@@ -126,6 +126,35 @@ func TestRunHelpListenHelpShowsListenHelp(t *testing.T) {
 	}
 }
 
+func TestRunHelpListenPreservesLegacyHelpSpellings(t *testing.T) {
+	for _, args := range [][]string{
+		{"help", "listen", "-h"},
+		{"help", "listen", "-help"},
+		{"help", "listen", "--help=0"},
+		{"help", "listen", "--help", "extra"},
+	} {
+		t.Run(strings.Join(args, "_"), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := run(args, nil, &stdout, &stderr)
+			if code != 0 {
+				t.Fatalf("run() = %d, want 0", code)
+			}
+			if got, want := stderr.String(), yargs.GenerateSubCommandHelp(
+				listenHelpConfig,
+				"listen",
+				struct{}{},
+				listenFlags{},
+				struct{}{},
+			); got != want {
+				t.Fatalf("stderr = %q, want exact listen help %q", got, want)
+			}
+			if got := stdout.String(); got != "" {
+				t.Fatalf("stdout = %q, want empty", got)
+			}
+		})
+	}
+}
+
 func TestRunHelpBogusRejected(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"help", "bogus"}, nil, &stdout, &stderr)
