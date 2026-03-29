@@ -111,7 +111,12 @@ func rewriteRootHelpArgs(args []string) []string {
 	}
 
 	rewritten := make([]string, 0, len(args))
-	rewritten = append(rewritten, args[1], "--help")
+	rewritten = append(rewritten, args[1])
+	if len(args) == 2 {
+		rewritten = append(rewritten, "--help")
+		return rewritten
+	}
+
 	rewritten = append(rewritten, args[2:]...)
 	return rewritten
 }
