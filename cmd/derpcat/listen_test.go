@@ -3,8 +3,8 @@ package main
 import (
 	"bytes"
 	"strings"
-	"time"
 	"testing"
+	"time"
 
 	"github.com/shayne/derpcat/pkg/token"
 )
@@ -20,6 +20,24 @@ func TestListenPrintTokenOnlyTargetsStdout(t *testing.T) {
 	}
 	if stderr.String() != "" {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestListenHelpTargetsCanonicalUsage(t *testing.T) {
+	for _, args := range [][]string{{"listen", "-h"}, {"listen", "--help"}} {
+		t.Run(args[1], func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := run(args, nil, &stdout, &stderr)
+			if code != 0 {
+				t.Fatalf("run() = %d, want 0", code)
+			}
+			if got := stderr.String(); got != "usage: derpcat listen [--print-token-only]\n" {
+				t.Fatalf("stderr = %q, want exact listen usage", got)
+			}
+			if got := stdout.String(); got != "" {
+				t.Fatalf("stdout = %q, want empty", got)
+			}
+		})
 	}
 }
 
@@ -62,18 +80,14 @@ func TestListenEmitsStructurallyValidToken(t *testing.T) {
 }
 
 func TestListenEmitsDifferentTokensBackToBack(t *testing.T) {
-	var stdout1, stderr1 bytes.Buffer
-	if code := runListen([]string{}, &stdout1, &stderr1); code != 0 {
-		t.Fatalf("first runListen() = %d, want 0", code)
-	}
+	decoded1 := mustDecodeListenToken(t)
+	decoded2 := mustDecodeListenToken(t)
 
-	var stdout2, stderr2 bytes.Buffer
-	if code := runListen([]string{}, &stdout2, &stderr2); code != 0 {
-		t.Fatalf("second runListen() = %d, want 0", code)
+	if decoded1.SessionID == decoded2.SessionID {
+		t.Fatal("SessionID matched, want distinct session material")
 	}
-
-	if stdout1.String() == stdout2.String() {
-		t.Fatal("tokens matched, want distinct session material")
+	if decoded1.BearerSecret == decoded2.BearerSecret {
+		t.Fatal("BearerSecret matched, want distinct session material")
 	}
 }
 
@@ -89,4 +103,19 @@ func TestListenRejectsStrayPositionalArgs(t *testing.T) {
 	if got := stdout.String(); got != "" {
 		t.Fatalf("stdout = %q, want empty", got)
 	}
+}
+
+func mustDecodeListenToken(t *testing.T) token.Token {
+	t.Helper()
+
+	var stdout, stderr bytes.Buffer
+	if code := runListen([]string{}, &stdout, &stderr); code != 0 {
+		t.Fatalf("runListen() = %d, want 0", code)
+	}
+
+	decoded, err := token.Decode(strings.TrimSpace(stdout.String()), time.Now())
+	if err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	return decoded
 }

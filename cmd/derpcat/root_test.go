@@ -33,6 +33,24 @@ func TestRunRejectsUnknownSubcommand(t *testing.T) {
 	}
 }
 
+func TestRunRootHelpSucceeds(t *testing.T) {
+	for _, args := range [][]string{{"-h"}, {"--help"}} {
+		t.Run(args[0], func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := run(args, nil, &stdout, &stderr)
+			if code != 0 {
+				t.Fatalf("run() = %d, want 0", code)
+			}
+			if got := stderr.String(); got != "usage: derpcat <listen|send> [flags]\n" {
+				t.Fatalf("stderr = %q, want exact root usage", got)
+			}
+			if got := stdout.String(); got != "" {
+				t.Fatalf("stdout = %q, want empty", got)
+			}
+		})
+	}
+}
+
 func TestRunListenDispatchesToListenBehavior(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"listen"}, nil, &stdout, &stderr)
@@ -47,14 +65,46 @@ func TestRunListenDispatchesToListenBehavior(t *testing.T) {
 	}
 }
 
+func TestRunListenHelpSucceeds(t *testing.T) {
+	for _, args := range [][]string{{"listen", "-h"}, {"listen", "--help"}} {
+		t.Run(args[1], func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := run(args, nil, &stdout, &stderr)
+			if code != 0 {
+				t.Fatalf("run() = %d, want 0", code)
+			}
+			if got := stderr.String(); got != "usage: derpcat listen [--print-token-only]\n" {
+				t.Fatalf("stderr = %q, want exact listen usage", got)
+			}
+			if got := stdout.String(); got != "" {
+				t.Fatalf("stdout = %q, want empty", got)
+			}
+		})
+	}
+}
+
 func TestRunSendDispatchesToSendUsageError(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"send"}, nil, &stdout, &stderr)
 	if code != 2 {
 		t.Fatalf("run() = %d, want 2", code)
 	}
-	if got := stderr.String(); got != "usage: derpcat send <token>\n" {
+	if got := stderr.String(); got != "usage: derpcat send <token> [flags...]\n" {
 		t.Fatalf("stderr = %q, want usage text", got)
+	}
+	if got := stdout.String(); got != "" {
+		t.Fatalf("stdout = %q, want empty", got)
+	}
+}
+
+func TestRunSendGrammarAllowsTokenBeforeFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"send", "token-value", "-h"}, nil, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0", code)
+	}
+	if got := stderr.String(); got != "usage: derpcat send <token> [flags...]\n" {
+		t.Fatalf("stderr = %q, want exact send usage", got)
 	}
 	if got := stdout.String(); got != "" {
 		t.Fatalf("stdout = %q, want empty", got)

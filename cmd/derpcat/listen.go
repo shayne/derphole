@@ -11,16 +11,28 @@ import (
 	"github.com/shayne/derpcat/pkg/token"
 )
 
+const listenUsage = "usage: derpcat listen [--print-token-only]"
+
 func runListen(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("listen", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	fs.Usage = func() {
+		fmt.Fprintln(stderr, listenUsage)
+	}
 
 	printTokenOnly := fs.Bool("print-token-only", false, "print only the session token")
+	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
+		fs.Usage()
+		return 0
+	}
 	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "usage: derpcat listen [--print-token-only]")
+		fs.Usage()
 		return 2
 	}
 

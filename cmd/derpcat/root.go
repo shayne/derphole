@@ -11,6 +11,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	if args[0] == "-h" || args[0] == "--help" {
+		fmt.Fprintln(stderr, "usage: derpcat <listen|send> [flags]")
+		return 0
+	}
+
 	switch args[0] {
 	case "listen":
 		return runListen(args[1:], stdout, stderr)
