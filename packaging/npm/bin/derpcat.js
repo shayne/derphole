@@ -35,7 +35,8 @@ const child = spawn(binaryPath, process.argv.slice(2), {
 });
 
 child.on("error", (err) => {
-  console.error(err);
+  const reason = err instanceof Error ? err.message : String(err);
+  console.error(`Failed to launch vendored binary: ${reason}`);
   process.exit(1);
 });
 
