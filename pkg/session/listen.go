@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"io"
+	"net"
 	"sync"
 	"time"
 
@@ -12,15 +13,21 @@ import (
 
 var (
 	relayMu        sync.Mutex
-	relayMailboxes = map[string]chan relayMessage{}
+	relayMailboxes = map[string]*relaySession{}
 )
 
 type relayMessage struct {
 	payload []byte
 	ack     chan error
+	path    State
 }
 
-func issueToken() (string, chan relayMessage, error) {
+type relaySession struct {
+	mailbox   chan relayMessage
+	probeConn net.PacketConn
+}
+
+func issueToken() (string, *relaySession, error) {
 	var sessionID [16]byte
 	if _, err := rand.Read(sessionID[:]); err != nil {
 		return "", nil, err
@@ -42,18 +49,31 @@ func issueToken() (string, chan relayMessage, error) {
 		return "", nil, err
 	}
 
-	mailbox := make(chan relayMessage)
+	var probeConn net.PacketConn
+	probeConn, _ = net.ListenPacket("udp", "127.0.0.1:0")
+
+	session := &relaySession{
+		mailbox:   make(chan relayMessage),
+		probeConn: probeConn,
+	}
 	relayMu.Lock()
-	relayMailboxes[tok] = mailbox
+	relayMailboxes[tok] = session
 	relayMu.Unlock()
-	return tok, mailbox, nil
+	return tok, session, nil
 }
 
-func deleteRelayMailbox(tok string, mailbox chan relayMessage) {
+func deleteRelayMailbox(tok string, session *relaySession) {
+	var probeConn net.PacketConn
+
 	relayMu.Lock()
-	defer relayMu.Unlock()
-	if relayMailboxes[tok] == mailbox {
+	if relayMailboxes[tok] == session {
 		delete(relayMailboxes, tok)
+		probeConn = session.probeConn
+	}
+	relayMu.Unlock()
+
+	if probeConn != nil {
+		_ = probeConn.Close()
 	}
 }
 
@@ -68,11 +88,11 @@ func listenOutput(cfg ListenConfig) io.Writer {
 }
 
 func Listen(ctx context.Context, cfg ListenConfig) (string, error) {
-	tok, mailbox, err := issueToken()
+	tok, session, err := issueToken()
 	if err != nil {
 		return "", err
 	}
-	defer deleteRelayMailbox(tok, mailbox)
+	defer deleteRelayMailbox(tok, session)
 
 	emitStatus(cfg.Emitter, StateWaiting)
 	if cfg.TokenSink != nil {
@@ -84,8 +104,12 @@ func Listen(ctx context.Context, cfg ListenConfig) (string, error) {
 	}
 
 	select {
-	case msg := <-mailbox:
-		emitStatus(cfg.Emitter, StateRelay)
+	case msg := <-session.mailbox:
+		path := msg.path
+		if path == "" {
+			path = StateRelay
+		}
+		emitStatus(cfg.Emitter, path)
 		_, err := listenOutput(cfg).Write(msg.payload)
 		msg.ack <- err
 		if err != nil {

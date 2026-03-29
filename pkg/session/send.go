@@ -5,15 +5,18 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
+
+	"github.com/shayne/derpcat/pkg/traversal"
 )
 
 var ErrUnknownSession = errors.New("unknown session")
 
-func relayMailbox(tok string) (chan relayMessage, bool) {
+func relayMailbox(tok string) (*relaySession, bool) {
 	relayMu.Lock()
 	defer relayMu.Unlock()
-	mailbox, ok := relayMailboxes[tok]
-	return mailbox, ok
+	session, ok := relayMailboxes[tok]
+	return session, ok
 }
 
 func sendInput(cfg SendConfig) io.Reader {
@@ -34,14 +37,15 @@ func Send(ctx context.Context, cfg SendConfig) error {
 		return err
 	}
 
-	mailbox, ok := relayMailbox(cfg.Token)
+	session, ok := relayMailbox(cfg.Token)
 	if !ok {
 		return ErrUnknownSession
 	}
 
+	path := detectPath(ctx, cfg.ForceRelay, session.probeConn)
 	ack := make(chan error, 1)
 	select {
-	case mailbox <- relayMessage{payload: payload, ack: ack}:
+	case session.mailbox <- relayMessage{payload: payload, ack: ack, path: path}:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -54,7 +58,35 @@ func Send(ctx context.Context, cfg SendConfig) error {
 		return ctx.Err()
 	}
 
-	emitStatus(cfg.Emitter, StateRelay)
+	emitStatus(cfg.Emitter, path)
 	emitStatus(cfg.Emitter, StateComplete)
 	return nil
+}
+
+func choosePath(forceRelay bool, probe traversal.Result) State {
+	if forceRelay {
+		return StateRelay
+	}
+	if probe.Direct {
+		return StateDirect
+	}
+	return StateRelay
+}
+
+func detectPath(ctx context.Context, forceRelay bool, peer net.PacketConn) State {
+	if forceRelay || peer == nil {
+		return StateRelay
+	}
+
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		return StateRelay
+	}
+	defer conn.Close()
+
+	probe, err := traversal.ProbeDirect(ctx, conn, peer.LocalAddr().String(), peer, conn.LocalAddr().String())
+	if err != nil {
+		return StateRelay
+	}
+	return choosePath(forceRelay, probe)
 }
