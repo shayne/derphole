@@ -16,6 +16,12 @@ run = "./scripts/smoke-local.sh"
 [tasks.smoke-remote]
 run = "./scripts/smoke-remote.sh hetz"
 
+[tasks.smoke-remote-relay]
+run = "./scripts/smoke-remote-relay.sh hetz"
+
+[tasks.smoke-remote-tcp]
+run = "./scripts/smoke-remote-tcp.sh hetz"
+
 [tasks.promotion-1g-hetz]
 run = "./scripts/promotion-test.sh hetz 1024"
 
