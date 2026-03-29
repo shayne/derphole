@@ -148,11 +148,42 @@ func TestRunHelpVersionRejectsExtraArgs(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("run() = %d, want 2", code)
 	}
-	if got := stderr.String(); got != versionUsage+"\n" {
-		t.Fatalf("stderr = %q, want exact version usage", got)
-	}
+	assertRootHelp(t, stderr.String())
 	if got := stdout.String(); got != "" {
 		t.Fatalf("stdout = %q, want empty", got)
+	}
+}
+
+func TestRunHelpSendRejectsExtraArgs(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"help", "send", "garbage"}, nil, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("run() = %d, want 2", code)
+	}
+	assertRootHelp(t, stderr.String())
+	if got := stdout.String(); got != "" {
+		t.Fatalf("stdout = %q, want empty", got)
+	}
+}
+
+func TestRunHelpListenRejectsExtraArgs(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"help", "listen", "--tcp-listen", "127.0.0.1:7000"}, nil, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("run() = %d, want 2", code)
+	}
+	assertRootHelp(t, stderr.String())
+	if got := stdout.String(); got != "" {
+		t.Fatalf("stdout = %q, want empty", got)
+	}
+}
+
+func assertRootHelp(t *testing.T, got string) {
+	t.Helper()
+	for _, want := range []string{"listen", "send", "version"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("stderr = %q, want root help mentioning %q", got, want)
+		}
 	}
 }
 

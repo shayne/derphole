@@ -61,8 +61,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	level := rootTelemetryLevel(parsed.Flags)
 
-	remaining := rewriteRootHelpArgs(parsed.RemainingArgs)
+	remaining, malformedHelp := rewriteRootHelpArgs(parsed.RemainingArgs)
 	if len(remaining) == 0 {
+		fmt.Fprint(stderr, yargs.GenerateGlobalHelp(rootHelpConfig, rootGlobalFlags{}))
+		return 2
+	}
+	if malformedHelp {
 		fmt.Fprint(stderr, yargs.GenerateGlobalHelp(rootHelpConfig, rootGlobalFlags{}))
 		return 2
 	}
@@ -105,20 +109,16 @@ func isRootHelpRequest(args []string) bool {
 	return args[0] == "-h" || args[0] == "--help" || (args[0] == "help" && len(args) == 1)
 }
 
-func rewriteRootHelpArgs(args []string) []string {
+func rewriteRootHelpArgs(args []string) ([]string, bool) {
 	if len(args) < 2 || args[0] != "help" {
-		return args
+		return args, false
 	}
 
-	rewritten := make([]string, 0, len(args))
-	rewritten = append(rewritten, args[1])
-	if len(args) == 2 {
-		rewritten = append(rewritten, "--help")
-		return rewritten
+	if len(args) > 2 {
+		return args, true
 	}
 
-	rewritten = append(rewritten, args[2:]...)
-	return rewritten
+	return []string{args[1], "--help"}, false
 }
 
 func rootTelemetryLevel(flags rootGlobalFlags) telemetry.Level {
