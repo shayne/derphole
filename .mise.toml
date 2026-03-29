@@ -24,7 +24,15 @@ run = "bash ./tools/packaging/build-npm.sh"
 run = "bash ./tools/packaging/build-release-assets.sh"
 
 [tasks."release:npm-dry-run"]
-run = "npm publish ./dist/npm --access public --dry-run"
+run = """
+set -euo pipefail
+pkg_version="$(node -e 'process.stdout.write(require("./dist/npm/package.json").version)')"
+if [[ "$pkg_version" == *-* ]]; then
+  npm publish ./dist/npm --access public --dry-run --tag dev
+else
+  npm publish ./dist/npm --access public --dry-run
+fi
+"""
 
 [tasks."release:smoke"]
 run = "bash ./scripts/release-package-smoke.sh"
