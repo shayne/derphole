@@ -1,7 +1,7 @@
 package token
 
 import (
-	"strings"
+	"encoding/base64"
 	"testing"
 	"time"
 )
@@ -42,13 +42,30 @@ func TestDecodeRejectsExpiredToken(t *testing.T) {
 	}
 }
 
+func TestDecodeRejectsTokenAtExpiryBoundary(t *testing.T) {
+	now := time.Now().UTC()
+	tok := Token{Version: 1, ExpiresUnix: now.Unix()}
+	encoded, err := Encode(tok)
+	if err != nil {
+		t.Fatalf("Encode() error = %v", err)
+	}
+	if _, err := Decode(encoded, now); err != ErrExpired {
+		t.Fatalf("Decode() error = %v, want ErrExpired", err)
+	}
+}
+
 func TestDecodeRejectsCorruptedChecksum(t *testing.T) {
 	tok := Token{Version: 1, ExpiresUnix: time.Now().Add(time.Minute).Unix()}
 	encoded, err := Encode(tok)
 	if err != nil {
 		t.Fatalf("Encode() error = %v", err)
 	}
-	encoded = encoded[:len(encoded)-1] + strings.Repeat("A", 1)
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("DecodeString() error = %v", err)
+	}
+	raw[len(raw)-1] ^= 0x01
+	encoded = base64.RawURLEncoding.EncodeToString(raw)
 	if _, err := Decode(encoded, time.Now()); err != ErrChecksum {
 		t.Fatalf("Decode() error = %v, want ErrChecksum", err)
 	}
