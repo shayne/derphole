@@ -20,8 +20,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "listen":
 		return runListen(args[1:], stdout, stderr)
 	case "send":
-		_ = stdin
-		return runSend(args[1:], stdout, stderr)
+		return runSend(args[1:], stdin, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown subcommand %q\n", args[0])
 		return 2

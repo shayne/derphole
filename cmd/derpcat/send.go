@@ -8,7 +8,7 @@ import (
 
 const sendUsage = "usage: derpcat send <token> [flags...]"
 
-func runSend(args []string, stdout, stderr io.Writer) int {
+func runSend(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("send", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
@@ -42,6 +42,7 @@ func runSend(args []string, stdout, stderr io.Writer) int {
 	}
 
 	_ = tokenArg
+	_ = stdin
 	_ = stdout
 	return 0
 }

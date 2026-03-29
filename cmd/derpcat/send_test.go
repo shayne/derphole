@@ -7,7 +7,7 @@ import (
 
 func TestSendRejectsMissingTokenArgument(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := runSend([]string{}, &stdout, &stderr)
+	code := runSend([]string{}, nil, &stdout, &stderr)
 	if code != 2 {
 		t.Fatalf("runSend() = %d, want 2", code)
 	}
@@ -23,7 +23,7 @@ func TestSendHelpTargetsCanonicalUsage(t *testing.T) {
 	for _, args := range [][]string{{"-h"}, {"--help"}} {
 		t.Run(args[0], func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := runSend(args, &stdout, &stderr)
+			code := runSend(args, nil, &stdout, &stderr)
 			if code != 0 {
 				t.Fatalf("runSend() = %d, want 0", code)
 			}
@@ -39,7 +39,7 @@ func TestSendHelpTargetsCanonicalUsage(t *testing.T) {
 
 func TestSendAllowsTokenBeforeFlags(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := runSend([]string{"token-value", "-h"}, &stdout, &stderr)
+	code := runSend([]string{"token-value", "-h"}, nil, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("runSend() = %d, want 0", code)
 	}
