@@ -71,6 +71,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprint(stderr, yargs.GenerateGlobalHelp(rootHelpConfig, rootGlobalFlags{}))
 		return 2
 	}
+	if isRootHelpLLMRequest(remaining) {
+		fmt.Fprint(stderr, yargs.GenerateGlobalHelpLLM(rootHelpConfig, rootGlobalFlags{}))
+		return 0
+	}
 	if isRootHelpRequest(remaining) {
 		fmt.Fprint(stderr, yargs.GenerateGlobalHelp(rootHelpConfig, rootGlobalFlags{}))
 		return 0
@@ -108,6 +112,10 @@ func isRootHelpRequest(args []string) bool {
 		return false
 	}
 	return args[0] == "-h" || args[0] == "--help" || (args[0] == "help" && len(args) == 1)
+}
+
+func isRootHelpLLMRequest(args []string) bool {
+	return len(args) > 0 && args[0] == "--help-llm"
 }
 
 func splitRootGlobalPrefix(args []string) ([]string, []string) {

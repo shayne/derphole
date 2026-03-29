@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/shayne/yargs"
 )
 
 func TestRunRejectsMissingSubcommand(t *testing.T) {
@@ -56,6 +58,20 @@ func TestRunRootHelpSucceeds(t *testing.T) {
 				t.Fatalf("stdout = %q, want empty", got)
 			}
 		})
+	}
+}
+
+func TestRunRootHelpLLMSucceeds(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--help-llm"}, nil, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0", code)
+	}
+	if got, want := stderr.String(), yargs.GenerateGlobalHelpLLM(rootHelpConfig, rootGlobalFlags{}); got != want {
+		t.Fatalf("stderr = %q, want exact LLM help %q", got, want)
+	}
+	if got := stdout.String(); got != "" {
+		t.Fatalf("stdout = %q, want empty", got)
 	}
 }
 
