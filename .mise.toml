@@ -24,7 +24,6 @@ run = "bash ./tools/packaging/build-npm.sh"
 run = "bash ./tools/packaging/build-release-assets.sh"
 
 [tasks."release:npm-dry-run"]
-env = { npm_config_tag = "next" }
 run = "npm publish ./dist/npm --access public --dry-run"
 
 [tasks."release:smoke"]
