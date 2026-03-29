@@ -6,14 +6,15 @@
 
 The npm packaging and release workflow now exist.
 The first `0.0.1` publish is still manual until npm trusted publishing is configured.
+The install commands below are post-publish examples.
 
-### Production install
+### Production install example
 
 ```bash
 npx derpcat --version
 ```
 
-### Dev channel install
+### Dev channel install example
 
 ```bash
 npx derpcat@dev --version
