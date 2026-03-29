@@ -20,6 +20,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		case "-s", "--silent":
 			level = telemetry.LevelSilent
 			args = args[1:]
+		case "--version":
+			fmt.Fprintln(stdout, versionString())
+			return 0
 		case "-h", "--help":
 			fmt.Fprintln(stderr, "usage: derpcat <listen|send> [flags]")
 			return 0
