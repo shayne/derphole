@@ -48,6 +48,26 @@ func TestSendAllowsTokenBeforeFlags(t *testing.T) {
 	}
 }
 
+func TestSendPreservesIntentionalHelpEdgeCases(t *testing.T) {
+	for _, args := range [][]string{
+		{"--", "--help"},
+		{"token-value", "--help"},
+		{"--bogus", "--", "--help"},
+	} {
+		t.Run(strings.Join(args, "_"), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := runSend(args, telemetry.LevelDefault, nil, &stdout, &stderr)
+			if code != 0 {
+				t.Fatalf("runSend() = %d, want 0", code)
+			}
+			assertSendHelpText(t, stderr.String())
+			if got := stdout.String(); got != "" {
+				t.Fatalf("stdout = %q, want empty", got)
+			}
+		})
+	}
+}
+
 func assertSendHelpText(t *testing.T, got string) {
 	t.Helper()
 	for _, want := range []string{
