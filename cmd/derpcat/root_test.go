@@ -157,6 +157,34 @@ func TestRunVersionHelpLLMSucceeds(t *testing.T) {
 	}
 }
 
+func TestRunVersionHelpLLMRejectsExtraArgs(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"version", "--help-llm", "extra"}, nil, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("run() = %d, want 2", code)
+	}
+	if got := stderr.String(); got != versionUsage+"\n" {
+		t.Fatalf("stderr = %q, want exact version usage", got)
+	}
+	if got := stdout.String(); got != "" {
+		t.Fatalf("stdout = %q, want empty", got)
+	}
+}
+
+func TestRunHelpVersionHelpLLMSucceeds(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"help", "version", "--help-llm"}, nil, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0", code)
+	}
+	if got, want := stderr.String(), yargs.GenerateSubCommandHelpLLMFromConfig(rootHelpConfig, "version", rootGlobalFlags{}); got != want {
+		t.Fatalf("stderr = %q, want exact LLM version help %q", got, want)
+	}
+	if got := stdout.String(); got != "" {
+		t.Fatalf("stdout = %q, want empty", got)
+	}
+}
+
 func TestParseRootArgsResetsVerbosityToDefaultOnFalseNegation(t *testing.T) {
 	tests := []struct {
 		name          string

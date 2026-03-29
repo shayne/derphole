@@ -259,6 +259,10 @@ func rewriteRootHelpArgs(args []string) ([]string, bool) {
 		return args, false
 	}
 
+	if len(args) == 3 && args[1] == "version" && args[2] == "--help-llm" {
+		return []string{"version", "--help-llm"}, false
+	}
+
 	if len(args) > 2 {
 		return args, true
 	}
@@ -268,6 +272,10 @@ func rewriteRootHelpArgs(args []string) ([]string, bool) {
 
 func runVersion(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "--help-llm" {
+		if len(args) != 1 {
+			fmt.Fprintln(stderr, versionUsage)
+			return 2
+		}
 		fmt.Fprint(stderr, yargs.GenerateSubCommandHelpLLMFromConfig(rootHelpConfig, "version", rootGlobalFlags{}))
 		return 0
 	}
