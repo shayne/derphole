@@ -1,0 +1,22 @@
+{
+  "name": "derpcat",
+  "version": "0.0.0",
+  "license": "BSD-3-Clause",
+  "bin": {
+    "derpcat": "bin/derpcat.js"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=16"
+  },
+  "files": [
+    "bin",
+    "vendor",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shayne/derpcat.git"
+  }
+}
