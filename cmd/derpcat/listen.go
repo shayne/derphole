@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -37,18 +36,11 @@ func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) i
 		return 2
 	}
 
-	emitterLevel := level
-	if *printTokenOnly {
-		emitterLevel = telemetry.LevelSilent
-	}
-	emitter := telemetry.New(stderr, emitterLevel)
+	emitter := telemetry.New(stderr, level)
 	tokenSink := make(chan string, 1)
 	done := make(chan error, 1)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	go func() {
-		_, err := session.Listen(ctx, session.ListenConfig{
+		_, err := session.Listen(context.Background(), session.ListenConfig{
 			Emitter:    emitter,
 			TokenSink:  tokenSink,
 			StdioOut:   stdout,
@@ -62,7 +54,7 @@ func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) i
 	select {
 	case tok = <-tokenSink:
 	case err := <-done:
-		if err != nil && !errors.Is(err, context.Canceled) {
+		if err != nil {
 			fmt.Fprintln(stderr, err)
 			return 1
 		}
@@ -72,9 +64,13 @@ func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) i
 		return 1
 	}
 
-	fmt.Fprintln(stdout, tok)
-	cancel()
-	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+	tokenOut := stderr
+	if *printTokenOnly {
+		tokenOut = stdout
+	}
+	fmt.Fprintln(tokenOut, tok)
+
+	if err := <-done; err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}

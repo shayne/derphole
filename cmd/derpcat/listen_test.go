@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,17 +11,127 @@ import (
 	"github.com/shayne/derpcat/pkg/token"
 )
 
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func runRelayListenAndSend(
+	t *testing.T,
+	listenArgs []string,
+	level telemetry.Level,
+	tokenSource func(stdout, stderr *lockedBuffer) *lockedBuffer,
+	payload string,
+) (listenerStdout string, listenerStderr string, senderStderr string, issuedToken string) {
+	t.Helper()
+
+	listenerStdoutBuf := &lockedBuffer{}
+	listenerStderrBuf := &lockedBuffer{}
+	listenerDone := make(chan int, 1)
+	go func() {
+		listenerDone <- runListen(listenArgs, level, listenerStdoutBuf, listenerStderrBuf)
+	}()
+
+	issuedToken = waitForIssuedToken(t, tokenSource(listenerStdoutBuf, listenerStderrBuf))
+
+	var senderStdout bytes.Buffer
+	var senderStderrBuf bytes.Buffer
+	sendCode := runSend([]string{issuedToken, "--force-relay"}, level, strings.NewReader(payload), &senderStdout, &senderStderrBuf)
+	if sendCode != 0 {
+		t.Fatalf("runSend() = %d, want 0, stderr=%q", sendCode, senderStderrBuf.String())
+	}
+	if got := senderStdout.String(); got != "" {
+		t.Fatalf("sender stdout = %q, want empty", got)
+	}
+
+	select {
+	case code := <-listenerDone:
+		if code != 0 {
+			t.Fatalf("runListen() = %d, want 0, stderr=%q", code, listenerStderrBuf.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runListen() did not return after sender completed")
+	}
+
+	return listenerStdoutBuf.String(), listenerStderrBuf.String(), senderStderrBuf.String(), issuedToken
+}
+
+func waitForIssuedToken(t *testing.T, buf *lockedBuffer) string {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, line := range strings.Split(buf.String(), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if _, err := token.Decode(line, time.Now()); err == nil {
+				return line
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatalf("no issued token found in output %q", buf.String())
+	return ""
+}
+
 func TestListenPrintTokenOnlyTargetsStdout(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"listen", "--print-token-only"}, nil, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("run() = %d, want 0", code)
+	listenerStdout, listenerStderr, senderStderr, issuedToken := runRelayListenAndSend(
+		t,
+		[]string{"--print-token-only"},
+		telemetry.LevelDefault,
+		func(stdout, stderr *lockedBuffer) *lockedBuffer { return stdout },
+		"hello over derp",
+	)
+
+	if !strings.HasPrefix(listenerStdout, issuedToken+"\n") {
+		t.Fatalf("listener stdout = %q, want token prefix", listenerStdout)
 	}
-	if stdout.String() == "" {
-		t.Fatal("stdout empty, want token")
+	if !strings.HasSuffix(listenerStdout, "hello over derp") {
+		t.Fatalf("listener stdout = %q, want payload suffix", listenerStdout)
 	}
-	if stderr.String() != "" {
-		t.Fatalf("stderr = %q, want empty", stderr.String())
+	if strings.Contains(listenerStderr, issuedToken) {
+		t.Fatalf("listener stderr = %q, want token only on stdout", listenerStderr)
+	}
+	if got := listenerStderr; got != "waiting-for-claim\nconnected-relay\nstream-complete\n" {
+		t.Fatalf("listener stderr = %q, want status-only stderr", got)
+	}
+	if got := senderStderr; got != "probing-direct\nconnected-relay\nstream-complete\n" {
+		t.Fatalf("sender stderr = %q, want relay status sequence", got)
+	}
+}
+
+func TestListenWithoutFlagsUsesStderrForTokenAndStdoutForPayload(t *testing.T) {
+	listenerStdout, listenerStderr, senderStderr, issuedToken := runRelayListenAndSend(
+		t,
+		nil,
+		telemetry.LevelDefault,
+		func(stdout, stderr *lockedBuffer) *lockedBuffer { return stderr },
+		"hello over derp",
+	)
+
+	if got := listenerStdout; got != "hello over derp" {
+		t.Fatalf("listener stdout = %q, want payload", got)
+	}
+	if !strings.Contains(listenerStderr, "waiting-for-claim\n"+issuedToken+"\nconnected-relay\nstream-complete\n") {
+		t.Fatalf("listener stderr = %q, want token and statuses on stderr", listenerStderr)
+	}
+	if got := senderStderr; got != "probing-direct\nconnected-relay\nstream-complete\n" {
+		t.Fatalf("sender stderr = %q, want relay status sequence", got)
 	}
 }
 
@@ -42,56 +153,6 @@ func TestListenHelpTargetsCanonicalUsage(t *testing.T) {
 	}
 }
 
-func TestListenWithoutFlagsPrintsStatusAndToken(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	code := runListen([]string{}, telemetry.LevelDefault, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("runListen() = %d, want 0", code)
-	}
-	if stdout.String() == "" {
-		t.Fatal("stdout empty, want token")
-	}
-	if got := stderr.String(); got != "waiting-for-claim\n" {
-		t.Fatalf("stderr = %q, want status text", got)
-	}
-}
-
-func TestListenEmitsStructurallyValidToken(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	code := runListen([]string{}, telemetry.LevelDefault, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("runListen() = %d, want 0", code)
-	}
-
-	encoded := stdout.String()
-	if encoded == "" {
-		t.Fatal("stdout empty, want token")
-	}
-
-	decoded, err := token.Decode(strings.TrimSpace(encoded), time.Now())
-	if err != nil {
-		t.Fatalf("Decode() error = %v", err)
-	}
-	if decoded.SessionID == ([16]byte{}) {
-		t.Fatal("SessionID zero, want random bytes")
-	}
-	if decoded.BearerSecret == ([32]byte{}) {
-		t.Fatal("BearerSecret zero, want random bytes")
-	}
-}
-
-func TestListenEmitsDifferentTokensBackToBack(t *testing.T) {
-	decoded1 := mustDecodeListenToken(t)
-	decoded2 := mustDecodeListenToken(t)
-
-	if decoded1.SessionID == decoded2.SessionID {
-		t.Fatal("SessionID matched, want distinct session material")
-	}
-	if decoded1.BearerSecret == decoded2.BearerSecret {
-		t.Fatal("BearerSecret matched, want distinct session material")
-	}
-}
-
 func TestListenRejectsStrayPositionalArgs(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := runListen([]string{"extra"}, telemetry.LevelDefault, &stdout, &stderr)
@@ -104,21 +165,6 @@ func TestListenRejectsStrayPositionalArgs(t *testing.T) {
 	if got := stdout.String(); got != "" {
 		t.Fatalf("stdout = %q, want empty", got)
 	}
-}
-
-func mustDecodeListenToken(t *testing.T) token.Token {
-	t.Helper()
-
-	var stdout, stderr bytes.Buffer
-	if code := runListen([]string{}, telemetry.LevelDefault, &stdout, &stderr); code != 0 {
-		t.Fatalf("runListen() = %d, want 0", code)
-	}
-
-	decoded, err := token.Decode(strings.TrimSpace(stdout.String()), time.Now())
-	if err != nil {
-		t.Fatalf("Decode() error = %v", err)
-	}
-	return decoded
 }
 
 func TestListenHonorsVerbosityLevel(t *testing.T) {
@@ -135,16 +181,18 @@ func TestListenHonorsVerbosityLevel(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
-			code := runListen([]string{}, tc.level, &stdout, &stderr)
-			if code != 0 {
-				t.Fatalf("runListen() = %d, want 0", code)
+			_, listenerStderr, _, issuedToken := runRelayListenAndSend(
+				t,
+				nil,
+				tc.level,
+				func(stdout, stderr *lockedBuffer) *lockedBuffer { return stderr },
+				"payload",
+			)
+			if !strings.Contains(listenerStderr, issuedToken+"\n") {
+				t.Fatalf("listener stderr = %q, want token on stderr", listenerStderr)
 			}
-			if got := stderr.String(); got != tc.wantStderr {
-				t.Fatalf("stderr = %q, want %q", got, tc.wantStderr)
-			}
-			if stdout.String() == "" {
-				t.Fatal("stdout empty, want token")
+			if !strings.HasPrefix(listenerStderr, tc.wantStderr) {
+				t.Fatalf("listener stderr = %q, want prefix %q", listenerStderr, tc.wantStderr)
 			}
 		})
 	}

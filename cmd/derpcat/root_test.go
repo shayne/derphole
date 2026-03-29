@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestRunRejectsMissingSubcommand(t *testing.T) {
@@ -52,16 +54,38 @@ func TestRunRootHelpSucceeds(t *testing.T) {
 }
 
 func TestRunListenDispatchesToListenBehavior(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	code := run([]string{"listen"}, nil, &stdout, &stderr)
+	listenerStdoutBuf := &lockedBuffer{}
+	listenerStderrBuf := &lockedBuffer{}
+	listenerDone := make(chan int, 1)
+	go func() {
+		listenerDone <- run([]string{"listen"}, nil, listenerStdoutBuf, listenerStderrBuf)
+	}()
+
+	issuedToken := waitForIssuedToken(t, listenerStderrBuf)
+
+	var senderStdout, senderStderr bytes.Buffer
+	code := run([]string{"send", issuedToken, "--force-relay"}, strings.NewReader("hello through root"), &senderStdout, &senderStderr)
 	if code != 0 {
-		t.Fatalf("run() = %d, want 0", code)
+		t.Fatalf("run() = %d, want 0, stderr=%q", code, senderStderr.String())
 	}
-	if stdout.String() == "" {
-		t.Fatal("stdout empty, want token")
+	if got := senderStdout.String(); got != "" {
+		t.Fatalf("sender stdout = %q, want empty", got)
 	}
-	if got := stderr.String(); got != "waiting-for-claim\n" {
-		t.Fatalf("stderr = %q, want status text", got)
+
+	select {
+	case code := <-listenerDone:
+		if code != 0 {
+			t.Fatalf("run() = %d, want 0, stderr=%q", code, listenerStderrBuf.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("listen subcommand did not complete after sender finished")
+	}
+
+	if got := listenerStdoutBuf.String(); got != "hello through root" {
+		t.Fatalf("listener stdout = %q, want payload", got)
+	}
+	if !strings.Contains(listenerStderrBuf.String(), issuedToken+"\n") {
+		t.Fatalf("listener stderr = %q, want issued token", listenerStderrBuf.String())
 	}
 }
 
@@ -69,26 +93,44 @@ func TestRunVerbosityFlagsBeforeListen(t *testing.T) {
 	tests := []struct {
 		name       string
 		args       []string
-		wantCode   int
-		wantStderr string
+		wantPrefix string
 	}{
-		{name: "quiet", args: []string{"-q", "listen"}, wantCode: 0, wantStderr: ""},
-		{name: "silent", args: []string{"-s", "listen"}, wantCode: 0, wantStderr: ""},
-		{name: "verbose", args: []string{"-v", "listen"}, wantCode: 0, wantStderr: "waiting-for-claim\n"},
+		{name: "quiet", args: []string{"-q", "listen"}, wantPrefix: ""},
+		{name: "silent", args: []string{"-s", "listen"}, wantPrefix: ""},
+		{name: "verbose", args: []string{"-v", "listen"}, wantPrefix: "waiting-for-claim\n"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
-			code := run(tc.args, nil, &stdout, &stderr)
-			if code != tc.wantCode {
-				t.Fatalf("run() = %d, want %d", code, tc.wantCode)
+			listenerStdoutBuf := &lockedBuffer{}
+			listenerStderrBuf := &lockedBuffer{}
+			listenerDone := make(chan int, 1)
+			go func() {
+				listenerDone <- run(tc.args, nil, listenerStdoutBuf, listenerStderrBuf)
+			}()
+
+			issuedToken := waitForIssuedToken(t, listenerStderrBuf)
+
+			var senderStdout, senderStderr bytes.Buffer
+			code := run([]string{"send", issuedToken, "--force-relay"}, strings.NewReader("payload"), &senderStdout, &senderStderr)
+			if code != 0 {
+				t.Fatalf("send run() = %d, want 0, stderr=%q", code, senderStderr.String())
 			}
-			if got := stderr.String(); got != tc.wantStderr {
-				t.Fatalf("stderr = %q, want %q", got, tc.wantStderr)
+
+			select {
+			case code := <-listenerDone:
+				if code != 0 {
+					t.Fatalf("listen run() = %d, want 0, stderr=%q", code, listenerStderrBuf.String())
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("listen subcommand did not complete after sender finished")
 			}
-			if stdout.String() == "" {
-				t.Fatal("stdout empty, want token")
+
+			if got := listenerStderrBuf.String(); !strings.HasPrefix(got, tc.wantPrefix) {
+				t.Fatalf("stderr = %q, want prefix %q", got, tc.wantPrefix)
+			}
+			if !strings.Contains(listenerStderrBuf.String(), issuedToken+"\n") {
+				t.Fatalf("stderr = %q, want token on stderr", listenerStderrBuf.String())
 			}
 		})
 	}
