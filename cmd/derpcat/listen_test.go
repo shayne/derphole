@@ -254,6 +254,30 @@ func TestListenRejectsStrayPositionalArgsEvenWithHelp(t *testing.T) {
 	}
 }
 
+func TestListenRejectsStrayPositionalArgsBeforeLateFlag(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runListen([]string{"extra", "--bogus"}, telemetry.LevelDefault, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("runListen() = %d, want 2", code)
+	}
+	got := stderr.String()
+	if strings.Contains(got, "unknown flag: --bogus") || strings.Contains(got, "flag provided but not defined") {
+		t.Fatalf("stderr = %q, want stray positional handling rather than parse error", got)
+	}
+	if got, want := got, yargs.GenerateSubCommandHelp(
+		testListenHelpConfig(),
+		"listen",
+		struct{}{},
+		listenHelpFlags{},
+		struct{}{},
+	); got != want {
+		t.Fatalf("stderr = %q, want yargs help %q", got, want)
+	}
+	if got := stdout.String(); got != "" {
+		t.Fatalf("stdout = %q, want empty", got)
+	}
+}
+
 func TestListenUnknownFlagShowsParseErrorAndHelp(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := runListen([]string{"--bogus"}, telemetry.LevelDefault, &stdout, &stderr)

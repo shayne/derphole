@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 
@@ -15,15 +16,6 @@ type listenFlags struct {
 	ForceRelay     bool   `flag:"force-relay" help:"Disable direct probing"`
 	TCPListen      string `flag:"tcp-listen" help:"Accept one local TCP connection and forward its bytes to the session sink"`
 	TCPConnect     string `flag:"tcp-connect" help:"Connect to a local TCP service and forward session bytes to it"`
-}
-
-type listenParseFlags struct {
-	PrintTokenOnly bool   `flag:"print-token-only" help:"Print only the session token"`
-	ForceRelay     bool   `flag:"force-relay" help:"Disable direct probing"`
-	TCPListen      string `flag:"tcp-listen" help:"Accept one local TCP connection and forward its bytes to the session sink"`
-	TCPConnect     string `flag:"tcp-connect" help:"Connect to a local TCP service and forward session bytes to it"`
-	Help           bool   `flag:"help" short:"h" help:"Show this help message"`
-	HelpLLM        bool   `flag:"help-llm" help:"Show LLM-optimized help"`
 }
 
 var listenHelpConfig = yargs.HelpConfig{
@@ -50,28 +42,52 @@ var listenHelpConfig = yargs.HelpConfig{
 }
 
 func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) int {
-	parsed, err := yargs.ParseFlags[listenParseFlags](args)
-	if err != nil {
+	fs := flag.NewFlagSet("listen", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.Usage = func() {
+		fmt.Fprint(stderr, listenHelpText())
+	}
+
+	fs.Bool("h", false, "Show this help message")
+	fs.Bool("help", false, "Show this help message")
+	fs.Bool("help-llm", false, "Show LLM-optimized help")
+	printTokenOnly := fs.Bool("print-token-only", false, "Print only the session token")
+	forceRelay := fs.Bool("force-relay", false, "Disable direct probing")
+	tcpListen := fs.String("tcp-listen", "", "Accept one local TCP connection and forward its bytes to the session sink")
+	tcpConnect := fs.String("tcp-connect", "", "Connect to a local TCP service and forward session bytes to it")
+
+	if err := fs.Parse(args); err != nil {
 		fmt.Fprintln(stderr, err)
-		fmt.Fprint(stderr, listenHelpText())
+		fs.Usage()
 		return 2
 	}
 
-	if len(parsed.Args) != 0 || len(parsed.RemainingArgs) != 0 {
-		fmt.Fprint(stderr, listenHelpText())
+	if len(fs.Args()) != 0 {
+		fs.Usage()
 		return 2
 	}
 
-	if parsed.Flags.HelpLLM {
+	helpRequested := false
+	helpLLMRequested := false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "h", "help":
+			helpRequested = true
+		case "help-llm":
+			helpLLMRequested = true
+		}
+	})
+
+	if helpLLMRequested {
 		fmt.Fprint(stderr, listenHelpLLMText())
 		return 0
 	}
-	if listenHelpRequested(parsed) {
+	if helpRequested {
 		fmt.Fprint(stderr, listenHelpText())
 		return 0
 	}
 
-	if parsed.Flags.TCPListen != "" && parsed.Flags.TCPConnect != "" {
+	if *tcpListen != "" && *tcpConnect != "" {
 		fmt.Fprintln(stderr, "listen: --tcp-listen and --tcp-connect are mutually exclusive")
 		return 2
 	}
@@ -85,9 +101,9 @@ func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) i
 			TokenSink:     tokenSink,
 			StdioOut:      stdout,
 			Attachment:    nil,
-			TCPListen:     parsed.Flags.TCPListen,
-			TCPConnect:    parsed.Flags.TCPConnect,
-			ForceRelay:    parsed.Flags.ForceRelay,
+			TCPListen:     *tcpListen,
+			TCPConnect:    *tcpConnect,
+			ForceRelay:    *forceRelay,
 			UsePublicDERP: usePublicDERPTransport(),
 		})
 		done <- err
@@ -108,7 +124,7 @@ func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) i
 	}
 
 	tokenOut := stderr
-	if parsed.Flags.PrintTokenOnly {
+	if *printTokenOnly {
 		tokenOut = stdout
 	}
 	fmt.Fprintln(tokenOut, tok)
@@ -118,14 +134,6 @@ func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) i
 		return 1
 	}
 	return 0
-}
-
-func listenHelpRequested(parsed *yargs.ParseResult[listenParseFlags]) bool {
-	if parsed.Flags.Help {
-		return true
-	}
-	_, ok := parsed.Parser.Flags["help"]
-	return ok
 }
 
 func listenHelpText() string {
