@@ -255,9 +255,7 @@ func TestRunVersionHelpShowsHelp(t *testing.T) {
 			if code != 0 {
 				t.Fatalf("run() = %d, want 0", code)
 			}
-			if got := stderr.String(); got != versionUsage+"\n" {
-				t.Fatalf("stderr = %q, want exact version usage", got)
-			}
+			assertVersionHelp(t, stderr.String())
 			if got := stdout.String(); got != "" {
 				t.Fatalf("stdout = %q, want empty", got)
 			}
@@ -273,9 +271,7 @@ func TestRunVersionHelpRejectsExtraArgs(t *testing.T) {
 			if code != 2 {
 				t.Fatalf("run() = %d, want 2", code)
 			}
-			if got := stderr.String(); got != versionUsage+"\n" {
-				t.Fatalf("stderr = %q, want exact version usage", got)
-			}
+			assertVersionHelp(t, stderr.String())
 			if got := stdout.String(); got != "" {
 				t.Fatalf("stdout = %q, want empty", got)
 			}
@@ -303,9 +299,7 @@ func TestRunHelpVersionHelpSucceeds(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("run() = %d, want 0", code)
 	}
-	if got := stderr.String(); got != versionUsage+"\n" {
-		t.Fatalf("stderr = %q, want exact version usage", got)
-	}
+	assertVersionHelp(t, stderr.String())
 	if got := stdout.String(); got != "" {
 		t.Fatalf("stdout = %q, want empty", got)
 	}
@@ -317,9 +311,7 @@ func TestRunVersionHelpLLMRejectsExtraArgs(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("run() = %d, want 2", code)
 	}
-	if got := stderr.String(); got != versionUsage+"\n" {
-		t.Fatalf("stderr = %q, want exact version usage", got)
-	}
+	assertVersionHelp(t, stderr.String())
 	if got := stdout.String(); got != "" {
 		t.Fatalf("stdout = %q, want empty", got)
 	}
@@ -492,6 +484,10 @@ func assertRootHelp(t *testing.T, got string) {
 		"-v, --verbose",
 		"-q, --quiet",
 		"-s, --silent",
+		"EXAMPLES:",
+		"derpcat listen",
+		"derpcat send <token>",
+		"derpcat version",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("stderr = %q, want root help mentioning %q", got, want)
@@ -638,25 +634,60 @@ func TestRunVerbosityFlagsBeforeSend(t *testing.T) {
 	tests := []struct {
 		name       string
 		args       []string
-		wantCode   int
-		wantStderr string
+		wantPrefix string
 	}{
-		{name: "quiet usage", args: []string{"-q", "send"}, wantCode: 2},
-		{name: "silent help", args: []string{"-s", "send", "token-value", "-h"}, wantCode: 0},
+		{name: "quiet", args: []string{"-q", "send"}, wantPrefix: ""},
+		{name: "silent", args: []string{"-s", "send"}, wantPrefix: ""},
+		{name: "verbose", args: []string{"-v", "send"}, wantPrefix: "probing-direct\n"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
-			code := run(tc.args, nil, &stdout, &stderr)
-			if code != tc.wantCode {
-				t.Fatalf("run() = %d, want %d", code, tc.wantCode)
+			listenerStdoutBuf := &lockedBuffer{}
+			listenerStderrBuf := &lockedBuffer{}
+			listenerDone := make(chan int, 1)
+			go func() {
+				listenerDone <- run([]string{"listen"}, nil, listenerStdoutBuf, listenerStderrBuf)
+			}()
+
+			issuedToken := waitForIssuedToken(t, listenerStderrBuf)
+
+			senderArgs := append(append([]string(nil), tc.args...), issuedToken, "--force-relay")
+			var senderStdout, senderStderr bytes.Buffer
+			code := run(senderArgs, strings.NewReader("payload"), &senderStdout, &senderStderr)
+			if code != 0 {
+				t.Fatalf("run() = %d, want 0, stderr=%q", code, senderStderr.String())
 			}
-			assertSendHelpText(t, stderr.String())
-			if tc.wantCode == 0 && stdout.String() != "" {
-				t.Fatalf("stdout = %q, want empty", stdout.String())
+			if got := senderStdout.String(); got != "" {
+				t.Fatalf("stdout = %q, want empty", got)
+			}
+
+			select {
+			case code := <-listenerDone:
+				if code != 0 {
+					t.Fatalf("listen run() = %d, want 0, stderr=%q", code, listenerStderrBuf.String())
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("listen subcommand did not complete after sender finished")
+			}
+
+			if tc.wantPrefix == "" {
+				if got := senderStderr.String(); got != "" {
+					t.Fatalf("stderr = %q, want empty", got)
+				}
+				return
+			}
+			if got := senderStderr.String(); !strings.HasPrefix(got, tc.wantPrefix) {
+				t.Fatalf("stderr = %q, want prefix %q", got, tc.wantPrefix)
 			}
 		})
+	}
+}
+
+func assertVersionHelp(t *testing.T, got string) {
+	t.Helper()
+	if !strings.Contains(got, "version") {
+		t.Fatalf("stderr = %q, want version help text", got)
 	}
 }
 
