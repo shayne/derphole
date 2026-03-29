@@ -144,6 +144,20 @@ func TestRunVersionHelpShowsHelp(t *testing.T) {
 	}
 }
 
+func TestRunVersionHelpLLMSucceeds(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"version", "--help-llm"}, nil, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0", code)
+	}
+	if got, want := stderr.String(), yargs.GenerateSubCommandHelpLLMFromConfig(rootHelpConfig, "version", rootGlobalFlags{}); got != want {
+		t.Fatalf("stderr = %q, want exact LLM version help %q", got, want)
+	}
+	if got := stdout.String(); got != "" {
+		t.Fatalf("stdout = %q, want empty", got)
+	}
+}
+
 func TestRunVersionRejectsExtraArgs(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"version", "garbage"}, nil, &stdout, &stderr)
