@@ -26,6 +26,14 @@ npx derpcat@dev --version
 mise run build
 ```
 
+## Development
+
+```bash
+mise install
+mise run install-githooks
+mise run check
+```
+
 ## Test
 
 ```bash

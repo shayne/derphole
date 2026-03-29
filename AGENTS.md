@@ -13,6 +13,9 @@ Use `mise` for toolchain consistency.
 - `mise run build` builds `dist/derpcat`
 - `mise run test` runs `go test ./...`
 - `mise run vet` runs `go vet ./...`
+- `mise run install-githooks` installs the local `pre-commit` and `prepare-commit-msg` hooks
+- `mise run check:hooks` runs the full `pre-commit` hook set across the repo
+- `mise run check` runs hooks, build, and tests in the same order CI uses
 - `mise run smoke-local` runs the local end-to-end smoke test
 - `mise run release:build-all` builds vendored binaries, release tarballs, and `dist/npm`
 - `mise run release:npm-dry-run` validates the npm package without publishing
@@ -45,4 +48,3 @@ PRs should include:
 - linked issue or rationale when applicable
 - exact verification commands run
 - release or packaging implications if workflows, npm assets, or `docs/releases/` changed
-
