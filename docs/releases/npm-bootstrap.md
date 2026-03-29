@@ -1,0 +1,39 @@
+# Manual npm Bootstrap Publish
+
+This runbook covers the first npm publish before GitHub trusted publishing is configured.
+
+## Prerequisites
+
+- npm account with publish access to `derpcat`
+- local `npm whoami` succeeds
+- clean git working tree
+
+## Build and validate `0.0.1`
+
+```bash
+VERSION=v0.0.1 COMMIT=$(git rev-parse HEAD) BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) mise run release:build-all
+VERSION=v0.0.1 mise run release:npm-dry-run
+node ./dist/npm/bin/derpcat.js --version
+```
+
+Expected output:
+
+- `npm publish --dry-run` succeeds
+- `node ./dist/npm/bin/derpcat.js --version` prints `v0.0.1`
+
+## Publish
+
+```bash
+npm publish ./dist/npm --access public
+```
+
+## After trusted publisher setup
+
+Once npm trusted publishing is configured for `shayne/derpcat`:
+
+```bash
+git tag v0.1.0
+git push origin main --tags
+```
+
+After that, GitHub Actions should publish npm releases automatically from `main` and version tags, so the manual `0.0.1` bootstrap path is no longer needed.
