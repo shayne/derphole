@@ -118,65 +118,101 @@ func isRootHelpLLMRequest(args []string) bool {
 }
 
 func parseRootArgs(args []string) (telemetry.Level, []string, error) {
-	level := telemetry.LevelDefault
+	state := rootVerbosityState{}
 	for i, arg := range args {
 		if isRootHelpToken(arg) {
-			return level, args[i:], nil
+			return state.level(), args[i:], nil
 		}
-		if nextLevel, ok, err := parseRootGlobalArg(arg, level); ok {
+		if ok, err := state.applyArg(arg, i); ok {
 			if err != nil {
 				return telemetry.LevelDefault, nil, err
 			}
-			level = nextLevel
 			continue
 		} else if strings.HasPrefix(arg, "-") {
 			return telemetry.LevelDefault, nil, fmt.Errorf("flag provided but not defined: %s", arg)
 		} else {
-			return level, args[i:], nil
+			return state.level(), args[i:], nil
 		}
 	}
-	return level, nil, nil
+	return state.level(), nil, nil
 }
 
 func isRootHelpToken(arg string) bool {
 	return arg == "-h" || arg == "--help" || arg == "--help-llm" || arg == "help"
 }
 
-func parseRootGlobalArg(arg string, current telemetry.Level) (telemetry.Level, bool, error) {
+type rootVerbosityState struct {
+	verboseActive bool
+	verboseOrder  int
+	quietActive   bool
+	quietOrder    int
+	silentActive  bool
+	silentOrder   int
+}
+
+func (s *rootVerbosityState) applyArg(arg string, order int) (bool, error) {
 	switch arg {
 	case "-v", "--verbose":
-		return telemetry.LevelVerbose, true, nil
+		s.verboseActive = true
+		s.verboseOrder = order
+		return true, nil
 	case "-q", "--quiet":
-		return telemetry.LevelQuiet, true, nil
+		s.quietActive = true
+		s.quietOrder = order
+		return true, nil
 	case "-s", "--silent":
-		return telemetry.LevelSilent, true, nil
+		s.silentActive = true
+		s.silentOrder = order
+		return true, nil
 	}
 
 	for _, spec := range []struct {
 		prefix string
-		level  telemetry.Level
+		set    func()
+		clear  func()
 	}{
-		{prefix: "-v=", level: telemetry.LevelVerbose},
-		{prefix: "--verbose=", level: telemetry.LevelVerbose},
-		{prefix: "-q=", level: telemetry.LevelQuiet},
-		{prefix: "--quiet=", level: telemetry.LevelQuiet},
-		{prefix: "-s=", level: telemetry.LevelSilent},
-		{prefix: "--silent=", level: telemetry.LevelSilent},
+		{prefix: "-v=", set: func() { s.verboseActive = true; s.verboseOrder = order }, clear: func() { s.verboseActive = false }},
+		{prefix: "--verbose=", set: func() { s.verboseActive = true; s.verboseOrder = order }, clear: func() { s.verboseActive = false }},
+		{prefix: "-q=", set: func() { s.quietActive = true; s.quietOrder = order }, clear: func() { s.quietActive = false }},
+		{prefix: "--quiet=", set: func() { s.quietActive = true; s.quietOrder = order }, clear: func() { s.quietActive = false }},
+		{prefix: "-s=", set: func() { s.silentActive = true; s.silentOrder = order }, clear: func() { s.silentActive = false }},
+		{prefix: "--silent=", set: func() { s.silentActive = true; s.silentOrder = order }, clear: func() { s.silentActive = false }},
 	} {
 		if strings.HasPrefix(arg, spec.prefix) {
 			value := strings.TrimPrefix(arg, spec.prefix)
 			parsed, err := strconv.ParseBool(value)
 			if err != nil {
-				return current, true, fmt.Errorf("invalid boolean value %q for %s", value, strings.TrimSuffix(spec.prefix, "="))
+				return true, fmt.Errorf("invalid boolean value %q for %s", value, strings.TrimSuffix(spec.prefix, "="))
 			}
 			if parsed {
-				return spec.level, true, nil
+				spec.set()
+			} else {
+				spec.clear()
 			}
-			return telemetry.LevelDefault, true, nil
+			return true, nil
 		}
 	}
 
-	return current, false, nil
+	return false, nil
+}
+
+func (s rootVerbosityState) level() telemetry.Level {
+	level := telemetry.LevelDefault
+	order := -1
+
+	if s.verboseActive && s.verboseOrder >= order {
+		level = telemetry.LevelVerbose
+		order = s.verboseOrder
+	}
+	if s.quietActive && s.quietOrder >= order {
+		level = telemetry.LevelQuiet
+		order = s.quietOrder
+	}
+	if s.silentActive && s.silentOrder >= order {
+		level = telemetry.LevelSilent
+	}
+
+	return level
 }
 
 func rewriteRootHelpArgs(args []string) ([]string, bool) {

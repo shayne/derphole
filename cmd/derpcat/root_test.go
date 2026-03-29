@@ -169,6 +169,9 @@ func TestParseRootArgsResetsVerbosityToDefaultOnFalseNegation(t *testing.T) {
 		{name: "quiet", args: []string{"-q", "--quiet=false", "listen"}, wantLevel: telemetry.LevelDefault, wantRemaining: []string{"listen"}},
 		{name: "silent", args: []string{"-s", "--silent=false", "listen"}, wantLevel: telemetry.LevelDefault, wantRemaining: []string{"listen"}},
 		{name: "verbose", args: []string{"-v", "--verbose=false", "listen"}, wantLevel: telemetry.LevelDefault, wantRemaining: []string{"listen"}},
+		{name: "quiet preserved across verbose false", args: []string{"-q", "--verbose=false", "listen"}, wantLevel: telemetry.LevelQuiet, wantRemaining: []string{"listen"}},
+		{name: "silent preserved across quiet false", args: []string{"-s", "--quiet=false", "listen"}, wantLevel: telemetry.LevelSilent, wantRemaining: []string{"listen"}},
+		{name: "verbose preserved across quiet false", args: []string{"-v", "--quiet=false", "listen"}, wantLevel: telemetry.LevelVerbose, wantRemaining: []string{"listen"}},
 	}
 
 	for _, tc := range tests {
@@ -341,6 +344,9 @@ func TestRunVerbosityFlagsBeforeListen(t *testing.T) {
 		{name: "verbose", args: []string{"-v", "listen"}, wantPrefix: "waiting-for-claim\n"},
 		{name: "last verbose wins", args: []string{"-s", "-v", "listen"}, wantPrefix: "waiting-for-claim\n"},
 		{name: "last silent wins", args: []string{"-v", "-s", "listen"}, wantPrefix: ""},
+		{name: "quiet preserved across verbose false", args: []string{"-q", "--verbose=false", "listen"}, wantPrefix: ""},
+		{name: "silent preserved across quiet false", args: []string{"-s", "--quiet=false", "listen"}, wantPrefix: ""},
+		{name: "verbose preserved across quiet false", args: []string{"-v", "--quiet=false", "listen"}, wantPrefix: "waiting-for-claim\n"},
 	}
 
 	for _, tc := range tests {
