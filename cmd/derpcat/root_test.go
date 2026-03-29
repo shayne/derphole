@@ -40,8 +40,8 @@ func TestRunPlaceholderSubcommandsReturnRuntimeFailure(t *testing.T) {
 		t.Run(subcommand, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			code := run([]string{subcommand}, nil, &stdout, &stderr)
-			if code != 1 {
-				t.Fatalf("run() = %d, want 1", code)
+			if code != 2 {
+				t.Fatalf("run() = %d, want 2", code)
 			}
 			if got := stderr.String(); got != subcommand+" not implemented\n" {
 				t.Fatalf("stderr = %q, want exact placeholder message", got)
