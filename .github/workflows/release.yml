@@ -112,7 +112,7 @@ jobs:
   release-prod:
     name: Publish release
     runs-on: ubuntu-latest
-    needs: [meta, check, build-derpcat, publish-packages-prod]
+    needs: [meta, check, build-derpcat, publish-npm-prod]
     if: needs.meta.outputs.is_tag == 'true'
     permissions:
       contents: write
@@ -122,6 +122,7 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: derpcat-*
           path: dist/raw
           merge-multiple: true
       - name: Verify binary version
@@ -148,7 +149,7 @@ jobs:
   release-dev:
     name: Publish dev release
     runs-on: ubuntu-latest
-    needs: [meta, check, build-derpcat, publish-packages-dev]
+    needs: [meta, check, build-derpcat, publish-npm-dev]
     if: needs.meta.outputs.is_main == 'true'
     permissions:
       contents: write
@@ -160,6 +161,7 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: derpcat-*
           path: dist/raw
           merge-multiple: true
       - name: Verify binary version
@@ -197,6 +199,7 @@ jobs:
     name: Build npm artifact (prod)
     runs-on: ubuntu-latest
     needs: [meta, build-derpcat]
+    if: needs.meta.outputs.is_tag == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -208,6 +211,7 @@ jobs:
       - name: Download raw build artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: derpcat-*
           path: dist/raw
           merge-multiple: true
       - name: Stage vendored binaries
@@ -250,6 +254,7 @@ jobs:
     name: Build npm artifact (dev)
     runs-on: ubuntu-latest
     needs: [meta, build-derpcat]
+    if: needs.meta.outputs.is_main == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -261,6 +266,7 @@ jobs:
       - name: Download raw build artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: derpcat-*
           path: dist/raw
           merge-multiple: true
       - name: Stage vendored binaries
@@ -302,7 +308,8 @@ jobs:
   publish-npm-prod:
     name: Publish npm package
     runs-on: ubuntu-latest
-    needs: [publish-packages-prod, release-prod]
+    needs: [publish-packages-prod]
+    if: needs.publish-packages-prod.result == 'success'
     permissions:
       contents: read
       id-token: write
@@ -328,7 +335,8 @@ jobs:
   publish-npm-dev:
     name: Publish npm package (dev tag)
     runs-on: ubuntu-latest
-    needs: [publish-packages-dev, release-dev]
+    needs: [publish-packages-dev]
+    if: needs.publish-packages-dev.result == 'success'
     permissions:
       contents: read
       id-token: write
