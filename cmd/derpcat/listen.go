@@ -51,6 +51,10 @@ func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) i
 		fmt.Fprint(stderr, listenHelpText())
 		return 2
 	}
+	if preScan.positionalAfterDoubleDash {
+		fmt.Fprint(stderr, listenHelpText())
+		return 2
+	}
 
 	if preScan.helpLLM || preScan.help {
 		if preScan.helpLLM {
@@ -153,10 +157,11 @@ func listenHelpLLMText() string {
 }
 
 type listenPreScanResult struct {
-	help                     bool
-	helpLLM                  bool
-	positionalBeforeLateFlag bool
-	parseArgs                []string
+	help                      bool
+	helpLLM                   bool
+	positionalBeforeLateFlag  bool
+	positionalAfterDoubleDash bool
+	parseArgs                 []string
 }
 
 func listenPreScan(args []string) listenPreScanResult {
@@ -168,10 +173,10 @@ func listenPreScan(args []string) listenPreScanResult {
 		if arg == "--" {
 			result.parseArgs = append(result.parseArgs, arg)
 			for j := i + 1; j < len(args); j++ {
-				if listenParserHelpToken(args[j]) {
-					continue
-				}
 				result.parseArgs = append(result.parseArgs, args[j])
+			}
+			if i+1 < len(args) {
+				result.positionalAfterDoubleDash = true
 			}
 			return result
 		}
