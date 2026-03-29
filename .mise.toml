@@ -26,8 +26,10 @@ run = "bash ./tools/packaging/build-release-assets.sh"
 [tasks."release:npm-dry-run"]
 run = """
 set -euo pipefail
+bash ./tools/packaging/build-vendor.sh
+bash ./tools/packaging/build-npm.sh
 pkg_version="$(node -e 'process.stdout.write(require("./dist/npm/package.json").version)')"
-if [[ "$pkg_version" == *-* ]]; then
+if [[ "$pkg_version" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+-.+ ]]; then
   npm publish ./dist/npm --access public --dry-run --tag dev
 else
   npm publish ./dist/npm --access public --dry-run
