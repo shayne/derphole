@@ -5,20 +5,57 @@ import (
 	"testing"
 )
 
-func TestEmitterQuietSuppressesStatus(t *testing.T) {
-	var buf bytes.Buffer
-	e := New(&buf, LevelQuiet)
-	e.Status("waiting-for-claim")
-	if got := buf.String(); got != "" {
-		t.Fatalf("Status output = %q, want empty", got)
+func TestEmitterOutputByLevel(t *testing.T) {
+	tests := []struct {
+		name      string
+		level     Level
+		method    func(*Emitter)
+		wantEmpty bool
+	}{
+		{
+			name:  "quiet suppresses status",
+			level: LevelQuiet,
+			method: func(e *Emitter) {
+				e.Status("waiting-for-claim")
+			},
+			wantEmpty: true,
+		},
+		{
+			name:  "verbose prints status",
+			level: LevelVerbose,
+			method: func(e *Emitter) {
+				e.Status("probing-direct")
+			},
+			wantEmpty: false,
+		},
+		{
+			name:  "verbose prints debug",
+			level: LevelVerbose,
+			method: func(e *Emitter) {
+				e.Debug("probing-debug")
+			},
+			wantEmpty: false,
+		},
+		{
+			name:  "default suppresses debug",
+			level: LevelDefault,
+			method: func(e *Emitter) {
+				e.Debug("probing-debug")
+			},
+			wantEmpty: true,
+		},
 	}
-}
 
-func TestEmitterVerbosePrintsStatus(t *testing.T) {
-	var buf bytes.Buffer
-	e := New(&buf, LevelVerbose)
-	e.Status("probing-direct")
-	if got := buf.String(); got == "" {
-		t.Fatal("Status output empty, want text")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			e := New(&buf, tc.level)
+			tc.method(e)
+			if got := buf.String(); tc.wantEmpty && got != "" {
+				t.Fatalf("output = %q, want empty", got)
+			} else if !tc.wantEmpty && got == "" {
+				t.Fatal("output empty, want text")
+			}
+		})
 	}
 }
