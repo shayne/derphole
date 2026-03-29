@@ -24,6 +24,7 @@ run = "bash ./tools/packaging/build-npm.sh"
 run = "bash ./tools/packaging/build-release-assets.sh"
 
 [tasks."release:npm-dry-run"]
+shell = "bash -c"
 run = """
 set -euo pipefail
 bash ./tools/packaging/build-vendor.sh
@@ -40,6 +41,7 @@ fi
 run = "bash ./scripts/release-package-smoke.sh"
 
 [tasks."release:build-all"]
+shell = "bash -c"
 run = """
 set -euo pipefail
 mkdir -p dist/raw
