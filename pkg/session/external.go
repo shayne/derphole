@@ -39,6 +39,12 @@ type envelope struct {
 	Decision *rendezvous.Decision `json:"decision,omitempty"`
 }
 
+func derpPublicKeyRaw32(pub key.NodePublic) [32]byte {
+	var raw [32]byte
+	copy(raw[:], pub.AppendTo(raw[:0]))
+	return raw
+}
+
 func issuePublicSession(ctx context.Context) (string, *relaySession, error) {
 	dm, err := derpbind.FetchMap(ctx, derpbind.PublicDERPMapURL)
 	if err != nil {
@@ -80,7 +86,7 @@ func issuePublicSession(ctx context.Context) (string, *relaySession, error) {
 		SessionID:       sessionID,
 		ExpiresUnix:     time.Now().Add(10 * time.Minute).Unix(),
 		BootstrapRegion: uint16(node.RegionID),
-		DERPPublic:      derpClient.PublicKey().Raw32(),
+		DERPPublic:      derpPublicKeyRaw32(derpClient.PublicKey()),
 		WGPublic:        wgPublic,
 		DiscoPublic:     discoPublic,
 		BearerSecret:    bearerSecret,
@@ -152,7 +158,7 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 	claim := rendezvous.Claim{
 		Version:      tok.Version,
 		SessionID:    tok.SessionID,
-		DERPPublic:   derpClient.PublicKey().Raw32(),
+		DERPPublic:   derpPublicKeyRaw32(derpClient.PublicKey()),
 		WGPublic:     senderPublic,
 		DiscoPublic:  senderDisco,
 		Candidates:   publicProbeCandidates(ctx, probeConn, dm),
