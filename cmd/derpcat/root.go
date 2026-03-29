@@ -53,7 +53,8 @@ var rootRegistry = yargs.Registry{
 var rootHelpConfig = rootRegistry.HelpConfig()
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	parsed, err := yargs.ParseKnownFlags[rootGlobalFlags](args, yargs.KnownFlagsOptions{})
+	rootGlobalArgs, commandArgs := splitRootGlobalPrefix(args)
+	parsed, err := yargs.ParseKnownFlags[rootGlobalFlags](rootGlobalArgs, yargs.KnownFlagsOptions{})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
@@ -61,7 +62,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	level := rootTelemetryLevel(parsed.Flags)
 
-	remaining, malformedHelp := rewriteRootHelpArgs(parsed.RemainingArgs)
+	remaining, malformedHelp := rewriteRootHelpArgs(commandArgs)
 	if len(remaining) == 0 {
 		fmt.Fprint(stderr, yargs.GenerateGlobalHelp(rootHelpConfig, rootGlobalFlags{}))
 		return 2
@@ -107,6 +108,30 @@ func isRootHelpRequest(args []string) bool {
 		return false
 	}
 	return args[0] == "-h" || args[0] == "--help" || (args[0] == "help" && len(args) == 1)
+}
+
+func splitRootGlobalPrefix(args []string) ([]string, []string) {
+	for i, arg := range args {
+		if !isRootGlobalArg(arg) {
+			return args[:i], args[i:]
+		}
+	}
+	return args, nil
+}
+
+func isRootGlobalArg(arg string) bool {
+	switch arg {
+	case "-v", "--verbose", "-q", "--quiet", "-s", "--silent":
+		return true
+	}
+
+	for _, prefix := range []string{"-v=", "--verbose=", "-q=", "--quiet=", "-s=", "--silent="} {
+		if strings.HasPrefix(arg, prefix) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func rewriteRootHelpArgs(args []string) ([]string, bool) {
