@@ -1,14 +1,14 @@
 package main
 
 import (
-	"crypto/rand"
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"time"
 
+	"github.com/shayne/derpcat/pkg/session"
 	"github.com/shayne/derpcat/pkg/telemetry"
-	"github.com/shayne/derpcat/pkg/token"
 )
 
 const listenUsage = "usage: derpcat listen [--print-token-only]"
@@ -21,6 +21,7 @@ func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) i
 	}
 
 	printTokenOnly := fs.Bool("print-token-only", false, "print only the session token")
+	forceRelay := fs.Bool("force-relay", false, "disable direct probing")
 	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
 		fs.Usage()
 		return 0
@@ -36,35 +37,46 @@ func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) i
 		return 2
 	}
 
-	var sessionID [16]byte
-	if _, err := rand.Read(sessionID[:]); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
-	}
-	var bearerSecret [32]byte
-	if _, err := rand.Read(bearerSecret[:]); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
-	}
-
-	tok, err := token.Encode(token.Token{
-		Version:      token.SupportedVersion,
-		SessionID:    sessionID,
-		ExpiresUnix:  time.Now().Add(10 * time.Minute).Unix(),
-		BearerSecret: bearerSecret,
-		Capabilities: token.CapabilityStdio | token.CapabilityTCP,
-	})
-	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
-	}
-
+	emitterLevel := level
 	if *printTokenOnly {
-		fmt.Fprintln(stdout, tok)
-		return 0
+		emitterLevel = telemetry.LevelSilent
+	}
+	emitter := telemetry.New(stderr, emitterLevel)
+	tokenSink := make(chan string, 1)
+	done := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_, err := session.Listen(ctx, session.ListenConfig{
+			Emitter:    emitter,
+			TokenSink:  tokenSink,
+			StdioOut:   stdout,
+			Attachment: nil,
+			ForceRelay: *forceRelay,
+		})
+		done <- err
+	}()
+
+	var tok string
+	select {
+	case tok = <-tokenSink:
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+	}
+	if tok == "" {
+		fmt.Fprintln(stderr, "failed to issue session token")
+		return 1
 	}
 
-	telemetry.New(stderr, level).Status("waiting-for-claim")
 	fmt.Fprintln(stdout, tok)
+	cancel()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
 	return 0
 }

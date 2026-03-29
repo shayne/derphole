@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
 
+	"github.com/shayne/derpcat/pkg/session"
 	"github.com/shayne/derpcat/pkg/telemetry"
 )
 
@@ -27,6 +29,7 @@ func runSend(args []string, level telemetry.Level, stdin io.Reader, stdout, stde
 	}
 
 	tokenArg := args[0]
+	forceRelay := fs.Bool("force-relay", false, "disable direct probing")
 	if err := fs.Parse(args[1:]); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -43,9 +46,17 @@ func runSend(args []string, level telemetry.Level, stdin io.Reader, stdout, stde
 		return 2
 	}
 
-	_ = tokenArg
-	_ = level
-	_ = stdin
+	if err := session.Send(context.Background(), session.SendConfig{
+		Token:      tokenArg,
+		Emitter:    telemetry.New(stderr, level),
+		StdioIn:    stdin,
+		Attachment: nil,
+		ForceRelay: *forceRelay,
+	}); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+
 	_ = stdout
 	return 0
 }
