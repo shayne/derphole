@@ -32,10 +32,16 @@ var (
 	ErrUnsupportedVersion = errors.New("token unsupported version")
 )
 
-const supportedVersion uint8 = 1
+const SupportedVersion uint8 = 1
 const payloadSize = 1 + 16 + 8 + 2 + 32 + 32 + 32 + 32 + 4
 
 func Encode(tok Token) (string, error) {
+	if tok.Version == 0 {
+		tok.Version = SupportedVersion
+	} else if tok.Version != SupportedVersion {
+		return "", ErrUnsupportedVersion
+	}
+
 	var payload bytes.Buffer
 	if err := binary.Write(&payload, binary.BigEndian, tok.Version); err != nil {
 		return "", err
@@ -94,7 +100,7 @@ func Decode(encoded string, now time.Time) (Token, error) {
 	if err := binary.Read(r, binary.BigEndian, &tok.Version); err != nil {
 		return tok, err
 	}
-	if tok.Version != supportedVersion {
+	if tok.Version != SupportedVersion {
 		return tok, ErrUnsupportedVersion
 	}
 	if _, err := r.Read(tok.SessionID[:]); err != nil {

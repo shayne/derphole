@@ -2,6 +2,8 @@ package token
 
 import (
 	"encoding/base64"
+	"encoding/binary"
+	"hash/crc32"
 	"strings"
 	"testing"
 	"time"
@@ -9,7 +11,7 @@ import (
 
 func TestEncodeDecodeRoundTrip(t *testing.T) {
 	tok := Token{
-		Version:         supportedVersion,
+		Version:         SupportedVersion,
 		SessionID:       [16]byte{1, 2, 3, 4},
 		ExpiresUnix:     time.Now().Add(5 * time.Minute).Unix(),
 		BootstrapRegion: 12,
@@ -32,19 +34,49 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 	}
 }
 
-func TestDecodeRejectsUnsupportedVersion(t *testing.T) {
-	tok := Token{Version: supportedVersion + 1, ExpiresUnix: time.Now().Add(time.Minute).Unix()}
+func TestEncodeDefaultsZeroVersion(t *testing.T) {
+	tok := Token{ExpiresUnix: time.Now().Add(time.Minute).Unix()}
 	encoded, err := Encode(tok)
 	if err != nil {
 		t.Fatalf("Encode() error = %v", err)
 	}
+	decoded, err := Decode(encoded, time.Now())
+	if err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if decoded.Version != SupportedVersion {
+		t.Fatalf("Version = %d, want %d", decoded.Version, SupportedVersion)
+	}
+}
+
+func TestEncodeRejectsUnsupportedVersion(t *testing.T) {
+	_, err := Encode(Token{Version: SupportedVersion + 1, ExpiresUnix: time.Now().Add(time.Minute).Unix()})
+	if err != ErrUnsupportedVersion {
+		t.Fatalf("Encode() error = %v, want ErrUnsupportedVersion", err)
+	}
+}
+
+func TestDecodeRejectsUnsupportedVersion(t *testing.T) {
+	tok := Token{Version: SupportedVersion, ExpiresUnix: time.Now().Add(time.Minute).Unix()}
+	encoded, err := Encode(tok)
+	if err != nil {
+		t.Fatalf("Encode() error = %v", err)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("DecodeString() error = %v", err)
+	}
+	raw[0] = SupportedVersion + 1
+	sum := crc32.ChecksumIEEE(raw[:len(raw)-4])
+	binary.BigEndian.PutUint32(raw[len(raw)-4:], sum)
+	encoded = base64.RawURLEncoding.EncodeToString(raw)
 	if _, err := Decode(encoded, time.Now()); err != ErrUnsupportedVersion {
 		t.Fatalf("Decode() error = %v, want ErrUnsupportedVersion", err)
 	}
 }
 
 func TestDecodeRejectsExpiredToken(t *testing.T) {
-	tok := Token{Version: supportedVersion, ExpiresUnix: time.Now().Add(-time.Minute).Unix()}
+	tok := Token{Version: SupportedVersion, ExpiresUnix: time.Now().Add(-time.Minute).Unix()}
 	encoded, err := Encode(tok)
 	if err != nil {
 		t.Fatalf("Encode() error = %v", err)
@@ -56,7 +88,7 @@ func TestDecodeRejectsExpiredToken(t *testing.T) {
 
 func TestDecodeRejectsTokenAtExpiryBoundary(t *testing.T) {
 	now := time.Now().UTC()
-	tok := Token{Version: supportedVersion, ExpiresUnix: now.Unix()}
+	tok := Token{Version: SupportedVersion, ExpiresUnix: now.Unix()}
 	encoded, err := Encode(tok)
 	if err != nil {
 		t.Fatalf("Encode() error = %v", err)
@@ -67,7 +99,7 @@ func TestDecodeRejectsTokenAtExpiryBoundary(t *testing.T) {
 }
 
 func TestDecodeRejectsCorruptedChecksum(t *testing.T) {
-	tok := Token{Version: supportedVersion, ExpiresUnix: time.Now().Add(time.Minute).Unix()}
+	tok := Token{Version: SupportedVersion, ExpiresUnix: time.Now().Add(time.Minute).Unix()}
 	encoded, err := Encode(tok)
 	if err != nil {
 		t.Fatalf("Encode() error = %v", err)
@@ -85,7 +117,7 @@ func TestDecodeRejectsCorruptedChecksum(t *testing.T) {
 
 func TestEncodeWireFormatContract(t *testing.T) {
 	tok := Token{
-		Version:         supportedVersion,
+		Version:         SupportedVersion,
 		SessionID:       [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
 		ExpiresUnix:     1700000000,
 		BootstrapRegion: 0x1234,
@@ -129,7 +161,7 @@ func TestEncodeWireFormatContract(t *testing.T) {
 }
 
 func TestDecodeRejectsMalformedLength(t *testing.T) {
-	tok := Token{Version: supportedVersion, ExpiresUnix: time.Now().Add(time.Minute).Unix()}
+	tok := Token{Version: SupportedVersion, ExpiresUnix: time.Now().Add(time.Minute).Unix()}
 	encoded, err := Encode(tok)
 	if err != nil {
 		t.Fatalf("Encode() error = %v", err)
