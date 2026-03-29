@@ -40,4 +40,10 @@ if [ "${npm_launcher_version}" != "${VERSION}" ]; then
   exit 1
 fi
 
+package_name="$(node -e "const fs=require('fs'); const pkg=JSON.parse(fs.readFileSync('${ROOT_DIR}/dist/npm/package.json','utf8')); process.stdout.write(pkg.name)")"
+if [ "${package_name}" != "derpcat" ]; then
+  echo "packaged npm metadata mismatch: ${package_name}" >&2
+  exit 1
+fi
+
 npm publish "${ROOT_DIR}/dist/npm" --access public --dry-run

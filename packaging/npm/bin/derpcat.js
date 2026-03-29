@@ -2,6 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -17,13 +18,15 @@ const triples = new Map([
 
 const triple = triples.get(`${process.platform}:${process.arch}`);
 if (!triple) {
-  throw new Error(`Unsupported platform: ${process.platform} (${process.arch})`);
+  console.error(`Unsupported platform: ${process.platform} (${process.arch})`);
+  process.exit(1);
 }
 
 const binaryName = process.platform === "win32" ? "derpcat.exe" : "derpcat";
 const binaryPath = path.join(__dirname, "..", "vendor", triple, "derpcat", binaryName);
 if (!existsSync(binaryPath)) {
-  throw new Error(`Missing vendored binary: ${binaryPath}`);
+  console.error(`Missing vendored binary: ${binaryPath}`);
+  process.exit(1);
 }
 
 const child = spawn(binaryPath, process.argv.slice(2), {
@@ -55,7 +58,8 @@ const result = await new Promise((resolve) => {
 });
 
 if (result.signal) {
-  process.kill(process.pid, result.signal);
+  const signalNumber = os.constants.signals[result.signal];
+  process.exit(typeof signalNumber === "number" ? 128 + signalNumber : 1);
 } else {
   process.exit(result.code);
 }

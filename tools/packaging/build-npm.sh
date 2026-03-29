@@ -15,6 +15,20 @@ if [ ! -d "${VENDOR_DIR}" ]; then
   exit 1
 fi
 
+expected_vendor_paths=(
+  "${VENDOR_DIR}/x86_64-unknown-linux-musl/derpcat/derpcat"
+  "${VENDOR_DIR}/aarch64-unknown-linux-musl/derpcat/derpcat"
+  "${VENDOR_DIR}/x86_64-apple-darwin/derpcat/derpcat"
+  "${VENDOR_DIR}/aarch64-apple-darwin/derpcat/derpcat"
+)
+
+for vendor_path in "${expected_vendor_paths[@]}"; do
+  if [ ! -x "${vendor_path}" ]; then
+    echo "missing expected vendored binary: ${vendor_path}" >&2
+    exit 1
+  fi
+done
+
 rm -rf "${OUT_DIR}"
 mkdir -p "${OUT_DIR}"
 
