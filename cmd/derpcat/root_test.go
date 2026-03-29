@@ -506,9 +506,10 @@ func TestRunRootRejectsVersionFlag(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("run() = %d, want 2", code)
 	}
-	if got := stderr.String(); got == "" {
-		t.Fatal("stderr = empty, want usage or parse error")
+	if got := stderr.String(); !strings.HasPrefix(got, "flag provided but not defined: --version\n") {
+		t.Fatalf("stderr = %q, want parse error prefix for --version", got)
 	}
+	assertRootHelp(t, stderr.String())
 	if got := stdout.String(); got != "" {
 		t.Fatalf("stdout = %q, want empty", got)
 	}
@@ -686,8 +687,8 @@ func TestRunVerbosityFlagsBeforeSend(t *testing.T) {
 
 func assertVersionHelp(t *testing.T, got string) {
 	t.Helper()
-	if got != versionUsage+"\n" {
-		t.Fatalf("stderr = %q, want exact version usage %q", got, versionUsage+"\\n")
+	if got != "usage: derpcat version\n" {
+		t.Fatalf("stderr = %q, want exact version usage %q", got, "usage: derpcat version\\n")
 	}
 }
 
