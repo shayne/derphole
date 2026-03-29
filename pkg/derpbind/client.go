@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
@@ -18,8 +19,15 @@ type Packet struct {
 }
 
 type Client struct {
-	pub key.NodePublic
-	dc  *derphttp.Client
+	pub      key.NodePublic
+	dc       *derphttp.Client
+	packetCh chan Packet
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+
+	mu          sync.Mutex
+	terminalErr error
+	stopOnce    sync.Once
 }
 
 func NewClient(ctx context.Context, node *tailcfg.DERPNode, serverURL string) (*Client, error) {
@@ -36,24 +44,16 @@ func NewClient(ctx context.Context, node *tailcfg.DERPNode, serverURL string) (*
 		_ = dc.Close()
 		return nil, fmt.Errorf("connect derp client: %w", err)
 	}
-	if err := waitForServerInfo(dc); err != nil {
-		_ = dc.Close()
-		return nil, fmt.Errorf("wait for server info: %w", err)
-	}
 
-	return &Client{pub: priv.Public(), dc: dc}, nil
-}
-
-func waitForServerInfo(dc *derphttp.Client) error {
-	for {
-		msg, err := dc.Recv()
-		if err != nil {
-			return err
-		}
-		if _, ok := msg.(derp.ServerInfoMessage); ok {
-			return nil
-		}
+	c := &Client{
+		pub:      priv.Public(),
+		dc:       dc,
+		packetCh: make(chan Packet, 16),
+		stopCh:   make(chan struct{}),
+		doneCh:   make(chan struct{}),
 	}
+	go c.recvLoop()
+	return c, nil
 }
 
 func (c *Client) PublicKey() key.NodePublic { return c.pub }
@@ -62,6 +62,9 @@ func (c *Client) Close() error {
 	if c == nil || c.dc == nil {
 		return nil
 	}
+	c.stopOnce.Do(func() {
+		close(c.stopCh)
+	})
 	return c.dc.Close()
 }
 
@@ -73,40 +76,66 @@ func (c *Client) Send(ctx context.Context, dst key.NodePublic, payload []byte) e
 }
 
 func (c *Client) Receive(ctx context.Context) (Packet, error) {
-	type result struct {
-		msg derp.ReceivedMessage
-		err error
+	if err := ctx.Err(); err != nil {
+		return Packet{}, err
 	}
-
-	ch := make(chan result, 1)
-	go func() {
-		for {
-			msg, err := c.dc.Recv()
-			if err != nil {
-				ch <- result{err: err}
-				return
-			}
-			pkt, ok := msg.(derp.ReceivedPacket)
-			if !ok {
-				continue
-			}
-			ch <- result{msg: pkt}
-			return
-		}
-	}()
 
 	select {
-	case <-ctx.Done():
-		_ = c.dc.Close()
-		return Packet{}, ctx.Err()
-	case res := <-ch:
-		if res.err != nil {
-			return Packet{}, res.err
+	case pkt := <-c.packetCh:
+		return pkt, nil
+	default:
+	}
+
+	select {
+	case pkt := <-c.packetCh:
+		return pkt, nil
+	case <-c.doneCh:
+		select {
+		case pkt := <-c.packetCh:
+			return pkt, nil
+		default:
 		}
-		pkt := res.msg.(derp.ReceivedPacket)
-		return Packet{
+		if err := c.recvErr(); err != nil {
+			return Packet{}, err
+		}
+		return Packet{}, errors.New("derpbind client closed")
+	case <-ctx.Done():
+		return Packet{}, ctx.Err()
+	}
+}
+
+func (c *Client) recvLoop() {
+	defer close(c.doneCh)
+	for {
+		msg, err := c.dc.Recv()
+		if err != nil {
+			c.setRecvErr(err)
+			return
+		}
+		pkt, ok := msg.(derp.ReceivedPacket)
+		if !ok {
+			continue
+		}
+		out := Packet{
 			From:    pkt.Source,
 			Payload: append([]byte(nil), pkt.Data...),
-		}, nil
+		}
+		select {
+		case c.packetCh <- out:
+		case <-c.stopCh:
+			return
+		}
 	}
+}
+
+func (c *Client) setRecvErr(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.terminalErr = err
+}
+
+func (c *Client) recvErr() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.terminalErr
 }

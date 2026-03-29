@@ -3,6 +3,7 @@ package derpbind
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -14,10 +15,10 @@ import (
 )
 
 type testDERPServer struct {
-	MapURL string
+	MapURL  string
 	DERPURL string
-	Map    *tailcfg.DERPMap
-	http   *httptest.Server
+	Map     *tailcfg.DERPMap
+	http    *httptest.Server
 }
 
 func newTestDERPServer(t *testing.T) *testDERPServer {
@@ -61,10 +62,10 @@ func newTestDERPServer(t *testing.T) *testDERPServer {
 	t.Cleanup(mapHTTP.Close)
 
 	return &testDERPServer{
-		MapURL: mapHTTP.URL,
+		MapURL:  mapHTTP.URL,
 		DERPURL: derpHTTP.URL + "/derp",
-		Map:    dm,
-		http:   derpHTTP,
+		Map:     dm,
+		http:    derpHTTP,
 	}
 }
 
@@ -93,7 +94,7 @@ func TestFetchMapParsesDERPMapJSON(t *testing.T) {
 	}
 }
 
-func TestClientSendReceiveControlPacket(t *testing.T) {
+func TestClientReceiveTimeoutDoesNotKillSession(t *testing.T) {
 	srv := newTestDERPServer(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -111,14 +112,20 @@ func TestClientSendReceiveControlPacket(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = b.Close() })
 
-	payload := []byte("hello over derp")
+	timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer timeoutCancel()
+	if _, err := b.Receive(timeoutCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Receive(timeout) error = %v, want deadline exceeded", err)
+	}
+
+	payload := []byte("still alive")
 	if err := a.Send(ctx, b.PublicKey(), payload); err != nil {
 		t.Fatalf("Send() error = %v", err)
 	}
 
 	got, err := b.Receive(ctx)
 	if err != nil {
-		t.Fatalf("Receive() error = %v", err)
+		t.Fatalf("Receive() after timeout error = %v", err)
 	}
 	if got.From != a.PublicKey() {
 		t.Fatalf("Receive().From = %v, want %v", got.From, a.PublicKey())
