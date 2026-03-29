@@ -66,7 +66,7 @@ func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) i
 		fmt.Fprint(stderr, listenHelpLLMText())
 		return 0
 	}
-	if parsed.Flags.Help {
+	if listenHelpRequested(parsed) {
 		fmt.Fprint(stderr, listenHelpText())
 		return 0
 	}
@@ -118,6 +118,14 @@ func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) i
 		return 1
 	}
 	return 0
+}
+
+func listenHelpRequested(parsed *yargs.ParseResult[listenParseFlags]) bool {
+	if parsed.Flags.Help {
+		return true
+	}
+	_, ok := parsed.Parser.Flags["help"]
+	return ok
 }
 
 func listenHelpText() string {

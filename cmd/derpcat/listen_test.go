@@ -160,6 +160,40 @@ func TestListenHelpTargetsCanonicalUsage(t *testing.T) {
 	}
 }
 
+func TestListenHelpEqualsFalseTargetsCanonicalUsage(t *testing.T) {
+	for _, args := range [][]string{{"listen", "-h=false"}, {"listen", "--help=false"}} {
+		t.Run(args[1], func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			done := make(chan int, 1)
+			go func() {
+				done <- run(args, nil, &stdout, &stderr)
+			}()
+
+			select {
+			case code := <-done:
+				if code != 0 {
+					t.Fatalf("run() = %d, want 0", code)
+				}
+			case <-time.After(200 * time.Millisecond):
+				t.Fatal("run() did not return help output for explicit false help flag")
+			}
+
+			if got, want := stderr.String(), yargs.GenerateSubCommandHelp(
+				testListenHelpConfig(),
+				"listen",
+				struct{}{},
+				listenHelpFlags{},
+				struct{}{},
+			); got != want {
+				t.Fatalf("stderr = %q, want yargs help %q", got, want)
+			}
+			if got := stdout.String(); got != "" {
+				t.Fatalf("stdout = %q, want empty", got)
+			}
+		})
+	}
+}
+
 func TestListenHelpLLMTargetsCanonicalOutput(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"listen", "--help-llm"}, nil, &stdout, &stderr)
