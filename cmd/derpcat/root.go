@@ -14,10 +14,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "listen":
 		fmt.Fprintln(stderr, "listen not implemented")
-		return 2
+		return 1
 	case "send":
 		fmt.Fprintln(stderr, "send not implemented")
-		return 2
+		return 1
 	default:
 		fmt.Fprintf(stderr, "unknown subcommand %q\n", args[0])
 		return 2

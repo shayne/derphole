@@ -5,7 +5,7 @@ go = "1.26.1"
 run = "go test ./..."
 
 [tasks.build]
-run = "go build ./cmd/derpcat"
+run = "mkdir -p dist && go build -o dist/derpcat ./cmd/derpcat"
 
 [tasks.build-linux-amd64]
-run = "GOOS=linux GOARCH=amd64 go build -o dist/derpcat-linux-amd64 ./cmd/derpcat"
+run = "mkdir -p dist && GOOS=linux GOARCH=amd64 go build -o dist/derpcat-linux-amd64 ./cmd/derpcat"
