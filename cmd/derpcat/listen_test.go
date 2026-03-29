@@ -160,6 +160,35 @@ func TestListenHelpTargetsCanonicalUsage(t *testing.T) {
 	}
 }
 
+func TestListenHelpTargetsLegacySpellings(t *testing.T) {
+	for _, args := range [][]string{
+		{"listen", "-help"},
+		{"listen", "-help=true"},
+		{"listen", "--help=true"},
+		{"listen", "--help=0"},
+	} {
+		t.Run(strings.Join(args[1:], "_"), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := run(args, nil, &stdout, &stderr)
+			if code != 0 {
+				t.Fatalf("run() = %d, want 0", code)
+			}
+			if got, want := stderr.String(), yargs.GenerateSubCommandHelp(
+				testListenHelpConfig(),
+				"listen",
+				struct{}{},
+				listenHelpFlags{},
+				struct{}{},
+			); got != want {
+				t.Fatalf("stderr = %q, want yargs help %q", got, want)
+			}
+			if got := stdout.String(); got != "" {
+				t.Fatalf("stdout = %q, want empty", got)
+			}
+		})
+	}
+}
+
 func TestListenHelpEqualsFalseTargetsCanonicalUsage(t *testing.T) {
 	for _, args := range [][]string{{"listen", "-h=false"}, {"listen", "--help=false"}} {
 		t.Run(args[1], func(t *testing.T) {

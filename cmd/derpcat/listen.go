@@ -217,21 +217,19 @@ func listenPreScan(args []string) listenPreScanResult {
 			continue
 		}
 
-		switch arg {
-		case "--help-llm":
+		switch {
+		case arg == "--help-llm":
 			if !sawUnknownFlag {
 				result.helpLLM = true
 				return result
 			}
 			continue
-		case "-h", "--help", "-h=false", "--help=false":
+		case listenParserHelpToken(arg):
 			if !sawUnknownFlag {
 				result.help = true
 				return result
 			}
-			if listenParserHelpToken(arg) {
-				continue
-			}
+			continue
 		}
 		if !ok {
 			sawUnknownFlag = true
@@ -250,7 +248,12 @@ func listenRequestedHelp(args []string) (helpLLM bool, help bool) {
 }
 
 func listenParserHelpToken(arg string) bool {
-	return arg == "-h" || arg == "--help" || arg == "--help-llm"
+	switch arg {
+	case "-h", "--help", "-help", "-h=false", "--help=false", "-help=true", "--help=true", "--help=0":
+		return true
+	default:
+		return false
+	}
 }
 
 func deriveListenFlagKinds() map[string]reflect.Kind {
