@@ -1,14 +1,47 @@
 [tools]
 go = "1.26.1"
+node = "24"
 
 [tasks.test]
 run = "go test ./..."
+
+[tasks.vet]
+run = "go vet ./..."
 
 [tasks.build]
 run = "mkdir -p dist && go build -o dist/derpcat ./cmd/derpcat"
 
 [tasks.build-linux-amd64]
 run = "mkdir -p dist && GOOS=linux GOARCH=amd64 go build -o dist/derpcat-linux-amd64 ./cmd/derpcat"
+
+[tasks."release:build-vendor"]
+run = "bash ./tools/packaging/build-vendor.sh"
+
+[tasks."release:build-npm"]
+run = "bash ./tools/packaging/build-npm.sh"
+
+[tasks."release:package-assets"]
+run = "bash ./tools/packaging/build-release-assets.sh"
+
+[tasks."release:npm-dry-run"]
+env = { npm_config_tag = "next" }
+run = "npm publish ./dist/npm --access public --dry-run"
+
+[tasks."release:smoke"]
+run = "bash ./scripts/release-package-smoke.sh"
+
+[tasks."release:build-all"]
+run = """
+set -euo pipefail
+mkdir -p dist/raw
+bash ./tools/packaging/build-vendor.sh
+cp dist/vendor/x86_64-unknown-linux-musl/derpcat/derpcat dist/raw/derpcat-linux-amd64
+cp dist/vendor/aarch64-unknown-linux-musl/derpcat/derpcat dist/raw/derpcat-linux-arm64
+cp dist/vendor/x86_64-apple-darwin/derpcat/derpcat dist/raw/derpcat-darwin-amd64
+cp dist/vendor/aarch64-apple-darwin/derpcat/derpcat dist/raw/derpcat-darwin-arm64
+bash ./tools/packaging/build-release-assets.sh
+bash ./tools/packaging/build-npm.sh
+"""
 
 [tasks.smoke-local]
 run = "./scripts/smoke-local.sh"
