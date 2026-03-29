@@ -686,8 +686,8 @@ func TestRunVerbosityFlagsBeforeSend(t *testing.T) {
 
 func assertVersionHelp(t *testing.T, got string) {
 	t.Helper()
-	if !strings.Contains(got, "version") {
-		t.Fatalf("stderr = %q, want version help text", got)
+	if got != versionUsage+"\n" {
+		t.Fatalf("stderr = %q, want exact version usage %q", got, versionUsage+"\\n")
 	}
 }
 
