@@ -262,6 +262,79 @@ func TestShareTokenAllowsOneClaimer(t *testing.T) {
 	backendDone()
 }
 
+func TestShareOpenExternalAllowsOneClaimer(t *testing.T) {
+	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
+
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	backendAddr, backendDone := startEchoServer(t, ctx)
+	defer backendDone()
+
+	tokenSink := make(chan string, 1)
+	shareErr := make(chan error, 1)
+	go func() {
+		_, err := Share(ctx, ShareConfig{
+			Emitter:       telemetry.New(&bytes.Buffer{}, telemetry.LevelSilent),
+			TokenSink:     tokenSink,
+			TargetAddr:    backendAddr,
+			ForceRelay:    true,
+			UsePublicDERP: true,
+		})
+		shareErr <- err
+	}()
+
+	tok := <-tokenSink
+	bindSink := make(chan string, 1)
+	firstOpenErr := make(chan error, 1)
+	go func() {
+		firstOpenErr <- Open(ctx, OpenConfig{
+			Token:         tok,
+			BindAddrSink:  bindSink,
+			Emitter:       telemetry.New(&bytes.Buffer{}, telemetry.LevelSilent),
+			ForceRelay:    true,
+			UsePublicDERP: true,
+		})
+	}()
+
+	openAddr := <-bindSink
+	reply, err := roundTripTCP(ctx, openAddr, "claimed")
+	if err != nil {
+		t.Fatalf("roundTripTCP() error = %v", err)
+	}
+	if reply != "claimed" {
+		t.Fatalf("reply = %q, want %q", reply, "claimed")
+	}
+
+	secondCtx, secondCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer secondCancel()
+
+	start := time.Now()
+	err = Open(secondCtx, OpenConfig{
+		Token:         tok,
+		Emitter:       telemetry.New(&bytes.Buffer{}, telemetry.LevelSilent),
+		ForceRelay:    true,
+		UsePublicDERP: true,
+	})
+	if err == nil {
+		t.Fatal("second Open() error = nil, want rejection")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second Open() error = %v after %v, want deterministic rejection", err, time.Since(start))
+	}
+	if !strings.Contains(err.Error(), "session already claimed") {
+		t.Fatalf("second Open() error = %v, want session already claimed", err)
+	}
+
+	cancel()
+	waitNoErr(t, <-firstOpenErr)
+	waitNoErr(t, <-shareErr)
+}
+
 func TestShareOpenExternalCanUpgradeAfterRelayStartAndServeConnections(t *testing.T) {
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
 

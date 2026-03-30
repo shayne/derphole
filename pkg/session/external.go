@@ -666,6 +666,14 @@ func isTransportControlPayload(payload []byte) bool {
 	return err == nil && env.Type == envelopeControl && env.Control != nil
 }
 
+func isClaimPayload(payload []byte) bool {
+	if len(payload) == 0 || payload[0] != '{' {
+		return false
+	}
+	env, err := decodeEnvelope(payload)
+	return err == nil && env.Type == envelopeClaim && env.Claim != nil
+}
+
 func isAckPayload(payload []byte) bool {
 	if len(payload) == 0 || payload[0] != '{' {
 		return false

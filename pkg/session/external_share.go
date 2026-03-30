@@ -98,6 +98,10 @@ func shareExternal(ctx context.Context, cfg ShareConfig) (string, error) {
 	}
 	defer session.derp.Close()
 	defer session.probeConn.Close()
+	claimCh, unsubscribeClaims := session.derp.Subscribe(func(pkt derpbind.Packet) bool {
+		return isClaimPayload(pkt.Payload)
+	})
+	defer unsubscribeClaims()
 
 	pathEmitter := newTransportPathEmitter(cfg.Emitter)
 	pathEmitter.Emit(StateWaiting)
@@ -110,7 +114,7 @@ func shareExternal(ctx context.Context, cfg ShareConfig) (string, error) {
 	}
 
 	for {
-		pkt, err := session.derp.Receive(ctx)
+		pkt, err := receiveSubscribedPacket(ctx, claimCh)
 		if err != nil {
 			if ctx.Err() != nil {
 				return tok, ctx.Err()
@@ -170,7 +174,8 @@ func shareExternal(ctx context.Context, cfg ShareConfig) (string, error) {
 		if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
 			return tok, err
 		}
-		return tok, serveOverlayListener(ctx, ln, cfg.TargetAddr, cfg.Emitter)
+		claimErrCh := rejectAdditionalShareClaims(ctx, session.derp, session.gate, claimCh)
+		return tok, serveOverlayListenerWithClaimRejections(ctx, ln, cfg.TargetAddr, cfg.Emitter, claimErrCh)
 	}
 }
 
@@ -299,5 +304,80 @@ func serveOverlayListener(ctx context.Context, listener net.Listener, targetAddr
 			defer backendConn.Close()
 			_ = stream.Bridge(ctx, overlayConn, backendConn)
 		}()
+	}
+}
+
+func serveOverlayListenerWithClaimRejections(
+	ctx context.Context,
+	listener net.Listener,
+	targetAddr string,
+	emitter *telemetry.Emitter,
+	claimErrCh <-chan error,
+) error {
+	overlayErrCh := make(chan error, 1)
+	go func() {
+		overlayErrCh <- serveOverlayListener(ctx, listener, targetAddr, emitter)
+	}()
+
+	for {
+		select {
+		case err := <-overlayErrCh:
+			return err
+		case err, ok := <-claimErrCh:
+			if !ok {
+				claimErrCh = nil
+				continue
+			}
+			if err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func rejectAdditionalShareClaims(
+	ctx context.Context,
+	client *derpbind.Client,
+	gate *rendezvous.Gate,
+	claimCh <-chan derpbind.Packet,
+) <-chan error {
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(errCh)
+		for {
+			pkt, err := receiveSubscribedPacket(ctx, claimCh)
+			if err != nil {
+				if ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
+					errCh <- err
+				}
+				return
+			}
+			env, err := decodeEnvelope(pkt.Payload)
+			if err != nil || env.Type != envelopeClaim || env.Claim == nil {
+				continue
+			}
+
+			peerDERP := key.NodePublicFromRaw32(mem.B(env.Claim.DERPPublic[:]))
+			decision, _ := gate.Accept(time.Now(), *env.Claim)
+			if err := sendEnvelope(ctx, client, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
+				if ctx.Err() == nil {
+					errCh <- err
+				}
+				return
+			}
+		}
+	}()
+	return errCh
+}
+
+func receiveSubscribedPacket(ctx context.Context, ch <-chan derpbind.Packet) (derpbind.Packet, error) {
+	select {
+	case pkt, ok := <-ch:
+		if !ok {
+			return derpbind.Packet{}, net.ErrClosed
+		}
+		return pkt, nil
+	case <-ctx.Done():
+		return derpbind.Packet{}, ctx.Err()
 	}
 }
