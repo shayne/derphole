@@ -1,6 +1,9 @@
 package transport
 
-import "net"
+import (
+	"net"
+	"time"
+)
 
 // Path describes the currently selected transport path.
 type Path int
@@ -15,27 +18,13 @@ type pathState struct {
 	current          Path
 	relayConfigured  bool
 	directConfigured bool
-	directStale      bool
 	endpoints        map[string]net.Addr
-}
-
-func newPathState(hasRelay, hasDirect bool) pathState {
-	current := PathUnknown
-	if hasRelay {
-		current = PathRelay
-	}
-
-	return pathState{
-		current:          current,
-		relayConfigured:  hasRelay,
-		directConfigured: hasDirect,
-		directStale:      hasDirect,
-		endpoints:        make(map[string]net.Addr),
-	}
-}
-
-func (s pathState) path() Path {
-	return s.current
+	bestEndpoint     string
+	lastRelayAt      time.Time
+	lastDirectAt     time.Time
+	lastEndpointsAt  time.Time
+	upgrades         int
+	fallbacks        int
 }
 
 type discoveryPlan struct {
@@ -45,26 +34,74 @@ type discoveryPlan struct {
 	shouldAttempt bool
 }
 
-func (s pathState) discoveryPlan() discoveryPlan {
-	shouldAttempt := s.directConfigured && (s.current != PathDirect || s.directStale)
+func newPathState(now time.Time, hasRelay, hasDirect bool) pathState {
+	current := PathUnknown
+	var lastRelayAt time.Time
+	if hasRelay {
+		current = PathRelay
+		lastRelayAt = now
+	}
+
+	return pathState{
+		current:          current,
+		relayConfigured:  hasRelay,
+		directConfigured: hasDirect,
+		endpoints:        make(map[string]net.Addr),
+		lastRelayAt:      lastRelayAt,
+	}
+}
+
+func (s pathState) path() Path {
+	return s.current
+}
+
+func (s pathState) discoveryPlan(now time.Time, refreshInterval, staleAfter time.Duration) discoveryPlan {
+	if !s.directConfigured {
+		return discoveryPlan{}
+	}
+
+	shouldAttempt := s.current != PathDirect || s.directIsStale(now, staleAfter)
 	if !shouldAttempt {
 		return discoveryPlan{}
 	}
 
 	targets := make([]net.Addr, 0, len(s.endpoints))
-	for _, endpoint := range s.endpoints {
+	if s.bestEndpoint != "" {
+		if endpoint, ok := s.endpoints[s.bestEndpoint]; ok {
+			targets = append(targets, cloneAddr(endpoint))
+		}
+	}
+	for key, endpoint := range s.endpoints {
+		if key == s.bestEndpoint {
+			continue
+		}
 		targets = append(targets, cloneAddr(endpoint))
 	}
 
+	needRefresh := s.lastEndpointsAt.IsZero() || now.Sub(s.lastEndpointsAt) >= refreshInterval
 	return discoveryPlan{
-		needRefresh:   true,
-		sendCallMe:    s.relayConfigured,
+		needRefresh:   needRefresh,
+		sendCallMe:    s.relayConfigured && needRefresh,
 		probeTargets:  targets,
 		shouldAttempt: true,
 	}
 }
 
-func (s *pathState) updateCandidates(candidates []net.Addr) bool {
+func (s pathState) directIsStale(now time.Time, staleAfter time.Duration) bool {
+	if s.current != PathDirect {
+		return true
+	}
+	if s.lastDirectAt.IsZero() {
+		return true
+	}
+	return !now.Before(s.lastDirectAt.Add(staleAfter))
+}
+
+func (s *pathState) noteEndpointRefresh(now time.Time) {
+	s.lastEndpointsAt = now
+}
+
+func (s *pathState) noteCandidates(now time.Time, candidates []net.Addr) bool {
 	next := make(map[string]net.Addr, len(candidates))
 	for _, candidate := range candidates {
 		if candidate == nil {
@@ -84,36 +121,47 @@ func (s *pathState) updateCandidates(candidates []net.Addr) bool {
 	}
 
 	s.endpoints = next
-	if len(s.endpoints) > 0 && s.directConfigured && s.current != PathDirect {
-		s.directStale = true
+	if s.bestEndpoint != "" {
+		if _, ok := s.endpoints[s.bestEndpoint]; !ok {
+			s.bestEndpoint = ""
+		}
 	}
+	s.lastEndpointsAt = now
 	return changed
 }
 
-func (s *pathState) markDirectValidated(addr net.Addr) bool {
+func (s *pathState) noteDirect(now time.Time, addr net.Addr) bool {
 	if !s.directConfigured || addr == nil {
 		return false
 	}
-	if _, ok := s.endpoints[addr.String()]; !ok {
+	key := addr.String()
+	if _, ok := s.endpoints[key]; !ok {
 		return false
 	}
 
-	changed := s.current != PathDirect || s.directStale
+	changed := s.current != PathDirect || s.bestEndpoint != key
+	if s.current != PathDirect {
+		s.upgrades++
+	}
 	s.current = PathDirect
-	s.directStale = false
+	s.bestEndpoint = key
+	s.lastDirectAt = now
 	return changed
 }
 
-func (s *pathState) markDirectBroken() bool {
+func (s *pathState) noteRelay(now time.Time) bool {
 	next := PathUnknown
 	if s.relayConfigured {
 		next = PathRelay
 	}
 
-	changed := s.current != next || !s.directStale
+	changed := s.current != next
+	if s.current == PathDirect {
+		s.fallbacks++
+	}
 	s.current = next
-	if s.directConfigured {
-		s.directStale = true
+	if next == PathRelay {
+		s.lastRelayAt = now
 	}
 	return changed
 }
