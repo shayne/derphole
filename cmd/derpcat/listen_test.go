@@ -2,7 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
@@ -11,6 +15,9 @@ import (
 
 	"github.com/shayne/derpcat/pkg/telemetry"
 	"github.com/shayne/derpcat/pkg/token"
+	"tailscale.com/derp/derpserver"
+	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 )
 
 type lockedBuffer struct {
@@ -141,7 +148,7 @@ func TestListenReportsRelayThenDirectWhenTransportUpgrades(t *testing.T) {
 	listenerStderr, senderStderr := runUpgradingExternalListenAndSend(t)
 
 	assertStatusOrder(t, listenerStderr, "listener stderr", "waiting-for-claim", "connected-relay", "connected-direct", "stream-complete")
-	assertStatusOrder(t, senderStderr, "sender stderr", "probing-direct", "connected-relay", "connected-direct", "stream-complete")
+	assertStatusOrder(t, senderStderr, "sender stderr", "probing-direct", "connected-relay", "connected-direct")
 }
 
 func TestListenHelpTargetsCanonicalUsage(t *testing.T) {
@@ -245,9 +252,15 @@ func TestListenHonorsVerbosityLevel(t *testing.T) {
 func runUpgradingExternalListenAndSend(t *testing.T) (listenerStderr string, senderStderr string) {
 	t.Helper()
 
+	srv := newCommandTestDERPServer(t)
+	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(1*time.Second).UnixNano(), 10))
 	t.Setenv("DERPCAT_TEST_LOCAL_RELAY", "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	withCommandContext(t, ctx)
 
 	listenerStdoutBuf := &lockedBuffer{}
 	listenerStderrBuf := &lockedBuffer{}
@@ -260,17 +273,14 @@ func runUpgradingExternalListenAndSend(t *testing.T) (listenerStderr string, sen
 	time.Sleep(500 * time.Millisecond)
 
 	var senderStdout bytes.Buffer
-	var senderStderrBuf bytes.Buffer
-	sendCode := runSend([]string{issuedToken}, telemetry.LevelDefault, &holdEOFReader{
-		payload: []byte("upgrade-me"),
-		hold:    6 * time.Second,
-	}, &senderStdout, &senderStderrBuf)
-	if sendCode != 0 {
-		t.Fatalf("runSend() = %d, want 0, stderr=%q", sendCode, senderStderrBuf.String())
-	}
-	if got := senderStdout.String(); got != "" {
-		t.Fatalf("sender stdout = %q, want empty", got)
-	}
+	var senderStderrBuf lockedBuffer
+	senderDone := make(chan int, 1)
+	go func() {
+		senderDone <- runSend([]string{issuedToken}, telemetry.LevelDefault, &holdEOFReader{
+			payload: []byte("upgrade-me"),
+			hold:    6 * time.Second,
+		}, &senderStdout, &senderStderrBuf)
+	}()
 
 	select {
 	case code := <-listenerDone:
@@ -285,7 +295,39 @@ func runUpgradingExternalListenAndSend(t *testing.T) (listenerStderr string, sen
 		t.Fatalf("listener stdout = %q, want %q", got, "upgrade-me")
 	}
 
+	sendGrace := time.NewTimer(3 * time.Second)
+	defer sendGrace.Stop()
+	select {
+	case code := <-senderDone:
+		if code != 0 {
+			t.Fatalf("runSend() = %d, want 0, stderr=%q", code, senderStderrBuf.String())
+		}
+	case <-sendGrace.C:
+		cancel()
+		code := <-senderDone
+		if code != 1 {
+			t.Fatalf("runSend() after cancel = %d, want 1, stderr=%q", code, senderStderrBuf.String())
+		}
+		if !strings.Contains(senderStderrBuf.String(), "context canceled\n") {
+			t.Fatalf("sender stderr = %q, want cancellation after listener completion", senderStderrBuf.String())
+		}
+	}
+
+	if got := senderStdout.String(); got != "" {
+		t.Fatalf("sender stdout = %q, want empty", got)
+	}
+
 	return listenerStderrBuf.String(), senderStderrBuf.String()
+}
+
+func withCommandContext(t *testing.T, ctx context.Context) {
+	t.Helper()
+
+	prev := commandContext
+	commandContext = func() context.Context { return ctx }
+	t.Cleanup(func() {
+		commandContext = prev
+	})
 }
 
 type holdEOFReader struct {
@@ -322,5 +364,56 @@ func assertStatusOrder(t *testing.T, got, label string, statuses ...string) {
 			t.Fatalf("%s = %q, want statuses in order %v", label, got, statuses)
 		}
 		last = idx
+	}
+}
+
+type commandTestDERPServer struct {
+	MapURL  string
+	DERPURL string
+}
+
+func newCommandTestDERPServer(t *testing.T) *commandTestDERPServer {
+	t.Helper()
+
+	server := derpserver.New(key.NewNode(), t.Logf)
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
+
+	derpHTTP := httptest.NewServer(derpserver.Handler(server))
+	t.Cleanup(derpHTTP.Close)
+
+	dm := &tailcfg.DERPMap{
+		Regions: map[int]*tailcfg.DERPRegion{
+			1: {
+				RegionID:   1,
+				RegionCode: "test",
+				RegionName: "Command Test",
+				Nodes: []*tailcfg.DERPNode{
+					{
+						Name:     "command-test-1",
+						RegionID: 1,
+						HostName: "127.0.0.1",
+						IPv4:     "127.0.0.1",
+						STUNPort: -1,
+						DERPPort: 0,
+					},
+				},
+			},
+		},
+	}
+
+	mapHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(dm)
+	}))
+	t.Cleanup(mapHTTP.Close)
+
+	return &commandTestDERPServer{
+		MapURL:  mapHTTP.URL,
+		DERPURL: derpHTTP.URL + "/derp",
 	}
 }

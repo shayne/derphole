@@ -39,6 +39,8 @@ var listenHelpConfig = yargs.HelpConfig{
 	},
 }
 
+var commandContext = context.Background
+
 func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) int {
 	parsed, err := yargs.ParseWithCommandAndHelp[struct{}, listenFlags, struct{}](append([]string{"listen"}, args...), listenHelpConfig)
 	if err != nil {
@@ -66,7 +68,7 @@ func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) i
 	tokenSink := make(chan string, 1)
 	done := make(chan error, 1)
 	go func() {
-		_, err := session.Listen(context.Background(), session.ListenConfig{
+		_, err := session.Listen(commandContext(), session.ListenConfig{
 			Emitter:       emitter,
 			TokenSink:     tokenSink,
 			StdioOut:      stdout,
