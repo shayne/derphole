@@ -375,44 +375,62 @@ func TestBindSelectorSendUsesCoherentDirectPathSnapshot(t *testing.T) {
 	}
 	defer bind.Close()
 
-	directADone := make(chan []byte, 1)
+	directADone := make(chan [][]byte, 1)
 	go func() {
-		buf := make([]byte, 64<<10)
-		_ = directA.SetReadDeadline(time.Now().Add(2 * time.Second))
-		n, _, err := directA.ReadFrom(buf)
-		if err != nil {
-			directADone <- nil
-			return
+		var packets [][]byte
+		for range 2 {
+			buf := make([]byte, 64<<10)
+			_ = directA.SetReadDeadline(time.Now().Add(2 * time.Second))
+			n, _, err := directA.ReadFrom(buf)
+			if err != nil {
+				directADone <- nil
+				return
+			}
+			packets = append(packets, append([]byte(nil), buf[:n]...))
 		}
-		directADone <- append([]byte(nil), buf[:n]...)
+		directADone <- packets
 	}()
 
-	payload := []byte("coherent")
-	if err := bind.Send([][]byte{payload}, &Endpoint{dst: "derp"}, 0); err != nil {
+	payloadA := []byte("coherent-a")
+	payloadB := []byte("coherent-b")
+	if err := bind.Send([][]byte{payloadA, payloadB}, &Endpoint{dst: "derp"}, 0); err != nil {
 		t.Fatalf("Send() error = %v", err)
 	}
 
 	select {
 	case got := <-directADone:
-		if string(got) != string(payload) {
-			t.Fatalf("direct A payload = %q, want %q", got, payload)
+		if len(got) != 2 {
+			t.Fatalf("direct A packet count = %d, want 2", len(got))
+		}
+		if string(got[0]) != string(payloadA) {
+			t.Fatalf("direct A payload[0] = %q, want %q", got[0], payloadA)
+		}
+		if string(got[1]) != string(payloadB) {
+			t.Fatalf("direct A payload[1] = %q, want %q", got[1], payloadB)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("direct send did not use first snapshot endpoint")
+		t.Fatal("direct send did not use first snapshot endpoint for whole batch")
 	}
 
 	_ = directB.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 	buf := make([]byte, 64<<10)
 	if _, _, err := directB.ReadFrom(buf); err == nil {
-		t.Fatal("direct send used churned endpoint instead of first snapshot")
+		t.Fatal("direct send used churned endpoint during batch")
 	}
 
 	pkt, err := derpB.Receive(ctx)
 	if err != nil {
 		t.Fatalf("Receive() error = %v", err)
 	}
-	if got := string(pkt.Payload); got != string(payload) {
-		t.Fatalf("DERP payload = %q, want %q", got, payload)
+	if got := string(pkt.Payload); got != string(payloadA) {
+		t.Fatalf("DERP payload[0] = %q, want %q", got, payloadA)
+	}
+	pkt, err = derpB.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Receive() second error = %v", err)
+	}
+	if got := string(pkt.Payload); got != string(payloadB) {
+		t.Fatalf("DERP payload[1] = %q, want %q", got, payloadB)
 	}
 	if calls := selector.calls(); calls != 1 {
 		t.Fatalf("selector DirectPath() calls = %d, want 1", calls)

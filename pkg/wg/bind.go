@@ -155,14 +155,15 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
 	state := b.state
 	b.mu.Unlock()
 
+	directEndpoint, directConfirmed := b.directPath()
+	directAddr := resolveUDPAddr(directEndpoint)
+
 	for _, buf := range bufs {
 		payload := buf[offset:]
 		if len(payload) == 0 {
 			continue
 		}
 
-		directEndpoint, directConfirmed := b.directPath()
-		directAddr := resolveUDPAddr(directEndpoint)
 		if directAddr != nil {
 			if pc == nil {
 				return net.ErrClosed
