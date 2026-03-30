@@ -66,10 +66,8 @@ func TestManagerDoesNotReportDirectForUnownedUDPNoise(t *testing.T) {
 		DirectConn: nil,
 	})
 
-	noise.inject([]byte("random udp noise"), noise.LocalAddr())
-	buf := make([]byte, 64)
-	if _, _, err := noise.ReadFrom(buf); err != nil {
-		t.Fatalf("noise ReadFrom() error = %v", err)
+	if err := mgr.ObserveInboundUDPNoise(noise.LocalAddr(), []byte("random udp noise")); err != nil {
+		t.Fatalf("ObserveInboundUDPNoise() error = %v", err)
 	}
 
 	if got := mgr.PathState(); got != PathRelay {
