@@ -2,6 +2,8 @@ package transport
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
 	"time"
 )
@@ -34,6 +36,9 @@ func (m *Manager) receiveControlLoop(ctx context.Context) {
 		msg, err := m.cfg.ReceiveControl(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
+				return
+			}
+			if isTerminalControlReadError(err) {
 				return
 			}
 			if !m.waitForNextControlRead(ctx) {
@@ -139,4 +144,8 @@ func (m *Manager) waitForNextControlRead(ctx context.Context) bool {
 	case <-m.cfg.Clock.After(backoff):
 		return true
 	}
+}
+
+func isTerminalControlReadError(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed)
 }

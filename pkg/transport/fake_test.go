@@ -264,16 +264,18 @@ func (c *fakePacketConn) failNextWriteTo(addr net.Addr) {
 }
 
 type fakeControlPipe struct {
-	mu             sync.Mutex
-	inbound        chan []byte
-	sent           []ControlMessage
-	sendAttempts   map[ControlType]int
-	receiveCount   int
-	failNextByType map[ControlType]int
-	receiveErrors  int
-	blockByType    map[ControlType]chan struct{}
-	peerCandidates []string
-	notify         chan struct{}
+	mu              sync.Mutex
+	inbound         chan []byte
+	sent            []ControlMessage
+	sendAttempts    map[ControlType]int
+	receiveAttempts int
+	receiveCount    int
+	failNextByType  map[ControlType]int
+	receiveErrors   int
+	terminalErr     error
+	blockByType     map[ControlType]chan struct{}
+	peerCandidates  []string
+	notify          chan struct{}
 }
 
 func newFakeControlPipe() *fakeControlPipe {
@@ -339,6 +341,13 @@ func (p *fakeControlPipe) send(ctx context.Context, msg ControlMessage) error {
 
 func (p *fakeControlPipe) receive(ctx context.Context) (ControlMessage, error) {
 	p.mu.Lock()
+	p.receiveAttempts++
+	if p.terminalErr != nil {
+		err := p.terminalErr
+		p.signalLocked()
+		p.mu.Unlock()
+		return ControlMessage{}, err
+	}
 	if p.receiveErrors > 0 {
 		p.receiveErrors--
 		p.signalLocked()
@@ -420,6 +429,13 @@ func (p *fakeControlPipe) failNextReceive() {
 	p.receiveErrors++
 }
 
+func (p *fakeControlPipe) closeReceive(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.terminalErr = err
+	p.signalLocked()
+}
+
 func (p *fakeControlPipe) blockSend(typ ControlType) chan struct{} {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -465,6 +481,26 @@ func (p *fakeControlPipe) waitForReceiveCount(n int, timeout time.Duration) bool
 		p.mu.Unlock()
 		return false, waitCh
 	})
+}
+
+func (p *fakeControlPipe) waitForReceiveAttempts(n int, timeout time.Duration) bool {
+	return waitForNotify(timeout, func() (bool, <-chan struct{}) {
+		p.mu.Lock()
+		count := p.receiveAttempts
+		if count >= n {
+			p.mu.Unlock()
+			return true, nil
+		}
+		waitCh := p.notify
+		p.mu.Unlock()
+		return false, waitCh
+	})
+}
+
+func (p *fakeControlPipe) receiveAttemptsCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.receiveAttempts
 }
 
 func (p *fakeControlPipe) waitForReceiveErrorsDrained(timeout time.Duration) bool {

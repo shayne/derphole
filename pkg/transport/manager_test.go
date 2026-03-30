@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -551,6 +552,37 @@ func TestManagerRetriesAfterTransientReceiveControlError(t *testing.T) {
 	}
 	if !waitForPath(t, mgr, PathDirect, 200*time.Millisecond) {
 		t.Fatalf("PathState() after transient receive error recovery = %v, want %v", mgr.PathState(), PathDirect)
+	}
+}
+
+func TestManagerStopsOnTerminalReceiveControlError(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000036, 0))
+	controls := newFakeControlPipe()
+	controls.closeReceive(io.EOF)
+	baseTimers := clock.timerCount()
+
+	mgr := NewManager(ManagerConfig{
+		ReceiveControl:    controls.receive,
+		Clock:             clock,
+		DiscoveryInterval: 1 * time.Second,
+	})
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 1)
+	if !controls.waitForReceiveAttempts(1, 200*time.Millisecond) {
+		t.Fatal("receive control loop did not observe the terminal reader shutdown")
+	}
+
+	clock.Advance(5 * time.Second)
+	if got := controls.receiveAttemptsCount(); got != 1 {
+		t.Fatalf("receive control attempts after terminal error = %d, want 1", got)
 	}
 }
 

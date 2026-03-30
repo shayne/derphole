@@ -132,7 +132,11 @@ func (m *Manager) tryPromoteDirect(now time.Time, addr net.Addr) bool {
 	if !m.state.consumeProbe(addr, m.discoveryInterval(), now) {
 		return false
 	}
-	return m.state.noteDirect(now, addr)
+	if !m.state.noteDirect(now, addr) {
+		return false
+	}
+	m.signalStateChangeLocked()
+	return true
 }
 
 func (m *Manager) discoveryInterval() time.Duration {
