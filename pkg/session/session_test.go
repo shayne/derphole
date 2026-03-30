@@ -410,9 +410,8 @@ func runExternalRoundTrip(t *testing.T, cfg roundTripConfig) roundTripResult {
 		}
 	case <-sendGrace.C:
 		cancel()
-		if err := <-sendErr; err != nil && !errors.Is(err, context.Canceled) {
-			t.Fatalf("Send() error after listener completion = %v", err)
-		}
+		err := <-sendErr
+		t.Fatalf("Send() did not exit after listener completion; error after forced cleanup = %v", err)
 	}
 
 	listenerStatuses := listenerStatus.String()

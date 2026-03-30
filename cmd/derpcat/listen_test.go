@@ -318,12 +318,7 @@ func runUpgradingExternalListenAndSend(t *testing.T) (listenerStderr string, sen
 	case <-sendGrace.C:
 		cancel()
 		code := <-senderDone
-		if code != 1 {
-			t.Fatalf("runSend() after cancel = %d, want 1, stderr=%q", code, senderStderrBuf.String())
-		}
-		if !strings.Contains(senderStderrBuf.String(), "context canceled\n") {
-			t.Fatalf("sender stderr = %q, want cancellation after listener completion", senderStderrBuf.String())
-		}
+		t.Fatalf("runSend() did not exit after listener completion; code after forced cleanup = %d, stderr=%q", code, senderStderrBuf.String())
 	}
 
 	if got := senderStdout.String(); got != "" {

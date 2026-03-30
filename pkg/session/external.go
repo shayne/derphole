@@ -29,11 +29,11 @@ const (
 	envelopeClaim    = "claim"
 	envelopeDecision = "decision"
 	envelopeControl  = "control"
+	envelopeAck      = "ack"
 
 	overlayPort       = 7000
 	directProbeWindow = 1 * time.Second
 	dialRetryInterval = 100 * time.Millisecond
-	overlayAck        = "derpcat-ack"
 )
 
 type envelope struct {
@@ -190,6 +190,10 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 		}
 		return errors.New("claim rejected")
 	}
+	ackCh, unsubscribeAck := derpClient.Subscribe(func(pkt derpbind.Packet) bool {
+		return pkt.From == listenerDERP && isAckPayload(pkt.Payload)
+	})
+	defer unsubscribeAck()
 
 	pathEmitter := newTransportPathEmitter(cfg.Emitter)
 	pathEmitter.Emit(StateProbing)
@@ -254,12 +258,11 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 	} else if err := overlayConn.Close(); err != nil {
 		return err
 	}
-	if err := waitForPeerAck(ctx, overlayConn); err != nil {
+	if err := waitForPeerAck(ctx, ackCh); err != nil {
 		return err
 	}
 
 	pathEmitter.Complete(transportManager)
-	transportCancel()
 	return nil
 }
 
@@ -374,12 +377,14 @@ func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
 		if _, err := io.Copy(dst, overlayConn); err != nil {
 			return tok, err
 		}
-		if _, err := io.WriteString(overlayConn, overlayAck); err != nil {
+		if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeAck}); err != nil {
+			return tok, err
+		}
+		if err := overlayConn.Close(); err != nil {
 			return tok, err
 		}
 
 		pathEmitter.Complete(transportManager)
-		transportCancel()
 		return tok, nil
 	}
 }
@@ -472,24 +477,13 @@ func acceptOverlay(ctx context.Context, ln net.Listener) (net.Conn, error) {
 	}
 }
 
-func waitForPeerAck(ctx context.Context, conn net.Conn) error {
-	done := make(chan error, 1)
-	go func() {
-		buf := make([]byte, len(overlayAck))
-		if _, err := io.ReadFull(conn, buf); err != nil {
-			done <- err
-			return
-		}
-		if string(buf) != overlayAck {
-			done <- errors.New("unexpected listener ack")
-			return
-		}
-		done <- nil
-	}()
-
+func waitForPeerAck(ctx context.Context, ch <-chan derpbind.Packet) error {
 	select {
-	case err := <-done:
-		return err
+	case _, ok := <-ch:
+		if !ok {
+			return net.ErrClosed
+		}
+		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -678,6 +672,14 @@ func isTransportControlPayload(payload []byte) bool {
 	}
 	env, err := decodeEnvelope(payload)
 	return err == nil && env.Type == envelopeControl && env.Control != nil
+}
+
+func isAckPayload(payload []byte) bool {
+	if len(payload) == 0 || payload[0] != '{' {
+		return false
+	}
+	env, err := decodeEnvelope(payload)
+	return err == nil && env.Type == envelopeAck
 }
 
 func fakeTransportCandidatesBlocked() bool {
