@@ -209,3 +209,45 @@ func TestClientSubscribeInterceptsMatchingPackets(t *testing.T) {
 		t.Fatal("dispatchSubscriber(data) = true, want false")
 	}
 }
+
+func TestClientSubscribeDropsOldestWhenSubscriberBackedUp(t *testing.T) {
+	c := &Client{
+		stopCh:      make(chan struct{}),
+		subscribers: make(map[uint64]packetSubscriber),
+	}
+
+	controlCh, unsubscribe := c.Subscribe(func(Packet) bool { return true })
+	defer unsubscribe()
+
+	for i := 0; i < cap(controlCh); i++ {
+		if !c.dispatchSubscriber(Packet{Payload: []byte{byte(i)}}) {
+			t.Fatalf("dispatchSubscriber(prefill %d) = false, want true", i)
+		}
+	}
+
+	done := make(chan bool, 1)
+	latest := Packet{Payload: []byte("latest")}
+	go func() {
+		done <- c.dispatchSubscriber(latest)
+	}()
+
+	select {
+	case handled := <-done:
+		if !handled {
+			t.Fatal("dispatchSubscriber(latest) = false, want true")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("dispatchSubscriber(latest) blocked on full subscriber")
+	}
+
+	var gotLatest bool
+	for i := 0; i < cap(controlCh); i++ {
+		pkt := <-controlCh
+		if bytes.Equal(pkt.Payload, latest.Payload) {
+			gotLatest = true
+		}
+	}
+	if !gotLatest {
+		t.Fatalf("subscriber queue did not retain latest packet %q", latest.Payload)
+	}
+}

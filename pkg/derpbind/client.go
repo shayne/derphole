@@ -190,12 +190,32 @@ func (c *Client) dispatchSubscriber(pkt Packet) bool {
 		if !sub.filter(pkt) {
 			continue
 		}
-		select {
-		case sub.ch <- pkt:
-			return true
-		case <-c.stopCh:
+		if c.tryDeliverSubscriber(sub.ch, pkt) {
 			return true
 		}
 	}
 	return false
+}
+
+func (c *Client) tryDeliverSubscriber(ch chan Packet, pkt Packet) bool {
+	select {
+	case ch <- pkt:
+		return true
+	case <-c.stopCh:
+		return true
+	default:
+	}
+
+	select {
+	case <-ch:
+	case <-c.stopCh:
+		return true
+	default:
+	}
+
+	select {
+	case ch <- pkt:
+	case <-c.stopCh:
+	}
+	return true
 }
