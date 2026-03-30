@@ -26,6 +26,10 @@ type PathSelector interface {
 	DirectPath() (endpoint string, active bool)
 }
 
+type DirectPacketHandler interface {
+	HandleDirectPacket(conn net.PacketConn, addr net.Addr, payload []byte) bool
+}
+
 type Bind struct {
 	mu       sync.Mutex
 	conn     net.PacketConn
@@ -269,6 +273,9 @@ func (s *bindState) readUDP() {
 		}
 		udpAddr, ok := addr.(*net.UDPAddr)
 		if !ok {
+			continue
+		}
+		if handler, ok := s.parent.selector.(DirectPacketHandler); ok && handler.HandleDirectPacket(s.conn, udpAddr, buf[:n]) {
 			continue
 		}
 		if ip, ok := netip.AddrFromSlice(udpAddr.IP); ok {

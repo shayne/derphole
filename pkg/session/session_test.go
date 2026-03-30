@@ -3,9 +3,13 @@ package session
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +17,8 @@ import (
 
 	"github.com/shayne/derpcat/pkg/telemetry"
 	"go4.org/mem"
+	"tailscale.com/derp/derpserver"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
 
@@ -254,10 +260,201 @@ func TestShareTokenAllowsOneClaimer(t *testing.T) {
 }
 
 func TestExternalListenSendCanUpgradeAfterRelayStart(t *testing.T) {
-	// The future transport-manager/session seam should make this regression compile
-	// and pass once relay-first upgrade support exists.
-	harness := newRelayFirstUpgradeHarness(t)
-	harness.RunRelayThenDirectUpgrade(t)
+	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
+	result := runExternalRoundTrip(t, roundTripConfig{
+		payload:           []byte("upgrade-me"),
+		enableDirectAfter: 1 * time.Second,
+		keepAlive:         8 * time.Second,
+	})
+
+	if !result.SeenRelay || !result.SeenDirect {
+		t.Fatalf("SeenRelay=%v SeenDirect=%v listener=%q sender=%q", result.SeenRelay, result.SeenDirect, result.ListenerStatus, result.SenderStatus)
+	}
+	if got := result.Output; got != "upgrade-me" {
+		t.Fatalf("output = %q, want %q", got, "upgrade-me")
+	}
+}
+
+type roundTripConfig struct {
+	payload           []byte
+	enableDirectAfter time.Duration
+	keepAlive         time.Duration
+}
+
+type roundTripResult struct {
+	Output         string
+	ListenerStatus string
+	SenderStatus   string
+	SeenRelay      bool
+	SeenDirect     bool
+}
+
+func runExternalRoundTrip(t *testing.T, cfg roundTripConfig) roundTripResult {
+	t.Helper()
+
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	enableDirectAt := time.Now().Add(cfg.enableDirectAfter).UnixNano()
+	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(enableDirectAt, 10))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	timeout := time.After(cfg.keepAlive + 20*time.Second)
+
+	var listenerOut bytes.Buffer
+	var listenerStatus syncBuffer
+	var senderStatus syncBuffer
+
+	tokenSink := make(chan string, 1)
+	listenErr := make(chan error, 1)
+	go func() {
+		_, err := Listen(ctx, ListenConfig{
+			Emitter:       telemetry.New(&listenerStatus, telemetry.LevelDefault),
+			TokenSink:     tokenSink,
+			StdioOut:      &listenerOut,
+			UsePublicDERP: true,
+		})
+		listenErr <- err
+	}()
+
+	token := <-tokenSink
+	time.Sleep(500 * time.Millisecond)
+	sendErr := make(chan error, 1)
+	go func() {
+		sendErr <- Send(ctx, SendConfig{
+			Token:         token,
+			Emitter:       telemetry.New(&senderStatus, telemetry.LevelDefault),
+			StdioIn:       &lingerReader{payload: cfg.payload, hold: cfg.keepAlive},
+			UsePublicDERP: true,
+		})
+	}()
+
+	select {
+	case err := <-listenErr:
+		if err != nil {
+			t.Fatalf("Listen() error = %v", err)
+		}
+	case <-timeout:
+		cancel()
+		t.Fatalf("timed out waiting for Listen(); listener=%q sender=%q", listenerStatus.String(), senderStatus.String())
+	}
+
+	sendGrace := time.NewTimer(3 * time.Second)
+	defer sendGrace.Stop()
+	select {
+	case err := <-sendErr:
+		if err != nil {
+			t.Fatalf("Send() error = %v", err)
+		}
+	case <-sendGrace.C:
+		cancel()
+		if err := <-sendErr; err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("Send() error after listener completion = %v", err)
+		}
+	}
+
+	listenerStatuses := listenerStatus.String()
+	senderStatuses := senderStatus.String()
+	return roundTripResult{
+		Output:         listenerOut.String(),
+		ListenerStatus: listenerStatuses,
+		SenderStatus:   senderStatuses,
+		SeenRelay:      strings.Contains(listenerStatuses, string(StateRelay)) && strings.Contains(senderStatuses, string(StateRelay)),
+		SeenDirect:     strings.Contains(listenerStatuses, string(StateDirect)) && strings.Contains(senderStatuses, string(StateDirect)),
+	}
+}
+
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+type lingerReader struct {
+	payload []byte
+	hold    time.Duration
+	sent    bool
+	waited  bool
+}
+
+type sessionTestDERPServer struct {
+	MapURL  string
+	DERPURL string
+	Map     *tailcfg.DERPMap
+}
+
+func newSessionTestDERPServer(t *testing.T) *sessionTestDERPServer {
+	t.Helper()
+
+	server := derpserver.New(key.NewNode(), t.Logf)
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
+
+	derpHTTP := httptest.NewServer(derpserver.Handler(server))
+	t.Cleanup(derpHTTP.Close)
+
+	dm := &tailcfg.DERPMap{
+		Regions: map[int]*tailcfg.DERPRegion{
+			1: {
+				RegionID:   1,
+				RegionCode: "test",
+				RegionName: "Session Test",
+				Nodes: []*tailcfg.DERPNode{
+					{
+						Name:     "session-test-1",
+						RegionID: 1,
+						HostName: "127.0.0.1",
+						IPv4:     "127.0.0.1",
+						STUNPort: -1,
+						DERPPort: 0,
+					},
+				},
+			},
+		},
+	}
+
+	mapHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(dm)
+	}))
+	t.Cleanup(mapHTTP.Close)
+
+	return &sessionTestDERPServer{
+		MapURL:  mapHTTP.URL,
+		DERPURL: derpHTTP.URL + "/derp",
+		Map:     dm,
+	}
+}
+
+func (r *lingerReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		return copy(p, r.payload), nil
+	}
+	if !r.waited {
+		r.waited = true
+		if r.hold > 0 {
+			time.Sleep(r.hold)
+		}
+	}
+	return 0, io.EOF
 }
 
 func connectWithRetry(ctx context.Context, addr string) (net.Conn, error) {

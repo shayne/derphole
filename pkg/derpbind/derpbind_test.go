@@ -1,6 +1,7 @@
 package derpbind
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -170,5 +171,41 @@ func TestClientRecoversAfterTransientTransportDisconnect(t *testing.T) {
 	}
 	if string(got.Payload) != string(payload) {
 		t.Fatalf("Receive().Payload = %q, want %q", got.Payload, payload)
+	}
+}
+
+func TestClientSubscribeInterceptsMatchingPackets(t *testing.T) {
+	c := &Client{
+		stopCh:      make(chan struct{}),
+		subscribers: make(map[uint64]packetSubscriber),
+	}
+	controlPayload := []byte(`{"type":"control"}`)
+	controlCh, unsubscribe := c.Subscribe(func(pkt Packet) bool {
+		return bytes.Equal(pkt.Payload, controlPayload)
+	})
+	defer unsubscribe()
+
+	controlPacket := Packet{
+		From:    key.NewNode().Public(),
+		Payload: controlPayload,
+	}
+	if !c.dispatchSubscriber(controlPacket) {
+		t.Fatal("dispatchSubscriber(control) = false, want true")
+	}
+
+	select {
+	case pkt := <-controlCh:
+		if pkt.From != controlPacket.From {
+			t.Fatalf("control packet From = %v, want %v", pkt.From, controlPacket.From)
+		}
+		if !bytes.Equal(pkt.Payload, controlPayload) {
+			t.Fatalf("control packet payload = %q, want %q", pkt.Payload, controlPayload)
+		}
+	default:
+		t.Fatal("subscribed control packet was not delivered")
+	}
+
+	if c.dispatchSubscriber(Packet{Payload: []byte("wireguard-bytes")}) {
+		t.Fatal("dispatchSubscriber(data) = true, want false")
 	}
 }

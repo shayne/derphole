@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -135,6 +137,13 @@ func TestListenWithoutFlagsUsesStderrForTokenAndStdoutForPayload(t *testing.T) {
 	}
 }
 
+func TestListenReportsRelayThenDirectWhenTransportUpgrades(t *testing.T) {
+	listenerStderr, senderStderr := runUpgradingExternalListenAndSend(t)
+
+	assertStatusOrder(t, listenerStderr, "listener stderr", "waiting-for-claim", "connected-relay", "connected-direct", "stream-complete")
+	assertStatusOrder(t, senderStderr, "sender stderr", "probing-direct", "connected-relay", "connected-direct", "stream-complete")
+}
+
 func TestListenHelpTargetsCanonicalUsage(t *testing.T) {
 	for _, args := range [][]string{{"-h"}, {"--help"}} {
 		t.Run(strings.Join(args, "_"), func(t *testing.T) {
@@ -230,5 +239,88 @@ func TestListenHonorsVerbosityLevel(t *testing.T) {
 				t.Fatalf("listener stderr = %q, want prefix %q", listenerStderr, tc.wantStderr)
 			}
 		})
+	}
+}
+
+func runUpgradingExternalListenAndSend(t *testing.T) (listenerStderr string, senderStderr string) {
+	t.Helper()
+
+	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(1*time.Second).UnixNano(), 10))
+	t.Setenv("DERPCAT_TEST_LOCAL_RELAY", "")
+
+	listenerStdoutBuf := &lockedBuffer{}
+	listenerStderrBuf := &lockedBuffer{}
+	listenerDone := make(chan int, 1)
+	go func() {
+		listenerDone <- runListen(nil, telemetry.LevelDefault, listenerStdoutBuf, listenerStderrBuf)
+	}()
+
+	issuedToken := waitForIssuedToken(t, listenerStderrBuf)
+	time.Sleep(500 * time.Millisecond)
+
+	var senderStdout bytes.Buffer
+	var senderStderrBuf bytes.Buffer
+	sendCode := runSend([]string{issuedToken}, telemetry.LevelDefault, &holdEOFReader{
+		payload: []byte("upgrade-me"),
+		hold:    6 * time.Second,
+	}, &senderStdout, &senderStderrBuf)
+	if sendCode != 0 {
+		t.Fatalf("runSend() = %d, want 0, stderr=%q", sendCode, senderStderrBuf.String())
+	}
+	if got := senderStdout.String(); got != "" {
+		t.Fatalf("sender stdout = %q, want empty", got)
+	}
+
+	select {
+	case code := <-listenerDone:
+		if code != 0 {
+			t.Fatalf("runListen() = %d, want 0, stderr=%q", code, listenerStderrBuf.String())
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("runListen() did not return after sender completed")
+	}
+
+	if got := listenerStdoutBuf.String(); got != "upgrade-me" {
+		t.Fatalf("listener stdout = %q, want %q", got, "upgrade-me")
+	}
+
+	return listenerStderrBuf.String(), senderStderrBuf.String()
+}
+
+type holdEOFReader struct {
+	payload []byte
+	hold    time.Duration
+	sent    bool
+	waited  bool
+}
+
+func (r *holdEOFReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		return copy(p, r.payload), nil
+	}
+	if !r.waited {
+		r.waited = true
+		if r.hold > 0 {
+			time.Sleep(r.hold)
+		}
+	}
+	return 0, io.EOF
+}
+
+func assertStatusOrder(t *testing.T, got, label string, statuses ...string) {
+	t.Helper()
+
+	last := -1
+	for _, status := range statuses {
+		idx := strings.Index(got, status)
+		if idx == -1 {
+			t.Fatalf("%s = %q, want status %q", label, got, status)
+		}
+		if idx < last {
+			t.Fatalf("%s = %q, want statuses in order %v", label, got, statuses)
+		}
+		last = idx
 	}
 }

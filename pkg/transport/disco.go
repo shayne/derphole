@@ -147,6 +147,23 @@ func (m *Manager) directReadLoop(ctx context.Context) {
 	}
 }
 
+func (m *Manager) HandleDirectPacket(conn net.PacketConn, addr net.Addr, payload []byte) bool {
+	if addr == nil {
+		return false
+	}
+	if len(payload) == len(discoProbePayload) && bytes.Equal(payload, discoProbePayload) {
+		if conn != nil {
+			_, _ = conn.WriteTo(discoAckPayload, addr)
+		}
+		return true
+	}
+	if len(payload) == len(discoAckPayload) && bytes.Equal(payload, discoAckPayload) {
+		m.tryPromoteDirect(m.now(), addr)
+		return true
+	}
+	return false
+}
+
 func isTimeout(err error) bool {
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()

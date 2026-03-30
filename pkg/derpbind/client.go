@@ -26,7 +26,15 @@ type Client struct {
 	stopCh   chan struct{}
 	doneCh   chan struct{}
 
-	stopOnce sync.Once
+	subMu       sync.RWMutex
+	subscribers map[uint64]packetSubscriber
+	nextSubID   uint64
+	stopOnce    sync.Once
+}
+
+type packetSubscriber struct {
+	filter func(Packet) bool
+	ch     chan Packet
 }
 
 func NewClient(ctx context.Context, node *tailcfg.DERPNode, serverURL string) (*Client, error) {
@@ -45,11 +53,12 @@ func NewClient(ctx context.Context, node *tailcfg.DERPNode, serverURL string) (*
 	}
 
 	c := &Client{
-		pub:      priv.Public(),
-		dc:       dc,
-		packetCh: make(chan Packet, 16),
-		stopCh:   make(chan struct{}),
-		doneCh:   make(chan struct{}),
+		pub:         priv.Public(),
+		dc:          dc,
+		packetCh:    make(chan Packet, 16),
+		stopCh:      make(chan struct{}),
+		doneCh:      make(chan struct{}),
+		subscribers: make(map[uint64]packetSubscriber),
 	}
 	go c.recvLoop()
 	return c, nil
@@ -72,6 +81,38 @@ func (c *Client) Send(ctx context.Context, dst key.NodePublic, payload []byte) e
 		return err
 	}
 	return c.dc.Send(dst, payload)
+}
+
+func (c *Client) Subscribe(filter func(Packet) bool) (<-chan Packet, func()) {
+	ch := make(chan Packet, 16)
+	if filter == nil {
+		close(ch)
+		return ch, func() {}
+	}
+
+	c.subMu.Lock()
+	id := c.nextSubID
+	c.nextSubID++
+	c.subscribers[id] = packetSubscriber{
+		filter: filter,
+		ch:     ch,
+	}
+	c.subMu.Unlock()
+
+	var once sync.Once
+	return ch, func() {
+		once.Do(func() {
+			c.subMu.Lock()
+			sub, ok := c.subscribers[id]
+			if ok {
+				delete(c.subscribers, id)
+			}
+			c.subMu.Unlock()
+			if ok {
+				close(sub.ch)
+			}
+		})
+	}
 }
 
 func (c *Client) Receive(ctx context.Context) (Packet, error) {
@@ -131,10 +172,30 @@ func (c *Client) recvLoop() {
 			From:    pkt.Source,
 			Payload: append([]byte(nil), pkt.Data...),
 		}
+		if c.dispatchSubscriber(out) {
+			continue
+		}
 		select {
 		case c.packetCh <- out:
 		case <-c.stopCh:
 			return
 		}
 	}
+}
+
+func (c *Client) dispatchSubscriber(pkt Packet) bool {
+	c.subMu.RLock()
+	defer c.subMu.RUnlock()
+	for _, sub := range c.subscribers {
+		if !sub.filter(pkt) {
+			continue
+		}
+		select {
+		case sub.ch <- pkt:
+			return true
+		case <-c.stopCh:
+			return true
+		}
+	}
+	return false
 }

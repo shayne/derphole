@@ -28,6 +28,7 @@ type Timer interface {
 type ManagerConfig struct {
 	RelayConn               net.PacketConn
 	DirectConn              net.PacketConn
+	DisableDirectReads      bool
 	CandidateSource         func(context.Context) []net.Addr
 	SendControl             func(context.Context, ControlMessage) error
 	ReceiveControl          func(context.Context) (ControlMessage, error)
@@ -75,7 +76,9 @@ func (m *Manager) Start(ctx context.Context) error {
 
 	go m.discoveryLoop(ctx)
 	go m.receiveControlLoop(ctx)
-	go m.directReadLoop(ctx)
+	if !m.cfg.DisableDirectReads {
+		go m.directReadLoop(ctx)
+	}
 	return nil
 }
 

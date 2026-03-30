@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"slices"
 	"strconv"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/shayne/derpcat/pkg/derpbind"
 	"github.com/shayne/derpcat/pkg/rendezvous"
 	"github.com/shayne/derpcat/pkg/token"
+	"github.com/shayne/derpcat/pkg/transport"
 	"github.com/shayne/derpcat/pkg/traversal"
 	"github.com/shayne/derpcat/pkg/wg"
 	"tailscale.com/tailcfg"
@@ -26,6 +28,7 @@ import (
 const (
 	envelopeClaim    = "claim"
 	envelopeDecision = "decision"
+	envelopeControl  = "control"
 
 	overlayPort       = 7000
 	directProbeWindow = 1 * time.Second
@@ -34,9 +37,10 @@ const (
 )
 
 type envelope struct {
-	Type     string               `json:"type"`
-	Claim    *rendezvous.Claim    `json:"claim,omitempty"`
-	Decision *rendezvous.Decision `json:"decision,omitempty"`
+	Type     string                    `json:"type"`
+	Claim    *rendezvous.Claim         `json:"claim,omitempty"`
+	Decision *rendezvous.Decision      `json:"decision,omitempty"`
+	Control  *transport.ControlMessage `json:"control,omitempty"`
 }
 
 func derpPublicKeyRaw32(pub key.NodePublic) [32]byte {
@@ -46,7 +50,7 @@ func derpPublicKeyRaw32(pub key.NodePublic) [32]byte {
 }
 
 func issuePublicSession(ctx context.Context) (string, *relaySession, error) {
-	dm, err := derpbind.FetchMap(ctx, derpbind.PublicDERPMapURL)
+	dm, err := derpbind.FetchMap(ctx, publicDERPMapURL())
 	if err != nil {
 		return "", nil, err
 	}
@@ -55,7 +59,7 @@ func issuePublicSession(ctx context.Context) (string, *relaySession, error) {
 		return "", nil, errors.New("no DERP node available")
 	}
 
-	derpClient, err := derpbind.NewClient(ctx, node, derpServerURL(node))
+	derpClient, err := derpbind.NewClient(ctx, node, publicDERPServerURL(node))
 	if err != nil {
 		return "", nil, err
 	}
@@ -129,7 +133,7 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 		return ErrUnknownSession
 	}
 
-	dm, err := derpbind.FetchMap(ctx, derpbind.PublicDERPMapURL)
+	dm, err := derpbind.FetchMap(ctx, publicDERPMapURL())
 	if err != nil {
 		return err
 	}
@@ -137,7 +141,7 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 	if node == nil {
 		return errors.New("no bootstrap DERP node available")
 	}
-	derpClient, err := derpbind.NewClient(ctx, node, derpServerURL(node))
+	derpClient, err := derpbind.NewClient(ctx, node, publicDERPServerURL(node))
 	if err != nil {
 		return err
 	}
@@ -187,13 +191,14 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 	if cfg.Emitter != nil {
 		cfg.Emitter.Debug("claim-accepted")
 	}
-
-	directCandidate := ""
-	if !cfg.ForceRelay && decision.Accept != nil {
-		if candidate, ok := firstDirectCandidate(ctx, probeConn, decision.Accept.Candidates); ok {
-			directCandidate = candidate
-		}
+	transportCtx, transportCancel := context.WithCancel(ctx)
+	defer transportCancel()
+	transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, probeConn, dm, derpClient, listenerDERP, cfg.ForceRelay)
+	if err != nil {
+		return err
 	}
+	defer transportCleanup()
+	emitTransportPathTransitions(transportCtx, cfg.Emitter, transportManager)
 
 	_, listenerAddr, senderAddr := wg.DeriveAddresses(tok.SessionID)
 	sessionNode, err := wg.NewNode(wg.Config{
@@ -204,6 +209,7 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 		PacketConn:    probeConn,
 		DERPClient:    derpClient,
 		PeerDERP:      listenerDERP,
+		PathSelector:  transportManager,
 	})
 	if err != nil {
 		return err
@@ -211,15 +217,6 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 	defer sessionNode.Close()
 	if cfg.Emitter != nil {
 		cfg.Emitter.Debug("sender-node-ready")
-	}
-
-	if directCandidate != "" {
-		if err := sessionNode.SetDirectEndpoint(directCandidate); err != nil {
-			return err
-		}
-		if cfg.Emitter != nil {
-			cfg.Emitter.Debug("direct-endpoint-set")
-		}
 	}
 
 	if cfg.Emitter != nil {
@@ -254,7 +251,7 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 		return err
 	}
 
-	emitStatus(cfg.Emitter, transportState(sessionNode))
+	transportCancel()
 	emitStatus(cfg.Emitter, StateComplete)
 	return nil
 }
@@ -304,12 +301,15 @@ func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
 		if cfg.Emitter != nil {
 			cfg.Emitter.Debug("claim-accepted")
 		}
-
-		if !cfg.ForceRelay {
-			probeCtx, cancel := context.WithTimeout(ctx, directProbeWindow)
-			serveDirectProbes(probeCtx, session.probeConn)
-			cancel()
+		transportCtx, transportCancel := context.WithCancel(ctx)
+		transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, session.probeConn, session.derpMap, session.derp, peerDERP, cfg.ForceRelay)
+		if err != nil {
+			transportCancel()
+			return tok, err
 		}
+		defer transportCancel()
+		defer transportCleanup()
+		emitTransportPathTransitions(transportCtx, cfg.Emitter, transportManager)
 
 		_, listenerAddr, senderAddr := wg.DeriveAddresses(session.token.SessionID)
 		sessionNode, err := wg.NewNode(wg.Config{
@@ -320,6 +320,7 @@ func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
 			PacketConn:    session.probeConn,
 			DERPClient:    session.derp,
 			PeerDERP:      peerDERP,
+			PathSelector:  transportManager,
 		})
 		if err != nil {
 			return tok, err
@@ -368,10 +369,51 @@ func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
 			return tok, err
 		}
 
-		emitStatus(cfg.Emitter, transportState(sessionNode))
+		transportCancel()
 		emitStatus(cfg.Emitter, StateComplete)
 		return tok, nil
 	}
+}
+
+func startExternalTransportManager(
+	ctx context.Context,
+	conn net.PacketConn,
+	dm *tailcfg.DERPMap,
+	derpClient *derpbind.Client,
+	peerDERP key.NodePublic,
+	forceRelay bool,
+) (*transport.Manager, func(), error) {
+	controlCh, unsubscribe := derpClient.Subscribe(func(pkt derpbind.Packet) bool {
+		return pkt.From == peerDERP && isTransportControlPayload(pkt.Payload)
+	})
+
+	cfg := transport.ManagerConfig{
+		RelayConn:               conn,
+		DirectConn:              nil,
+		DisableDirectReads:      true,
+		DiscoveryInterval:       1 * time.Second,
+		EndpointRefreshInterval: 1 * time.Second,
+		DirectStaleTimeout:      10 * time.Second,
+		SendControl: func(ctx context.Context, msg transport.ControlMessage) error {
+			return sendTransportControl(ctx, derpClient, peerDERP, msg)
+		},
+		ReceiveControl: func(ctx context.Context) (transport.ControlMessage, error) {
+			return receiveTransportControl(ctx, controlCh)
+		},
+	}
+	if !forceRelay {
+		cfg.DirectConn = conn
+		cfg.CandidateSource = func(ctx context.Context) []net.Addr {
+			return publicProbeAddrs(ctx, conn, dm)
+		}
+	}
+
+	manager := transport.NewManager(cfg)
+	if err := manager.Start(ctx); err != nil {
+		unsubscribe()
+		return nil, nil, err
+	}
+	return manager, unsubscribe, nil
 }
 
 func transportState(node *wg.Node) State {
@@ -474,6 +516,20 @@ func derpServerURL(node *tailcfg.DERPNode) string {
 	return "https://" + host + "/derp"
 }
 
+func publicDERPMapURL() string {
+	if override := os.Getenv("DERPCAT_TEST_DERP_MAP_URL"); override != "" {
+		return override
+	}
+	return derpbind.PublicDERPMapURL
+}
+
+func publicDERPServerURL(node *tailcfg.DERPNode) string {
+	if override := os.Getenv("DERPCAT_TEST_DERP_SERVER_URL"); override != "" {
+		return override
+	}
+	return derpServerURL(node)
+}
+
 func receiveDecision(ctx context.Context, client *derpbind.Client, from key.NodePublic) (rendezvous.Decision, error) {
 	for {
 		pkt, err := client.Receive(ctx)
@@ -494,6 +550,26 @@ func receiveDecision(ctx context.Context, client *derpbind.Client, from key.Node
 	}
 }
 
+func sendTransportControl(ctx context.Context, client *derpbind.Client, dst key.NodePublic, msg transport.ControlMessage) error {
+	return sendEnvelope(ctx, client, dst, envelope{Type: envelopeControl, Control: &msg})
+}
+
+func receiveTransportControl(ctx context.Context, ch <-chan derpbind.Packet) (transport.ControlMessage, error) {
+	select {
+	case pkt, ok := <-ch:
+		if !ok {
+			return transport.ControlMessage{}, net.ErrClosed
+		}
+		env, err := decodeEnvelope(pkt.Payload)
+		if err != nil || env.Type != envelopeControl || env.Control == nil {
+			return transport.ControlMessage{}, errors.New("unexpected control payload")
+		}
+		return *env.Control, nil
+	case <-ctx.Done():
+		return transport.ControlMessage{}, ctx.Err()
+	}
+}
+
 func sendEnvelope(ctx context.Context, client *derpbind.Client, dst key.NodePublic, env envelope) error {
 	payload, err := json.Marshal(env)
 	if err != nil {
@@ -509,6 +585,9 @@ func decodeEnvelope(payload []byte) (envelope, error) {
 }
 
 func publicProbeCandidates(ctx context.Context, conn net.PacketConn, dm *tailcfg.DERPMap) []string {
+	if fakeTransportCandidatesBlocked() {
+		return nil
+	}
 	if conn == nil {
 		return nil
 	}
@@ -554,6 +633,46 @@ func publicProbeCandidates(ctx context.Context, conn net.PacketConn, dm *tailcfg
 	}
 	slices.Sort(candidates)
 	return candidates
+}
+
+func publicProbeAddrs(ctx context.Context, conn net.PacketConn, dm *tailcfg.DERPMap) []net.Addr {
+	raw := publicProbeCandidates(ctx, conn, dm)
+	addrs := make([]net.Addr, 0, len(raw))
+	for _, candidate := range raw {
+		addrPort, err := netip.ParseAddrPort(candidate)
+		if err != nil {
+			continue
+		}
+		addrs = append(addrs, &net.UDPAddr{
+			IP:   append(net.IP(nil), addrPort.Addr().AsSlice()...),
+			Port: int(addrPort.Port()),
+			Zone: addrPort.Addr().Zone(),
+		})
+	}
+	return addrs
+}
+
+func isTransportControlPayload(payload []byte) bool {
+	if len(payload) == 0 || payload[0] != '{' {
+		return false
+	}
+	env, err := decodeEnvelope(payload)
+	return err == nil && env.Type == envelopeControl && env.Control != nil
+}
+
+func fakeTransportCandidatesBlocked() bool {
+	if os.Getenv("DERPCAT_FAKE_TRANSPORT") != "1" {
+		return false
+	}
+	raw := os.Getenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT")
+	if raw == "" {
+		return false
+	}
+	enableAt, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return false
+	}
+	return time.Now().Before(time.Unix(0, enableAt))
 }
 
 func firstDirectCandidate(ctx context.Context, conn net.PacketConn, candidates []string) (string, bool) {
