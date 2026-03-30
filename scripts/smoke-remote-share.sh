@@ -64,6 +64,31 @@ wait_for_remote_bind() {
   return 1
 }
 
+path_trace() {
+  local file="$1"
+  grep -Eo 'connected-(relay|direct)' "${file}" 2>/dev/null || true
+}
+
+remote_path_trace() {
+  local file="$1"
+  remote "grep -Eo 'connected-(relay|direct)' '${file}' 2>/dev/null || true"
+}
+
+assert_path_evidence() {
+  local label="$1"
+  local trace="$2"
+
+  if [[ -z "${trace}" ]]; then
+    echo "${label} missing path evidence" >&2
+    exit 1
+  fi
+
+  printf '%s path trace:\n%s\n' "${label}" "${trace}" >&2
+  if grep -q 'connected-relay' <<<"${trace}" && grep -q 'connected-direct' <<<"${trace}"; then
+    echo "${label} path transition observed" >&2
+  fi
+}
+
 mise run build
 mise run build-linux-amd64
 scp dist/derpcat-linux-amd64 "root@${target}:${remote_upload}" >/dev/null
@@ -76,7 +101,7 @@ python3 -m http.server "${local_http_port}" --bind 127.0.0.1 --directory "${tmp}
 local_http_pid=$!
 
 local_share_log="${tmp}/share.err"
-dist/derpcat share "127.0.0.1:${local_http_port}" >"${tmp}/share.out" 2>"${local_share_log}" &
+dist/derpcat --verbose share "127.0.0.1:${local_http_port}" >"${tmp}/share.out" 2>"${local_share_log}" &
 local_share_pid=$!
 
 token="$(wait_for_local_token "${local_share_log}")" || {
@@ -86,7 +111,7 @@ token="$(wait_for_local_token "${local_share_log}")" || {
 }
 
 remote_open_err="${remote_base}.open.err"
-remote "rm -f '${remote_base}.pid' '${remote_open_err}'; nohup /usr/local/bin/derpcat open '${token}' >/dev/null 2>'${remote_open_err}' </dev/null & echo \$! > '${remote_base}.pid'"
+remote "rm -f '${remote_base}.pid' '${remote_open_err}'; nohup /usr/local/bin/derpcat --verbose open '${token}' >/dev/null 2>'${remote_open_err}' </dev/null & echo \$! > '${remote_base}.pid'"
 bind_addr="$(wait_for_remote_bind "${remote_open_err}")" || {
   echo "failed to capture remote bind address" >&2
   remote "sed -n '1,200p' '${remote_open_err}'" >&2 || true
@@ -110,4 +135,5 @@ if [[ "${response_two}" != "${shared_content}" ]]; then
 fi
 
 grep -q '^claimed$' "${local_share_log}"
-remote "grep -Eq 'connected-(direct|relay)' '${remote_open_err}'"
+assert_path_evidence "share" "$(path_trace "${local_share_log}")"
+assert_path_evidence "open" "$(remote_path_trace "${remote_open_err}")"

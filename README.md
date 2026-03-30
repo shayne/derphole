@@ -26,6 +26,10 @@ npx derpcat@dev version
 mise run build
 ```
 
+## Runtime Notes
+
+`derpcat` sessions can start on DERP relay and later promote to direct UDP without restarting. Use `--verbose` when you want to observe status transitions such as `connected-relay` and `connected-direct`; the live smoke scripts now inspect the full trace instead of only a final state.
+
 ## Development
 
 ```bash
@@ -37,9 +41,12 @@ mise run check
 ## Test
 
 ```bash
-mise run test
-mise run smoke-local
+mise run check
+./scripts/smoke-local.sh
+mise run smoke-remote
 mise run smoke-remote-share
+./scripts/promotion-test.sh hetz 1024
+./scripts/promotion-test.sh pve1 1024
 ```
 
 ## Usage

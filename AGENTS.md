@@ -20,7 +20,7 @@ Use `mise` for toolchain consistency.
 - `mise run release:build-all` builds vendored binaries, release tarballs, and `dist/npm`
 - `mise run release:npm-dry-run` validates the npm package without publishing
 
-For remote verification, use tasks such as `mise run smoke-remote`, `mise run smoke-remote-share`, and `mise run promotion-1g-hetz`.
+For remote verification, use tasks such as `mise run smoke-remote`, `mise run smoke-remote-share`, and `mise run promotion-1g-hetz`. These live checks now rely on verbose path traces, so a single run may show both `connected-relay` and `connected-direct` as the session promotes.
 
 ## Coding Style & Naming Conventions
 
@@ -34,7 +34,9 @@ Tests live alongside code in `*_test.go` files. Prefer focused package tests fir
 
 - Package-level example: `go test ./pkg/token -run TestEncode`
 - Full suite: `mise run test`
-- Network/regression coverage: `mise run smoke-local`
+- Network/regression coverage: `mise run smoke-local` or `./scripts/smoke-local.sh`
+
+For live transport verification, prefer `./scripts/smoke-remote.sh hetz`, `./scripts/smoke-remote.sh pve1`, `./scripts/smoke-remote-share.sh pve1`, and `./scripts/promotion-test.sh hetz 1024` / `pve1 1024` when you need to inspect relay-first to direct-upgrade traces.
 
 When changing release or packaging behavior, also run `mise run release:npm-dry-run`.
 

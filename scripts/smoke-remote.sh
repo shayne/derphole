@@ -69,6 +69,31 @@ wait_for_local_exit() {
   return 1
 }
 
+path_trace() {
+  local file="$1"
+  grep -Eo 'connected-(relay|direct)' "${file}" 2>/dev/null || true
+}
+
+remote_path_trace() {
+  local file="$1"
+  remote "grep -Eo 'connected-(relay|direct)' '${file}' 2>/dev/null || true"
+}
+
+assert_path_evidence() {
+  local label="$1"
+  local trace="$2"
+
+  if [[ -z "${trace}" ]]; then
+    echo "${label} missing path evidence" >&2
+    exit 1
+  fi
+
+  printf '%s path trace:\n%s\n' "${label}" "${trace}" >&2
+  if grep -q 'connected-relay' <<<"${trace}" && grep -q 'connected-direct' <<<"${trace}"; then
+    echo "${label} path transition observed" >&2
+  fi
+}
+
 dump_remote_logs() {
   remote "echo '--- remote err'; sed -n '1,160p' '${remote_base}.err' 2>/dev/null || true; echo '--- remote out'; sed -n '1,160p' '${remote_base}.out' 2>/dev/null || true; echo '--- remote sender err'; sed -n '1,160p' '${remote_base}.sender.err' 2>/dev/null || true; echo '--- remote sender out'; sed -n '1,160p' '${remote_base}.sender.out' 2>/dev/null || true"
 }
@@ -79,13 +104,13 @@ scp dist/derpcat-linux-amd64 "root@${target}:${remote_upload}"
 remote "install -m 0755 '${remote_upload}' /usr/local/bin/derpcat && rm -f '${remote_upload}' && /usr/local/bin/derpcat --help >/dev/null 2>&1"
 
 payload_local_to_remote="hello local-to-${target}-$(date +%s)"
-remote "rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err'; nohup /usr/local/bin/derpcat listen >'${remote_base}.out' 2>'${remote_base}.err' </dev/null & echo \$! > '${remote_base}.pid'"
+remote "rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err'; nohup /usr/local/bin/derpcat --verbose listen >'${remote_base}.out' 2>'${remote_base}.err' </dev/null & echo \$! > '${remote_base}.pid'"
 remote_token="$(wait_for_remote_token)" || {
   echo "failed to capture remote listener token" >&2
   dump_remote_logs >&2
   exit 1
 }
-printf '%s' "${payload_local_to_remote}" | dist/derpcat send "${remote_token}" >"${tmp}/local-sender.out" 2>"${tmp}/local-sender.err"
+printf '%s' "${payload_local_to_remote}" | dist/derpcat --verbose send "${remote_token}" >"${tmp}/local-sender.out" 2>"${tmp}/local-sender.err"
 wait_for_remote_exit || {
   echo "remote listener did not exit" >&2
   dump_remote_logs >&2
@@ -99,18 +124,20 @@ if [[ "${remote_output}" != "${payload_local_to_remote}" ]]; then
   dump_remote_logs >&2
   exit 1
 fi
+assert_path_evidence "local sender" "$(path_trace "${tmp}/local-sender.err")"
+assert_path_evidence "remote listener" "$(remote_path_trace "${remote_base}.err")"
 
 payload_remote_to_local="hello ${target}-to-local-$(date +%s)"
 local_listener_log="${tmp}/local-listener.err"
 local_listener_out="${tmp}/local-listener.out"
-dist/derpcat listen >"${local_listener_out}" 2>"${local_listener_log}" &
+dist/derpcat --verbose listen >"${local_listener_out}" 2>"${local_listener_log}" &
 local_listener_pid=$!
 local_token="$(wait_for_local_token "${local_listener_log}")" || {
   echo "failed to capture local listener token" >&2
   sed -n '1,160p' "${local_listener_log}" >&2 || true
   exit 1
 }
-remote "printf '%s' '${payload_remote_to_local}' | /usr/local/bin/derpcat send '${local_token}' >'${remote_base}.sender.out' 2>'${remote_base}.sender.err'"
+remote "printf '%s' '${payload_remote_to_local}' | /usr/local/bin/derpcat --verbose send '${local_token}' >'${remote_base}.sender.out' 2>'${remote_base}.sender.err'"
 wait_for_local_exit "${local_listener_pid}" || {
   echo "local listener did not exit" >&2
   sed -n '1,160p' "${local_listener_log}" >&2 || true
@@ -127,3 +154,5 @@ if [[ "${local_output}" != "${payload_remote_to_local}" ]]; then
   dump_remote_logs >&2
   exit 1
 fi
+assert_path_evidence "local listener" "$(path_trace "${local_listener_log}")"
+assert_path_evidence "remote sender" "$(remote_path_trace "${remote_base}.sender.err")"
