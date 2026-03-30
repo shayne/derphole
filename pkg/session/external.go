@@ -32,7 +32,6 @@ const (
 	envelopeAck      = "ack"
 
 	overlayPort       = 7000
-	directProbeWindow = 1 * time.Second
 	dialRetryInterval = 100 * time.Millisecond
 )
 
@@ -430,13 +429,6 @@ func startExternalTransportManager(
 	return manager, unsubscribe, nil
 }
 
-func transportState(node *wg.Node) State {
-	if node != nil && node.DirectConfirmed() {
-		return StateDirect
-	}
-	return StateRelay
-}
-
 func dialOverlay(ctx context.Context, node *wg.Node, addr netip.AddrPort) (net.Conn, error) {
 	ticker := time.NewTicker(dialRetryInterval)
 	defer ticker.Stop()
@@ -695,42 +687,4 @@ func fakeTransportCandidatesBlocked() bool {
 		return false
 	}
 	return time.Now().Before(time.Unix(0, enableAt))
-}
-
-func firstDirectCandidate(ctx context.Context, conn net.PacketConn, candidates []string) (string, bool) {
-	for _, candidate := range candidates {
-		result, err := traversal.ProbeDirect(ctx, conn, candidate, nil, "")
-		if err == nil && result.Direct {
-			return candidate, true
-		}
-	}
-	return "", false
-}
-
-func serveDirectProbes(ctx context.Context, conn net.PacketConn) {
-	if conn == nil {
-		return
-	}
-	buf := make([]byte, 64<<10)
-	for {
-		deadline := time.Now().Add(250 * time.Millisecond)
-		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
-			deadline = ctxDeadline
-		}
-		_ = conn.SetReadDeadline(deadline)
-		n, addr, err := conn.ReadFrom(buf)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
-				continue
-			}
-			return
-		}
-		if string(buf[:n]) == "derpcat-probe" {
-			_, _ = conn.WriteTo([]byte("derpcat-ack"), addr)
-		}
-	}
 }

@@ -262,6 +262,27 @@ func TestShareTokenAllowsOneClaimer(t *testing.T) {
 	backendDone()
 }
 
+func TestShareOpenExternalCanUpgradeAfterRelayStartAndServeConnections(t *testing.T) {
+	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
+
+	result := runExternalShareOpenSession(t, shareOpenRoundTripConfig{
+		relayPayload:    "relay-first",
+		upgradePayloads: []string{"direct-one", "direct-two", "direct-three"},
+	})
+
+	if !result.SeenRelay || !result.SeenDirect {
+		t.Fatalf("SeenRelay=%v SeenDirect=%v share=%q open=%q", result.SeenRelay, result.SeenDirect, result.ShareStatus, result.OpenStatus)
+	}
+	if got := result.RelayReply; got != "relay-first" {
+		t.Fatalf("relay reply = %q, want %q", got, "relay-first")
+	}
+	for _, payload := range []string{"direct-one", "direct-two", "direct-three"} {
+		if got := result.UpgradeReplies[payload]; got != payload {
+			t.Fatalf("upgrade reply for %q = %q, want %q", payload, got, payload)
+		}
+	}
+}
+
 func TestExternalListenSendCanUpgradeAfterRelayStart(t *testing.T) {
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
 	result := runExternalRoundTrip(t, roundTripConfig{
@@ -324,10 +345,24 @@ type roundTripConfig struct {
 	payload []byte
 }
 
+type shareOpenRoundTripConfig struct {
+	relayPayload    string
+	upgradePayloads []string
+}
+
 type roundTripResult struct {
 	Output         string
 	ListenerStatus string
 	SenderStatus   string
+	SeenRelay      bool
+	SeenDirect     bool
+}
+
+type shareOpenRoundTripResult struct {
+	RelayReply     string
+	UpgradeReplies map[string]string
+	ShareStatus    string
+	OpenStatus     string
 	SeenRelay      bool
 	SeenDirect     bool
 }
@@ -422,6 +457,103 @@ func runExternalRoundTrip(t *testing.T, cfg roundTripConfig) roundTripResult {
 		SenderStatus:   senderStatuses,
 		SeenRelay:      strings.Contains(listenerStatuses, string(StateRelay)) && strings.Contains(senderStatuses, string(StateRelay)),
 		SeenDirect:     strings.Contains(listenerStatuses, string(StateDirect)) && strings.Contains(senderStatuses, string(StateDirect)),
+	}
+}
+
+func runExternalShareOpenSession(t *testing.T, cfg shareOpenRoundTripConfig) shareOpenRoundTripResult {
+	t.Helper()
+
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	backendAddr, backendDone := startEchoServer(t, ctx)
+	defer backendDone()
+
+	var shareStatus syncBuffer
+	var openStatus syncBuffer
+
+	tokenSink := make(chan string, 1)
+	shareErr := make(chan error, 1)
+	go func() {
+		_, err := Share(ctx, ShareConfig{
+			Emitter:       telemetry.New(&shareStatus, telemetry.LevelDefault),
+			TokenSink:     tokenSink,
+			TargetAddr:    backendAddr,
+			UsePublicDERP: true,
+		})
+		shareErr <- err
+	}()
+
+	tok := <-tokenSink
+	bindSink := make(chan string, 1)
+	openErr := make(chan error, 1)
+	go func() {
+		openErr <- Open(ctx, OpenConfig{
+			Token:         tok,
+			BindAddrSink:  bindSink,
+			Emitter:       telemetry.New(&openStatus, telemetry.LevelDefault),
+			UsePublicDERP: true,
+		})
+	}()
+
+	openAddr := <-bindSink
+	relayReply, err := roundTripTCP(ctx, openAddr, cfg.relayPayload)
+	if err != nil {
+		t.Fatalf("relay roundTripTCP() error = %v", err)
+	}
+
+	waitForStatusPrefixBuffer(t, &shareStatus, 10*time.Second, string(StateWaiting), string(StateRelay))
+	waitForStatusPrefixBuffer(t, &openStatus, 10*time.Second, string(StateProbing), string(StateRelay))
+	if err := os.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0"); err != nil {
+		t.Fatalf("Setenv(enable direct) error = %v", err)
+	}
+	waitForStatusPrefixBuffer(t, &shareStatus, 10*time.Second, string(StateWaiting), string(StateRelay), string(StateDirect))
+	waitForStatusPrefixBuffer(t, &openStatus, 10*time.Second, string(StateProbing), string(StateRelay), string(StateDirect))
+
+	replies := make(map[string]string, len(cfg.upgradePayloads))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(cfg.upgradePayloads))
+	for _, payload := range cfg.upgradePayloads {
+		wg.Add(1)
+		go func(payload string) {
+			defer wg.Done()
+			reply, err := roundTripTCP(ctx, openAddr, payload)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			mu.Lock()
+			replies[payload] = reply
+			mu.Unlock()
+		}(payload)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("post-upgrade roundTripTCP() error = %v", err)
+		}
+	}
+
+	cancel()
+	waitNoErr(t, <-openErr)
+	waitNoErr(t, <-shareErr)
+
+	shareStatuses := shareStatus.String()
+	openStatuses := openStatus.String()
+	return shareOpenRoundTripResult{
+		RelayReply:     relayReply,
+		UpgradeReplies: replies,
+		ShareStatus:    shareStatuses,
+		OpenStatus:     openStatuses,
+		SeenRelay:      strings.Contains(shareStatuses, string(StateRelay)) && strings.Contains(openStatuses, string(StateRelay)),
+		SeenDirect:     strings.Contains(shareStatuses, string(StateDirect)) && strings.Contains(openStatuses, string(StateDirect)),
 	}
 }
 

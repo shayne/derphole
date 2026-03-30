@@ -25,3 +25,9 @@ func TestRunOpenHelpShowsUsage(t *testing.T) {
 		t.Fatalf("stdout = %q, want empty", got)
 	}
 }
+
+func TestOpenReportsRelayThenDirectWhenTransportUpgrades(t *testing.T) {
+	_, openStderr := runUpgradingExternalShareAndOpen(t)
+
+	assertStatusLinesPrefix(t, openStderr, "open stderr", "probing-direct", "connected-relay", "connected-direct")
+}

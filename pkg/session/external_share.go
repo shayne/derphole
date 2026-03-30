@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net"
 	"net/netip"
-	"sync"
 	"time"
 
 	"github.com/shayne/derpcat/pkg/derpbind"
@@ -100,7 +99,8 @@ func shareExternal(ctx context.Context, cfg ShareConfig) (string, error) {
 	defer session.derp.Close()
 	defer session.probeConn.Close()
 
-	emitStatus(cfg.Emitter, StateWaiting)
+	pathEmitter := newTransportPathEmitter(cfg.Emitter)
+	pathEmitter.Emit(StateWaiting)
 	if cfg.TokenSink != nil {
 		select {
 		case cfg.TokenSink <- tok:
@@ -131,15 +131,19 @@ func shareExternal(ctx context.Context, cfg ShareConfig) (string, error) {
 			continue
 		}
 
-		emitStatus(cfg.Emitter, StateClaimed)
 		if decision.Accept != nil {
 			decision.Accept.Candidates = publicProbeCandidates(ctx, session.probeConn, session.derpMap)
 		}
-		if !cfg.ForceRelay {
-			probeCtx, cancel := context.WithTimeout(ctx, directProbeWindow)
-			serveDirectProbes(probeCtx, session.probeConn)
-			cancel()
+		transportCtx, transportCancel := context.WithCancel(ctx)
+		transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, session.probeConn, session.derpMap, session.derp, peerDERP, cfg.ForceRelay)
+		if err != nil {
+			transportCancel()
+			return tok, err
 		}
+		defer transportCancel()
+		defer transportCleanup()
+		pathEmitter.Watch(transportCtx, transportManager)
+		pathEmitter.Flush(transportManager)
 
 		_, listenerAddr, senderAddr := wg.DeriveAddresses(session.token.SessionID)
 		sessionNode, err := wg.NewNode(wg.Config{
@@ -150,6 +154,7 @@ func shareExternal(ctx context.Context, cfg ShareConfig) (string, error) {
 			PacketConn:    session.probeConn,
 			DERPClient:    session.derp,
 			PeerDERP:      peerDERP,
+			PathSelector:  transportManager,
 		})
 		if err != nil {
 			return tok, err
@@ -165,7 +170,7 @@ func shareExternal(ctx context.Context, cfg ShareConfig) (string, error) {
 		if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
 			return tok, err
 		}
-		return tok, serveOverlayListener(ctx, ln, cfg.TargetAddr, sessionNode, cfg.Emitter)
+		return tok, serveOverlayListener(ctx, ln, cfg.TargetAddr, cfg.Emitter)
 	}
 }
 
@@ -229,12 +234,18 @@ func openExternal(ctx context.Context, cfg OpenConfig, tok token.Token) error {
 		return errors.New("claim rejected")
 	}
 
-	directCandidate := ""
-	if !cfg.ForceRelay && decision.Accept != nil {
-		if candidate, ok := firstDirectCandidate(ctx, probeConn, decision.Accept.Candidates); ok {
-			directCandidate = candidate
-		}
+	pathEmitter := newTransportPathEmitter(cfg.Emitter)
+	pathEmitter.Emit(StateProbing)
+	transportCtx, transportCancel := context.WithCancel(ctx)
+	defer transportCancel()
+	transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, probeConn, dm, derpClient, listenerDERP, cfg.ForceRelay)
+	if err != nil {
+		return err
 	}
+	defer transportCleanup()
+	pathEmitter.Watch(transportCtx, transportManager)
+	pathEmitter.Flush(transportManager)
+	seedAcceptedDecisionCandidates(transportCtx, transportManager, decision)
 
 	_, listenerAddr, senderAddr := wg.DeriveAddresses(tok.SessionID)
 	sessionNode, err := wg.NewNode(wg.Config{
@@ -245,17 +256,12 @@ func openExternal(ctx context.Context, cfg OpenConfig, tok token.Token) error {
 		PacketConn:    probeConn,
 		DERPClient:    derpClient,
 		PeerDERP:      listenerDERP,
+		PathSelector:  transportManager,
 	})
 	if err != nil {
 		return err
 	}
 	defer sessionNode.Close()
-
-	if directCandidate != "" {
-		if err := sessionNode.SetDirectEndpoint(directCandidate); err != nil {
-			return err
-		}
-	}
 
 	listener, err := openLocalListener(cfg, tok)
 	if err != nil {
@@ -264,20 +270,12 @@ func openExternal(ctx context.Context, cfg OpenConfig, tok token.Token) error {
 	defer listener.Close()
 	notifyBindAddr(cfg.BindAddrSink, listener.Addr().String(), ctx)
 
-	var pathOnce sync.Once
 	return serveOpenListener(ctx, listener, func(ctx context.Context) (net.Conn, error) {
-		conn, err := dialOverlay(ctx, sessionNode, netip.AddrPortFrom(listenerAddr, overlayPort))
-		if err == nil {
-			pathOnce.Do(func() {
-				emitStatus(cfg.Emitter, transportState(sessionNode))
-			})
-		}
-		return conn, err
+		return dialOverlay(ctx, sessionNode, netip.AddrPortFrom(listenerAddr, overlayPort))
 	}, cfg.Emitter)
 }
 
-func serveOverlayListener(ctx context.Context, listener net.Listener, targetAddr string, sessionNode *wg.Node, emitter *telemetry.Emitter) error {
-	var pathOnce sync.Once
+func serveOverlayListener(ctx context.Context, listener net.Listener, targetAddr string, emitter *telemetry.Emitter) error {
 	for {
 		overlayConn, err := acceptOverlay(ctx, listener)
 		if err != nil {
@@ -286,10 +284,6 @@ func serveOverlayListener(ctx context.Context, listener net.Listener, targetAddr
 			}
 			return err
 		}
-
-		pathOnce.Do(func() {
-			emitStatus(emitter, transportState(sessionNode))
-		})
 
 		backendConn, err := (&net.Dialer{}).DialContext(ctx, "tcp", targetAddr)
 		if err != nil {
