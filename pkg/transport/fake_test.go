@@ -19,6 +19,8 @@ type fakePacketConn struct {
 	local              net.Addr
 	reads              []packet
 	writes             []packet
+	readAttempts       int
+	readErrors         []error
 	responderEndpoints map[string]net.Addr
 	failWritesTo       map[string]int
 	notify             chan struct{}
@@ -41,6 +43,14 @@ func newFakePacketConn(local net.Addr) *fakePacketConn {
 func (c *fakePacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	for {
 		c.mu.Lock()
+		c.readAttempts++
+		if len(c.readErrors) > 0 {
+			err := c.readErrors[0]
+			c.readErrors = c.readErrors[1:]
+			c.signalLocked()
+			c.mu.Unlock()
+			return 0, nil, err
+		}
 		if len(c.reads) > 0 {
 			pkt := c.reads[0]
 			c.reads = c.reads[1:]
@@ -261,6 +271,33 @@ func (c *fakePacketConn) failNextWriteTo(addr net.Addr) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.failWritesTo[addr.String()]++
+}
+
+func (c *fakePacketConn) failNextRead(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.readErrors = append(c.readErrors, err)
+	c.signalLocked()
+}
+
+func (c *fakePacketConn) waitForReadAttempts(n int, timeout time.Duration) bool {
+	return waitForNotify(timeout, func() (bool, <-chan struct{}) {
+		c.mu.Lock()
+		count := c.readAttempts
+		if count >= n {
+			c.mu.Unlock()
+			return true, nil
+		}
+		waitCh := c.notify
+		c.mu.Unlock()
+		return false, waitCh
+	})
+}
+
+func (c *fakePacketConn) readAttemptsCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.readAttempts
 }
 
 type fakeControlPipe struct {

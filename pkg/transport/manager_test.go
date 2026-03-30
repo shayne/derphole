@@ -464,6 +464,80 @@ func TestManagerRespondsToInboundProbeWithAck(t *testing.T) {
 	}
 }
 
+func TestManagerStopsOnTerminalDirectReadError(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000032, 0))
+	direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	direct.useClock(clock)
+	direct.failNextRead(io.EOF)
+	baseTimers := clock.timerCount()
+
+	mgr := NewManager(ManagerConfig{
+		DirectConn:              direct,
+		Clock:                   clock,
+		DiscoveryInterval:       1 * time.Second,
+		EndpointRefreshInterval: 2 * time.Second,
+		DirectStaleTimeout:      4 * time.Second,
+	})
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+	if !direct.waitForReadAttempts(1, 200*time.Millisecond) {
+		t.Fatal("direct read loop did not observe the terminal reader shutdown")
+	}
+
+	clock.Advance(5 * time.Second)
+	if got := direct.readAttemptsCount(); got != 1 {
+		t.Fatalf("direct read attempts after terminal error = %d, want 1", got)
+	}
+}
+
+func TestManagerRetriesAfterTransientDirectReadError(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000033, 0))
+	direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	direct.useClock(clock)
+	direct.failNextRead(context.DeadlineExceeded)
+	peerCandidate := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 70), Port: 60100}
+	baseTimers := clock.timerCount()
+
+	mgr := NewManager(ManagerConfig{
+		DirectConn:              direct,
+		Clock:                   clock,
+		DiscoveryInterval:       1 * time.Second,
+		EndpointRefreshInterval: 2 * time.Second,
+		DirectStaleTimeout:      4 * time.Second,
+	})
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+	if !direct.waitForReadAttempts(1, 200*time.Millisecond) {
+		t.Fatal("direct read loop did not hit the transient read error")
+	}
+	waitForManagerTimers(t, clock, baseTimers, 3)
+
+	direct.enqueueRead(discoProbePayload, peerCandidate)
+	clock.Advance(250 * time.Millisecond)
+	if !direct.waitForReadAttempts(2, 200*time.Millisecond) {
+		t.Fatal("direct read loop did not retry after transient read error")
+	}
+	if !direct.waitForWritePayloadTo(peerCandidate, discoAckPayload, 200*time.Millisecond) {
+		t.Fatal("manager did not recover to answer a probe after transient direct read error")
+	}
+}
+
 func TestManagerIgnoresUnexpectedDirectNoise(t *testing.T) {
 	t.Helper()
 
@@ -496,6 +570,7 @@ func TestManagerIgnoresUnexpectedDirectNoise(t *testing.T) {
 
 	direct.enqueueRead([]byte("derpcat-ack"), &net.UDPAddr{IP: net.IPv4(100, 64, 0, 99), Port: 9999})
 	direct.enqueueRead([]byte("udp-noise"), &net.UDPAddr{IP: net.IPv4(100, 64, 0, 100), Port: 10000})
+	direct.enqueueRead(append(append([]byte(nil), discoAckPayload...), []byte("-extra")...), &net.UDPAddr{IP: net.IPv4(100, 64, 0, 101), Port: 10001})
 	clock.Advance(1 * time.Second)
 
 	if !waitForPath(t, mgr, PathRelay, 100*time.Millisecond) {
