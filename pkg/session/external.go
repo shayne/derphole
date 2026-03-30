@@ -187,13 +187,13 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 		return errors.New("claim rejected")
 	}
 
-	emitStatus(cfg.Emitter, StateProbing)
+	pathEmitter := newTransportPathEmitter(cfg.Emitter)
+	pathEmitter.Emit(StateProbing)
 	if cfg.Emitter != nil {
 		cfg.Emitter.Debug("claim-accepted")
 	}
 	transportCtx, transportCancel := context.WithCancel(ctx)
 	defer transportCancel()
-	pathEmitter := newTransportPathEmitter(cfg.Emitter)
 	transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, probeConn, dm, derpClient, listenerDERP, cfg.ForceRelay, pathEmitter.Handle)
 	if err != nil {
 		return err
@@ -254,7 +254,7 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 
 	pathEmitter.Flush(transportManager)
 	transportCancel()
-	emitStatus(cfg.Emitter, StateComplete)
+	pathEmitter.Emit(StateComplete)
 	return nil
 }
 
@@ -266,7 +266,8 @@ func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
 	defer deleteRelayMailbox(tok, session)
 	defer session.derp.Close()
 
-	emitStatus(cfg.Emitter, StateWaiting)
+	pathEmitter := newTransportPathEmitter(cfg.Emitter)
+	pathEmitter.Emit(StateWaiting)
 	if cfg.TokenSink != nil {
 		select {
 		case cfg.TokenSink <- tok:
@@ -304,7 +305,6 @@ func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
 			cfg.Emitter.Debug("claim-accepted")
 		}
 		transportCtx, transportCancel := context.WithCancel(ctx)
-		pathEmitter := newTransportPathEmitter(cfg.Emitter)
 		transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, session.probeConn, session.derpMap, session.derp, peerDERP, cfg.ForceRelay, pathEmitter.Handle)
 		if err != nil {
 			transportCancel()
@@ -374,7 +374,7 @@ func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
 
 		pathEmitter.Flush(transportManager)
 		transportCancel()
-		emitStatus(cfg.Emitter, StateComplete)
+		pathEmitter.Emit(StateComplete)
 		return tok, nil
 	}
 }

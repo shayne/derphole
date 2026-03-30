@@ -77,18 +77,17 @@ func (e *transportPathEmitter) Handle(path transport.Path) {
 	}
 
 	e.mu.Lock()
+	defer e.mu.Unlock()
 	if path == e.last {
-		e.mu.Unlock()
 		return
 	}
 	e.last = path
-	e.mu.Unlock()
 
 	switch path {
 	case transport.PathDirect:
-		emitStatus(e.emitter, StateDirect)
+		e.emitter.Status(string(StateDirect))
 	case transport.PathRelay:
-		emitStatus(e.emitter, StateRelay)
+		e.emitter.Status(string(StateRelay))
 	}
 }
 
@@ -97,4 +96,14 @@ func (e *transportPathEmitter) Flush(manager *transport.Manager) {
 		return
 	}
 	e.Handle(manager.PathState())
+}
+
+func (e *transportPathEmitter) Emit(state State) {
+	if e == nil || e.emitter == nil {
+		return
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.emitter.Status(string(state))
 }
