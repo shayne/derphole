@@ -21,13 +21,13 @@ var (
 
 func (m *Manager) discoveryLoop(ctx context.Context) {
 	for {
-		m.discoveryTick(ctx)
-
 		select {
 		case <-ctx.Done():
 			return
 		case <-m.cfg.Clock.After(m.discoveryInterval()):
 		}
+
+		m.discoveryTick(ctx)
 	}
 }
 
@@ -66,7 +66,11 @@ func (m *Manager) directReadLoop(ctx context.Context) {
 		return
 	}
 
-	buf := make([]byte, len(discoAckPayload))
+	bufLen := len(discoProbePayload)
+	if len(discoAckPayload) > bufLen {
+		bufLen = len(discoAckPayload)
+	}
+	buf := make([]byte, bufLen)
 	for {
 		if err := m.cfg.DirectConn.SetReadDeadline(m.now().Add(m.discoveryInterval())); err != nil {
 			return
@@ -79,6 +83,10 @@ func (m *Manager) directReadLoop(ctx context.Context) {
 			if isTimeout(err) {
 				continue
 			}
+			continue
+		}
+		if bytes.Equal(buf[:n], discoProbePayload) {
+			_, _ = m.cfg.DirectConn.WriteTo(discoAckPayload, addr)
 			continue
 		}
 		if !bytes.Equal(buf[:n], discoAckPayload) {
