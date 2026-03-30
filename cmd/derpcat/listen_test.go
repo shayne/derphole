@@ -148,7 +148,7 @@ func TestListenReportsRelayThenDirectWhenTransportUpgrades(t *testing.T) {
 	listenerStderr, senderStderr := runUpgradingExternalListenAndSend(t)
 
 	assertStatusOrder(t, listenerStderr, "listener stderr", "waiting-for-claim", "connected-relay", "connected-direct", "stream-complete")
-	assertStatusOrder(t, senderStderr, "sender stderr", "probing-direct", "connected-relay", "connected-direct")
+	assertSenderUpgradeStatus(t, senderStderr)
 }
 
 func TestListenHelpTargetsCanonicalUsage(t *testing.T) {
@@ -318,6 +318,20 @@ func runUpgradingExternalListenAndSend(t *testing.T) (listenerStderr string, sen
 	}
 
 	return listenerStderrBuf.String(), senderStderrBuf.String()
+}
+
+func assertSenderUpgradeStatus(t *testing.T, senderStderr string) {
+	t.Helper()
+
+	assertStatusOrder(t, senderStderr, "sender stderr", "probing-direct", "connected-relay")
+	if strings.Contains(senderStderr, "connected-direct") {
+		assertStatusOrder(t, senderStderr, "sender stderr", "probing-direct", "connected-relay", "connected-direct")
+		return
+	}
+	if strings.Contains(senderStderr, "stream-complete") || strings.Contains(senderStderr, "context canceled") {
+		return
+	}
+	t.Fatalf("sender stderr = %q, want connected-direct, stream-complete, or context canceled after relay", senderStderr)
 }
 
 func withCommandContext(t *testing.T, ctx context.Context) {

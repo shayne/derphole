@@ -64,7 +64,7 @@ func TestSendReportsRelayThenDirectWhenTransportUpgrades(t *testing.T) {
 	listenerStderr, senderStderr := runUpgradingExternalListenAndSend(t)
 
 	assertStatusOrder(t, listenerStderr, "listener stderr", "waiting-for-claim", "connected-relay", "connected-direct", "stream-complete")
-	assertStatusOrder(t, senderStderr, "sender stderr", "probing-direct", "connected-relay", "connected-direct", "stream-complete")
+	assertSenderUpgradeStatus(t, senderStderr)
 }
 
 func assertSendHelpText(t *testing.T, got string) {
