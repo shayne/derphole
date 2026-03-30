@@ -107,24 +107,6 @@ func (c *fakePacketConn) SetDeadline(t time.Time) error {
 func (c *fakePacketConn) SetReadDeadline(t time.Time) error { return c.SetDeadline(t) }
 func (c *fakePacketConn) SetWriteDeadline(time.Time) error  { return nil }
 
-func (c *fakePacketConn) inject(payload []byte, addr net.Addr) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.reads = append(c.reads, packet{
-		payload: append([]byte(nil), payload...),
-		addr:    addr,
-	})
-	c.signalLocked()
-}
-
-func (c *fakePacketConn) writesSnapshot() []packet {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	out := make([]packet, len(c.writes))
-	copy(out, c.writes)
-	return out
-}
-
 func (c *fakePacketConn) signalLocked() {
 	next := make(chan struct{})
 	close(c.notify)

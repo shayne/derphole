@@ -25,6 +25,10 @@ func TestManagerStartsRelayAndLaterUpgradesDirect(t *testing.T) {
 		t.Fatalf("PathState() = %v, want %v", got, PathRelay)
 	}
 
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
 	if err := mgr.WaitForUpgrade(ctx); err != nil {
 		t.Fatalf("WaitForUpgrade() error = %v", err)
 	}
@@ -44,6 +48,10 @@ func TestManagerFallsBackToRelayWhenDirectBreaks(t *testing.T) {
 		RelayConn:  relay,
 		DirectConn: direct,
 	})
+
+	if err := mgr.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
 
 	if err := mgr.MarkDirectBroken(); err != nil {
 		t.Fatalf("MarkDirectBroken() error = %v", err)
@@ -65,6 +73,10 @@ func TestManagerDoesNotReportDirectForUnownedUDPNoise(t *testing.T) {
 		NoiseConn:  noise,
 		DirectConn: nil,
 	})
+
+	if err := mgr.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
 
 	if err := mgr.ObserveInboundUDPNoise(noise.LocalAddr(), []byte("random udp noise")); err != nil {
 		t.Fatalf("ObserveInboundUDPNoise() error = %v", err)
