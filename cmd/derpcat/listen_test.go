@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -147,8 +148,8 @@ func TestListenWithoutFlagsUsesStderrForTokenAndStdoutForPayload(t *testing.T) {
 func TestListenReportsRelayThenDirectWhenTransportUpgrades(t *testing.T) {
 	listenerStderr, senderStderr := runUpgradingExternalListenAndSend(t)
 
-	assertStatusOrder(t, listenerStderr, "listener stderr", "waiting-for-claim", "connected-relay", "connected-direct", "stream-complete")
-	assertStatusOrder(t, senderStderr, "sender stderr", "probing-direct", "connected-relay", "connected-direct")
+	assertStatusLinesExact(t, listenerStderr, "listener stderr", "waiting-for-claim", "connected-relay", "connected-direct", "stream-complete")
+	assertStatusLinesPrefix(t, senderStderr, "sender stderr", "probing-direct", "connected-relay", "connected-direct")
 }
 
 func TestListenHelpTargetsCanonicalUsage(t *testing.T) {
@@ -256,7 +257,7 @@ func runUpgradingExternalListenAndSend(t *testing.T) (listenerStderr string, sen
 	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
 	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(1*time.Second).UnixNano(), 10))
+	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
 	t.Setenv("DERPCAT_TEST_LOCAL_RELAY", "")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -270,17 +271,29 @@ func runUpgradingExternalListenAndSend(t *testing.T) (listenerStderr string, sen
 	}()
 
 	issuedToken := waitForIssuedToken(t, listenerStderrBuf)
-	time.Sleep(500 * time.Millisecond)
 
 	var senderStdout bytes.Buffer
 	var senderStderrBuf lockedBuffer
+	releaseEOF := make(chan struct{})
 	senderDone := make(chan int, 1)
 	go func() {
-		senderDone <- runSend([]string{issuedToken}, telemetry.LevelDefault, &holdEOFReader{
-			payload: []byte("upgrade-me"),
-			hold:    6 * time.Second,
+		senderDone <- runSend([]string{issuedToken}, telemetry.LevelDefault, &directGateReader{
+			ctx:        ctx,
+			payload:    []byte("upgrade-me"),
+			releaseEOF: releaseEOF,
 		}, &senderStdout, &senderStderrBuf)
 	}()
+
+	waitForStatusPrefix(t, listenerStderrBuf, 10*time.Second, "waiting-for-claim", "connected-relay")
+	waitForStatusPrefix(t, &senderStderrBuf, 10*time.Second, "probing-direct", "connected-relay")
+
+	if err := os.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0"); err != nil {
+		t.Fatalf("Setenv(enable direct) error = %v", err)
+	}
+
+	waitForStatusPrefix(t, listenerStderrBuf, 10*time.Second, "waiting-for-claim", "connected-relay", "connected-direct")
+	waitForStatusPrefix(t, &senderStderrBuf, 10*time.Second, "probing-direct", "connected-relay", "connected-direct")
+	close(releaseEOF)
 
 	select {
 	case code := <-listenerDone:
@@ -330,42 +343,97 @@ func withCommandContext(t *testing.T, ctx context.Context) {
 	})
 }
 
-type holdEOFReader struct {
-	payload []byte
-	hold    time.Duration
-	sent    bool
-	waited  bool
+type outputBuffer interface {
+	String() string
 }
 
-func (r *holdEOFReader) Read(p []byte) (int, error) {
+type directGateReader struct {
+	ctx        context.Context
+	payload    []byte
+	releaseEOF <-chan struct{}
+	sent       bool
+}
+
+func (r *directGateReader) Read(p []byte) (int, error) {
 	if !r.sent {
 		r.sent = true
 		return copy(p, r.payload), nil
 	}
-	if !r.waited {
-		r.waited = true
-		if r.hold > 0 {
-			time.Sleep(r.hold)
-		}
+	select {
+	case <-r.releaseEOF:
+		return 0, io.EOF
+	case <-r.ctx.Done():
+		return 0, r.ctx.Err()
 	}
-	return 0, io.EOF
 }
 
-func assertStatusOrder(t *testing.T, got, label string, statuses ...string) {
+func waitForStatusPrefix(t *testing.T, buf outputBuffer, timeout time.Duration, want ...string) {
 	t.Helper()
 
-	last := -1
-	for _, status := range statuses {
-		idx := strings.Index(got, status)
-		if idx == -1 {
-			t.Fatalf("%s = %q, want status %q", label, got, status)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if hasStatusPrefix(statusLines(buf.String()), want) {
+			return
 		}
-		if idx < last {
-			t.Fatalf("%s = %q, want statuses in order %v", label, got, statuses)
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("statuses = %q, want prefix %v", buf.String(), want)
+}
+
+func assertStatusLinesExact(t *testing.T, got, label string, want ...string) {
+	t.Helper()
+
+	lines := statusLines(got)
+	if len(lines) != len(want) {
+		t.Fatalf("%s statuses = %q, want exact %v", label, lines, want)
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Fatalf("%s statuses = %q, want exact %v", label, lines, want)
 		}
-		last = idx
 	}
 }
+
+func assertStatusLinesPrefix(t *testing.T, got, label string, want ...string) {
+	t.Helper()
+
+	lines := statusLines(got)
+	if !hasStatusPrefix(lines, want) {
+		t.Fatalf("%s statuses = %q, want prefix %v", label, lines, want)
+	}
+}
+
+func hasStatusPrefix(got, want []string) bool {
+	if len(got) < len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func statusLines(got string) []string {
+	lines := make([]string, 0)
+	for _, line := range strings.Split(got, "\n") {
+		line = strings.TrimSpace(line)
+		switch line {
+		case string(sessionStatusWaiting), string(sessionStatusProbing), string(sessionStatusRelay), string(sessionStatusDirect), string(sessionStatusComplete):
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+const (
+	sessionStatusWaiting  = "waiting-for-claim"
+	sessionStatusProbing  = "probing-direct"
+	sessionStatusRelay    = "connected-relay"
+	sessionStatusDirect   = "connected-direct"
+	sessionStatusComplete = "stream-complete"
+)
 
 type commandTestDERPServer struct {
 	MapURL  string

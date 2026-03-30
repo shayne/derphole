@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -262,9 +263,7 @@ func TestShareTokenAllowsOneClaimer(t *testing.T) {
 func TestExternalListenSendCanUpgradeAfterRelayStart(t *testing.T) {
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
 	result := runExternalRoundTrip(t, roundTripConfig{
-		payload:           []byte("upgrade-me"),
-		enableDirectAfter: 1 * time.Second,
-		keepAlive:         8 * time.Second,
+		payload: []byte("upgrade-me"),
 	})
 
 	if !result.SeenRelay || !result.SeenDirect {
@@ -276,9 +275,7 @@ func TestExternalListenSendCanUpgradeAfterRelayStart(t *testing.T) {
 }
 
 type roundTripConfig struct {
-	payload           []byte
-	enableDirectAfter time.Duration
-	keepAlive         time.Duration
+	payload []byte
 }
 
 type roundTripResult struct {
@@ -295,13 +292,11 @@ func runExternalRoundTrip(t *testing.T, cfg roundTripConfig) roundTripResult {
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
 	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
-
-	enableDirectAt := time.Now().Add(cfg.enableDirectAfter).UnixNano()
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(enableDirectAt, 10))
+	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	timeout := time.After(cfg.keepAlive + 20*time.Second)
+	timeout := time.After(20 * time.Second)
 
 	var listenerOut bytes.Buffer
 	var listenerStatus syncBuffer
@@ -320,16 +315,25 @@ func runExternalRoundTrip(t *testing.T, cfg roundTripConfig) roundTripResult {
 	}()
 
 	token := <-tokenSink
-	time.Sleep(500 * time.Millisecond)
+	releaseEOF := make(chan struct{})
 	sendErr := make(chan error, 1)
 	go func() {
 		sendErr <- Send(ctx, SendConfig{
 			Token:         token,
 			Emitter:       telemetry.New(&senderStatus, telemetry.LevelDefault),
-			StdioIn:       &lingerReader{payload: cfg.payload, hold: cfg.keepAlive},
+			StdioIn:       &sessionDirectGateReader{ctx: ctx, payload: cfg.payload, releaseEOF: releaseEOF},
 			UsePublicDERP: true,
 		})
 	}()
+
+	waitForStatusPrefixBuffer(t, &listenerStatus, 10*time.Second, "waiting-for-claim", "connected-relay")
+	waitForStatusPrefixBuffer(t, &senderStatus, 10*time.Second, "probing-direct", "connected-relay")
+	if err := os.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0"); err != nil {
+		t.Fatalf("Setenv(enable direct) error = %v", err)
+	}
+	waitForStatusPrefixBuffer(t, &listenerStatus, 10*time.Second, "waiting-for-claim", "connected-relay", "connected-direct")
+	waitForStatusPrefixBuffer(t, &senderStatus, 10*time.Second, "probing-direct", "connected-relay", "connected-direct")
+	close(releaseEOF)
 
 	select {
 	case err := <-listenErr:
@@ -383,11 +387,61 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-type lingerReader struct {
-	payload []byte
-	hold    time.Duration
-	sent    bool
-	waited  bool
+type sessionDirectGateReader struct {
+	ctx        context.Context
+	payload    []byte
+	releaseEOF <-chan struct{}
+	sent       bool
+}
+
+func (r *sessionDirectGateReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		return copy(p, r.payload), nil
+	}
+	select {
+	case <-r.releaseEOF:
+		return 0, io.EOF
+	case <-r.ctx.Done():
+		return 0, r.ctx.Err()
+	}
+}
+
+func waitForStatusPrefixBuffer(t *testing.T, buf interface{ String() string }, timeout time.Duration, want ...string) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if hasSessionStatusPrefix(sessionStatusLines(buf.String()), want) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("statuses = %q, want prefix %v", buf.String(), want)
+}
+
+func hasSessionStatusPrefix(got, want []string) bool {
+	if len(got) < len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sessionStatusLines(got string) []string {
+	lines := make([]string, 0)
+	for _, line := range strings.Split(got, "\n") {
+		line = strings.TrimSpace(line)
+		switch line {
+		case string(StateWaiting), string(StateProbing), string(StateRelay), string(StateDirect), string(StateComplete):
+			lines = append(lines, line)
+		}
+	}
+	return lines
 }
 
 type sessionTestDERPServer struct {
@@ -441,20 +495,6 @@ func newSessionTestDERPServer(t *testing.T) *sessionTestDERPServer {
 		DERPURL: derpHTTP.URL + "/derp",
 		Map:     dm,
 	}
-}
-
-func (r *lingerReader) Read(p []byte) (int, error) {
-	if !r.sent {
-		r.sent = true
-		return copy(p, r.payload), nil
-	}
-	if !r.waited {
-		r.waited = true
-		if r.hold > 0 {
-			time.Sleep(r.hold)
-		}
-	}
-	return 0, io.EOF
 }
 
 func connectWithRetry(ctx context.Context, addr string) (net.Conn, error) {

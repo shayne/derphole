@@ -193,12 +193,13 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 	}
 	transportCtx, transportCancel := context.WithCancel(ctx)
 	defer transportCancel()
-	transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, probeConn, dm, derpClient, listenerDERP, cfg.ForceRelay)
+	pathEmitter := newTransportPathEmitter(cfg.Emitter)
+	transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, probeConn, dm, derpClient, listenerDERP, cfg.ForceRelay, pathEmitter.Handle)
 	if err != nil {
 		return err
 	}
 	defer transportCleanup()
-	flushTransportPath := emitTransportPathTransitions(transportCtx, cfg.Emitter, transportManager)
+	pathEmitter.Flush(transportManager)
 
 	_, listenerAddr, senderAddr := wg.DeriveAddresses(tok.SessionID)
 	sessionNode, err := wg.NewNode(wg.Config{
@@ -251,7 +252,7 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 		return err
 	}
 
-	flushTransportPath()
+	pathEmitter.Flush(transportManager)
 	transportCancel()
 	emitStatus(cfg.Emitter, StateComplete)
 	return nil
@@ -303,14 +304,15 @@ func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
 			cfg.Emitter.Debug("claim-accepted")
 		}
 		transportCtx, transportCancel := context.WithCancel(ctx)
-		transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, session.probeConn, session.derpMap, session.derp, peerDERP, cfg.ForceRelay)
+		pathEmitter := newTransportPathEmitter(cfg.Emitter)
+		transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, session.probeConn, session.derpMap, session.derp, peerDERP, cfg.ForceRelay, pathEmitter.Handle)
 		if err != nil {
 			transportCancel()
 			return tok, err
 		}
 		defer transportCancel()
 		defer transportCleanup()
-		flushTransportPath := emitTransportPathTransitions(transportCtx, cfg.Emitter, transportManager)
+		pathEmitter.Flush(transportManager)
 
 		_, listenerAddr, senderAddr := wg.DeriveAddresses(session.token.SessionID)
 		sessionNode, err := wg.NewNode(wg.Config{
@@ -370,7 +372,7 @@ func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
 			return tok, err
 		}
 
-		flushTransportPath()
+		pathEmitter.Flush(transportManager)
 		transportCancel()
 		emitStatus(cfg.Emitter, StateComplete)
 		return tok, nil
@@ -384,6 +386,7 @@ func startExternalTransportManager(
 	derpClient *derpbind.Client,
 	peerDERP key.NodePublic,
 	forceRelay bool,
+	pathChanged func(transport.Path),
 ) (*transport.Manager, func(), error) {
 	controlCh, unsubscribe := derpClient.Subscribe(func(pkt derpbind.Packet) bool {
 		return pkt.From == peerDERP && isTransportControlPayload(pkt.Payload)
@@ -393,6 +396,7 @@ func startExternalTransportManager(
 		RelayConn:               conn,
 		DirectConn:              nil,
 		DisableDirectReads:      true,
+		PathChanged:             pathChanged,
 		DiscoveryInterval:       1 * time.Second,
 		EndpointRefreshInterval: 1 * time.Second,
 		DirectStaleTimeout:      10 * time.Second,
