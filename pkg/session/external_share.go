@@ -139,6 +139,7 @@ func shareExternal(ctx context.Context, cfg ShareConfig) (string, error) {
 		if decision.Accept != nil {
 			decision.Accept.Candidates = publicProbeCandidates(ctx, session.probeConn, session.derpMap)
 		}
+		pathEmitter.Emit(StateClaimed)
 		transportCtx, transportCancel := context.WithCancel(ctx)
 		transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, session.probeConn, session.derpMap, session.derp, peerDERP, cfg.ForceRelay)
 		if err != nil {

@@ -33,12 +33,16 @@ type Client struct {
 }
 
 type packetSubscriber struct {
-	filter    func(Packet) bool
-	ch        chan Packet
-	mode      subscriberMode
-	queueCh   chan Packet
-	done      chan struct{}
-	once      sync.Once
+	filter func(Packet) bool
+	ch     chan Packet
+	mode   subscriberMode
+	done   chan struct{}
+	once   sync.Once
+
+	queueMu    sync.Mutex
+	queue      []Packet
+	queueReady chan struct{}
+
 	deliverMu sync.Mutex
 	closed    bool
 }
@@ -119,8 +123,8 @@ func (c *Client) subscribe(filter func(Packet) bool, mode subscriberMode) (<-cha
 		mode:   mode,
 	}
 	if mode == subscriberLossless {
-		sub.queueCh = make(chan Packet, losslessSubscriberQueueSize)
 		sub.done = make(chan struct{})
+		sub.queueReady = make(chan struct{}, 1)
 		go sub.run(c.stopCh)
 	}
 
@@ -242,18 +246,34 @@ func (c *Client) tryDeliverSubscriber(sub *packetSubscriber, pkt Packet) bool {
 
 func (s *packetSubscriber) enqueue(stopCh <-chan struct{}, pkt Packet) bool {
 	select {
-	case s.queueCh <- pkt:
-		return true
 	case <-s.done:
 		return false
 	case <-stopCh:
 		return false
+	default:
 	}
+
+	s.queueMu.Lock()
+	if s.closed {
+		s.queueMu.Unlock()
+		return false
+	}
+	s.queue = append(s.queue, pkt)
+	s.queueMu.Unlock()
+
+	select {
+	case s.queueReady <- struct{}{}:
+	default:
+	}
+	return true
 }
 
 func (s *packetSubscriber) close() {
 	if s.mode == subscriberLossless {
 		s.once.Do(func() {
+			s.queueMu.Lock()
+			s.closed = true
+			s.queueMu.Unlock()
 			close(s.done)
 		})
 		return
@@ -272,19 +292,37 @@ func (s *packetSubscriber) run(stopCh <-chan struct{}) {
 		close(s.ch)
 	})
 	for {
+		pkt, ok := s.nextQueuedPacket(stopCh)
+		if !ok {
+			return
+		}
 		select {
-		case pkt := <-s.queueCh:
-			select {
-			case s.ch <- pkt:
-			case <-s.done:
-				return
-			case <-stopCh:
-				return
-			}
+		case s.ch <- pkt:
 		case <-s.done:
 			return
 		case <-stopCh:
 			return
+		}
+	}
+}
+
+func (s *packetSubscriber) nextQueuedPacket(stopCh <-chan struct{}) (Packet, bool) {
+	for {
+		s.queueMu.Lock()
+		if len(s.queue) > 0 {
+			pkt := s.queue[0]
+			s.queue = s.queue[1:]
+			s.queueMu.Unlock()
+			return pkt, true
+		}
+		s.queueMu.Unlock()
+
+		select {
+		case <-s.queueReady:
+		case <-s.done:
+			return Packet{}, false
+		case <-stopCh:
+			return Packet{}, false
 		}
 	}
 }

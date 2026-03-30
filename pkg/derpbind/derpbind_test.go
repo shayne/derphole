@@ -286,6 +286,54 @@ func TestClientSubscribeLosslessRetainsAllBackedUpPackets(t *testing.T) {
 	}
 }
 
+func TestClientSubscribeLosslessDoesNotBlockDispatchWhenConsumerBacksUp(t *testing.T) {
+	c := &Client{
+		stopCh:      make(chan struct{}),
+		subscribers: make(map[uint64]*packetSubscriber),
+	}
+
+	controlCh, unsubscribe := c.SubscribeLossless(func(Packet) bool { return true })
+	defer unsubscribe()
+
+	const total = losslessSubscriberQueueSize + 32
+	done := make(chan bool, 1)
+	go func() {
+		handled := true
+		for i := 0; i < total; i++ {
+			if !c.dispatchSubscriber(Packet{Payload: []byte{byte(i)}}) {
+				handled = false
+				break
+			}
+		}
+		done <- handled
+	}()
+
+	select {
+	case handled := <-done:
+		if !handled {
+			t.Fatal("dispatchSubscriber() = false, want true for all queued packets")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("dispatchSubscriber() blocked behind backed-up lossless subscriber")
+	}
+
+	got := make([]byte, 0, total)
+	for i := 0; i < total; i++ {
+		select {
+		case pkt := <-controlCh:
+			got = append(got, pkt.Payload...)
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("timed out waiting for packet %d", i)
+		}
+	}
+
+	for i := 0; i < total; i++ {
+		if got[i] != byte(i) {
+			t.Fatalf("got packet sequence %v, want ordered 0..%d", got, total-1)
+		}
+	}
+}
+
 func TestClientSubscribeUnsubscribeWhileDispatchingDoesNotPanic(t *testing.T) {
 	c := &Client{
 		stopCh:      make(chan struct{}),

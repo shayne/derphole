@@ -26,6 +26,14 @@ type PathSelector interface {
 	DirectPath() (endpoint string, active bool)
 }
 
+type directBreakReporter interface {
+	MarkDirectBroken() error
+}
+
+type directActivityReporter interface {
+	NoteDirectActivity(addr net.Addr)
+}
+
 type DirectPacketHandler interface {
 	HandleDirectPacket(conn net.PacketConn, addr net.Addr, payload []byte) bool
 }
@@ -173,11 +181,16 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
 				return net.ErrClosed
 			}
 			if _, err := pc.WriteTo(payload, directAddr); err != nil {
+				if reporter, ok := b.selector.(directBreakReporter); ok {
+					_ = reporter.MarkDirectBroken()
+				}
+				directConfirmed = false
 				if state == nil || state.derp == nil || state.peerDERP.IsZero() {
 					return err
 				}
+			} else {
+				b.sent.Add(1)
 			}
-			b.sent.Add(1)
 			if directConfirmed || state == nil || state.derp == nil || state.peerDERP.IsZero() {
 				continue
 			}
@@ -280,6 +293,7 @@ func (s *bindState) readUDP() {
 		}
 		if ip, ok := netip.AddrFromSlice(udpAddr.IP); ok {
 			s.parent.noteDirectValidation(udpAddr)
+			s.parent.noteDirectActivity(udpAddr)
 			s.parent.received.Add(1)
 			s.deliver(inboundPacket{
 				payload: append([]byte(nil), buf[:n]...),
@@ -355,6 +369,15 @@ func (b *Bind) noteDirectValidation(addr *net.UDPAddr) {
 	defer b.mu.Unlock()
 	if udpAddrsEqual(b.direct.addr, addr) {
 		b.direct.seen = true
+	}
+}
+
+func (b *Bind) noteDirectActivity(addr *net.UDPAddr) {
+	if addr == nil {
+		return
+	}
+	if reporter, ok := b.selector.(directActivityReporter); ok {
+		reporter.NoteDirectActivity(addr)
 	}
 }
 

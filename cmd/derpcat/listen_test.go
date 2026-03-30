@@ -415,7 +415,7 @@ func statusLines(got string) []string {
 	for _, line := range strings.Split(got, "\n") {
 		line = strings.TrimSpace(line)
 		switch line {
-		case string(sessionStatusWaiting), string(sessionStatusProbing), string(sessionStatusRelay), string(sessionStatusDirect), string(sessionStatusComplete):
+		case string(sessionStatusWaiting), string(sessionStatusClaimed), string(sessionStatusProbing), string(sessionStatusRelay), string(sessionStatusDirect), string(sessionStatusComplete):
 			lines = append(lines, line)
 		}
 	}
@@ -424,6 +424,7 @@ func statusLines(got string) []string {
 
 const (
 	sessionStatusWaiting  = "waiting-for-claim"
+	sessionStatusClaimed  = "claimed"
 	sessionStatusProbing  = "probing-direct"
 	sessionStatusRelay    = "connected-relay"
 	sessionStatusDirect   = "connected-direct"

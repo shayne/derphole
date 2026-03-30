@@ -177,6 +177,16 @@ func (s *pathState) noteDirect(now time.Time, addr net.Addr) bool {
 	return changed
 }
 
+func (s *pathState) noteDirectActivity(now time.Time, addr net.Addr) {
+	if s.current != PathDirect || addr == nil || s.bestEndpoint == "" {
+		return
+	}
+	if addr.String() != s.bestEndpoint {
+		return
+	}
+	s.lastDirectAt = now
+}
+
 func (s *pathState) noteRelay(now time.Time) bool {
 	next := PathUnknown
 	if s.relayConfigured {

@@ -310,6 +310,116 @@ func TestManagerFallsBackToRelayAndRetriesDiscovery(t *testing.T) {
 	}
 }
 
+func TestManagerDemotesStaleDirectPathWhenReadForSend(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000020, 0))
+	relay := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	relay.useClock(clock)
+	direct.useClock(clock)
+
+	peerCandidate := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 44), Port: 34567}
+	controls := newFakeControlPipe()
+	controls.enablePeerCandidate(peerCandidate)
+	direct.enableResponder(peerCandidate)
+	baseTimers := clock.timerCount()
+
+	mgr := NewManager(ManagerConfig{
+		RelayConn:               relay,
+		DirectConn:              direct,
+		SendControl:             controls.send,
+		ReceiveControl:          controls.receive,
+		Clock:                   clock,
+		DiscoveryInterval:       1 * time.Second,
+		EndpointRefreshInterval: 2 * time.Second,
+		DirectStaleTimeout:      3 * time.Second,
+	})
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+
+	clock.Advance(1 * time.Second)
+	if !waitForPath(t, mgr, PathDirect, 200*time.Millisecond) {
+		t.Fatalf("PathState() = %v, want %v before stale demotion", mgr.PathState(), PathDirect)
+	}
+
+	callMeMaybeCount := controls.sentCount(ControlCallMeMaybe)
+	probeCount := direct.writeCountTo(peerCandidate)
+
+	clock.Advance(3 * time.Second)
+	if endpoint, active := mgr.DirectPath(); endpoint != "" || active {
+		t.Fatalf("DirectPath() after stale direct = (%q, %t), want (\"\", false)", endpoint, active)
+	}
+	if got := mgr.PathState(); got != PathRelay {
+		t.Fatalf("PathState() after stale direct = %v, want %v", got, PathRelay)
+	}
+
+	clock.Advance(1 * time.Second)
+	if !controls.waitForSentCount(ControlCallMeMaybe, callMeMaybeCount+1, 200*time.Millisecond) {
+		t.Fatal("manager did not send a fresh call-me-maybe after stale direct demotion")
+	}
+	if !direct.waitForWriteCountTo(peerCandidate, probeCount+1, 200*time.Millisecond) {
+		t.Fatal("manager did not retry direct probes after stale direct demotion")
+	}
+}
+
+func TestManagerNoteDirectActivityKeepsCurrentDirectPathActive(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000020, 0))
+	relay := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	relay.useClock(clock)
+	direct.useClock(clock)
+
+	peerCandidate := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 45), Port: 35567}
+	controls := newFakeControlPipe()
+	controls.enablePeerCandidate(peerCandidate)
+	direct.enableResponder(peerCandidate)
+	baseTimers := clock.timerCount()
+
+	mgr := NewManager(ManagerConfig{
+		RelayConn:               relay,
+		DirectConn:              direct,
+		SendControl:             controls.send,
+		ReceiveControl:          controls.receive,
+		Clock:                   clock,
+		DiscoveryInterval:       1 * time.Second,
+		EndpointRefreshInterval: 2 * time.Second,
+		DirectStaleTimeout:      3 * time.Second,
+	})
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+
+	clock.Advance(1 * time.Second)
+	if !waitForPath(t, mgr, PathDirect, 200*time.Millisecond) {
+		t.Fatalf("PathState() = %v, want %v before activity refresh", mgr.PathState(), PathDirect)
+	}
+
+	clock.Advance(2 * time.Second)
+	mgr.NoteDirectActivity(peerCandidate)
+	clock.Advance(2 * time.Second)
+
+	if endpoint, active := mgr.DirectPath(); endpoint != peerCandidate.String() || !active {
+		t.Fatalf("DirectPath() after refreshed activity = (%q, %t), want (%q, true)", endpoint, active, peerCandidate.String())
+	}
+	if got := mgr.PathState(); got != PathDirect {
+		t.Fatalf("PathState() after refreshed activity = %v, want %v", got, PathDirect)
+	}
+}
+
 func TestManagerFallbackWaitsForInFlightDiscovery(t *testing.T) {
 	t.Helper()
 

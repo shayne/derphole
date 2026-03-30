@@ -93,9 +93,17 @@ func (m *Manager) PathState() Path {
 }
 
 func (m *Manager) DirectPath() (string, bool) {
+	now := m.now()
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.state.directPath()
+	if m.state.current == PathDirect && m.state.directIsStale(now, m.directStaleTimeout()) {
+		m.discoveryGen++
+		if m.state.noteRelay(now) {
+			m.signalStateChangeLocked()
+		}
+	}
+	endpoint, active := m.state.directPath()
+	m.mu.Unlock()
+	return endpoint, active
 }
 
 func (m *Manager) now() time.Time {
@@ -108,6 +116,15 @@ func (m *Manager) noteRelayOnly(now time.Time) {
 	if m.state.noteRelay(now) {
 		m.signalStateChangeLocked()
 	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) NoteDirectActivity(addr net.Addr) {
+	if addr == nil {
+		return
+	}
+	m.mu.Lock()
+	m.state.noteDirectActivity(m.now(), addr)
 	m.mu.Unlock()
 }
 

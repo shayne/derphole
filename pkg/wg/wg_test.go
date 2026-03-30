@@ -437,6 +437,99 @@ func TestBindSelectorSendUsesCoherentDirectPathSnapshot(t *testing.T) {
 	}
 }
 
+func TestBindSelectorInboundTrafficRefreshesDirectActivity(t *testing.T) {
+	pc := newLoopPacketConn(t)
+	defer pc.Close()
+
+	selector := &trackingSelector{
+		path: selectorPath{endpoint: "127.0.0.1:1", active: true},
+	}
+	bind := NewBind(BindConfig{
+		PacketConn:   pc,
+		PathSelector: selector,
+	})
+	fns, _, err := bind.Open(0)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer bind.Close()
+
+	sender := newLoopPacketConn(t)
+	defer sender.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		packet := make([][]byte, 1)
+		packet[0] = make([]byte, 64<<10)
+		sizes := make([]int, 1)
+		eps := make([]conn.Endpoint, 1)
+		_, err := fns[0](packet, sizes, eps)
+		done <- err
+	}()
+
+	if _, err := sender.WriteTo([]byte("direct-data"), pc.LocalAddr()); err != nil {
+		t.Fatalf("WriteTo() error = %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("receive error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("receive did not complete")
+	}
+
+	if !selector.sawActivity(sender.LocalAddr()) {
+		t.Fatalf("selector activity = %v, want %v", selector.activity, sender.LocalAddr())
+	}
+}
+
+func TestBindSelectorWriteFailureFallsBackToDERPAndMarksDirectBroken(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	derpA, derpB := newTestDERPClientPair(t, ctx)
+	baseConn := newLoopPacketConn(t)
+	defer baseConn.Close()
+	directPeer := newLoopPacketConn(t)
+	defer directPeer.Close()
+
+	selector := &trackingSelector{
+		path: selectorPath{endpoint: directPeer.LocalAddr().String(), active: true},
+	}
+	bind := NewBind(BindConfig{
+		PacketConn: &failingPacketConn{
+			PacketConn: baseConn,
+			failAddr:   directPeer.LocalAddr().String(),
+		},
+		DERPClient:   derpA,
+		PeerDERP:     derpB.PublicKey(),
+		PathSelector: selector,
+	})
+	if _, _, err := bind.Open(0); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer bind.Close()
+
+	payload := []byte("relay-after-direct-failure")
+	if err := bind.Send([][]byte{payload}, &Endpoint{dst: "derp"}, 0); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	if got := selector.brokenCount(); got != 1 {
+		t.Fatalf("MarkDirectBroken() calls = %d, want 1", got)
+	}
+
+	pkt, err := derpB.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Receive() error = %v", err)
+	}
+	if got := string(pkt.Payload); got != string(payload) {
+		t.Fatalf("DERP payload = %q, want %q", got, payload)
+	}
+}
+
 func TestNodeTCPRoundTripOverUDP(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -696,6 +789,62 @@ func (s *scriptedSelector) calls() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.called
+}
+
+type trackingSelector struct {
+	mu       sync.Mutex
+	path     selectorPath
+	broken   int
+	activity []string
+}
+
+func (s *trackingSelector) DirectPath() (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.path.endpoint, s.path.active
+}
+
+func (s *trackingSelector) MarkDirectBroken() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.broken++
+	s.path = selectorPath{}
+	return nil
+}
+
+func (s *trackingSelector) NoteDirectActivity(addr net.Addr) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.activity = append(s.activity, addr.String())
+}
+
+func (s *trackingSelector) brokenCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.broken
+}
+
+func (s *trackingSelector) sawActivity(addr net.Addr) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, got := range s.activity {
+		if got == addr.String() {
+			return true
+		}
+	}
+	return false
+}
+
+type failingPacketConn struct {
+	net.PacketConn
+	failAddr string
+}
+
+func (c *failingPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if addr != nil && addr.String() == c.failAddr {
+		return 0, net.ErrClosed
+	}
+	return c.PacketConn.WriteTo(b, addr)
 }
 
 func newLoopPacketConn(t *testing.T) net.PacketConn {

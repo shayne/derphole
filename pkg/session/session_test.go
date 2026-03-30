@@ -343,6 +343,98 @@ func TestShareOpenExternalAllowsOneClaimerUnderContention(t *testing.T) {
 	waitNoErr(t, <-shareErr)
 }
 
+func TestShareOpenExternalClaimPressureDoesNotStallAcceptedRelaySession(t *testing.T) {
+	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
+
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	backendAddr, backendDone := startEchoServer(t, ctx)
+	defer backendDone()
+
+	tokenSink := make(chan string, 1)
+	shareErr := make(chan error, 1)
+	go func() {
+		_, err := Share(ctx, ShareConfig{
+			Emitter:       telemetry.New(&bytes.Buffer{}, telemetry.LevelSilent),
+			TokenSink:     tokenSink,
+			TargetAddr:    backendAddr,
+			ForceRelay:    true,
+			UsePublicDERP: true,
+		})
+		shareErr <- err
+	}()
+
+	tok := <-tokenSink
+	bindSink := make(chan string, 1)
+	firstOpenErr := make(chan error, 1)
+	go func() {
+		firstOpenErr <- Open(ctx, OpenConfig{
+			Token:         tok,
+			BindAddrSink:  bindSink,
+			Emitter:       telemetry.New(&bytes.Buffer{}, telemetry.LevelSilent),
+			ForceRelay:    true,
+			UsePublicDERP: true,
+		})
+	}()
+
+	openAddr := <-bindSink
+	if reply, err := roundTripTCP(ctx, openAddr, "accepted-before-pressure"); err != nil {
+		t.Fatalf("initial roundTripTCP() error = %v", err)
+	} else if reply != "accepted-before-pressure" {
+		t.Fatalf("initial reply = %q, want %q", reply, "accepted-before-pressure")
+	}
+
+	const contenders = 96
+	start := make(chan struct{})
+	errCh := make(chan error, contenders)
+	for i := 0; i < contenders; i++ {
+		go func() {
+			<-start
+			secondCtx, secondCancel := context.WithTimeout(ctx, 15*time.Second)
+			defer secondCancel()
+			errCh <- Open(secondCtx, OpenConfig{
+				Token:         tok,
+				Emitter:       telemetry.New(&bytes.Buffer{}, telemetry.LevelSilent),
+				ForceRelay:    true,
+				UsePublicDERP: true,
+			})
+		}()
+	}
+	close(start)
+
+	responsiveCtx, responsiveCancel := context.WithTimeout(ctx, 5*time.Second)
+	reply, err := roundTripTCP(responsiveCtx, openAddr, "accepted-under-pressure")
+	responsiveCancel()
+	if err != nil {
+		t.Fatalf("roundTripTCP() under claim pressure error = %v", err)
+	}
+	if reply != "accepted-under-pressure" {
+		t.Fatalf("reply under claim pressure = %q, want %q", reply, "accepted-under-pressure")
+	}
+
+	for i := 0; i < contenders; i++ {
+		err := <-errCh
+		if err == nil {
+			t.Fatal("contending Open() error = nil, want rejection")
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("contending Open() error = %v, want deterministic rejection", err)
+		}
+		if !strings.Contains(err.Error(), "session already claimed") {
+			t.Fatalf("contending Open() error = %v, want session already claimed", err)
+		}
+	}
+
+	cancel()
+	waitNoErr(t, <-firstOpenErr)
+	waitNoErr(t, <-shareErr)
+}
+
 func TestShareOpenExternalCanUpgradeAfterRelayStartAndServeConnections(t *testing.T) {
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
 
@@ -356,6 +448,9 @@ func TestShareOpenExternalCanUpgradeAfterRelayStartAndServeConnections(t *testin
 	}
 	if got := result.RelayReply; got != "relay-first" {
 		t.Fatalf("relay reply = %q, want %q", got, "relay-first")
+	}
+	if !strings.Contains(result.ShareStatus, string(StateClaimed)) {
+		t.Fatalf("ShareStatus = %q, want %q", result.ShareStatus, StateClaimed)
 	}
 	for _, payload := range []string{"direct-one", "direct-two", "direct-three"} {
 		if got := result.UpgradeReplies[payload]; got != payload {
@@ -588,12 +683,12 @@ func runExternalShareOpenSession(t *testing.T, cfg shareOpenRoundTripConfig) sha
 		t.Fatalf("relay roundTripTCP() error = %v", err)
 	}
 
-	waitForStatusPrefixBuffer(t, &shareStatus, 20*time.Second, string(StateWaiting), string(StateRelay))
+	waitForStatusPrefixBuffer(t, &shareStatus, 20*time.Second, string(StateWaiting), string(StateClaimed), string(StateRelay))
 	waitForStatusPrefixBuffer(t, &openStatus, 20*time.Second, string(StateProbing), string(StateRelay))
 	if err := os.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0"); err != nil {
 		t.Fatalf("Setenv(enable direct) error = %v", err)
 	}
-	waitForStatusPrefixBuffer(t, &shareStatus, 20*time.Second, string(StateWaiting), string(StateRelay), string(StateDirect))
+	waitForStatusPrefixBuffer(t, &shareStatus, 20*time.Second, string(StateWaiting), string(StateClaimed), string(StateRelay), string(StateDirect))
 	waitForStatusPrefixBuffer(t, &openStatus, 20*time.Second, string(StateProbing), string(StateRelay), string(StateDirect))
 
 	replies := make(map[string]string, len(cfg.upgradePayloads))
@@ -705,7 +800,7 @@ func sessionStatusLines(got string) []string {
 	for _, line := range strings.Split(got, "\n") {
 		line = strings.TrimSpace(line)
 		switch line {
-		case string(StateWaiting), string(StateProbing), string(StateRelay), string(StateDirect), string(StateComplete):
+		case string(StateWaiting), string(StateClaimed), string(StateProbing), string(StateRelay), string(StateDirect), string(StateComplete):
 			lines = append(lines, line)
 		}
 	}
