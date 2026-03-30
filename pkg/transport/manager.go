@@ -37,7 +37,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 
 	m.started = true
-	m.state.markDirectReady()
+	m.state.activateConfiguredDirect()
 	return nil
 }
 

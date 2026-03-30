@@ -67,6 +67,10 @@ func TestManagerDirectOnlyBrokenDoesNotInventRelay(t *testing.T) {
 		DirectConn: direct,
 	})
 
+	if got := mgr.PathState(); got != PathUnknown {
+		t.Fatalf("PathState() before Start = %v, want %v", got, PathUnknown)
+	}
+
 	if err := mgr.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -81,6 +85,28 @@ func TestManagerDirectOnlyBrokenDoesNotInventRelay(t *testing.T) {
 
 	if got := mgr.PathState(); got != PathUnknown {
 		t.Fatalf("PathState() = %v, want %v", got, PathUnknown)
+	}
+}
+
+func TestManagerRelayOnlyStartKeepsRelay(t *testing.T) {
+	t.Helper()
+
+	relay := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+
+	mgr := NewManager(ManagerConfig{
+		RelayConn: relay,
+	})
+
+	if got := mgr.PathState(); got != PathRelay {
+		t.Fatalf("PathState() before Start = %v, want %v", got, PathRelay)
+	}
+
+	if err := mgr.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	if got := mgr.PathState(); got != PathRelay {
+		t.Fatalf("PathState() after Start = %v, want %v", got, PathRelay)
 	}
 }
 

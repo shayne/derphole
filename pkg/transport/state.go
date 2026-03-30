@@ -10,25 +10,22 @@ const (
 )
 
 type pathState struct {
-	current        Path
-	relayAvailable bool
-	directReady    bool
-	directBroken   bool
+	current           Path
+	relayConfigured   bool
+	directConfigured  bool
+	directUnavailable bool
 }
 
 func newPathState(hasRelay, hasDirect bool) pathState {
 	current := PathUnknown
-	switch {
-	case hasRelay:
+	if hasRelay {
 		current = PathRelay
-	case hasDirect:
-		current = PathDirect
 	}
 
 	return pathState{
-		current:        current,
-		relayAvailable: hasRelay,
-		directReady:    hasDirect,
+		current:          current,
+		relayConfigured:  hasRelay,
+		directConfigured: hasDirect,
 	}
 }
 
@@ -36,8 +33,8 @@ func (s pathState) path() Path {
 	return s.current
 }
 
-func (s *pathState) markDirectReady() bool {
-	if !s.directReady || s.directBroken || s.current == PathDirect {
+func (s *pathState) activateConfiguredDirect() bool {
+	if !s.directConfigured || s.directUnavailable || s.current == PathDirect {
 		return false
 	}
 	s.current = PathDirect
@@ -46,12 +43,12 @@ func (s *pathState) markDirectReady() bool {
 
 func (s *pathState) markDirectBroken() bool {
 	next := PathUnknown
-	if s.relayAvailable {
+	if s.relayConfigured {
 		next = PathRelay
 	}
 
-	changed := s.current != next || !s.directBroken
-	s.directBroken = true
+	changed := s.current != next || !s.directUnavailable
+	s.directUnavailable = true
 	s.current = next
 	return changed
 }
