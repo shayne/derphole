@@ -60,15 +60,11 @@ func (s pathState) path() Path {
 	return s.current
 }
 
-func (s pathState) activeDirectEndpoint() string {
+func (s pathState) directPath() (string, bool) {
 	if s.current != PathDirect {
-		return ""
+		return "", false
 	}
-	return s.bestEndpoint
-}
-
-func (s pathState) directActive() bool {
-	return s.current == PathDirect && s.bestEndpoint != ""
+	return s.bestEndpoint, s.bestEndpoint != ""
 }
 
 func (s pathState) discoveryPlan(now time.Time, refreshInterval, staleAfter time.Duration) discoveryPlan {

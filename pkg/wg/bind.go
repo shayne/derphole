@@ -23,8 +23,7 @@ type BindConfig struct {
 }
 
 type PathSelector interface {
-	ActiveDirectEndpoint() string
-	DirectActive() bool
+	DirectPath() (endpoint string, active bool)
 }
 
 type Bind struct {
@@ -37,6 +36,7 @@ type Bind struct {
 	state      *bindState
 	opened     bool
 	directAddr *net.UDPAddr
+	directSeen atomic.Bool
 	sent       atomic.Int64
 	received   atomic.Int64
 }
@@ -157,7 +157,8 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
 			continue
 		}
 
-		directAddr := b.activeDirectAddr()
+		directEndpoint, directConfirmed := b.directPath()
+		directAddr := resolveUDPAddr(directEndpoint)
 		if directAddr != nil {
 			if pc == nil {
 				return net.ErrClosed
@@ -168,7 +169,7 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
 				}
 			}
 			b.sent.Add(1)
-			if b.directConfirmed() || state == nil || state.derp == nil || state.peerDERP.IsZero() {
+			if directConfirmed || state == nil || state.derp == nil || state.peerDERP.IsZero() {
 				continue
 			}
 		}
@@ -219,6 +220,7 @@ func (b *Bind) SetDirectEndpoint(s string) error {
 		b.mu.Lock()
 		b.directAddr = nil
 		b.mu.Unlock()
+		b.directSeen.Store(false)
 		return nil
 	}
 	addr, err := net.ResolveUDPAddr("udp", s)
@@ -228,15 +230,13 @@ func (b *Bind) SetDirectEndpoint(s string) error {
 	b.mu.Lock()
 	b.directAddr = addr
 	b.mu.Unlock()
+	b.directSeen.Store(false)
 	return nil
 }
 
 func (b *Bind) DirectEndpoint() string {
-	addr := b.activeDirectAddr()
-	if addr == nil {
-		return ""
-	}
-	return addr.String()
+	endpoint, _ := b.directPath()
+	return endpoint
 }
 
 func (s *bindState) receive(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
@@ -269,6 +269,7 @@ func (s *bindState) readUDP() {
 			continue
 		}
 		if ip, ok := netip.AddrFromSlice(udpAddr.IP); ok {
+			s.parent.noteDirectValidation(udpAddr)
 			s.parent.received.Add(1)
 			s.deliver(inboundPacket{
 				payload: append([]byte(nil), buf[:n]...),
@@ -314,18 +315,8 @@ func (s *bindState) reportErr(err error) {
 }
 
 func (b *Bind) activeDirectAddr() *net.UDPAddr {
-	if b.selector != nil {
-		ep := b.selector.ActiveDirectEndpoint()
-		if ep == "" {
-			return nil
-		}
-		addr, err := net.ResolveUDPAddr("udp", ep)
-		if err != nil {
-			return nil
-		}
-		return addr
-	}
-	return b.directUDPAddr()
+	endpoint, _ := b.directPath()
+	return resolveUDPAddr(endpoint)
 }
 
 func (b *Bind) directUDPAddr() *net.UDPAddr {
@@ -338,11 +329,51 @@ func (b *Bind) directUDPAddr() *net.UDPAddr {
 	return &clone
 }
 
-func (b *Bind) directConfirmed() bool {
+func (b *Bind) directPath() (endpoint string, active bool) {
 	if b.selector != nil {
-		return b.selector.DirectActive()
+		return b.selector.DirectPath()
 	}
-	return b.directUDPAddr() != nil
+	addr := b.directUDPAddr()
+	if addr == nil {
+		return "", false
+	}
+	return addr.String(), b.directSeen.Load()
+}
+
+func (b *Bind) noteDirectValidation(addr *net.UDPAddr) {
+	if b.selector != nil || addr == nil {
+		return
+	}
+	directAddr := b.directUDPAddr()
+	if directAddr == nil {
+		return
+	}
+	if udpAddrsEqual(directAddr, addr) {
+		b.directSeen.Store(true)
+	}
+}
+
+func (b *Bind) directConfirmed() bool {
+	_, active := b.directPath()
+	return active
+}
+
+func udpAddrsEqual(a, b *net.UDPAddr) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return a.Port == b.Port && a.Zone == b.Zone && a.IP.Equal(b.IP)
+}
+
+func resolveUDPAddr(endpoint string) *net.UDPAddr {
+	if endpoint == "" {
+		return nil
+	}
+	addr, err := net.ResolveUDPAddr("udp", endpoint)
+	if err != nil {
+		return nil
+	}
+	return addr
 }
 
 func (e *Endpoint) ClearSrc() {}

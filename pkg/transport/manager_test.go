@@ -869,7 +869,7 @@ func TestManagerCanceledStartCanBeRetried(t *testing.T) {
 	}
 }
 
-func TestManagerExposesActiveDirectEndpoint(t *testing.T) {
+func TestManagerExposesDirectPathSnapshot(t *testing.T) {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -898,11 +898,8 @@ func TestManagerExposesActiveDirectEndpoint(t *testing.T) {
 		DirectStaleTimeout:      4 * time.Second,
 	})
 
-	if got := mgr.ActiveDirectEndpoint(); got != "" {
-		t.Fatalf("ActiveDirectEndpoint() before Start = %q, want empty", got)
-	}
-	if mgr.DirectActive() {
-		t.Fatal("DirectActive() before Start = true, want false")
+	if endpoint, active := mgr.DirectPath(); endpoint != "" || active {
+		t.Fatalf("DirectPath() before Start = (%q, %t), want (\"\", false)", endpoint, active)
 	}
 
 	if err := mgr.Start(ctx); err != nil {
@@ -914,21 +911,15 @@ func TestManagerExposesActiveDirectEndpoint(t *testing.T) {
 	if !waitForPath(t, mgr, PathDirect, 200*time.Millisecond) {
 		t.Fatalf("PathState() = %v, want %v after direct promotion", mgr.PathState(), PathDirect)
 	}
-	if got := mgr.ActiveDirectEndpoint(); got != peerCandidate.String() {
-		t.Fatalf("ActiveDirectEndpoint() after promotion = %q, want %q", got, peerCandidate.String())
-	}
-	if !mgr.DirectActive() {
-		t.Fatal("DirectActive() after promotion = false, want true")
+	if endpoint, active := mgr.DirectPath(); endpoint != peerCandidate.String() || !active {
+		t.Fatalf("DirectPath() after promotion = (%q, %t), want (%q, true)", endpoint, active, peerCandidate.String())
 	}
 
 	if err := mgr.MarkDirectBroken(); err != nil {
 		t.Fatalf("MarkDirectBroken() error = %v", err)
 	}
-	if got := mgr.ActiveDirectEndpoint(); got != "" {
-		t.Fatalf("ActiveDirectEndpoint() after fallback = %q, want empty", got)
-	}
-	if mgr.DirectActive() {
-		t.Fatal("DirectActive() after fallback = true, want false")
+	if endpoint, active := mgr.DirectPath(); endpoint != "" || active {
+		t.Fatalf("DirectPath() after fallback = (%q, %t), want (\"\", false)", endpoint, active)
 	}
 }
 

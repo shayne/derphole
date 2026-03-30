@@ -85,16 +85,10 @@ func (m *Manager) PathState() Path {
 	return m.state.path()
 }
 
-func (m *Manager) ActiveDirectEndpoint() string {
+func (m *Manager) DirectPath() (string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.state.activeDirectEndpoint()
-}
-
-func (m *Manager) DirectActive() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.state.directActive()
+	return m.state.directPath()
 }
 
 func (m *Manager) now() time.Time {
