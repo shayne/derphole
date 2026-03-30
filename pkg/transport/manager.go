@@ -38,12 +38,16 @@ type ManagerConfig struct {
 }
 
 type Manager struct {
-	mu          sync.Mutex
-	discoveryMu sync.Mutex
-	cfg         ManagerConfig
-	state       pathState
-	stateNotify chan struct{}
-	started     bool
+	mu                    sync.Mutex
+	discoveryMu           sync.Mutex
+	cfg                   ManagerConfig
+	state                 pathState
+	stateNotify           chan struct{}
+	discoveryGen          uint64
+	discoveryRun          bool
+	discoveryPending      bool
+	forceCandidateRefresh bool
+	started               bool
 }
 
 func NewManager(cfg ManagerConfig) *Manager {
@@ -96,6 +100,7 @@ func (m *Manager) noteValidatedDirect(now time.Time, addr net.Addr) {
 func (m *Manager) noteRelayOnly(now time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.discoveryGen++
 	if m.state.noteRelay(now) {
 		m.signalStateChangeLocked()
 	}
@@ -117,7 +122,9 @@ func (m *Manager) snapshotDiscoveryPlan() discoveryPlan {
 	now := m.now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.state.discoveryPlan(now, m.endpointRefreshInterval(), m.directStaleTimeout())
+	plan := m.state.discoveryPlan(now, m.endpointRefreshInterval(), m.directStaleTimeout())
+	plan.generation = m.discoveryGen
+	return plan
 }
 
 func (m *Manager) noteProbeSent(now time.Time, addr net.Addr) {
@@ -160,10 +167,31 @@ func (m *Manager) directStaleTimeout() time.Duration {
 	return defaultDirectStaleTimeout
 }
 
-func (m *Manager) withDiscoveryLock(fn func() error) error {
-	m.discoveryMu.Lock()
-	defer m.discoveryMu.Unlock()
-	return fn()
+func (m *Manager) noteEndpointRefreshIfCurrent(generation uint64, now time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.discoveryGen != generation {
+		return
+	}
+	m.state.noteRefreshSuccess(now)
+}
+
+func (m *Manager) noteCallMeMaybeIfCurrent(generation uint64, now time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.discoveryGen != generation {
+		return
+	}
+	m.state.noteCallMeMaybeSuccess(now)
+}
+
+func (m *Manager) noteProbeSentIfCurrent(generation uint64, now time.Time, addr net.Addr) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.discoveryGen != generation {
+		return
+	}
+	m.state.noteProbeSent(now, addr)
 }
 
 func (m *Manager) stateChanged() <-chan struct{} {

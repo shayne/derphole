@@ -622,6 +622,7 @@ type fakeClock struct {
 }
 
 type fakeTimer struct {
+	clock   *fakeClock
 	at      time.Time
 	seq     int
 	ch      chan time.Time
@@ -651,9 +652,10 @@ func (c *fakeClock) After(d time.Duration) <-chan time.Time {
 	defer c.mu.Unlock()
 
 	timer := &fakeTimer{
-		at:  c.now.Add(d),
-		seq: c.nextSeq,
-		ch:  make(chan time.Time, 1),
+		clock: c,
+		at:    c.now.Add(d),
+		seq:   c.nextSeq,
+		ch:    make(chan time.Time, 1),
 	}
 	c.nextSeq++
 	c.timers = append(c.timers, timer)
@@ -666,9 +668,10 @@ func (c *fakeClock) AfterFunc(d time.Duration, fn func()) Timer {
 	defer c.mu.Unlock()
 
 	timer := &fakeTimer{
-		at:  c.now.Add(d),
-		seq: c.nextSeq,
-		fn:  fn,
+		clock: c,
+		at:    c.now.Add(d),
+		seq:   c.nextSeq,
+		fn:    fn,
 	}
 	c.nextSeq++
 	c.timers = append(c.timers, timer)
@@ -741,6 +744,10 @@ func (c *fakeClock) signalLocked() {
 }
 
 func (t *fakeTimer) Stop() bool {
+	if t.clock != nil {
+		t.clock.mu.Lock()
+		defer t.clock.mu.Unlock()
+	}
 	if t.fired || t.stopped {
 		return false
 	}

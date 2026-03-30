@@ -35,6 +35,7 @@ type discoveryPlan struct {
 	sendCallMe    bool
 	probeTargets  []net.Addr
 	shouldAttempt bool
+	generation    uint64
 }
 
 func newPathState(now time.Time, hasRelay, hasDirect bool) pathState {

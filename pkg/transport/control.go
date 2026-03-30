@@ -21,10 +21,8 @@ type ControlMessage struct {
 }
 
 func (m *Manager) MarkDirectBroken() error {
-	return m.withDiscoveryLock(func() error {
-		m.noteRelayOnly(m.now())
-		return nil
-	})
+	m.noteRelayOnly(m.now())
+	return nil
 }
 
 func (m *Manager) receiveControlLoop(ctx context.Context) {
@@ -56,12 +54,11 @@ func (m *Manager) handleControl(ctx context.Context, msg ControlMessage) error {
 	switch msg.Type {
 	case ControlCandidates:
 		m.applyRemoteCandidates(m.now(), parseCandidateAddrs(msg.Candidates))
-		m.discoveryTick(ctx)
+		m.requestDiscovery(ctx, false)
 		return nil
 	case ControlCallMeMaybe:
-		return m.withDiscoveryLock(func() error {
-			return m.sendCandidateUpdate(ctx)
-		})
+		m.requestDiscovery(ctx, true)
+		return nil
 	default:
 		return nil
 	}
@@ -74,7 +71,6 @@ func (m *Manager) sendCallMeMaybe(ctx context.Context) error {
 	if err := m.cfg.SendControl(ctx, ControlMessage{Type: ControlCallMeMaybe}); err != nil {
 		return err
 	}
-	m.noteCallMeMaybeSuccess(m.now())
 	return nil
 }
 
@@ -93,7 +89,6 @@ func (m *Manager) sendCandidateUpdate(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
-	m.noteEndpointRefresh(m.now())
 	return nil
 }
 

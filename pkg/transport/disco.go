@@ -28,41 +28,85 @@ func (m *Manager) discoveryLoop(ctx context.Context) {
 		case <-m.cfg.Clock.After(m.discoveryInterval()):
 		}
 
-		m.discoveryTick(ctx)
+		m.requestDiscovery(ctx, false)
 	}
 }
 
-func (m *Manager) discoveryTick(ctx context.Context) {
-	_ = m.withDiscoveryLock(func() error {
+func (m *Manager) requestDiscovery(ctx context.Context, forceCandidateRefresh bool) {
+	m.discoveryMu.Lock()
+	if forceCandidateRefresh {
+		m.forceCandidateRefresh = true
+	}
+	if m.discoveryRun {
+		m.discoveryPending = true
+		m.discoveryMu.Unlock()
+		return
+	}
+	forceCandidateRefresh = m.forceCandidateRefresh
+	m.forceCandidateRefresh = false
+	m.discoveryRun = true
+	m.discoveryPending = false
+	m.discoveryMu.Unlock()
+
+	go m.discoveryWorker(ctx, forceCandidateRefresh)
+}
+
+func (m *Manager) discoveryWorker(ctx context.Context, forceCandidateRefresh bool) {
+	for {
+		m.discoveryTick(ctx, forceCandidateRefresh)
+
+		m.discoveryMu.Lock()
 		if ctx.Err() != nil {
-			return nil
+			m.discoveryRun = false
+			m.discoveryPending = false
+			m.forceCandidateRefresh = false
+			m.discoveryMu.Unlock()
+			return
 		}
+		if !m.discoveryPending {
+			m.discoveryRun = false
+			m.discoveryMu.Unlock()
+			return
+		}
+		forceCandidateRefresh = m.forceCandidateRefresh
+		m.forceCandidateRefresh = false
+		m.discoveryPending = false
+		m.discoveryMu.Unlock()
+	}
+}
 
-		plan := m.snapshotDiscoveryPlan()
-		if !plan.shouldAttempt {
-			return nil
-		}
+func (m *Manager) discoveryTick(ctx context.Context, forceCandidateRefresh bool) {
+	if ctx.Err() != nil {
+		return
+	}
 
-		if plan.needRefresh {
-			_ = m.sendCandidateUpdate(ctx)
-		}
-		if plan.sendCallMe {
-			_ = m.sendCallMeMaybe(ctx)
-		}
-		if m.cfg.DirectConn == nil {
-			return nil
-		}
+	plan := m.snapshotDiscoveryPlan()
+	if !plan.shouldAttempt && !forceCandidateRefresh {
+		return
+	}
 
-		for _, target := range plan.probeTargets {
-			if target == nil {
-				continue
-			}
-			if _, err := m.cfg.DirectConn.WriteTo(discoProbePayload, target); err == nil {
-				m.noteProbeSent(m.now(), target)
-			}
+	if forceCandidateRefresh || plan.needRefresh {
+		if err := m.sendCandidateUpdate(ctx); err == nil {
+			m.noteEndpointRefreshIfCurrent(plan.generation, m.now())
 		}
-		return nil
-	})
+	}
+	if plan.sendCallMe {
+		if err := m.sendCallMeMaybe(ctx); err == nil {
+			m.noteCallMeMaybeIfCurrent(plan.generation, m.now())
+		}
+	}
+	if m.cfg.DirectConn == nil {
+		return
+	}
+
+	for _, target := range plan.probeTargets {
+		if target == nil {
+			continue
+		}
+		if _, err := m.cfg.DirectConn.WriteTo(discoProbePayload, target); err == nil {
+			m.noteProbeSentIfCurrent(plan.generation, m.now(), target)
+		}
+	}
 }
 
 func (m *Manager) directReadLoop(ctx context.Context) {

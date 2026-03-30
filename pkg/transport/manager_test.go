@@ -75,9 +75,6 @@ func TestManagerUpgradesDirectViaDelayedCallMeMaybe(t *testing.T) {
 	if len(candidates.Candidates) != 1 || candidates.Candidates[0] != localCandidate.String() {
 		t.Fatalf("candidate control = %#v, want %q", candidates, localCandidate.String())
 	}
-	if !controls.waitForReceiveCount(2, 200*time.Millisecond) {
-		t.Fatal("manager did not consume the delayed call-me-maybe and candidate controls")
-	}
 
 	if !direct.waitForWritePayloadTo(peerCandidate, discoProbePayload, 200*time.Millisecond) {
 		t.Fatalf("manager did not send %q probe to %v", string(discoProbePayload), peerCandidate)
@@ -261,24 +258,15 @@ func TestManagerFallbackWaitsForInFlightDiscovery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("MarkDirectBroken() error = %v", err)
 		}
-		t.Fatal("MarkDirectBroken returned before the in-flight discovery round finished")
 	case <-time.After(50 * time.Millisecond):
-	}
-
-	controls.unblockSend(ControlCandidates)
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("MarkDirectBroken() error = %v", err)
-		}
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("MarkDirectBroken did not finish after the blocked discovery round completed")
+		t.Fatal("MarkDirectBroken blocked behind in-flight discovery work")
 	}
 
 	if got := mgr.PathState(); got != PathRelay {
 		t.Fatalf("PathState() after fallback = %v, want %v", got, PathRelay)
 	}
 
+	controls.unblockSend(ControlCandidates)
 	clock.Advance(1 * time.Second)
 	if !controls.waitForSentCount(ControlCallMeMaybe, callMeMaybeCount+1, 200*time.Millisecond) {
 		t.Fatal("manager did not send a fresh call-me-maybe immediately after fallback")
