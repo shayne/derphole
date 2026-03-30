@@ -316,12 +316,14 @@ func (s *bindState) reportErr(err error) {
 func (b *Bind) activeDirectAddr() *net.UDPAddr {
 	if b.selector != nil {
 		ep := b.selector.ActiveDirectEndpoint()
-		if ep != "" {
-			addr, err := net.ResolveUDPAddr("udp", ep)
-			if err == nil {
-				return addr
-			}
+		if ep == "" {
+			return nil
 		}
+		addr, err := net.ResolveUDPAddr("udp", ep)
+		if err != nil {
+			return nil
+		}
+		return addr
 	}
 	return b.directUDPAddr()
 }

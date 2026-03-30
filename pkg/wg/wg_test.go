@@ -132,12 +132,16 @@ func TestBindDoesNotInferDirectFromArbitraryInboundUDP(t *testing.T) {
 	defer pc.Close()
 
 	bind := NewBind(BindConfig{
-		PacketConn:   pc,
-		PathSelector: fakeSelector{},
+		DirectEndpoint: "127.0.0.1:12345",
+		PacketConn:     pc,
+		PathSelector:   fakeSelector{},
 	})
 
 	if got := bind.activeDirectAddr(); got != nil {
 		t.Fatalf("activeDirectAddr() = %v, want nil", got)
+	}
+	if got := bind.DirectEndpoint(); got != "" {
+		t.Fatalf("DirectEndpoint() = %q, want empty", got)
 	}
 }
 
