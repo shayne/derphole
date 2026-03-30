@@ -198,7 +198,7 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 		return err
 	}
 	defer transportCleanup()
-	emitTransportPathTransitions(transportCtx, cfg.Emitter, transportManager)
+	flushTransportPath := emitTransportPathTransitions(transportCtx, cfg.Emitter, transportManager)
 
 	_, listenerAddr, senderAddr := wg.DeriveAddresses(tok.SessionID)
 	sessionNode, err := wg.NewNode(wg.Config{
@@ -251,6 +251,7 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 		return err
 	}
 
+	flushTransportPath()
 	transportCancel()
 	emitStatus(cfg.Emitter, StateComplete)
 	return nil
@@ -309,7 +310,7 @@ func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
 		}
 		defer transportCancel()
 		defer transportCleanup()
-		emitTransportPathTransitions(transportCtx, cfg.Emitter, transportManager)
+		flushTransportPath := emitTransportPathTransitions(transportCtx, cfg.Emitter, transportManager)
 
 		_, listenerAddr, senderAddr := wg.DeriveAddresses(session.token.SessionID)
 		sessionNode, err := wg.NewNode(wg.Config{
@@ -369,6 +370,7 @@ func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
 			return tok, err
 		}
 
+		flushTransportPath()
 		transportCancel()
 		emitStatus(cfg.Emitter, StateComplete)
 		return tok, nil

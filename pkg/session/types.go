@@ -3,7 +3,7 @@ package session
 import (
 	"context"
 	"io"
-	"time"
+	"sync"
 
 	"github.com/shayne/derpcat/pkg/telemetry"
 	"github.com/shayne/derpcat/pkg/transport"
@@ -59,41 +59,41 @@ func emitStatus(emitter *telemetry.Emitter, state State) {
 	}
 }
 
-func emitTransportPathTransitions(ctx context.Context, emitter *telemetry.Emitter, manager *transport.Manager) {
+func emitTransportPathTransitions(ctx context.Context, emitter *telemetry.Emitter, manager *transport.Manager) func() {
 	if emitter == nil || manager == nil {
-		return
+		return func() {}
 	}
 
-	last := manager.PathState()
-	switch last {
-	case transport.PathDirect:
-		emitStatus(emitter, StateDirect)
-	case transport.PathRelay:
-		emitStatus(emitter, StateRelay)
-	}
-
-	go func(last transport.Path) {
-		ticker := time.NewTicker(25 * time.Millisecond)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-
-			path := manager.PathState()
-			if path == last {
-				continue
-			}
-			switch path {
-			case transport.PathDirect:
-				emitStatus(emitter, StateDirect)
-			case transport.PathRelay:
-				emitStatus(emitter, StateRelay)
-			}
-			last = path
+	var mu sync.Mutex
+	last := transport.PathUnknown
+	emitPath := func(path transport.Path) {
+		if path == transport.PathUnknown {
+			return
 		}
-	}(last)
+
+		mu.Lock()
+		if path == last {
+			mu.Unlock()
+			return
+		}
+		last = path
+		mu.Unlock()
+
+		switch path {
+		case transport.PathDirect:
+			emitStatus(emitter, StateDirect)
+		case transport.PathRelay:
+			emitStatus(emitter, StateRelay)
+		}
+	}
+
+	go func() {
+		for update := range manager.Updates(ctx) {
+			emitPath(update.Path)
+		}
+	}()
+
+	return func() {
+		emitPath(manager.PathState())
+	}
 }

@@ -51,6 +51,10 @@ type Manager struct {
 	started               bool
 }
 
+type Update struct {
+	Path Path
+}
+
 func NewManager(cfg ManagerConfig) *Manager {
 	cfg = normalizeConfig(cfg)
 	return &Manager{
@@ -181,6 +185,39 @@ func (m *Manager) stateChanged() <-chan struct{} {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.stateNotify
+}
+
+func (m *Manager) snapshotUpdate() (Path, <-chan struct{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.state.path(), m.stateNotify
+}
+
+func (m *Manager) Updates(ctx context.Context) <-chan Update {
+	updates := make(chan Update, 1)
+	go func() {
+		defer close(updates)
+
+		last := PathUnknown
+		for {
+			path, notify := m.snapshotUpdate()
+			if path != last {
+				select {
+				case updates <- Update{Path: path}:
+					last = path
+				case <-ctx.Done():
+					return
+				}
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-notify:
+			}
+		}
+	}()
+	return updates
 }
 
 func (m *Manager) signalStateChangeLocked() {
