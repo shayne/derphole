@@ -120,7 +120,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
       - name: Download build artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           pattern: derpcat-*
           path: dist/raw
@@ -132,11 +132,11 @@ jobs:
       - name: Package tarballs + checksums
         run: bash ./tools/packaging/build-release-assets.sh
       - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: |
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.version }}
+        run: |
+          files=(
             dist/release/derpcat-linux-amd64.tar.gz
             dist/release/derpcat-linux-amd64.tar.gz.sha256
             dist/release/derpcat-linux-arm64.tar.gz
@@ -145,6 +145,12 @@ jobs:
             dist/release/derpcat-darwin-amd64.tar.gz.sha256
             dist/release/derpcat-darwin-arm64.tar.gz
             dist/release/derpcat-darwin-arm64.tar.gz.sha256
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" --clobber
+          else
+            gh release create "$TAG" "${files[@]}" --verify-tag --generate-notes
+          fi
 
   release-dev:
     name: Publish dev release
@@ -159,7 +165,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Download build artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           pattern: derpcat-*
           path: dist/raw
@@ -177,15 +183,10 @@ jobs:
           git tag -f dev "$GITHUB_SHA"
           git push -f origin refs/tags/dev
       - name: Publish dev release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: dev
-          name: Dev
-          prerelease: true
-          make_latest: false
-          overwrite_files: true
-          fail_on_unmatched_files: true
-          files: |
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          files=(
             dist/release/derpcat-linux-amd64.tar.gz
             dist/release/derpcat-linux-amd64.tar.gz.sha256
             dist/release/derpcat-linux-arm64.tar.gz
@@ -194,6 +195,13 @@ jobs:
             dist/release/derpcat-darwin-amd64.tar.gz.sha256
             dist/release/derpcat-darwin-arm64.tar.gz
             dist/release/derpcat-darwin-arm64.tar.gz.sha256
+          )
+          if gh release view dev >/dev/null 2>&1; then
+            gh release edit dev --title Dev --prerelease
+            gh release upload dev "${files[@]}" --clobber
+          else
+            gh release create dev "${files[@]}" --verify-tag --title Dev --prerelease --latest=false
+          fi
 
   publish-packages-prod:
     name: Build npm artifact (prod)
@@ -209,7 +217,7 @@ jobs:
           install: true
           cache: true
       - name: Download raw build artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           pattern: derpcat-*
           path: dist/raw
@@ -264,7 +272,7 @@ jobs:
           install: true
           cache: true
       - name: Download raw build artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           pattern: derpcat-*
           path: dist/raw
@@ -318,7 +326,7 @@ jobs:
       url: https://www.npmjs.com/package/derpcat
     steps:
       - name: Download package artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: package-artifacts-prod
           path: dist
@@ -345,7 +353,7 @@ jobs:
       url: https://www.npmjs.com/package/derpcat
     steps:
       - name: Download package artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: package-artifacts-dev
           path: dist
