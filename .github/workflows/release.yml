@@ -15,6 +15,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -118,16 +119,26 @@ jobs:
     needs: [meta, check, build-derpcat, publish-npm-prod]
     if: needs.meta.outputs.is_tag == 'true'
     permissions:
+      actions: read
       contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v5
       - name: Download build artifacts
-        uses: actions/download-artifact@v6
-        with:
-          pattern: derpcat-*
-          path: dist/raw
-          merge-multiple: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf dist/downloads dist/raw
+          mkdir -p dist/downloads dist/raw
+          gh run download "$GITHUB_RUN_ID" \
+            --dir dist/downloads \
+            -n derpcat-linux-amd64 \
+            -n derpcat-linux-arm64 \
+            -n derpcat-darwin-amd64 \
+            -n derpcat-darwin-arm64
+          for asset in derpcat-linux-amd64 derpcat-linux-arm64 derpcat-darwin-amd64 derpcat-darwin-arm64; do
+            cp "dist/downloads/$asset/$asset" "dist/raw/$asset"
+          done
       - name: Verify binary version
         run: |
           chmod +x dist/raw/derpcat-linux-amd64
@@ -161,6 +172,7 @@ jobs:
     needs: [meta, check, build-derpcat, publish-npm-dev]
     if: needs.meta.outputs.is_main == 'true'
     permissions:
+      actions: read
       contents: write
     steps:
       - name: Checkout
@@ -168,11 +180,20 @@ jobs:
         with:
           fetch-depth: 0
       - name: Download build artifacts
-        uses: actions/download-artifact@v6
-        with:
-          pattern: derpcat-*
-          path: dist/raw
-          merge-multiple: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf dist/downloads dist/raw
+          mkdir -p dist/downloads dist/raw
+          gh run download "$GITHUB_RUN_ID" \
+            --dir dist/downloads \
+            -n derpcat-linux-amd64 \
+            -n derpcat-linux-arm64 \
+            -n derpcat-darwin-amd64 \
+            -n derpcat-darwin-arm64
+          for asset in derpcat-linux-amd64 derpcat-linux-arm64 derpcat-darwin-amd64 derpcat-darwin-arm64; do
+            cp "dist/downloads/$asset/$asset" "dist/raw/$asset"
+          done
       - name: Verify binary version
         run: |
           chmod +x dist/raw/derpcat-linux-amd64
@@ -220,11 +241,20 @@ jobs:
           install: true
           cache: true
       - name: Download raw build artifacts
-        uses: actions/download-artifact@v6
-        with:
-          pattern: derpcat-*
-          path: dist/raw
-          merge-multiple: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf dist/downloads dist/raw
+          mkdir -p dist/downloads dist/raw
+          gh run download "$GITHUB_RUN_ID" \
+            --dir dist/downloads \
+            -n derpcat-linux-amd64 \
+            -n derpcat-linux-arm64 \
+            -n derpcat-darwin-amd64 \
+            -n derpcat-darwin-arm64
+          for asset in derpcat-linux-amd64 derpcat-linux-arm64 derpcat-darwin-amd64 derpcat-darwin-arm64; do
+            cp "dist/downloads/$asset/$asset" "dist/raw/$asset"
+          done
       - name: Stage vendored binaries
         run: |
           rm -rf dist/vendor
@@ -275,11 +305,20 @@ jobs:
           install: true
           cache: true
       - name: Download raw build artifacts
-        uses: actions/download-artifact@v6
-        with:
-          pattern: derpcat-*
-          path: dist/raw
-          merge-multiple: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf dist/downloads dist/raw
+          mkdir -p dist/downloads dist/raw
+          gh run download "$GITHUB_RUN_ID" \
+            --dir dist/downloads \
+            -n derpcat-linux-amd64 \
+            -n derpcat-linux-arm64 \
+            -n derpcat-darwin-amd64 \
+            -n derpcat-darwin-arm64
+          for asset in derpcat-linux-amd64 derpcat-linux-arm64 derpcat-darwin-amd64 derpcat-darwin-arm64; do
+            cp "dist/downloads/$asset/$asset" "dist/raw/$asset"
+          done
       - name: Stage vendored binaries
         run: |
           rm -rf dist/vendor
@@ -322,6 +361,7 @@ jobs:
     needs: [check, publish-packages-prod]
     if: needs.publish-packages-prod.result == 'success'
     permissions:
+      actions: read
       contents: read
       id-token: write
     environment:
@@ -329,10 +369,13 @@ jobs:
       url: https://www.npmjs.com/package/derpcat
     steps:
       - name: Download package artifact
-        uses: actions/download-artifact@v6
-        with:
-          name: package-artifacts-prod
-          path: dist
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf dist/downloads
+          mkdir -p dist/downloads
+          gh run download "$GITHUB_RUN_ID" --dir dist/downloads -n package-artifacts-prod
+          cp dist/downloads/package-artifacts-prod/npm.tgz dist/npm.tgz
       - name: Unpack npm artifact
         run: tar -xzf dist/npm.tgz -C dist
       - name: Setup Node
@@ -349,6 +392,7 @@ jobs:
     needs: [check, publish-packages-dev]
     if: needs.publish-packages-dev.result == 'success'
     permissions:
+      actions: read
       contents: read
       id-token: write
     environment:
@@ -356,10 +400,13 @@ jobs:
       url: https://www.npmjs.com/package/derpcat
     steps:
       - name: Download package artifact
-        uses: actions/download-artifact@v6
-        with:
-          name: package-artifacts-dev
-          path: dist
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf dist/downloads
+          mkdir -p dist/downloads
+          gh run download "$GITHUB_RUN_ID" --dir dist/downloads -n package-artifacts-dev
+          cp dist/downloads/package-artifacts-dev/npm.tgz dist/npm.tgz
       - name: Unpack npm artifact
         run: tar -xzf dist/npm.tgz -C dist
       - name: Setup Node
