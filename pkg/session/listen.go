@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/shayne/derpcat/pkg/derpbind"
+	"github.com/shayne/derpcat/pkg/quicpath"
 	"github.com/shayne/derpcat/pkg/rendezvous"
 	"github.com/shayne/derpcat/pkg/token"
 	"tailscale.com/tailcfg"
@@ -31,7 +32,7 @@ type relaySession struct {
 	token        token.Token
 	gate         *rendezvous.Gate
 	derpMap      *tailcfg.DERPMap
-	wgPrivate    [32]byte
+	quicIdentity quicpath.SessionIdentity
 	claimMu      sync.Mutex
 	claimed      bool
 	shareClaimCh chan shareClaim
@@ -51,7 +52,7 @@ func issueLocalToken() (string, *relaySession, error) {
 	tok, err := token.Encode(token.Token{
 		Version:      token.SupportedVersion,
 		SessionID:    sessionID,
-		ExpiresUnix:  time.Now().Add(10 * time.Minute).Unix(),
+		ExpiresUnix:  time.Now().Add(time.Hour).Unix(),
 		BearerSecret: bearerSecret,
 		Capabilities: token.CapabilityStdio,
 	})

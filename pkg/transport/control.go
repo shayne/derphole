@@ -21,6 +21,9 @@ type ControlMessage struct {
 	Candidates []string    `json:"candidates,omitempty"`
 }
 
+const maxControlCandidates = 32
+const maxControlCandidateLength = 128
+
 func (m *Manager) MarkDirectBroken() error {
 	m.noteRelayOnly(m.now())
 	return nil
@@ -110,9 +113,12 @@ func (m *Manager) applyRemoteCandidates(now time.Time, candidates []net.Addr) {
 }
 
 func parseCandidateAddrs(raw []string) []net.Addr {
+	if len(raw) > maxControlCandidates {
+		raw = raw[:maxControlCandidates]
+	}
 	addrs := make([]net.Addr, 0, len(raw))
 	for _, candidate := range raw {
-		if candidate == "" {
+		if candidate == "" || len(candidate) > maxControlCandidateLength {
 			continue
 		}
 		addrPort, err := netip.ParseAddrPort(candidate)
@@ -132,10 +138,17 @@ func parseCandidateAddrs(raw []string) []net.Addr {
 func stringifyCandidates(addrs []net.Addr) []string {
 	out := make([]string, 0, len(addrs))
 	for _, addr := range addrs {
+		if len(out) >= maxControlCandidates {
+			break
+		}
 		if addr == nil {
 			continue
 		}
-		out = append(out, addr.String())
+		candidate := addr.String()
+		if len(candidate) > maxControlCandidateLength {
+			continue
+		}
+		out = append(out, candidate)
 	}
 	return out
 }

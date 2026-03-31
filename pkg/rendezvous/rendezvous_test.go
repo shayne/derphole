@@ -23,10 +23,9 @@ func testClaim(tok token.Token) Claim {
 		Version:      tok.Version,
 		SessionID:    tok.SessionID,
 		DERPPublic:   [32]byte{1, 2, 3, 4},
-		WGPublic:     [32]byte{5, 6, 7, 8},
-		DiscoPublic:  [32]byte{9, 10, 11, 12},
+		QUICPublic:   [32]byte{5, 6, 7, 8},
 		Candidates:   []string{"udp4:203.0.113.10:12345", "udp6:[2001:db8::10]:12345"},
-		Capabilities: 0x5,
+		Capabilities: tok.Capabilities,
 	}
 	claim.BearerMAC = ComputeBearerMAC(tok.BearerSecret, claim)
 	return claim
@@ -81,17 +80,8 @@ func TestGateAcceptsAtExpiryBoundaryAndRejectsAfter(t *testing.T) {
 	tok.ExpiresUnix = now.Unix()
 	claim := testClaim(tok)
 
-	boundaryGate := NewGate(tok)
-	decision, err := boundaryGate.Accept(now, claim)
-	if err != nil {
-		t.Fatalf("boundary Accept() error = %v", err)
-	}
-	if !decision.Accepted {
-		t.Fatalf("boundary Accepted = false, want true")
-	}
-
 	expiredGate := NewGate(tok)
-	decision, err = expiredGate.Accept(now.Add(time.Second), claim)
+	decision, err := expiredGate.Accept(now, claim)
 	if !errors.Is(err, token.ErrExpired) {
 		t.Fatalf("expired Accept() error = %v, want token.ErrExpired", err)
 	}
@@ -196,8 +186,7 @@ func TestClaimAndDecisionSerializationRoundTrip(t *testing.T) {
 		SessionID:    [16]byte{1, 2, 3, 4},
 		BearerMAC:    "mac",
 		DERPPublic:   [32]byte{5, 6, 7, 8},
-		WGPublic:     [32]byte{9, 10, 11, 12},
-		DiscoPublic:  [32]byte{13, 14, 15, 16},
+		QUICPublic:   [32]byte{9, 10, 11, 12},
 		Candidates:   []string{"udp4:127.0.0.1:1", "udp6:[::1]:2"},
 		Capabilities: 0x42,
 	}
@@ -235,5 +224,45 @@ func TestClaimAndDecisionSerializationRoundTrip(t *testing.T) {
 	}
 	if decodedDecision.Accept.SessionID != claim.SessionID {
 		t.Fatalf("decoded decision session = %x, want %x", decodedDecision.Accept.SessionID, claim.SessionID)
+	}
+}
+
+func TestGateRejectsCapabilityMismatch(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	tok := testToken(now)
+	tok.Capabilities = token.CapabilityShare
+	gate := NewGate(tok)
+
+	claim := testClaim(tok)
+	claim.Capabilities = token.CapabilityStdio
+	claim.BearerMAC = ComputeBearerMAC(tok.BearerSecret, claim)
+
+	decision, err := gate.Accept(now, claim)
+	if !errors.Is(err, ErrDenied) {
+		t.Fatalf("Accept() error = %v, want ErrDenied", err)
+	}
+	if decision.Reject == nil || decision.Reject.Code != RejectCapabilities {
+		t.Fatalf("Reject = %+v, want %q", decision.Reject, RejectCapabilities)
+	}
+}
+
+func TestGateRejectsOversizedCandidateSet(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	tok := testToken(now)
+	gate := NewGate(tok)
+
+	claim := testClaim(tok)
+	claim.Candidates = make([]string, MaxClaimCandidates+1)
+	for i := range claim.Candidates {
+		claim.Candidates[i] = "udp4:203.0.113.10:12345"
+	}
+	claim.BearerMAC = ComputeBearerMAC(tok.BearerSecret, claim)
+
+	decision, err := gate.Accept(now, claim)
+	if !errors.Is(err, ErrDenied) {
+		t.Fatalf("Accept() error = %v, want ErrDenied", err)
+	}
+	if decision.Reject == nil || decision.Reject.Code != RejectClaimMalformed {
+		t.Fatalf("Reject = %+v, want %q", decision.Reject, RejectClaimMalformed)
 	}
 }

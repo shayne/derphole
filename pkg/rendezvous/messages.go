@@ -12,8 +12,7 @@ type Claim struct {
 	SessionID    [16]byte `json:"session_id"`
 	BearerMAC    string   `json:"bearer_mac"`
 	DERPPublic   [32]byte `json:"derp_public"`
-	WGPublic     [32]byte `json:"wg_public"`
-	DiscoPublic  [32]byte `json:"disco_public"`
+	QUICPublic   [32]byte `json:"quic_public"`
 	Candidates   []string `json:"candidates,omitempty"`
 	Capabilities uint32   `json:"capabilities"`
 }
@@ -33,6 +32,8 @@ const (
 	RejectVersionMismatch RejectCode = "version_mismatch"
 	RejectSessionMismatch RejectCode = "session_mismatch"
 	RejectBadMAC          RejectCode = "bad_mac"
+	RejectCapabilities    RejectCode = "capabilities_mismatch"
+	RejectClaimMalformed  RejectCode = "claim_malformed"
 )
 
 type RejectInfo struct {
@@ -51,16 +52,14 @@ func ComputeBearerMAC(secret [32]byte, claim Claim) string {
 		Version      uint8    `json:"version"`
 		SessionID    [16]byte `json:"session_id"`
 		DERPPublic   [32]byte `json:"derp_public"`
-		WGPublic     [32]byte `json:"wg_public"`
-		DiscoPublic  [32]byte `json:"disco_public"`
+		QUICPublic   [32]byte `json:"quic_public"`
 		Candidates   []string `json:"candidates,omitempty"`
 		Capabilities uint32   `json:"capabilities"`
 	}{
 		Version:      claim.Version,
 		SessionID:    claim.SessionID,
 		DERPPublic:   claim.DERPPublic,
-		WGPublic:     claim.WGPublic,
-		DiscoPublic:  claim.DiscoPublic,
+		QUICPublic:   claim.QUICPublic,
 		Candidates:   claim.Candidates,
 		Capabilities: claim.Capabilities,
 	})

@@ -87,14 +87,18 @@ func TestQUICStreamSurvivesRelayToDirectUpgrade(t *testing.T) {
 		t.Fatalf("managerB.Start() error = %v", err)
 	}
 
-	cert, err := GenerateSelfSignedCertificate()
+	serverIdentity, err := GenerateSessionIdentity()
 	if err != nil {
-		t.Fatalf("GenerateSelfSignedCertificate() error = %v", err)
+		t.Fatalf("GenerateSessionIdentity(server) error = %v", err)
+	}
+	clientIdentity, err := GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(client) error = %v", err)
 	}
 
 	serverAdapter := NewAdapter(managerB.PeerDatagramConn(ctx))
 	defer serverAdapter.Close()
-	listener, err := quic.Listen(serverAdapter, DefaultTLSConfig(cert, ServerName), DefaultQUICConfig())
+	listener, err := quic.Listen(serverAdapter, ServerTLSConfig(serverIdentity, clientIdentity.Public), DefaultQUICConfig())
 	if err != nil {
 		t.Fatalf("quic.Listen() error = %v", err)
 	}
@@ -154,7 +158,7 @@ func TestQUICStreamSurvivesRelayToDirectUpgrade(t *testing.T) {
 
 	clientAdapter := NewAdapter(managerA.PeerDatagramConn(ctx))
 	defer clientAdapter.Close()
-	clientConn, err := quic.Dial(ctx, clientAdapter, managerA.PeerDatagramConn(ctx).RemoteAddr(), DefaultClientTLSConfig(), DefaultQUICConfig())
+	clientConn, err := quic.Dial(ctx, clientAdapter, managerA.PeerDatagramConn(ctx).RemoteAddr(), ClientTLSConfig(clientIdentity, serverIdentity.Public), DefaultQUICConfig())
 	if err != nil {
 		t.Fatalf("quic.Dial() error = %v", err)
 	}

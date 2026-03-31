@@ -22,7 +22,6 @@ import (
 	"github.com/shayne/derpcat/pkg/token"
 	"github.com/shayne/derpcat/pkg/transport"
 	"github.com/shayne/derpcat/pkg/traversal"
-	"github.com/shayne/derpcat/pkg/wg"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -32,6 +31,7 @@ const (
 	envelopeDecision = "decision"
 	envelopeControl  = "control"
 	envelopeAck      = "ack"
+	maxEnvelopeBytes = 16 << 10
 )
 
 type envelope struct {
@@ -76,12 +76,7 @@ func issuePublicSession(ctx context.Context) (string, *relaySession, error) {
 		_ = derpClient.Close()
 		return "", nil, err
 	}
-	wgPrivate, wgPublic, err := wg.GenerateKeypair()
-	if err != nil {
-		_ = derpClient.Close()
-		return "", nil, err
-	}
-	_, discoPublic, err := wg.GenerateKeypair()
+	quicIdentity, err := quicpath.GenerateSessionIdentity()
 	if err != nil {
 		_ = derpClient.Close()
 		return "", nil, err
@@ -90,11 +85,10 @@ func issuePublicSession(ctx context.Context) (string, *relaySession, error) {
 	tokValue := token.Token{
 		Version:         token.SupportedVersion,
 		SessionID:       sessionID,
-		ExpiresUnix:     time.Now().Add(10 * time.Minute).Unix(),
+		ExpiresUnix:     time.Now().Add(time.Hour).Unix(),
 		BootstrapRegion: uint16(node.RegionID),
 		DERPPublic:      derpPublicKeyRaw32(derpClient.PublicKey()),
-		WGPublic:        wgPublic,
-		DiscoPublic:     discoPublic,
+		QUICPublic:      quicIdentity.Public,
 		BearerSecret:    bearerSecret,
 		Capabilities:    token.CapabilityStdio,
 	}
@@ -111,13 +105,13 @@ func issuePublicSession(ctx context.Context) (string, *relaySession, error) {
 	}
 
 	session := &relaySession{
-		mailbox:   make(chan relayMessage),
-		probeConn: probeConn,
-		derp:      derpClient,
-		token:     tokValue,
-		gate:      rendezvous.NewGate(tokValue),
-		derpMap:   dm,
-		wgPrivate: wgPrivate,
+		mailbox:      make(chan relayMessage),
+		probeConn:    probeConn,
+		derp:         derpClient,
+		token:        tokValue,
+		gate:         rendezvous.NewGate(tokValue),
+		derpMap:      dm,
+		quicIdentity: quicIdentity,
 	}
 	return tok, session, nil
 }
@@ -155,11 +149,7 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 	}
 	defer probeConn.Close()
 
-	_, senderPublic, err := wg.GenerateKeypair()
-	if err != nil {
-		return err
-	}
-	_, senderDisco, err := wg.GenerateKeypair()
+	clientIdentity, err := quicpath.GenerateSessionIdentity()
 	if err != nil {
 		return err
 	}
@@ -168,8 +158,7 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 		Version:      tok.Version,
 		SessionID:    tok.SessionID,
 		DERPPublic:   derpPublicKeyRaw32(derpClient.PublicKey()),
-		WGPublic:     senderPublic,
-		DiscoPublic:  senderDisco,
+		QUICPublic:   clientIdentity.Public,
 		Candidates:   publicProbeCandidates(ctx, probeConn, dm),
 		Capabilities: tok.Capabilities,
 	}
@@ -216,7 +205,7 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 		cfg.Emitter.Debug("sender-quic-ready")
 		cfg.Emitter.Debug("dialing-quic")
 	}
-	quicConn, err := quic.Dial(ctx, adapter, peerConn.RemoteAddr(), quicpath.DefaultClientTLSConfig(), quicpath.DefaultQUICConfig())
+	quicConn, err := quic.Dial(ctx, adapter, peerConn.RemoteAddr(), quicpath.ClientTLSConfig(clientIdentity, tok.QUICPublic), quicpath.DefaultQUICConfig())
 	if err != nil {
 		return err
 	}
@@ -309,15 +298,9 @@ func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
 		defer transportCleanup()
 		pathEmitter.Watch(transportCtx, transportManager)
 		pathEmitter.Flush(transportManager)
-		_ = env.Claim.WGPublic
-
-		cert, err := quicpath.GenerateSelfSignedCertificate()
-		if err != nil {
-			return tok, err
-		}
 		adapter := quicpath.NewAdapter(transportManager.PeerDatagramConn(transportCtx))
 		defer adapter.Close()
-		quicListener, err := quic.Listen(adapter, quicpath.DefaultTLSConfig(cert, quicpath.ServerName), quicpath.DefaultQUICConfig())
+		quicListener, err := quic.Listen(adapter, quicpath.ServerTLSConfig(session.quicIdentity, env.Claim.QUICPublic), quicpath.DefaultQUICConfig())
 		if err != nil {
 			return tok, err
 		}
@@ -536,6 +519,9 @@ func sendEnvelope(ctx context.Context, client *derpbind.Client, dst key.NodePubl
 
 func decodeEnvelope(payload []byte) (envelope, error) {
 	var env envelope
+	if len(payload) == 0 || len(payload) > maxEnvelopeBytes {
+		return env, errors.New("invalid envelope size")
+	}
 	err := json.Unmarshal(payload, &env)
 	return env, err
 }
@@ -588,6 +574,9 @@ func publicProbeCandidates(ctx context.Context, conn net.PacketConn, dm *tailcfg
 		candidates = append(candidates, candidate)
 	}
 	slices.Sort(candidates)
+	if len(candidates) > rendezvous.MaxClaimCandidates {
+		candidates = candidates[:rendezvous.MaxClaimCandidates]
+	}
 	return candidates
 }
 

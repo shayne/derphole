@@ -158,6 +158,13 @@ func TestShareOpenUsesEphemeralLocalBind(t *testing.T) {
 	backendDone()
 }
 
+func TestDecodeEnvelopeRejectsOversizedPayload(t *testing.T) {
+	payload := make([]byte, maxEnvelopeBytes+1)
+	if _, err := decodeEnvelope(payload); err == nil {
+		t.Fatal("decodeEnvelope() error = nil, want invalid envelope size")
+	}
+}
+
 func TestShareOpenForwardsSequentialConnections(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

@@ -20,13 +20,9 @@ type Token struct {
 	ExpiresUnix     int64
 	BootstrapRegion uint16
 	DERPPublic      [32]byte
-	WGPublic        [32]byte
-	DiscoPublic     [32]byte
+	QUICPublic      [32]byte
 	BearerSecret    [32]byte
 	Capabilities    uint32
-	ShareTargetAddr string
-	DefaultBindHost string
-	DefaultBindPort uint16
 }
 
 var (
@@ -36,8 +32,8 @@ var (
 	ErrInvalidLength      = errors.New("token invalid length")
 )
 
-const SupportedVersion uint8 = 2
-const fixedPayloadSize = 1 + 16 + 8 + 2 + 32 + 32 + 32 + 32 + 4 + 2 + 2 + 2
+const SupportedVersion uint8 = 3
+const fixedPayloadSize = 1 + 16 + 8 + 2 + 32 + 32 + 32 + 4
 
 func Encode(tok Token) (string, error) {
 	if tok.Version == 0 {
@@ -62,25 +58,13 @@ func Encode(tok Token) (string, error) {
 	if _, err := payload.Write(tok.DERPPublic[:]); err != nil {
 		return "", err
 	}
-	if _, err := payload.Write(tok.WGPublic[:]); err != nil {
-		return "", err
-	}
-	if _, err := payload.Write(tok.DiscoPublic[:]); err != nil {
+	if _, err := payload.Write(tok.QUICPublic[:]); err != nil {
 		return "", err
 	}
 	if _, err := payload.Write(tok.BearerSecret[:]); err != nil {
 		return "", err
 	}
 	if err := binary.Write(&payload, binary.BigEndian, tok.Capabilities); err != nil {
-		return "", err
-	}
-	if err := writeString(&payload, tok.ShareTargetAddr); err != nil {
-		return "", err
-	}
-	if err := writeString(&payload, tok.DefaultBindHost); err != nil {
-		return "", err
-	}
-	if err := binary.Write(&payload, binary.BigEndian, tok.DefaultBindPort); err != nil {
 		return "", err
 	}
 
@@ -130,25 +114,13 @@ func Decode(encoded string, now time.Time) (Token, error) {
 	if _, err := r.Read(tok.DERPPublic[:]); err != nil {
 		return tok, err
 	}
-	if _, err := r.Read(tok.WGPublic[:]); err != nil {
-		return tok, err
-	}
-	if _, err := r.Read(tok.DiscoPublic[:]); err != nil {
+	if _, err := r.Read(tok.QUICPublic[:]); err != nil {
 		return tok, err
 	}
 	if _, err := r.Read(tok.BearerSecret[:]); err != nil {
 		return tok, err
 	}
 	if err := binary.Read(r, binary.BigEndian, &tok.Capabilities); err != nil {
-		return tok, err
-	}
-	if tok.ShareTargetAddr, err = readString(r); err != nil {
-		return tok, err
-	}
-	if tok.DefaultBindHost, err = readString(r); err != nil {
-		return tok, err
-	}
-	if err := binary.Read(r, binary.BigEndian, &tok.DefaultBindPort); err != nil {
 		return tok, err
 	}
 	if r.Len() != 0 {
@@ -160,32 +132,4 @@ func Decode(encoded string, now time.Time) (Token, error) {
 	}
 
 	return tok, nil
-}
-
-func writeString(buf *bytes.Buffer, v string) error {
-	if len(v) > 0xffff {
-		return ErrInvalidLength
-	}
-	if err := binary.Write(buf, binary.BigEndian, uint16(len(v))); err != nil {
-		return err
-	}
-	if _, err := buf.WriteString(v); err != nil {
-		return err
-	}
-	return nil
-}
-
-func readString(r *bytes.Reader) (string, error) {
-	var size uint16
-	if err := binary.Read(r, binary.BigEndian, &size); err != nil {
-		return "", err
-	}
-	if int(size) > r.Len() {
-		return "", ErrInvalidLength
-	}
-	buf := make([]byte, int(size))
-	if _, err := r.Read(buf); err != nil {
-		return "", err
-	}
-	return string(buf), nil
 }

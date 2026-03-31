@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net"
-	"strconv"
 	"sync"
 	"time"
 
@@ -65,11 +64,7 @@ func claimRelayShare(session *relaySession, claim shareClaim) error {
 func openLocalListener(cfg OpenConfig, tok token.Token) (net.Listener, error) {
 	addr := cfg.BindAddr
 	if addr == "" {
-		host := tok.DefaultBindHost
-		if host == "" {
-			host = "127.0.0.1"
-		}
-		addr = net.JoinHostPort(host, strconv.Itoa(int(tok.DefaultBindPort)))
+		addr = "127.0.0.1:0"
 	}
 	return net.Listen("tcp", addr)
 }

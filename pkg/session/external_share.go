@@ -15,7 +15,6 @@ import (
 	"github.com/shayne/derpcat/pkg/stream"
 	"github.com/shayne/derpcat/pkg/telemetry"
 	"github.com/shayne/derpcat/pkg/token"
-	"github.com/shayne/derpcat/pkg/wg"
 	"go4.org/mem"
 	"tailscale.com/types/key"
 )
@@ -45,12 +44,7 @@ func issuePublicShareSession(ctx context.Context, cfg ShareConfig) (string, *rel
 		_ = derpClient.Close()
 		return "", nil, err
 	}
-	wgPrivate, wgPublic, err := wg.GenerateKeypair()
-	if err != nil {
-		_ = derpClient.Close()
-		return "", nil, err
-	}
-	_, discoPublic, err := wg.GenerateKeypair()
+	quicIdentity, err := quicpath.GenerateSessionIdentity()
 	if err != nil {
 		_ = derpClient.Close()
 		return "", nil, err
@@ -59,16 +53,12 @@ func issuePublicShareSession(ctx context.Context, cfg ShareConfig) (string, *rel
 	tokValue := token.Token{
 		Version:         token.SupportedVersion,
 		SessionID:       sessionID,
-		ExpiresUnix:     time.Now().Add(10 * time.Minute).Unix(),
+		ExpiresUnix:     time.Now().Add(time.Hour).Unix(),
 		BootstrapRegion: uint16(node.RegionID),
 		DERPPublic:      derpPublicKeyRaw32(derpClient.PublicKey()),
-		WGPublic:        wgPublic,
-		DiscoPublic:     discoPublic,
+		QUICPublic:      quicIdentity.Public,
 		BearerSecret:    bearerSecret,
 		Capabilities:    token.CapabilityShare,
-		ShareTargetAddr: cfg.TargetAddr,
-		DefaultBindHost: "127.0.0.1",
-		DefaultBindPort: 0,
 	}
 	tok, err := token.Encode(tokValue)
 	if err != nil {
@@ -83,12 +73,12 @@ func issuePublicShareSession(ctx context.Context, cfg ShareConfig) (string, *rel
 	}
 
 	session := &relaySession{
-		probeConn: probeConn,
-		derp:      derpClient,
-		token:     tokValue,
-		gate:      rendezvous.NewGate(tokValue),
-		derpMap:   dm,
-		wgPrivate: wgPrivate,
+		probeConn:    probeConn,
+		derp:         derpClient,
+		token:        tokValue,
+		gate:         rendezvous.NewGate(tokValue),
+		derpMap:      dm,
+		quicIdentity: quicIdentity,
 	}
 	return tok, session, nil
 }
@@ -151,13 +141,9 @@ func shareExternal(ctx context.Context, cfg ShareConfig) (string, error) {
 		defer transportCleanup()
 		pathEmitter.Watch(transportCtx, transportManager)
 		pathEmitter.Flush(transportManager)
-		cert, err := quicpath.GenerateSelfSignedCertificate()
-		if err != nil {
-			return tok, err
-		}
 		adapter := quicpath.NewAdapter(transportManager.PeerDatagramConn(transportCtx))
 		defer adapter.Close()
-		quicListener, err := quic.Listen(adapter, quicpath.DefaultTLSConfig(cert, quicpath.ServerName), quicpath.DefaultQUICConfig())
+		quicListener, err := quic.Listen(adapter, quicpath.ServerTLSConfig(session.quicIdentity, env.Claim.QUICPublic), quicpath.DefaultQUICConfig())
 		if err != nil {
 			return tok, err
 		}
@@ -202,11 +188,7 @@ func openExternal(ctx context.Context, cfg OpenConfig, tok token.Token) error {
 	}
 	defer probeConn.Close()
 
-	_, senderPublic, err := wg.GenerateKeypair()
-	if err != nil {
-		return err
-	}
-	_, senderDisco, err := wg.GenerateKeypair()
+	clientIdentity, err := quicpath.GenerateSessionIdentity()
 	if err != nil {
 		return err
 	}
@@ -215,8 +197,7 @@ func openExternal(ctx context.Context, cfg OpenConfig, tok token.Token) error {
 		Version:      tok.Version,
 		SessionID:    tok.SessionID,
 		DERPPublic:   derpPublicKeyRaw32(derpClient.PublicKey()),
-		WGPublic:     senderPublic,
-		DiscoPublic:  senderDisco,
+		QUICPublic:   clientIdentity.Public,
 		Candidates:   publicProbeCandidates(ctx, probeConn, dm),
 		Capabilities: tok.Capabilities,
 	}
@@ -252,7 +233,7 @@ func openExternal(ctx context.Context, cfg OpenConfig, tok token.Token) error {
 	peerConn := transportManager.PeerDatagramConn(transportCtx)
 	adapter := quicpath.NewAdapter(peerConn)
 	defer adapter.Close()
-	quicConn, err := quic.Dial(ctx, adapter, peerConn.RemoteAddr(), quicpath.DefaultClientTLSConfig(), quicpath.DefaultQUICConfig())
+	quicConn, err := quic.Dial(ctx, adapter, peerConn.RemoteAddr(), quicpath.ClientTLSConfig(clientIdentity, tok.QUICPublic), quicpath.DefaultQUICConfig())
 	if err != nil {
 		return err
 	}
@@ -276,6 +257,7 @@ func openExternal(ctx context.Context, cfg OpenConfig, tok token.Token) error {
 
 func serveQUICListener(ctx context.Context, conn *quic.Conn, targetAddr string, emitter *telemetry.Emitter) error {
 	var wg sync.WaitGroup
+	slots := make(chan struct{}, quicpath.MaxIncomingStreams)
 	defer wg.Wait()
 
 	for {
@@ -291,12 +273,22 @@ func serveQUICListener(ctx context.Context, conn *quic.Conn, targetAddr string, 
 			return err
 		}
 		overlayConn := quicpath.WrapStream(conn, streamConn)
+		select {
+		case slots <- struct{}{}:
+		default:
+			if emitter != nil {
+				emitter.Debug("stream-limit-reached")
+			}
+			_ = overlayConn.Close()
+			continue
+		}
 
 		backendConn, err := (&net.Dialer{}).DialContext(ctx, "tcp", targetAddr)
 		if err != nil {
 			if emitter != nil {
 				emitter.Debug("backend-dial-failed")
 			}
+			<-slots
 			_ = overlayConn.Close()
 			continue
 		}
@@ -304,6 +296,7 @@ func serveQUICListener(ctx context.Context, conn *quic.Conn, targetAddr string, 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() { <-slots }()
 			defer overlayConn.Close()
 			defer backendConn.Close()
 			_ = stream.Bridge(ctx, overlayConn, backendConn)

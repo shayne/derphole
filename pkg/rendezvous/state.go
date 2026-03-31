@@ -15,6 +15,9 @@ var (
 	ErrDenied  = errors.New("claim denied")
 )
 
+const MaxClaimCandidates = 32
+const MaxCandidateLength = 128
+
 type Gate struct {
 	mu      sync.Mutex
 	token   token.Token
@@ -29,7 +32,7 @@ func (g *Gate) Accept(now time.Time, claim Claim) (Decision, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if now.Unix() > g.token.ExpiresUnix {
+	if now.Unix() >= g.token.ExpiresUnix {
 		return Decision{
 			Accepted: false,
 			Reject:   &RejectInfo{Code: RejectExpired, Reason: "token expired"},
@@ -59,6 +62,18 @@ func (g *Gate) Accept(now time.Time, claim Claim) (Decision, error) {
 			Reject:   &RejectInfo{Code: RejectBadMAC, Reason: "bad bearer mac"},
 		}, ErrDenied
 	}
+	if claim.Capabilities != g.token.Capabilities {
+		return Decision{
+			Accepted: false,
+			Reject:   &RejectInfo{Code: RejectCapabilities, Reason: "capabilities mismatch"},
+		}, ErrDenied
+	}
+	if claim.DERPPublic == [32]byte{} || claim.QUICPublic == [32]byte{} || !validCandidates(claim.Candidates) {
+		return Decision{
+			Accepted: false,
+			Reject:   &RejectInfo{Code: RejectClaimMalformed, Reason: "claim malformed"},
+		}, ErrDenied
+	}
 
 	g.claimed = true
 	return Decision{
@@ -83,4 +98,16 @@ func validBearerMAC(secret [32]byte, claim Claim) bool {
 		return false
 	}
 	return hmac.Equal(got, want)
+}
+
+func validCandidates(candidates []string) bool {
+	if len(candidates) > MaxClaimCandidates {
+		return false
+	}
+	for _, candidate := range candidates {
+		if candidate == "" || len(candidate) > MaxCandidateLength {
+			return false
+		}
+	}
+	return true
 }
