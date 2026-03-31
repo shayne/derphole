@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-target="${1:?usage: $0 <hetz|pve1>}"
+target="${1:?usage: $0 <host>}"
 tmp="$(mktemp -d)"
 remote_base="/tmp/derpcat-smoke-$$"
 remote_upload="/tmp/derpcat-smoke-bin-$$"
 local_listener_pid=""
 transfer_pause=5
+remote_user="${DERPCAT_REMOTE_USER:-root}"
 
 remote() {
-  ssh "root@${target}" 'bash -se' <<<"$1"
+  ssh "${remote_user}@${target}" 'bash -se' <<<"$1"
 }
 
 cleanup() {
@@ -124,7 +125,7 @@ dump_remote_logs() {
 
 mise run build
 mise run build-linux-amd64
-scp dist/derpcat-linux-amd64 "root@${target}:${remote_upload}"
+scp dist/derpcat-linux-amd64 "${remote_user}@${target}:${remote_upload}"
 remote "install -m 0755 '${remote_upload}' /usr/local/bin/derpcat && rm -f '${remote_upload}' && /usr/local/bin/derpcat --help >/dev/null 2>&1"
 
 payload_local_to_remote="hello local-to-${target}-$(date +%s)"

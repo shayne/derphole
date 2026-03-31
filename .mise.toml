@@ -81,16 +81,33 @@ bash ./tools/packaging/build-npm.sh
 run = "./scripts/smoke-local.sh"
 
 [tasks.smoke-remote]
-run = "./scripts/smoke-remote.sh hetz"
+shell = "bash -c"
+run = """
+set -euo pipefail
+: "${REMOTE_HOST:?set REMOTE_HOST to a reachable SSH host}"
+./scripts/smoke-remote.sh "${REMOTE_HOST}"
+"""
 
 [tasks.smoke-remote-relay]
-run = "./scripts/smoke-remote-relay.sh hetz"
+shell = "bash -c"
+run = """
+set -euo pipefail
+: "${REMOTE_HOST:?set REMOTE_HOST to a reachable SSH host}"
+./scripts/smoke-remote-relay.sh "${REMOTE_HOST}"
+"""
 
 [tasks.smoke-remote-share]
-run = "./scripts/smoke-remote-share.sh hetz"
+shell = "bash -c"
+run = """
+set -euo pipefail
+: "${REMOTE_HOST:?set REMOTE_HOST to a reachable SSH host}"
+./scripts/smoke-remote-share.sh "${REMOTE_HOST}"
+"""
 
-[tasks.promotion-1g-hetz]
-run = "./scripts/promotion-test.sh hetz 1024"
-
-[tasks.promotion-1g-pve1]
-run = "./scripts/promotion-test.sh pve1 1024"
+[tasks.promotion-1g]
+shell = "bash -c"
+run = """
+set -euo pipefail
+: "${REMOTE_HOST:?set REMOTE_HOST to a reachable SSH host}"
+./scripts/promotion-test.sh "${REMOTE_HOST}" 1024
+"""

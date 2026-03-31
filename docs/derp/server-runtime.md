@@ -2,7 +2,7 @@
 
 ## Overview
 
-The reference server implementation is in `/Users/shayne/code/tailscale/derp/derpserver/derpserver.go`. The server owns:
+The reference server implementation is in `tailscale/derp/derpserver/derpserver.go`. The server owns:
 
 - admission and handshake,
 - client registration keyed by node public key,
@@ -20,7 +20,7 @@ The server is intentionally stateful and connection-oriented.
 The main `Server` structure makes the responsibilities visible:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/derpserver.go:125-209
+// Source: tailscale/derp/derpserver/derpserver.go:125-209
 type Server struct {
     WriteTimeout time.Duration
     privateKey key.NodePrivate
@@ -52,7 +52,7 @@ Important internal maps:
 Every accepted DERP transport goes through the same path:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/derpserver.go:914-979
+// Source: tailscale/derp/derpserver/derpserver.go:914-979
 func (s *Server) accept(ctx context.Context, nc derp.Conn, brw *bufio.ReadWriter, remoteAddr string, connNum int64) error {
     ...
     if err := s.sendServerKey(bw); err != nil { ... }
@@ -85,7 +85,7 @@ The sequencing matters:
 The server supports two verification mechanisms, plus a bypass for trusted mesh peers:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/derpserver.go:1377-1440
+// Source: tailscale/derp/derpserver/derpserver.go:1377-1440
 func (s *Server) verifyClient(ctx context.Context, clientKey key.NodePublic, info *derp.ClientInfo, clientIP netip.Addr) error {
     if s.isMeshPeer(info) {
         return nil
@@ -118,7 +118,7 @@ Modes:
 The server tracks connections by public key and explicitly handles duplicates:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/derpserver.go:663-719
+// Source: tailscale/derp/derpserver/derpserver.go:663-719
 func (s *Server) registerClient(c *sclient) {
     ...
     cs, ok := s.clients[c.key]
@@ -144,7 +144,7 @@ func (s *Server) registerClient(c *sclient) {
 And unregistering reverses that state:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/derpserver.go:738-811
+// Source: tailscale/derp/derpserver/derpserver.go:738-811
 func (s *Server) unregisterClient(c *sclient) {
     ...
     if dup == nil {
@@ -175,7 +175,7 @@ Design intent:
 The per-client runtime is split into a reader (`run`) and a sender (`sendLoop`).
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/derpserver.go:988-1050
+// Source: tailscale/derp/derpserver/derpserver.go:988-1050
 func (c *sclient) run(ctx context.Context) error {
     var grp errgroup.Group
     sendCtx, cancelSender := context.WithCancel(ctx)
@@ -220,7 +220,7 @@ A regular client sends `FrameSendPacket`, which becomes one of three outcomes:
 3. drop with a reason and optional `PeerGone`.
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/derpserver.go:1184-1235
+// Source: tailscale/derp/derpserver/derpserver.go:1184-1235
 func (c *sclient) handleFrameSendPacket(ft derp.FrameType, fl uint32) error {
     dstKey, contents, err := s.recvPacket(c.br, fl)
     ...
@@ -250,7 +250,7 @@ func (c *sclient) handleFrameSendPacket(ft derp.FrameType, fl uint32) error {
 A trusted mesh peer may forward on behalf of another source:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/derpserver.go:1140-1182
+// Source: tailscale/derp/derpserver/derpserver.go:1140-1182
 func (c *sclient) handleFrameForwardPacket(ft derp.FrameType, fl uint32) error {
     if !c.canMesh {
         return fmt.Errorf("insufficient permissions")
@@ -276,7 +276,7 @@ This is the core of intra-region mesh forwarding.
 Per-client queueing is intentionally bounded and freshness-biased:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/derpserver.go:1286-1325
+// Source: tailscale/derp/derpserver/derpserver.go:1286-1325
 func (c *sclient) sendPkt(dst *sclient, p pkt) error {
     sendQueue := dst.sendQueue
     if disco.LooksLikeDiscoWrapper(p.bs) {
@@ -315,7 +315,7 @@ This is a deliberate latency-over-throughput choice.
 The send loop batches non-blocking work, flushes, then blocks for the next event:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/derpserver.go:1789-1862
+// Source: tailscale/derp/derpserver/derpserver.go:1789-1862
 func (c *sclient) sendLoop(ctx context.Context) error {
     ...
     jitter := rand.N(5 * time.Second)
@@ -352,7 +352,7 @@ The server supports both old-style keepalives and newer ping/pong activity.
 Ping handling:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/derpserver.go:1081-1105
+// Source: tailscale/derp/derpserver/derpserver.go:1081-1105
 func (c *sclient) handleFramePing(ft derp.FrameType, fl uint32) error {
     ...
     select {
@@ -367,7 +367,7 @@ func (c *sclient) handleFramePing(ft derp.FrameType, fl uint32) error {
 Keepalive write:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/derpserver.go:1891-1895
+// Source: tailscale/derp/derpserver/derpserver.go:1891-1895
 func (c *sclient) sendKeepAlive() error {
     c.setWriteDeadline()
     return derp.WriteFrameHeader(c.bw.bw(), derp.FrameKeepAlive, 0)
@@ -381,7 +381,7 @@ Trusted peers may subscribe to peer presence, receiving a flood of current clien
 Watcher registration:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/derpserver.go:880-911
+// Source: tailscale/derp/derpserver/derpserver.go:880-911
 func (s *Server) addWatcher(c *sclient) {
     ...
     for peer, clientSet := range s.clients {
@@ -404,7 +404,7 @@ func (s *Server) addWatcher(c *sclient) {
 Broadcast on peer state change:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/derpserver.go:721-735
+// Source: tailscale/derp/derpserver/derpserver.go:721-735
 func (s *Server) broadcastPeerStateChangeLocked(peer key.NodePublic, ipPort netip.AddrPort, flags derp.PeerPresentFlags, present bool) {
     for w := range s.watchers {
         w.peerStateChange = append(w.peerStateChange, peerConnState{
@@ -425,7 +425,7 @@ This is the mechanism that makes regional meshes possible.
 If multiple forwarders exist for the same destination key, the server wraps them in a `multiForwarder` and picks a preferred one consistently:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/derpserver.go:2057-2198
+// Source: tailscale/derp/derpserver/derpserver.go:2057-2198
 func (s *Server) AddPacketForwarder(dst key.NodePublic, fwd PacketForwarder)
 func (s *Server) RemovePacketForwarder(dst key.NodePublic, fwd PacketForwarder)
 type multiForwarder struct { ... }
@@ -439,8 +439,8 @@ The server generates a self-signed "meta cert" that encodes its public key and p
 
 The full implementation is in:
 
-- `/Users/shayne/code/tailscale/derp/derpserver/derpserver.go:597-660`
-- `/Users/shayne/code/tailscale/derp/derphttp/derphttp_client.go:1165-1177`
+- `tailscale/derp/derpserver/derpserver.go:597-660`
+- `tailscale/derp/derphttp/derphttp_client.go:1165-1177`
 
 Operationally, this is a pure optimization. DERP still functions without it.
 
@@ -454,7 +454,7 @@ The main handler exposes:
 - `/generate_204` via `derper`
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/handler.go:15-70
+// Source: tailscale/derp/derpserver/handler.go:15-70
 func Handler(s *Server) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         ...

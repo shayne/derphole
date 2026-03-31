@@ -12,7 +12,7 @@ This split is important because "DERP client behavior" is not just a socket dial
 
 ## Transport Establishment
 
-The transport implementation is in `/Users/shayne/code/tailscale/derp/derphttp/derphttp_client.go`.
+The transport implementation is in `tailscale/derp/derphttp/derphttp_client.go`.
 
 ### Connection Modes
 
@@ -23,7 +23,7 @@ The transport implementation is in `/Users/shayne/code/tailscale/derp/derphttp/d
 - for TLS probing only (`NewNetcheckClient`).
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derphttp/derphttp_client.go:120-177
+// Source: tailscale/derp/derphttp/derphttp_client.go:120-177
 func NewRegionClient(...)
 func NewNetcheckClient(...)
 func NewClient(...)
@@ -43,7 +43,7 @@ The `connect` method handles:
 - optional watcher subscription.
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derphttp/derphttp_client.go:331-585
+// Source: tailscale/derp/derphttp/derphttp_client.go:331-585
 func (c *Client) connect(ctx context.Context, caller string) (client *derp.Client, connGen int, err error) {
     ...
     switch {
@@ -84,7 +84,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 When using a DERP map, clients dial a region by trying nodes in priority order and skipping `STUNOnly` nodes for DERP transport.
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derphttp/derphttp_client.go:624-648
+// Source: tailscale/derp/derphttp/derphttp_client.go:624-648
 func (c *Client) dialRegion(ctx context.Context, reg *tailcfg.DERPRegion) (net.Conn, *tailcfg.DERPNode, error) {
     if len(reg.Nodes) == 0 { ... }
     for _, n := range reg.Nodes {
@@ -105,7 +105,7 @@ func (c *Client) dialRegion(ctx context.Context, reg *tailcfg.DERPRegion) (net.C
 `dialNode` races IPv4 and IPv6 and can prefer IPv6 with a slight delay before IPv4:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derphttp/derphttp_client.go:722-827
+// Source: tailscale/derp/derphttp/derphttp_client.go:722-827
 func (c *Client) dialNode(ctx context.Context, n *tailcfg.DERPNode) (net.Conn, error) {
     ...
     if proto == "tcp4" && c.preferIPv6() {
@@ -136,7 +136,7 @@ The node model therefore supports:
 - `RecvDetail()` surfaces the generation to callers.
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derphttp/derphttp_client.go:1089-1111
+// Source: tailscale/derp/derphttp/derphttp_client.go:1089-1111
 func (c *Client) RecvDetail() (m derp.ReceivedMessage, connGen int, err error) {
     client, connGen, err := c.connect(c.newContext(), "derphttp.Client.Recv")
     ...
@@ -159,7 +159,7 @@ Netcheck is the measurement engine that feeds home DERP selection.
 ### Report Model
 
 ```go
-// Source: /Users/shayne/code/tailscale/net/netcheck/netcheck.go:88-126
+// Source: tailscale/net/netcheck/netcheck.go:88-126
 type Report struct {
     UDP bool
     IPv6 bool
@@ -182,7 +182,7 @@ This is not just a DERP measurement structure. It is a combined NAT, reachabilit
 Netcheck generates probe plans from the DERP map, recent latency history, and the current preferred DERP:
 
 ```go
-// Source: /Users/shayne/code/tailscale/net/netcheck/netcheck.go:422-535
+// Source: tailscale/net/netcheck/netcheck.go:422-535
 func makeProbePlan(dm *tailcfg.DERPMap, ifState *netmon.State, last *Report, preferredDERP int) (plan probePlan) {
     ...
     // ensure that the home region is always probed
@@ -207,7 +207,7 @@ Key behaviors:
 If UDP is blocked, netcheck falls back to HTTPS-based latency measurement:
 
 ```go
-// Source: /Users/shayne/code/tailscale/net/netcheck/netcheck.go:960-1015
+// Source: tailscale/net/netcheck/netcheck.go:960-1015
 if !rs.anyUDP() && ctx.Err() == nil && !onlySTUN {
     ...
     c.logf("netcheck: UDP is blocked, trying HTTPS")
@@ -219,7 +219,7 @@ if !rs.anyUDP() && ctx.Err() == nil && !onlySTUN {
 And in JS/wasm or similarly constrained environments it uses `/derp/probe`:
 
 ```go
-// Source: /Users/shayne/code/tailscale/net/netcheck/netcheck.go:1034-1101
+// Source: tailscale/net/netcheck/netcheck.go:1034-1101
 func (c *Client) runHTTPOnlyChecks(ctx context.Context, last *Report, rs *reportState, dm *tailcfg.DERPMap) error {
     ...
     req, _ := http.NewRequestWithContext(ctx, "HEAD", "https://"+node.HostName+"/derp/probe", nil)
@@ -232,7 +232,7 @@ func (c *Client) runHTTPOnlyChecks(ctx context.Context, last *Report, rs *report
 Netcheck includes explicit anti-flap constants:
 
 ```go
-// Source: /Users/shayne/code/tailscale/net/netcheck/netcheck.go:1330-1353
+// Source: tailscale/net/netcheck/netcheck.go:1330-1353
 const (
     preferredDERPAbsoluteDiff = 10 * time.Millisecond
     PreferredDERPFrameTime = 8 * time.Second
@@ -249,7 +249,7 @@ And the actual selection logic combines:
 - absolute and relative improvement thresholds.
 
 ```go
-// Source: /Users/shayne/code/tailscale/net/netcheck/netcheck.go:1355-1455
+// Source: tailscale/net/netcheck/netcheck.go:1355-1455
 func (c *Client) addReportHistoryAndSetPreferredDERP(rs *reportState, r *Report, dm tailcfg.DERPMapView) {
     ...
     for regionID, d := range bestRecent {
@@ -279,7 +279,7 @@ This is one of the most important runtime behaviors in DERP: the system is inten
 `magicsock` takes the netcheck report and uses it to update `tailcfg.NetInfo` and select a live home DERP:
 
 ```go
-// Source: /Users/shayne/code/tailscale/wgengine/magicsock/magicsock.go:1008-1062
+// Source: tailscale/wgengine/magicsock/magicsock.go:1008-1062
 func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
     ...
     report, err := c.netChecker.GetReport(ctx, dm, &netcheck.GetReportOpts{
@@ -299,7 +299,7 @@ Important consequence: recent incoming DERP frame activity feeds back into futur
 Magicsock will not casually change home DERP if the node is disconnected from control and already has one:
 
 ```go
-// Source: /Users/shayne/code/tailscale/wgengine/magicsock/derp.go:152-206
+// Source: tailscale/wgengine/magicsock/derp.go:152-206
 func (c *Conn) maybeSetNearestDERP(report *netcheck.Report) (preferredDERP int) {
     ...
     if !connectedToControl {
@@ -326,7 +326,7 @@ That is a subtle but critical correctness rule: changing home DERP without contr
 If the report cannot identify a preferred region, the client picks a deterministic fallback:
 
 ```go
-// Source: /Users/shayne/code/tailscale/wgengine/magicsock/derp.go:106-146
+// Source: tailscale/wgengine/magicsock/derp.go:106-146
 func (c *Conn) pickDERPFallback() int {
     ...
     if c.myDerp != 0 {
@@ -344,7 +344,7 @@ This is a fallback of last resort, used when measurement is impossible or incomp
 Clients can learn a peer's likely DERP region by observing recent inbound DERP traffic:
 
 ```go
-// Source: /Users/shayne/code/tailscale/wgengine/magicsock/derp.go:70-88
+// Source: tailscale/wgengine/magicsock/derp.go:70-88
 func (c *Conn) fallbackDERPRegionForPeer(peer key.NodePublic) (regionID int) {
     c.mu.Lock()
     defer c.mu.Unlock()
@@ -366,7 +366,7 @@ This is especially useful for:
 `magicsock` keeps active DERP connections per region and notes which one is the current home:
 
 ```go
-// Source: /Users/shayne/code/tailscale/wgengine/magicsock/derp.go:228-273
+// Source: tailscale/wgengine/magicsock/derp.go:228-273
 func (c *Conn) setNearestDERP(derpNum int) (wantDERP bool) {
     ...
     c.myDerp = derpNum

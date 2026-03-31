@@ -10,12 +10,12 @@ The frame header is fixed-width:
 - 4 bytes: big-endian payload length
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derp.go:51-54
+// Source: tailscale/derp/derp.go:51-54
 type FrameType byte
 ```
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derp.go:248-255
+// Source: tailscale/derp/derp.go:248-255
 // WriteFrameHeader writes a DERP frame header to bw: a one-byte frame
 // type followed by a big-endian uint32 frame length.
 func WriteFrameHeader(bw *bufio.Writer, t FrameType, frameLen uint32) error
@@ -26,7 +26,7 @@ func WriteFrameHeader(bw *bufio.Writer, t FrameType, frameLen uint32) error
 The intended protocol flow is documented directly in the reference implementation:
 
 ```text
-Source: /Users/shayne/code/tailscale/derp/derp.go:56-70
+Source: tailscale/derp/derp.go:56-70
 Protocol flow:
 
 Login:
@@ -53,7 +53,7 @@ The concrete client-side handshake is:
    - JSON-encoded `ClientInfo`.
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derp_client.go:126-140
+// Source: tailscale/derp/derp_client.go:126-140
 func (c *Client) recvServerKey() error {
     var buf [40]byte
     t, flen, err := readFrame(c.br, 1<<10, buf[:])
@@ -67,7 +67,7 @@ func (c *Client) recvServerKey() error {
 ```
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derp_client.go:195-210
+// Source: tailscale/derp/derp_client.go:195-210
 func (c *Client) sendClientKey() error {
     msg, err := json.Marshal(ClientInfo{
         Version:     ProtocolVersion,
@@ -85,7 +85,7 @@ func (c *Client) sendClientKey() error {
 On the server side, the flow is symmetrical:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/derpserver.go:914-979
+// Source: tailscale/derp/derpserver/derpserver.go:914-979
 func (s *Server) accept(ctx context.Context, nc derp.Conn, brw *bufio.ReadWriter, remoteAddr string, connNum int64) error {
     ...
     if err := s.sendServerKey(bw); err != nil { ... }
@@ -106,7 +106,7 @@ func (s *Server) accept(ctx context.Context, nc derp.Conn, brw *bufio.ReadWriter
 `ClientInfo` advertises capabilities and trust level:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derp_client.go:163-182
+// Source: tailscale/derp/derp_client.go:163-182
 type ClientInfo struct {
     MeshKey key.DERPMesh `json:"meshKey,omitempty,omitzero"`
     Version int `json:"version,omitempty"`
@@ -127,7 +127,7 @@ Interpretation:
 The important frame types are declared centrally:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derp.go:71-130
+// Source: tailscale/derp/derp.go:71-130
 const (
     FrameServerKey     = FrameType(0x01)
     FrameClientInfo    = FrameType(0x02)
@@ -208,7 +208,7 @@ const (
 The client receives server traffic through `Recv()` and maps each frame to a typed message:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derp_client.go:535-645
+// Source: tailscale/derp/derp_client.go:535-645
 switch t {
 case FrameServerInfo:
     ...
@@ -238,7 +238,7 @@ This is the protocol surface that `magicsock` and other consumers actually work 
 Clients can tell the server whether a connection is currently their preferred/home DERP path:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derp_client.go:306-330
+// Source: tailscale/derp/derp_client.go:306-330
 func (c *Client) NotePreferred(preferred bool) (err error) {
     ...
     if err := WriteFrameHeader(c.bw, FrameNotePreferred, 1); err != nil {
@@ -259,7 +259,7 @@ This is mostly used by the server for stats and operator visibility, but it also
 Watching connections and closing peers require `canMesh` privileges:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/derpserver.go:1070-1078
+// Source: tailscale/derp/derpserver/derpserver.go:1070-1078
 func (c *sclient) handleFrameWatchConns(ft derp.FrameType, fl uint32) error {
     if fl != 0 {
         return fmt.Errorf("handleFrameWatchConns wrong size")
@@ -273,7 +273,7 @@ func (c *sclient) handleFrameWatchConns(ft derp.FrameType, fl uint32) error {
 ```
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/derpserver.go:1108-1137
+// Source: tailscale/derp/derpserver/derpserver.go:1108-1137
 func (c *sclient) handleFrameClosePeer(ft derp.FrameType, fl uint32) error {
     if fl != derp.KeyLen { ... }
     if !c.canMesh {
@@ -290,7 +290,7 @@ That separation is fundamental: regular clients relay only their own traffic; pr
 The DERP transport usually begins as an HTTP request:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derphttp/derphttp_client.go:499-518
+// Source: tailscale/derp/derphttp/derphttp_client.go:499-518
 req, err := http.NewRequest("GET", c.urlString(node), nil)
 ...
 req.Header.Set("Upgrade", "DERP")
@@ -303,7 +303,7 @@ if !idealNodeInRegion && reg != nil {
 The server accepts either `Upgrade: derp` or `Upgrade: websocket`:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/handler.go:30-39
+// Source: tailscale/derp/derpserver/handler.go:30-39
 up := strings.ToLower(r.Header.Get("Upgrade"))
 if up != "websocket" && up != "derp" {
     http.Error(w, "DERP requires connection upgrade", http.StatusUpgradeRequired)
@@ -327,7 +327,7 @@ The fast-start optimization exists to remove one round trip from connection setu
 Client side:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derphttp/derphttp_client.go:518-527
+// Source: tailscale/derp/derphttp/derphttp_client.go:518-527
 if !serverPub.IsZero() && serverProtoVersion != 0 {
     req.Header.Set(derp.FastStartHeader, "1")
     if err := req.Write(brw); err != nil {
@@ -339,7 +339,7 @@ if !serverPub.IsZero() && serverProtoVersion != 0 {
 Server side:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/handler.go:54-63
+// Source: tailscale/derp/derpserver/handler.go:54-63
 if !fastStart {
     fmt.Fprintf(conn, "HTTP/1.1 101 Switching Protocols\r\n"+
         "Upgrade: DERP\r\n"+
@@ -362,7 +362,7 @@ Websocket transport exists mainly for environments where raw DERP-over-upgraded-
 - `ProtocolVersion` is currently 2.
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derp.go:25-49
+// Source: tailscale/derp/derp.go:25-49
 const MaxPacketSize = 64 << 10
 const KeepAlive = 60 * time.Second
 const ProtocolVersion = 2

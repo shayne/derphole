@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-target="${1:?usage: $0 <hetz|pve1>}"
+target="${1:?usage: $0 <host>}"
 tmp="$(mktemp -d)"
 remote_base="/tmp/derpcat-share-smoke-$$"
 remote_upload="/tmp/derpcat-share-bin-$$"
 local_share_pid=""
 local_http_pid=""
+remote_user="${DERPCAT_REMOTE_USER:-root}"
 
 remote() {
-  ssh "root@${target}" 'bash -se' <<<"$1"
+  ssh "${remote_user}@${target}" 'bash -se' <<<"$1"
 }
 
 cleanup() {
@@ -101,7 +102,7 @@ require_direct_evidence() {
 
 mise run build
 mise run build-linux-amd64
-scp dist/derpcat-linux-amd64 "root@${target}:${remote_upload}" >/dev/null
+scp dist/derpcat-linux-amd64 "${remote_user}@${target}:${remote_upload}" >/dev/null
 remote "install -m 0755 '${remote_upload}' /usr/local/bin/derpcat && rm -f '${remote_upload}' && /usr/local/bin/derpcat help open >/dev/null 2>&1"
 
 shared_content="hello shared service ${target} $(date +%s)"

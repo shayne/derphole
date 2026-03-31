@@ -19,7 +19,7 @@ The practical result is a fallback network that keeps nodes reachable even behin
 The control plane publishes the set of regions and nodes that clients should know about.
 
 ```go
-// Source: /Users/shayne/code/tailscale/tailcfg/derpmap.go:13-31
+// Source: tailscale/tailcfg/derpmap.go:13-31
 type DERPMap struct {
     HomeParams *DERPHomeParams `json:",omitempty"`
     Regions map[int]*DERPRegion
@@ -39,16 +39,16 @@ The DERP map is not just a list of endpoints. It also carries:
 
 The client side is split across several packages:
 
-- `/Users/shayne/code/tailscale/net/netcheck/netcheck.go` measures reachability and latency.
-- `/Users/shayne/code/tailscale/wgengine/magicsock/magicsock.go` turns those measurements into runtime path choices.
-- `/Users/shayne/code/tailscale/derp/derphttp/derphttp_client.go` establishes DERP-over-HTTP/TLS connections.
-- `/Users/shayne/code/tailscale/derp/derp_client.go` speaks the DERP binary protocol once the transport exists.
+- `tailscale/net/netcheck/netcheck.go` measures reachability and latency.
+- `tailscale/wgengine/magicsock/magicsock.go` turns those measurements into runtime path choices.
+- `tailscale/derp/derphttp/derphttp_client.go` establishes DERP-over-HTTP/TLS connections.
+- `tailscale/derp/derp_client.go` speaks the DERP binary protocol once the transport exists.
 
 The client keeps one long-lived home connection and may create additional region connections on demand.
 
 ### 3. DERP Server
 
-The server side is centered on `/Users/shayne/code/tailscale/derp/derpserver/derpserver.go`.
+The server side is centered on `tailscale/derp/derpserver/derpserver.go`.
 
 Responsibilities include:
 
@@ -64,7 +64,7 @@ Responsibilities include:
 Multiple DERP nodes can exist within one region. Those nodes subscribe to each other's peer presence and forward packets within the region.
 
 ```text
-Source: /Users/shayne/code/tailscale/derp/README.md:39-47
+Source: tailscale/derp/README.md:39-47
 Regions generally have multiple nodes per region "meshed" together for redundancy.
 Packets are forwarded only one hop within the region.
 There is no routing between regions.
@@ -79,9 +79,9 @@ DERP deployments usually also expose STUN on UDP/3478 so clients can learn refle
 
 Tailscale `derper` and Headscale embedded DERP both explicitly wire this in:
 
-- `/Users/shayne/code/tailscale/cmd/derper/derper.go:180-183`
-- `/Users/shayne/code/headscale/hscontrol/app.go:553-560`
-- `/Users/shayne/code/headscale/hscontrol/derp/server/derp_server.go:356-425`
+- `tailscale/cmd/derper/derper.go:180-183`
+- `headscale/hscontrol/app.go:553-560`
+- `headscale/hscontrol/derp/server/derp_server.go:356-425`
 
 ## End-to-End Flow
 
@@ -120,7 +120,7 @@ When the region itself becomes worse but still alive:
 DERP servers route by node public key rather than IP address.
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derp.go:4-12
+// Source: tailscale/derp/derp.go:4-12
 // Package derp implements the Designated Encrypted Relay for Packets (DERP)
 // protocol.
 //

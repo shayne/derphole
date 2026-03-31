@@ -7,9 +7,10 @@ expected_size="$((size_mib * 1048576))"
 tmp="$(mktemp -d)"
 remote_base="/tmp/derpcat-promotion-$$"
 remote_upload="/tmp/derpcat-promotion-bin-$$"
+remote_user="${DERPCAT_REMOTE_USER:-root}"
 
 remote() {
-  ssh "root@${target}" 'bash -se' <<<"$1"
+  ssh "${remote_user}@${target}" 'bash -se' <<<"$1"
 }
 
 dump_failure() {
@@ -55,7 +56,7 @@ trap 'status=$?; if [[ ${status} -ne 0 ]]; then dump_failure; fi; cleanup; exit 
 
 mise run build
 mise run build-linux-amd64
-scp dist/derpcat-linux-amd64 "root@${target}:${remote_upload}" >/dev/null
+scp dist/derpcat-linux-amd64 "${remote_user}@${target}:${remote_upload}" >/dev/null
 remote "install -m 0755 '${remote_upload}' /usr/local/bin/derpcat && rm -f '${remote_upload}' && /usr/local/bin/derpcat --help >/dev/null 2>&1"
 
 payload="${tmp}/payload.bin"

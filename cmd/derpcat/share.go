@@ -28,7 +28,7 @@ var shareHelpConfig = yargs.HelpConfig{
 		Description: "Expose a local TCP service over public DERP with direct UDP promotion when available.",
 		Examples: []string{
 			"derpcat share 127.0.0.1:3000",
-			"derpcat share 10.0.4.2:8006 --print-token-only",
+			"derpcat share 127.0.0.1:8080 --print-token-only",
 			"derpcat open <token>",
 		},
 	},
@@ -39,7 +39,7 @@ var shareHelpConfig = yargs.HelpConfig{
 			Usage:       "[--print-token-only] [--force-relay]",
 			Examples: []string{
 				"derpcat share 127.0.0.1:3000",
-				"derpcat share 10.0.4.2:8006 --print-token-only",
+				"derpcat share 127.0.0.1:8080 --print-token-only",
 			},
 		},
 	},

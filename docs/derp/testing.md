@@ -28,7 +28,7 @@ The main scenario starts Headscale with:
 - periodic DERP map refresh enabled.
 
 ```go
-// Source: /Users/shayne/code/headscale/integration/embedded_derp_test.go:117-132
+// Source: headscale/integration/embedded_derp_test.go:117-132
 err = scenario.CreateHeadscaleEnv(
     []tsic.Option{
         tsic.WithWebsocketDERP(websocket),
@@ -52,7 +52,7 @@ The test then checks:
 - connectivity remains healthy after the map updater runs multiple times.
 
 ```go
-// Source: /Users/shayne/code/headscale/integration/embedded_derp_test.go:181-205
+// Source: headscale/integration/embedded_derp_test.go:181-205
 // Let the DERP updater run a couple of times to ensure it does not
 // break the DERPMap.
 time.Sleep(30 * time.Second)
@@ -75,7 +75,7 @@ This is good coverage of one of the most failure-prone control-plane behaviors: 
 Headscale also verifies websocket DERP mode:
 
 ```go
-// Source: /Users/shayne/code/headscale/integration/embedded_derp_test.go:70-95
+// Source: headscale/integration/embedded_derp_test.go:70-95
 func TestDERPServerWebsocketScenario(t *testing.T) {
     ...
     derpServerScenario(t, spec, "derp-ws", true, func(scenario *Scenario) {
@@ -100,7 +100,7 @@ Headscale also tests the external `derper -> /verify` pattern.
 The test sets up a standalone DERP server with `verify-client-url` pointed at Headscale:
 
 ```go
-// Source: /Users/shayne/code/headscale/integration/derp_verify_endpoint_test.go:48-50
+// Source: headscale/integration/derp_verify_endpoint_test.go:48-50
 derper, err := scenario.CreateDERPServer("head",
     dsic.WithCACert(caHeadscale),
     dsic.WithVerifyClientURL(fmt.Sprintf("https://%s/verify", net.JoinHostPort(hostname, strconv.Itoa(headscalePort)))),
@@ -113,7 +113,7 @@ It then validates that:
 - real client node keys are accepted.
 
 ```go
-// Source: /Users/shayne/code/headscale/integration/derp_verify_endpoint_test.go:93-100
+// Source: headscale/integration/derp_verify_endpoint_test.go:93-100
 fakeKey := key.NewNode()
 DERPVerify(t, fakeKey, derpRegion, false)
 
@@ -129,7 +129,7 @@ for _, client := range allClients {
 The helper itself is a compact example of what a DERP sanity check looks like:
 
 ```go
-// Source: /Users/shayne/code/headscale/integration/derp_verify_endpoint_test.go:103-133
+// Source: headscale/integration/derp_verify_endpoint_test.go:103-133
 func DERPVerify(t *testing.T, nodeKey key.NodePrivate, region tailcfg.DERPRegion, expectSuccess bool) {
     c := derphttp.NewRegionClient(nodeKey, t.Logf, netmon.NewStatic(), func() *tailcfg.DERPRegion {
         return &region
@@ -172,8 +172,8 @@ On Headscale:
 
 Useful tools:
 
-- `/Users/shayne/code/tailscale/cmd/stunc/stunc.go`
-- `/Users/shayne/code/tailscale/cmd/stunstamp/stunstamp.go`
+- `tailscale/cmd/stunc/stunc.go`
+- `tailscale/cmd/stunstamp/stunstamp.go`
 
 What to validate:
 

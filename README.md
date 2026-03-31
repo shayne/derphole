@@ -1,34 +1,61 @@
 # derpcat
 
-`derpcat` is a standalone Go CLI for moving one bidirectional byte stream or sharing a local TCP service between two hosts using the public Tailscale DERP network for bootstrap and relay fallback, with direct UDP promotion when possible.
+`derpcat` is a standalone CLI for moving data between two hosts over the public Tailscale DERP network, with direct UDP promotion when the network allows it.
 
-## npm
+It supports two primary modes:
 
-The npm packaging and release workflow now exist.
-The first `0.0.1` publish is still manual until npm trusted publishing is configured.
-The install commands below are post-publish examples.
+- one-shot byte-stream transfer with `listen` and `send`
+- long-lived local service sharing with `share` and `open`
 
-### Production install example
+## Quick Start
 
-```bash
-npx derpcat version
-```
-
-### Dev channel install example
+Use the published package directly:
 
 ```bash
-npx derpcat@dev version
+npx -y derpcat@latest version
 ```
 
-## Build
+Use the development channel for the latest commit published from `main`:
 
 ```bash
-mise run build
+npx -y derpcat@dev version
 ```
 
-## Runtime Notes
+## Examples
 
-`derpcat` sessions can start on DERP relay and later promote to direct UDP without restarting. Use `--verbose` when you want to observe status transitions such as `connected-relay` and `connected-direct`; the live smoke scripts now inspect the full trace instead of only a final state.
+Receive one stream on one machine:
+
+```bash
+npx -y derpcat@latest listen
+```
+
+Send data from another machine:
+
+```bash
+printf 'hello\n' | npx -y derpcat@latest send <token>
+```
+
+Share a local web app or API until Ctrl-C:
+
+```bash
+npx -y derpcat@latest share 127.0.0.1:3000
+```
+
+Expose that shared service locally on another machine:
+
+```bash
+npx -y derpcat@latest open <token>
+```
+
+Bind `open` to a specific local port:
+
+```bash
+npx -y derpcat@latest open <token> 127.0.0.1:8080
+```
+
+## Behavior
+
+Sessions can start on DERP relay and later promote to a direct UDP path without restarting. Use `--verbose` to observe path changes such as `connected-relay` and `connected-direct`.
 
 ## Development
 
@@ -36,37 +63,28 @@ mise run build
 mise install
 mise run install-githooks
 mise run check
+mise run build
 ```
 
-## Test
+## Verification
+
+Local smoke test:
 
 ```bash
-mise run check
-./scripts/smoke-local.sh
-mise run smoke-remote
-mise run smoke-remote-share
-./scripts/promotion-test.sh hetz 1024
-./scripts/promotion-test.sh pve1 1024
+mise run smoke-local
 ```
 
-## Usage
-
-One-shot stdin/stdout transfer:
+Remote smoke tests against a host you control:
 
 ```bash
-derpcat listen
-printf 'hello\n' | derpcat send <token>
+REMOTE_HOST=my-server.example.com mise run smoke-remote
+REMOTE_HOST=my-server.example.com mise run smoke-remote-share
+REMOTE_HOST=my-server.example.com mise run promotion-1g
 ```
 
-Share a local service until Ctrl-C:
+## Releases
 
-```bash
-derpcat share 127.0.0.1:3000
-derpcat open <token>
-```
-
-## Publishing
-
-- Manual bootstrap runbook: [docs/releases/npm-bootstrap.md](docs/releases/npm-bootstrap.md)
-- `main` publishes the npm `dev` dist-tag once trusted publishing is configured
-- version tags like `v0.1.0` publish production releases through GitHub Actions once trusted publishing is configured
+- npm package: `derpcat`
+- production channel: `@latest`
+- development channel: `@dev`
+- bootstrap runbook: [docs/releases/npm-bootstrap.md](docs/releases/npm-bootstrap.md)

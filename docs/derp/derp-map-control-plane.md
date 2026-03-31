@@ -14,10 +14,10 @@ That description is the `DERPMap`.
 
 ## Core Schema
 
-The schema lives in `/Users/shayne/code/tailscale/tailcfg/derpmap.go`.
+The schema lives in `tailscale/tailcfg/derpmap.go`.
 
 ```go
-// Source: /Users/shayne/code/tailscale/tailcfg/derpmap.go:13-31
+// Source: tailscale/tailcfg/derpmap.go:13-31
 type DERPMap struct {
     HomeParams *DERPHomeParams `json:",omitempty"`
     Regions map[int]*DERPRegion
@@ -30,7 +30,7 @@ type DERPMap struct {
 `HomeParams` lets the control plane influence home-region selection without redefining the whole map:
 
 ```go
-// Source: /Users/shayne/code/tailscale/tailcfg/derpmap.go:44-61
+// Source: tailscale/tailcfg/derpmap.go:44-61
 type DERPHomeParams struct {
     RegionScore map[int]float64 `json:",omitempty"`
 }
@@ -47,7 +47,7 @@ This is an important design point: the control plane can bias selection policy w
 ### Regions
 
 ```go
-// Source: /Users/shayne/code/tailscale/tailcfg/derpmap.go:63-138
+// Source: tailscale/tailcfg/derpmap.go:63-138
 type DERPRegion struct {
     RegionID int
     RegionCode string
@@ -71,7 +71,7 @@ Important semantics:
 ### Nodes
 
 ```go
-// Source: /Users/shayne/code/tailscale/tailcfg/derpmap.go:140-210
+// Source: tailscale/tailcfg/derpmap.go:140-210
 type DERPNode struct {
     Name string
     RegionID int
@@ -109,7 +109,7 @@ It must:
 The DERP map is part of a normal map response in Headscale:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/mapper/builder.go:102-105
+// Source: headscale/hscontrol/mapper/builder.go:102-105
 func (b *MapResponseBuilder) WithDERPMap() *MapResponseBuilder {
     b.resp.DERPMap = b.mapper.state.DERPMap().AsStruct()
     return b
@@ -121,7 +121,7 @@ func (b *MapResponseBuilder) WithDERPMap() *MapResponseBuilder {
 Tailscale also defines a schema for DERP admission control, used by `derper --verify-client-url` and by Headscale's `/verify` endpoint.
 
 ```go
-// Source: /Users/shayne/code/tailscale/tailcfg/derpmap.go:219-229
+// Source: tailscale/tailcfg/derpmap.go:219-229
 type DERPAdmitClientRequest struct {
     NodePublic key.NodePublic
     Source     netip.Addr
@@ -147,7 +147,7 @@ From the client perspective, the map drives:
 The ordering inside `DERPRegion.Nodes` matters. The first entry is supposed to be the ideal target for both DERP and, usually, STUN.
 
 ```text
-Source: /Users/shayne/code/tailscale/tailcfg/derpmap.go:125-137
+Source: tailscale/tailcfg/derpmap.go:125-137
 Nodes are the DERP nodes running in this region, in priority order for the current client.
 Client TLS connections should ideally only go to the first entry.
 STUN packets should go to the first 1 or 2.
@@ -164,7 +164,7 @@ Headscale can compose a final DERP map from multiple sources:
 - the automatically generated embedded DERP region.
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/derp/derp.go:100-127
+// Source: headscale/hscontrol/derp/derp.go:100-127
 func GetDERPMap(cfg types.DERPConfig) (*tailcfg.DERPMap, error) {
     var derpMaps []*tailcfg.DERPMap
     if cfg.DERPMap != nil {
@@ -183,7 +183,7 @@ func GetDERPMap(cfg types.DERPConfig) (*tailcfg.DERPMap, error) {
 Headscale merges maps naively by region ID, with "last writer wins" semantics:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/derp/derp.go:76-98
+// Source: headscale/hscontrol/derp/derp.go:76-98
 func mergeDERPMaps(derpMaps []*tailcfg.DERPMap) *tailcfg.DERPMap {
     result := tailcfg.DERPMap{
         OmitDefaultRegions: false,
@@ -212,7 +212,7 @@ Practical implications:
 Headscale shuffles nodes within a region after merge:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/derp/derp.go:130-188
+// Source: headscale/hscontrol/derp/derp.go:130-188
 func shuffleDERPMap(dm *tailcfg.DERPMap) {
     ...
     for _, id := range ids {
@@ -234,7 +234,7 @@ This is a subtle but important behavioral difference from treating the map as a 
 If embedded DERP is enabled and auto-add is on, Headscale generates a `DERPRegion` for itself and injects it into the map.
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/app.go:562-576
+// Source: headscale/hscontrol/app.go:562-576
 derpMap, err := derp.GetDERPMap(h.cfg.DERP)
 ...
 if h.cfg.DERP.ServerEnabled && h.cfg.DERP.AutomaticallyAddEmbeddedDerpRegion {
@@ -252,7 +252,7 @@ That region is then exposed to clients through Headscale state and map responses
 Headscale stores the current DERP map in process state:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/state/state.go:241-248
+// Source: headscale/hscontrol/state/state.go:241-248
 func (s *State) SetDERPMap(dm *tailcfg.DERPMap) {
     s.derpMap.Store(dm)
 }
@@ -265,7 +265,7 @@ func (s *State) DERPMap() tailcfg.DERPMapView {
 It also emits a dedicated change type to tell map-response machinery to include the updated map:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/types/change/change.go:304-308
+// Source: headscale/hscontrol/types/change/change.go:304-308
 func DERPMap() Change {
     return Change{
         Reason:         "DERP map update",
@@ -279,7 +279,7 @@ func DERPMap() Change {
 When auto-update is enabled, Headscale periodically rebuilds the map and broadcasts the change:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/app.go:302-325
+// Source: headscale/hscontrol/app.go:302-325
 case <-derpTickerChan:
     derpMap, err := backoff.Retry(ctx, func() (*tailcfg.DERPMap, error) {
         derpMap, err := derp.GetDERPMap(h.cfg.DERP)
@@ -302,7 +302,7 @@ This means DERP map updates are a live control-plane event, not merely startup c
 Clients report their preferred DERP through `Hostinfo.NetInfo.PreferredDERP`. Headscale observes that and turns it into peer changes.
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/types/node.go:551-569
+// Source: headscale/hscontrol/types/node.go:551-569
 if node.Hostinfo != nil &&
     node.Hostinfo.NetInfo != nil &&
     req.Hostinfo != nil &&
@@ -315,7 +315,7 @@ if node.Hostinfo != nil &&
 Later, lightweight endpoint/DERP-only updates can be sent without a full node rebuild:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/state/state.go:2403-2419
+// Source: headscale/hscontrol/state/state.go:2403-2419
 if endpointChanged || derpChanged {
     patch := &tailcfg.PeerChange{NodeID: id.NodeID()}
     ...
@@ -337,7 +337,7 @@ This is the control-plane bridge between the client's measured home DERP and eve
 Headscale still populates the legacy DERP string field in `tailcfg.Node`:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/types/node.go:1092-1139
+// Source: headscale/hscontrol/types/node.go:1092-1139
 legacyDERP := "127.3.3.40:0"
 if nv.Hostinfo().Valid() && nv.Hostinfo().NetInfo().Valid() {
     legacyDERP = fmt.Sprintf("127.3.3.40:%d", nv.Hostinfo().NetInfo().PreferredDERP())
@@ -355,7 +355,7 @@ That is primarily compatibility scaffolding for older clients.
 Headscale's YAML configuration exposes both embedded DERP server settings and source-map settings:
 
 ```yaml
-# Source: /Users/shayne/code/headscale/config-example.yaml:85-143
+# Source: headscale/config-example.yaml:85-143
 derp:
   server:
     enabled: false
@@ -386,7 +386,7 @@ This division matches the implementation model:
 The reference schema reserves region IDs `900-999` for end users running their own DERP nodes:
 
 ```text
-Source: /Users/shayne/code/tailscale/tailcfg/derpmap.go:79-84
+Source: tailscale/tailcfg/derpmap.go:79-84
 RegionIDs in range 900-999 are reserved for end users to run their
 own DERP nodes.
 ```

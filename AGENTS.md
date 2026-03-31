@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`cmd/derpcat/` contains the CLI entrypoint and subcommand wiring. Core transport and session logic lives under `pkg/` (`pkg/session`, `pkg/wg`, `pkg/traversal`, `pkg/derpbind`, etc.). Packaging assets live in `packaging/npm/` and `tools/packaging/`. Verification scripts are in `scripts/`. Design and release docs live in `docs/derp/`, `docs/releases/`, and `docs/superpowers/`.
+`cmd/derpcat/` contains the CLI entrypoint and subcommand wiring. Core transport and session logic lives under `pkg/` (`pkg/session`, `pkg/wg`, `pkg/traversal`, `pkg/derpbind`, etc.). Packaging assets live in `packaging/npm/` and `tools/packaging/`. Verification scripts are in `scripts/`. Public documentation lives in `docs/derp/` and `docs/releases/`.
 
 `dist/` is generated output for local builds, release packaging, and npm assembly. Treat it as ephemeral.
 
@@ -20,7 +20,7 @@ Use `mise` for toolchain consistency.
 - `mise run release:build-all` builds vendored binaries, release tarballs, and `dist/npm`
 - `mise run release:npm-dry-run` validates the npm package without publishing
 
-For remote verification, use tasks such as `mise run smoke-remote`, `mise run smoke-remote-share`, and `mise run promotion-1g-hetz`. These live checks now rely on verbose path traces, so a single run may show both `connected-relay` and `connected-direct` as the session promotes.
+For remote verification, set `REMOTE_HOST` and use `mise run smoke-remote`, `mise run smoke-remote-share`, or `mise run promotion-1g`.
 
 ## Coding Style & Naming Conventions
 
@@ -36,7 +36,7 @@ Tests live alongside code in `*_test.go` files. Prefer focused package tests fir
 - Full suite: `mise run test`
 - Network/regression coverage: `mise run smoke-local` or `./scripts/smoke-local.sh`
 
-For live transport verification, prefer `./scripts/smoke-remote.sh hetz`, `./scripts/smoke-remote.sh pve1`, `./scripts/smoke-remote-share.sh pve1`, and `./scripts/promotion-test.sh hetz 1024` / `pve1 1024` when you need to inspect relay-first to direct-upgrade traces.
+For live transport verification, prefer `REMOTE_HOST=my-server.example.com mise run smoke-remote`, `REMOTE_HOST=my-server.example.com mise run smoke-remote-share`, and `REMOTE_HOST=my-server.example.com mise run promotion-1g` when you need to inspect relay-first to direct-upgrade traces.
 
 When changing release or packaging behavior, also run `mise run release:npm-dry-run`.
 

@@ -17,7 +17,7 @@ That means the DERP runtime semantics are mostly inherited from Tailscale, while
 Headscale creates an embedded DERP server during app initialization when `derp.server.enabled` is true.
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/app.go:215-246
+// Source: headscale/hscontrol/app.go:215-246
 if cfg.DERP.ServerEnabled {
     derpServerKey, err := readOrCreatePrivateKey(cfg.DERP.ServerPrivateKeyPath)
     ...
@@ -49,7 +49,7 @@ Notable design choices:
 The embedded server is a thin wrapper around `tailscale.com/derp/derpserver.Server`:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/derp/server/derp_server.go:45-70
+// Source: headscale/hscontrol/derp/server/derp_server.go:45-70
 type DERPServer struct {
     serverURL string
     key key.NodePrivate
@@ -74,7 +74,7 @@ The most important Headscale-specific behavior here is that verification is rout
 Headscale can synthesize a DERP region definition for its own embedded server based on `server_url` and DERP config.
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/derp/server/derp_server.go:73-147
+// Source: headscale/hscontrol/derp/server/derp_server.go:73-147
 func (d *DERPServer) GenerateRegion() (tailcfg.DERPRegion, error) {
     ...
     localDERPregion := tailcfg.DERPRegion{
@@ -112,7 +112,7 @@ Important details:
 Headscale supports both plain DERP-over-upgrade and websocket DERP:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/derp/server/derp_server.go:150-183
+// Source: headscale/hscontrol/derp/server/derp_server.go:150-183
 func (d *DERPServer) DERPHandler(writer http.ResponseWriter, req *http.Request) {
     upgrade := strings.ToLower(req.Header.Get("Upgrade"))
     if upgrade != "websocket" && upgrade != "derp" { ... }
@@ -127,7 +127,7 @@ func (d *DERPServer) DERPHandler(writer http.ResponseWriter, req *http.Request) 
 Plain upgraded mode:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/derp/server/derp_server.go:228-279
+// Source: headscale/hscontrol/derp/server/derp_server.go:228-279
 func (d *DERPServer) servePlain(writer http.ResponseWriter, req *http.Request) {
     fastStart := req.Header.Get(fastStartHeader) == "1"
     ...
@@ -147,7 +147,7 @@ func (d *DERPServer) servePlain(writer http.ResponseWriter, req *http.Request) {
 Websocket mode:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/derp/server/derp_server.go:185-226
+// Source: headscale/hscontrol/derp/server/derp_server.go:185-226
 func (d *DERPServer) serveWebsocket(writer http.ResponseWriter, req *http.Request) {
     websocketConn, err := websocket.Accept(writer, req, &websocket.AcceptOptions{
         Subprotocols: []string{"derp"},
@@ -176,7 +176,7 @@ Headscale exposes:
 Router wiring:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/app.go:498-505
+// Source: headscale/hscontrol/app.go:498-505
 r.Post("/verify", h.VerifyHandler)
 
 if h.cfg.DERP.ServerEnabled {
@@ -194,7 +194,7 @@ Unlike Tailscale `derper`, Headscale does not expose `/generate_204` in this rou
 When embedded DERP is enabled, Headscale also starts STUN:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/app.go:553-560
+// Source: headscale/hscontrol/app.go:553-560
 if h.cfg.DERP.ServerEnabled {
     if h.cfg.DERP.STUNAddr == "" {
         return errSTUNAddressNotSet
@@ -206,7 +206,7 @@ if h.cfg.DERP.ServerEnabled {
 And the implementation is a straightforward UDP STUN responder:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/derp/server/derp_server.go:356-425
+// Source: headscale/hscontrol/derp/server/derp_server.go:356-425
 func (d *DERPServer) ServeSTUN() {
     packetConn, err := new(net.ListenConfig).ListenPacket(context.Background(), "udp", d.cfg.STUNAddr)
     ...
@@ -219,7 +219,7 @@ func (d *DERPServer) ServeSTUN() {
 Headscale's verify logic checks whether the connecting node public key belongs to any known node:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/handlers.go:83-114
+// Source: headscale/hscontrol/handlers.go:83-114
 func (h *Headscale) handleVerifyRequest(req *http.Request, writer io.Writer) error {
     ...
     var derpAdmitClientRequest tailcfg.DERPAdmitClientRequest
@@ -242,7 +242,7 @@ func (h *Headscale) handleVerifyRequest(req *http.Request, writer io.Writer) err
 And exposes it over HTTP:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/handlers.go:116-133
+// Source: headscale/hscontrol/handlers.go:116-133
 func (h *Headscale) VerifyHandler(writer http.ResponseWriter, req *http.Request) {
     if req.Method != http.MethodPost {
         httpError(writer, errMethodNotAllowed)
@@ -264,7 +264,7 @@ This same logic can be used:
 The relevant config loading path is:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/types/config.go:550-612
+// Source: headscale/hscontrol/types/config.go:550-612
 func derpConfig() DERPConfig {
     serverEnabled := viper.GetBool("derp.server.enabled")
     serverRegionID := viper.GetInt("derp.server.region_id")
@@ -293,10 +293,10 @@ That validation encodes two operational invariants:
 
 Headscale rebuilds or refreshes its DERP map, injects the embedded region if requested, stores it in state, and broadcasts `IncludeDERPMap` changes to clients. See:
 
-- `/Users/shayne/code/headscale/hscontrol/app.go:302-325`
-- `/Users/shayne/code/headscale/hscontrol/app.go:562-576`
-- `/Users/shayne/code/headscale/hscontrol/state/state.go:241-248`
-- `/Users/shayne/code/headscale/hscontrol/types/change/change.go:304-308`
+- `headscale/hscontrol/app.go:302-325`
+- `headscale/hscontrol/app.go:562-576`
+- `headscale/hscontrol/state/state.go:241-248`
+- `headscale/hscontrol/types/change/change.go:304-308`
 
 This is the core distinction between Headscale and `derper`: Headscale is the map authority for its clients.
 
@@ -305,7 +305,7 @@ This is the core distinction between Headscale and `derper`: Headscale is the ma
 Headscale stores the preferred DERP region in node hostinfo and exports it into tailcfg:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/types/node.go:668-705
+// Source: headscale/hscontrol/types/node.go:668-705
 func (node *Node) ApplyPeerChange(change *tailcfg.PeerChange) {
     ...
     if change.DERPRegion != 0 {
@@ -330,7 +330,7 @@ func (node *Node) ApplyPeerChange(change *tailcfg.PeerChange) {
 And then emits both `HomeDERP` and the legacy DERP string:
 
 ```go
-// Source: /Users/shayne/code/headscale/hscontrol/types/node.go:1092-1139
+// Source: headscale/hscontrol/types/node.go:1092-1139
 legacyDERP := "127.3.3.40:0"
 if nv.Hostinfo().Valid() && nv.Hostinfo().NetInfo().Valid() {
     legacyDERP = fmt.Sprintf("127.3.3.40:%d", nv.Hostinfo().NetInfo().PreferredDERP())
@@ -348,7 +348,7 @@ Headscale supports third-party `derper` instances by giving them the `/verify` e
 The integration test demonstrates this pattern:
 
 ```go
-// Source: /Users/shayne/code/headscale/integration/derp_verify_endpoint_test.go:48-50
+// Source: headscale/integration/derp_verify_endpoint_test.go:48-50
 derper, err := scenario.CreateDERPServer("head",
     dsic.WithCACert(caHeadscale),
     dsic.WithVerifyClientURL(fmt.Sprintf("https://%s/verify", net.JoinHostPort(hostname, strconv.Itoa(headscalePort)))),
@@ -362,7 +362,7 @@ That is the cleanest way to understand Headscale's interoperability story: Heads
 Headscale's own reference docs explicitly call out two important limitations:
 
 ```text
-Source: /Users/shayne/code/headscale/docs/ref/derp.md:168-172
+Source: headscale/docs/ref/derp.md:168-172
 - The embedded DERP server can't be used for Tailscale's captive portal checks
   as it doesn't support the /generate_204 endpoint via HTTP on port tcp/80.
 - There are no speed or throughput optimisations, the main purpose is to assist

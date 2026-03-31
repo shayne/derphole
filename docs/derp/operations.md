@@ -5,7 +5,7 @@
 Tailscale's own `derper` documentation is unusually explicit: most users should not run custom DERP.
 
 ```text
-Source: /Users/shayne/code/tailscale/cmd/derper/README.md:5-15
+Source: tailscale/cmd/derper/README.md:5-15
 In general, you should not need to or want to run this code.
 In the happy path, Tailscale establishes direct connections between peers.
 If you find yourself wanting DERP for more bandwidth, the real problem is usually the
@@ -28,7 +28,7 @@ The expected public surface is:
 - UDP 3478 for STUN.
 
 ```text
-Source: /Users/shayne/code/tailscale/cmd/derper/README.md:67-68
+Source: tailscale/cmd/derper/README.md:67-68
 The firewall on the derper should permit TCP ports 80 and 443 and UDP port 3478.
 ```
 
@@ -39,7 +39,7 @@ Headscale's embedded DERP exposes STUN and the DERP HTTP endpoints, but not the 
 DERP is not an ordinary HTTP workload.
 
 ```text
-Source: /Users/shayne/code/tailscale/cmd/derper/README.md:37-43
+Source: tailscale/cmd/derper/README.md:37-43
 The DERP protocol does a protocol switch inside TLS from HTTP to a custom
 bidirectional binary protocol. It is thus incompatible with many HTTP proxies.
 Do not put derper behind another HTTP proxy.
@@ -61,7 +61,7 @@ Operationally this means:
 Tailscale's docs recommend explicit public addressing:
 
 ```text
-Source: /Users/shayne/code/tailscale/cmd/derper/README.md:45-50
+Source: tailscale/cmd/derper/README.md:45-50
 DERP servers should ideally have both a static IPv4 and static IPv6 address.
 Both of those should be listed in the DERP map so the client doesn't need to
 rely on its DNS which might be broken and dependent on DERP to get back up.
@@ -78,7 +78,7 @@ Multiple nodes in one region are possible, but they are not free operationally.
 Reference code guidance:
 
 ```text
-Source: /Users/shayne/code/tailscale/derp/README.md:39-53
+Source: tailscale/derp/README.md:39-53
 Regions generally have multiple nodes per region "meshed" together for redundancy.
 Each node in the region is required to be meshed with every other node in the region.
 Packets are forwarded only one hop within the region.
@@ -88,7 +88,7 @@ There is no routing between regions.
 And operator guidance:
 
 ```text
-Source: /Users/shayne/code/tailscale/cmd/derper/README.md:51-57
+Source: tailscale/cmd/derper/README.md:51-57
 Avoid having multiple DERP nodes in a region. If you must, they all need to be
 meshed with each other and monitored.
 Having two one-node "regions" in the same datacenter is usually easier and more reliable than meshing.
@@ -114,7 +114,7 @@ The main binary exposes flags for:
 - listener rate limiting.
 
 ```go
-// Source: /Users/shayne/code/tailscale/cmd/derper/derper.go:56-99
+// Source: tailscale/cmd/derper/derper.go:56-99
 var (
     addr = flag.String("a", ":443", ...)
     httpPort = flag.Int("http-port", 80, ...)
@@ -133,7 +133,7 @@ var (
 And wires the server like this:
 
 ```go
-// Source: /Users/shayne/code/tailscale/cmd/derper/derper.go:180-280
+// Source: tailscale/cmd/derper/derper.go:180-280
 if *runSTUN {
     ss := stunserver.New(ctx)
     go ss.ListenAndServe(...)
@@ -158,7 +158,7 @@ mux.Handle("/generate_204", http.HandlerFunc(derpserver.ServeNoContent))
 Meshing is built on top of ordinary DERP clients authenticated with the mesh key:
 
 ```go
-// Source: /Users/shayne/code/tailscale/cmd/derper/mesh.go:21-78
+// Source: tailscale/cmd/derper/mesh.go:21-78
 func startMesh(s *derpserver.Server) error { ... }
 
 func startMeshWithHost(s *derpserver.Server, hostTuple string) error {
@@ -181,7 +181,7 @@ Operational implication: a region mesh is just a set of mutually connected privi
 The DERP docs and binary expose several useful diagnostics:
 
 ```text
-Source: /Users/shayne/code/tailscale/cmd/derper/README.md:90-104
+Source: tailscale/cmd/derper/README.md:90-104
 * The debug handler is accessible at URL path /debug/
 * Go pprof can be accessed via the debug handler at /debug/pprof/
 * Prometheus compatible metrics can be gathered from the debug handler at /debug/varz.
@@ -192,10 +192,10 @@ Source: /Users/shayne/code/tailscale/cmd/derper/README.md:90-104
 
 ### Useful Tools
 
-- `/Users/shayne/code/tailscale/cmd/derpprobe/derpprobe.go`
-- `/Users/shayne/code/tailscale/cmd/stunc/stunc.go`
-- `/Users/shayne/code/tailscale/cmd/stunstamp/stunstamp.go`
-- `/Users/shayne/code/tailscale/cmd/tailscale/cli/netcheck.go`
+- `tailscale/cmd/derpprobe/derpprobe.go`
+- `tailscale/cmd/stunc/stunc.go`
+- `tailscale/cmd/stunstamp/stunstamp.go`
+- `tailscale/cmd/tailscale/cli/netcheck.go`
 
 These cover:
 
@@ -209,7 +209,7 @@ These cover:
 Tailscale `derper` exposes `/generate_204` to support captive portal detection:
 
 ```go
-// Source: /Users/shayne/code/tailscale/derp/derpserver/handler.go:84-108
+// Source: tailscale/derp/derpserver/handler.go:84-108
 func ServeNoContent(w http.ResponseWriter, r *http.Request) {
     if challenge := r.Header.Get(NoContentChallengeHeader); challenge != "" {
         ...

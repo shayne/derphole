@@ -2,12 +2,12 @@
 
 This directory is a source-backed technical library for DERP: what it is, how it works, how clients and servers behave at runtime, how Tailscale models regions and nodes, how Headscale integrates and embeds DERP, and how to operate or test a deployment.
 
-The material here is based on the current local source trees:
+The material here is based on the current upstream source trees:
 
-- `/Users/shayne/code/tailscale`
-- `/Users/shayne/code/headscale`
+- `tailscale`
+- `headscale`
 
-The documents are intentionally implementation-oriented. Where possible, they cite exact source files and include short code excerpts with absolute file paths so the reader can pivot directly into the code.
+The documents are intentionally implementation-oriented. Where possible, they cite exact source files and include short code excerpts so the reader can pivot directly into the code.
 
 ## Reading Order
 
@@ -41,7 +41,7 @@ DERP is Tailscale's encrypted TCP relay path for cases where direct peer-to-peer
 It is addressed by node public key, not by IP address. Clients receive a DERP map from the control plane, choose a "home" DERP region based primarily on measured latency, and keep that home connection alive. Additional DERP connections are opened on demand when talking to peers whose home region differs.
 
 ```text
-Source: /Users/shayne/code/tailscale/derp/README.md:6-15
+Source: tailscale/derp/README.md:6-15
 DERP is a packet relay system (client and servers) where peers are addressed
 using WireGuard public keys instead of IP addresses.
 
@@ -51,7 +51,7 @@ It relays two types of packets:
 ```
 
 ```text
-Source: /Users/shayne/code/tailscale/derp/README.md:23-32
+Source: tailscale/derp/README.md:23-32
 The client picks its home "DERP home" based on latency.
 Clients pick their DERP home and report it to the coordination server.
 The client will make connections to multiple DERP regions as needed.
@@ -68,7 +68,7 @@ DERP is not a general-purpose proxy tier and not a replacement for normal direct
 - Global load balancers and generic HTTP proxying conflict with how DERP clients select and upgrade connections.
 
 ```text
-Source: /Users/shayne/code/tailscale/cmd/derper/README.md:37-47
+Source: tailscale/cmd/derper/README.md:37-47
 The DERP protocol does a protocol switch inside TLS from HTTP to a custom
 bidirectional binary protocol. It is thus incompatible with many HTTP proxies.
 Do not put derper behind another HTTP proxy.
@@ -82,24 +82,24 @@ balancer.
 
 The most important implementation files used throughout this library are:
 
-- `/Users/shayne/code/tailscale/derp/derp.go`
-- `/Users/shayne/code/tailscale/derp/derp_client.go`
-- `/Users/shayne/code/tailscale/derp/derphttp/derphttp_client.go`
-- `/Users/shayne/code/tailscale/derp/derpserver/derpserver.go`
-- `/Users/shayne/code/tailscale/derp/derpserver/handler.go`
-- `/Users/shayne/code/tailscale/tailcfg/derpmap.go`
-- `/Users/shayne/code/tailscale/net/netcheck/netcheck.go`
-- `/Users/shayne/code/tailscale/wgengine/magicsock/derp.go`
-- `/Users/shayne/code/tailscale/wgengine/magicsock/magicsock.go`
-- `/Users/shayne/code/tailscale/cmd/derper/derper.go`
-- `/Users/shayne/code/tailscale/cmd/derper/mesh.go`
-- `/Users/shayne/code/headscale/hscontrol/derp/server/derp_server.go`
-- `/Users/shayne/code/headscale/hscontrol/derp/derp.go`
-- `/Users/shayne/code/headscale/hscontrol/app.go`
-- `/Users/shayne/code/headscale/hscontrol/types/config.go`
-- `/Users/shayne/code/headscale/hscontrol/handlers.go`
-- `/Users/shayne/code/headscale/hscontrol/state/state.go`
-- `/Users/shayne/code/headscale/hscontrol/types/node.go`
+- `tailscale/derp/derp.go`
+- `tailscale/derp/derp_client.go`
+- `tailscale/derp/derphttp/derphttp_client.go`
+- `tailscale/derp/derpserver/derpserver.go`
+- `tailscale/derp/derpserver/handler.go`
+- `tailscale/tailcfg/derpmap.go`
+- `tailscale/net/netcheck/netcheck.go`
+- `tailscale/wgengine/magicsock/derp.go`
+- `tailscale/wgengine/magicsock/magicsock.go`
+- `tailscale/cmd/derper/derper.go`
+- `tailscale/cmd/derper/mesh.go`
+- `headscale/hscontrol/derp/server/derp_server.go`
+- `headscale/hscontrol/derp/derp.go`
+- `headscale/hscontrol/app.go`
+- `headscale/hscontrol/types/config.go`
+- `headscale/hscontrol/handlers.go`
+- `headscale/hscontrol/state/state.go`
+- `headscale/hscontrol/types/node.go`
 
 ## Design Themes
 
