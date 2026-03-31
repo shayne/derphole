@@ -5,11 +5,12 @@ import (
 	"crypto/rand"
 	"errors"
 	"net"
-	"net/netip"
 	"sync"
 	"time"
 
+	quic "github.com/quic-go/quic-go"
 	"github.com/shayne/derpcat/pkg/derpbind"
+	"github.com/shayne/derpcat/pkg/quicpath"
 	"github.com/shayne/derpcat/pkg/rendezvous"
 	"github.com/shayne/derpcat/pkg/stream"
 	"github.com/shayne/derpcat/pkg/telemetry"
@@ -150,34 +151,28 @@ func shareExternal(ctx context.Context, cfg ShareConfig) (string, error) {
 		defer transportCleanup()
 		pathEmitter.Watch(transportCtx, transportManager)
 		pathEmitter.Flush(transportManager)
-
-		_, listenerAddr, senderAddr := wg.DeriveAddresses(session.token.SessionID)
-		sessionNode, err := wg.NewNode(wg.Config{
-			PrivateKey:    session.wgPrivate,
-			PeerPublicKey: env.Claim.WGPublic,
-			LocalAddr:     listenerAddr,
-			PeerAddr:      senderAddr,
-			PacketConn:    session.probeConn,
-			DERPClient:    session.derp,
-			PeerDERP:      peerDERP,
-			PathSelector:  transportManager,
-		})
+		cert, err := quicpath.GenerateSelfSignedCertificate()
 		if err != nil {
 			return tok, err
 		}
-		defer sessionNode.Close()
-
-		ln, err := sessionNode.ListenTCP(overlayPort)
+		adapter := quicpath.NewAdapter(transportManager.PeerDatagramConn(transportCtx))
+		defer adapter.Close()
+		quicListener, err := quic.Listen(adapter, quicpath.DefaultTLSConfig(cert, quicpath.ServerName), quicpath.DefaultQUICConfig())
 		if err != nil {
 			return tok, err
 		}
-		defer ln.Close()
+		defer quicListener.Close()
 
 		if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
 			return tok, err
 		}
 		claimErrCh := rejectAdditionalShareClaims(ctx, session.derp, session.gate, claimCh)
-		return tok, serveOverlayListenerWithClaimRejections(ctx, ln, cfg.TargetAddr, cfg.Emitter, claimErrCh)
+		quicConn, err := quicListener.Accept(ctx)
+		if err != nil {
+			return tok, err
+		}
+		defer quicConn.CloseWithError(0, "")
+		return tok, serveQUICListenerWithClaimRejections(ctx, quicConn, cfg.TargetAddr, cfg.Emitter, claimErrCh)
 	}
 }
 
@@ -207,7 +202,7 @@ func openExternal(ctx context.Context, cfg OpenConfig, tok token.Token) error {
 	}
 	defer probeConn.Close()
 
-	senderPrivate, senderPublic, err := wg.GenerateKeypair()
+	_, senderPublic, err := wg.GenerateKeypair()
 	if err != nil {
 		return err
 	}
@@ -254,21 +249,14 @@ func openExternal(ctx context.Context, cfg OpenConfig, tok token.Token) error {
 	pathEmitter.Flush(transportManager)
 	seedAcceptedDecisionCandidates(transportCtx, transportManager, decision)
 
-	_, listenerAddr, senderAddr := wg.DeriveAddresses(tok.SessionID)
-	sessionNode, err := wg.NewNode(wg.Config{
-		PrivateKey:    senderPrivate,
-		PeerPublicKey: tok.WGPublic,
-		LocalAddr:     senderAddr,
-		PeerAddr:      listenerAddr,
-		PacketConn:    probeConn,
-		DERPClient:    derpClient,
-		PeerDERP:      listenerDERP,
-		PathSelector:  transportManager,
-	})
+	peerConn := transportManager.PeerDatagramConn(transportCtx)
+	adapter := quicpath.NewAdapter(peerConn)
+	defer adapter.Close()
+	quicConn, err := quic.Dial(ctx, adapter, peerConn.RemoteAddr(), quicpath.DefaultClientTLSConfig(), quicpath.DefaultQUICConfig())
 	if err != nil {
 		return err
 	}
-	defer sessionNode.Close()
+	defer quicConn.CloseWithError(0, "")
 
 	listener, err := openLocalListener(cfg, tok)
 	if err != nil {
@@ -278,22 +266,31 @@ func openExternal(ctx context.Context, cfg OpenConfig, tok token.Token) error {
 	notifyBindAddr(cfg.BindAddrSink, listener.Addr().String(), ctx)
 
 	return serveOpenListener(ctx, listener, func(ctx context.Context) (net.Conn, error) {
-		return dialOverlay(ctx, sessionNode, netip.AddrPortFrom(listenerAddr, overlayPort))
+		streamConn, err := quicConn.OpenStreamSync(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return quicpath.WrapStream(quicConn, streamConn), nil
 	}, cfg.Emitter)
 }
 
-func serveOverlayListener(ctx context.Context, listener net.Listener, targetAddr string, emitter *telemetry.Emitter) error {
+func serveQUICListener(ctx context.Context, conn *quic.Conn, targetAddr string, emitter *telemetry.Emitter) error {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
 	for {
-		overlayConn, err := acceptOverlay(ctx, listener)
+		streamConn, err := conn.AcceptStream(ctx)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
+			var appErr *quic.ApplicationError
+			if errors.As(err, &appErr) && appErr.ErrorCode == 0 {
+				return nil
+			}
 			return err
 		}
+		overlayConn := quicpath.WrapStream(conn, streamConn)
 
 		backendConn, err := (&net.Dialer{}).DialContext(ctx, "tcp", targetAddr)
 		if err != nil {
@@ -314,9 +311,9 @@ func serveOverlayListener(ctx context.Context, listener net.Listener, targetAddr
 	}
 }
 
-func serveOverlayListenerWithClaimRejections(
+func serveQUICListenerWithClaimRejections(
 	ctx context.Context,
-	listener net.Listener,
+	conn *quic.Conn,
 	targetAddr string,
 	emitter *telemetry.Emitter,
 	claimErrCh <-chan error,
@@ -324,14 +321,14 @@ func serveOverlayListenerWithClaimRejections(
 	serveCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	overlayErrCh := make(chan error, 1)
+	connErrCh := make(chan error, 1)
 	go func() {
-		overlayErrCh <- serveOverlayListener(serveCtx, listener, targetAddr, emitter)
+		connErrCh <- serveQUICListener(serveCtx, conn, targetAddr, emitter)
 	}()
 
 	for {
 		select {
-		case err := <-overlayErrCh:
+		case err := <-connErrCh:
 			return err
 		case err, ok := <-claimErrCh:
 			if !ok {
@@ -340,8 +337,8 @@ func serveOverlayListenerWithClaimRejections(
 			}
 			if err != nil {
 				cancel()
-				_ = listener.Close()
-				<-overlayErrCh
+				_ = conn.CloseWithError(1, "claim rejection loop failed")
+				<-connErrCh
 				return err
 			}
 		}

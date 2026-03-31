@@ -235,6 +235,14 @@ func (s *pathState) consumeProbe(addr net.Addr, maxAge time.Duration, now time.T
 	return !sentAt.Add(maxAge).Before(now)
 }
 
+func (s pathState) hasCandidate(addr net.Addr) bool {
+	if addr == nil {
+		return false
+	}
+	_, ok := s.endpoints[addr.String()]
+	return ok
+}
+
 func cloneAddr(addr net.Addr) net.Addr {
 	switch v := addr.(type) {
 	case *net.UDPAddr:

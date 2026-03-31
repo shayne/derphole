@@ -13,6 +13,7 @@ const (
 	defaultDiscoveryInterval       = 2 * time.Second
 	defaultEndpointRefreshInterval = 15 * time.Second
 	defaultDirectStaleTimeout      = 30 * time.Second
+	maxDirectPayloadSize           = 64 << 10
 )
 
 var (
@@ -114,7 +115,10 @@ func (m *Manager) directReadLoop(ctx context.Context) {
 		return
 	}
 
-	bufLen := len(discoProbePayload) + 1
+	bufLen := maxDirectPayloadSize
+	if len(discoProbePayload)+1 > bufLen {
+		bufLen = len(discoProbePayload) + 1
+	}
 	if len(discoAckPayload)+1 > bufLen {
 		bufLen = len(discoAckPayload) + 1
 	}
@@ -140,10 +144,15 @@ func (m *Manager) directReadLoop(ctx context.Context) {
 			_, _ = m.cfg.DirectConn.WriteTo(discoAckPayload, addr)
 			continue
 		}
-		if n != len(discoAckPayload) || !bytes.Equal(buf[:n], discoAckPayload) {
+		if n == len(discoAckPayload) && bytes.Equal(buf[:n], discoAckPayload) {
+			m.tryPromoteDirect(m.now(), addr)
 			continue
 		}
-		m.tryPromoteDirect(m.now(), addr)
+		if !m.shouldAcceptDirectPayload(addr) {
+			continue
+		}
+		m.NoteDirectActivity(addr)
+		m.enqueuePeerDatagram(m.remotePeerAddr(), buf[:n])
 	}
 }
 
@@ -162,6 +171,18 @@ func (m *Manager) HandleDirectPacket(conn net.PacketConn, addr net.Addr, payload
 		return true
 	}
 	return false
+}
+
+func (m *Manager) shouldAcceptDirectPayload(addr net.Addr) bool {
+	if addr == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.state.current == PathDirect && m.state.bestEndpoint == addr.String() {
+		return true
+	}
+	return m.state.hasCandidate(addr)
 }
 
 func isTimeout(err error) bool {

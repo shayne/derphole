@@ -27,6 +27,9 @@ type Timer interface {
 
 type ManagerConfig struct {
 	RelayConn               net.PacketConn
+	RelaySend               func(context.Context, []byte) error
+	ReceiveRelay            func(context.Context) ([]byte, error)
+	RelayAddr               net.Addr
 	DirectConn              net.PacketConn
 	DisableDirectReads      bool
 	CandidateSource         func(context.Context) []net.Addr
@@ -49,6 +52,8 @@ type Manager struct {
 	discoveryPending      bool
 	forceCandidateRefresh bool
 	started               bool
+	peerRecvCh            chan peerPacket
+	peerRecvErrCh         chan error
 }
 
 type Update struct {
@@ -57,10 +62,13 @@ type Update struct {
 
 func NewManager(cfg ManagerConfig) *Manager {
 	cfg = normalizeConfig(cfg)
+	hasRelay := cfg.RelayConn != nil || cfg.RelaySend != nil || cfg.ReceiveRelay != nil || cfg.RelayAddr != nil
 	return &Manager{
-		cfg:         cfg,
-		state:       newPathState(cfg.Clock.Now(), cfg.RelayConn != nil, cfg.DirectConn != nil),
-		stateNotify: make(chan struct{}),
+		cfg:           cfg,
+		state:         newPathState(cfg.Clock.Now(), hasRelay, cfg.DirectConn != nil),
+		stateNotify:   make(chan struct{}),
+		peerRecvCh:    make(chan peerPacket, 256),
+		peerRecvErrCh: make(chan error, 1),
 	}
 }
 
@@ -80,6 +88,9 @@ func (m *Manager) Start(ctx context.Context) error {
 
 	go m.discoveryLoop(ctx)
 	go m.receiveControlLoop(ctx)
+	if m.cfg.ReceiveRelay != nil {
+		go m.relayReadLoop(ctx)
+	}
 	if !m.cfg.DisableDirectReads {
 		go m.directReadLoop(ctx)
 	}

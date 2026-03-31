@@ -518,6 +518,78 @@ func (p *fakeControlPipe) sendAttemptsCount(typ ControlType) int {
 	return p.sendAttempts[typ]
 }
 
+type fakeRelayDataPipe struct {
+	mu      sync.Mutex
+	inbound chan []byte
+	sent    [][]byte
+	notify  chan struct{}
+	closed  bool
+	local   net.Addr
+	remote  net.Addr
+}
+
+func newFakeRelayDataPipe() *fakeRelayDataPipe {
+	return &fakeRelayDataPipe{
+		inbound: make(chan []byte, 16),
+		notify:  make(chan struct{}),
+		local:   &net.UnixAddr{Name: "derp-local", Net: "derp"},
+		remote:  &net.UnixAddr{Name: "derp-remote", Net: "derp"},
+	}
+}
+
+func (p *fakeRelayDataPipe) send(_ context.Context, payload []byte) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return net.ErrClosed
+	}
+	p.sent = append(p.sent, append([]byte(nil), payload...))
+	p.signalLocked()
+	return nil
+}
+
+func (p *fakeRelayDataPipe) receive(ctx context.Context) ([]byte, error) {
+	select {
+	case payload, ok := <-p.inbound:
+		if !ok {
+			return nil, net.ErrClosed
+		}
+		return append([]byte(nil), payload...), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (p *fakeRelayDataPipe) deliver(payload []byte) {
+	p.inbound <- append([]byte(nil), payload...)
+}
+
+func (p *fakeRelayDataPipe) waitForSentCount(payload []byte, n int, timeout time.Duration) bool {
+	return waitForNotify(timeout, func() (bool, <-chan struct{}) {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if p.closed {
+			return false, nil
+		}
+		count := 0
+		for _, sent := range p.sent {
+			if string(sent) == string(payload) {
+				count++
+			}
+		}
+		if count >= n {
+			return true, nil
+		}
+		return false, p.notify
+	})
+}
+
+func (p *fakeRelayDataPipe) signalLocked() {
+	next := make(chan struct{})
+	close(p.notify)
+	p.notify = next
+}
+
 func (p *fakeControlPipe) waitForReceiveCount(n int, timeout time.Duration) bool {
 	return waitForNotify(timeout, func() (bool, <-chan struct{}) {
 		p.mu.Lock()

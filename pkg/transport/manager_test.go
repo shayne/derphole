@@ -367,6 +367,138 @@ func TestManagerDemotesStaleDirectPathWhenReadForSend(t *testing.T) {
 	}
 }
 
+func TestManagerPeerDatagramConnUsesRelayThenDirect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700001000, 0))
+	relay := newFakeRelayDataPipe()
+	direct := newFakePacketConn(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1})
+	direct.useClock(clock)
+	baseTimers := clock.timerCount()
+	controls := newFakeControlPipe()
+	peerCandidate := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 55), Port: 45555}
+	controls.enablePeerCandidate(peerCandidate)
+	direct.enableResponder(peerCandidate)
+
+	mgr := NewManager(ManagerConfig{
+		RelaySend:               relay.send,
+		ReceiveRelay:            relay.receive,
+		RelayAddr:               relay.remote,
+		DirectConn:              direct,
+		SendControl:             controls.send,
+		ReceiveControl:          controls.receive,
+		Clock:                   clock,
+		DiscoveryInterval:       1 * time.Second,
+		EndpointRefreshInterval: 2 * time.Second,
+		DirectStaleTimeout:      4 * time.Second,
+	})
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+
+	conn := mgr.PeerDatagramConn(ctx)
+	if err := conn.SendDatagram([]byte("relay-data")); err != nil {
+		t.Fatalf("SendDatagram(relay) error = %v", err)
+	}
+	if !relay.waitForSentCount([]byte("relay-data"), 1, 200*time.Millisecond) {
+		t.Fatal("relay send did not receive payload")
+	}
+
+	clock.Advance(1 * time.Second)
+	if !waitForPath(t, mgr, PathDirect, 200*time.Millisecond) {
+		t.Fatalf("PathState() = %v, want %v", mgr.PathState(), PathDirect)
+	}
+
+	if err := conn.SendDatagram([]byte("direct-data")); err != nil {
+		t.Fatalf("SendDatagram(direct) error = %v", err)
+	}
+	if !direct.waitForWritePayloadTo(peerCandidate, []byte("direct-data"), 200*time.Millisecond) {
+		t.Fatal("direct path did not receive payload after upgrade")
+	}
+}
+
+func TestManagerPeerDatagramConnReceivesPeerDatagrams(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	relay := newFakeRelayDataPipe()
+	mgr := NewManager(ManagerConfig{
+		RelaySend:    relay.send,
+		ReceiveRelay: relay.receive,
+		RelayAddr:    relay.remote,
+	})
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	conn := mgr.PeerDatagramConn(ctx)
+	relay.deliver([]byte("from-relay"))
+
+	payload, addr, err := conn.RecvDatagram(ctx)
+	if err != nil {
+		t.Fatalf("RecvDatagram() error = %v", err)
+	}
+	if got := string(payload); got != "from-relay" {
+		t.Fatalf("RecvDatagram() payload = %q, want %q", got, "from-relay")
+	}
+	if got := addr.String(); got != relay.remote.String() {
+		t.Fatalf("RecvDatagram() addr = %q, want %q", got, relay.remote.String())
+	}
+}
+
+func TestManagerPeerDatagramConnSurvivesPathUpgrade(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700001010, 0))
+	relay := newFakeRelayDataPipe()
+	direct := newFakePacketConn(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1})
+	direct.useClock(clock)
+	baseTimers := clock.timerCount()
+	controls := newFakeControlPipe()
+	peerCandidate := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 56), Port: 46666}
+	controls.enablePeerCandidate(peerCandidate)
+	direct.enableResponder(peerCandidate)
+
+	mgr := NewManager(ManagerConfig{
+		RelaySend:               relay.send,
+		ReceiveRelay:            relay.receive,
+		RelayAddr:               relay.remote,
+		DirectConn:              direct,
+		SendControl:             controls.send,
+		ReceiveControl:          controls.receive,
+		Clock:                   clock,
+		DiscoveryInterval:       1 * time.Second,
+		EndpointRefreshInterval: 2 * time.Second,
+		DirectStaleTimeout:      4 * time.Second,
+	})
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+
+	conn := mgr.PeerDatagramConn(ctx)
+	if err := conn.SendDatagram([]byte("before-upgrade")); err != nil {
+		t.Fatalf("SendDatagram(before-upgrade) error = %v", err)
+	}
+	if !relay.waitForSentCount([]byte("before-upgrade"), 1, 200*time.Millisecond) {
+		t.Fatal("relay send did not receive initial payload")
+	}
+
+	clock.Advance(1 * time.Second)
+	if !waitForPath(t, mgr, PathDirect, 200*time.Millisecond) {
+		t.Fatalf("PathState() = %v, want %v", mgr.PathState(), PathDirect)
+	}
+	if err := conn.SendDatagram([]byte("after-upgrade")); err != nil {
+		t.Fatalf("SendDatagram(after-upgrade) error = %v", err)
+	}
+	if !direct.waitForWritePayloadTo(peerCandidate, []byte("after-upgrade"), 200*time.Millisecond) {
+		t.Fatal("direct path did not receive payload after upgrade")
+	}
+}
+
 func TestManagerNoteDirectActivityKeepsCurrentDirectPathActive(t *testing.T) {
 	t.Helper()
 

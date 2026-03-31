@@ -15,7 +15,9 @@ import (
 
 	"go4.org/mem"
 
+	quic "github.com/quic-go/quic-go"
 	"github.com/shayne/derpcat/pkg/derpbind"
+	"github.com/shayne/derpcat/pkg/quicpath"
 	"github.com/shayne/derpcat/pkg/rendezvous"
 	"github.com/shayne/derpcat/pkg/token"
 	"github.com/shayne/derpcat/pkg/transport"
@@ -30,9 +32,6 @@ const (
 	envelopeDecision = "decision"
 	envelopeControl  = "control"
 	envelopeAck      = "ack"
-
-	overlayPort       = 7000
-	dialRetryInterval = 100 * time.Millisecond
 )
 
 type envelope struct {
@@ -156,7 +155,7 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 	}
 	defer probeConn.Close()
 
-	senderPrivate, senderPublic, err := wg.GenerateKeypair()
+	_, senderPublic, err := wg.GenerateKeypair()
 	if err != nil {
 		return err
 	}
@@ -210,35 +209,25 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 	pathEmitter.Flush(transportManager)
 	seedAcceptedDecisionCandidates(transportCtx, transportManager, decision)
 
-	_, listenerAddr, senderAddr := wg.DeriveAddresses(tok.SessionID)
-	sessionNode, err := wg.NewNode(wg.Config{
-		PrivateKey:    senderPrivate,
-		PeerPublicKey: tok.WGPublic,
-		LocalAddr:     senderAddr,
-		PeerAddr:      listenerAddr,
-		PacketConn:    probeConn,
-		DERPClient:    derpClient,
-		PeerDERP:      listenerDERP,
-		PathSelector:  transportManager,
-	})
+	peerConn := transportManager.PeerDatagramConn(transportCtx)
+	adapter := quicpath.NewAdapter(peerConn)
+	defer adapter.Close()
+	if cfg.Emitter != nil {
+		cfg.Emitter.Debug("sender-quic-ready")
+		cfg.Emitter.Debug("dialing-quic")
+	}
+	quicConn, err := quic.Dial(ctx, adapter, peerConn.RemoteAddr(), quicpath.DefaultClientTLSConfig(), quicpath.DefaultQUICConfig())
 	if err != nil {
 		return err
 	}
-	defer sessionNode.Close()
-	if cfg.Emitter != nil {
-		cfg.Emitter.Debug("sender-node-ready")
-	}
-
-	if cfg.Emitter != nil {
-		cfg.Emitter.Debug("dialing-overlay")
-	}
-	overlayConn, err := dialOverlay(ctx, sessionNode, netip.AddrPortFrom(listenerAddr, overlayPort))
+	defer quicConn.CloseWithError(0, "")
+	streamConn, err := quicConn.OpenStreamSync(ctx)
 	if err != nil {
 		return err
 	}
-	defer overlayConn.Close()
+	defer streamConn.Close()
 	if cfg.Emitter != nil {
-		cfg.Emitter.Debug("overlay-connected")
+		cfg.Emitter.Debug("quic-connected")
 	}
 
 	src, err := openSendSource(ctx, cfg)
@@ -247,17 +236,16 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 	}
 	defer src.Close()
 
-	if _, err := io.Copy(overlayConn, src); err != nil {
+	if _, err := io.Copy(streamConn, src); err != nil {
 		return err
 	}
-	if cw, ok := overlayConn.(interface{ CloseWrite() error }); ok {
-		if err := cw.CloseWrite(); err != nil {
-			return err
-		}
-	} else if err := overlayConn.Close(); err != nil {
+	if err := streamConn.Close(); err != nil {
 		return err
 	}
 	if err := waitForPeerAck(ctx, ackCh); err != nil {
+		return err
+	}
+	if err := quicConn.CloseWithError(0, ""); err != nil {
 		return err
 	}
 
@@ -321,33 +309,22 @@ func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
 		defer transportCleanup()
 		pathEmitter.Watch(transportCtx, transportManager)
 		pathEmitter.Flush(transportManager)
+		_ = env.Claim.WGPublic
 
-		_, listenerAddr, senderAddr := wg.DeriveAddresses(session.token.SessionID)
-		sessionNode, err := wg.NewNode(wg.Config{
-			PrivateKey:    session.wgPrivate,
-			PeerPublicKey: env.Claim.WGPublic,
-			LocalAddr:     listenerAddr,
-			PeerAddr:      senderAddr,
-			PacketConn:    session.probeConn,
-			DERPClient:    session.derp,
-			PeerDERP:      peerDERP,
-			PathSelector:  transportManager,
-		})
+		cert, err := quicpath.GenerateSelfSignedCertificate()
 		if err != nil {
 			return tok, err
 		}
-		defer sessionNode.Close()
-		if cfg.Emitter != nil {
-			cfg.Emitter.Debug("listener-node-ready")
-		}
-
-		ln, err := sessionNode.ListenTCP(overlayPort)
+		adapter := quicpath.NewAdapter(transportManager.PeerDatagramConn(transportCtx))
+		defer adapter.Close()
+		quicListener, err := quic.Listen(adapter, quicpath.DefaultTLSConfig(cert, quicpath.ServerName), quicpath.DefaultQUICConfig())
 		if err != nil {
 			return tok, err
 		}
-		defer ln.Close()
+		defer quicListener.Close()
 		if cfg.Emitter != nil {
-			cfg.Emitter.Debug("overlay-listening")
+			cfg.Emitter.Debug("listener-quic-ready")
+			cfg.Emitter.Debug("quic-listening")
 		}
 
 		if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
@@ -355,16 +332,21 @@ func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
 		}
 		if cfg.Emitter != nil {
 			cfg.Emitter.Debug("decision-sent")
-			cfg.Emitter.Debug("accepting-overlay")
+			cfg.Emitter.Debug("accepting-quic")
 		}
 
-		overlayConn, err := acceptOverlay(ctx, ln)
+		quicConn, err := quicListener.Accept(ctx)
 		if err != nil {
 			return tok, err
 		}
-		defer overlayConn.Close()
+		defer quicConn.CloseWithError(0, "")
+		streamConn, err := quicConn.AcceptStream(ctx)
+		if err != nil {
+			return tok, err
+		}
+		defer streamConn.Close()
 		if cfg.Emitter != nil {
-			cfg.Emitter.Debug("overlay-accepted")
+			cfg.Emitter.Debug("quic-accepted")
 		}
 
 		dst, err := openListenSink(ctx, cfg)
@@ -373,13 +355,10 @@ func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
 		}
 		defer dst.Close()
 
-		if _, err := io.Copy(dst, overlayConn); err != nil {
+		if _, err := io.Copy(dst, streamConn); err != nil {
 			return tok, err
 		}
 		if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeAck}); err != nil {
-			return tok, err
-		}
-		if err := overlayConn.Close(); err != nil {
 			return tok, err
 		}
 
@@ -399,11 +378,29 @@ func startExternalTransportManager(
 	controlCh, unsubscribe := derpClient.Subscribe(func(pkt derpbind.Packet) bool {
 		return pkt.From == peerDERP && isTransportControlPayload(pkt.Payload)
 	})
+	payloadCh, unsubscribePayload := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == peerDERP && isTransportDataPayload(pkt.Payload)
+	})
 
 	cfg := transport.ManagerConfig{
-		RelayConn:               conn,
+		RelayConn: conn,
+		RelaySend: func(ctx context.Context, payload []byte) error {
+			return derpClient.Send(ctx, peerDERP, payload)
+		},
+		ReceiveRelay: func(ctx context.Context) ([]byte, error) {
+			select {
+			case pkt, ok := <-payloadCh:
+				if !ok {
+					return nil, net.ErrClosed
+				}
+				return append([]byte(nil), pkt.Payload...), nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+		RelayAddr:               relayTransportAddr(),
 		DirectConn:              nil,
-		DisableDirectReads:      true,
+		DisableDirectReads:      false,
 		DiscoveryInterval:       1 * time.Second,
 		EndpointRefreshInterval: 1 * time.Second,
 		DirectStaleTimeout:      10 * time.Second,
@@ -424,49 +421,13 @@ func startExternalTransportManager(
 	manager := transport.NewManager(cfg)
 	if err := manager.Start(ctx); err != nil {
 		unsubscribe()
+		unsubscribePayload()
 		return nil, nil, err
 	}
-	return manager, unsubscribe, nil
-}
-
-func dialOverlay(ctx context.Context, node *wg.Node, addr netip.AddrPort) (net.Conn, error) {
-	ticker := time.NewTicker(dialRetryInterval)
-	defer ticker.Stop()
-
-	for {
-		conn, err := node.DialTCP(ctx, addr)
-		if err == nil {
-			return conn, nil
-		}
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		select {
-		case <-ticker.C:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-}
-
-func acceptOverlay(ctx context.Context, ln net.Listener) (net.Conn, error) {
-	type result struct {
-		conn net.Conn
-		err  error
-	}
-	done := make(chan result, 1)
-	go func() {
-		conn, err := ln.Accept()
-		done <- result{conn: conn, err: err}
-	}()
-
-	select {
-	case res := <-done:
-		return res.conn, res.err
-	case <-ctx.Done():
-		_ = ln.Close()
-		return nil, ctx.Err()
-	}
+	return manager, func() {
+		unsubscribe()
+		unsubscribePayload()
+	}, nil
 }
 
 func waitForPeerAck(ctx context.Context, ch <-chan derpbind.Packet) error {
@@ -680,6 +641,22 @@ func isAckPayload(payload []byte) bool {
 	}
 	env, err := decodeEnvelope(payload)
 	return err == nil && env.Type == envelopeAck
+}
+
+func isDecisionPayload(payload []byte) bool {
+	if len(payload) == 0 || payload[0] != '{' {
+		return false
+	}
+	env, err := decodeEnvelope(payload)
+	return err == nil && env.Type == envelopeDecision && env.Decision != nil
+}
+
+func isTransportDataPayload(payload []byte) bool {
+	return !isTransportControlPayload(payload) && !isAckPayload(payload) && !isClaimPayload(payload) && !isDecisionPayload(payload)
+}
+
+func relayTransportAddr() net.Addr {
+	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
 }
 
 func fakeTransportCandidatesBlocked() bool {
