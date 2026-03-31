@@ -208,6 +208,75 @@ func TestQUICStreamSurvivesRelayToDirectUpgrade(t *testing.T) {
 	}
 }
 
+func TestQUICDialRejectsMismatchedPinnedServerIdentity(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	relayA, relayB := newRelayPipePair()
+	directA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(directA) error = %v", err)
+	}
+	defer directA.Close()
+	directB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(directB) error = %v", err)
+	}
+	defer directB.Close()
+	managerA := transport.NewManager(transport.ManagerConfig{
+		RelaySend:          relayA.send,
+		ReceiveRelay:       relayA.receive,
+		RelayAddr:          relayA.addr,
+		DirectConn:         directA,
+		DisableDirectReads: false,
+		DiscoveryInterval:  time.Second,
+		DirectStaleTimeout: 5 * time.Second,
+	})
+	managerB := transport.NewManager(transport.ManagerConfig{
+		RelaySend:          relayB.send,
+		ReceiveRelay:       relayB.receive,
+		RelayAddr:          relayB.addr,
+		DirectConn:         directB,
+		DisableDirectReads: false,
+		DiscoveryInterval:  time.Second,
+		DirectStaleTimeout: 5 * time.Second,
+	})
+	if err := managerA.Start(ctx); err != nil {
+		t.Fatalf("managerA.Start() error = %v", err)
+	}
+	if err := managerB.Start(ctx); err != nil {
+		t.Fatalf("managerB.Start() error = %v", err)
+	}
+
+	serverIdentity, err := GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(server) error = %v", err)
+	}
+	clientIdentity, err := GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(client) error = %v", err)
+	}
+	wrongServerIdentity, err := GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(wrong server) error = %v", err)
+	}
+
+	serverAdapter := NewAdapter(managerB.PeerDatagramConn(ctx))
+	defer serverAdapter.Close()
+	listener, err := quic.Listen(serverAdapter, ServerTLSConfig(serverIdentity, clientIdentity.Public), DefaultQUICConfig())
+	if err != nil {
+		t.Fatalf("quic.Listen() error = %v", err)
+	}
+	defer listener.Close()
+
+	clientAdapter := NewAdapter(managerA.PeerDatagramConn(ctx))
+	defer clientAdapter.Close()
+	_, err = quic.Dial(ctx, clientAdapter, managerA.PeerDatagramConn(ctx).RemoteAddr(), ClientTLSConfig(clientIdentity, wrongServerIdentity.Public), DefaultQUICConfig())
+	if err == nil {
+		t.Fatal("quic.Dial() error = nil, want peer identity mismatch")
+	}
+}
+
 func waitForPathState(t *testing.T, mgr *transport.Manager, want transport.Path, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
