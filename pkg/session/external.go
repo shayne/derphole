@@ -11,14 +11,17 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"sync"
 	"time"
 
 	"go4.org/mem"
 
 	quic "github.com/quic-go/quic-go"
 	"github.com/shayne/derpcat/pkg/derpbind"
+	"github.com/shayne/derpcat/pkg/portmap"
 	"github.com/shayne/derpcat/pkg/quicpath"
 	"github.com/shayne/derpcat/pkg/rendezvous"
+	"github.com/shayne/derpcat/pkg/telemetry"
 	"github.com/shayne/derpcat/pkg/token"
 	"github.com/shayne/derpcat/pkg/transport"
 	"github.com/shayne/derpcat/pkg/traversal"
@@ -35,6 +38,17 @@ const (
 )
 
 var gatherTraversalCandidates = traversal.GatherCandidates
+var publicSessionPortmaps sync.Map
+var newPublicPortmap = func(emitter *telemetry.Emitter) publicPortmap {
+	return portmap.New(emitter)
+}
+
+type publicPortmap interface {
+	transport.Portmap
+	SetLocalPort(uint16)
+	Snapshot() (netip.AddrPort, bool)
+	Close() error
+}
 
 type envelope struct {
 	Type     string                    `json:"type"`
@@ -115,6 +129,7 @@ func issuePublicSession(ctx context.Context) (string, *relaySession, error) {
 		derpMap:      dm,
 		quicIdentity: quicIdentity,
 	}
+	attachPublicPortmap(session, newBoundPublicPortmap(probeConn, nil))
 	return tok, session, nil
 }
 
@@ -150,6 +165,8 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 		return err
 	}
 	defer probeConn.Close()
+	pm := newBoundPublicPortmap(probeConn, cfg.Emitter)
+	defer pm.Close()
 
 	clientIdentity, err := quicpath.GenerateSessionIdentity()
 	if err != nil {
@@ -161,7 +178,7 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 		SessionID:    tok.SessionID,
 		DERPPublic:   derpPublicKeyRaw32(derpClient.PublicKey()),
 		QUICPublic:   clientIdentity.Public,
-		Candidates:   publicProbeCandidates(ctx, probeConn, dm),
+		Candidates:   publicProbeCandidates(ctx, probeConn, dm, pm),
 		Capabilities: tok.Capabilities,
 	}
 	claim.BearerMAC = rendezvous.ComputeBearerMAC(tok.BearerSecret, claim)
@@ -191,7 +208,7 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 	}
 	transportCtx, transportCancel := context.WithCancel(ctx)
 	defer transportCancel()
-	transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, probeConn, dm, derpClient, listenerDERP, cfg.ForceRelay)
+	transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, probeConn, dm, derpClient, listenerDERP, pm, cfg.ForceRelay)
 	if err != nil {
 		return err
 	}
@@ -250,6 +267,7 @@ func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
 		return "", err
 	}
 	defer deleteRelayMailbox(tok, session)
+	defer closePublicSessionTransport(session)
 	defer session.derp.Close()
 
 	pathEmitter := newTransportPathEmitter(cfg.Emitter)
@@ -285,13 +303,13 @@ func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
 		}
 
 		if decision.Accept != nil {
-			decision.Accept.Candidates = publicProbeCandidates(ctx, session.probeConn, session.derpMap)
+			decision.Accept.Candidates = publicProbeCandidates(ctx, session.probeConn, session.derpMap, publicSessionPortmap(session))
 		}
 		if cfg.Emitter != nil {
 			cfg.Emitter.Debug("claim-accepted")
 		}
 		transportCtx, transportCancel := context.WithCancel(ctx)
-		transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, session.probeConn, session.derpMap, session.derp, peerDERP, cfg.ForceRelay)
+		transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, session.probeConn, session.derpMap, session.derp, peerDERP, publicSessionPortmap(session), cfg.ForceRelay)
 		if err != nil {
 			transportCancel()
 			return tok, err
@@ -358,6 +376,7 @@ func startExternalTransportManager(
 	dm *tailcfg.DERPMap,
 	derpClient *derpbind.Client,
 	peerDERP key.NodePublic,
+	pm publicPortmap,
 	forceRelay bool,
 ) (*transport.Manager, func(), error) {
 	controlCh, unsubscribe := derpClient.Subscribe(func(pkt derpbind.Packet) bool {
@@ -386,6 +405,7 @@ func startExternalTransportManager(
 		RelayAddr:               relayTransportAddr(),
 		DirectConn:              nil,
 		DisableDirectReads:      false,
+		Portmap:                 pm,
 		DiscoveryInterval:       1 * time.Second,
 		EndpointRefreshInterval: 1 * time.Second,
 		DirectStaleTimeout:      10 * time.Second,
@@ -399,7 +419,7 @@ func startExternalTransportManager(
 	if !forceRelay {
 		cfg.DirectConn = conn
 		cfg.CandidateSource = func(ctx context.Context) []net.Addr {
-			return publicProbeAddrs(ctx, conn, dm)
+			return publicProbeAddrs(ctx, conn, dm, pm)
 		}
 	}
 
@@ -528,7 +548,7 @@ func decodeEnvelope(payload []byte) (envelope, error) {
 	return env, err
 }
 
-func publicProbeCandidates(ctx context.Context, conn net.PacketConn, dm *tailcfg.DERPMap) []string {
+func publicProbeCandidates(ctx context.Context, conn net.PacketConn, dm *tailcfg.DERPMap, pm publicPortmap) []string {
 	if fakeTransportCandidatesBlocked() {
 		return nil
 	}
@@ -562,7 +582,11 @@ func publicProbeCandidates(ctx context.Context, conn net.PacketConn, dm *tailcfg
 	}
 
 	if dm != nil {
-		if gathered, err := gatherTraversalCandidates(ctx, dm, nil); err == nil {
+		var mapped func() (netip.AddrPort, bool)
+		if pm != nil {
+			mapped = pm.Snapshot
+		}
+		if gathered, err := gatherTraversalCandidates(ctx, dm, mapped); err == nil {
 			for _, candidate := range gathered {
 				if addrPort, err := netip.ParseAddrPort(candidate); err == nil {
 					seen[addrPort.String()] = struct{}{}
@@ -582,9 +606,54 @@ func publicProbeCandidates(ctx context.Context, conn net.PacketConn, dm *tailcfg
 	return candidates
 }
 
-func publicProbeAddrs(ctx context.Context, conn net.PacketConn, dm *tailcfg.DERPMap) []net.Addr {
-	raw := publicProbeCandidates(ctx, conn, dm)
+func publicProbeAddrs(ctx context.Context, conn net.PacketConn, dm *tailcfg.DERPMap, pm publicPortmap) []net.Addr {
+	raw := publicProbeCandidates(ctx, conn, dm, pm)
 	return parseCandidateStrings(raw)
+}
+
+func newBoundPublicPortmap(conn net.PacketConn, emitter *telemetry.Emitter) publicPortmap {
+	pm := newPublicPortmap(emitter)
+	if pm == nil || conn == nil {
+		return pm
+	}
+	if udpAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		pm.SetLocalPort(uint16(udpAddr.Port))
+		_ = pm.Refresh(time.Now())
+	}
+	return pm
+}
+
+func attachPublicPortmap(session *relaySession, pm publicPortmap) {
+	if session == nil || pm == nil {
+		return
+	}
+	publicSessionPortmaps.Store(session, pm)
+}
+
+func publicSessionPortmap(session *relaySession) publicPortmap {
+	if session == nil {
+		return nil
+	}
+	if pm, ok := publicSessionPortmaps.Load(session); ok {
+		if client, ok := pm.(publicPortmap); ok {
+			return client
+		}
+	}
+	return nil
+}
+
+func closePublicSessionTransport(session *relaySession) {
+	if session == nil {
+		return
+	}
+	if pm, ok := publicSessionPortmaps.LoadAndDelete(session); ok {
+		if client, ok := pm.(publicPortmap); ok {
+			_ = client.Close()
+		}
+	}
+	if session.probeConn != nil {
+		_ = session.probeConn.Close()
+	}
 }
 
 func parseCandidateStrings(raw []string) []net.Addr {

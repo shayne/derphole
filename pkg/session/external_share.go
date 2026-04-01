@@ -80,6 +80,7 @@ func issuePublicShareSession(ctx context.Context, cfg ShareConfig) (string, *rel
 		derpMap:      dm,
 		quicIdentity: quicIdentity,
 	}
+	attachPublicPortmap(session, newBoundPublicPortmap(probeConn, nil))
 	return tok, session, nil
 }
 
@@ -89,7 +90,7 @@ func shareExternal(ctx context.Context, cfg ShareConfig) (string, error) {
 		return "", err
 	}
 	defer session.derp.Close()
-	defer session.probeConn.Close()
+	defer closePublicSessionTransport(session)
 	claimCh, unsubscribeClaims := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return isClaimPayload(pkt.Payload)
 	})
@@ -128,11 +129,11 @@ func shareExternal(ctx context.Context, cfg ShareConfig) (string, error) {
 		}
 
 		if decision.Accept != nil {
-			decision.Accept.Candidates = publicProbeCandidates(ctx, session.probeConn, session.derpMap)
+			decision.Accept.Candidates = publicProbeCandidates(ctx, session.probeConn, session.derpMap, publicSessionPortmap(session))
 		}
 		pathEmitter.Emit(StateClaimed)
 		transportCtx, transportCancel := context.WithCancel(ctx)
-		transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, session.probeConn, session.derpMap, session.derp, peerDERP, cfg.ForceRelay)
+		transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, session.probeConn, session.derpMap, session.derp, peerDERP, publicSessionPortmap(session), cfg.ForceRelay)
 		if err != nil {
 			transportCancel()
 			return tok, err
@@ -187,6 +188,8 @@ func openExternal(ctx context.Context, cfg OpenConfig, tok token.Token) error {
 		return err
 	}
 	defer probeConn.Close()
+	pm := newBoundPublicPortmap(probeConn, cfg.Emitter)
+	defer pm.Close()
 
 	clientIdentity, err := quicpath.GenerateSessionIdentity()
 	if err != nil {
@@ -198,7 +201,7 @@ func openExternal(ctx context.Context, cfg OpenConfig, tok token.Token) error {
 		SessionID:    tok.SessionID,
 		DERPPublic:   derpPublicKeyRaw32(derpClient.PublicKey()),
 		QUICPublic:   clientIdentity.Public,
-		Candidates:   publicProbeCandidates(ctx, probeConn, dm),
+		Candidates:   publicProbeCandidates(ctx, probeConn, dm, pm),
 		Capabilities: tok.Capabilities,
 	}
 	claim.BearerMAC = rendezvous.ComputeBearerMAC(tok.BearerSecret, claim)
@@ -221,7 +224,7 @@ func openExternal(ctx context.Context, cfg OpenConfig, tok token.Token) error {
 	pathEmitter.Emit(StateProbing)
 	transportCtx, transportCancel := context.WithCancel(ctx)
 	defer transportCancel()
-	transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, probeConn, dm, derpClient, listenerDERP, cfg.ForceRelay)
+	transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, probeConn, dm, derpClient, listenerDERP, pm, cfg.ForceRelay)
 	if err != nil {
 		return err
 	}

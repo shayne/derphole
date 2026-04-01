@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shayne/derpcat/pkg/portmap"
 	"github.com/shayne/derpcat/pkg/rendezvous"
 	"github.com/shayne/derpcat/pkg/telemetry"
 	"github.com/shayne/derpcat/pkg/transport"
@@ -495,25 +496,171 @@ func TestTransportPathEmitterCompletionIsTerminal(t *testing.T) {
 	}
 }
 
-func TestPublicProbeCandidatesPreservesGatheredHostPort(t *testing.T) {
+func TestPublicProbeCandidatesIncludesMappedCandidate(t *testing.T) {
 	ctx := context.Background()
 	conn := &stubPacketConn{localAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242}}
+	mapped := netip.MustParseAddrPort("198.51.100.10:54321")
+	pm := portmap.NewForTest(&sessionFakePortmapMapper{have: true, external: mapped}, telemetry.New(io.Discard, telemetry.LevelVerbose))
+	pm.SetLocalPort(4242)
+	if changed := pm.Refresh(time.Now()); !changed {
+		t.Fatal("initial portmap Refresh() changed = false, want true")
+	}
 
 	prev := gatherTraversalCandidates
 	t.Cleanup(func() {
 		gatherTraversalCandidates = prev
 	})
-	gatherTraversalCandidates = func(context.Context, *tailcfg.DERPMap, func() (netip.AddrPort, bool)) ([]string, error) {
-		return []string{"100.64.0.11:5555", "not-an-endpoint"}, nil
+	gatherTraversalCandidates = func(_ context.Context, _ *tailcfg.DERPMap, mappedFn func() (netip.AddrPort, bool)) ([]string, error) {
+		gotMapped, ok := mappedFn()
+		if !ok {
+			t.Fatal("gatherTraversalCandidates() mapped callback = false, want true")
+		}
+		if gotMapped != mapped {
+			t.Fatalf("gatherTraversalCandidates() mapped callback = %v, want %v", gotMapped, mapped)
+		}
+		return []string{"100.64.0.11:5555", gotMapped.String(), "not-an-endpoint"}, nil
 	}
 
-	got := publicProbeCandidates(ctx, conn, &tailcfg.DERPMap{})
+	got := publicProbeCandidates(ctx, conn, &tailcfg.DERPMap{}, pm)
 	if !containsString(got, "100.64.0.11:5555") {
 		t.Fatalf("publicProbeCandidates() = %v, want gathered host:port candidate", got)
 	}
-	if containsString(got, "100.64.0.11:4242") {
-		t.Fatalf("publicProbeCandidates() = %v, want gathered candidate to keep its original port", got)
+	if !containsString(got, mapped.String()) {
+		t.Fatalf("publicProbeCandidates() = %v, want mapped candidate %q", got, mapped)
 	}
+}
+
+func TestIssuePublicSessionAttachesAndClosesPortmap(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	prevCtor := newPublicPortmap
+	fake := &sessionLifecyclePortmap{
+		have:     true,
+		snapshot: netip.MustParseAddrPort("198.51.100.10:54321"),
+	}
+	newPublicPortmap = func(*telemetry.Emitter) publicPortmap { return fake }
+	t.Cleanup(func() { newPublicPortmap = prevCtor })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, session, err := issuePublicSession(ctx)
+	if err != nil {
+		t.Fatalf("issuePublicSession() error = %v", err)
+	}
+	defer session.derp.Close()
+
+	pm := publicSessionPortmap(session)
+	if pm == nil {
+		t.Fatal("publicSessionPortmap() = nil, want attached portmap")
+	}
+	if pm != fake {
+		t.Fatalf("publicSessionPortmap() = %T, want fake portmap", pm)
+	}
+
+	wantPort := uint16(session.probeConn.LocalAddr().(*net.UDPAddr).Port)
+	if got := fake.localPort; got != wantPort {
+		t.Fatalf("SetLocalPort() = %d, want %d", got, wantPort)
+	}
+
+	closePublicSessionTransport(session)
+	closePublicSessionTransport(session)
+
+	if got, want := fake.closeCalls, 1; got != want {
+		t.Fatalf("Close() calls = %d, want %d", got, want)
+	}
+	if publicSessionPortmap(session) != nil {
+		t.Fatal("publicSessionPortmap() after close = non-nil, want nil")
+	}
+}
+
+type sessionFakePortmapMapper struct {
+	localPort uint16
+	external  netip.AddrPort
+	have      bool
+	closed    int
+}
+
+func (m *sessionFakePortmapMapper) SetLocalPort(p uint16) { m.localPort = p }
+
+func (m *sessionFakePortmapMapper) SetGatewayLookupFunc(func() (gw, myIP netip.Addr, ok bool)) {}
+
+func (m *sessionFakePortmapMapper) HaveMapping() bool { return m.have }
+
+func (m *sessionFakePortmapMapper) GetCachedMappingOrStartCreatingOne() (netip.AddrPort, bool) {
+	if !m.have {
+		return netip.AddrPort{}, false
+	}
+	return m.external, true
+}
+
+func (m *sessionFakePortmapMapper) Close() error {
+	m.closed++
+	return nil
+}
+
+type sessionLifecyclePortmap struct {
+	mu         sync.Mutex
+	localPort  uint16
+	snapshot   netip.AddrPort
+	have       bool
+	closeCalls int
+}
+
+func (m *sessionLifecyclePortmap) SetLocalPort(p uint16) {
+	m.mu.Lock()
+	m.localPort = p
+	m.mu.Unlock()
+}
+
+func (m *sessionLifecyclePortmap) SetGatewayLookupFunc(func() (gw, myIP netip.Addr, ok bool)) {}
+
+func (m *sessionLifecyclePortmap) HaveMapping() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.have
+}
+
+func (m *sessionLifecyclePortmap) GetCachedMappingOrStartCreatingOne() (netip.AddrPort, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.have {
+		return netip.AddrPort{}, false
+	}
+	return m.snapshot, true
+}
+
+func (m *sessionLifecyclePortmap) Snapshot() (netip.AddrPort, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.have {
+		return netip.AddrPort{}, false
+	}
+	return m.snapshot, true
+}
+
+func (m *sessionLifecyclePortmap) SnapshotAddrs() []net.Addr {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.have || !m.snapshot.Addr().IsValid() || m.snapshot.Port() == 0 {
+		return nil
+	}
+	return []net.Addr{&net.UDPAddr{
+		IP:   append(net.IP(nil), m.snapshot.Addr().AsSlice()...),
+		Port: int(m.snapshot.Port()),
+		Zone: m.snapshot.Addr().Zone(),
+	}}
+}
+
+func (m *sessionLifecyclePortmap) Refresh(time.Time) bool { return true }
+
+func (m *sessionLifecyclePortmap) Close() error {
+	m.mu.Lock()
+	m.closeCalls++
+	m.mu.Unlock()
+	return nil
 }
 
 func containsString(values []string, target string) bool {
