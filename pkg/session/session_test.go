@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -494,6 +495,36 @@ func TestTransportPathEmitterCompletionIsTerminal(t *testing.T) {
 	}
 }
 
+func TestPublicProbeCandidatesPreservesGatheredHostPort(t *testing.T) {
+	ctx := context.Background()
+	conn := &stubPacketConn{localAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242}}
+
+	prev := gatherTraversalCandidates
+	t.Cleanup(func() {
+		gatherTraversalCandidates = prev
+	})
+	gatherTraversalCandidates = func(context.Context, *tailcfg.DERPMap, func() (netip.AddrPort, bool)) ([]string, error) {
+		return []string{"100.64.0.11:5555", "not-an-endpoint"}, nil
+	}
+
+	got := publicProbeCandidates(ctx, conn, &tailcfg.DERPMap{})
+	if !containsString(got, "100.64.0.11:5555") {
+		t.Fatalf("publicProbeCandidates() = %v, want gathered host:port candidate", got)
+	}
+	if containsString(got, "100.64.0.11:4242") {
+		t.Fatalf("publicProbeCandidates() = %v, want gathered candidate to keep its original port", got)
+	}
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 func TestSeedAcceptedDecisionCandidatesUsesAcceptCandidates(t *testing.T) {
 	ctx := context.Background()
 	decision := rendezvous.Decision{
@@ -554,6 +585,18 @@ type captureCandidateSeeder struct {
 	calls      int
 	candidates []net.Addr
 }
+
+type stubPacketConn struct {
+	localAddr net.Addr
+}
+
+func (c *stubPacketConn) ReadFrom([]byte) (int, net.Addr, error) { return 0, nil, net.ErrClosed }
+func (c *stubPacketConn) WriteTo([]byte, net.Addr) (int, error)  { return 0, net.ErrClosed }
+func (c *stubPacketConn) Close() error                           { return nil }
+func (c *stubPacketConn) LocalAddr() net.Addr                    { return c.localAddr }
+func (c *stubPacketConn) SetDeadline(time.Time) error            { return nil }
+func (c *stubPacketConn) SetReadDeadline(time.Time) error        { return nil }
+func (c *stubPacketConn) SetWriteDeadline(time.Time) error       { return nil }
 
 func (c *captureCandidateSeeder) SeedRemoteCandidates(_ context.Context, candidates []net.Addr) {
 	c.calls++

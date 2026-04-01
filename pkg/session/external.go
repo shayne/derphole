@@ -34,6 +34,8 @@ const (
 	maxEnvelopeBytes = 16 << 10
 )
 
+var gatherTraversalCandidates = traversal.GatherCandidates
+
 type envelope struct {
 	Type     string                    `json:"type"`
 	Claim    *rendezvous.Claim         `json:"claim,omitempty"`
@@ -560,10 +562,10 @@ func publicProbeCandidates(ctx context.Context, conn net.PacketConn, dm *tailcfg
 	}
 
 	if dm != nil {
-		if gathered, err := traversal.GatherCandidates(ctx, dm, nil); err == nil {
-			for _, candidateIP := range gathered {
-				if ip, err := netip.ParseAddr(candidateIP); err == nil {
-					add(ip)
+		if gathered, err := gatherTraversalCandidates(ctx, dm, nil); err == nil {
+			for _, candidate := range gathered {
+				if addrPort, err := netip.ParseAddrPort(candidate); err == nil {
+					seen[addrPort.String()] = struct{}{}
 				}
 			}
 		}
