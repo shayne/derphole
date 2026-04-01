@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -709,6 +710,87 @@ func TestManagerRefreshRetryAfterControlSendFailure(t *testing.T) {
 	}
 }
 
+func TestManagerRefreshesDiscoveryWhenPortmapChanges(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000028, 0))
+	relay := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	relay.useClock(clock)
+	direct.useClock(clock)
+
+	localCandidate := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 11), Port: 64000}
+	peerCandidate := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 12), Port: 64001}
+	mappedCandidate := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 10), Port: 54321}
+	controls := newFakeControlPipe()
+	portmap := &fakePortmap{mapped: mappedCandidate}
+	direct.enableResponder(peerCandidate)
+	baseTimers := clock.timerCount()
+
+	mgr := NewManager(ManagerConfig{
+		RelayConn:               relay,
+		DirectConn:              direct,
+		CandidateSource:         func(context.Context) []net.Addr { return []net.Addr{localCandidate} },
+		Portmap:                 portmap,
+		SendControl:             controls.send,
+		ReceiveControl:          controls.receive,
+		Clock:                   clock,
+		DiscoveryInterval:       1 * time.Second,
+		EndpointRefreshInterval: 10 * time.Second,
+		DirectStaleTimeout:      4 * time.Second,
+	})
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+
+	clock.Advance(1 * time.Second)
+	if !controls.waitForSentCount(ControlCandidates, 1, 200*time.Millisecond) {
+		t.Fatal("manager did not send the initial candidate update")
+	}
+	initial := controls.lastSentType(ControlCandidates)
+	if initial == nil {
+		t.Fatal("manager did not record the initial candidate update")
+	}
+	if got := initial.Candidates; len(got) != 1 || got[0] != localCandidate.String() {
+		t.Fatalf("initial candidates = %#v, want %q", got, localCandidate.String())
+	}
+
+	if !controls.deliver(ControlMessage{
+		Type:       ControlCandidates,
+		Candidates: []string{peerCandidate.String()},
+	}, 200*time.Millisecond) {
+		t.Fatal("failed to deliver direct peer candidate")
+	}
+	clock.Advance(1 * time.Second)
+	if !waitForPath(t, mgr, PathDirect, 200*time.Millisecond) {
+		t.Fatalf("PathState() = %v, want %v before portmap change", mgr.PathState(), PathDirect)
+	}
+	if endpoint, active := mgr.DirectPath(); endpoint != peerCandidate.String() || !active {
+		t.Fatalf("DirectPath() before portmap change = (%q, %t), want (%q, true)", endpoint, active, peerCandidate.String())
+	}
+
+	portmap.activate()
+	clock.Advance(1 * time.Second)
+	if !controls.waitForSentCount(ControlCandidates, 2, 200*time.Millisecond) {
+		t.Fatal("manager did not refresh candidates after the portmap changed while direct was healthy")
+	}
+	refreshed := controls.lastSentType(ControlCandidates)
+	if refreshed == nil {
+		t.Fatal("manager did not record the refreshed candidate update")
+	}
+	if got := refreshed.Candidates; len(got) != 2 || got[0] != localCandidate.String() || got[1] != mappedCandidate.String() {
+		t.Fatalf("refreshed candidates = %#v, want [%q %q]", got, localCandidate.String(), mappedCandidate.String())
+	}
+	if got, active := mgr.DirectPath(); got != peerCandidate.String() || !active {
+		t.Fatalf("DirectPath() after portmap change = (%q, %t), want (%q, true)", got, active, peerCandidate.String())
+	}
+}
+
 func TestManagerIgnoresAckWithoutOutstandingProbe(t *testing.T) {
 	t.Helper()
 
@@ -1221,4 +1303,39 @@ func waitForPath(t *testing.T, mgr *Manager, want Path, timeout time.Duration) b
 		}
 		return false, mgr.stateChanged()
 	})
+}
+
+type fakePortmap struct {
+	mu      sync.Mutex
+	mapped  net.Addr
+	have    bool
+	changed bool
+}
+
+func (p *fakePortmap) Refresh(time.Time) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.changed {
+		p.changed = false
+		p.have = true
+		return true
+	}
+	return false
+}
+
+func (p *fakePortmap) SnapshotAddrs() []net.Addr {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.have || p.mapped == nil {
+		return nil
+	}
+	return []net.Addr{cloneAddr(p.mapped)}
+}
+
+func (p *fakePortmap) activate() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.changed = true
 }

@@ -81,6 +81,10 @@ func (m *Manager) discoveryTick(ctx context.Context, forceCandidateRefresh bool)
 		return
 	}
 
+	if m.cfg.Portmap != nil && m.cfg.Portmap.Refresh(m.now()) {
+		forceCandidateRefresh = true
+	}
+
 	plan := m.snapshotDiscoveryPlan()
 	if !plan.shouldAttempt && !forceCandidateRefresh {
 		return

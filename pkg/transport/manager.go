@@ -33,6 +33,7 @@ type ManagerConfig struct {
 	DirectConn              net.PacketConn
 	DisableDirectReads      bool
 	CandidateSource         func(context.Context) []net.Addr
+	Portmap                 Portmap
 	SendControl             func(context.Context, ControlMessage) error
 	ReceiveControl          func(context.Context) (ControlMessage, error)
 	Clock                   Clock
@@ -45,6 +46,7 @@ type Manager struct {
 	mu                    sync.Mutex
 	discoveryMu           sync.Mutex
 	cfg                   ManagerConfig
+	candidateSourceBase   func(context.Context) []net.Addr
 	state                 pathState
 	stateNotify           chan struct{}
 	discoveryGen          uint64
@@ -60,16 +62,24 @@ type Update struct {
 	Path Path
 }
 
+type Portmap interface {
+	Refresh(time.Time) bool
+	SnapshotAddrs() []net.Addr
+}
+
 func NewManager(cfg ManagerConfig) *Manager {
 	cfg = normalizeConfig(cfg)
 	hasRelay := cfg.RelayConn != nil || cfg.RelaySend != nil || cfg.ReceiveRelay != nil || cfg.RelayAddr != nil
-	return &Manager{
-		cfg:           cfg,
-		state:         newPathState(cfg.Clock.Now(), hasRelay, cfg.DirectConn != nil),
-		stateNotify:   make(chan struct{}),
-		peerRecvCh:    make(chan peerPacket, 256),
-		peerRecvErrCh: make(chan error, 1),
+	m := &Manager{
+		cfg:                 cfg,
+		candidateSourceBase: cfg.CandidateSource,
+		state:               newPathState(cfg.Clock.Now(), hasRelay, cfg.DirectConn != nil),
+		stateNotify:         make(chan struct{}),
+		peerRecvCh:          make(chan peerPacket, 256),
+		peerRecvErrCh:       make(chan error, 1),
 	}
+	m.cfg.CandidateSource = m.candidateSource
+	return m
 }
 
 func (m *Manager) Start(ctx context.Context) error {
@@ -260,4 +270,31 @@ func normalizeConfig(cfg ManagerConfig) ManagerConfig {
 		cfg.Clock = realClock{}
 	}
 	return cfg
+}
+
+func (m *Manager) candidateSource(ctx context.Context) []net.Addr {
+	out := make([]net.Addr, 0)
+	seen := make(map[string]struct{})
+
+	appendAddrs := func(addrs []net.Addr) {
+		for _, addr := range addrs {
+			if addr == nil {
+				continue
+			}
+			key := addr.String()
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, addr)
+		}
+	}
+
+	if m.candidateSourceBase != nil {
+		appendAddrs(m.candidateSourceBase(ctx))
+	}
+	if m.cfg.Portmap != nil {
+		appendAddrs(m.cfg.Portmap.SnapshotAddrs())
+	}
+	return out
 }
