@@ -100,6 +100,37 @@ require_direct_evidence() {
   fi
 }
 
+wait_for_direct_evidence() {
+  local label="$1"
+  local mode="$2"
+  local content="$3"
+  local bind_addr="$4"
+  local trace=""
+
+  for _ in $(seq 1 40); do
+    if [[ "${mode}" == "local" ]]; then
+      trace="$(path_trace "${local_share_log}")"
+    else
+      trace="$(remote_path_trace "${remote_open_err}")"
+    fi
+    if grep -q 'connected-direct' <<<"${trace}"; then
+      printf '%s\n' "${trace}"
+      return 0
+    fi
+    got="$(remote "curl --fail --silent 'http://${bind_addr}/'")"
+    if [[ "${got}" != "${content}" ]]; then
+      echo "${label} response mismatch while waiting for direct evidence" >&2
+      printf 'want=%q\n' "${content}" >&2
+      printf ' got=%q\n' "${got}" >&2
+      exit 1
+    fi
+    sleep 0.25
+  done
+
+  printf '%s\n' "${trace}"
+  return 1
+}
+
 mise run build
 mise run build-linux-amd64
 scp dist/derpcat-linux-amd64 "${remote_user}@${target}:${remote_upload}" >/dev/null
@@ -147,6 +178,14 @@ fi
 
 share_trace="$(path_trace "${local_share_log}")"
 open_trace="$(remote_path_trace "${remote_open_err}")"
+
+if ! grep -q 'connected-direct' <<<"${share_trace}"; then
+  share_trace="$(wait_for_direct_evidence "share" "local" "${shared_content}" "${bind_addr}" || true)"
+fi
+if ! grep -q 'connected-direct' <<<"${open_trace}"; then
+  open_trace="$(wait_for_direct_evidence "open" "remote" "${shared_content}" "${bind_addr}" || true)"
+fi
+
 assert_path_evidence "share" "${share_trace}"
 assert_path_evidence "open" "${open_trace}"
 require_direct_evidence "share" "${share_trace}"
