@@ -449,6 +449,38 @@ func TestManagerPeerDatagramConnReceivesPeerDatagrams(t *testing.T) {
 	}
 }
 
+func TestManagerPeerDatagramConnReceivesUnknownDirectDatagramsWhileRelayed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	relay := newFakeRelayDataPipe()
+	direct := newFakePacketConn(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1})
+	mgr := NewManager(ManagerConfig{
+		RelaySend:    relay.send,
+		ReceiveRelay: relay.receive,
+		RelayAddr:    relay.remote,
+		DirectConn:   direct,
+	})
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	unknownDirect := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 99), Port: 49999}
+	direct.enqueueRead([]byte("from-unknown-direct"), unknownDirect)
+
+	conn := mgr.PeerDatagramConn(ctx)
+	payload, addr, err := conn.RecvDatagram(ctx)
+	if err != nil {
+		t.Fatalf("RecvDatagram() error = %v", err)
+	}
+	if got := string(payload); got != "from-unknown-direct" {
+		t.Fatalf("RecvDatagram() payload = %q, want %q", got, "from-unknown-direct")
+	}
+	if got := addr.String(); got != relay.remote.String() {
+		t.Fatalf("RecvDatagram() addr = %q, want stable relay peer addr %q", got, relay.remote.String())
+	}
+}
+
 func TestManagerPeerDatagramConnSurvivesPathUpgrade(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

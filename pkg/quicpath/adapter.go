@@ -43,6 +43,9 @@ func (a *Adapter) ReadFrom(p []byte) (int, net.Addr, error) {
 	if err != nil {
 		return 0, nil, a.translateError(err)
 	}
+	if remote := a.peer.RemoteAddr(); remote != nil {
+		addr = remote
+	}
 	n := copy(p, payload)
 	return n, addr, nil
 }

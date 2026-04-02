@@ -37,6 +37,11 @@ const (
 	maxEnvelopeBytes = 16 << 10
 )
 
+var (
+	publicProbeTailscaleCGNATPrefix = netip.MustParsePrefix("100.64.0.0/10")
+	publicProbeTailscaleULAPrefix   = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+)
+
 var gatherTraversalCandidates = traversal.GatherCandidates
 var publicSessionPortmaps sync.Map
 var newPublicPortmap = func(emitter *telemetry.Emitter) publicPortmap {
@@ -563,7 +568,7 @@ func publicProbeCandidates(ctx context.Context, conn net.PacketConn, dm *tailcfg
 	port := udpAddr.Port
 	seen := map[string]struct{}{}
 	add := func(ip netip.Addr) {
-		if !ip.IsValid() || ip.IsUnspecified() {
+		if !publicProbeCandidateAllowed(ip) {
 			return
 		}
 		candidate := net.JoinHostPort(ip.String(), strconv.Itoa(port))
@@ -590,6 +595,9 @@ func publicProbeCandidates(ctx context.Context, conn net.PacketConn, dm *tailcfg
 		if gathered, err := gatherTraversalCandidates(ctx, dm, mapped); err == nil {
 			for _, candidate := range gathered {
 				if addrPort, err := netip.ParseAddrPort(candidate); err == nil {
+					if !publicProbeCandidateAllowed(addrPort.Addr()) {
+						continue
+					}
 					seen[addrPort.String()] = struct{}{}
 				}
 			}
@@ -605,6 +613,16 @@ func publicProbeCandidates(ctx context.Context, conn net.PacketConn, dm *tailcfg
 		candidates = candidates[:rendezvous.MaxClaimCandidates]
 	}
 	return candidates
+}
+
+func publicProbeCandidateAllowed(ip netip.Addr) bool {
+	if !ip.IsValid() || ip.IsUnspecified() {
+		return false
+	}
+	if os.Getenv("DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES") != "1" {
+		return true
+	}
+	return !publicProbeTailscaleCGNATPrefix.Contains(ip) && !publicProbeTailscaleULAPrefix.Contains(ip)
 }
 
 func publicProbeAddrs(ctx context.Context, conn net.PacketConn, dm *tailcfg.DERPMap, pm publicPortmap) []net.Addr {

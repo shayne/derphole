@@ -8,11 +8,12 @@ import (
 )
 
 type fakePeerDatagramConn struct {
-	sendCh chan []byte
-	recvCh chan []byte
-	doneCh chan struct{}
-	local  net.Addr
-	remote net.Addr
+	sendCh   chan []byte
+	recvCh   chan []byte
+	doneCh   chan struct{}
+	local    net.Addr
+	remote   net.Addr
+	recvAddr net.Addr
 }
 
 func newFakePeerDatagramConn() *fakePeerDatagramConn {
@@ -33,6 +34,9 @@ func (f *fakePeerDatagramConn) SendDatagram(p []byte) error {
 func (f *fakePeerDatagramConn) RecvDatagram(ctx context.Context) ([]byte, net.Addr, error) {
 	select {
 	case p := <-f.recvCh:
+		if f.recvAddr != nil {
+			return append([]byte(nil), p...), f.recvAddr, nil
+		}
 		return append([]byte(nil), p...), f.remote, nil
 	case <-f.doneCh:
 		return nil, nil, context.Canceled
@@ -69,6 +73,27 @@ func TestAdapterDeliversInboundPackets(t *testing.T) {
 	}
 	if got := addr.String(); got != peer.remote.String() {
 		t.Fatalf("ReadFrom() addr = %q, want %q", got, peer.remote.String())
+	}
+}
+
+func TestAdapterReadFromUsesStableRemoteAddr(t *testing.T) {
+	peer := newFakePeerDatagramConn()
+	peer.recvAddr = &net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 4242}
+	conn := NewAdapter(peer)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	peer.recvCh <- []byte("payload")
+
+	buf := make([]byte, 32)
+	n, addr, err := conn.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom() error = %v", err)
+	}
+	if got := string(buf[:n]); got != "payload" {
+		t.Fatalf("ReadFrom() payload = %q, want %q", got, "payload")
+	}
+	if got := addr.String(); got != peer.remote.String() {
+		t.Fatalf("ReadFrom() addr = %q, want stable peer addr %q", got, peer.remote.String())
 	}
 }
 

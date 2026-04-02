@@ -531,6 +531,33 @@ func TestPublicProbeCandidatesIncludesMappedCandidate(t *testing.T) {
 	}
 }
 
+func TestPublicProbeCandidatesSkipsTailscaleCGNATInInternetOnlyTestMode(t *testing.T) {
+	t.Setenv("DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES", "1")
+
+	ctx := context.Background()
+	conn := &stubPacketConn{localAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242}}
+
+	prev := gatherTraversalCandidates
+	t.Cleanup(func() {
+		gatherTraversalCandidates = prev
+	})
+	gatherTraversalCandidates = func(context.Context, *tailcfg.DERPMap, func() (netip.AddrPort, bool)) ([]string, error) {
+		return []string{
+			"100.64.0.11:5555",
+			"100.125.235.82:4242",
+			"192.0.2.10:5555",
+		}, nil
+	}
+
+	got := publicProbeCandidates(ctx, conn, &tailcfg.DERPMap{}, nil)
+	if containsCGNATCandidate(got) {
+		t.Fatalf("publicProbeCandidates() = %v, want no 100.64.0.0/10 candidates", got)
+	}
+	if !containsString(got, "192.0.2.10:5555") {
+		t.Fatalf("publicProbeCandidates() = %v, want non-CGNAT gathered candidate", got)
+	}
+}
+
 func TestIssuePublicSessionAttachesAndClosesPortmap(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
@@ -792,6 +819,20 @@ func (m *sessionLifecyclePortmap) Close() error {
 func containsString(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func containsCGNATCandidate(values []string) bool {
+	tailscaleCGNAT := netip.MustParsePrefix("100.64.0.0/10")
+	for _, value := range values {
+		addrPort, err := netip.ParseAddrPort(value)
+		if err != nil {
+			continue
+		}
+		if tailscaleCGNAT.Contains(addrPort.Addr()) {
 			return true
 		}
 	}

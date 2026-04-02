@@ -183,6 +183,9 @@ func (m *Manager) shouldAcceptDirectPayload(addr net.Addr) bool {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.state.current != PathDirect {
+		return true
+	}
 	if m.state.current == PathDirect && m.state.bestEndpoint == addr.String() {
 		return true
 	}
