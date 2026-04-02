@@ -13,6 +13,28 @@ remote() {
   ssh "${remote_user}@${target}" 'bash -se' <<<"$1"
 }
 
+count_local_udp_sockets() {
+  local pids
+  pids="$(pgrep -x derpcat | paste -sd, - || true)"
+  if [[ -z "${pids}" ]]; then
+    echo 0
+    return 0
+  fi
+  lsof -nP -a -p "${pids}" -iUDP 2>/dev/null | awk 'NR > 1 { count++ } END { print count + 0 }' || true
+}
+
+count_local_derpcat_processes() {
+  pgrep -x derpcat | awk '{ count++ } END { print count + 0 }' || true
+}
+
+count_remote_udp_sockets() {
+  remote "pids=\$(pgrep -x derpcat | paste -sd, - || true); if [[ -z \"\${pids}\" ]]; then echo 0; else lsof -nP -a -p \"\${pids}\" -iUDP 2>/dev/null | awk 'NR > 1 { count++ } END { print count + 0 }' || true; fi"
+}
+
+count_remote_derpcat_processes() {
+  remote "pgrep -x derpcat | awk '{ count++ } END { print count + 0 }' || true"
+}
+
 dump_failure() {
   echo "--- local sender log" >&2
   sed -n '1,200p' "${tmp}/send.err" >&2 || true
@@ -52,7 +74,36 @@ cleanup() {
   rm -rf "${tmp}"
 }
 
-trap 'status=$?; if [[ ${status} -ne 0 ]]; then dump_failure; fi; cleanup; exit ${status}' EXIT
+assert_no_derpcat_leaks() {
+  local local_udp_count
+  local local_process_count
+  local remote_udp_count
+  local remote_process_count
+
+  local_udp_count="$(count_local_udp_sockets | tr -d '[:space:]')"
+  local_process_count="$(count_local_derpcat_processes | tr -d '[:space:]')"
+  remote_udp_count="$(count_remote_udp_sockets | tr -d '[:space:]')"
+  remote_process_count="$(count_remote_derpcat_processes | tr -d '[:space:]')"
+
+  if [[ "${local_udp_count}" != "0" ]]; then
+    echo "local derpcat UDP sockets leaked: ${local_udp_count}" >&2
+    exit 1
+  fi
+  if [[ "${local_process_count}" != "0" ]]; then
+    echo "local derpcat processes leaked: ${local_process_count}" >&2
+    exit 1
+  fi
+  if [[ "${remote_udp_count}" != "0" ]]; then
+    echo "remote derpcat UDP sockets leaked on ${target}: ${remote_udp_count}" >&2
+    exit 1
+  fi
+  if [[ "${remote_process_count}" != "0" ]]; then
+    echo "remote derpcat processes leaked on ${target}: ${remote_process_count}" >&2
+    exit 1
+  fi
+}
+
+trap 'status=$?; if [[ ${status} -ne 0 ]]; then dump_failure; fi; cleanup; if [[ ${status} -eq 0 ]]; then assert_no_derpcat_leaks; fi; exit ${status}' EXIT
 
 mise run build
 mise run build-linux-amd64

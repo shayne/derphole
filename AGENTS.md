@@ -38,6 +38,8 @@ Tests live alongside code in `*_test.go` files. Prefer focused package tests fir
 
 For live transport verification, prefer `REMOTE_HOST=my-server.example.com mise run smoke-remote`, `REMOTE_HOST=my-server.example.com mise run smoke-remote-share`, and `REMOTE_HOST=my-server.example.com mise run promotion-1g` when you need to inspect relay-first to direct-upgrade traces.
 
+For throughput benchmarks and safe harness rules, read `docs/benchmarks.md` before writing one-off loops or custom benchmark binaries.
+
 When changing release or packaging behavior, also run `mise run release:npm-dry-run`.
 
 ## Commit & Pull Request Guidelines
