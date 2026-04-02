@@ -23,6 +23,7 @@ type fakePacketConn struct {
 	readErrors         []error
 	responderEndpoints map[string]net.Addr
 	failWritesTo       map[string]int
+	writeErrorsTo      map[string][]error
 	notify             chan struct{}
 	closed             bool
 	deadline           time.Time
@@ -35,6 +36,7 @@ func newFakePacketConn(local net.Addr) *fakePacketConn {
 		local:              local,
 		responderEndpoints: make(map[string]net.Addr),
 		failWritesTo:       make(map[string]int),
+		writeErrorsTo:      make(map[string][]error),
 		notify:             make(chan struct{}),
 		clock:              realClock{},
 	}
@@ -94,6 +96,16 @@ func (c *fakePacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 		c.signalLocked()
 		return 0, net.ErrClosed
 	}
+	if errs := c.writeErrorsTo[addr.String()]; len(errs) > 0 {
+		err := errs[0]
+		if len(errs) == 1 {
+			delete(c.writeErrorsTo, addr.String())
+		} else {
+			c.writeErrorsTo[addr.String()] = errs[1:]
+		}
+		c.signalLocked()
+		return 0, err
+	}
 	if string(payload) == string(discoProbePayload) {
 		if responder, ok := c.responderEndpoints[addr.String()]; ok {
 			c.reads = append(c.reads, packet{
@@ -152,6 +164,12 @@ func (c *fakePacketConn) enableResponder(addr net.Addr) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.responderEndpoints[addr.String()] = cloneAddr(addr)
+}
+
+func (c *fakePacketConn) failNextWriteTo(addr net.Addr, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writeErrorsTo[addr.String()] = append(c.writeErrorsTo[addr.String()], err)
 }
 
 func (c *fakePacketConn) enableResponderAfter(clock *fakeClock, d time.Duration, addr net.Addr) {
@@ -277,12 +295,6 @@ func (c *fakePacketConn) clearWrites() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.writes = nil
-}
-
-func (c *fakePacketConn) failNextWriteTo(addr net.Addr) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.failWritesTo[addr.String()]++
 }
 
 func (c *fakePacketConn) failNextRead(err error) {

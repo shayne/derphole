@@ -3,6 +3,7 @@ package quicpath
 import (
 	"context"
 	"net"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -146,5 +147,42 @@ func TestAdapterCloseUnblocksReaders(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("ReadFrom() remained blocked after Close()")
+	}
+}
+
+type syscallPeerDatagramConn struct {
+	*fakePeerDatagramConn
+	conn *net.UDPConn
+}
+
+func (p *syscallPeerDatagramConn) SyscallConn() (syscall.RawConn, error) {
+	return p.conn.SyscallConn()
+}
+
+func TestAdapterExposesSyscallConnWhenPeerDoes(t *testing.T) {
+	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP() error = %v", err)
+	}
+	t.Cleanup(func() { _ = udpConn.Close() })
+
+	conn := NewAdapter(&syscallPeerDatagramConn{
+		fakePeerDatagramConn: newFakePeerDatagramConn(),
+		conn:                 udpConn,
+	})
+	t.Cleanup(func() { _ = conn.Close() })
+
+	sysConn, ok := any(conn).(interface {
+		SyscallConn() (syscall.RawConn, error)
+	})
+	if !ok {
+		t.Fatal("NewAdapter() does not expose SyscallConn")
+	}
+	rawConn, err := sysConn.SyscallConn()
+	if err != nil {
+		t.Fatalf("SyscallConn() error = %v", err)
+	}
+	if rawConn == nil {
+		t.Fatal("SyscallConn() = nil, want non-nil")
 	}
 }

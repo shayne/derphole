@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -70,6 +71,16 @@ func (a *Adapter) Close() error {
 }
 
 func (a *Adapter) LocalAddr() net.Addr { return a.peer.LocalAddr() }
+
+func (a *Adapter) SyscallConn() (syscall.RawConn, error) {
+	type syscallConn interface {
+		SyscallConn() (syscall.RawConn, error)
+	}
+	if conn, ok := a.peer.(syscallConn); ok {
+		return conn.SyscallConn()
+	}
+	return nil, syscall.EOPNOTSUPP
+}
 
 func (a *Adapter) SetReadBuffer(bytes int) error {
 	type readBufferConn interface {

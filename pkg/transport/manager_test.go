@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -306,6 +307,52 @@ func TestManagerFallsBackToRelayAndRetriesDiscovery(t *testing.T) {
 	}
 	if !waitForPath(t, mgr, PathDirect, 200*time.Millisecond) {
 		t.Fatalf("PathState() after fallback recovery = %v, want %v", mgr.PathState(), PathDirect)
+	}
+}
+
+func TestManagerKeepsDirectPathAfterEMSGSIZEWriteFallback(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000025, 0))
+	relay := newFakeRelayDataPipe()
+	direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	direct.useClock(clock)
+
+	peerCandidate := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 77), Port: 34567}
+	controls := newFakeControlPipe()
+	controls.enablePeerCandidate(peerCandidate)
+	direct.enableResponder(peerCandidate)
+	baseTimers := clock.timerCount()
+
+	mgr := NewManager(ManagerConfig{
+		RelaySend:               relay.send,
+		ReceiveRelay:            relay.receive,
+		RelayAddr:               relay.remote,
+		DirectConn:              direct,
+		SendControl:             controls.send,
+		ReceiveControl:          controls.receive,
+		Clock:                   clock,
+		DiscoveryInterval:       1 * time.Second,
+		EndpointRefreshInterval: 2 * time.Second,
+		DirectStaleTimeout:      4 * time.Second,
+	})
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+
+	clock.Advance(1 * time.Second)
+	if !waitForPath(t, mgr, PathDirect, 200*time.Millisecond) {
+		t.Fatalf("PathState() = %v, want %v before EMSGSIZE fallback", mgr.PathState(), PathDirect)
+	}
+
+	direct.failNextWriteTo(peerCandidate, syscall.EMSGSIZE)
+	if err := mgr.sendPeerDatagram(ctx, []byte("payload")); err != nil {
+		t.Fatalf("sendPeerDatagram() error = %v", err)
+	}
+	if got := mgr.PathState(); got != PathDirect {
+		t.Fatalf("PathState() after EMSGSIZE fallback = %v, want %v", got, PathDirect)
 	}
 }
 
@@ -834,7 +881,7 @@ func TestManagerIgnoresAckWithoutOutstandingProbe(t *testing.T) {
 	direct.useClock(clock)
 	controls := newFakeControlPipe()
 	peerCandidate := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 6), Port: 56789}
-	direct.failNextWriteTo(peerCandidate)
+	direct.failNextWriteTo(peerCandidate, net.ErrClosed)
 	baseTimers := clock.timerCount()
 
 	mgr := NewManager(ManagerConfig{

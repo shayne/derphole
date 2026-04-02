@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"syscall"
 )
 
 type PeerDatagramConn interface {
@@ -64,6 +65,23 @@ func (c *peerDatagramConn) Close() error {
 	return nil
 }
 
+func (c *peerDatagramConn) SyscallConn() (syscall.RawConn, error) {
+	type syscallConn interface {
+		SyscallConn() (syscall.RawConn, error)
+	}
+	if c.manager.cfg.DirectConn != nil {
+		if conn, ok := c.manager.cfg.DirectConn.(syscallConn); ok {
+			return conn.SyscallConn()
+		}
+	}
+	if c.manager.cfg.RelayConn != nil {
+		if conn, ok := c.manager.cfg.RelayConn.(syscallConn); ok {
+			return conn.SyscallConn()
+		}
+	}
+	return nil, syscall.EOPNOTSUPP
+}
+
 func (c *peerDatagramConn) SetReadBuffer(bytes int) error {
 	type readBufferConn interface {
 		SetReadBuffer(int) error
@@ -91,13 +109,14 @@ func (m *Manager) sendPeerDatagram(ctx context.Context, payload []byte) error {
 
 	if endpoint, active := m.DirectPath(); active && m.cfg.DirectConn != nil {
 		if addr, err := net.ResolveUDPAddr("udp", endpoint); err == nil {
-			if _, err := m.cfg.DirectConn.WriteTo(payload, addr); err == nil {
+			if _, writeErr := m.cfg.DirectConn.WriteTo(payload, addr); writeErr == nil {
 				m.NoteDirectActivity(addr)
 				return nil
 			} else if m.cfg.RelaySend == nil {
-				return err
+				return writeErr
+			} else if !errors.Is(writeErr, syscall.EMSGSIZE) {
+				_ = m.MarkDirectBroken()
 			}
-			_ = m.MarkDirectBroken()
 		}
 	}
 

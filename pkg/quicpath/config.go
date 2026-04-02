@@ -30,6 +30,7 @@ func DefaultQUICConfig() *quic.Config {
 		KeepAlivePeriod:       5 * time.Second,
 		MaxIdleTimeout:        30 * time.Second,
 		HandshakeIdleTimeout:  10 * time.Second,
+		InitialPacketSize:     1200,
 		MaxIncomingStreams:    MaxIncomingStreams,
 		MaxIncomingUniStreams: -1,
 		EnableDatagrams:       false,
