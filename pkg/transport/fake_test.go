@@ -560,6 +560,12 @@ func (p *fakeRelayDataPipe) send(_ context.Context, payload []byte) error {
 	return nil
 }
 
+func (p *fakeRelayDataPipe) sentCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.sent)
+}
+
 func (p *fakeRelayDataPipe) receive(ctx context.Context) ([]byte, error) {
 	select {
 	case payload, ok := <-p.inbound:

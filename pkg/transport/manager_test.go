@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -310,7 +311,7 @@ func TestManagerFallsBackToRelayAndRetriesDiscovery(t *testing.T) {
 	}
 }
 
-func TestManagerKeepsDirectPathAfterEMSGSIZEWriteFallback(t *testing.T) {
+func TestManagerReturnsEMSGSIZEAndKeepsDirectPathWithoutRelayFallback(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -348,11 +349,14 @@ func TestManagerKeepsDirectPathAfterEMSGSIZEWriteFallback(t *testing.T) {
 	}
 
 	direct.failNextWriteTo(peerCandidate, syscall.EMSGSIZE)
-	if err := mgr.sendPeerDatagram(ctx, []byte("payload")); err != nil {
-		t.Fatalf("sendPeerDatagram() error = %v", err)
+	if err := mgr.sendPeerDatagram(ctx, []byte("payload")); !errors.Is(err, syscall.EMSGSIZE) {
+		t.Fatalf("sendPeerDatagram() error = %v, want %v", err, syscall.EMSGSIZE)
 	}
 	if got := mgr.PathState(); got != PathDirect {
-		t.Fatalf("PathState() after EMSGSIZE fallback = %v, want %v", got, PathDirect)
+		t.Fatalf("PathState() after EMSGSIZE = %v, want %v", got, PathDirect)
+	}
+	if sent := relay.sentCount(); sent != 0 {
+		t.Fatalf("relay sent %d packets after EMSGSIZE direct write, want 0", sent)
 	}
 }
 

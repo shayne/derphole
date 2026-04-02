@@ -159,7 +159,7 @@ func (p *syscallPeerDatagramConn) SyscallConn() (syscall.RawConn, error) {
 	return p.conn.SyscallConn()
 }
 
-func TestAdapterExposesSyscallConnWhenPeerDoes(t *testing.T) {
+func TestAdapterDoesNotExposeSyscallConnEvenWhenPeerDoes(t *testing.T) {
 	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
 		t.Fatalf("ListenUDP() error = %v", err)
@@ -175,14 +175,8 @@ func TestAdapterExposesSyscallConnWhenPeerDoes(t *testing.T) {
 	sysConn, ok := any(conn).(interface {
 		SyscallConn() (syscall.RawConn, error)
 	})
-	if !ok {
-		t.Fatal("NewAdapter() does not expose SyscallConn")
-	}
-	rawConn, err := sysConn.SyscallConn()
-	if err != nil {
-		t.Fatalf("SyscallConn() error = %v", err)
-	}
-	if rawConn == nil {
-		t.Fatal("SyscallConn() = nil, want non-nil")
+	if ok {
+		rawConn, err := sysConn.SyscallConn()
+		t.Fatalf("NewAdapter() exposes SyscallConn = (%v, %v), want no SyscallConn", rawConn, err)
 	}
 }
