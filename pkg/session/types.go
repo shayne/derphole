@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync"
 
@@ -147,6 +148,15 @@ func (e *transportPathEmitter) Complete(manager *transport.Manager) {
 		return
 	}
 	if manager != nil {
+		if drops := manager.DroppedPeerDatagrams(); drops > 0 {
+			e.emitter.Debug(fmt.Sprintf("transport-dropped-datagrams=%d", drops))
+		}
+		if rejected := manager.RejectedDirectDatagrams(); rejected > 0 {
+			e.emitter.Debug(fmt.Sprintf("transport-rejected-direct-datagrams=%d", rejected))
+		}
+		if depth := manager.MaxPeerRecvQueueDepth(); depth > 0 {
+			e.emitter.Debug(fmt.Sprintf("transport-max-peer-recv-queue-depth=%d", depth))
+		}
 		path := manager.PathState()
 		if path != transport.PathUnknown && path != e.last {
 			e.last = path

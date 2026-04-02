@@ -4,14 +4,25 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"syscall"
 )
+
+const peerDatagramPayloadPoolSize = 2048
+
+var peerDatagramPayloadPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, peerDatagramPayloadPoolSize)
+		return &buf
+	},
+}
 
 type PeerDatagramConn interface {
 	SendDatagram([]byte) error
 	RecvDatagram(context.Context) ([]byte, net.Addr, error)
 	LocalAddr() net.Addr
 	RemoteAddr() net.Addr
+	ReleaseDatagram([]byte)
 	Close() error
 }
 
@@ -42,7 +53,7 @@ func (c *peerDatagramConn) SendDatagram(payload []byte) error {
 func (c *peerDatagramConn) RecvDatagram(ctx context.Context) ([]byte, net.Addr, error) {
 	select {
 	case pkt := <-c.manager.peerRecvCh:
-		return append([]byte(nil), pkt.payload...), pkt.addr, nil
+		return pkt.payload, pkt.addr, nil
 	case err := <-c.manager.peerRecvErrCh:
 		return nil, nil, err
 	case <-ctx.Done():
@@ -58,6 +69,10 @@ func (c *peerDatagramConn) LocalAddr() net.Addr {
 
 func (c *peerDatagramConn) RemoteAddr() net.Addr {
 	return c.manager.remotePeerAddr()
+}
+
+func (c *peerDatagramConn) ReleaseDatagram(payload []byte) {
+	releasePeerDatagramPayload(payload)
 }
 
 func (c *peerDatagramConn) Close() error {
@@ -90,18 +105,16 @@ func (m *Manager) sendPeerDatagram(ctx context.Context, payload []byte) error {
 		return nil
 	}
 
-	if endpoint, active := m.DirectPath(); active && m.cfg.DirectConn != nil {
-		if addr, err := net.ResolveUDPAddr("udp", endpoint); err == nil {
-			if _, writeErr := m.cfg.DirectConn.WriteTo(payload, addr); writeErr == nil {
-				m.NoteDirectActivity(addr)
-				return nil
-			} else if errors.Is(writeErr, syscall.EMSGSIZE) {
-				return writeErr
-			} else if m.cfg.RelaySend == nil {
-				return writeErr
-			} else {
-				_ = m.MarkDirectBroken()
-			}
+	if addr, active := m.DirectAddr(); active && m.cfg.DirectConn != nil {
+		if _, writeErr := m.cfg.DirectConn.WriteTo(payload, addr); writeErr == nil {
+			m.NoteDirectActivity(addr)
+			return nil
+		} else if errors.Is(writeErr, syscall.EMSGSIZE) {
+			return writeErr
+		} else if m.cfg.RelaySend == nil {
+			return writeErr
+		} else {
+			_ = m.MarkDirectBroken()
 		}
 	}
 
@@ -135,15 +148,19 @@ func (m *Manager) relayReadLoop(ctx context.Context) {
 }
 
 func (m *Manager) enqueuePeerDatagram(addr net.Addr, payload []byte) {
-	pkt := peerPacket{payload: append([]byte(nil), payload...), addr: cloneAddr(addr)}
+	pkt := peerPacket{payload: clonePeerDatagramPayload(payload), addr: addr}
 	select {
 	case m.peerRecvCh <- pkt:
+		m.notePeerRecvDepth(len(m.peerRecvCh))
 	default:
+		m.peerRecvDrops.Add(1)
 		select {
-		case <-m.peerRecvCh:
+		case dropped := <-m.peerRecvCh:
+			releasePeerDatagramPayload(dropped.payload)
 		default:
 		}
 		m.peerRecvCh <- pkt
+		m.notePeerRecvDepth(len(m.peerRecvCh))
 	}
 }
 
@@ -161,10 +178,27 @@ func (m *Manager) remotePeerAddr() net.Addr {
 	if m.cfg.RelayAddr != nil {
 		return m.cfg.RelayAddr
 	}
-	if endpoint, active := m.DirectPath(); active {
-		if addr, err := net.ResolveUDPAddr("udp", endpoint); err == nil {
-			return addr
-		}
+	if addr, active := m.DirectAddr(); active {
+		return addr
 	}
 	return nil
+}
+
+func clonePeerDatagramPayload(payload []byte) []byte {
+	if len(payload) > peerDatagramPayloadPoolSize {
+		return append([]byte(nil), payload...)
+	}
+	bufPtr := peerDatagramPayloadPool.Get().(*[]byte)
+	buf := (*bufPtr)[:len(payload)]
+	copy(buf, payload)
+	return buf
+}
+
+func releasePeerDatagramPayload(payload []byte) {
+	if cap(payload) != peerDatagramPayloadPoolSize {
+		return
+	}
+	clear(payload)
+	buf := payload[:peerDatagramPayloadPoolSize]
+	peerDatagramPayloadPool.Put(&buf)
 }

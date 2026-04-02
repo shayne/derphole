@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -56,6 +57,9 @@ type Manager struct {
 	started               bool
 	peerRecvCh            chan peerPacket
 	peerRecvErrCh         chan error
+	peerRecvDrops         atomic.Uint64
+	peerRecvMaxDepth      atomic.Uint64
+	directRecvRejects     atomic.Uint64
 }
 
 type Update struct {
@@ -116,15 +120,30 @@ func (m *Manager) PathState() Path {
 func (m *Manager) DirectPath() (string, bool) {
 	now := m.now()
 	m.mu.Lock()
-	if m.state.current == PathDirect && m.state.directIsStale(now, m.directStaleTimeout()) {
-		m.discoveryGen++
-		if m.state.noteRelay(now) {
-			m.signalStateChangeLocked()
-		}
-	}
+	m.demoteStaleDirectLocked(now)
 	endpoint, active := m.state.directPath()
 	m.mu.Unlock()
 	return endpoint, active
+}
+
+func (m *Manager) DirectAddr() (net.Addr, bool) {
+	now := m.now()
+	m.mu.Lock()
+	m.demoteStaleDirectLocked(now)
+	endpoint, active := m.state.directPath()
+	addr := m.state.endpoints[endpoint]
+	m.mu.Unlock()
+	return addr, active && addr != nil
+}
+
+func (m *Manager) demoteStaleDirectLocked(now time.Time) {
+	if m.state.current != PathDirect || !m.state.directIsStale(now, m.directStaleTimeout()) {
+		return
+	}
+	m.discoveryGen++
+	if m.state.noteRelay(now) {
+		m.signalStateChangeLocked()
+	}
 }
 
 func (m *Manager) now() time.Time {
@@ -258,6 +277,30 @@ func (m *Manager) Updates(ctx context.Context) <-chan Update {
 		}
 	}()
 	return updates
+}
+
+func (m *Manager) DroppedPeerDatagrams() uint64 {
+	return m.peerRecvDrops.Load()
+}
+
+func (m *Manager) MaxPeerRecvQueueDepth() int {
+	return int(m.peerRecvMaxDepth.Load())
+}
+
+func (m *Manager) RejectedDirectDatagrams() uint64 {
+	return m.directRecvRejects.Load()
+}
+
+func (m *Manager) notePeerRecvDepth(depth int) {
+	for {
+		prev := m.peerRecvMaxDepth.Load()
+		if uint64(depth) <= prev {
+			return
+		}
+		if m.peerRecvMaxDepth.CompareAndSwap(prev, uint64(depth)) {
+			return
+		}
+	}
 }
 
 func (m *Manager) signalStateChangeLocked() {

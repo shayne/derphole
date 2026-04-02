@@ -14,6 +14,7 @@ type PeerDatagramConn interface {
 	RecvDatagram(context.Context) ([]byte, net.Addr, error)
 	LocalAddr() net.Addr
 	RemoteAddr() net.Addr
+	ReleaseDatagram([]byte)
 	Close() error
 }
 
@@ -47,6 +48,7 @@ func (a *Adapter) ReadFrom(p []byte) (int, net.Addr, error) {
 		addr = remote
 	}
 	n := copy(p, payload)
+	a.peer.ReleaseDatagram(payload)
 	return n, addr, nil
 }
 

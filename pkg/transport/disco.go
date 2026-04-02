@@ -153,6 +153,7 @@ func (m *Manager) directReadLoop(ctx context.Context) {
 			continue
 		}
 		if !m.shouldAcceptDirectPayload(addr) {
+			m.directRecvRejects.Add(1)
 			continue
 		}
 		m.NoteDirectActivity(addr)
@@ -186,7 +187,7 @@ func (m *Manager) shouldAcceptDirectPayload(addr net.Addr) bool {
 	if m.state.current != PathDirect {
 		return true
 	}
-	if m.state.current == PathDirect && m.state.bestEndpoint == addr.String() {
+	if m.state.current == PathDirect && sameAddr(addr, m.state.endpoints[m.state.bestEndpoint]) {
 		return true
 	}
 	return m.state.hasCandidate(addr)

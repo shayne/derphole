@@ -360,6 +360,59 @@ func TestManagerReturnsEMSGSIZEAndKeepsDirectPathWithoutRelayFallback(t *testing
 	}
 }
 
+func TestManagerCountsDroppedPeerDatagrams(t *testing.T) {
+	mgr := NewManager(ManagerConfig{})
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443}
+
+	for i := 0; i < cap(mgr.peerRecvCh)+3; i++ {
+		mgr.enqueuePeerDatagram(addr, []byte("payload"))
+	}
+
+	if got := mgr.DroppedPeerDatagrams(); got != 3 {
+		t.Fatalf("DroppedPeerDatagrams() = %d, want 3", got)
+	}
+	if got := mgr.MaxPeerRecvQueueDepth(); got != cap(mgr.peerRecvCh) {
+		t.Fatalf("MaxPeerRecvQueueDepth() = %d, want %d", got, cap(mgr.peerRecvCh))
+	}
+}
+
+func TestManagerCountsRejectedDirectDatagrams(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	direct := newFakePacketConn(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234})
+	allowed := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 1), Port: 4444}
+	rejected := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 2), Port: 5555}
+
+	mgr := NewManager(ManagerConfig{
+		DirectConn:         direct,
+		DisableDirectReads: false,
+		DirectStaleTimeout: time.Minute,
+	})
+	mgr.mu.Lock()
+	mgr.state.endpoints[allowed.String()] = cloneAddr(allowed)
+	mgr.state.current = PathDirect
+	mgr.state.bestEndpoint = allowed.String()
+	mgr.state.lastDirectAt = mgr.now()
+	mgr.mu.Unlock()
+
+	direct.enqueueRead([]byte("payload"), rejected)
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	if !direct.waitForReadAttempts(1, time.Second) {
+		t.Fatal("manager did not read the rejected datagram")
+	}
+	deadline := time.Now().Add(time.Second)
+	for mgr.RejectedDirectDatagrams() != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := mgr.RejectedDirectDatagrams(); got != 1 {
+		t.Fatalf("RejectedDirectDatagrams() = %d, want 1", got)
+	}
+}
+
 func TestManagerDemotesStaleDirectPathWhenReadForSend(t *testing.T) {
 	t.Helper()
 
@@ -1365,6 +1418,140 @@ func TestManagerExposesDirectPathSnapshot(t *testing.T) {
 	}
 	if endpoint, active := mgr.DirectPath(); endpoint != "" || active {
 		t.Fatalf("DirectPath() after fallback = (%q, %t), want (\"\", false)", endpoint, active)
+	}
+}
+
+func TestManagerExposesDirectAddrSnapshot(t *testing.T) {
+	mgr := NewManager(ManagerConfig{
+		DirectConn: newFakePacketConn(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234}),
+	})
+	peerCandidate := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 77), Port: 45678}
+
+	mgr.mu.Lock()
+	mgr.state.noteCandidates(mgr.now(), []net.Addr{peerCandidate})
+	mgr.state.current = PathDirect
+	mgr.state.bestEndpoint = peerCandidate.String()
+	mgr.state.lastDirectAt = mgr.now()
+	mgr.mu.Unlock()
+
+	addr, active := mgr.DirectAddr()
+	if !active {
+		t.Fatal("DirectAddr() active = false, want true")
+	}
+	got, ok := addr.(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("DirectAddr() type = %T, want *net.UDPAddr", addr)
+	}
+	if got.String() != peerCandidate.String() {
+		t.Fatalf("DirectAddr() = %v, want %v", got, peerCandidate)
+	}
+}
+
+func TestPeerDatagramConnRecvDatagramDoesNotCopyPayload(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := NewManager(ManagerConfig{})
+	conn := mgr.PeerDatagramConn(ctx)
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443}
+	payload := []byte("payload")
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		mgr.peerRecvCh <- peerPacket{payload: payload, addr: addr}
+		got, _, err := conn.RecvDatagram(ctx)
+		if err != nil {
+			t.Fatalf("RecvDatagram() error = %v", err)
+		}
+		if len(got) != len(payload) {
+			t.Fatalf("RecvDatagram() len = %d, want %d", len(got), len(payload))
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("RecvDatagram() allocs/run = %v, want 0", allocs)
+	}
+}
+
+func TestManagerDirectAddrDoesNotAllocate(t *testing.T) {
+	clock := newFakeClock(time.Unix(1700001100, 0))
+	mgr := NewManager(ManagerConfig{
+		DirectConn:         benchmarkPacketConn{local: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}},
+		Clock:              clock,
+		DirectStaleTimeout: time.Minute,
+	})
+	peerCandidate := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 88), Port: 48888}
+
+	mgr.mu.Lock()
+	mgr.state.noteCandidates(clock.Now(), []net.Addr{peerCandidate})
+	mgr.state.current = PathDirect
+	mgr.state.bestEndpoint = peerCandidate.String()
+	mgr.state.lastDirectAt = clock.Now()
+	mgr.mu.Unlock()
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		addr, active := mgr.DirectAddr()
+		if !active {
+			t.Fatal("DirectAddr() active = false, want true")
+		}
+		got, ok := addr.(*net.UDPAddr)
+		if !ok {
+			t.Fatalf("DirectAddr() type = %T, want *net.UDPAddr", addr)
+		}
+		if got.Port != peerCandidate.Port || !got.IP.Equal(peerCandidate.IP) {
+			t.Fatalf("DirectAddr() = %v, want %v", got, peerCandidate)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("DirectAddr() allocs/run = %v, want 0", allocs)
+	}
+}
+
+func TestManagerNoteDirectActivityDoesNotAllocate(t *testing.T) {
+	clock := newFakeClock(time.Unix(1700001110, 0))
+	mgr := NewManager(ManagerConfig{
+		DirectConn:         benchmarkPacketConn{local: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}},
+		Clock:              clock,
+		DirectStaleTimeout: time.Minute,
+	})
+	peerCandidate := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 89), Port: 48889}
+
+	mgr.mu.Lock()
+	mgr.state.noteCandidates(clock.Now(), []net.Addr{peerCandidate})
+	mgr.state.current = PathDirect
+	mgr.state.bestEndpoint = peerCandidate.String()
+	mgr.state.lastDirectAt = clock.Now()
+	mgr.mu.Unlock()
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		mgr.NoteDirectActivity(peerCandidate)
+	})
+	if allocs != 0 {
+		t.Fatalf("NoteDirectActivity() allocs/run = %v, want 0", allocs)
+	}
+}
+
+func TestManagerShouldAcceptDirectPayloadDoesNotAllocate(t *testing.T) {
+	clock := newFakeClock(time.Unix(1700001120, 0))
+	mgr := NewManager(ManagerConfig{
+		DirectConn:         benchmarkPacketConn{local: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}},
+		Clock:              clock,
+		DirectStaleTimeout: time.Minute,
+	})
+	peerCandidate := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 90), Port: 48890}
+
+	mgr.mu.Lock()
+	mgr.state.noteCandidates(clock.Now(), []net.Addr{peerCandidate})
+	mgr.state.current = PathDirect
+	mgr.state.bestEndpoint = peerCandidate.String()
+	mgr.state.lastDirectAt = clock.Now()
+	mgr.mu.Unlock()
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		if !mgr.shouldAcceptDirectPayload(peerCandidate) {
+			t.Fatal("shouldAcceptDirectPayload() = false, want true")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("shouldAcceptDirectPayload() allocs/run = %v, want 0", allocs)
 	}
 }
 

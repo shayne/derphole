@@ -9,21 +9,23 @@ import (
 )
 
 type fakePeerDatagramConn struct {
-	sendCh   chan []byte
-	recvCh   chan []byte
-	doneCh   chan struct{}
-	local    net.Addr
-	remote   net.Addr
-	recvAddr net.Addr
+	sendCh     chan []byte
+	recvCh     chan []byte
+	doneCh     chan struct{}
+	local      net.Addr
+	remote     net.Addr
+	recvAddr   net.Addr
+	releasedCh chan []byte
 }
 
 func newFakePeerDatagramConn() *fakePeerDatagramConn {
 	return &fakePeerDatagramConn{
-		sendCh: make(chan []byte, 1),
-		recvCh: make(chan []byte, 1),
-		doneCh: make(chan struct{}),
-		local:  &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1111},
-		remote: &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 2222},
+		sendCh:     make(chan []byte, 1),
+		recvCh:     make(chan []byte, 1),
+		doneCh:     make(chan struct{}),
+		local:      &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1111},
+		remote:     &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 2222},
+		releasedCh: make(chan []byte, 1),
 	}
 }
 
@@ -48,6 +50,9 @@ func (f *fakePeerDatagramConn) RecvDatagram(ctx context.Context) ([]byte, net.Ad
 
 func (f *fakePeerDatagramConn) LocalAddr() net.Addr  { return f.local }
 func (f *fakePeerDatagramConn) RemoteAddr() net.Addr { return f.remote }
+func (f *fakePeerDatagramConn) ReleaseDatagram(p []byte) {
+	f.releasedCh <- p
+}
 func (f *fakePeerDatagramConn) Close() error {
 	select {
 	case <-f.doneCh:
@@ -95,6 +100,29 @@ func TestAdapterReadFromUsesStableRemoteAddr(t *testing.T) {
 	}
 	if got := addr.String(); got != peer.remote.String() {
 		t.Fatalf("ReadFrom() addr = %q, want stable peer addr %q", got, peer.remote.String())
+	}
+}
+
+func TestAdapterReadFromReleasesTransportDatagram(t *testing.T) {
+	peer := newFakePeerDatagramConn()
+	conn := NewAdapter(peer)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	payload := []byte("payload")
+	peer.recvCh <- payload
+
+	buf := make([]byte, 32)
+	if _, _, err := conn.ReadFrom(buf); err != nil {
+		t.Fatalf("ReadFrom() error = %v", err)
+	}
+
+	select {
+	case released := <-peer.releasedCh:
+		if string(released) != string(payload) {
+			t.Fatalf("released payload = %q, want %q", string(released), string(payload))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReadFrom() did not release the transport datagram")
 	}
 }
 
