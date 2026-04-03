@@ -1079,7 +1079,6 @@ func newBoundPublicPortmap(conn net.PacketConn, emitter *telemetry.Emitter) publ
 	}
 	if udpAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
 		pm.SetLocalPort(uint16(udpAddr.Port))
-		_ = pm.Refresh(time.Now())
 	}
 	return pm
 }

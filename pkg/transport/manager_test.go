@@ -188,6 +188,47 @@ func TestManagerSeedsRemoteCandidatesWithoutWaitingForDiscoveryTick(t *testing.T
 	}
 }
 
+func TestManagerStartsDiscoveryWithoutWaitingForFirstTick(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000014, 0))
+	relay := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	relay.useClock(clock)
+	direct.useClock(clock)
+
+	localCandidate := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 9), Port: 54321}
+	controls := newFakeControlPipe()
+	baseTimers := clock.timerCount()
+
+	mgr := NewManager(ManagerConfig{
+		RelayConn:               relay,
+		DirectConn:              direct,
+		CandidateSource:         func(context.Context) []net.Addr { return []net.Addr{localCandidate} },
+		SendControl:             controls.send,
+		ReceiveControl:          controls.receive,
+		Clock:                   clock,
+		DiscoveryInterval:       1 * time.Second,
+		EndpointRefreshInterval: 2 * time.Second,
+		DirectStaleTimeout:      4 * time.Second,
+	})
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+
+	if !controls.waitForSentCount(ControlCandidates, 1, 200*time.Millisecond) {
+		t.Fatal("manager did not send startup candidates before the first scheduled tick")
+	}
+	if !controls.waitForSentCount(ControlCallMeMaybe, 1, 200*time.Millisecond) {
+		t.Fatal("manager did not send startup call-me-maybe before the first scheduled tick")
+	}
+}
+
 func TestManagerReadsBatchedDirectPayloadsFromBatchConn(t *testing.T) {
 	t.Helper()
 

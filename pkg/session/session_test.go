@@ -719,6 +719,27 @@ func TestIssuePublicSessionAttachesAndClosesPortmap(t *testing.T) {
 	}
 }
 
+func TestNewBoundPublicPortmapDoesNotSynchronouslyRefresh(t *testing.T) {
+	prevCtor := newPublicPortmap
+	fake := &sessionLifecyclePortmap{refreshDelay: 250 * time.Millisecond}
+	newPublicPortmap = func(*telemetry.Emitter) publicPortmap { return fake }
+	t.Cleanup(func() { newPublicPortmap = prevCtor })
+
+	conn := &stubPacketConn{localAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242}}
+	started := time.Now()
+	pm := newBoundPublicPortmap(conn, telemetry.New(io.Discard, telemetry.LevelVerbose))
+	if pm == nil {
+		t.Fatal("newBoundPublicPortmap() = nil, want portmap")
+	}
+
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("newBoundPublicPortmap() took %s, want non-blocking startup", elapsed)
+	}
+	if got := fake.localPort; got != 4242 {
+		t.Fatalf("SetLocalPort() = %d, want 4242", got)
+	}
+}
+
 func TestExternalRoundTripUsesSessionPortmapLifecycle(t *testing.T) {
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
 
@@ -862,6 +883,7 @@ type sessionLifecyclePortmap struct {
 	localPort          uint16
 	snapshot           netip.AddrPort
 	have               bool
+	refreshDelay       time.Duration
 	refreshCalls       int
 	snapshotAddrsCalls int
 	closeCalls         int
@@ -918,6 +940,9 @@ func (m *sessionLifecyclePortmap) SnapshotAddrs() []net.Addr {
 }
 
 func (m *sessionLifecyclePortmap) Refresh(time.Time) bool {
+	if m.refreshDelay > 0 {
+		time.Sleep(m.refreshDelay)
+	}
 	m.mu.Lock()
 	m.refreshCalls++
 	m.mu.Unlock()

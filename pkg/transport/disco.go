@@ -26,6 +26,7 @@ var (
 )
 
 func (m *Manager) discoveryLoop(ctx context.Context) {
+	m.requestDiscovery(ctx, false)
 	for {
 		select {
 		case <-ctx.Done():
