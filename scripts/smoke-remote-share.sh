@@ -8,9 +8,14 @@ remote_upload="/tmp/derpcat-share-bin-$$"
 local_share_pid=""
 local_http_pid=""
 remote_user="${DERPCAT_REMOTE_USER:-root}"
+remote_env=()
+
+if [[ "${DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES:-}" == "1" ]]; then
+  remote_env+=(DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1)
+fi
 
 remote() {
-  ssh "${remote_user}@${target}" 'bash -se' <<<"$1"
+  ssh "${remote_user}@${target}" "${remote_env[@]}" 'bash -se' <<<"$1"
 }
 
 cleanup() {
