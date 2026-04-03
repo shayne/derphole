@@ -212,7 +212,7 @@ func TestExternalNativeQUICStripedTransferUsesMultipleConnections(t *testing.T) 
 	}
 }
 
-func TestExternalNativeQUICStripedTransferUsesMultiplePacketConns(t *testing.T) {
+func TestExternalNativeQUICStripedTransferReusesPrimaryPacketConn(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -308,12 +308,11 @@ func TestExternalNativeQUICStripedTransferUsesMultiplePacketConns(t *testing.T) 
 		t.Fatalf("striped payload mismatch: got %d bytes, want %d", got.Len(), len(payload))
 	}
 
-	senderLocalPorts := map[string]struct{}{}
-	for _, packetConn := range session.packetConns {
-		senderLocalPorts[packetConn.LocalAddr().String()] = struct{}{}
+	if len(session.packetConns) != 1 {
+		t.Fatalf("striped session packet conns = %d, want 1", len(session.packetConns))
 	}
-	if len(senderLocalPorts) < 2 {
-		t.Fatalf("striped session used %d local packet conns, want at least 2", len(senderLocalPorts))
+	if len(session.conns) != 4 {
+		t.Fatalf("striped session QUIC conns = %d, want 4", len(session.conns))
 	}
 }
 
@@ -327,6 +326,13 @@ func TestExternalNativeQUICStripedTransferFallsBackToPrimaryWhenExtraStripeCandi
 	}()
 	externalNativeQUICStripeProbeCandidates = func(context.Context, net.PacketConn, *tailcfg.DERPMap, publicPortmap) []string {
 		return []string{"203.0.113.1:54321"}
+	}
+	prevLocalAddrCandidate := externalNativeQUICStripeCanUseLocalAddrCandidate
+	defer func() {
+		externalNativeQUICStripeCanUseLocalAddrCandidate = prevLocalAddrCandidate
+	}()
+	externalNativeQUICStripeCanUseLocalAddrCandidate = func(net.Addr, net.Addr) bool {
+		return false
 	}
 
 	senderPacketConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
@@ -436,6 +442,14 @@ func TestDialExternalNativeQUICStripedConnsFallsBackToControlStreamWhenPeerSetup
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	prevLocalAddrCandidate := externalNativeQUICStripeCanUseLocalAddrCandidate
+	defer func() {
+		externalNativeQUICStripeCanUseLocalAddrCandidate = prevLocalAddrCandidate
+	}()
+	externalNativeQUICStripeCanUseLocalAddrCandidate = func(net.Addr, net.Addr) bool {
+		return false
+	}
+
 	senderPacketConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -528,5 +542,249 @@ func TestDialExternalNativeQUICStripedConnsFallsBackToControlStreamWhenPeerSetup
 	close(releaseListenerConn)
 	if err := <-listenerDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOpenExternalNativeQUICStripePacketConnsGathersCandidatesConcurrently(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	prevStripeCandidates := externalNativeQUICStripeProbeCandidates
+	defer func() {
+		externalNativeQUICStripeProbeCandidates = prevStripeCandidates
+	}()
+	externalNativeQUICStripeProbeCandidates = func(_ context.Context, packetConn net.PacketConn, _ *tailcfg.DERPMap, _ publicPortmap) []string {
+		time.Sleep(200 * time.Millisecond)
+		return []string{packetConn.LocalAddr().String()}
+	}
+
+	start := time.Now()
+	packetConns, portmaps, candidateSets, err := openExternalNativeQUICStripePacketConns(
+		ctx,
+		&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1},
+		nil,
+		nil,
+		3,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeExternalNativeQUICStripePacketConns(packetConns, portmaps)
+
+	if elapsed := time.Since(start); elapsed > 350*time.Millisecond {
+		t.Fatalf("openExternalNativeQUICStripePacketConns() took %v, want concurrent candidate gathering", elapsed)
+	}
+	if len(candidateSets) != 3 {
+		t.Fatalf("candidate set count = %d, want 3", len(candidateSets))
+	}
+	for i, candidateSet := range candidateSets {
+		if len(candidateSet) != 1 || candidateSet[0] != packetConns[i].LocalAddr().String() {
+			t.Fatalf("candidateSet[%d] = %v, want [%q]", i, candidateSet, packetConns[i].LocalAddr().String())
+		}
+	}
+}
+
+func TestExternalNativeQUICStripedTransferAllowsSlowCandidateGatheringOnBothSides(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	prevStripeCandidates := externalNativeQUICStripeProbeCandidates
+	defer func() {
+		externalNativeQUICStripeProbeCandidates = prevStripeCandidates
+	}()
+	externalNativeQUICStripeProbeCandidates = func(_ context.Context, packetConn net.PacketConn, _ *tailcfg.DERPMap, _ publicPortmap) []string {
+		time.Sleep(1200 * time.Millisecond)
+		udpAddr := packetConn.LocalAddr().(*net.UDPAddr)
+		return []string{net.JoinHostPort("127.0.0.1", fmt.Sprint(udpAddr.Port))}
+	}
+
+	senderPacketConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer senderPacketConn.Close()
+
+	listenerPacketConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listenerPacketConn.Close()
+
+	senderIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listenerIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload := bytes.Repeat([]byte("slow-stripe-setup"), 4096)
+	listenerDone := make(chan struct{})
+	senderErr := make(chan error, 1)
+	go func() {
+		session, err := dialExternalNativeQUICStripedConns(
+			ctx,
+			senderPacketConn,
+			cloneSessionAddr(listenerPacketConn.LocalAddr()),
+			nil,
+			nil,
+			quicpath.ClientTLSConfig(senderIdentity, listenerIdentity.Public),
+			quicpath.ServerTLSConfig(senderIdentity, listenerIdentity.Public),
+			2,
+		)
+		if err != nil {
+			senderErr <- err
+			return
+		}
+		defer session.Close()
+		if len(session.conns) != 2 {
+			senderErr <- fmt.Errorf("sender conn count = %d, want 2", len(session.conns))
+			return
+		}
+
+		writers, err := session.OpenStreams(ctx)
+		if err != nil {
+			senderErr <- err
+			return
+		}
+		if err := sendExternalStripedCopy(ctx, bytes.NewReader(payload), writers, 32<<10); err != nil {
+			senderErr <- err
+			return
+		}
+		<-listenerDone
+		senderErr <- nil
+	}()
+
+	session, streams, err := acceptExternalNativeQUICStripedConns(
+		ctx,
+		listenerPacketConn,
+		cloneSessionAddr(senderPacketConn.LocalAddr()),
+		nil,
+		nil,
+		quicpath.ClientTLSConfig(listenerIdentity, senderIdentity.Public),
+		quicpath.ServerTLSConfig(listenerIdentity, senderIdentity.Public),
+		2,
+	)
+	if err != nil {
+		select {
+		case senderSideErr := <-senderErr:
+			t.Fatalf("acceptExternalNativeQUICStripedConns() error = %v; sender error = %v", err, senderSideErr)
+		default:
+		}
+		t.Fatal(err)
+	}
+	defer session.Close()
+	defer closeExternalNativeQUICStreams(streams)
+	if len(session.conns) != 2 {
+		t.Fatalf("listener conn count = %d, want 2", len(session.conns))
+	}
+	if len(streams) != 2 {
+		t.Fatalf("listener stream count = %d, want 2", len(streams))
+	}
+
+	readers := make([]io.ReadCloser, 0, len(streams))
+	for _, stream := range streams {
+		readers = append(readers, stream)
+	}
+
+	var got bytes.Buffer
+	if err := receiveExternalStripedCopy(ctx, &got, readers, 32<<10); err != nil {
+		t.Fatal(err)
+	}
+	close(listenerDone)
+	if err := <-senderErr; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Bytes(), payload) {
+		t.Fatalf("payload mismatch: got %d bytes, want %d", got.Len(), len(payload))
+	}
+}
+
+func TestOpenExternalNativeQUICStripePacketConnsClearsProbeReadDeadlines(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	prevStripeCandidates := externalNativeQUICStripeProbeCandidates
+	defer func() {
+		externalNativeQUICStripeProbeCandidates = prevStripeCandidates
+	}()
+	externalNativeQUICStripeProbeCandidates = func(_ context.Context, packetConn net.PacketConn, _ *tailcfg.DERPMap, _ publicPortmap) []string {
+		_ = packetConn.SetReadDeadline(time.Now().Add(time.Millisecond))
+		return []string{packetConn.LocalAddr().String()}
+	}
+
+	packetConns, portmaps, _, err := openExternalNativeQUICStripePacketConns(
+		ctx,
+		&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1},
+		nil,
+		nil,
+		1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeExternalNativeQUICStripePacketConns(packetConns, portmaps)
+
+	readErr := make(chan error, 1)
+	go func() {
+		_, _, err := packetConns[0].ReadFrom(make([]byte, 1))
+		readErr <- err
+	}()
+
+	select {
+	case err := <-readErr:
+		t.Fatalf("stripe packet conn deadline was not cleared: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	_ = packetConns[0].Close()
+	<-readErr
+}
+
+func TestOpenExternalNativeQUICStripePacketConnsSkipsProbeForRouteLocalPeer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	prevStripeCandidates := externalNativeQUICStripeProbeCandidates
+	defer func() {
+		externalNativeQUICStripeProbeCandidates = prevStripeCandidates
+	}()
+	externalNativeQUICStripeProbeCandidates = func(context.Context, net.PacketConn, *tailcfg.DERPMap, publicPortmap) []string {
+		t.Fatal("externalNativeQUICStripeProbeCandidates called for route-local peer")
+		return nil
+	}
+
+	packetConns, portmaps, candidateSets, err := openExternalNativeQUICStripePacketConns(
+		ctx,
+		&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345},
+		nil,
+		nil,
+		2,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeExternalNativeQUICStripePacketConns(packetConns, portmaps)
+
+	for i, packetConn := range packetConns {
+		want := packetConn.LocalAddr().String()
+		if len(candidateSets[i]) != 1 || candidateSets[i][0] != want {
+			t.Fatalf("candidateSets[%d] = %v, want [%q]", i, candidateSets[i], want)
+		}
+	}
+}
+
+func TestExternalNativeQUICStripeLocalBindAddrUsesPeerRouteIP(t *testing.T) {
+	addr := externalNativeQUICStripeLocalBindAddr(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345})
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("bind addr type = %T, want *net.UDPAddr", addr)
+	}
+	if got := udpAddr.IP.String(); got != "127.0.0.1" {
+		t.Fatalf("bind addr IP = %q, want %q", got, "127.0.0.1")
+	}
+	if got := udpAddr.Port; got != 0 {
+		t.Fatalf("bind addr port = %d, want 0", got)
 	}
 }

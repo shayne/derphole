@@ -37,10 +37,11 @@ const (
 	envelopeAck          = "ack"
 	envelopeQUICModeReq  = "quic_mode_request"
 	envelopeQUICModeResp = "quic_mode_response"
+	envelopeQUICModeAck  = "quic_mode_ack"
 	maxEnvelopeBytes     = 16 << 10
 )
 
-const externalNativeQUICWait = 2 * time.Second
+const externalNativeQUICWait = 5 * time.Second
 const externalCopyBufferSize = 256 << 10
 const defaultExternalNativeQUICConns = 4
 
@@ -70,6 +71,7 @@ type envelope struct {
 	Control      *transport.ControlMessage `json:"control,omitempty"`
 	QUICModeReq  *quicModeRequest          `json:"quic_mode_request,omitempty"`
 	QUICModeResp *quicModeResponse         `json:"quic_mode_response,omitempty"`
+	QUICModeAck  *quicModeAck              `json:"quic_mode_ack,omitempty"`
 }
 
 type quicModeRequest struct {
@@ -77,6 +79,11 @@ type quicModeRequest struct {
 }
 
 type quicModeResponse struct {
+	NativeDirect bool   `json:"native_direct"`
+	DirectAddr   string `json:"direct_addr,omitempty"`
+}
+
+type quicModeAck struct {
 	NativeDirect bool `json:"native_direct"`
 }
 
@@ -251,6 +258,7 @@ func sendExternal(ctx context.Context, cfg SendConfig) error {
 		return err
 	}
 	if nativeQUIC {
+		pathEmitter.Emit(StateDirect)
 		if cfg.Emitter != nil {
 			cfg.Emitter.Debug("sender-quic-direct")
 			cfg.Emitter.Debug("dialing-quic")
@@ -417,7 +425,7 @@ func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
 		if cfg.Emitter != nil {
 			cfg.Emitter.Debug("claim-accepted")
 		}
-		modeCh, unsubscribeMode := session.derp.Subscribe(func(pkt derpbind.Packet) bool {
+		modeCh, unsubscribeMode := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
 			return pkt.From == peerDERP && isQUICModeRequestPayload(pkt.Payload)
 		})
 		defer unsubscribeMode()
@@ -445,7 +453,7 @@ func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
 			cfg.Emitter.Debug("decision-sent")
 		}
 
-		nativeQUIC, err := acceptExternalQUICMode(ctx, session.derp, modeCh, peerDERP, transportManager, cfg.ForceRelay)
+		nativeQUIC, err := acceptExternalQUICMode(ctx, session.derp, modeCh, peerDERP, transportManager, localCandidates, cfg.ForceRelay)
 		if err != nil {
 			return tok, err
 		}
@@ -641,13 +649,8 @@ func requestExternalQUICMode(
 	if forceRelay || manager == nil {
 		return false, nil, nil
 	}
-	var addr net.Addr
-	_, ok := waitForExternalDirectAddr(ctx, manager, externalNativeQUICWait)
-	if !ok {
-		return false, nil, nil
-	}
 
-	modeCh, unsubscribe := client.Subscribe(func(pkt derpbind.Packet) bool {
+	modeCh, unsubscribe := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == peerDERP && isQUICModeResponsePayload(pkt.Payload)
 	})
 	defer unsubscribe()
@@ -666,7 +669,24 @@ func requestExternalQUICMode(
 		return false, nil, nil
 	}
 
-	addr, ok = manager.DirectAddr()
+	var addr net.Addr
+	ok := false
+	if parsed := parseCandidateStrings([]string{resp.DirectAddr}); len(parsed) == 1 {
+		addr = parsed[0]
+		ok = true
+	}
+	if !ok || addr == nil {
+		addr, ok = manager.DirectAddr()
+	}
+	if !ok || addr == nil {
+		addr, ok = waitForExternalDirectAddr(ctx, manager, externalNativeQUICWait)
+	}
+	if err := sendEnvelope(ctx, client, peerDERP, envelope{
+		Type:        envelopeQUICModeAck,
+		QUICModeAck: &quicModeAck{NativeDirect: ok && addr != nil},
+	}); err != nil {
+		return false, nil, err
+	}
 	if !ok || addr == nil {
 		return false, nil, nil
 	}
@@ -679,6 +699,7 @@ func acceptExternalQUICMode(
 	modeCh <-chan derpbind.Packet,
 	peerDERP key.NodePublic,
 	manager *transport.Manager,
+	localCandidates []net.Addr,
 	forceRelay bool,
 ) (bool, error) {
 	modeCtx, cancel := context.WithTimeout(ctx, externalNativeQUICWait)
@@ -696,16 +717,73 @@ func acceptExternalQUICMode(
 	}
 
 	nativeQUIC := false
+	var nativeQUICAddr net.Addr
 	if req.NativeDirect && !forceRelay {
-		_, nativeQUIC = waitForExternalDirectAddr(ctx, manager, externalNativeQUICWait)
+		peerDirectAddr, ok := waitForExternalDirectAddr(ctx, manager, externalNativeQUICWait)
+		if ok {
+			nativeQUIC = true
+			nativeQUICAddr = selectExternalQUICModeResponseAddr(peerDirectAddr, localCandidates)
+		}
 	}
+	ackCh, unsubscribeAck := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == peerDERP && isQUICModeAckPayload(pkt.Payload)
+	})
+	defer unsubscribeAck()
 	if err := sendEnvelope(ctx, client, peerDERP, envelope{
-		Type:         envelopeQUICModeResp,
-		QUICModeResp: &quicModeResponse{NativeDirect: nativeQUIC},
+		Type: envelopeQUICModeResp,
+		QUICModeResp: &quicModeResponse{
+			NativeDirect: nativeQUIC,
+			DirectAddr:   quicModeDirectAddrString(nativeQUICAddr),
+		},
 	}); err != nil {
 		return false, err
 	}
+	if !nativeQUIC {
+		return false, nil
+	}
+	ackCtx, ackCancel := context.WithTimeout(ctx, externalNativeQUICWait)
+	defer ackCancel()
+	ack, err := receiveQUICModeAck(ackCtx, ackCh)
+	if err != nil || !ack.NativeDirect {
+		return false, nil
+	}
 	return nativeQUIC, nil
+}
+
+func selectExternalQUICModeResponseAddr(peerAddr net.Addr, localCandidates []net.Addr) net.Addr {
+	for _, candidate := range localCandidates {
+		if externalNativeQUICStripeCanUseLocalAddrCandidate(candidate, peerAddr) {
+			return cloneSessionAddr(candidate)
+		}
+	}
+	for _, candidate := range localCandidates {
+		udpAddr, ok := candidate.(*net.UDPAddr)
+		if !ok || udpAddr == nil {
+			continue
+		}
+		ip, ok := netip.AddrFromSlice(udpAddr.IP)
+		if !ok {
+			continue
+		}
+		ip = ip.Unmap()
+		if ip.IsLoopback() || ip.IsPrivate() || publicProbeTailscaleCGNATPrefix.Contains(ip) || publicProbeTailscaleULAPrefix.Contains(ip) {
+			continue
+		}
+		if ip.IsGlobalUnicast() {
+			return cloneSessionAddr(candidate)
+		}
+	}
+	if len(localCandidates) > 0 {
+		return cloneSessionAddr(localCandidates[0])
+	}
+	return nil
+}
+
+func quicModeDirectAddrString(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	return addr.String()
 }
 
 func receiveQUICModeRequest(ctx context.Context, ch <-chan derpbind.Packet) (quicModeRequest, error) {
@@ -737,6 +815,22 @@ func receiveQUICModeResponse(ctx context.Context, ch <-chan derpbind.Packet) (qu
 		return *env.QUICModeResp, nil
 	case <-ctx.Done():
 		return quicModeResponse{}, ctx.Err()
+	}
+}
+
+func receiveQUICModeAck(ctx context.Context, ch <-chan derpbind.Packet) (quicModeAck, error) {
+	select {
+	case pkt, ok := <-ch:
+		if !ok {
+			return quicModeAck{}, net.ErrClosed
+		}
+		env, err := decodeEnvelope(pkt.Payload)
+		if err != nil || env.Type != envelopeQUICModeAck || env.QUICModeAck == nil {
+			return quicModeAck{}, errors.New("unexpected quic mode ack")
+		}
+		return *env.QUICModeAck, nil
+	case <-ctx.Done():
+		return quicModeAck{}, ctx.Err()
 	}
 }
 
@@ -1106,6 +1200,14 @@ func isQUICModeResponsePayload(payload []byte) bool {
 	return err == nil && env.Type == envelopeQUICModeResp && env.QUICModeResp != nil
 }
 
+func isQUICModeAckPayload(payload []byte) bool {
+	if len(payload) == 0 || payload[0] != '{' {
+		return false
+	}
+	env, err := decodeEnvelope(payload)
+	return err == nil && env.Type == envelopeQUICModeAck && env.QUICModeAck != nil
+}
+
 func isDecisionPayload(payload []byte) bool {
 	if len(payload) == 0 || payload[0] != '{' {
 		return false
@@ -1120,7 +1222,8 @@ func isTransportDataPayload(payload []byte) bool {
 		!isClaimPayload(payload) &&
 		!isDecisionPayload(payload) &&
 		!isQUICModeRequestPayload(payload) &&
-		!isQUICModeResponsePayload(payload)
+		!isQUICModeResponsePayload(payload) &&
+		!isQUICModeAckPayload(payload)
 }
 
 func relayTransportAddr() net.Addr {

@@ -539,6 +539,62 @@ func TestExternalListenSendUsesNativeDirectQUICWhenBothSidesAreDirectReady(t *te
 	}
 }
 
+func TestExternalListenSendUsesNativeDirectQUICWhenDirectPromotionIsSlightlyDelayed(t *testing.T) {
+	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(3*time.Second).UnixNano(), 10))
+
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var listenerOut bytes.Buffer
+	var listenerStatus syncBuffer
+	var senderStatus syncBuffer
+
+	tokenSink := make(chan string, 1)
+	listenErr := make(chan error, 1)
+	go func() {
+		_, err := Listen(ctx, ListenConfig{
+			Emitter:       telemetry.New(&listenerStatus, telemetry.LevelVerbose),
+			TokenSink:     tokenSink,
+			StdioOut:      &listenerOut,
+			UsePublicDERP: true,
+		})
+		listenErr <- err
+	}()
+
+	token := <-tokenSink
+	sendErr := make(chan error, 1)
+	go func() {
+		sendErr <- Send(ctx, SendConfig{
+			Token:         token,
+			Emitter:       telemetry.New(&senderStatus, telemetry.LevelVerbose),
+			StdioIn:       bytes.NewReader([]byte("delayed-native-direct")),
+			UsePublicDERP: true,
+		})
+	}()
+
+	if err := <-listenErr; err != nil {
+		t.Fatalf("Listen() error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+	}
+	if err := <-sendErr; err != nil {
+		t.Fatalf("Send() error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+	}
+
+	if got := listenerOut.String(); got != "delayed-native-direct" {
+		t.Fatalf("listener output = %q, want %q", got, "delayed-native-direct")
+	}
+	if got := senderStatus.String(); !strings.Contains(got, "sender-quic-direct") {
+		t.Fatalf("sender status = %q, want sender-quic-direct", got)
+	}
+	if got := listenerStatus.String(); !strings.Contains(got, "listener-quic-direct") {
+		t.Fatalf("listener status = %q, want listener-quic-direct", got)
+	}
+}
+
 func TestTransportPathEmitterCompletionIsTerminal(t *testing.T) {
 	var status bytes.Buffer
 	emitter := newTransportPathEmitter(telemetry.New(&status, telemetry.LevelDefault))

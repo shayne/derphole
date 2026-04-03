@@ -92,7 +92,9 @@ func (c *Client) Close() error {
 	c.stopOnce.Do(func() {
 		close(c.stopCh)
 	})
-	return c.dc.Close()
+	err := c.dc.Close()
+	<-c.doneCh
+	return err
 }
 
 func (c *Client) Send(ctx context.Context, dst key.NodePublic, payload []byte) error {

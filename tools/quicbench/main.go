@@ -128,16 +128,16 @@ func runListen(addr string, stdout, stderr io.Writer) error {
 }
 
 func runSend(cfg sendArgs, stdout io.Writer) error {
-	udpConn, err := net.ListenPacket("udp4", "0.0.0.0:0")
+	serverAddr, err := net.ResolveUDPAddr("udp4", cfg.addr)
+	if err != nil {
+		return err
+	}
+	udpConn, err := net.ListenPacket("udp4", sendLocalBindAddr(serverAddr).String())
 	if err != nil {
 		return err
 	}
 	defer udpConn.Close()
 
-	serverAddr, err := net.ResolveUDPAddr("udp4", cfg.addr)
-	if err != nil {
-		return err
-	}
 	transport := &quic.Transport{Conn: udpConn}
 	defer transport.Close()
 
@@ -421,6 +421,24 @@ func throughputMbps(byteCount int64, elapsed time.Duration) float64 {
 		return 0
 	}
 	return float64(byteCount*8) / elapsed.Seconds() / 1e6
+}
+
+func sendLocalBindAddr(serverAddr *net.UDPAddr) net.Addr {
+	fallbackAddr := &net.UDPAddr{Port: 0}
+	if serverAddr == nil || len(serverAddr.IP) == 0 || serverAddr.IP.IsUnspecified() {
+		return fallbackAddr
+	}
+	routeProbe, err := net.DialUDP("udp4", nil, serverAddr)
+	if err != nil {
+		return fallbackAddr
+	}
+	defer routeProbe.Close()
+
+	localAddr, ok := routeProbe.LocalAddr().(*net.UDPAddr)
+	if !ok || localAddr == nil || len(localAddr.IP) == 0 || localAddr.IP.IsUnspecified() {
+		return fallbackAddr
+	}
+	return &net.UDPAddr{IP: append(net.IP(nil), localAddr.IP...), Port: 0}
 }
 
 type zeroReader struct{}

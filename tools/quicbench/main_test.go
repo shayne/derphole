@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"testing"
 	"time"
 )
@@ -104,5 +105,21 @@ func TestThroughputMbps(t *testing.T) {
 	got := throughputMbps(64<<20, 4*time.Second)
 	if got != 134.217728 {
 		t.Fatalf("throughputMbps() = %f, want %f", got, 134.217728)
+	}
+}
+
+func TestSendLocalBindAddrUsesPeerRouteIP(t *testing.T) {
+	t.Parallel()
+
+	addr := sendLocalBindAddr(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345})
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("bind addr type = %T, want *net.UDPAddr", addr)
+	}
+	if got := udpAddr.IP.String(); got != "127.0.0.1" {
+		t.Fatalf("bind addr IP = %q, want %q", got, "127.0.0.1")
+	}
+	if got := udpAddr.Port; got != 0 {
+		t.Fatalf("bind addr port = %d, want 0", got)
 	}
 }
