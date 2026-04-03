@@ -76,16 +76,26 @@ npx -y derpcat@latest open <token> 127.0.0.1:8080
 At a high level:
 
 1. `listen` or `share` creates an ephemeral session and prints an opaque bearer token.
-2. That token contains the bootstrap information the other side needs, including session metadata, peer identity material, relay bootstrap hints, and authorization state.
+2. That token contains the bootstrap information the other side needs, including the session ID, expiry, DERP bootstrap hints, the listener's DERP and transport identity material, a bearer secret, and the allowed session capability.
 3. `send` or `open` uses the token to reach the listening side over the public DERP network and claim the session.
-4. Once the peers are connected, `derpcat` carries traffic immediately over whatever path is available first, including DERP relay.
-5. In parallel, both peers continue endpoint discovery and direct UDP probing.
-6. If a direct path succeeds, the live session upgrades from relay to direct without interrupting the transfer.
+4. The listener validates the claim, checks the capability, returns its own direct-path candidates, and both sides immediately start on the first working path, including DERP relay if needed.
+5. In parallel, both peers continue endpoint discovery and direct probing. If a better direct path appears later, the live session upgrades in place without restarting the transfer.
 
-Public sessions use a QUIC stream layer over `derpcat`'s transport manager. That gives:
+### Under The Hood
 
-- a single stream for `listen` and `send`
-- multiplexed streams for `share` and `open`, so one claimed session can carry many TCP connections
+`derpcat` has two data-plane implementations, selected dynamically after DERP rendezvous:
+
+- **Public Internet / NAT path:** `listen/send` and `share/open` run QUIC over `derpcat`'s relay/direct UDP transport. That transport starts on DERP packets, exchanges endpoint candidates, sends direct probes, and promotes to direct UDP when a probe succeeds. The QUIC peer certificate is pinned to the identity encoded in the token, so DERP relays ciphertext but does not terminate the session.
+- **Route-local fast path:** if both peers advertise a route-local address (`100.64.0.0/10` or `fd7a:115c:a1e0::/48` from Tailscale, loopback, or RFC1918 private LAN), `listen/send` can switch the bulk byte stream onto native TCP while preserving the same DERP bootstrap and fallback behavior. Tailscale-route TCP is authenticated with a per-session HMAC handshake derived from the token bearer secret and both peers' transport identities; non-Tailscale TCP candidates use TLS with the peer identity pinned from the token.
+
+`share/open` stays on multiplexed QUIC streams so a single claimed session can carry many independent TCP connections to the shared local service. `listen/send` uses one or more native TCP stripes on route-local direct paths, and otherwise falls back to a QUIC stream over the relay/direct UDP transport.
+
+Candidate discovery has two phases:
+
+- **Fast local candidates first:** immediately advertise the bound socket's local interface addresses and any cached UPnP / NAT-PMP / PCP mapping.
+- **Background traversal discovery:** run STUN and port-mapping refresh in parallel, then send updated candidates and `call-me-maybe` probes if a new direct endpoint appears.
+
+That split keeps startup latency low while still allowing NAT traversal and relay-to-direct promotion.
 
 ## Behavior
 

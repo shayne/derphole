@@ -1029,6 +1029,18 @@ func TestExternalNativeTCPAddrAllowedDefaultAcceptsRouteLocalAddressesOnly(t *te
 }
 
 func TestListenExternalNativeTCPOnCandidatesPrefersTailscaleCandidate(t *testing.T) {
+	prevListen := externalNativeTCPListen
+	externalNativeTCPListen = func(addr net.Addr, _ *tls.Config) (net.Listener, error) {
+		tcpAddr, _, ok := externalNativeTCPAddr(addr)
+		if !ok {
+			return nil, errors.New("native tcp direct address unavailable")
+		}
+		return &testAddrListener{addr: tcpAddr}, nil
+	}
+	t.Cleanup(func() {
+		externalNativeTCPListen = prevListen
+	})
+
 	ln, ok := listenExternalNativeTCPOnCandidates([]net.Addr{
 		&net.UDPAddr{IP: net.IPv4(10, 0, 1, 254), Port: 12345},
 		&net.UDPAddr{IP: net.IPv4(100, 125, 235, 82), Port: 12345},
@@ -1042,6 +1054,23 @@ func TestListenExternalNativeTCPOnCandidatesPrefersTailscaleCandidate(t *testing
 	if got.IP.String() != "100.125.235.82" {
 		t.Fatalf("listenExternalNativeTCPOnCandidates() addr = %v, want 100.125.235.82", got)
 	}
+}
+
+type testAddrListener struct {
+	net.Listener
+	addr net.Addr
+}
+
+func (l *testAddrListener) Accept() (net.Conn, error) {
+	return nil, net.ErrClosed
+}
+
+func (l *testAddrListener) Close() error {
+	return nil
+}
+
+func (l *testAddrListener) Addr() net.Addr {
+	return l.addr
 }
 
 func TestSelectExternalNativeTCPResponseAddrPrefersRequestRoute(t *testing.T) {

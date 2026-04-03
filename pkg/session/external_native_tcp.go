@@ -23,6 +23,7 @@ const externalNativeTCPBearerAuthSize = 32 + sha256.Size
 var externalNativeTCPBearerAuthDomain = []byte("derpcat-native-tcp-v1")
 
 var externalNativeTCPAddrAllowed = externalNativeTCPAddrAllowedDefault
+var externalNativeTCPListen = listenExternalNativeTCP
 
 type externalNativeTCPAuth struct {
 	Enabled      bool
@@ -84,7 +85,7 @@ func listenExternalNativeTCPOnCandidates(addrs []net.Addr, tlsConfig *tls.Config
 		if externalNativeTCPAddrIsTailscale(addr) {
 			addrTLSConfig = nil
 		}
-		ln, err := listenExternalNativeTCP(addr, addrTLSConfig)
+		ln, err := externalNativeTCPListen(addr, addrTLSConfig)
 		if err != nil {
 			continue
 		}
