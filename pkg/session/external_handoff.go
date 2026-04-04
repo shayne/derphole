@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"os"
 	"sync"
 	"time"
@@ -16,8 +18,21 @@ import (
 
 var errExternalHandoffWindowOverflow = errors.New("external handoff receive window overflow")
 var errExternalHandoffUnackedWindowFull = errors.New("external handoff unacked window full")
+var errExternalHandoffSourcePending = errors.New("external handoff source data pending")
+var errExternalHandoffCarrierHandoff = errors.New("external handoff carrier switching to another transport")
 
 const externalHandoffMaxUnackedBytes = 64 << 20
+const externalHandoffTransferIDHandoff = ^uint64(0)
+
+var externalTransferTraceStart = time.Now()
+
+func externalTransferTracef(format string, args ...any) {
+	if os.Getenv("DERPCAT_TRACE_HANDOFF") != "1" {
+		return
+	}
+	allArgs := append([]any{time.Since(externalTransferTraceStart).Truncate(time.Microsecond)}, args...)
+	log.Printf("handoff-trace elapsed=%s "+format, allArgs...)
+}
 
 type externalHandoffChunk struct {
 	TransferID uint64
@@ -103,16 +118,22 @@ func (r *externalHandoffReceiver) AcceptChunk(chunk externalHandoffChunk) error 
 }
 
 type externalHandoffSpool struct {
-	mu             sync.Mutex
-	src            io.Reader
-	file           *os.File
-	filePath       string
-	chunkSize      int
-	maxUnacked     int64
-	readOffset     int64
-	sourceOffset   int64
-	ackedWatermark int64
-	eof            bool
+	mu              sync.Mutex
+	cond            *sync.Cond
+	src             io.Reader
+	srcCloser       io.Closer
+	file            *os.File
+	filePath        string
+	chunkSize       int
+	maxUnacked      int64
+	readOffset      int64
+	sourceOffset    int64
+	ackedWatermark  int64
+	eof             bool
+	readErr         error
+	readInterrupted bool
+	closed          bool
+	pumpDone        chan struct{}
 }
 
 func newExternalHandoffSpool(src io.Reader, chunkSize int, maxUnackedBytes int64) (*externalHandoffSpool, error) {
@@ -129,13 +150,18 @@ func newExternalHandoffSpool(src io.Reader, chunkSize int, maxUnackedBytes int64
 	if err != nil {
 		return nil, err
 	}
-	return &externalHandoffSpool{
+	spool := &externalHandoffSpool{
 		src:        src,
+		srcCloser:  externalHandoffSourceCloser(src),
 		file:       file,
 		filePath:   file.Name(),
 		chunkSize:  chunkSize,
 		maxUnacked: maxUnackedBytes,
-	}, nil
+		pumpDone:   make(chan struct{}),
+	}
+	spool.cond = sync.NewCond(&spool.mu)
+	go spool.pumpSource()
+	return spool, nil
 }
 
 func (s *externalHandoffSpool) NextChunk() (externalHandoffChunk, error) {
@@ -153,46 +179,37 @@ func (s *externalHandoffSpool) NextChunk() (externalHandoffChunk, error) {
 		return externalHandoffChunk{}, errExternalHandoffUnackedWindowFull
 	}
 
-	if s.readOffset < s.sourceOffset {
-		available := s.sourceOffset - s.readOffset
-		if available < chunkLen {
-			chunkLen = available
+	for {
+		if s.readOffset < s.sourceOffset {
+			available := s.sourceOffset - s.readOffset
+			if available < chunkLen {
+				chunkLen = available
+			}
+			payload := make([]byte, chunkLen)
+			n, err := s.file.ReadAt(payload, s.readOffset)
+			if err != nil && !errors.Is(err, io.EOF) {
+				return externalHandoffChunk{}, err
+			}
+			payload = payload[:n]
+			chunk := externalHandoffChunk{Offset: s.readOffset, Payload: payload}
+			s.readOffset += int64(n)
+			return chunk, nil
 		}
-		payload := make([]byte, chunkLen)
-		n, err := s.file.ReadAt(payload, s.readOffset)
-		if err != nil && !errors.Is(err, io.EOF) {
-			return externalHandoffChunk{}, err
-		}
-		payload = payload[:n]
-		chunk := externalHandoffChunk{Offset: s.readOffset, Payload: payload}
-		s.readOffset += int64(n)
-		return chunk, nil
-	}
 
-	if s.eof {
-		return externalHandoffChunk{}, io.EOF
-	}
-
-	payload := make([]byte, chunkLen)
-	n, err := io.ReadFull(s.src, payload)
-	switch {
-	case err == nil:
-	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
-		s.eof = true
-		if n == 0 {
+		switch {
+		case s.readInterrupted:
+			s.readInterrupted = false
+			return externalHandoffChunk{}, errExternalHandoffSourcePending
+		case s.readErr != nil:
+			return externalHandoffChunk{}, s.readErr
+		case s.eof:
 			return externalHandoffChunk{}, io.EOF
+		case s.closed:
+			return externalHandoffChunk{}, net.ErrClosed
+		default:
+			s.cond.Wait()
 		}
-	default:
-		return externalHandoffChunk{}, err
 	}
-	payload = payload[:n]
-	if _, err := s.file.WriteAt(payload, s.sourceOffset); err != nil {
-		return externalHandoffChunk{}, err
-	}
-	chunk := externalHandoffChunk{Offset: s.sourceOffset, Payload: payload}
-	s.sourceOffset += int64(len(payload))
-	s.readOffset = s.sourceOffset
-	return chunk, nil
 }
 
 func (s *externalHandoffSpool) AckTo(watermark int64) error {
@@ -206,6 +223,7 @@ func (s *externalHandoffSpool) AckTo(watermark int64) error {
 		return fmt.Errorf("external handoff ack watermark %d exceeds source offset %d", watermark, s.sourceOffset)
 	}
 	s.ackedWatermark = watermark
+	s.cond.Broadcast()
 	return nil
 }
 
@@ -234,7 +252,17 @@ func (s *externalHandoffSpool) RewindTo(offset int64) error {
 		return fmt.Errorf("external handoff rewind offset %d exceeds source offset %d", offset, s.sourceOffset)
 	}
 	s.readOffset = offset
+	s.readInterrupted = false
+	s.cond.Broadcast()
 	return nil
+}
+
+func (s *externalHandoffSpool) InterruptPendingRead() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.readInterrupted = true
+	s.cond.Broadcast()
 }
 
 func (s *externalHandoffSpool) Close() error {
@@ -243,11 +271,22 @@ func (s *externalHandoffSpool) Close() error {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.file == nil {
+		s.mu.Unlock()
 		return nil
 	}
+	s.closed = true
+	s.cond.Broadcast()
+	srcCloser := s.srcCloser
+	s.mu.Unlock()
+
+	if srcCloser != nil {
+		_ = srcCloser.Close()
+	}
+	<-s.pumpDone
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	err := s.file.Close()
 	removeErr := os.Remove(s.filePath)
 	s.file = nil
@@ -260,12 +299,67 @@ func (s *externalHandoffSpool) Close() error {
 	return nil
 }
 
+func (s *externalHandoffSpool) pumpSource() {
+	defer close(s.pumpDone)
+
+	for {
+		payload := make([]byte, s.chunkSize)
+		n, err := io.ReadFull(s.src, payload)
+		payload = payload[:n]
+
+		s.mu.Lock()
+		if len(payload) > 0 {
+			if _, writeErr := s.file.WriteAt(payload, s.sourceOffset); writeErr != nil && s.readErr == nil {
+				s.readErr = writeErr
+			} else {
+				s.sourceOffset += int64(len(payload))
+			}
+		}
+		switch {
+		case err == nil:
+		case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+			s.eof = true
+		default:
+			if s.readErr == nil {
+				s.readErr = err
+			}
+		}
+		done := s.eof || s.readErr != nil || s.closed
+		s.cond.Broadcast()
+		s.mu.Unlock()
+
+		if done {
+			return
+		}
+	}
+}
+
+func externalHandoffSourceCloser(src io.Reader) io.Closer {
+	if closer, ok := src.(io.Closer); ok {
+		return closer
+	}
+	return nil
+}
+
 func sendExternalHandoffCarrier(ctx context.Context, carrier io.ReadWriteCloser, spool *externalHandoffSpool, stop <-chan struct{}) error {
+	externalTransferTracef("sender-carrier-start carrier=%T stop=%v", carrier, stop != nil)
+	if stop != nil {
+		stopWatchDone := make(chan struct{})
+		defer close(stopWatchDone)
+		go func() {
+			select {
+			case <-stop:
+				spool.InterruptPendingRead()
+			case <-stopWatchDone:
+			}
+		}()
+	}
 	ackErrCh := make(chan error, 1)
 	go func() {
 		for {
 			watermark, err := readExternalHandoffWatermarkFrame(carrier)
 			if err != nil {
+				externalTransferTracef("sender-carrier-ack-stop carrier=%T err=%v", carrier, err)
 				if externalHandoffCarrierClosed(err) {
 					ackErrCh <- nil
 					return
@@ -277,14 +371,22 @@ func sendExternalHandoffCarrier(ctx context.Context, carrier io.ReadWriteCloser,
 				ackErrCh <- err
 				return
 			}
+			externalTransferTracef("sender-carrier-ack carrier=%T watermark=%d", carrier, watermark)
 		}
 	}()
 
+	firstChunk := true
 	for {
 		select {
 		case err := <-ackErrCh:
 			return err
 		case <-stop:
+			if !spool.Done() {
+				externalTransferTracef("sender-carrier-handoff carrier=%T acked=%d", carrier, spool.AckedWatermark())
+				if err := writeExternalHandoffHandoffFrame(carrier, spool.AckedWatermark()); err != nil {
+					return err
+				}
+			}
 			if err := closeExternalHandoffWrite(carrier); err != nil {
 				return err
 			}
@@ -295,19 +397,30 @@ func sendExternalHandoffCarrier(ctx context.Context, carrier io.ReadWriteCloser,
 		chunk, err := spool.NextChunk()
 		switch {
 		case err == nil:
+			if firstChunk {
+				firstChunk = false
+				externalTransferTracef("sender-first-chunk offset=%d bytes=%d carrier=%T", chunk.Offset, len(chunk.Payload), carrier)
+			}
 			if err := writeExternalHandoffChunkFrame(carrier, chunk); err != nil {
 				return err
 			}
 		case errors.Is(err, io.EOF):
+			externalTransferTracef("sender-carrier-eof carrier=%T", carrier)
 			if err := closeExternalHandoffWrite(carrier); err != nil {
 				return err
 			}
 			return <-ackErrCh
-		case errors.Is(err, errExternalHandoffUnackedWindowFull):
+		case errors.Is(err, errExternalHandoffUnackedWindowFull), errors.Is(err, errExternalHandoffSourcePending):
 			select {
 			case ackErr := <-ackErrCh:
 				return ackErr
 			case <-stop:
+				if !spool.Done() {
+					externalTransferTracef("sender-carrier-handoff carrier=%T acked=%d", carrier, spool.AckedWatermark())
+					if err := writeExternalHandoffHandoffFrame(carrier, spool.AckedWatermark()); err != nil {
+						return err
+					}
+				}
 				if err := closeExternalHandoffWrite(carrier); err != nil {
 					return err
 				}
@@ -323,16 +436,34 @@ func sendExternalHandoffCarrier(ctx context.Context, carrier io.ReadWriteCloser,
 }
 
 func receiveExternalHandoffCarrier(ctx context.Context, carrier io.ReadWriteCloser, rx *externalHandoffReceiver, maxPayload int) error {
+	externalTransferTracef("listener-carrier-start carrier=%T", carrier)
+	firstChunk := true
 	for {
 		chunk, err := readExternalHandoffChunkFrame(carrier, maxPayload)
 		if err != nil {
 			if externalHandoffCarrierClosed(err) {
+				externalTransferTracef("listener-carrier-eof carrier=%T watermark=%d", carrier, rx.Watermark())
 				if writeErr := writeExternalHandoffWatermarkFrame(carrier, rx.Watermark()); writeErr != nil {
 					return writeErr
 				}
+				externalTransferTracef("listener-carrier-final-ack carrier=%T watermark=%d", carrier, rx.Watermark())
 				return closeExternalHandoffWrite(carrier)
 			}
 			return err
+		}
+		if chunk.TransferID == externalHandoffTransferIDHandoff {
+			externalTransferTracef("listener-carrier-handoff carrier=%T watermark=%d", carrier, rx.Watermark())
+			if writeErr := writeExternalHandoffWatermarkFrame(carrier, rx.Watermark()); writeErr != nil {
+				return writeErr
+			}
+			if closeErr := closeExternalHandoffWrite(carrier); closeErr != nil {
+				return closeErr
+			}
+			return errExternalHandoffCarrierHandoff
+		}
+		if firstChunk {
+			firstChunk = false
+			externalTransferTracef("listener-first-chunk offset=%d bytes=%d carrier=%T", chunk.Offset, len(chunk.Payload), carrier)
 		}
 		if err := rx.AcceptChunk(chunk); err != nil {
 			return err
@@ -349,7 +480,7 @@ func receiveExternalHandoffCarrier(ctx context.Context, carrier io.ReadWriteClos
 }
 
 func externalHandoffCarrierClosed(err error) bool {
-	if errors.Is(err, io.EOF) {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
 		return true
 	}
 	var appErr *quic.ApplicationError
@@ -398,6 +529,12 @@ func readExternalHandoffChunkFrame(r io.Reader, maxPayload int) (externalHandoff
 	if err := binary.Read(r, binary.BigEndian, &payloadLen); err != nil {
 		return externalHandoffChunk{}, err
 	}
+	if chunk.TransferID == externalHandoffTransferIDHandoff {
+		if payloadLen != 0 {
+			return externalHandoffChunk{}, fmt.Errorf("external handoff marker payload length %d must be zero", payloadLen)
+		}
+		return chunk, nil
+	}
 	if maxPayload < 0 || int64(payloadLen) > int64(maxPayload) {
 		return externalHandoffChunk{}, fmt.Errorf("external handoff chunk payload length %d exceeds max %d", payloadLen, maxPayload)
 	}
@@ -413,6 +550,19 @@ func writeExternalHandoffWatermarkFrame(w io.Writer, watermark int64) error {
 		return fmt.Errorf("external handoff watermark %d is negative", watermark)
 	}
 	return binary.Write(w, binary.BigEndian, watermark)
+}
+
+func writeExternalHandoffHandoffFrame(w io.Writer, watermark int64) error {
+	if watermark < 0 {
+		return fmt.Errorf("external handoff marker watermark %d is negative", watermark)
+	}
+	if err := binary.Write(w, binary.BigEndian, externalHandoffTransferIDHandoff); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.BigEndian, watermark); err != nil {
+		return err
+	}
+	return binary.Write(w, binary.BigEndian, uint32(0))
 }
 
 func readExternalHandoffWatermarkFrame(r io.Reader) (int64, error) {

@@ -33,19 +33,22 @@ import (
 )
 
 const (
-	envelopeClaim        = "claim"
-	envelopeDecision     = "decision"
-	envelopeControl      = "control"
-	envelopeAck          = "ack"
-	envelopeQUICModeReq  = "quic_mode_request"
-	envelopeQUICModeResp = "quic_mode_response"
-	envelopeQUICModeAck  = "quic_mode_ack"
-	maxEnvelopeBytes     = 16 << 10
+	envelopeClaim         = "claim"
+	envelopeDecision      = "decision"
+	envelopeControl       = "control"
+	envelopeAck           = "ack"
+	envelopeQUICModeReq   = "quic_mode_request"
+	envelopeQUICModeResp  = "quic_mode_response"
+	envelopeQUICModeAck   = "quic_mode_ack"
+	envelopeQUICModeReady = "quic_mode_ready"
+	maxEnvelopeBytes      = 16 << 10
 )
 
 const externalNativeQUICWait = 5 * time.Second
 const externalNativeQUICConnectWait = externalNativeQUICWait
 const externalNativeQUICNackWait = 1 * time.Second
+const externalNativeQUICSetupGraceWait = 750 * time.Millisecond
+const externalNativeQUICSetupShortRelayTailBytes = 8 << 20
 const externalCopyBufferSize = 256 << 10
 const defaultExternalNativeQUICConns = 4
 const externalClaimRetryInterval = 250 * time.Millisecond
@@ -72,13 +75,14 @@ type publicPortmap interface {
 }
 
 type envelope struct {
-	Type         string                    `json:"type"`
-	Claim        *rendezvous.Claim         `json:"claim,omitempty"`
-	Decision     *rendezvous.Decision      `json:"decision,omitempty"`
-	Control      *transport.ControlMessage `json:"control,omitempty"`
-	QUICModeReq  *quicModeRequest          `json:"quic_mode_request,omitempty"`
-	QUICModeResp *quicModeResponse         `json:"quic_mode_response,omitempty"`
-	QUICModeAck  *quicModeAck              `json:"quic_mode_ack,omitempty"`
+	Type          string                    `json:"type"`
+	Claim         *rendezvous.Claim         `json:"claim,omitempty"`
+	Decision      *rendezvous.Decision      `json:"decision,omitempty"`
+	Control       *transport.ControlMessage `json:"control,omitempty"`
+	QUICModeReq   *quicModeRequest          `json:"quic_mode_request,omitempty"`
+	QUICModeResp  *quicModeResponse         `json:"quic_mode_response,omitempty"`
+	QUICModeAck   *quicModeAck              `json:"quic_mode_ack,omitempty"`
+	QUICModeReady *quicModeReady            `json:"quic_mode_ready,omitempty"`
 }
 
 type quicModeRequest struct {
@@ -98,6 +102,10 @@ type quicModeResponse struct {
 type quicModeAck struct {
 	NativeDirect bool `json:"native_direct"`
 	NativeTCP    bool `json:"native_tcp,omitempty"`
+}
+
+type quicModeReady struct {
+	NativeDirect bool `json:"native_direct"`
 }
 
 type remoteCandidateSeeder interface {
@@ -335,32 +343,45 @@ func runExternalSendStream(
 ) error {
 	defer quicConn.CloseWithError(0, "")
 
+	externalTransferTracef("sender-open-relay-stream-start")
 	streamConn, err := quicConn.OpenStreamSync(ctx)
 	if err != nil {
 		return err
 	}
 	defer streamConn.Close()
+	externalTransferTracef("sender-open-relay-stream-complete")
 
 	src, err := openSendSource(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer src.Close()
+	externalTransferTracef("sender-source-ready src=%T", src)
 
 	spool, err := newExternalHandoffSpool(src, externalCopyBufferSize, externalHandoffMaxUnackedBytes)
 	if err != nil {
 		return err
 	}
 	defer spool.Close()
+	externalTransferTracef("sender-spool-ready")
 
 	relayStopCh := make(chan struct{})
 	relayErrCh := make(chan error, 1)
 	go func() {
 		relayErrCh <- sendExternalHandoffCarrier(ctx, streamConn, spool, relayStopCh)
 	}()
+	externalTransferTracef("sender-relay-carrier-launched")
 
 	select {
 	case modeResult := <-nativeDirectModeCh:
+		externalTransferTracef(
+			"sender-native-mode-result err=%v nativeTCP=%d nativeQUIC=%v acked=%d relayDone=%v",
+			modeResult.err,
+			len(modeResult.nativeTCPConns),
+			modeResult.nativeQUIC && modeResult.nativeQUICAddr != nil,
+			spool.AckedWatermark(),
+			spool.Done(),
+		)
 		if modeResult.err != nil {
 			close(relayStopCh)
 			relayErr := <-relayErrCh
@@ -384,70 +405,199 @@ func runExternalSendStream(
 			return nil
 		}
 
-		close(relayStopCh)
-		if err := <-relayErrCh; err != nil {
-			closeExternalNativeTCPConns(modeResult.nativeTCPConns)
-			return err
-		}
-		if err := spool.RewindTo(spool.AckedWatermark()); err != nil {
-			closeExternalNativeTCPConns(modeResult.nativeTCPConns)
-			return err
-		}
-
 		if len(modeResult.nativeTCPConns) > 0 {
+			close(relayStopCh)
+			if err := <-relayErrCh; err != nil {
+				closeExternalNativeTCPConns(modeResult.nativeTCPConns)
+				return err
+			}
+			externalTransferTracef("sender-relay-carrier-stopped acked=%d", spool.AckedWatermark())
+			if spool.Done() {
+				externalTransferTracef("sender-native-tcp-skip relay-complete acked=%d", spool.AckedWatermark())
+				closeExternalNativeTCPConns(modeResult.nativeTCPConns)
+				break
+			}
+			if err := spool.RewindTo(spool.AckedWatermark()); err != nil {
+				closeExternalNativeTCPConns(modeResult.nativeTCPConns)
+				return err
+			}
+
 			pathEmitter.Emit(StateDirect)
 			if cfg.Emitter != nil {
 				cfg.Emitter.Debug("sender-tcp-direct")
 				cfg.Emitter.Debug("tcp-connected")
 			}
 
+			externalTransferTracef("sender-native-tcp-copy-start conns=%d acked=%d", len(modeResult.nativeTCPConns), spool.AckedWatermark())
 			if err := sendExternalHandoffNativeTCPConns(ctx, modeResult.nativeTCPConns, spool); err != nil {
 				closeExternalNativeTCPConns(modeResult.nativeTCPConns)
 				return err
 			}
 			closeExternalNativeTCPConns(modeResult.nativeTCPConns)
+			externalTransferTracef("sender-native-tcp-copy-complete")
 			break
 		}
 
-		if err := quicConn.CloseWithError(0, ""); err != nil {
-			return err
-		}
-		transportCancel()
-		transportManager.Wait()
-		_ = probeConn.SetDeadline(time.Time{})
-
-		nativeQUICSession, err := dialExternalNativeQUICStripedConns(
-			ctx,
-			probeConn,
-			modeResult.nativeQUICAddr,
-			dm,
-			cfg.Emitter,
-			clientTLSConfig,
-			serverTLSConfig,
-			externalNativeQUICConnCount(),
-		)
-		if err != nil {
-			if spool.Done() {
-				break
+		if relayErr, relayDone := waitExternalNativeQUICSetupGrace(relayErrCh, externalNativeQUICSetupGraceWaitForSpool(spool)); relayDone {
+			externalTransferTracef("sender-native-quic-setup-skip relay-complete err=%v acked=%d", relayErr, spool.AckedWatermark())
+			if relayErr != nil {
+				return relayErr
 			}
+			if err := waitForPeerAck(ctx, ackCh); err != nil {
+				return err
+			}
+			if err := quicConn.CloseWithError(0, ""); err != nil {
+				return err
+			}
+			pathEmitter.Complete(transportManager)
+			return nil
+		}
+
+		transportManager.StopDirect()
+		_ = probeConn.SetDeadline(time.Time{})
+		externalTransferTracef("sender-keep-relay-quic-during-native-setup")
+
+		nativeQUICSetupCtx, nativeQUICSetupCancel := context.WithCancel(ctx)
+		nativeQUICSetupCh := make(chan externalNativeQUICSendSetupResult, 1)
+		go func() {
+			nativeQUICSession, err := dialExternalNativeQUICStripedConns(
+				nativeQUICSetupCtx,
+				probeConn,
+				modeResult.nativeQUICAddr,
+				dm,
+				cfg.Emitter,
+				clientTLSConfig,
+				serverTLSConfig,
+				externalNativeQUICConnCount(),
+			)
+			if err != nil || nativeQUICSession == nil || nativeQUICSession.setupFallback {
+				nativeQUICSetupCh <- externalNativeQUICSendSetupResult{
+					session: nativeQUICSession,
+					err:     err,
+				}
+				return
+			}
+
+			nativeQUICStreams, err := nativeQUICSession.OpenReadWriteStreams(nativeQUICSetupCtx)
+			if err != nil {
+				nativeQUICSetupCh <- externalNativeQUICSendSetupResult{
+					session: nativeQUICSession,
+					err:     err,
+				}
+				return
+			}
+			if err := waitExternalNativeQUICReceiverReady(
+				nativeQUICSetupCtx,
+				nativeQUICStreams,
+				externalNativeQUICStreamRole(nativeQUICSession.openStreams, 0),
+			); err != nil {
+				nativeQUICSetupCh <- externalNativeQUICSendSetupResult{
+					session: nativeQUICSession,
+					streams: nativeQUICStreams,
+					err:     err,
+				}
+				return
+			}
+			nativeQUICSetupCh <- externalNativeQUICSendSetupResult{
+				session: nativeQUICSession,
+				streams: nativeQUICStreams,
+			}
+		}()
+
+		var nativeQUICSetup externalNativeQUICSendSetupResult
+		nativeQUICSetupReady := false
+		select {
+		case nativeQUICSetup = <-nativeQUICSetupCh:
+			nativeQUICSetupReady = nativeQUICSetup.err == nil && nativeQUICSetup.session != nil && !nativeQUICSetup.session.setupFallback
+		case relayErr := <-relayErrCh:
+			nativeQUICSetupCancel()
+			closeExternalNativeQUICSendSetupResultAsync(nativeQUICSetupCh)
+			if relayErr != nil {
+				return relayErr
+			}
+			if err := waitForPeerAck(ctx, ackCh); err != nil {
+				return err
+			}
+			if err := quicConn.CloseWithError(0, ""); err != nil {
+				return err
+			}
+			externalTransferTracef("sender-close-relay-quic-complete")
+			externalTransferTracef("sender-transport-cancel")
+			transportCancel()
+			externalTransferTracef("sender-transport-wait-start")
+			transportManager.Wait()
+			externalTransferTracef("sender-transport-wait-complete")
+			pathEmitter.Complete(transportManager)
+			return nil
+		}
+		nativeQUICSetupCancel()
+
+		if !nativeQUICSetupReady {
+			closeExternalNativeQUICSendSetupResult(nativeQUICSetup)
+			if cfg.Emitter != nil {
+				if nativeQUICSetup.err != nil {
+					cfg.Emitter.Debug("sender-native-quic-setup-fallback err=" + nativeQUICSetup.err.Error())
+				} else {
+					cfg.Emitter.Debug("sender-native-quic-setup-fallback=primary-only")
+				}
+			}
+			if err := <-relayErrCh; err != nil {
+				return err
+			}
+			if err := waitForPeerAck(ctx, ackCh); err != nil {
+				return err
+			}
+			if err := quicConn.CloseWithError(0, ""); err != nil {
+				return err
+			}
+			externalTransferTracef("sender-close-relay-quic-complete")
+			externalTransferTracef("sender-transport-cancel")
+			transportCancel()
+			externalTransferTracef("sender-transport-wait-start")
+			transportManager.Wait()
+			externalTransferTracef("sender-transport-wait-complete")
+			pathEmitter.Complete(transportManager)
+			return nil
+		}
+		defer nativeQUICSetup.session.Close()
+
+		close(relayStopCh)
+		if err := <-relayErrCh; err != nil {
 			return err
 		}
-		defer nativeQUICSession.Close()
-
-		nativeQUICStreams, err := nativeQUICSession.OpenReadWriteStreams(ctx)
-		if err != nil {
+		externalTransferTracef("sender-relay-carrier-stopped acked=%d", spool.AckedWatermark())
+		if spool.Done() {
+			externalTransferTracef("sender-native-quic-skip relay-complete acked=%d", spool.AckedWatermark())
+			break
+		}
+		if err := spool.RewindTo(spool.AckedWatermark()); err != nil {
 			return err
 		}
 		pathEmitter.Emit(StateDirect)
 		if cfg.Emitter != nil {
 			cfg.Emitter.Debug("sender-quic-direct")
 		}
-		if err := sendExternalHandoffCarriers(ctx, nativeQUICStreams, spool); err != nil {
+		externalTransferTracef("sender-native-quic-copy-start conns=%d acked=%d", len(nativeQUICSetup.streams), spool.AckedWatermark())
+		if err := sendExternalHandoffCarriers(ctx, nativeQUICSetup.streams, spool); err != nil {
 			return err
 		}
+		externalTransferTracef("sender-native-quic-copy-complete")
+
+		if err := quicConn.CloseWithError(0, ""); err != nil {
+			return err
+		}
+		externalTransferTracef("sender-close-relay-quic-complete")
+		externalTransferTracef("sender-transport-cancel")
+		transportCancel()
+		externalTransferTracef("sender-transport-wait-start")
+		transportManager.Wait()
+		externalTransferTracef("sender-transport-wait-complete")
 	case err := <-relayErrCh:
+		externalTransferTracef("sender-relay-carrier-complete err=%v", err)
 		nativeDirectModeCancel()
+		externalTransferTracef("sender-native-mode-drain-after-relay-start")
 		closeExternalNativeTCPConns(waitExternalNativeDirectModeResult(nativeDirectModeCh).nativeTCPConns)
+		externalTransferTracef("sender-native-mode-drain-after-relay-complete")
 		if err != nil {
 			return err
 		}
@@ -495,15 +645,24 @@ func runExternalListenStream(
 		return err
 	}
 	defer dst.Close()
+	externalTransferTracef("listener-sink-ready dst=%T", dst)
 
 	rx := newExternalHandoffReceiver(dst, externalHandoffMaxUnackedBytes)
 	relayErrCh := make(chan error, 1)
 	go func() {
 		relayErrCh <- receiveExternalHandoffCarrier(ctx, streamConn, rx, externalCopyBufferSize)
 	}()
+	externalTransferTracef("listener-relay-carrier-launched")
 
 	select {
 	case modeResult := <-nativeDirectModeCh:
+		externalTransferTracef(
+			"listener-native-mode-result err=%v nativeTCP=%d nativeQUIC=%v watermark=%d",
+			modeResult.err,
+			len(modeResult.nativeTCPConns),
+			modeResult.nativeQUIC && modeResult.nativeQUICAddr != nil,
+			rx.Watermark(),
+		)
 		switch {
 		case modeResult.err != nil:
 			closeExternalNativeTCPConns(modeResult.nativeTCPConns)
@@ -515,63 +674,170 @@ func runExternalListenStream(
 				return err
 			}
 		case len(modeResult.nativeTCPConns) > 0:
-			if err := <-relayErrCh; err != nil {
+			relayErr := <-relayErrCh
+			if relayErr != nil && !errors.Is(relayErr, errExternalHandoffCarrierHandoff) {
 				closeExternalNativeTCPConns(modeResult.nativeTCPConns)
-				return err
+				return relayErr
 			}
+			if relayErr == nil {
+				externalTransferTracef("listener-native-tcp-skip relay-complete watermark=%d", rx.Watermark())
+				closeExternalNativeTCPConns(modeResult.nativeTCPConns)
+				break
+			}
+			externalTransferTracef("listener-relay-carrier-stopped watermark=%d", rx.Watermark())
 			pathEmitter.Emit(StateDirect)
 			if cfg.Emitter != nil {
 				cfg.Emitter.Debug("listener-tcp-direct")
 				cfg.Emitter.Debug("tcp-accepted")
 			}
+			externalTransferTracef("listener-native-tcp-copy-start conns=%d watermark=%d", len(modeResult.nativeTCPConns), rx.Watermark())
 			if err := receiveExternalHandoffNativeTCPConns(ctx, modeResult.nativeTCPConns, rx); err != nil {
 				closeExternalNativeTCPConns(modeResult.nativeTCPConns)
 				return err
 			}
 			closeExternalNativeTCPConns(modeResult.nativeTCPConns)
+			externalTransferTracef("listener-native-tcp-copy-complete watermark=%d", rx.Watermark())
 		default:
-			if err := <-relayErrCh; err != nil {
-				return err
+			relayErrReady := false
+			var relayErr error
+			if relayErr, relayErrReady = waitExternalNativeQUICSetupGrace(relayErrCh, externalNativeQUICSetupGraceWait); relayErrReady {
+				if relayErr != nil && !errors.Is(relayErr, errExternalHandoffCarrierHandoff) {
+					return relayErr
+				}
+				if relayErr == nil {
+					externalTransferTracef("listener-native-quic-setup-skip relay-complete watermark=%d", rx.Watermark())
+					break
+				}
 			}
+
+			transportManager.StopDirect()
+			_ = probeConn.SetDeadline(time.Time{})
+			nativeQUICSetupCtx, nativeQUICSetupCancel := context.WithCancel(ctx)
+			nativeQUICSetupCh := make(chan externalNativeQUICListenSetupResult, 1)
+			go func() {
+				nativeQUICSession, nativeQUICStreams, err := acceptExternalNativeQUICStripedConns(
+					nativeQUICSetupCtx,
+					probeConn,
+					modeResult.nativeQUICAddr,
+					dm,
+					cfg.Emitter,
+					clientTLSConfig,
+					serverTLSConfig,
+					externalNativeQUICConnCount(),
+				)
+				if err == nil && nativeQUICSession != nil && !nativeQUICSession.setupFallback {
+					err = signalExternalNativeQUICReceiverReady(
+						nativeQUICSetupCtx,
+						nativeQUICStreams,
+						externalNativeQUICStreamRole(nativeQUICSession.openStreams, 0),
+					)
+				}
+				nativeQUICSetupCh <- externalNativeQUICListenSetupResult{
+					session: nativeQUICSession,
+					streams: nativeQUICStreams,
+					err:     err,
+				}
+			}()
+
+			var nativeQUICSetup externalNativeQUICListenSetupResult
+			nativeQUICSetupReady := false
+			if !relayErrReady {
+				select {
+				case nativeQUICSetup = <-nativeQUICSetupCh:
+					nativeQUICSetupReady = nativeQUICSetup.err == nil && nativeQUICSetup.session != nil && !nativeQUICSetup.session.setupFallback
+				case relayErr = <-relayErrCh:
+					relayErrReady = true
+				}
+			}
+			if relayErrReady && relayErr == nil {
+				nativeQUICSetupCancel()
+				closeExternalNativeQUICListenSetupResultAsync(nativeQUICSetupCh)
+				break
+			}
+			if relayErrReady && errors.Is(relayErr, errExternalHandoffCarrierHandoff) {
+				select {
+				case nativeQUICSetup = <-nativeQUICSetupCh:
+					nativeQUICSetupReady = nativeQUICSetup.err == nil && nativeQUICSetup.session != nil && !nativeQUICSetup.session.setupFallback
+				case <-time.After(externalNativeQUICWait):
+					nativeQUICSetupCancel()
+					closeExternalNativeQUICListenSetupResult(<-nativeQUICSetupCh)
+				}
+			}
+			nativeQUICSetupCancel()
+
+			if !nativeQUICSetupReady {
+				closeExternalNativeQUICListenSetupResult(nativeQUICSetup)
+				if cfg.Emitter != nil {
+					if nativeQUICSetup.err != nil {
+						cfg.Emitter.Debug("listener-native-quic-setup-fallback err=" + nativeQUICSetup.err.Error())
+					} else {
+						cfg.Emitter.Debug("listener-native-quic-setup-fallback=primary-only")
+					}
+				}
+				if !relayErrReady {
+					relayErr = <-relayErrCh
+					relayErrReady = true
+				}
+				if relayErr != nil && !errors.Is(relayErr, errExternalHandoffCarrierHandoff) {
+					return relayErr
+				}
+				break
+			}
+			defer nativeQUICSetup.session.Close()
+			defer closeExternalNativeQUICStreams(nativeQUICSetup.streams)
+
+			if !relayErrReady {
+				relayErr = <-relayErrCh
+				relayErrReady = true
+			}
+			if relayErr != nil && !errors.Is(relayErr, errExternalHandoffCarrierHandoff) {
+				return relayErr
+			}
+			if relayErr == nil {
+				externalTransferTracef("listener-native-quic-skip relay-complete watermark=%d", rx.Watermark())
+				break
+			}
+			externalTransferTracef("listener-relay-carrier-stopped watermark=%d", rx.Watermark())
 			if relayConn != nil {
+				externalTransferTracef("listener-close-relay-quic-start")
 				_ = relayConn.CloseWithError(0, "")
+				externalTransferTracef("listener-close-relay-quic-complete")
 			}
 			if closeRelayQUIC != nil {
 				closeRelayQUIC()
 			}
+			externalTransferTracef("listener-transport-cancel")
 			transportCancel()
+			externalTransferTracef("listener-transport-wait-start")
 			transportManager.Wait()
+			externalTransferTracef("listener-transport-wait-complete")
 			_ = probeConn.SetDeadline(time.Time{})
-
-			nativeQUICSession, nativeQUICStreams, err := acceptExternalNativeQUICStripedConns(
-				ctx,
-				probeConn,
-				modeResult.nativeQUICAddr,
-				dm,
-				cfg.Emitter,
-				clientTLSConfig,
-				serverTLSConfig,
-				externalNativeQUICConnCount(),
-			)
-			if err != nil {
-				return err
-			}
-			defer nativeQUICSession.Close()
-			defer closeExternalNativeQUICStreams(nativeQUICStreams)
 
 			pathEmitter.Emit(StateDirect)
 			if cfg.Emitter != nil {
 				cfg.Emitter.Debug("listener-quic-direct")
 			}
-			if err := receiveExternalHandoffNativeQUICStreams(ctx, nativeQUICStreams, rx); err != nil {
+			externalTransferTracef("listener-native-quic-copy-start conns=%d watermark=%d", len(nativeQUICSetup.streams), rx.Watermark())
+			if err := receiveExternalHandoffNativeQUICStreams(ctx, nativeQUICSetup.streams, rx); err != nil {
 				return err
 			}
+			externalTransferTracef("listener-native-quic-copy-complete watermark=%d", rx.Watermark())
 		}
 	case err := <-relayErrCh:
-		if err != nil {
+		externalTransferTracef("listener-relay-carrier-complete err=%v watermark=%d", err, rx.Watermark())
+		if err != nil && !errors.Is(err, errExternalHandoffCarrierHandoff) {
 			nativeDirectModeCancel()
+			externalTransferTracef("listener-native-mode-drain-after-relay-error-start")
 			closeExternalNativeTCPConns(waitExternalNativeDirectModeResult(nativeDirectModeCh).nativeTCPConns)
+			externalTransferTracef("listener-native-mode-drain-after-relay-error-complete")
 			return err
+		}
+		if !errors.Is(err, errExternalHandoffCarrierHandoff) {
+			nativeDirectModeCancel()
+			externalTransferTracef("listener-native-mode-drain-after-relay-start")
+			closeExternalNativeTCPConns(waitExternalNativeDirectModeResult(nativeDirectModeCh).nativeTCPConns)
+			externalTransferTracef("listener-native-mode-drain-after-relay-complete")
+			break
 		}
 		modeResult := waitExternalNativeDirectModeResult(nativeDirectModeCh)
 		if modeResult.err != nil {
@@ -584,22 +850,29 @@ func runExternalListenStream(
 				cfg.Emitter.Debug("listener-tcp-direct")
 				cfg.Emitter.Debug("tcp-accepted")
 			}
+			externalTransferTracef("listener-native-tcp-copy-start conns=%d watermark=%d", len(modeResult.nativeTCPConns), rx.Watermark())
 			if err := receiveExternalHandoffNativeTCPConns(ctx, modeResult.nativeTCPConns, rx); err != nil {
 				closeExternalNativeTCPConns(modeResult.nativeTCPConns)
 				return err
 			}
 			closeExternalNativeTCPConns(modeResult.nativeTCPConns)
+			externalTransferTracef("listener-native-tcp-copy-complete watermark=%d", rx.Watermark())
 			break
 		}
 		if modeResult.nativeQUIC && modeResult.nativeQUICAddr != nil {
 			if relayConn != nil {
+				externalTransferTracef("listener-close-relay-quic-start")
 				_ = relayConn.CloseWithError(0, "")
+				externalTransferTracef("listener-close-relay-quic-complete")
 			}
 			if closeRelayQUIC != nil {
 				closeRelayQUIC()
 			}
+			externalTransferTracef("listener-transport-cancel")
 			transportCancel()
+			externalTransferTracef("listener-transport-wait-start")
 			transportManager.Wait()
+			externalTransferTracef("listener-transport-wait-complete")
 			_ = probeConn.SetDeadline(time.Time{})
 
 			nativeQUICSession, nativeQUICStreams, err := acceptExternalNativeQUICStripedConns(
@@ -622,9 +895,11 @@ func runExternalListenStream(
 			if cfg.Emitter != nil {
 				cfg.Emitter.Debug("listener-quic-direct")
 			}
+			externalTransferTracef("listener-native-quic-copy-start conns=%d watermark=%d", len(nativeQUICStreams), rx.Watermark())
 			if err := receiveExternalHandoffNativeQUICStreams(ctx, nativeQUICStreams, rx); err != nil {
 				return err
 			}
+			externalTransferTracef("listener-native-quic-copy-complete watermark=%d", rx.Watermark())
 		}
 	}
 
@@ -640,6 +915,108 @@ type externalNativeDirectModeResult struct {
 	nativeQUICAddr net.Addr
 	nativeTCPConns []net.Conn
 	err            error
+}
+
+type externalNativeQUICSendSetupResult struct {
+	session *externalNativeQUICStripedSession
+	streams []io.ReadWriteCloser
+	err     error
+}
+
+func closeExternalNativeQUICSendSetupResult(result externalNativeQUICSendSetupResult) {
+	for _, stream := range result.streams {
+		_ = stream.Close()
+	}
+	if result.session != nil {
+		result.session.Close()
+	}
+}
+
+func closeExternalNativeQUICSendSetupResultAsync(resultCh <-chan externalNativeQUICSendSetupResult) {
+	if resultCh == nil {
+		return
+	}
+	go func() {
+		closeExternalNativeQUICSendSetupResult(<-resultCh)
+	}()
+}
+
+type externalNativeQUICListenSetupResult struct {
+	session *externalNativeQUICStripedSession
+	streams []*quic.Stream
+	err     error
+}
+
+const externalNativeQUICReceiverReadyByte = byte(1)
+
+func closeExternalNativeQUICListenSetupResult(result externalNativeQUICListenSetupResult) {
+	closeExternalNativeQUICStreams(result.streams)
+	if result.session != nil {
+		result.session.Close()
+	}
+}
+
+func closeExternalNativeQUICListenSetupResultAsync(resultCh <-chan externalNativeQUICListenSetupResult) {
+	if resultCh == nil {
+		return
+	}
+	go func() {
+		closeExternalNativeQUICListenSetupResult(<-resultCh)
+	}()
+}
+
+func waitExternalNativeQUICReceiverReady(ctx context.Context, streams []io.ReadWriteCloser, localOpenedStream bool) error {
+	if len(streams) == 0 {
+		return errors.New("native QUIC setup has no streams")
+	}
+	externalTransferTracef("native-quic-wait-receiver-ready-start local-opened=%v stream=%T", localOpenedStream, streams[0])
+	if deadlineCarrier, ok := streams[0].(interface{ SetDeadline(time.Time) error }); ok {
+		cancelDeadline := cancelExternalNativeQUICCarrierDeadlineOnContextDone(ctx, deadlineCarrier)
+		defer cancelDeadline()
+	}
+
+	if localOpenedStream {
+		externalTransferTracef("native-quic-wait-receiver-ready-write local-opened=%v", localOpenedStream)
+		if _, err := streams[0].Write([]byte{externalNativeQUICReceiverReadyByte}); err != nil {
+			return err
+		}
+	}
+	var ready [1]byte
+	externalTransferTracef("native-quic-wait-receiver-ready-read local-opened=%v", localOpenedStream)
+	if _, err := io.ReadFull(streams[0], ready[:]); err != nil {
+		return err
+	}
+	if ready[0] != externalNativeQUICReceiverReadyByte {
+		return fmt.Errorf("native QUIC setup ready byte = %d, want %d", ready[0], externalNativeQUICReceiverReadyByte)
+	}
+	externalTransferTracef("native-quic-wait-receiver-ready-complete local-opened=%v", localOpenedStream)
+	return nil
+}
+
+func signalExternalNativeQUICReceiverReady(ctx context.Context, streams []*quic.Stream, localOpenedStream bool) error {
+	if len(streams) == 0 {
+		return errors.New("native QUIC setup has no streams")
+	}
+	externalTransferTracef("native-quic-signal-receiver-ready-start local-opened=%v stream=%T", localOpenedStream, streams[0])
+	cancelDeadline := cancelExternalNativeQUICCarrierDeadlineOnContextDone(ctx, streams[0])
+	defer cancelDeadline()
+
+	if !localOpenedStream {
+		externalTransferTracef("native-quic-signal-receiver-ready-read local-opened=%v", localOpenedStream)
+		var ready [1]byte
+		if _, err := io.ReadFull(streams[0], ready[:]); err != nil {
+			return err
+		}
+		if ready[0] != externalNativeQUICReceiverReadyByte {
+			return fmt.Errorf("native QUIC setup ready byte = %d, want %d", ready[0], externalNativeQUICReceiverReadyByte)
+		}
+	}
+	externalTransferTracef("native-quic-signal-receiver-ready-write local-opened=%v", localOpenedStream)
+	_, err := streams[0].Write([]byte{externalNativeQUICReceiverReadyByte})
+	if err == nil {
+		externalTransferTracef("native-quic-signal-receiver-ready-complete local-opened=%v", localOpenedStream)
+	}
+	return err
 }
 
 func requestExternalDirectModeAsync(
@@ -686,7 +1063,7 @@ func acceptExternalDirectModeAsync(
 ) <-chan externalNativeDirectModeResult {
 	resultCh := make(chan externalNativeDirectModeResult, 1)
 	go func() {
-		nativeQUIC, nativeTCPConns, err := acceptExternalQUICMode(
+		nativeQUIC, nativeTCPConns, nativeQUICAddr, err := acceptExternalQUICMode(
 			ctx,
 			client,
 			modeCh,
@@ -699,10 +1076,6 @@ func acceptExternalDirectModeAsync(
 			serverTLSConfig,
 			nativeTCPAuth,
 		)
-		var nativeQUICAddr net.Addr
-		if nativeQUIC && manager != nil {
-			nativeQUICAddr, _ = manager.DirectAddr()
-		}
 		resultCh <- externalNativeDirectModeResult{
 			nativeQUIC:     nativeQUIC,
 			nativeQUICAddr: nativeQUICAddr,
@@ -1068,6 +1441,10 @@ func requestExternalQUICMode(
 		return pkt.From == peerDERP && isQUICModeResponsePayload(pkt.Payload)
 	})
 	defer unsubscribe()
+	readyCh, unsubscribeReady := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == peerDERP && isQUICModeReadyPayload(pkt.Payload)
+	})
+	defer unsubscribeReady()
 
 	if err := sendEnvelope(ctx, client, peerDERP, envelope{
 		Type: envelopeQUICModeReq,
@@ -1165,6 +1542,17 @@ func requestExternalQUICMode(
 	}
 	if len(nativeTCPConns) > 0 {
 		localTCPListener = nil
+		return true, nativeTCPConns, cloneSessionAddr(addr), nil
+	}
+	readyCtx, readyCancel := context.WithTimeout(ctx, externalNativeQUICWait)
+	defer readyCancel()
+	ready, err := receiveQUICModeReady(readyCtx, readyCh)
+	if err != nil || !ready.NativeDirect {
+		closeExternalNativeTCPConns(nativeTCPConns)
+		if errors.Is(err, context.Canceled) {
+			return false, nil, nil, ctx.Err()
+		}
+		return false, nil, nil, nil
 	}
 	return true, nativeTCPConns, cloneSessionAddr(addr), nil
 }
@@ -1181,7 +1569,7 @@ func acceptExternalQUICMode(
 	clientTLSConfig *tls.Config,
 	serverTLSConfig *tls.Config,
 	nativeTCPAuth externalNativeTCPAuth,
-) (bool, []net.Conn, error) {
+) (bool, []net.Conn, net.Addr, error) {
 	modeCtx, cancel := context.WithTimeout(ctx, externalNativeQUICWait)
 	defer cancel()
 
@@ -1193,12 +1581,12 @@ func acceptExternalQUICMode(
 	req, err := receiveQUICModeRequest(modeCtx, modeCh)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, net.ErrClosed) {
-			return false, nil, nil
+			return false, nil, nil, nil
 		}
 		if errors.Is(err, context.Canceled) {
-			return false, nil, ctx.Err()
+			return false, nil, nil, ctx.Err()
 		}
-		return false, nil, nil
+		return false, nil, nil, nil
 	}
 	if emitter != nil {
 		emitter.Debug("listener-tcp-request=" + strconv.FormatBool(req.NativeTCP) + " addr=" + req.DirectAddr)
@@ -1239,7 +1627,7 @@ func acceptExternalQUICMode(
 	if req.NativeDirect && !forceRelay && nativeTCPListener == nil {
 		peerDirectAddr, ok, aborted := waitForExternalDirectAddrOrModeAbort(ctx, manager, ackCh, externalNativeQUICWait)
 		if aborted {
-			return false, nil, nil
+			return false, nil, nil, nil
 		}
 		if ok {
 			nativeQUIC = true
@@ -1283,10 +1671,10 @@ func acceptExternalQUICMode(
 		if nativeTCPListener != nil {
 			_ = nativeTCPListener.Close()
 		}
-		return false, nil, err
+		return false, nil, nil, err
 	}
 	if !nativeQUIC && nativeTCPListener == nil {
-		return false, nil, nil
+		return false, nil, nil, nil
 	}
 
 	type nativeTCPResult struct {
@@ -1335,7 +1723,7 @@ func acceptExternalQUICMode(
 			result := <-nativeTCPConnCh
 			closeExternalNativeTCPConns(result.conns)
 		}
-		return false, nil, nil
+		return false, nil, nil, nil
 	}
 	if nativeTCPListener != nil && (!ack.NativeTCP || nativeTCPPeerAddr == nil) {
 		if emitter != nil {
@@ -1348,16 +1736,75 @@ func acceptExternalQUICMode(
 			result := <-nativeTCPConnCh
 			closeExternalNativeTCPConns(result.conns)
 		}
-		return nativeQUIC, nil, nil
+		if !nativeQUIC {
+			return false, nil, nil, nil
+		}
+		readyAddr, err := sendExternalQUICModeReady(ctx, client, peerDERP, manager, nativeQUICAddr)
+		return nativeQUIC, nil, readyAddr, err
 	}
 	if nativeTCPListener == nil {
-		return nativeQUIC, nil, nil
+		if !nativeQUIC {
+			return false, nil, nil, nil
+		}
+		readyAddr, err := sendExternalQUICModeReady(ctx, client, peerDERP, manager, nativeQUICAddr)
+		return nativeQUIC, nil, readyAddr, err
 	}
 	result := <-nativeTCPConnCh
 	if result.err != nil {
-		return false, nil, result.err
+		return false, nil, nil, result.err
 	}
-	return nativeQUIC, result.conns, nil
+	return nativeQUIC, result.conns, cloneSessionAddr(nativeQUICAddr), nil
+}
+
+func sendExternalQUICModeReady(
+	ctx context.Context,
+	client *derpbind.Client,
+	peerDERP key.NodePublic,
+	manager *transport.Manager,
+	nativeQUICAddr net.Addr,
+) (net.Addr, error) {
+	readyAddr := cloneSessionAddr(nativeQUICAddr)
+	if manager != nil {
+		if readyAddr == nil {
+			readyAddr, _ = manager.DirectAddr()
+		}
+	}
+	if err := sendEnvelope(ctx, client, peerDERP, envelope{
+		Type:          envelopeQUICModeReady,
+		QUICModeReady: &quicModeReady{NativeDirect: true},
+	}); err != nil {
+		return nil, err
+	}
+	externalTransferTracef("listener-native-quic-ready-sent addr=%v", readyAddr)
+	return cloneSessionAddr(readyAddr), nil
+}
+
+func waitExternalNativeQUICSetupGrace(relayErrCh <-chan error, graceWait time.Duration) (error, bool) {
+	if graceWait <= 0 {
+		return nil, false
+	}
+	graceTimer := time.NewTimer(graceWait)
+	defer graceTimer.Stop()
+	select {
+	case relayErr := <-relayErrCh:
+		return relayErr, true
+	case <-graceTimer.C:
+		return nil, false
+	}
+}
+
+func externalNativeQUICSetupGraceWaitForSpool(spool *externalHandoffSpool) time.Duration {
+	if spool == nil {
+		return externalNativeQUICSetupGraceWait
+	}
+	spool.mu.Lock()
+	sourceEOF := spool.eof
+	relayTailBytes := spool.sourceOffset - spool.ackedWatermark
+	spool.mu.Unlock()
+	if sourceEOF && relayTailBytes >= 0 && relayTailBytes <= externalNativeQUICSetupShortRelayTailBytes {
+		return 0
+	}
+	return externalNativeQUICSetupGraceWait
 }
 
 func selectExternalQUICModeResponseAddr(peerAddr net.Addr, localCandidates []net.Addr) net.Addr {
@@ -1445,6 +1892,22 @@ func receiveQUICModeAck(ctx context.Context, ch <-chan derpbind.Packet) (quicMod
 		return *env.QUICModeAck, nil
 	case <-ctx.Done():
 		return quicModeAck{}, ctx.Err()
+	}
+}
+
+func receiveQUICModeReady(ctx context.Context, ch <-chan derpbind.Packet) (quicModeReady, error) {
+	select {
+	case pkt, ok := <-ch:
+		if !ok {
+			return quicModeReady{}, net.ErrClosed
+		}
+		env, err := decodeEnvelope(pkt.Payload)
+		if err != nil || env.Type != envelopeQUICModeReady || env.QUICModeReady == nil {
+			return quicModeReady{}, errors.New("unexpected quic mode ready")
+		}
+		return *env.QUICModeReady, nil
+	case <-ctx.Done():
+		return quicModeReady{}, ctx.Err()
 	}
 }
 
@@ -1935,6 +2398,14 @@ func isQUICModeAckPayload(payload []byte) bool {
 	return err == nil && env.Type == envelopeQUICModeAck && env.QUICModeAck != nil
 }
 
+func isQUICModeReadyPayload(payload []byte) bool {
+	if len(payload) == 0 || payload[0] != '{' {
+		return false
+	}
+	env, err := decodeEnvelope(payload)
+	return err == nil && env.Type == envelopeQUICModeReady && env.QUICModeReady != nil
+}
+
 func isDecisionPayload(payload []byte) bool {
 	if len(payload) == 0 || payload[0] != '{' {
 		return false
@@ -1950,7 +2421,8 @@ func isTransportDataPayload(payload []byte) bool {
 		!isDecisionPayload(payload) &&
 		!isQUICModeRequestPayload(payload) &&
 		!isQUICModeResponsePayload(payload) &&
-		!isQUICModeAckPayload(payload)
+		!isQUICModeAckPayload(payload) &&
+		!isQUICModeReadyPayload(payload)
 }
 
 func relayTransportAddr() net.Addr {

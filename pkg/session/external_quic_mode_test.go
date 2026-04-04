@@ -76,6 +76,10 @@ func TestRequestExternalQUICModeSendsRequestBeforeLocalDirectIsReady(t *testing.
 		return pkt.From == senderDERP.PublicKey() && isQUICModeRequestPayload(pkt.Payload)
 	})
 	defer unsubscribe()
+	modeAckCh, unsubscribeAck := listenerDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == senderDERP.PublicKey() && isQUICModeAckPayload(pkt.Payload)
+	})
+	defer unsubscribeAck()
 
 	listenerDone := make(chan error, 1)
 	go func() {
@@ -89,9 +93,20 @@ func TestRequestExternalQUICModeSendsRequestBeforeLocalDirectIsReady(t *testing.
 			return
 		}
 		manager.SeedRemoteCandidates(ctx, []net.Addr{cloneSessionAddr(peerPacketConn.LocalAddr())})
-		listenerDone <- sendEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{
+		if err := sendEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{
 			Type:         envelopeQUICModeResp,
 			QUICModeResp: &quicModeResponse{NativeDirect: true},
+		}); err != nil {
+			listenerDone <- err
+			return
+		}
+		if _, err := receiveQUICModeAck(ctx, modeAckCh); err != nil {
+			listenerDone <- err
+			return
+		}
+		listenerDone <- sendEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{
+			Type:          envelopeQUICModeReady,
+			QUICModeReady: &quicModeReady{NativeDirect: true},
 		})
 	}()
 
@@ -154,6 +169,10 @@ func TestRequestExternalQUICModeUsesPeerResponseAddrWhenLocalDirectIsNotReady(t 
 		return pkt.From == senderDERP.PublicKey() && isQUICModeRequestPayload(pkt.Payload)
 	})
 	defer unsubscribe()
+	modeAckCh, unsubscribeAck := listenerDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == senderDERP.PublicKey() && isQUICModeAckPayload(pkt.Payload)
+	})
+	defer unsubscribeAck()
 
 	wantAddr := "127.0.0.1:54321"
 	listenerDone := make(chan error, 1)
@@ -162,12 +181,23 @@ func TestRequestExternalQUICModeUsesPeerResponseAddrWhenLocalDirectIsNotReady(t 
 			listenerDone <- err
 			return
 		}
-		listenerDone <- sendEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{
+		if err := sendEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{
 			Type: envelopeQUICModeResp,
 			QUICModeResp: &quicModeResponse{
 				NativeDirect: true,
 				DirectAddr:   wantAddr,
 			},
+		}); err != nil {
+			listenerDone <- err
+			return
+		}
+		if _, err := receiveQUICModeAck(ctx, modeAckCh); err != nil {
+			listenerDone <- err
+			return
+		}
+		listenerDone <- sendEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{
+			Type:          envelopeQUICModeReady,
+			QUICModeReady: &quicModeReady{NativeDirect: true},
 		})
 	}()
 
@@ -189,6 +219,105 @@ func TestRequestExternalQUICModeUsesPeerResponseAddrWhenLocalDirectIsNotReady(t 
 	if len(nativeTCPConns) > 0 {
 		closeExternalNativeTCPConns(nativeTCPConns)
 		t.Fatal("requestExternalQUICMode() nativeTCPConns != nil, want nil")
+	}
+	if err := <-listenerDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRequestExternalQUICModeWaitsForListenerReadyBeforeReturningNativeQUIC(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	srv := newSessionTestDERPServer(t)
+	node := firstDERPNode(srv.Map, 1)
+
+	senderDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer senderDERP.Close()
+
+	listenerDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listenerDERP.Close()
+	warmExternalQUICModeTestDERPRoute(t, ctx, senderDERP, listenerDERP)
+
+	manager := transport.NewManager(transport.ManagerConfig{RelayAddr: relayTransportAddr()})
+	if err := manager.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cancel()
+		manager.Wait()
+	}()
+
+	modeCh, unsubscribeMode := listenerDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == senderDERP.PublicKey() && isQUICModeRequestPayload(pkt.Payload)
+	})
+	defer unsubscribeMode()
+	modeAckCh, unsubscribeAck := listenerDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == senderDERP.PublicKey() && isQUICModeAckPayload(pkt.Payload)
+	})
+	defer unsubscribeAck()
+
+	listenerDone := make(chan error, 1)
+	go func() {
+		if _, err := receiveQUICModeRequest(ctx, modeCh); err != nil {
+			listenerDone <- err
+			return
+		}
+		if err := sendEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{
+			Type: envelopeQUICModeResp,
+			QUICModeResp: &quicModeResponse{
+				NativeDirect: true,
+				DirectAddr:   "127.0.0.1:54321",
+			},
+		}); err != nil {
+			listenerDone <- err
+			return
+		}
+		if _, err := receiveQUICModeAck(ctx, modeAckCh); err != nil {
+			listenerDone <- err
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+		listenerDone <- sendEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{
+			Type:          envelopeQUICModeReady,
+			QUICModeReady: &quicModeReady{NativeDirect: true},
+		})
+	}()
+
+	start := time.Now()
+	nativeQUIC, nativeTCPConns, addr, err := requestExternalQUICMode(
+		ctx,
+		senderDERP,
+		listenerDERP.PublicKey(),
+		manager,
+		nil,
+		nil,
+		nil,
+		nil,
+		externalNativeTCPAuth{},
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < 200*time.Millisecond {
+		t.Fatalf("requestExternalQUICMode() returned after %v, want it to wait for listener native-QUIC ready", elapsed)
+	}
+	if !nativeQUIC {
+		t.Fatal("requestExternalQUICMode() nativeQUIC = false, want true")
+	}
+	if len(nativeTCPConns) > 0 {
+		closeExternalNativeTCPConns(nativeTCPConns)
+		t.Fatal("requestExternalQUICMode() nativeTCPConns != nil, want nil")
+	}
+	if addr == nil || addr.String() != "127.0.0.1:54321" {
+		t.Fatalf("requestExternalQUICMode() addr = %v, want 127.0.0.1:54321", addr)
 	}
 	if err := <-listenerDone; err != nil {
 		t.Fatal(err)
@@ -276,7 +405,7 @@ func TestExternalQUICModeNegotiationUsesListenerResponseAddrWithoutSplitBrain(t 
 		err        error
 	}, 1)
 	go func() {
-		nativeQUIC, nativeTCPConns, err := acceptExternalQUICMode(
+		nativeQUIC, nativeTCPConns, _, err := acceptExternalQUICMode(
 			ctx,
 			listenerDERP,
 			modeCh,
@@ -388,7 +517,7 @@ func TestExternalQUICModeNegotiationUsesRouteLocalNativeTCPBeforeUDPDirectPromot
 		err        error
 	}, 1)
 	go func() {
-		nativeQUIC, nativeTCPConns, err := acceptExternalQUICMode(
+		nativeQUIC, nativeTCPConns, _, err := acceptExternalQUICMode(
 			ctx,
 			listenerDERP,
 			modeCh,

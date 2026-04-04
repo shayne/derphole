@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -592,6 +593,58 @@ func TestExternalListenSendStartsRelayQUICWhenNativeTCPIsUnavailableAndDirectNev
 	}
 }
 
+func TestExternalListenSendSmallRelayPayloadDoesNotWaitForDelayedNativeMode(t *testing.T) {
+	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
+
+	prevTCPAddrAllowed := externalNativeTCPAddrAllowed
+	externalNativeTCPAddrAllowed = func(net.Addr) bool { return false }
+	t.Cleanup(func() { externalNativeTCPAddrAllowed = prevTCPAddrAllowed })
+
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	var listenerOut bytes.Buffer
+	var listenerStatus syncBuffer
+	var senderStatus syncBuffer
+
+	tokenSink := make(chan string, 1)
+	listenErr := make(chan error, 1)
+	go func() {
+		_, err := Listen(ctx, ListenConfig{
+			Emitter:       telemetry.New(&listenerStatus, telemetry.LevelVerbose),
+			TokenSink:     tokenSink,
+			StdioOut:      &listenerOut,
+			UsePublicDERP: true,
+		})
+		listenErr <- err
+	}()
+
+	token := <-tokenSink
+	start := time.Now()
+	if err := Send(ctx, SendConfig{
+		Token:         token,
+		Emitter:       telemetry.New(&senderStatus, telemetry.LevelVerbose),
+		StdioIn:       bytes.NewReader(bytes.Repeat([]byte("relay-now"), 1024)),
+		UsePublicDERP: true,
+	}); err != nil {
+		t.Fatalf("Send() error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+	}
+	if err := <-listenErr; err != nil {
+		t.Fatalf("Listen() error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("small relay transfer took %v, want < 2s without waiting for native mode timeout; listener=%q sender=%q", elapsed, listenerStatus.String(), senderStatus.String())
+	}
+	if got := listenerOut.String(); got != strings.Repeat("relay-now", 1024) {
+		t.Fatalf("listener output length = %d, want %d", len(got), len(strings.Repeat("relay-now", 1024)))
+	}
+}
+
 func TestExternalListenSendHandsOffToNativeQUICWhenNativeTCPIsUnavailableAndBothSidesAreDirectReady(t *testing.T) {
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
@@ -607,7 +660,7 @@ func TestExternalListenSendHandsOffToNativeQUICWhenNativeTCPIsUnavailableAndBoth
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	payload := bytes.Repeat([]byte("native-quic-direct:"), 1<<14)
+	payload := bytes.Repeat([]byte("native-quic-direct:"), 1<<18)
 	var listenerOut bytes.Buffer
 	var listenerStatus syncBuffer
 	var senderStatus syncBuffer
@@ -634,7 +687,14 @@ func TestExternalListenSendHandsOffToNativeQUICWhenNativeTCPIsUnavailableAndBoth
 			writerErr <- err
 			return
 		}
-		time.Sleep(250 * time.Millisecond)
+		if err := waitForSessionTestStatusContains(ctx, &senderStatus, "sender-quic-direct"); err != nil {
+			writerErr <- fmt.Errorf("waiting for sender native QUIC handoff: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+			return
+		}
+		if err := waitForSessionTestStatusContains(ctx, &listenerStatus, "listener-quic-direct"); err != nil {
+			writerErr <- fmt.Errorf("waiting for listener native QUIC handoff: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+			return
+		}
 		_, err := stdinWriter.Write(payload[midpoint:])
 		writerErr <- err
 	}()
@@ -667,6 +727,21 @@ func TestExternalListenSendHandsOffToNativeQUICWhenNativeTCPIsUnavailableAndBoth
 	}
 	if got := listenerStatus.String(); !strings.Contains(got, "listener-quic-direct") || strings.Contains(got, "listener-tcp-direct") {
 		t.Fatalf("listener status = %q, want native QUIC handoff without native TCP", got)
+	}
+}
+
+func waitForSessionTestStatusContains(ctx context.Context, status *syncBuffer, needle string) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if strings.Contains(status.String(), needle) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 

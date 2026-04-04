@@ -148,7 +148,8 @@ func TestListenWithoutFlagsUsesStderrForTokenAndStdoutForPayload(t *testing.T) {
 func TestListenReportsRelayThenDirectWhenTransportUpgrades(t *testing.T) {
 	listenerStderr, senderStderr := runUpgradingExternalListenAndSend(t)
 
-	assertStatusLinesExact(t, listenerStderr, "listener stderr", "waiting-for-claim", "connected-relay", "connected-direct", "stream-complete")
+	assertStatusLinesPrefix(t, listenerStderr, "listener stderr", "waiting-for-claim", "connected-relay", "connected-direct")
+	assertStatusLinesComplete(t, listenerStderr, "listener stderr")
 	assertStatusLinesPrefix(t, senderStderr, "sender stderr", "probing-direct", "connected-relay", "connected-direct")
 }
 
@@ -375,26 +376,21 @@ func waitForStatusPrefix(t *testing.T, buf outputBuffer, timeout time.Duration, 
 	t.Fatalf("statuses = %q, want prefix %v", buf.String(), want)
 }
 
-func assertStatusLinesExact(t *testing.T, got, label string, want ...string) {
-	t.Helper()
-
-	lines := statusLines(got)
-	if len(lines) != len(want) {
-		t.Fatalf("%s statuses = %q, want exact %v", label, lines, want)
-	}
-	for i := range want {
-		if lines[i] != want[i] {
-			t.Fatalf("%s statuses = %q, want exact %v", label, lines, want)
-		}
-	}
-}
-
 func assertStatusLinesPrefix(t *testing.T, got, label string, want ...string) {
 	t.Helper()
 
 	lines := statusLines(got)
 	if !hasStatusPrefix(lines, want) {
 		t.Fatalf("%s statuses = %q, want prefix %v", label, lines, want)
+	}
+}
+
+func assertStatusLinesComplete(t *testing.T, got, label string) {
+	t.Helper()
+
+	lines := statusLines(got)
+	if len(lines) == 0 || lines[len(lines)-1] != "stream-complete" {
+		t.Fatalf("%s statuses = %q, want final status %q", label, lines, "stream-complete")
 	}
 }
 

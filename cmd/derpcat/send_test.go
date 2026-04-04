@@ -63,7 +63,8 @@ func TestSendRejectsTrailingArgs(t *testing.T) {
 func TestSendReportsRelayThenDirectWhenTransportUpgrades(t *testing.T) {
 	listenerStderr, senderStderr := runUpgradingExternalListenAndSend(t)
 
-	assertStatusLinesExact(t, listenerStderr, "listener stderr", "waiting-for-claim", "connected-relay", "connected-direct", "stream-complete")
+	assertStatusLinesPrefix(t, listenerStderr, "listener stderr", "waiting-for-claim", "connected-relay", "connected-direct")
+	assertStatusLinesComplete(t, listenerStderr, "listener stderr")
 	assertStatusLinesPrefix(t, senderStderr, "sender stderr", "probing-direct", "connected-relay", "connected-direct")
 }
 

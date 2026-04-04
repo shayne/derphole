@@ -40,6 +40,7 @@ func (m *Manager) discoveryLoop(ctx context.Context) {
 }
 
 func (m *Manager) requestDiscovery(ctx context.Context, forceCandidateRefresh bool) {
+	ctx = m.directContext(ctx)
 	m.discoveryMu.Lock()
 	if forceCandidateRefresh {
 		m.forceCandidateRefresh = true
@@ -150,6 +151,9 @@ func (m *Manager) directPacketReadLoop(ctx context.Context) {
 	}
 	buf := make([]byte, bufLen)
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		if err := m.cfg.DirectConn.SetReadDeadline(m.now().Add(m.discoveryInterval())); err != nil {
 			return
 		}
@@ -180,6 +184,9 @@ func (m *Manager) directBatchReadLoop(ctx context.Context, batchConn DirectBatch
 	}
 
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		if err := batchConn.SetReadDeadline(m.now().Add(m.discoveryInterval())); err != nil {
 			return
 		}

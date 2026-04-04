@@ -24,15 +24,26 @@ type externalNativeQUICConnResult struct {
 	err    error
 }
 
+type externalNativeQUICStreamResult struct {
+	index  int
+	stream *quic.Stream
+	err    error
+}
+
 var errExternalNativeQUICNoMatchingStripeCandidate = errors.New("no matching native QUIC stripe candidate")
+
+const externalNativeQUICDuplicateConnWait = 250 * time.Millisecond
+const externalNativeQUICStreamOpenByte = byte(1)
 
 var externalNativeQUICStripeProbeCandidates = publicProbeCandidates
 var externalNativeQUICStripeCanUseLocalAddrCandidate = externalNativeQUICStripeCanUseLocalAddrCandidateDefault
 
 type externalNativeQUICStripedSession struct {
+	setupFallback bool
 	packetConns   []net.PacketConn
 	transports    []*quic.Transport
 	conns         []*quic.Conn
+	openStreams   []bool
 	portmaps      []publicPortmap
 	primaryStream *quic.Stream
 }
@@ -74,20 +85,65 @@ func (s *externalNativeQUICStripedSession) OpenStreams(ctx context.Context) ([]i
 }
 
 func (s *externalNativeQUICStripedSession) OpenReadWriteStreams(ctx context.Context) ([]io.ReadWriteCloser, error) {
-	if s.primaryStream != nil {
-		return []io.ReadWriteCloser{s.primaryStream}, nil
+	streams, err := s.OpenQUICStreams(ctx)
+	if err != nil {
+		return nil, err
 	}
-	streams := make([]io.ReadWriteCloser, 0, len(s.conns))
-	for _, conn := range s.conns {
-		stream, err := conn.OpenStreamSync(ctx)
-		if err != nil {
-			for _, stream := range streams {
+	rwStreams := make([]io.ReadWriteCloser, 0, len(streams))
+	for _, stream := range streams {
+		rwStreams = append(rwStreams, stream)
+	}
+	return rwStreams, nil
+}
+
+func (s *externalNativeQUICStripedSession) OpenQUICStreams(ctx context.Context) ([]*quic.Stream, error) {
+	if s.primaryStream != nil {
+		externalTransferTracef("native-quic-open-streams-primary-reuse")
+		return []*quic.Stream{s.primaryStream}, nil
+	}
+	externalTransferTracef("native-quic-open-streams-start conns=%d", len(s.conns))
+	streamCtx, streamCancel := context.WithCancel(ctx)
+	defer streamCancel()
+
+	results := make(chan externalNativeQUICStreamResult, len(s.conns))
+	for i, conn := range s.conns {
+		i := i
+		conn := conn
+		openStream := externalNativeQUICStreamRole(s.openStreams, i)
+		go func() {
+			externalTransferTracef("native-quic-open-stream-start index=%d", i)
+			stream, err := openExternalNativeQUICStreamForConn(streamCtx, conn, openStream)
+			results <- externalNativeQUICStreamResult{
+				index:  i,
+				stream: stream,
+				err:    err,
+			}
+		}()
+	}
+
+	streams := make([]*quic.Stream, len(s.conns))
+	var firstErr error
+	for range s.conns {
+		result := <-results
+		if result.err != nil {
+			if firstErr == nil {
+				firstErr = result.err
+				streamCancel()
+			}
+			continue
+		}
+		streams[result.index] = result.stream
+		externalTransferTracef("native-quic-open-stream-complete index=%d", result.index)
+	}
+	if firstErr != nil {
+		for _, stream := range streams {
+			if stream != nil {
 				_ = stream.Close()
 			}
-			return nil, err
 		}
-		streams = append(streams, stream)
+		return nil, firstErr
 	}
+	externalTransferTracef("native-quic-open-streams-complete conns=%d", len(streams))
 	return streams, nil
 }
 
@@ -102,11 +158,12 @@ func dialExternalNativeQUICStripedConns(
 	connCount int,
 ) (*externalNativeQUICStripedSession, error) {
 	connCount = externalNativeQUICConnCountForPeer(peerAddr, connCount)
+	externalTransferTracef("native-quic-dial-striped-start peer=%v conns=%d", peerAddr, connCount)
 	if connCount < 1 {
 		return nil, errors.New("native QUIC connection count must be positive")
 	}
 	if connCount > 1 && externalNativeQUICStripeShouldReusePrimaryPacketConn(peerAddr) {
-		transport, conns, err := dialOrAcceptExternalNativeQUICConnsWithRole(
+		transport, conns, openStreams, err := dialOrAcceptExternalNativeQUICConnsWithStreamRole(
 			ctx,
 			packetConn,
 			peerAddr,
@@ -125,23 +182,27 @@ func dialExternalNativeQUICStripedConns(
 			packetConns: []net.PacketConn{packetConn},
 			transports:  []*quic.Transport{transport},
 			conns:       conns,
+			openStreams: externalNativeQUICStreamRoles(len(conns), openStreams),
 		}, nil
 	}
 
-	primaryTransport, primaryConn, err := dialOrAcceptExternalNativeQUICConn(
+	primaryTransport, primaryConn, openPrimaryStream, err := dialOrAcceptExternalNativeQUICConnWithRole(
 		ctx,
 		packetConn,
 		peerAddr,
 		clientTLS,
 		serverTLS,
+		true,
 	)
 	if err != nil {
 		return nil, err
 	}
+	externalTransferTracef("native-quic-dial-primary-ready")
 	session := &externalNativeQUICStripedSession{
 		packetConns: []net.PacketConn{packetConn},
 		transports:  []*quic.Transport{primaryTransport},
 		conns:       []*quic.Conn{primaryConn},
+		openStreams: []bool{openPrimaryStream},
 	}
 	if connCount == 1 {
 		if emitter != nil {
@@ -151,14 +212,18 @@ func dialExternalNativeQUICStripedConns(
 	}
 
 	controlOpenCtx, controlOpenCancel := context.WithTimeout(ctx, externalNativeQUICWait)
-	controlStream, err := primaryConn.OpenStreamSync(controlOpenCtx)
+	controlStream, err := openExternalNativeQUICStreamForConn(controlOpenCtx, primaryConn, openPrimaryStream)
 	controlOpenCancel()
 	if err != nil {
 		if emitter != nil {
 			emitter.Debug("native-quic-primary-fallback=open-control-stream")
 		}
+		session.setupFallback = true
 		return session, nil
 	}
+	externalTransferTracef("native-quic-dial-control-open")
+	cancelControlStreamDeadline := cancelExternalNativeQUICControlStreamDeadlineOnContextDone(ctx, controlStream)
+	defer cancelControlStreamDeadline()
 	keepControlStream := false
 	defer func() {
 		if keepControlStream {
@@ -173,7 +238,16 @@ func dialExternalNativeQUICStripedConns(
 		if emitter != nil {
 			emitter.Debug("native-quic-primary-fallback=open-stripe-sockets")
 		}
+		session.setupFallback = true
 		return session, nil
+	}
+	externalTransferTracef("native-quic-dial-stripe-candidates-ready stripes=%d", len(localPacketConns))
+	if err := ctx.Err(); err != nil {
+		closeExternalNativeQUICStripePacketConns(localPacketConns, localPortmaps)
+		session.setupFallback = true
+		session.primaryStream = controlStream
+		keepControlStream = true
+		return session, err
 	}
 
 	_ = controlStream.SetDeadline(time.Now().Add(externalNativeQUICWait))
@@ -182,16 +256,24 @@ func dialExternalNativeQUICStripedConns(
 		if emitter != nil {
 			emitter.Debug("native-quic-primary-fallback=encode-stripe-setup")
 		}
+		session.setupFallback = true
+		session.primaryStream = controlStream
+		keepControlStream = true
 		return session, nil
 	}
 	var peerSetup externalNativeQUICStripeSetup
+	externalTransferTracef("native-quic-dial-peer-stripe-setup-wait")
 	if err := json.NewDecoder(controlStream).Decode(&peerSetup); err != nil {
 		closeExternalNativeQUICStripePacketConns(localPacketConns, localPortmaps)
 		if emitter != nil {
 			emitter.Debug("native-quic-primary-fallback=decode-stripe-setup")
 		}
+		session.setupFallback = true
+		session.primaryStream = controlStream
+		keepControlStream = true
 		return session, nil
 	}
+	externalTransferTracef("native-quic-dial-peer-stripe-setup-received stripes=%d", len(peerSetup.CandidateSets))
 	stripeCount := min(len(localPacketConns), len(peerSetup.CandidateSets))
 	if stripeCount < len(localPacketConns) {
 		closeExternalNativeQUICStripePacketConns(localPacketConns[stripeCount:], localPortmaps[stripeCount:])
@@ -203,6 +285,9 @@ func dialExternalNativeQUICStripedConns(
 		if emitter != nil {
 			emitter.Debug("native-quic-primary-fallback=stripe-setup-size")
 		}
+		session.setupFallback = true
+		session.primaryStream = controlStream
+		keepControlStream = true
 		return session, nil
 	}
 	_ = controlStream.SetDeadline(time.Time{})
@@ -222,13 +307,15 @@ func dialExternalNativeQUICStripedConns(
 			}
 			break
 		}
-		transport, conn, err := dialOrAcceptExternalNativeQUICConn(
+		transport, conn, openStream, err := dialOrAcceptExternalNativeQUICConnWithRole(
 			extraSetupCtx,
 			localPacketConn,
 			stripePeerAddr,
 			clientTLS,
 			serverTLS,
+			true,
 		)
+		externalTransferTracef("native-quic-dial-stripe-ready index=%d peer=%v err=%v", i, stripePeerAddr, err)
 		if emitter != nil {
 			emitter.Debug("native-quic-stripe-local=" + localPacketConn.LocalAddr().String() + " peer=" + stripePeerAddr.String())
 		}
@@ -241,6 +328,7 @@ func dialExternalNativeQUICStripedConns(
 		}
 		extraTransports = append(extraTransports, transport)
 		extraConns = append(extraConns, conn)
+		session.openStreams = append(session.openStreams, openStream)
 	}
 	_ = controlStream.SetDeadline(time.Now().Add(externalNativeQUICWait))
 	if err := json.NewEncoder(controlStream).Encode(externalNativeQUICStripeSetupResult{Ready: stripeReady}); err != nil {
@@ -252,6 +340,9 @@ func dialExternalNativeQUICStripedConns(
 		if emitter != nil {
 			emitter.Debug("native-quic-primary-fallback=encode-stripe-ready")
 		}
+		session.setupFallback = true
+		session.primaryStream = controlStream
+		keepControlStream = true
 		return session, nil
 	}
 	var peerReady externalNativeQUICStripeSetupResult
@@ -264,8 +355,12 @@ func dialExternalNativeQUICStripedConns(
 		if emitter != nil {
 			emitter.Debug("native-quic-primary-fallback=final")
 		}
+		session.setupFallback = true
+		session.primaryStream = controlStream
+		keepControlStream = true
 		return session, nil
 	}
+	externalTransferTracef("native-quic-dial-striped-ready conns=%d", len(session.conns)+len(extraConns))
 
 	session.packetConns = append(session.packetConns, localPacketConns...)
 	session.portmaps = append(session.portmaps, localPortmaps...)
@@ -289,11 +384,12 @@ func acceptExternalNativeQUICStripedConns(
 	connCount int,
 ) (*externalNativeQUICStripedSession, []*quic.Stream, error) {
 	connCount = externalNativeQUICConnCountForPeer(peerAddr, connCount)
+	externalTransferTracef("native-quic-accept-striped-start peer=%v conns=%d", peerAddr, connCount)
 	if connCount < 1 {
 		return nil, nil, errors.New("native QUIC connection count must be positive")
 	}
 	if connCount > 1 && externalNativeQUICStripeShouldReusePrimaryPacketConn(peerAddr) {
-		transport, conns, err := dialOrAcceptExternalNativeQUICConnsWithRole(
+		transport, conns, openStreams, err := dialOrAcceptExternalNativeQUICConnsWithStreamRole(
 			ctx,
 			packetConn,
 			peerAddr,
@@ -309,30 +405,25 @@ func acceptExternalNativeQUICStripedConns(
 			packetConns: []net.PacketConn{packetConn},
 			transports:  []*quic.Transport{transport},
 			conns:       conns,
+			openStreams: externalNativeQUICStreamRoles(len(conns), openStreams),
 		}
 		if emitter != nil {
 			emitter.Debug(fmt.Sprintf("native-quic-stripes=%d", len(conns)))
 		}
-		streams := make([]*quic.Stream, 0, len(conns))
-		for _, conn := range conns {
-			stream, err := conn.AcceptStream(ctx)
-			if err != nil {
-				closeExternalNativeQUICStreams(streams)
-				session.Close()
-				return nil, nil, err
-			}
-			streams = append(streams, stream)
+		streams, err := session.OpenQUICStreams(ctx)
+		if err != nil {
+			session.Close()
+			return nil, nil, err
 		}
 		return session, streams, nil
 	}
 
-	transport, conns, err := dialOrAcceptExternalNativeQUICConnsWithRole(
+	transport, conn, openPrimaryStream, err := dialOrAcceptExternalNativeQUICConnWithRole(
 		ctx,
 		packetConn,
 		peerAddr,
 		clientTLS,
 		serverTLS,
-		1,
 		false,
 	)
 	if err != nil {
@@ -341,20 +432,26 @@ func acceptExternalNativeQUICStripedConns(
 	session := &externalNativeQUICStripedSession{
 		packetConns: []net.PacketConn{packetConn},
 		transports:  []*quic.Transport{transport},
-		conns:       conns,
+		conns:       []*quic.Conn{conn},
+		openStreams: []bool{openPrimaryStream},
 	}
+	externalTransferTracef("native-quic-accept-primary-ready")
 	if connCount > 1 {
 		controlAcceptCtx, controlAcceptCancel := context.WithTimeout(ctx, externalNativeQUICWait)
-		controlStream, err := conns[0].AcceptStream(controlAcceptCtx)
+		controlStream, err := openExternalNativeQUICStreamForConn(controlAcceptCtx, conn, openPrimaryStream)
 		controlAcceptCancel()
 		if err != nil {
-			stream, streamErr := conns[0].AcceptStream(ctx)
+			stream, streamErr := openExternalNativeQUICStreamForConn(ctx, conn, openPrimaryStream)
 			if streamErr != nil {
 				session.Close()
 				return nil, nil, streamErr
 			}
+			session.setupFallback = true
 			return session, []*quic.Stream{stream}, nil
 		}
+		externalTransferTracef("native-quic-accept-control-open")
+		cancelControlStreamDeadline := cancelExternalNativeQUICControlStreamDeadlineOnContextDone(ctx, controlStream)
+		defer cancelControlStreamDeadline()
 		keepControlStream := false
 		defer func() {
 			if keepControlStream {
@@ -370,24 +467,19 @@ func acceptExternalNativeQUICStripedConns(
 			if emitter != nil {
 				emitter.Debug("native-quic-primary-fallback=decode-stripe-setup")
 			}
-			stream, streamErr := conns[0].AcceptStream(ctx)
-			if streamErr != nil {
-				session.Close()
-				return nil, nil, streamErr
-			}
-			return session, []*quic.Stream{stream}, nil
+			session.setupFallback = true
+			keepControlStream = true
+			return session, []*quic.Stream{controlStream}, nil
 		}
+		externalTransferTracef("native-quic-accept-peer-stripe-setup-received stripes=%d", len(peerSetup.CandidateSets))
 		stripeCount := min(connCount-1, len(peerSetup.CandidateSets))
 		if stripeCount == 0 {
 			if emitter != nil {
 				emitter.Debug("native-quic-primary-fallback=stripe-setup-size")
 			}
-			stream, streamErr := conns[0].AcceptStream(ctx)
-			if streamErr != nil {
-				session.Close()
-				return nil, nil, streamErr
-			}
-			return session, []*quic.Stream{stream}, nil
+			session.setupFallback = true
+			keepControlStream = true
+			return session, []*quic.Stream{controlStream}, nil
 		}
 
 		_ = controlStream.SetDeadline(time.Time{})
@@ -397,12 +489,20 @@ func acceptExternalNativeQUICStripedConns(
 			if emitter != nil {
 				emitter.Debug("native-quic-primary-fallback=open-stripe-sockets")
 			}
-			stream, streamErr := conns[0].AcceptStream(ctx)
+			stream, streamErr := conn.AcceptStream(ctx)
 			if streamErr != nil {
 				session.Close()
 				return nil, nil, streamErr
 			}
+			session.setupFallback = true
 			return session, []*quic.Stream{stream}, nil
+		}
+		externalTransferTracef("native-quic-accept-stripe-candidates-ready stripes=%d", len(localPacketConns))
+		if err := ctx.Err(); err != nil {
+			closeExternalNativeQUICStripePacketConns(localPacketConns, localPortmaps)
+			session.setupFallback = true
+			keepControlStream = true
+			return session, []*quic.Stream{controlStream}, err
 		}
 		if stripeCount < len(localPacketConns) {
 			closeExternalNativeQUICStripePacketConns(localPacketConns[stripeCount:], localPortmaps[stripeCount:])
@@ -417,12 +517,9 @@ func acceptExternalNativeQUICStripedConns(
 			if emitter != nil {
 				emitter.Debug("native-quic-primary-fallback=encode-stripe-setup")
 			}
-			stream, streamErr := conns[0].AcceptStream(ctx)
-			if streamErr != nil {
-				session.Close()
-				return nil, nil, streamErr
-			}
-			return session, []*quic.Stream{stream}, nil
+			session.setupFallback = true
+			keepControlStream = true
+			return session, []*quic.Stream{controlStream}, nil
 		}
 		_ = controlStream.SetDeadline(time.Time{})
 
@@ -441,7 +538,7 @@ func acceptExternalNativeQUICStripedConns(
 				}
 				break
 			}
-			transport, conns, err := dialOrAcceptExternalNativeQUICConnsWithRole(
+			transport, conns, openStream, err := dialOrAcceptExternalNativeQUICConnsWithStreamRole(
 				extraSetupCtx,
 				localPacketConn,
 				stripePeerAddr,
@@ -450,6 +547,7 @@ func acceptExternalNativeQUICStripedConns(
 				1,
 				false,
 			)
+			externalTransferTracef("native-quic-accept-stripe-ready index=%d peer=%v err=%v", i, stripePeerAddr, err)
 			if emitter != nil {
 				emitter.Debug("native-quic-stripe-local=" + localPacketConn.LocalAddr().String() + " peer=" + stripePeerAddr.String())
 			}
@@ -462,6 +560,7 @@ func acceptExternalNativeQUICStripedConns(
 			}
 			extraTransports = append(extraTransports, transport)
 			extraConns = append(extraConns, conns[0])
+			session.openStreams = append(session.openStreams, openStream)
 		}
 		_ = controlStream.SetDeadline(time.Now().Add(externalNativeQUICWait))
 		var peerReady externalNativeQUICStripeSetupResult
@@ -477,32 +576,25 @@ func acceptExternalNativeQUICStripedConns(
 			if emitter != nil {
 				emitter.Debug("native-quic-primary-fallback")
 			}
-			stream, streamErr := conns[0].AcceptStream(ctx)
-			if streamErr != nil {
-				session.Close()
-				return nil, nil, streamErr
-			}
-			return session, []*quic.Stream{stream}, nil
+			session.setupFallback = true
+			keepControlStream = true
+			return session, []*quic.Stream{controlStream}, nil
 		}
 
 		session.packetConns = append(session.packetConns, localPacketConns...)
 		session.portmaps = append(session.portmaps, localPortmaps...)
 		session.transports = append(session.transports, extraTransports...)
 		session.conns = append(session.conns, extraConns...)
+		externalTransferTracef("native-quic-accept-striped-ready conns=%d", len(session.conns))
 		if emitter != nil {
 			emitter.Debug(fmt.Sprintf("native-quic-stripes=%d", len(session.conns)))
 		}
 	}
 
-	streams := make([]*quic.Stream, 0, len(session.conns))
-	for _, conn := range session.conns {
-		stream, err := conn.AcceptStream(ctx)
-		if err != nil {
-			closeExternalNativeQUICStreams(streams)
-			session.Close()
-			return nil, nil, err
-		}
-		streams = append(streams, stream)
+	streams, err := session.OpenQUICStreams(ctx)
+	if err != nil {
+		session.Close()
+		return nil, nil, err
 	}
 	return session, streams, nil
 }
@@ -699,11 +791,34 @@ func dialOrAcceptExternalNativeQUICConn(
 	clientTLS *tls.Config,
 	serverTLS *tls.Config,
 ) (*quic.Transport, *quic.Conn, error) {
-	transport, conns, err := dialOrAcceptExternalNativeQUICConns(ctx, packetConn, peerAddr, clientTLS, serverTLS, 1)
+	transport, conn, _, err := dialOrAcceptExternalNativeQUICConnWithRole(ctx, packetConn, peerAddr, clientTLS, serverTLS, true)
 	if err != nil {
 		return nil, nil, err
 	}
-	return transport, conns[0], nil
+	return transport, conn, nil
+}
+
+func dialOrAcceptExternalNativeQUICConnWithRole(
+	ctx context.Context,
+	packetConn net.PacketConn,
+	peerAddr net.Addr,
+	clientTLS *tls.Config,
+	serverTLS *tls.Config,
+	preferDial bool,
+) (*quic.Transport, *quic.Conn, bool, error) {
+	transport, conns, openStreams, err := dialOrAcceptExternalNativeQUICConnsWithStreamRole(
+		ctx,
+		packetConn,
+		peerAddr,
+		clientTLS,
+		serverTLS,
+		1,
+		preferDial,
+	)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return transport, conns[0], openStreams, nil
 }
 
 func dialOrAcceptExternalNativeQUICConns(
@@ -717,6 +832,51 @@ func dialOrAcceptExternalNativeQUICConns(
 	return dialOrAcceptExternalNativeQUICConnsWithRole(ctx, packetConn, peerAddr, clientTLS, serverTLS, connCount, true)
 }
 
+func acceptExternalNativeQUICConnStrict(
+	ctx context.Context,
+	packetConn net.PacketConn,
+	serverTLS *tls.Config,
+) (*quic.Transport, *quic.Conn, error) {
+	transport, conns, err := acceptExternalNativeQUICConnsStrict(ctx, packetConn, serverTLS, 1)
+	if err != nil {
+		return nil, nil, err
+	}
+	return transport, conns[0], nil
+}
+
+func acceptExternalNativeQUICConnsStrict(
+	ctx context.Context,
+	packetConn net.PacketConn,
+	serverTLS *tls.Config,
+	connCount int,
+) (*quic.Transport, []*quic.Conn, error) {
+	if connCount < 1 {
+		return nil, nil, errors.New("native QUIC connection count must be positive")
+	}
+	transport, listener, err := startExternalNativeQUICTransport(packetConn, serverTLS)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	acceptCtx, cancel := context.WithTimeout(ctx, externalNativeQUICConnectWait)
+	defer cancel()
+
+	conns := make([]*quic.Conn, 0, connCount)
+	for len(conns) < connCount {
+		conn, err := listener.Accept(acceptCtx)
+		if err != nil {
+			closeExternalNativeQUICConns(conns)
+			_ = listener.Close()
+			_ = transport.Close()
+			return nil, nil, err
+		}
+		conns = append(conns, conn)
+	}
+
+	_ = listener.Close()
+	return transport, conns, nil
+}
+
 func dialOrAcceptExternalNativeQUICConnsWithRole(
 	ctx context.Context,
 	packetConn net.PacketConn,
@@ -726,12 +886,25 @@ func dialOrAcceptExternalNativeQUICConnsWithRole(
 	connCount int,
 	preferDial bool,
 ) (*quic.Transport, []*quic.Conn, error) {
+	transport, conns, _, err := dialOrAcceptExternalNativeQUICConnsWithStreamRole(ctx, packetConn, peerAddr, clientTLS, serverTLS, connCount, preferDial)
+	return transport, conns, err
+}
+
+func dialOrAcceptExternalNativeQUICConnsWithStreamRole(
+	ctx context.Context,
+	packetConn net.PacketConn,
+	peerAddr net.Addr,
+	clientTLS *tls.Config,
+	serverTLS *tls.Config,
+	connCount int,
+	preferDial bool,
+) (*quic.Transport, []*quic.Conn, bool, error) {
 	if connCount < 1 {
-		return nil, nil, errors.New("native QUIC connection count must be positive")
+		return nil, nil, false, errors.New("native QUIC connection count must be positive")
 	}
 	transport, listener, err := startExternalNativeQUICTransport(packetConn, serverTLS)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 
 	connectCtx, cancel := context.WithTimeout(ctx, externalNativeQUICConnectWait)
@@ -747,7 +920,7 @@ func dialOrAcceptExternalNativeQUICConnsWithRole(
 		cancel()
 		_ = listener.Close()
 		_ = transport.Close()
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 
 	conns := []*quic.Conn{firstConn}
@@ -763,14 +936,14 @@ func dialOrAcceptExternalNativeQUICConnsWithRole(
 			_ = listener.Close()
 			closeExternalNativeQUICConns(conns)
 			_ = transport.Close()
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		conns = append(conns, nextConn)
 	}
 
 	cancel()
 	_ = listener.Close()
-	return transport, conns, nil
+	return transport, conns, dialRemainder, nil
 }
 
 func dialOrAcceptExternalNativeQUICConnOnTransport(
@@ -789,6 +962,16 @@ func dialOrAcceptExternalNativeQUICConnOnTransport(
 	if peerAddr != nil {
 		pendingResults++
 		go func() {
+			if !preferDial {
+				delayTimer := time.NewTimer(externalNativeQUICDuplicateConnWait)
+				defer delayTimer.Stop()
+				select {
+				case <-delayTimer.C:
+				case <-connectCtx.Done():
+					results <- externalNativeQUICConnResult{dialed: true, err: connectCtx.Err()}
+					return
+				}
+			}
 			conn, err := transport.Dial(connectCtx, peerAddr, clientTLS, quicpath.DefaultQUICConfig())
 			results <- externalNativeQUICConnResult{conn: conn, dialed: true, err: err}
 		}()
@@ -801,21 +984,35 @@ func dialOrAcceptExternalNativeQUICConnOnTransport(
 	var firstErr error
 	var firstConn *quic.Conn
 	var firstDialed bool
-	for range pendingResults {
-		result := <-results
-		if result.err == nil {
-			if firstConn == nil {
-				firstConn = result.conn
-				firstDialed = result.dialed
-				continue
+	for i := 0; i < pendingResults; i++ {
+		if firstConn != nil {
+			if firstDialed == preferDial {
+				cancel()
+				return firstConn, firstDialed, nil
+			}
+			select {
+			case result := <-results:
+				if result.err == nil {
+					cancel()
+					if result.dialed == preferDial {
+						_ = firstConn.CloseWithError(0, "")
+						return result.conn, preferDial, nil
+					}
+					_ = result.conn.CloseWithError(0, "")
+					return firstConn, firstDialed, nil
+				}
+			case <-time.After(externalNativeQUICDuplicateConnWait):
+			case <-ctx.Done():
 			}
 			cancel()
-			if result.dialed == preferDial {
-				_ = firstConn.CloseWithError(0, "")
-				return result.conn, preferDial, nil
-			}
-			_ = result.conn.CloseWithError(0, "")
-			return firstConn, preferDial, nil
+			return firstConn, firstDialed, nil
+		}
+
+		result := <-results
+		if result.err == nil {
+			firstConn = result.conn
+			firstDialed = result.dialed
+			continue
 		}
 		if firstErr == nil {
 			firstErr = result.err
@@ -831,6 +1028,53 @@ func dialOrAcceptExternalNativeQUICConnOnTransport(
 		firstErr = errors.New("native QUIC connection unavailable")
 	}
 	return nil, false, firstErr
+}
+
+func openExternalNativeQUICStreamForConn(ctx context.Context, conn *quic.Conn, openStream bool) (*quic.Stream, error) {
+	if openStream {
+		stream, err := conn.OpenStreamSync(ctx)
+		if err != nil {
+			return nil, err
+		}
+		cancelDeadline := cancelExternalNativeQUICCarrierDeadlineOnContextDone(ctx, stream)
+		defer cancelDeadline()
+		if _, err := stream.Write([]byte{externalNativeQUICStreamOpenByte}); err != nil {
+			_ = stream.Close()
+			return nil, err
+		}
+		return stream, nil
+	}
+	stream, err := conn.AcceptStream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	cancelDeadline := cancelExternalNativeQUICCarrierDeadlineOnContextDone(ctx, stream)
+	defer cancelDeadline()
+	var opened [1]byte
+	if _, err := io.ReadFull(stream, opened[:]); err != nil {
+		_ = stream.Close()
+		return nil, err
+	}
+	if opened[0] != externalNativeQUICStreamOpenByte {
+		_ = stream.Close()
+		return nil, fmt.Errorf("native QUIC stream open byte = %d, want %d", opened[0], externalNativeQUICStreamOpenByte)
+	}
+	return stream, nil
+}
+
+func externalNativeQUICStreamRole(openStreams []bool, index int) bool {
+	if index >= 0 && index < len(openStreams) {
+		return openStreams[index]
+	}
+	return true
+}
+
+func externalNativeQUICStreamRoles(count int, openStream bool) []bool {
+	roles := make([]bool, count)
+	for i := range roles {
+		roles[i] = openStream
+	}
+	return roles
 }
 
 func acceptExternalNativeQUICStream(
@@ -894,4 +1138,24 @@ func startExternalNativeQUICTransport(packetConn net.PacketConn, serverTLS *tls.
 		return nil, nil, err
 	}
 	return transport, listener, nil
+}
+
+func cancelExternalNativeQUICControlStreamDeadlineOnContextDone(ctx context.Context, stream *quic.Stream) func() {
+	return cancelExternalNativeQUICCarrierDeadlineOnContextDone(ctx, stream)
+}
+
+func cancelExternalNativeQUICCarrierDeadlineOnContextDone(ctx context.Context, carrier interface{ SetDeadline(time.Time) error }) func() {
+	callbackDone := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		externalTransferTracef("native-quic-carrier-deadline-cancel-fired carrier=%T", carrier)
+		_ = carrier.SetDeadline(time.Now())
+		close(callbackDone)
+	})
+	return func() {
+		if stop() {
+			close(callbackDone)
+		}
+		<-callbackDone
+		_ = carrier.SetDeadline(time.Time{})
+	}
 }

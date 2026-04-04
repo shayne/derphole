@@ -51,8 +51,11 @@ type Manager struct {
 	mu                    sync.Mutex
 	discoveryMu           sync.Mutex
 	wg                    sync.WaitGroup
+	directWG              sync.WaitGroup
 	cfg                   ManagerConfig
 	candidateSourceBase   func(context.Context) []net.Addr
+	directCtx             context.Context
+	directCancel          context.CancelFunc
 	state                 pathState
 	stateNotify           chan struct{}
 	discoveryGen          uint64
@@ -108,12 +111,20 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 
 	m.started = true
+	if m.cfg.DirectConn != nil || m.candidateSourceBase != nil || m.cfg.Portmap != nil {
+		m.directCtx, m.directCancel = context.WithCancel(ctx)
+	} else {
+		m.directCtx = ctx
+	}
+	directCtx := m.directCtx
 	m.mu.Unlock()
 
 	m.wg.Add(1)
+	m.directWG.Add(1)
 	go func() {
+		defer m.directWG.Done()
 		defer m.wg.Done()
-		m.discoveryLoop(ctx)
+		m.discoveryLoop(directCtx)
 	}()
 	m.wg.Add(1)
 	go func() {
@@ -129,16 +140,39 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 	if !m.cfg.DisableDirectReads {
 		m.wg.Add(1)
+		m.directWG.Add(1)
 		go func() {
+			defer m.directWG.Done()
 			defer m.wg.Done()
-			m.directReadLoop(ctx)
+			m.directReadLoop(directCtx)
 		}()
 	}
 	return nil
 }
 
 func (m *Manager) Wait() {
+	m.wakeDirectReads()
 	m.wg.Wait()
+}
+
+func (m *Manager) StopDirect() {
+	m.noteRelayOnly(m.now())
+	m.mu.Lock()
+	directCancel := m.directCancel
+	m.mu.Unlock()
+	if directCancel != nil {
+		directCancel()
+	}
+	m.wakeDirectReads()
+	m.directWG.Wait()
+}
+
+func (m *Manager) wakeDirectReads() {
+	if batchConn := m.directBatchConn(); batchConn != nil {
+		_ = batchConn.SetReadDeadline(m.now())
+	} else if m.cfg.DirectConn != nil {
+		_ = m.cfg.DirectConn.SetReadDeadline(m.now())
+	}
 }
 
 func (m *Manager) PathState() Path {
@@ -370,4 +404,13 @@ func (m *Manager) candidateSource(ctx context.Context) []net.Addr {
 		appendAddrs(m.cfg.Portmap.SnapshotAddrs())
 	}
 	return out
+}
+
+func (m *Manager) directContext(fallback context.Context) context.Context {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.directCtx != nil {
+		return m.directCtx
+	}
+	return fallback
 }

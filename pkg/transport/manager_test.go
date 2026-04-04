@@ -1542,7 +1542,7 @@ func TestManagerWaitReturnsAfterCancelWhileDirectReadLoopIsBlocked(t *testing.T)
 	direct := newFakePacketConn(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234})
 	mgr := NewManager(ManagerConfig{
 		DirectConn:        direct,
-		DiscoveryInterval: 100 * time.Millisecond,
+		DiscoveryInterval: time.Hour,
 	})
 	if err := mgr.Start(ctx); err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -1552,9 +1552,6 @@ func TestManagerWaitReturnsAfterCancelWhileDirectReadLoopIsBlocked(t *testing.T)
 	}
 
 	cancel()
-	if err := direct.SetReadDeadline(time.Now()); err != nil {
-		t.Fatalf("SetReadDeadline() error = %v", err)
-	}
 
 	done := make(chan struct{})
 	go func() {
@@ -1564,8 +1561,42 @@ func TestManagerWaitReturnsAfterCancelWhileDirectReadLoopIsBlocked(t *testing.T)
 
 	select {
 	case <-done:
-	case <-time.After(time.Second):
+	case <-time.After(200 * time.Millisecond):
 		t.Fatal("Wait() did not return after cancel and direct read wakeup")
+	}
+}
+
+func TestManagerWaitReturnsAfterCancelWhileDirectReadLoopKeepsReceivingPackets(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	direct := newHotPacketConn(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234})
+	mgr := NewManager(ManagerConfig{
+		DirectConn:        direct,
+		DiscoveryInterval: time.Hour,
+	})
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	select {
+	case <-direct.readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("manager did not enter the hot direct read loop")
+	}
+
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		mgr.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		_ = direct.Close()
+		<-done
+		t.Fatal("Wait() did not return after cancel while direct packets kept arriving")
 	}
 }
 
@@ -1829,3 +1860,47 @@ func (p *fakePortmap) activate() {
 	defer p.mu.Unlock()
 	p.changed = true
 }
+
+type hotPacketConn struct {
+	local           net.Addr
+	readStartedOnce sync.Once
+	readStarted     chan struct{}
+	closed          chan struct{}
+}
+
+func newHotPacketConn(local net.Addr) *hotPacketConn {
+	return &hotPacketConn{
+		local:       local,
+		readStarted: make(chan struct{}),
+		closed:      make(chan struct{}),
+	}
+}
+
+func (c *hotPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	c.readStartedOnce.Do(func() {
+		close(c.readStarted)
+	})
+	select {
+	case <-c.closed:
+		return 0, nil, net.ErrClosed
+	default:
+	}
+	time.Sleep(time.Millisecond)
+	return copy(b, discoProbePayload), &net.UDPAddr{IP: net.IPv4(100, 64, 0, 1), Port: 12345}, nil
+}
+
+func (c *hotPacketConn) WriteTo(b []byte, _ net.Addr) (int, error) { return len(b), nil }
+
+func (c *hotPacketConn) Close() error {
+	select {
+	case <-c.closed:
+	default:
+		close(c.closed)
+	}
+	return nil
+}
+
+func (c *hotPacketConn) LocalAddr() net.Addr              { return c.local }
+func (c *hotPacketConn) SetDeadline(time.Time) error      { return nil }
+func (c *hotPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *hotPacketConn) SetWriteDeadline(time.Time) error { return nil }

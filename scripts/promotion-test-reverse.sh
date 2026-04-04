@@ -22,6 +22,9 @@ fi
 if [[ -n "${DERPCAT_NATIVE_TCP_CONNS:-}" ]]; then
   remote_env+=(DERPCAT_NATIVE_TCP_CONNS="${DERPCAT_NATIVE_TCP_CONNS}")
 fi
+if [[ "${DERPCAT_TRACE_HANDOFF:-}" == "1" ]]; then
+  remote_env+=(DERPCAT_TRACE_HANDOFF=1)
+fi
 
 remote() {
   ssh "${remote_user}@${target}" "${remote_env[@]}" 'bash -se' <<<"$1"

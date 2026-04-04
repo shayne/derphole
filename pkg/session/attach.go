@@ -19,6 +19,9 @@ func (nopReadCloser) Close() error { return nil }
 
 func openSendSource(ctx context.Context, cfg SendConfig) (io.ReadCloser, error) {
 	if cfg.StdioIn != nil {
+		if src, ok := cfg.StdioIn.(io.ReadCloser); ok {
+			return src, nil
+		}
 		return nopReadCloser{Reader: cfg.StdioIn}, nil
 	}
 	return nopReadCloser{Reader: io.LimitReader(nilReader{}, 0)}, nil

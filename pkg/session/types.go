@@ -169,15 +169,9 @@ func (e *transportPathEmitter) Complete(manager *transport.Manager) {
 		if depth := manager.MaxPeerRecvQueueDepth(); depth > 0 {
 			e.emitter.Debug(fmt.Sprintf("transport-max-peer-recv-queue-depth=%d", depth))
 		}
-		path := manager.PathState()
-		if path != transport.PathUnknown && path != e.last {
-			e.last = path
-			switch path {
-			case transport.PathDirect:
-				e.emitter.Status(string(StateDirect))
-			case transport.PathRelay:
-				e.emitter.Status(string(StateRelay))
-			}
+		if path := manager.PathState(); path == transport.PathDirect && e.last != transport.PathDirect {
+			e.last = transport.PathDirect
+			e.emitter.Status(string(StateDirect))
 		}
 	}
 	e.closed = true
