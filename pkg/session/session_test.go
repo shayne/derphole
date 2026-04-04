@@ -121,6 +121,52 @@ func TestSessionPromotesDirectStateWhenProbeSucceeds(t *testing.T) {
 	}
 }
 
+func TestSendListenExternalStartsRelayPayloadBeforeNativeModeTimeout(t *testing.T) {
+	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
+
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var listenerOut bytes.Buffer
+	tokenSink := make(chan string, 1)
+	listenErr := make(chan error, 1)
+	go func() {
+		_, err := Listen(ctx, ListenConfig{
+			Emitter:       telemetry.New(&bytes.Buffer{}, telemetry.LevelSilent),
+			TokenSink:     tokenSink,
+			StdioOut:      &listenerOut,
+			UsePublicDERP: true,
+		})
+		listenErr <- err
+	}()
+
+	token := <-tokenSink
+	start := time.Now()
+	if err := Send(ctx, SendConfig{
+		Token:         token,
+		Emitter:       telemetry.New(&bytes.Buffer{}, telemetry.LevelSilent),
+		StdioIn:       strings.NewReader("relay-first payload"),
+		UsePublicDERP: true,
+	}); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= 3*time.Second {
+		t.Fatalf("Send() elapsed = %v, want relay payload before native mode timeout", elapsed)
+	}
+
+	if err := <-listenErr; err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	if got := listenerOut.String(); got != "relay-first payload" {
+		t.Fatalf("listener output = %q, want %q", got, "relay-first payload")
+	}
+}
+
 func TestShareOpenUsesEphemeralLocalBind(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -485,7 +531,7 @@ func TestExternalListenSendCanUpgradeAfterRelayStart(t *testing.T) {
 	}
 }
 
-func TestExternalListenSendUsesNativeDirectQUICWhenBothSidesAreDirectReady(t *testing.T) {
+func TestExternalListenSendStartsRelayQUICWhenNativeTCPIsUnavailableAndBothSidesAreDirectReady(t *testing.T) {
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
 
@@ -537,11 +583,11 @@ func TestExternalListenSendUsesNativeDirectQUICWhenBothSidesAreDirectReady(t *te
 	if got := listenerOut.String(); got != "native-direct" {
 		t.Fatalf("listener output = %q, want %q", got, "native-direct")
 	}
-	if got := senderStatus.String(); !strings.Contains(got, "sender-quic-direct") {
-		t.Fatalf("sender status = %q, want sender-quic-direct", got)
+	if got := senderStatus.String(); !strings.Contains(got, "quic-connected") || !strings.Contains(got, "sender-tcp-response=none") || strings.Contains(got, "sender-tcp-direct") {
+		t.Fatalf("sender status = %q, want fallback QUIC without native TCP", got)
 	}
-	if got := listenerStatus.String(); !strings.Contains(got, "listener-quic-direct") {
-		t.Fatalf("listener status = %q, want listener-quic-direct", got)
+	if got := listenerStatus.String(); !strings.Contains(got, "quic-accepted") || strings.Contains(got, "listener-tcp-direct") {
+		t.Fatalf("listener status = %q, want fallback QUIC without native TCP", got)
 	}
 }
 
@@ -670,7 +716,7 @@ func TestExternalListenSendUsesStripedNativeDirectTCPWhenRequested(t *testing.T)
 	}
 }
 
-func TestExternalListenSendUsesNativeDirectQUICWhenDirectPromotionIsSlightlyDelayed(t *testing.T) {
+func TestExternalListenSendStartsRelayQUICWhenNativeTCPIsUnavailableAndDirectPromotionIsSlightlyDelayed(t *testing.T) {
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(3*time.Second).UnixNano(), 10))
 
@@ -722,11 +768,11 @@ func TestExternalListenSendUsesNativeDirectQUICWhenDirectPromotionIsSlightlyDela
 	if got := listenerOut.String(); got != "delayed-native-direct" {
 		t.Fatalf("listener output = %q, want %q", got, "delayed-native-direct")
 	}
-	if got := senderStatus.String(); !strings.Contains(got, "sender-quic-direct") {
-		t.Fatalf("sender status = %q, want sender-quic-direct", got)
+	if got := senderStatus.String(); !strings.Contains(got, "quic-connected") || !strings.Contains(got, "sender-tcp-response=none") || strings.Contains(got, "sender-tcp-direct") {
+		t.Fatalf("sender status = %q, want fallback QUIC without native TCP", got)
 	}
-	if got := listenerStatus.String(); !strings.Contains(got, "listener-quic-direct") {
-		t.Fatalf("listener status = %q, want listener-quic-direct", got)
+	if got := listenerStatus.String(); !strings.Contains(got, "quic-accepted") || strings.Contains(got, "listener-tcp-direct") {
+		t.Fatalf("listener status = %q, want fallback QUIC without native TCP", got)
 	}
 }
 

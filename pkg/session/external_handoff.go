@@ -2,15 +2,22 @@ package session
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"sync"
+	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
 var errExternalHandoffWindowOverflow = errors.New("external handoff receive window overflow")
 var errExternalHandoffUnackedWindowFull = errors.New("external handoff unacked window full")
+
+const externalHandoffMaxUnackedBytes = 64 << 20
 
 type externalHandoffChunk struct {
 	TransferID uint64
@@ -19,6 +26,7 @@ type externalHandoffChunk struct {
 }
 
 type externalHandoffReceiver struct {
+	mu        sync.Mutex
 	out       io.Writer
 	maxWindow int64
 	watermark int64
@@ -35,10 +43,16 @@ func newExternalHandoffReceiver(out io.Writer, maxWindow int64) *externalHandoff
 }
 
 func (r *externalHandoffReceiver) Watermark() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	return r.watermark
 }
 
 func (r *externalHandoffReceiver) AcceptChunk(chunk externalHandoffChunk) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if chunk.Offset < 0 {
 		return fmt.Errorf("external handoff chunk offset %d is negative", chunk.Offset)
 	}
@@ -89,6 +103,7 @@ func (r *externalHandoffReceiver) AcceptChunk(chunk externalHandoffChunk) error 
 }
 
 type externalHandoffSpool struct {
+	mu             sync.Mutex
 	src            io.Reader
 	file           *os.File
 	filePath       string
@@ -124,6 +139,9 @@ func newExternalHandoffSpool(src io.Reader, chunkSize int, maxUnackedBytes int64
 }
 
 func (s *externalHandoffSpool) NextChunk() (externalHandoffChunk, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.readOffset-s.ackedWatermark >= s.maxUnacked {
 		return externalHandoffChunk{}, errExternalHandoffUnackedWindowFull
 	}
@@ -178,8 +196,11 @@ func (s *externalHandoffSpool) NextChunk() (externalHandoffChunk, error) {
 }
 
 func (s *externalHandoffSpool) AckTo(watermark int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if watermark < s.ackedWatermark {
-		return fmt.Errorf("external handoff ack watermark %d moved backward from %d", watermark, s.ackedWatermark)
+		return nil
 	}
 	if watermark > s.sourceOffset {
 		return fmt.Errorf("external handoff ack watermark %d exceeds source offset %d", watermark, s.sourceOffset)
@@ -188,7 +209,17 @@ func (s *externalHandoffSpool) AckTo(watermark int64) error {
 	return nil
 }
 
+func (s *externalHandoffSpool) AckedWatermark() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.ackedWatermark
+}
+
 func (s *externalHandoffSpool) RewindTo(offset int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if offset < s.ackedWatermark {
 		return fmt.Errorf("external handoff rewind offset %d precedes ack watermark %d", offset, s.ackedWatermark)
 	}
@@ -200,7 +231,14 @@ func (s *externalHandoffSpool) RewindTo(offset int64) error {
 }
 
 func (s *externalHandoffSpool) Close() error {
-	if s == nil || s.file == nil {
+	if s == nil {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.file == nil {
 		return nil
 	}
 	err := s.file.Close()
@@ -213,6 +251,109 @@ func (s *externalHandoffSpool) Close() error {
 		return removeErr
 	}
 	return nil
+}
+
+func sendExternalHandoffCarrier(ctx context.Context, carrier io.ReadWriteCloser, spool *externalHandoffSpool, stop <-chan struct{}) error {
+	ackErrCh := make(chan error, 1)
+	go func() {
+		for {
+			watermark, err := readExternalHandoffWatermarkFrame(carrier)
+			if err != nil {
+				if externalHandoffCarrierClosed(err) {
+					ackErrCh <- nil
+					return
+				}
+				ackErrCh <- err
+				return
+			}
+			if err := spool.AckTo(watermark); err != nil {
+				ackErrCh <- err
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case err := <-ackErrCh:
+			return err
+		case <-stop:
+			if err := closeExternalHandoffWrite(carrier); err != nil {
+				return err
+			}
+			return <-ackErrCh
+		default:
+		}
+
+		chunk, err := spool.NextChunk()
+		switch {
+		case err == nil:
+			if err := writeExternalHandoffChunkFrame(carrier, chunk); err != nil {
+				return err
+			}
+		case errors.Is(err, io.EOF):
+			if err := closeExternalHandoffWrite(carrier); err != nil {
+				return err
+			}
+			return <-ackErrCh
+		case errors.Is(err, errExternalHandoffUnackedWindowFull):
+			select {
+			case ackErr := <-ackErrCh:
+				return ackErr
+			case <-stop:
+				if err := closeExternalHandoffWrite(carrier); err != nil {
+					return err
+				}
+				return <-ackErrCh
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Millisecond):
+			}
+		default:
+			return err
+		}
+	}
+}
+
+func receiveExternalHandoffCarrier(ctx context.Context, carrier io.ReadWriteCloser, rx *externalHandoffReceiver, maxPayload int) error {
+	for {
+		chunk, err := readExternalHandoffChunkFrame(carrier, maxPayload)
+		if err != nil {
+			if externalHandoffCarrierClosed(err) {
+				if writeErr := writeExternalHandoffWatermarkFrame(carrier, rx.Watermark()); writeErr != nil {
+					return writeErr
+				}
+				return closeExternalHandoffWrite(carrier)
+			}
+			return err
+		}
+		if err := rx.AcceptChunk(chunk); err != nil {
+			return err
+		}
+		if err := writeExternalHandoffWatermarkFrame(carrier, rx.Watermark()); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+	}
+}
+
+func externalHandoffCarrierClosed(err error) bool {
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	var appErr *quic.ApplicationError
+	return errors.As(err, &appErr) && appErr.ErrorCode == 0
+}
+
+func closeExternalHandoffWrite(carrier io.ReadWriteCloser) error {
+	if closer, ok := carrier.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
+	}
+	return carrier.Close()
 }
 
 func writeExternalHandoffChunkFrame(w io.Writer, chunk externalHandoffChunk) error {

@@ -127,6 +127,35 @@ func TestExternalHandoffSenderReturnsEOFAfterSourceDrainedAndAcked(t *testing.T)
 	}
 }
 
+func TestExternalHandoffSenderIgnoresStaleAckWatermarks(t *testing.T) {
+	spool, err := newExternalHandoffSpool(strings.NewReader("abcdefgh"), 4, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	if _, err := spool.NextChunk(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := spool.NextChunk(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := spool.AckTo(8); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.AckTo(4); err != nil {
+		t.Fatalf("AckTo() stale watermark error = %v, want nil", err)
+	}
+	if got := spool.AckedWatermark(); got != 8 {
+		t.Fatalf("AckedWatermark() = %d, want 8", got)
+	}
+}
+
 func TestExternalHandoffChunkFrameRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	want := externalHandoffChunk{TransferID: 42, Offset: 9, Payload: []byte("payload")}
