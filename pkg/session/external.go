@@ -51,6 +51,7 @@ var (
 )
 
 var gatherTraversalCandidates = traversal.GatherCandidates
+var gatherTraversalCandidatesFromSTUNPackets = traversal.GatherCandidatesFromSTUNPackets
 var publicSessionPortmaps sync.Map
 var newPublicPortmap = func(emitter *telemetry.Emitter) publicPortmap {
 	return portmap.New(emitter)
@@ -766,9 +767,20 @@ func startExternalTransportManager(
 		},
 	}
 	if !forceRelay {
+		stunPackets := make(chan traversal.STUNPacket, 256)
 		cfg.DirectConn = conn
 		cfg.DirectBatchConn = publicDirectBatchConn(conn)
-		cfg.CandidateSource = publicCandidateSource(conn, dm, pm, localCandidates)
+		cfg.HandleSTUNPacket = func(payload []byte, addr net.Addr) {
+			packet, ok := publicSTUNPacket(payload, addr)
+			if !ok {
+				return
+			}
+			select {
+			case stunPackets <- packet:
+			default:
+			}
+		}
+		cfg.CandidateSource = publicCandidateSource(conn, dm, pm, localCandidates, stunPackets)
 	}
 
 	manager := newTransportManager(cfg)
@@ -1459,6 +1471,16 @@ func decodeEnvelope(payload []byte) (envelope, error) {
 }
 
 func publicProbeCandidates(ctx context.Context, conn net.PacketConn, dm *tailcfg.DERPMap, pm publicPortmap) []string {
+	return publicProbeCandidatesFromSTUNPackets(ctx, conn, dm, pm, nil)
+}
+
+func publicProbeCandidatesFromSTUNPackets(
+	ctx context.Context,
+	conn net.PacketConn,
+	dm *tailcfg.DERPMap,
+	pm publicPortmap,
+	stunPackets <-chan traversal.STUNPacket,
+) []string {
 	candidates := publicInitialProbeCandidates(conn, pm)
 	if fakeTransportCandidatesBlocked() {
 		return nil
@@ -1476,7 +1498,14 @@ func publicProbeCandidates(ctx context.Context, conn net.PacketConn, dm *tailcfg
 		if pm != nil {
 			mapped = pm.Snapshot
 		}
-		if gathered, err := gatherTraversalCandidates(ctx, conn, dm, mapped); err == nil {
+		var gathered []string
+		var err error
+		if stunPackets != nil {
+			gathered, err = gatherTraversalCandidatesFromSTUNPackets(ctx, conn, dm, mapped, stunPackets)
+		} else {
+			gathered, err = gatherTraversalCandidates(ctx, conn, dm, mapped)
+		}
+		if err == nil {
 			for _, candidate := range gathered {
 				if addrPort, err := netip.ParseAddrPort(candidate); err == nil {
 					if !publicProbeCandidateAllowed(addrPort.Addr()) {
@@ -1564,7 +1593,13 @@ func publicProbeAddrs(ctx context.Context, conn net.PacketConn, dm *tailcfg.DERP
 	return parseCandidateStrings(raw)
 }
 
-func publicCandidateSource(conn net.PacketConn, dm *tailcfg.DERPMap, pm publicPortmap, localCandidates []net.Addr) func(context.Context) []net.Addr {
+func publicCandidateSource(
+	conn net.PacketConn,
+	dm *tailcfg.DERPMap,
+	pm publicPortmap,
+	localCandidates []net.Addr,
+	stunPackets <-chan traversal.STUNPacket,
+) func(context.Context) []net.Addr {
 	if fakeTransportEnabled() {
 		return func(ctx context.Context) []net.Addr {
 			_ = dm
@@ -1573,12 +1608,38 @@ func publicCandidateSource(conn net.PacketConn, dm *tailcfg.DERPMap, pm publicPo
 		}
 	}
 	return func(ctx context.Context) []net.Addr {
-		candidates := publicProbeAddrs(ctx, conn, dm, pm)
+		candidates := publicProbeAddrsFromSTUNPackets(ctx, conn, dm, pm, stunPackets)
 		if len(candidates) > 0 {
 			return candidates
 		}
 		return slices.Clone(localCandidates)
 	}
+}
+
+func publicProbeAddrsFromSTUNPackets(
+	ctx context.Context,
+	conn net.PacketConn,
+	dm *tailcfg.DERPMap,
+	pm publicPortmap,
+	stunPackets <-chan traversal.STUNPacket,
+) []net.Addr {
+	raw := publicProbeCandidatesFromSTUNPackets(ctx, conn, dm, pm, stunPackets)
+	return parseCandidateStrings(raw)
+}
+
+func publicSTUNPacket(payload []byte, addr net.Addr) (traversal.STUNPacket, bool) {
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return traversal.STUNPacket{}, false
+	}
+	ip, ok := netip.AddrFromSlice(udpAddr.IP)
+	if !ok {
+		return traversal.STUNPacket{}, false
+	}
+	return traversal.STUNPacket{
+		Payload: payload,
+		Addr:    netip.AddrPortFrom(ip.Unmap(), uint16(udpAddr.Port)),
+	}, true
 }
 
 func newBoundPublicPortmap(conn net.PacketConn, emitter *telemetry.Emitter) publicPortmap {

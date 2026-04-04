@@ -36,6 +36,7 @@ type ManagerConfig struct {
 	DirectConn              net.PacketConn
 	DirectBatchConn         DirectBatchConn
 	DisableDirectReads      bool
+	HandleSTUNPacket        func([]byte, net.Addr)
 	CandidateSource         func(context.Context) []net.Addr
 	Portmap                 Portmap
 	SendControl             func(context.Context, ControlMessage) error

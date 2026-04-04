@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -9,6 +10,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"tailscale.com/net/stun"
 )
 
 func TestManagerUpgradesDirectViaDelayedCallMeMaybe(t *testing.T) {
@@ -279,6 +282,59 @@ func TestManagerReadsBatchedDirectPayloadsFromBatchConn(t *testing.T) {
 	}
 	peerConn.ReleaseDatagram(payload1)
 	peerConn.ReleaseDatagram(payload2)
+}
+
+func TestManagerRoutesDirectSTUNPacketsToHandler(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000015, 0))
+	direct := newFakePacketConn(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9999})
+	direct.useClock(clock)
+
+	stunPacket := stun.Request(stun.TxID{1, 2, 3})
+	stunAddr := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 10), Port: 3478}
+	stunCh := make(chan struct {
+		payload []byte
+		addr    net.Addr
+	}, 1)
+
+	mgr := NewManager(ManagerConfig{
+		DirectConn: direct,
+		HandleSTUNPacket: func(payload []byte, addr net.Addr) {
+			stunCh <- struct {
+				payload []byte
+				addr    net.Addr
+			}{
+				payload: append([]byte(nil), payload...),
+				addr:    cloneAddr(addr),
+			}
+		},
+		Clock:                   clock,
+		DiscoveryInterval:       time.Second,
+		DirectStaleTimeout:      4 * time.Second,
+		DisableDirectReads:      false,
+		EndpointRefreshInterval: 2 * time.Second,
+	})
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	direct.enqueueRead(stunPacket, stunAddr)
+
+	select {
+	case got := <-stunCh:
+		if !bytes.Equal(got.payload, stunPacket) {
+			t.Fatalf("STUN payload = %x, want %x", got.payload, stunPacket)
+		}
+		if got.addr.String() != stunAddr.String() {
+			t.Fatalf("STUN addr = %v, want %v", got.addr, stunAddr)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("manager did not route direct STUN packet to handler")
+	}
 }
 
 func TestManagerKeepsActiveDirectPathWhenCandidateSetReplacesEndpoint(t *testing.T) {

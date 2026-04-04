@@ -23,6 +23,7 @@ import (
 	"github.com/shayne/derpcat/pkg/rendezvous"
 	"github.com/shayne/derpcat/pkg/telemetry"
 	"github.com/shayne/derpcat/pkg/transport"
+	"github.com/shayne/derpcat/pkg/traversal"
 	"go4.org/mem"
 	"tailscale.com/derp/derpserver"
 	"tailscale.com/net/portmapper/portmappertype"
@@ -875,7 +876,7 @@ func TestPublicCandidateSourceRefreshesDynamicProbeCandidatesForRealSessions(t *
 		gatherTraversalCandidates = prev
 	})
 
-	source := publicCandidateSource(conn, &tailcfg.DERPMap{}, nil, localCandidates)
+	source := publicCandidateSource(conn, &tailcfg.DERPMap{}, nil, localCandidates, nil)
 	first := source(ctx)
 	second := source(ctx)
 
@@ -887,6 +888,56 @@ func TestPublicCandidateSourceRefreshesDynamicProbeCandidatesForRealSessions(t *
 	}
 	if !containsAddrString(second, "203.0.113.11:4242") {
 		t.Fatalf("second publicCandidateSource() = %v, want refreshed candidate 203.0.113.11:4242", second)
+	}
+}
+
+func TestPublicCandidateSourceRefreshesTraversalCandidatesFromSTUNPackets(t *testing.T) {
+	ctx := context.Background()
+	conn := &stubPacketConn{localAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242}}
+	localCandidates := []net.Addr{&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242}}
+	stunPackets := make(chan traversal.STUNPacket, 1)
+
+	directGatherCalled := false
+	prevDirectGather := gatherTraversalCandidates
+	gatherTraversalCandidates = func(context.Context, net.PacketConn, *tailcfg.DERPMap, func() (netip.AddrPort, bool)) ([]string, error) {
+		directGatherCalled = true
+		return nil, errors.New("unexpected direct traversal gather")
+	}
+	t.Cleanup(func() {
+		gatherTraversalCandidates = prevDirectGather
+	})
+
+	prevSTUNGather := gatherTraversalCandidatesFromSTUNPackets
+	gatherTraversalCandidatesFromSTUNPackets = func(
+		gotCtx context.Context,
+		gotConn net.PacketConn,
+		_ *tailcfg.DERPMap,
+		_ func() (netip.AddrPort, bool),
+		gotPackets <-chan traversal.STUNPacket,
+	) ([]string, error) {
+		if gotCtx != ctx {
+			t.Fatalf("gatherTraversalCandidatesFromSTUNPackets() ctx = %v, want %v", gotCtx, ctx)
+		}
+		if gotConn != conn {
+			t.Fatalf("gatherTraversalCandidatesFromSTUNPackets() conn = %v, want %v", gotConn, conn)
+		}
+		if gotPackets != stunPackets {
+			t.Fatalf("gatherTraversalCandidatesFromSTUNPackets() packets = %v, want %v", gotPackets, stunPackets)
+		}
+		return []string{"203.0.113.12:4242"}, nil
+	}
+	t.Cleanup(func() {
+		gatherTraversalCandidatesFromSTUNPackets = prevSTUNGather
+	})
+
+	source := publicCandidateSource(conn, &tailcfg.DERPMap{}, nil, localCandidates, stunPackets)
+	got := source(ctx)
+
+	if directGatherCalled {
+		t.Fatal("publicCandidateSource() called direct traversal gather with STUN packet channel present")
+	}
+	if !containsAddrString(got, "203.0.113.12:4242") {
+		t.Fatalf("publicCandidateSource() = %v, want STUN packet gathered candidate 203.0.113.12:4242", got)
 	}
 }
 
@@ -1200,6 +1251,23 @@ func TestSelectExternalNativeTCPResponseAddrRejectsLoopbackRequestWithoutLoopbac
 	)
 	if got != nil {
 		t.Fatalf("selectExternalNativeTCPResponseAddr() = %v, want nil", got)
+	}
+}
+
+func TestSelectExternalNativeTCPResponseAddrPrefersSamePrivateSubnetAsRequest(t *testing.T) {
+	got := selectExternalNativeTCPResponseAddr(
+		&net.UDPAddr{IP: net.IPv4(10, 0, 4, 2), Port: 37672},
+		nil,
+		[]net.Addr{
+			&net.UDPAddr{IP: net.IPv4(10, 0, 1, 254), Port: 53246},
+			&net.UDPAddr{IP: net.IPv4(10, 0, 4, 184), Port: 53246},
+		},
+	)
+	if got == nil {
+		t.Fatal("selectExternalNativeTCPResponseAddr() = nil, want 10.0.4.184:53246")
+	}
+	if got.String() != "10.0.4.184:53246" {
+		t.Fatalf("selectExternalNativeTCPResponseAddr() = %v, want 10.0.4.184:53246", got)
 	}
 }
 

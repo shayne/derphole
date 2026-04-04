@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"tailscale.com/net/stun"
 	"tailscale.com/net/stun/stuntest"
 )
 
@@ -85,6 +86,64 @@ func TestGatherCandidatesUsesProvidedProbeConnPort(t *testing.T) {
 	if !containsCandidate(got, want) {
 		t.Fatalf("GatherCandidates() = %v, want candidate %q from provided probe conn", got, want)
 	}
+}
+
+func TestGatherCandidatesFromSTUNPacketsUsesInjectedPackets(t *testing.T) {
+	stunAddr, cleanup := stuntest.Serve(t)
+	defer cleanup()
+
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer conn.Close()
+
+	packetCh := make(chan STUNPacket, 32)
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		buf := make([]byte, 64<<10)
+		for {
+			if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+				return
+			}
+			n, addr, err := conn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if !stun.Is(buf[:n]) {
+				continue
+			}
+			udpAddr, ok := addr.(*net.UDPAddr)
+			if !ok {
+				continue
+			}
+			addrIP, ok := netip.AddrFromSlice(udpAddr.IP)
+			if !ok {
+				continue
+			}
+			packetCh <- STUNPacket{
+				Payload: append([]byte(nil), buf[:n]...),
+				Addr:    netip.AddrPortFrom(addrIP.Unmap(), uint16(udpAddr.Port)),
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	got, err := GatherCandidatesFromSTUNPackets(ctx, conn, stuntest.DERPMapOf(stunAddr.String()), nil, packetCh)
+	if err != nil {
+		t.Fatalf("GatherCandidatesFromSTUNPackets() error = %v", err)
+	}
+
+	want := conn.LocalAddr().String()
+	if !containsCandidate(got, want) {
+		t.Fatalf("GatherCandidatesFromSTUNPackets() = %v, want candidate %q from provided probe conn", got, want)
+	}
+
+	_ = conn.Close()
+	<-readDone
 }
 
 func TestGatherCandidatesMergesMappedEndpoint(t *testing.T) {

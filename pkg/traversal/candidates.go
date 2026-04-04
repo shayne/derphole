@@ -17,7 +17,40 @@ import (
 
 const stunReadInterval = 100 * time.Millisecond
 
+type STUNPacket struct {
+	Payload []byte
+	Addr    netip.AddrPort
+}
+
 func GatherCandidates(ctx context.Context, conn net.PacketConn, dm *tailcfg.DERPMap, mapped func() (netip.AddrPort, bool)) ([]string, error) {
+	return gatherCandidatesWithReceiver(ctx, conn, dm, mapped, func(readCtx context.Context, recv func([]byte, netip.AddrPort)) {
+		if conn == nil {
+			<-readCtx.Done()
+			return
+		}
+		receiveSTUNPackets(readCtx, conn, recv)
+	})
+}
+
+func GatherCandidatesFromSTUNPackets(
+	ctx context.Context,
+	conn net.PacketConn,
+	dm *tailcfg.DERPMap,
+	mapped func() (netip.AddrPort, bool),
+	packets <-chan STUNPacket,
+) ([]string, error) {
+	return gatherCandidatesWithReceiver(ctx, conn, dm, mapped, func(readCtx context.Context, recv func([]byte, netip.AddrPort)) {
+		receiveSTUNPacketsFromChan(readCtx, packets, recv)
+	})
+}
+
+func gatherCandidatesWithReceiver(
+	ctx context.Context,
+	conn net.PacketConn,
+	dm *tailcfg.DERPMap,
+	mapped func() (netip.AddrPort, bool),
+	receive func(context.Context, func([]byte, netip.AddrPort)),
+) ([]string, error) {
 	client := &netcheck.Client{
 		Logf:   logger.Discard,
 		NetMon: netmon.NewStatic(),
@@ -31,11 +64,11 @@ func GatherCandidates(ctx context.Context, conn net.PacketConn, dm *tailcfg.DERP
 
 	readCtx, cancelRead := context.WithCancel(ctx)
 	var readWG sync.WaitGroup
-	if conn != nil {
+	if receive != nil {
 		readWG.Add(1)
 		go func() {
 			defer readWG.Done()
-			receiveSTUNPackets(readCtx, conn, client.ReceiveSTUNPacket)
+			receive(readCtx, client.ReceiveSTUNPacket)
 		}()
 	}
 	defer func() {
@@ -50,6 +83,27 @@ func GatherCandidates(ctx context.Context, conn net.PacketConn, dm *tailcfg.DERP
 
 	v4, v6 := report.GetGlobalAddrs()
 	return gatherCandidates(v4, v6, mapped), nil
+}
+
+func receiveSTUNPacketsFromChan(ctx context.Context, packets <-chan STUNPacket, recv func([]byte, netip.AddrPort)) {
+	if packets == nil {
+		<-ctx.Done()
+		return
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case packet, ok := <-packets:
+			if !ok {
+				return
+			}
+			if len(packet.Payload) == 0 || !packet.Addr.IsValid() {
+				continue
+			}
+			recv(append([]byte(nil), packet.Payload...), packet.Addr)
+		}
+	}
 }
 
 func gatherCandidates(v4, v6 []netip.AddrPort, mapped func() (netip.AddrPort, bool)) []string {

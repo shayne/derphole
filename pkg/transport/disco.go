@@ -10,6 +10,7 @@ import (
 
 	"golang.org/x/net/ipv6"
 	"tailscale.com/net/batching"
+	"tailscale.com/net/stun"
 )
 
 const (
@@ -205,6 +206,10 @@ func (m *Manager) directBatchReadLoop(ctx context.Context, batchConn DirectBatch
 }
 
 func (m *Manager) handleDirectPacket(addr net.Addr, payload []byte) {
+	if stun.Is(payload) {
+		m.handleSTUNPacket(addr, payload)
+		return
+	}
 	if len(payload) == len(discoProbePayload) && bytes.Equal(payload, discoProbePayload) {
 		_, _ = m.cfg.DirectConn.WriteTo(discoAckPayload, addr)
 		return
@@ -225,6 +230,10 @@ func (m *Manager) HandleDirectPacket(conn net.PacketConn, addr net.Addr, payload
 	if addr == nil {
 		return false
 	}
+	if stun.Is(payload) {
+		m.handleSTUNPacket(addr, payload)
+		return true
+	}
 	if len(payload) == len(discoProbePayload) && bytes.Equal(payload, discoProbePayload) {
 		if conn != nil {
 			_, _ = conn.WriteTo(discoAckPayload, addr)
@@ -236,6 +245,13 @@ func (m *Manager) HandleDirectPacket(conn net.PacketConn, addr net.Addr, payload
 		return true
 	}
 	return false
+}
+
+func (m *Manager) handleSTUNPacket(addr net.Addr, payload []byte) {
+	if m.cfg.HandleSTUNPacket == nil || addr == nil {
+		return
+	}
+	m.cfg.HandleSTUNPacket(append([]byte(nil), payload...), cloneAddr(addr))
 }
 
 func (m *Manager) shouldAcceptDirectPayload(addr net.Addr) bool {

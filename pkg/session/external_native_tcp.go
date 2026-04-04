@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"io"
+	"math/bits"
 	"net"
 	"net/netip"
 	"os"
@@ -170,12 +171,60 @@ func externalNativeTCPRequestAddrAllowed(requestAddr, peerAddr net.Addr, localCa
 }
 
 func selectExternalNativeTCPRouteAddr(peerAddr net.Addr, localCandidates []net.Addr) net.Addr {
-	for _, candidate := range localCandidates {
-		if externalNativeTCPAddrAllowed(candidate) && externalNativeQUICStripeCanUseLocalAddrCandidate(candidate, peerAddr) {
-			return cloneSessionAddr(candidate)
+	bestIdx := -1
+	bestPrefixBits := -1
+	bestRank := 0
+	for idx, candidate := range localCandidates {
+		if !externalNativeTCPAddrAllowed(candidate) || !externalNativeQUICStripeCanUseLocalAddrCandidate(candidate, peerAddr) {
+			continue
 		}
+		rank := externalNativeTCPAddrRank(candidate)
+		prefixBits := externalNativeTCPSharedPrefixBits(peerAddr, candidate)
+		if bestIdx >= 0 && rank > bestRank {
+			continue
+		}
+		if bestIdx >= 0 && rank == bestRank && prefixBits <= bestPrefixBits {
+			continue
+		}
+		bestIdx = idx
+		bestRank = rank
+		bestPrefixBits = prefixBits
+	}
+	if bestIdx >= 0 {
+		return cloneSessionAddr(localCandidates[bestIdx])
 	}
 	return nil
+}
+
+func externalNativeTCPSharedPrefixBits(peerAddr, candidate net.Addr) int {
+	peerIP, ok := sessionAddrIP(peerAddr)
+	if !ok {
+		return 0
+	}
+	candidateIP, ok := sessionAddrIP(candidate)
+	if !ok || peerIP.Is4() != candidateIP.Is4() || peerIP.Is6() != candidateIP.Is6() {
+		return 0
+	}
+	if peerIP.Is4() {
+		peerBytes := peerIP.As4()
+		candidateBytes := candidateIP.As4()
+		for i := range peerBytes {
+			xor := peerBytes[i] ^ candidateBytes[i]
+			if xor != 0 {
+				return i*8 + bits.LeadingZeros8(uint8(xor))
+			}
+		}
+		return 32
+	}
+	peerBytes := peerIP.As16()
+	candidateBytes := candidateIP.As16()
+	for i := range peerBytes {
+		xor := peerBytes[i] ^ candidateBytes[i]
+		if xor != 0 {
+			return i*8 + bits.LeadingZeros8(uint8(xor))
+		}
+	}
+	return 128
 }
 
 func externalNativeTCPUseBearerAuth(localAddr, peerAddr net.Addr) bool {
