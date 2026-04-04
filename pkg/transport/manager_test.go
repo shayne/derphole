@@ -885,6 +885,9 @@ func TestManagerFallbackWaitsForInFlightDiscovery(t *testing.T) {
 	if !waitForPath(t, mgr, PathDirect, 200*time.Millisecond) {
 		t.Fatalf("PathState() = %v, want %v before stale rediscovery", mgr.PathState(), PathDirect)
 	}
+	if !waitForDiscoveryIdle(t, mgr, 200*time.Millisecond) {
+		t.Fatal("manager did not finish startup discovery before stale rediscovery")
+	}
 
 	callMeMaybeCount := controls.sentCount(ControlCallMeMaybe)
 	probeCount := direct.writeCountTo(peerCandidate)
