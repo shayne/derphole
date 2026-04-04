@@ -1633,6 +1633,7 @@ func acceptExternalQUICMode(
 
 	nativeQUIC := false
 	var nativeQUICAddr net.Addr
+	var nativeQUICPeerAddr net.Addr
 	var nativeTCPListener net.Listener
 	var nativeTCPPeerAddr net.Addr
 	var nativeTCPAddr net.Addr
@@ -1670,6 +1671,7 @@ func acceptExternalQUICMode(
 		}
 		if ok {
 			nativeQUIC = true
+			nativeQUICPeerAddr = cloneSessionAddr(peerDirectAddr)
 			nativeQUICAddr = selectExternalQUICModeResponseAddr(peerDirectAddr, localCandidates)
 			if nativeTCPPeerAddr != nil {
 				nativeTCPAddr = selectExternalNativeTCPResponseAddr(nativeTCPPeerAddr, peerDirectAddr, localCandidates)
@@ -1778,21 +1780,25 @@ func acceptExternalQUICMode(
 		if !nativeQUIC {
 			return false, nil, nil, nil
 		}
-		readyAddr, err := sendExternalQUICModeReady(ctx, client, peerDERP, manager, nativeQUICAddr)
-		return nativeQUIC, nil, readyAddr, err
+		if _, err := sendExternalQUICModeReady(ctx, client, peerDERP, manager, nativeQUICAddr); err != nil {
+			return false, nil, nil, err
+		}
+		return nativeQUIC, nil, cloneSessionAddr(nativeQUICPeerAddr), nil
 	}
 	if nativeTCPListener == nil {
 		if !nativeQUIC {
 			return false, nil, nil, nil
 		}
-		readyAddr, err := sendExternalQUICModeReady(ctx, client, peerDERP, manager, nativeQUICAddr)
-		return nativeQUIC, nil, readyAddr, err
+		if _, err := sendExternalQUICModeReady(ctx, client, peerDERP, manager, nativeQUICAddr); err != nil {
+			return false, nil, nil, err
+		}
+		return nativeQUIC, nil, cloneSessionAddr(nativeQUICPeerAddr), nil
 	}
 	result := <-nativeTCPConnCh
 	if result.err != nil {
 		return false, nil, nil, result.err
 	}
-	return nativeQUIC, result.conns, cloneSessionAddr(nativeQUICAddr), nil
+	return nativeQUIC, result.conns, cloneSessionAddr(nativeQUICPeerAddr), nil
 }
 
 func sendExternalQUICModeReady(

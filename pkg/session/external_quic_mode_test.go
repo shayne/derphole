@@ -402,10 +402,11 @@ func TestExternalQUICModeNegotiationUsesListenerResponseAddrWithoutSplitBrain(t 
 
 	listenerDone := make(chan struct {
 		nativeQUIC bool
+		addr       net.Addr
 		err        error
 	}, 1)
 	go func() {
-		nativeQUIC, nativeTCPConns, _, err := acceptExternalQUICMode(
+		nativeQUIC, nativeTCPConns, addr, err := acceptExternalQUICMode(
 			ctx,
 			listenerDERP,
 			modeCh,
@@ -421,8 +422,9 @@ func TestExternalQUICModeNegotiationUsesListenerResponseAddrWithoutSplitBrain(t 
 		closeExternalNativeTCPConns(nativeTCPConns)
 		listenerDone <- struct {
 			nativeQUIC bool
+			addr       net.Addr
 			err        error
-		}{nativeQUIC: nativeQUIC, err: err}
+		}{nativeQUIC: nativeQUIC, addr: addr, err: err}
 	}()
 
 	nativeQUIC, nativeTCPConns, addr, err := requestExternalQUICMode(ctx, senderDERP, listenerDERP.PublicKey(), senderManager, nil, nil, nil, nil, externalNativeTCPAuth{}, false)
@@ -447,6 +449,9 @@ func TestExternalQUICModeNegotiationUsesListenerResponseAddrWithoutSplitBrain(t 
 		}
 		if !got.nativeQUIC {
 			t.Fatalf("acceptExternalQUICMode() nativeQUIC = false, want true; senderNative=%v senderAddr=%v", nativeQUIC, addr)
+		}
+		if got.addr == nil || got.addr.String() != peerPacketConn.LocalAddr().String() {
+			t.Fatalf("acceptExternalQUICMode() addr = %v, want peer addr %v", got.addr, peerPacketConn.LocalAddr())
 		}
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
