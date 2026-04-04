@@ -34,7 +34,7 @@ For no-Tailscale route verification, run 3x averaged 1 GiB transfers in both dir
 - Mac -> `pve1`
 - `pve1` -> Mac
 
-Use `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-matrix-no-tailscale.sh 1024` to ensure those runs do not advertise `100.64.0.0/10` or `fd7a:115c:a1e0::/48` candidates. For `pve1`, same-LAN private routing is expected in that mode because `pve1` and this Mac are on the same LAN.
+Default production runs already skip `100.64.0.0/10` and `fd7a:115c:a1e0::/48` candidates so transport stays independent from Tailscale routes. Use `./scripts/promotion-matrix-no-tailscale.sh 1024` for the public-Internet/private-LAN matrix, and use `DERPCAT_ENABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh <host> 1024` only when you intentionally want to compare the old over-Tailscale route. `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1` remains available as an explicit guardrail for internet-only tests. For `pve1`, same-LAN private routing is expected because `pve1` and this Mac are on the same LAN.
 
 ## Cleanup Guardrails
 

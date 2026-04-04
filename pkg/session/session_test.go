@@ -911,11 +911,14 @@ func TestPublicProbeCandidatesIncludesMappedCandidate(t *testing.T) {
 		if gotMapped != mapped {
 			t.Fatalf("gatherTraversalCandidates() mapped callback = %v, want %v", gotMapped, mapped)
 		}
-		return []string{"100.64.0.11:5555", gotMapped.String(), "not-an-endpoint"}, nil
+		return []string{"100.64.0.11:5555", "203.0.113.11:5555", gotMapped.String(), "not-an-endpoint"}, nil
 	}
 
 	got := publicProbeCandidates(ctx, conn, &tailcfg.DERPMap{}, pm)
-	if !containsString(got, "100.64.0.11:5555") {
+	if containsString(got, "100.64.0.11:5555") {
+		t.Fatalf("publicProbeCandidates() = %v, want no default Tailscale CGNAT candidate", got)
+	}
+	if !containsString(got, "203.0.113.11:5555") {
 		t.Fatalf("publicProbeCandidates() = %v, want gathered host:port candidate", got)
 	}
 	if !containsString(got, mapped.String()) {
@@ -1060,6 +1063,29 @@ func TestPublicProbeCandidatesSkipsTailscaleCGNATInInternetOnlyTestMode(t *testi
 	}
 	if !containsString(got, "192.0.2.10:5555") {
 		t.Fatalf("publicProbeCandidates() = %v, want non-CGNAT gathered candidate", got)
+	}
+}
+
+func TestPublicProbeCandidateAllowedSkipsTailscaleByDefault(t *testing.T) {
+	if publicProbeCandidateAllowed(netip.MustParseAddr("100.125.235.82")) {
+		t.Fatal("publicProbeCandidateAllowed(100.125.235.82) = true, want false by default")
+	}
+	if publicProbeCandidateAllowed(netip.MustParseAddr("fd7a:115c:a1e0::1")) {
+		t.Fatal("publicProbeCandidateAllowed(fd7a:115c:a1e0::1) = true, want false by default")
+	}
+	if !publicProbeCandidateAllowed(netip.MustParseAddr("203.0.113.10")) {
+		t.Fatal("publicProbeCandidateAllowed(203.0.113.10) = false, want true")
+	}
+}
+
+func TestPublicProbeCandidateAllowedCanEnableTailscaleExplicitly(t *testing.T) {
+	t.Setenv("DERPCAT_ENABLE_TAILSCALE_CANDIDATES", "1")
+
+	if !publicProbeCandidateAllowed(netip.MustParseAddr("100.125.235.82")) {
+		t.Fatal("publicProbeCandidateAllowed(100.125.235.82) = false, want true when DERPCAT_ENABLE_TAILSCALE_CANDIDATES=1")
+	}
+	if !publicProbeCandidateAllowed(netip.MustParseAddr("fd7a:115c:a1e0::1")) {
+		t.Fatal("publicProbeCandidateAllowed(fd7a:115c:a1e0::1) = false, want true when DERPCAT_ENABLE_TAILSCALE_CANDIDATES=1")
 	}
 }
 

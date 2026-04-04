@@ -1736,10 +1736,13 @@ func publicProbeCandidateAllowed(ip netip.Addr) bool {
 	if !ip.IsValid() || ip.IsUnspecified() {
 		return false
 	}
-	if os.Getenv("DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES") != "1" {
+	if !publicProbeTailscaleCGNATPrefix.Contains(ip) && !publicProbeTailscaleULAPrefix.Contains(ip) {
 		return true
 	}
-	return !publicProbeTailscaleCGNATPrefix.Contains(ip) && !publicProbeTailscaleULAPrefix.Contains(ip)
+	if os.Getenv("DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES") == "1" {
+		return false
+	}
+	return os.Getenv("DERPCAT_ENABLE_TAILSCALE_CANDIDATES") == "1"
 }
 
 func publicProbeAddrs(ctx context.Context, conn net.PacketConn, dm *tailcfg.DERPMap, pm publicPortmap) []net.Addr {
