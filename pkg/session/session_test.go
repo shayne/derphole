@@ -610,6 +610,7 @@ func TestExternalListenSendUsesNativeDirectTCPWhenAllowed(t *testing.T) {
 	var listenerOut bytes.Buffer
 	var listenerStatus syncBuffer
 	var senderStatus syncBuffer
+	payload := bytes.Repeat([]byte("native-tcp-direct:"), 1<<16)
 
 	tokenSink := make(chan string, 1)
 	listenErr := make(chan error, 1)
@@ -624,12 +625,25 @@ func TestExternalListenSendUsesNativeDirectTCPWhenAllowed(t *testing.T) {
 	}()
 
 	token := <-tokenSink
+	stdinReader, stdinWriter := io.Pipe()
+	writerErr := make(chan error, 1)
+	go func() {
+		defer stdinWriter.Close()
+		midpoint := len(payload) / 2
+		if _, err := stdinWriter.Write(payload[:midpoint]); err != nil {
+			writerErr <- err
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+		_, err := stdinWriter.Write(payload[midpoint:])
+		writerErr <- err
+	}()
 	sendErr := make(chan error, 1)
 	go func() {
 		sendErr <- Send(ctx, SendConfig{
 			Token:         token,
 			Emitter:       telemetry.New(&senderStatus, telemetry.LevelVerbose),
-			StdioIn:       bytes.NewReader([]byte("native-tcp-direct")),
+			StdioIn:       stdinReader,
 			UsePublicDERP: true,
 		})
 	}()
@@ -640,9 +654,12 @@ func TestExternalListenSendUsesNativeDirectTCPWhenAllowed(t *testing.T) {
 	if err := <-sendErr; err != nil {
 		t.Fatalf("Send() error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
 	}
+	if err := <-writerErr; err != nil {
+		t.Fatalf("stdin writer error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+	}
 
-	if got := listenerOut.String(); got != "native-tcp-direct" {
-		t.Fatalf("listener output = %q, want %q", got, "native-tcp-direct")
+	if !bytes.Equal(listenerOut.Bytes(), payload) {
+		t.Fatalf("listener output length = %d, want %d", listenerOut.Len(), len(payload))
 	}
 	if got := senderStatus.String(); !strings.Contains(got, "sender-tcp-direct") {
 		t.Fatalf("sender status = %q, want sender-tcp-direct", got)

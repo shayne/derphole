@@ -216,6 +216,13 @@ func (s *externalHandoffSpool) AckedWatermark() int64 {
 	return s.ackedWatermark
 }
 
+func (s *externalHandoffSpool) Done() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.eof && s.ackedWatermark >= s.sourceOffset
+}
+
 func (s *externalHandoffSpool) RewindTo(offset int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

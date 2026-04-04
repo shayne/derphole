@@ -365,6 +365,10 @@ func runExternalSendStream(
 			closeExternalNativeTCPConns(modeResult.conns)
 			return err
 		}
+		if spool.Done() {
+			closeExternalNativeTCPConns(modeResult.conns)
+			break
+		}
 		if err := spool.RewindTo(spool.AckedWatermark()); err != nil {
 			closeExternalNativeTCPConns(modeResult.conns)
 			return err
