@@ -747,26 +747,15 @@ func TestExternalListenSendHandsOffToNativeQUICWhenNativeTCPIsUnavailableAndBoth
 	}()
 
 	token := <-tokenSink
-	stdinReader, stdinWriter := io.Pipe()
-	writerErr := make(chan error, 1)
-	go func() {
-		defer stdinWriter.Close()
-		midpoint := len(payload) / 2
-		if _, err := stdinWriter.Write(payload[:midpoint]); err != nil {
-			writerErr <- err
-			return
-		}
-		if err := waitForSessionTestStatusContains(ctx, &senderStatus, string(StateDirect)); err != nil {
-			writerErr <- fmt.Errorf("waiting for sender direct promotion: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
-			return
-		}
-		if err := waitForSessionTestStatusContains(ctx, &listenerStatus, string(StateDirect)); err != nil {
-			writerErr <- fmt.Errorf("waiting for listener direct promotion: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
-			return
-		}
-		_, err := stdinWriter.Write(payload[midpoint:])
-		writerErr <- err
-	}()
+	midpoint := len(payload) / 2
+	releaseSecondHalf := make(chan struct{})
+	defer closeSessionTestRelease(releaseSecondHalf)
+	stdinReader := &sessionTwoStageGateReader{
+		ctx:           ctx,
+		firstPayload:  payload[:midpoint],
+		secondPayload: payload[midpoint:],
+		releaseSecond: releaseSecondHalf,
+	}
 
 	sendErr := make(chan error, 1)
 	go func() {
@@ -777,6 +766,21 @@ func TestExternalListenSendHandsOffToNativeQUICWhenNativeTCPIsUnavailableAndBoth
 			UsePublicDERP: true,
 		})
 	}()
+	gateErr := make(chan error, 1)
+	go func() {
+		defer closeSessionTestRelease(releaseSecondHalf)
+		gateCtx, gateCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer gateCancel()
+		if err := waitForSessionTestStatusContains(gateCtx, &senderStatus, "sender-quic-direct"); err != nil {
+			gateErr <- fmt.Errorf("waiting for sender native QUIC handoff: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+			return
+		}
+		if err := waitForSessionTestStatusContains(gateCtx, &listenerStatus, "listener-quic-direct"); err != nil {
+			gateErr <- fmt.Errorf("waiting for listener native QUIC handoff: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+			return
+		}
+		gateErr <- nil
+	}()
 
 	if err := <-listenErr; err != nil {
 		t.Fatalf("Listen() error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
@@ -784,8 +788,8 @@ func TestExternalListenSendHandsOffToNativeQUICWhenNativeTCPIsUnavailableAndBoth
 	if err := <-sendErr; err != nil {
 		t.Fatalf("Send() error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
 	}
-	if err := <-writerErr; err != nil {
-		t.Fatalf("stdin writer error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+	if err := <-gateErr; err != nil {
+		t.Fatalf("native QUIC handoff gate error = %v", err)
 	}
 
 	if !bytes.Equal(listenerOut.Bytes(), payload) {
@@ -916,6 +920,14 @@ func waitForSessionTestStatusContains(ctx context.Context, status *syncBuffer, n
 			return ctx.Err()
 		case <-ticker.C:
 		}
+	}
+}
+
+func closeSessionTestRelease(releaseCh chan struct{}) {
+	select {
+	case <-releaseCh:
+	default:
+		close(releaseCh)
 	}
 }
 
@@ -2464,6 +2476,38 @@ func (r *sessionDirectGateReader) Read(p []byte) (int, error) {
 	select {
 	case <-r.releaseEOF:
 		return 0, io.EOF
+	case <-r.ctx.Done():
+		return 0, r.ctx.Err()
+	}
+}
+
+type sessionTwoStageGateReader struct {
+	ctx           context.Context
+	firstPayload  []byte
+	secondPayload []byte
+	releaseSecond <-chan struct{}
+	firstOffset   int
+	secondOffset  int
+	firstDone     bool
+}
+
+func (r *sessionTwoStageGateReader) Read(p []byte) (int, error) {
+	if !r.firstDone {
+		if r.firstOffset < len(r.firstPayload) {
+			n := copy(p, r.firstPayload[r.firstOffset:])
+			r.firstOffset += n
+			return n, nil
+		}
+		r.firstDone = true
+	}
+	if r.secondOffset >= len(r.secondPayload) {
+		return 0, io.EOF
+	}
+	select {
+	case <-r.releaseSecond:
+		n := copy(p, r.secondPayload[r.secondOffset:])
+		r.secondOffset += n
+		return n, nil
 	case <-r.ctx.Done():
 		return 0, r.ctx.Err()
 	}
