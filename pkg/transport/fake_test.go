@@ -169,6 +169,12 @@ func (c *fakePacketConn) enableResponder(addr net.Addr) {
 	c.responderEndpoints[addr.String()] = cloneAddr(addr)
 }
 
+func (c *fakePacketConn) disableResponder(addr net.Addr) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.responderEndpoints, addr.String())
+}
+
 func (c *fakePacketConn) failNextWriteTo(addr net.Addr, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

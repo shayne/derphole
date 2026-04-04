@@ -59,16 +59,19 @@ func TestManagerUpgradesDirectViaDelayedCallMeMaybe(t *testing.T) {
 	}
 	waitForManagerTimers(t, clock, baseTimers, 2)
 
-	if controls.sentCount(ControlCallMeMaybe) != 0 {
-		t.Fatal("manager sent discovery traffic before the first scheduled tick")
-	}
-
-	clock.Advance(1 * time.Second)
 	if !controls.waitForSentCount(ControlCallMeMaybe, 1, 200*time.Millisecond) {
-		t.Fatal("manager did not send call-me-maybe on the first scheduled tick")
+		t.Fatal("manager did not send startup call-me-maybe")
 	}
 
-	clock.Advance(1 * time.Second)
+	if !waitForDiscoveryIdle(t, mgr, 200*time.Millisecond) {
+		t.Fatal("manager did not finish startup discovery before the first refresh interval")
+	}
+
+	callMeMaybeCount := controls.sentCount(ControlCallMeMaybe)
+	clock.Advance(2 * time.Second)
+	if !controls.waitForSentCount(ControlCallMeMaybe, callMeMaybeCount+1, 200*time.Millisecond) {
+		t.Fatal("manager did not send call-me-maybe on the first refresh interval")
+	}
 	if got := mgr.PathState(); got != PathRelay {
 		t.Fatalf("PathState() before delayed enablement = %v, want %v", got, PathRelay)
 	}
@@ -600,6 +603,10 @@ func TestManagerDemotesStaleDirectPathWhenReadForSend(t *testing.T) {
 	if !waitForPath(t, mgr, PathDirect, 200*time.Millisecond) {
 		t.Fatalf("PathState() = %v, want %v before stale demotion", mgr.PathState(), PathDirect)
 	}
+	if !waitForDiscoveryIdle(t, mgr, 200*time.Millisecond) {
+		t.Fatal("manager did not finish direct discovery before stale demotion check")
+	}
+	direct.disableResponder(peerCandidate)
 
 	callMeMaybeCount := controls.sentCount(ControlCallMeMaybe)
 	probeCount := direct.writeCountTo(peerCandidate)
@@ -633,6 +640,7 @@ func TestManagerPeerDatagramConnUsesRelayThenDirect(t *testing.T) {
 	controls := newFakeControlPipe()
 	peerCandidate := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 55), Port: 45555}
 	controls.enablePeerCandidate(peerCandidate)
+	controls.blockSend(ControlCallMeMaybe)
 	direct.enableResponder(peerCandidate)
 
 	mgr := NewManager(ManagerConfig{
@@ -660,6 +668,7 @@ func TestManagerPeerDatagramConnUsesRelayThenDirect(t *testing.T) {
 		t.Fatal("relay send did not receive payload")
 	}
 
+	controls.unblockSend(ControlCallMeMaybe)
 	clock.Advance(1 * time.Second)
 	if !waitForPath(t, mgr, PathDirect, 200*time.Millisecond) {
 		t.Fatalf("PathState() = %v, want %v", mgr.PathState(), PathDirect)
@@ -936,10 +945,13 @@ func TestManagerKeepsRefreshingLocallyAfterPeerCandidatesArrive(t *testing.T) {
 		t.Fatalf("Start() error = %v", err)
 	}
 	waitForManagerTimers(t, clock, baseTimers, 2)
-	clock.Advance(1 * time.Second)
 	if !controls.waitForSentCount(ControlCallMeMaybe, 1, 200*time.Millisecond) {
-		t.Fatal("manager did not send initial call-me-maybe")
+		t.Fatal("manager did not send startup call-me-maybe")
 	}
+	if !waitForDiscoveryIdle(t, mgr, 200*time.Millisecond) {
+		t.Fatal("manager did not finish startup discovery before peer candidate delivery")
+	}
+	callMeMaybeCount := controls.sentCount(ControlCallMeMaybe)
 
 	if !controls.deliver(ControlMessage{
 		Type:       ControlCandidates,
@@ -947,9 +959,12 @@ func TestManagerKeepsRefreshingLocallyAfterPeerCandidatesArrive(t *testing.T) {
 	}, 200*time.Millisecond) {
 		t.Fatal("failed to deliver peer candidates")
 	}
+	if !waitForDiscoveryIdle(t, mgr, 200*time.Millisecond) {
+		t.Fatal("manager did not finish peer-candidate discovery refresh")
+	}
 
 	clock.Advance(2 * time.Second)
-	if !controls.waitForSentCount(ControlCallMeMaybe, 2, 200*time.Millisecond) {
+	if !controls.waitForSentCount(ControlCallMeMaybe, callMeMaybeCount+1, 200*time.Millisecond) {
 		t.Fatal("peer candidate arrival suppressed local refresh/call-me-maybe retry")
 	}
 }
@@ -1757,6 +1772,24 @@ func waitForPath(t *testing.T, mgr *Manager, want Path, timeout time.Duration) b
 		}
 		return false, mgr.stateChanged()
 	})
+}
+
+func waitForDiscoveryIdle(t *testing.T, mgr *Manager, timeout time.Duration) bool {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for {
+		mgr.discoveryMu.Lock()
+		running := mgr.discoveryRun
+		mgr.discoveryMu.Unlock()
+		if !running {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 type fakePortmap struct {
