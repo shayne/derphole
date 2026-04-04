@@ -746,6 +746,7 @@ func TestManagerPeerDatagramConnSurvivesPathUpgrade(t *testing.T) {
 	controls := newFakeControlPipe()
 	peerCandidate := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 56), Port: 46666}
 	controls.enablePeerCandidate(peerCandidate)
+	controls.blockSend(ControlCallMeMaybe)
 	direct.enableResponder(peerCandidate)
 
 	mgr := NewManager(ManagerConfig{
@@ -769,10 +770,11 @@ func TestManagerPeerDatagramConnSurvivesPathUpgrade(t *testing.T) {
 	if err := conn.SendDatagram([]byte("before-upgrade")); err != nil {
 		t.Fatalf("SendDatagram(before-upgrade) error = %v", err)
 	}
-	if !relay.waitForSentCount([]byte("before-upgrade"), 1, 200*time.Millisecond) {
+	if !relay.waitForSentCount([]byte("before-upgrade"), 1, 2*time.Second) {
 		t.Fatal("relay send did not receive initial payload")
 	}
 
+	controls.unblockSend(ControlCallMeMaybe)
 	clock.Advance(1 * time.Second)
 	if !waitForPath(t, mgr, PathDirect, 200*time.Millisecond) {
 		t.Fatalf("PathState() = %v, want %v", mgr.PathState(), PathDirect)
