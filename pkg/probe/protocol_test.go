@@ -15,6 +15,7 @@ func TestPacketRoundTrip(t *testing.T) {
 		Seq:      42,
 		Offset:   8192,
 		AckFloor: 4096,
+		AckMask:  0x8040201008040201,
 		Payload:  []byte("hello"),
 	}
 
@@ -28,7 +29,7 @@ func TestPacketRoundTrip(t *testing.T) {
 		t.Fatalf("UnmarshalPacket() error = %v", err)
 	}
 
-	if got.Version != p.Version || got.Type != p.Type || !bytes.Equal(got.RunID[:], p.RunID[:]) || got.Seq != p.Seq || got.Offset != p.Offset || got.AckFloor != p.AckFloor || !bytes.Equal(got.Payload, p.Payload) {
+	if got.Version != p.Version || got.Type != p.Type || !bytes.Equal(got.RunID[:], p.RunID[:]) || got.Seq != p.Seq || got.Offset != p.Offset || got.AckFloor != p.AckFloor || got.AckMask != p.AckMask || !bytes.Equal(got.Payload, p.Payload) {
 		t.Fatalf("round trip mismatch: got %#v want %#v", got, p)
 	}
 }

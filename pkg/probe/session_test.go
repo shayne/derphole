@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -328,6 +329,36 @@ func (r *errAfterReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+type zeroThenDataReader struct {
+	chunk []byte
+	zeros int
+}
+
+func (r *zeroThenDataReader) Read(p []byte) (int, error) {
+	if r.zeros > 0 {
+		r.zeros--
+		return 0, nil
+	}
+	n := copy(p, r.chunk)
+	return n, io.EOF
+}
+
+type finalChunkErrorReader struct {
+	chunk []byte
+	stage int
+}
+
+func (r *finalChunkErrorReader) Read(p []byte) (int, error) {
+	switch r.stage {
+	case 0:
+		r.stage++
+		n := copy(p, r.chunk)
+		return n, errReaderBoom
+	default:
+		return 0, io.EOF
+	}
+}
+
 type sackSelectiveRetransmitConn struct {
 	net.PacketConn
 
@@ -414,6 +445,88 @@ func TestSendStreamsBeforeSourceEOF(t *testing.T) {
 	conn.mu.Unlock()
 	if writes == 0 {
 		t.Fatal("sender wrote 0 packets before reader failure, want streaming writes")
+	}
+
+	cancel()
+	if err := <-errs; !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Receive() error = %v, want context cancellation", err)
+	}
+}
+
+func TestSendRetriesAfterZeroProgressRead(t *testing.T) {
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	reader := &zeroThenDataReader{chunk: bytes.Repeat([]byte("zero-progress"), 80), zeros: 8}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	done := make(chan []byte, 1)
+	errs := make(chan error, 1)
+	go func() {
+		got, err := Receive(ctx, b, "", ReceiveConfig{Raw: true})
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- got
+	}()
+
+	stats, err := Send(ctx, a, b.LocalAddr().String(), reader, SendConfig{Raw: true, ChunkSize: len(reader.chunk), WindowSize: 2})
+	if err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if stats.BytesSent != int64(len(reader.chunk)) {
+		t.Fatalf("BytesSent = %d, want %d", stats.BytesSent, len(reader.chunk))
+	}
+
+	select {
+	case err := <-errs:
+		t.Fatalf("Receive() error = %v", err)
+	case got := <-done:
+		if !bytes.Equal(got, reader.chunk) {
+			t.Fatal("received payload mismatch")
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for receive: %v", ctx.Err())
+	}
+}
+
+func TestSendReturnsPartialReadErrorBeforeDone(t *testing.T) {
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	reader := &finalChunkErrorReader{chunk: bytes.Repeat([]byte("partial-fail"), 90)}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	errs := make(chan error, 1)
+	go func() {
+		_, err := Receive(ctx, b, "", ReceiveConfig{Raw: true})
+		errs <- err
+	}()
+
+	_, err = Send(ctx, a, b.LocalAddr().String(), reader, SendConfig{Raw: true, ChunkSize: len(reader.chunk), WindowSize: 2})
+	if !errors.Is(err, errReaderBoom) {
+		t.Fatalf("Send() error = %v, want %v", err, errReaderBoom)
 	}
 
 	cancel()

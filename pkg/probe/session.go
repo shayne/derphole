@@ -73,6 +73,12 @@ func Send(ctx context.Context, conn net.PacketConn, remoteAddr string, src io.Re
 		if err := fillSendWindow(ctx, conn, peer, &state, &stats); err != nil {
 			return TransferStats{}, err
 		}
+		if len(state.inFlight) == 0 && !state.doneQueued {
+			if err := ctx.Err(); err != nil {
+				return TransferStats{}, err
+			}
+			continue
+		}
 		if state.doneQueued && len(state.inFlight) == 0 {
 			stats.CompletedAt = time.Now()
 			return stats, nil
@@ -217,6 +223,7 @@ type senderState struct {
 	offset     uint64
 	eof        bool
 	doneQueued bool
+	pendingErr error
 	inFlight   map[uint64]*outboundPacket
 }
 
@@ -231,6 +238,9 @@ func sendOutbound(ctx context.Context, conn net.PacketConn, peer net.Addr, packe
 }
 
 func fillSendWindow(ctx context.Context, conn net.PacketConn, peer net.Addr, state *senderState, stats *TransferStats) error {
+	if len(state.inFlight) == 0 && state.pendingErr != nil {
+		return state.pendingErr
+	}
 	for len(state.inFlight) < state.window && !state.doneQueued {
 		packet, err := nextOutboundPacket(state)
 		if err != nil {
@@ -250,6 +260,9 @@ func fillSendWindow(ctx context.Context, conn net.PacketConn, peer net.Addr, sta
 
 func nextOutboundPacket(state *senderState) (*outboundPacket, error) {
 	if state.doneQueued {
+		return nil, nil
+	}
+	if state.pendingErr != nil {
 		return nil, nil
 	}
 	if state.eof {
@@ -291,6 +304,8 @@ func nextOutboundPacket(state *senderState) (*outboundPacket, error) {
 		state.offset += uint64(n)
 		if errors.Is(readErr, io.EOF) {
 			state.eof = true
+		} else if readErr != nil {
+			state.pendingErr = readErr
 		}
 		return packet, nil
 	}
