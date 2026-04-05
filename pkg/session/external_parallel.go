@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"strconv"
@@ -119,20 +120,9 @@ func startParallelAutoGrowthLoop(
 			growCancel()
 			if err != nil {
 				snapshot := spool.Snapshot()
-				if snapshot.EOF && snapshot.AckedWatermark >= snapshot.SourceOffset {
-					if emitter != nil {
-						emitter.Debug("parallel-auto-stop=done")
-					}
-					return
-				}
-				if externalParallelTail(snapshot) {
-					if emitter != nil {
-						emitter.Debug("parallel-auto-stop=tail")
-					}
-					return
-				}
+				stopReason := externalParallelGrowthStopReason(snapshot, err)
 				if emitter != nil {
-					emitter.Debug("parallel-auto-stop=grow-error err=" + err.Error())
+					emitter.Debug("parallel-auto-stop=" + stopReason)
 				}
 				return
 			}
@@ -415,6 +405,19 @@ func externalParallelBacklogLimited(snapshot externalHandoffSpoolSnapshot) bool 
 
 func externalParallelTail(snapshot externalHandoffSpoolSnapshot) bool {
 	return snapshot.EOF && snapshot.SourceOffset-snapshot.AckedWatermark <= externalParallelTailBytes
+}
+
+func externalParallelGrowthStopReason(snapshot externalHandoffSpoolSnapshot, err error) string {
+	if snapshot.EOF && snapshot.AckedWatermark >= snapshot.SourceOffset {
+		return "done"
+	}
+	if externalParallelTail(snapshot) {
+		return "tail"
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return "timeout"
+	}
+	return "grow-error err=" + err.Error()
 }
 
 func itoa(v int) string {
