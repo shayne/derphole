@@ -19,6 +19,66 @@ func testRunID(seed byte) [16]byte {
 	return runID
 }
 
+func writeProbePacket(t *testing.T, conn net.PacketConn, dst net.Addr, packet Packet) {
+	t.Helper()
+	wire, err := MarshalPacket(packet, nil)
+	if err != nil {
+		t.Fatalf("MarshalPacket() error = %v", err)
+	}
+	if _, err := conn.WriteTo(wire, dst); err != nil {
+		t.Fatalf("WriteTo() error = %v", err)
+	}
+}
+
+func readProbePacket(t *testing.T, conn net.PacketConn, timeout time.Duration) Packet {
+	t.Helper()
+	buf := make([]byte, 64<<10)
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+	n, _, err := conn.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom() error = %v", err)
+	}
+	packet, err := UnmarshalPacket(buf[:n], nil)
+	if err != nil {
+		t.Fatalf("UnmarshalPacket() error = %v", err)
+	}
+	return packet
+}
+
+func expectProbeTimeout(t *testing.T, conn net.PacketConn, timeout time.Duration) {
+	t.Helper()
+	buf := make([]byte, 64<<10)
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+	_, _, err := conn.ReadFrom(buf)
+	if err == nil {
+		t.Fatal("ReadFrom() error = nil, want timeout")
+	}
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("ReadFrom() error = %v, want timeout", err)
+	}
+}
+
+func establishReceiveSession(t *testing.T, conn net.PacketConn, dst net.Addr, runID [16]byte) {
+	t.Helper()
+	writeProbePacket(t, conn, dst, Packet{
+		Version: ProtocolVersion,
+		Type:    PacketTypeHello,
+		RunID:   runID,
+	})
+	packet := readProbePacket(t, conn, 500*time.Millisecond)
+	if packet.Type != PacketTypeHelloAck {
+		t.Fatalf("packet type = %v, want HELLO_ACK", packet.Type)
+	}
+	if packet.RunID != runID {
+		t.Fatalf("packet RunID = %x, want %x", packet.RunID, runID)
+	}
+}
+
 func TestTransferCompletesAcrossLoopback(t *testing.T) {
 	src := bytes.Repeat([]byte("derpcat"), 1<<17)
 	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
@@ -189,35 +249,18 @@ func TestReceiveAckSignalsOutOfOrderPackets(t *testing.T) {
 
 	writePacket := func(seq uint64, kind PacketType, payload []byte) {
 		t.Helper()
-		wire, err := MarshalPacket(Packet{
+		writeProbePacket(t, a, b.LocalAddr(), Packet{
 			Version: ProtocolVersion,
 			Type:    kind,
 			RunID:   testRunID(1),
 			Seq:     seq,
 			Payload: payload,
-		}, nil)
-		if err != nil {
-			t.Fatalf("MarshalPacket() error = %v", err)
-		}
-		if _, err := a.WriteTo(wire, b.LocalAddr()); err != nil {
-			t.Fatalf("WriteTo() error = %v", err)
-		}
+		})
 	}
 
 	readAck := func() Packet {
 		t.Helper()
-		buf := make([]byte, 64<<10)
-		if err := a.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
-			t.Fatalf("SetReadDeadline() error = %v", err)
-		}
-		n, _, err := a.ReadFrom(buf)
-		if err != nil {
-			t.Fatalf("ReadFrom() error = %v", err)
-		}
-		packet, err := UnmarshalPacket(buf[:n], nil)
-		if err != nil {
-			t.Fatalf("UnmarshalPacket() error = %v", err)
-		}
+		packet := readProbePacket(t, a, 500*time.Millisecond)
 		if packet.Type != PacketTypeAck {
 			t.Fatalf("packet type = %v, want ACK", packet.Type)
 		}
@@ -226,6 +269,8 @@ func TestReceiveAckSignalsOutOfOrderPackets(t *testing.T) {
 		}
 		return packet
 	}
+
+	establishReceiveSession(t, a, b.LocalAddr(), testRunID(1))
 
 	writePacket(1, PacketTypeData, []byte("b"))
 	ack := readAck()
@@ -285,32 +330,16 @@ func TestReceiveAckSignalsAckMaskBoundaryAtPlus64(t *testing.T) {
 		errs <- err
 	}()
 
-	wire, err := MarshalPacket(Packet{
+	establishReceiveSession(t, a, b.LocalAddr(), testRunID(2))
+	writeProbePacket(t, a, b.LocalAddr(), Packet{
 		Version: ProtocolVersion,
 		Type:    PacketTypeData,
 		RunID:   testRunID(2),
 		Seq:     64,
 		Payload: []byte("z"),
-	}, nil)
-	if err != nil {
-		t.Fatalf("MarshalPacket() error = %v", err)
-	}
-	if _, err := a.WriteTo(wire, b.LocalAddr()); err != nil {
-		t.Fatalf("WriteTo() error = %v", err)
-	}
+	})
 
-	buf := make([]byte, 64<<10)
-	if err := a.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
-		t.Fatalf("SetReadDeadline() error = %v", err)
-	}
-	n, _, err := a.ReadFrom(buf)
-	if err != nil {
-		t.Fatalf("ReadFrom() error = %v", err)
-	}
-	ack, err := UnmarshalPacket(buf[:n], nil)
-	if err != nil {
-		t.Fatalf("UnmarshalPacket() error = %v", err)
-	}
+	ack := readProbePacket(t, a, 500*time.Millisecond)
 	if ack.AckFloor != 0 {
 		t.Fatalf("AckFloor = %d, want 0", ack.AckFloor)
 	}
@@ -324,6 +353,138 @@ func TestReceiveAckSignalsAckMaskBoundaryAtPlus64(t *testing.T) {
 	cancel()
 	if err := <-errs; !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Receive() error = %v, want context cancellation", err)
+	}
+}
+
+func TestReceiveIgnoresStaleFirstPacketBeforeHello(t *testing.T) {
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan []byte, 1)
+	errs := make(chan error, 1)
+	go func() {
+		got, err := Receive(ctx, b, a.LocalAddr().String(), ReceiveConfig{Raw: true})
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- got
+	}()
+
+	writeProbePacket(t, a, b.LocalAddr(), Packet{
+		Version: ProtocolVersion,
+		Type:    PacketTypeData,
+		RunID:   testRunID(7),
+		Seq:     0,
+		Payload: []byte("stale"),
+	})
+	expectProbeTimeout(t, a, 100*time.Millisecond)
+
+	establishReceiveSession(t, a, b.LocalAddr(), testRunID(8))
+	writeProbePacket(t, a, b.LocalAddr(), Packet{
+		Version: ProtocolVersion,
+		Type:    PacketTypeData,
+		RunID:   testRunID(8),
+		Seq:     0,
+		Payload: []byte("fresh"),
+	})
+	packet := readProbePacket(t, a, 500*time.Millisecond)
+	if packet.Type != PacketTypeAck || packet.RunID != testRunID(8) {
+		t.Fatalf("ack = %#v, want ACK for established run", packet)
+	}
+	writeProbePacket(t, a, b.LocalAddr(), Packet{
+		Version: ProtocolVersion,
+		Type:    PacketTypeDone,
+		RunID:   testRunID(8),
+		Seq:     1,
+	})
+	_ = readProbePacket(t, a, 500*time.Millisecond)
+
+	select {
+	case err := <-errs:
+		t.Fatalf("Receive() error = %v", err)
+	case got := <-done:
+		if !bytes.Equal(got, []byte("fresh")) {
+			t.Fatalf("payload = %q, want %q", got, []byte("fresh"))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for receive: %v", ctx.Err())
+	}
+}
+
+func TestReceiveIgnoresStaleDoneBeforeHello(t *testing.T) {
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan []byte, 1)
+	errs := make(chan error, 1)
+	go func() {
+		got, err := Receive(ctx, b, a.LocalAddr().String(), ReceiveConfig{Raw: true})
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- got
+	}()
+
+	writeProbePacket(t, a, b.LocalAddr(), Packet{
+		Version: ProtocolVersion,
+		Type:    PacketTypeDone,
+		RunID:   testRunID(11),
+		Seq:     0,
+	})
+	expectProbeTimeout(t, a, 100*time.Millisecond)
+
+	establishReceiveSession(t, a, b.LocalAddr(), testRunID(12))
+	writeProbePacket(t, a, b.LocalAddr(), Packet{
+		Version: ProtocolVersion,
+		Type:    PacketTypeData,
+		RunID:   testRunID(12),
+		Seq:     0,
+		Payload: []byte("ok"),
+	})
+	_ = readProbePacket(t, a, 500*time.Millisecond)
+	writeProbePacket(t, a, b.LocalAddr(), Packet{
+		Version: ProtocolVersion,
+		Type:    PacketTypeDone,
+		RunID:   testRunID(12),
+		Seq:     1,
+	})
+	_ = readProbePacket(t, a, 500*time.Millisecond)
+
+	select {
+	case err := <-errs:
+		t.Fatalf("Receive() error = %v", err)
+	case got := <-done:
+		if !bytes.Equal(got, []byte("ok")) {
+			t.Fatalf("payload = %q, want %q", got, []byte("ok"))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for receive: %v", ctx.Err())
 	}
 }
 
@@ -734,21 +895,38 @@ func TestSendIgnoresAckWithWrongRunID(t *testing.T) {
 					return
 				}
 			}
-			badRunID := runID
-			badRunID[15] ^= 0xff
-			ack, err := MarshalPacket(Packet{
-				Version:  ProtocolVersion,
-				Type:     PacketTypeAck,
-				RunID:    badRunID,
-				AckFloor: math.MaxUint64,
-			}, nil)
-			if err != nil {
-				done <- err
-				return
-			}
-			if _, err := b.WriteTo(ack, addr); err != nil {
-				done <- err
-				return
+			switch packet.Type {
+			case PacketTypeHello:
+				ack, err := MarshalPacket(Packet{
+					Version: ProtocolVersion,
+					Type:    PacketTypeHelloAck,
+					RunID:   runID,
+				}, nil)
+				if err != nil {
+					done <- err
+					return
+				}
+				if _, err := b.WriteTo(ack, addr); err != nil {
+					done <- err
+					return
+				}
+			case PacketTypeData, PacketTypeDone:
+				badRunID := runID
+				badRunID[15] ^= 0xff
+				ack, err := MarshalPacket(Packet{
+					Version:  ProtocolVersion,
+					Type:     PacketTypeAck,
+					RunID:    badRunID,
+					AckFloor: math.MaxUint64,
+				}, nil)
+				if err != nil {
+					done <- err
+					return
+				}
+				if _, err := b.WriteTo(ack, addr); err != nil {
+					done <- err
+					return
+				}
 			}
 		}
 	}()
@@ -834,6 +1012,8 @@ func TestReceiveIgnoresPacketsWithWrongRunIDAfterEstablishingSession(t *testing.
 
 	goodRunID := testRunID(9)
 	badRunID := testRunID(10)
+
+	establishReceiveSession(t, a, b.LocalAddr(), goodRunID)
 
 	write(goodRunID, 0, PacketTypeData, []byte("a"))
 	if ack := readAck(false); ack.RunID != goodRunID {

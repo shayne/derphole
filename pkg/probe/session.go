@@ -75,6 +75,9 @@ func Send(ctx context.Context, conn net.PacketConn, remoteAddr string, src io.Re
 		runID:     runID,
 		inFlight:  make(map[uint64]*outboundPacket, cfg.WindowSize),
 	}
+	if err := performHelloHandshake(ctx, conn, peer, state.runID, &stats); err != nil {
+		return TransferStats{}, err
+	}
 
 	for {
 		if err := fillSendWindow(ctx, conn, peer, &state, &stats); err != nil {
@@ -176,13 +179,25 @@ func Receive(ctx context.Context, conn net.PacketConn, remoteAddr string, cfg Re
 		if isZeroRunID(packet.RunID) {
 			continue
 		}
-		if runIDSet {
-			if packet.RunID != runID {
+		if !runIDSet {
+			if packet.Type != PacketTypeHello {
 				continue
 			}
-		} else {
 			runID = packet.RunID
 			runIDSet = true
+			if err := sendHelloAck(ctx, conn, addr, runID); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if packet.RunID != runID {
+			continue
+		}
+		if packet.Type == PacketTypeHello {
+			if err := sendHelloAck(ctx, conn, addr, runID); err != nil {
+				return nil, err
+			}
+			continue
 		}
 
 		switch packet.Type {
@@ -227,6 +242,63 @@ func sendAck(ctx context.Context, conn net.PacketConn, peer net.Addr, runID [16]
 		RunID:    runID,
 		AckFloor: ackFloor,
 		AckMask:  ackMask,
+	}, nil)
+	if err != nil {
+		return err
+	}
+	_, err = writeWithContext(ctx, conn, peer, packet)
+	return err
+}
+
+func performHelloHandshake(ctx context.Context, conn net.PacketConn, peer net.Addr, runID [16]byte, stats *TransferStats) error {
+	hello, err := MarshalPacket(Packet{
+		Version: ProtocolVersion,
+		Type:    PacketTypeHello,
+		RunID:   runID,
+	}, nil)
+	if err != nil {
+		return err
+	}
+
+	buf := make([]byte, 64<<10)
+	for {
+		if _, err := writeWithContext(ctx, conn, peer, hello); err != nil {
+			return err
+		}
+		stats.PacketsSent++
+
+		if err := setReadDeadline(ctx, conn, defaultRetryInterval); err != nil {
+			return err
+		}
+		n, addr, err := conn.ReadFrom(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if isNetTimeout(err) {
+				continue
+			}
+			return err
+		}
+		if addr.String() != peer.String() {
+			continue
+		}
+		packet, err := UnmarshalPacket(buf[:n], nil)
+		if err != nil {
+			return err
+		}
+		if packet.Type != PacketTypeHelloAck || packet.RunID != runID {
+			continue
+		}
+		return nil
+	}
+}
+
+func sendHelloAck(ctx context.Context, conn net.PacketConn, peer net.Addr, runID [16]byte) error {
+	packet, err := MarshalPacket(Packet{
+		Version: ProtocolVersion,
+		Type:    PacketTypeHelloAck,
+		RunID:   runID,
 	}, nil)
 	if err != nil {
 		return err
