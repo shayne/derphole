@@ -39,6 +39,21 @@ func TestUnmarshalPacketRejectsShortHeader(t *testing.T) {
 	}
 }
 
+func TestUnmarshalPacketRejectsWrongVersion(t *testing.T) {
+	buf, err := MarshalPacket(Packet{
+		Version: ProtocolVersion,
+		Type:    PacketTypeAck,
+	}, nil)
+	if err != nil {
+		t.Fatalf("MarshalPacket() error = %v", err)
+	}
+
+	buf[0] = ProtocolVersion - 1
+	if _, err := UnmarshalPacket(buf, nil); err == nil {
+		t.Fatal("UnmarshalPacket() error = nil, want version error")
+	}
+}
+
 func TestPacketRejectsAEAD(t *testing.T) {
 	block, err := aes.NewCipher(make([]byte, 16))
 	if err != nil {

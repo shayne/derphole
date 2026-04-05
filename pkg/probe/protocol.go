@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	ProtocolVersion = 1
+	ProtocolVersion = 2
 	headerLen       = 52
 )
 
@@ -56,6 +56,9 @@ func UnmarshalPacket(buf []byte, aead cipher.AEAD) (Packet, error) {
 	}
 	if aead != nil {
 		return Packet{}, errors.New("encrypted mode not implemented")
+	}
+	if buf[0] != ProtocolVersion {
+		return Packet{}, errors.New("unsupported protocol version")
 	}
 
 	var p Packet

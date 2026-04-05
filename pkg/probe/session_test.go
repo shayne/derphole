@@ -3,6 +3,7 @@ package probe
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -246,6 +247,234 @@ func TestReceiveAckSignalsOutOfOrderPackets(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatalf("timed out waiting for receive: %v", ctx.Err())
+	}
+}
+
+func TestReceiveAckSignalsAckMaskBoundaryAtPlus64(t *testing.T) {
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	errs := make(chan error, 1)
+	go func() {
+		_, err := Receive(ctx, b, a.LocalAddr().String(), ReceiveConfig{Raw: true})
+		errs <- err
+	}()
+
+	wire, err := MarshalPacket(Packet{
+		Version: ProtocolVersion,
+		Type:    PacketTypeData,
+		Seq:     64,
+		Payload: []byte("z"),
+	}, nil)
+	if err != nil {
+		t.Fatalf("MarshalPacket() error = %v", err)
+	}
+	if _, err := a.WriteTo(wire, b.LocalAddr()); err != nil {
+		t.Fatalf("WriteTo() error = %v", err)
+	}
+
+	buf := make([]byte, 64<<10)
+	if err := a.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+	n, _, err := a.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom() error = %v", err)
+	}
+	ack, err := UnmarshalPacket(buf[:n], nil)
+	if err != nil {
+		t.Fatalf("UnmarshalPacket() error = %v", err)
+	}
+	if ack.AckFloor != 0 {
+		t.Fatalf("AckFloor = %d, want 0", ack.AckFloor)
+	}
+	if ack.AckMask != uint64(1)<<63 {
+		t.Fatalf("AckMask = %064b, want %064b", ack.AckMask, uint64(1)<<63)
+	}
+
+	cancel()
+	if err := <-errs; !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Receive() error = %v, want context cancellation", err)
+	}
+}
+
+var errReaderBoom = errors.New("synthetic reader failure")
+
+type errAfterReader struct {
+	chunk   []byte
+	okReads int
+	reads   int
+}
+
+func (r *errAfterReader) Read(p []byte) (int, error) {
+	if r.reads >= r.okReads {
+		return 0, errReaderBoom
+	}
+
+	n := copy(p, r.chunk)
+	r.reads++
+	return n, nil
+}
+
+type sackSelectiveRetransmitConn struct {
+	net.PacketConn
+
+	mu          sync.Mutex
+	droppedBase bool
+	writeCounts map[uint64]int
+}
+
+func newSackSelectiveRetransmitConn(conn net.PacketConn) *sackSelectiveRetransmitConn {
+	return &sackSelectiveRetransmitConn{
+		PacketConn:  conn,
+		writeCounts: make(map[uint64]int),
+	}
+}
+
+func (c *sackSelectiveRetransmitConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	packet, err := UnmarshalPacket(p, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if packet.Type == PacketTypeData || packet.Type == PacketTypeDone {
+		c.writeCounts[packet.Seq]++
+		if packet.Type == PacketTypeData && packet.Seq == 0 && !c.droppedBase {
+			c.droppedBase = true
+			return len(p), nil
+		}
+	}
+	return c.PacketConn.WriteTo(p, addr)
+}
+
+type countingPacketConn struct {
+	net.PacketConn
+
+	mu     sync.Mutex
+	writes int
+}
+
+func (c *countingPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.mu.Lock()
+	c.writes++
+	c.mu.Unlock()
+	return c.PacketConn.WriteTo(p, addr)
+}
+
+func TestSendStreamsBeforeSourceEOF(t *testing.T) {
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	conn := &countingPacketConn{PacketConn: a}
+	reader := &errAfterReader{
+		chunk:   bytes.Repeat([]byte("stream-first"), 100),
+		okReads: 2,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	errs := make(chan error, 1)
+	go func() {
+		_, err := Receive(ctx, b, "", ReceiveConfig{Raw: true})
+		errs <- err
+	}()
+
+	_, err = Send(ctx, conn, b.LocalAddr().String(), reader, SendConfig{Raw: true, ChunkSize: len(reader.chunk), WindowSize: 4})
+	if !errors.Is(err, errReaderBoom) {
+		t.Fatalf("Send() error = %v, want %v", err, errReaderBoom)
+	}
+
+	conn.mu.Lock()
+	writes := conn.writes
+	conn.mu.Unlock()
+	if writes == 0 {
+		t.Fatal("sender wrote 0 packets before reader failure, want streaming writes")
+	}
+
+	cancel()
+	if err := <-errs; !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Receive() error = %v, want context cancellation", err)
+	}
+}
+
+func TestSendUsesSelectiveRetransmitForMissingBasePacket(t *testing.T) {
+	src := bytes.Repeat([]byte("sack-window"), 700)
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	conn := newSackSelectiveRetransmitConn(a)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	done := make(chan []byte, 1)
+	errs := make(chan error, 1)
+	go func() {
+		got, err := Receive(ctx, b, "", ReceiveConfig{Raw: true})
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- got
+	}()
+
+	if _, err := Send(ctx, conn, b.LocalAddr().String(), bytes.NewReader(src), SendConfig{Raw: true, ChunkSize: 1200, WindowSize: 4}); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	select {
+	case err := <-errs:
+		t.Fatalf("Receive() error = %v", err)
+	case got := <-done:
+		if !bytes.Equal(got, src) {
+			t.Fatal("received payload mismatch")
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for receive: %v", ctx.Err())
+	}
+
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if conn.writeCounts[0] < 2 {
+		t.Fatalf("seq 0 writes = %d, want retransmit", conn.writeCounts[0])
+	}
+	for seq := uint64(1); seq < 4; seq++ {
+		if conn.writeCounts[seq] != 1 {
+			t.Fatalf("seq %d writes = %d, want 1 with SACK", seq, conn.writeCounts[seq])
+		}
 	}
 }
 

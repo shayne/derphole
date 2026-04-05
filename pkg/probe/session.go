@@ -57,35 +57,28 @@ func Send(ctx context.Context, conn net.PacketConn, remoteAddr string, src io.Re
 		return TransferStats{}, err
 	}
 
-	packets, totalBytes, err := buildSendPackets(src, cfg.ChunkSize)
-	if err != nil {
-		return TransferStats{}, err
-	}
-
-	stats := TransferStats{
-		BytesSent: totalBytes,
-		StartedAt: time.Now(),
-	}
-	if len(packets) == 0 {
-		stats.CompletedAt = stats.StartedAt
-		return stats, nil
-	}
+	stats := TransferStats{StartedAt: time.Now()}
 
 	buf := make([]byte, 64<<10)
-	base := 0
-	nextToSend := 0
+	state := senderState{
+		src:       src,
+		chunkSize: cfg.ChunkSize,
+		window:    cfg.WindowSize,
+		nextSeq:   0,
+		offset:    0,
+		inFlight:  make(map[uint64]*outboundPacket, cfg.WindowSize),
+	}
 
-	for base < len(packets) {
-		for nextToSend < len(packets) && nextToSend-base < cfg.WindowSize {
-			if packets[nextToSend].sentAt.IsZero() {
-				if err := sendOutbound(ctx, conn, peer, &packets[nextToSend], &stats); err != nil {
-					return TransferStats{}, err
-				}
-			}
-			nextToSend++
+	for {
+		if err := fillSendWindow(ctx, conn, peer, &state, &stats); err != nil {
+			return TransferStats{}, err
+		}
+		if state.doneQueued && len(state.inFlight) == 0 {
+			stats.CompletedAt = time.Now()
+			return stats, nil
 		}
 
-		if err := setReadDeadline(ctx, conn, nextRetransmitDeadline(ctx, packets[base:nextToSend])); err != nil {
+		if err := setReadDeadline(ctx, conn, nextRetransmitDeadline(ctx, state.inFlight)); err != nil {
 			return TransferStats{}, err
 		}
 
@@ -95,7 +88,7 @@ func Send(ctx context.Context, conn net.PacketConn, remoteAddr string, src io.Re
 				return TransferStats{}, ctx.Err()
 			}
 			if isNetTimeout(err) {
-				if err := retransmitExpired(ctx, conn, peer, packets[base:nextToSend], &stats); err != nil {
+				if err := retransmitExpired(ctx, conn, peer, state.inFlight, &stats); err != nil {
 					return TransferStats{}, err
 				}
 				continue
@@ -114,14 +107,8 @@ func Send(ctx context.Context, conn net.PacketConn, remoteAddr string, src io.Re
 			continue
 		}
 
-		stats.PacketsAcked += int64(applyAck(packets, packet.AckFloor, packet.AckMask))
-		for base < len(packets) && packets[base].acked {
-			base++
-		}
+		stats.PacketsAcked += int64(applyAck(state.inFlight, packet.AckFloor, packet.AckMask))
 	}
-
-	stats.CompletedAt = time.Now()
-	return stats, nil
 }
 
 func Receive(ctx context.Context, conn net.PacketConn, remoteAddr string, cfg ReceiveConfig) ([]byte, error) {
@@ -219,60 +206,18 @@ type outboundPacket struct {
 	seq     uint64
 	wire    []byte
 	sentAt  time.Time
-	acked   bool
 	payload int
 }
 
-func buildSendPackets(src io.Reader, chunkSize int) ([]outboundPacket, int64, error) {
-	buf := make([]byte, chunkSize)
-	var packets []outboundPacket
-	var seq uint64
-	var offset uint64
-	var totalBytes int64
-
-	for {
-		n, readErr := src.Read(buf)
-		if n > 0 {
-			payload := append([]byte(nil), buf[:n]...)
-			wire, err := MarshalPacket(Packet{
-				Version: ProtocolVersion,
-				Type:    PacketTypeData,
-				Seq:     seq,
-				Offset:  offset,
-				Payload: payload,
-			}, nil)
-			if err != nil {
-				return nil, 0, err
-			}
-			packets = append(packets, outboundPacket{
-				seq:     seq,
-				wire:    wire,
-				payload: n,
-			})
-			totalBytes += int64(n)
-			seq++
-			offset += uint64(n)
-		}
-		if errors.Is(readErr, io.EOF) {
-			wire, err := MarshalPacket(Packet{
-				Version: ProtocolVersion,
-				Type:    PacketTypeDone,
-				Seq:     seq,
-				Offset:  offset,
-			}, nil)
-			if err != nil {
-				return nil, 0, err
-			}
-			packets = append(packets, outboundPacket{
-				seq:  seq,
-				wire: wire,
-			})
-			return packets, totalBytes, nil
-		}
-		if readErr != nil {
-			return nil, 0, readErr
-		}
-	}
+type senderState struct {
+	src        io.Reader
+	chunkSize  int
+	window     int
+	nextSeq    uint64
+	offset     uint64
+	eof        bool
+	doneQueued bool
+	inFlight   map[uint64]*outboundPacket
 }
 
 func sendOutbound(ctx context.Context, conn net.PacketConn, peer net.Addr, packet *outboundPacket, stats *TransferStats) error {
@@ -285,27 +230,101 @@ func sendOutbound(ctx context.Context, conn net.PacketConn, peer net.Addr, packe
 	return nil
 }
 
-func retransmitExpired(ctx context.Context, conn net.PacketConn, peer net.Addr, packets []outboundPacket, stats *TransferStats) error {
+func fillSendWindow(ctx context.Context, conn net.PacketConn, peer net.Addr, state *senderState, stats *TransferStats) error {
+	for len(state.inFlight) < state.window && !state.doneQueued {
+		packet, err := nextOutboundPacket(state)
+		if err != nil {
+			return err
+		}
+		if packet == nil {
+			return nil
+		}
+		state.inFlight[packet.seq] = packet
+		if err := sendOutbound(ctx, conn, peer, packet, stats); err != nil {
+			return err
+		}
+		stats.BytesSent += int64(packet.payload)
+	}
+	return nil
+}
+
+func nextOutboundPacket(state *senderState) (*outboundPacket, error) {
+	if state.doneQueued {
+		return nil, nil
+	}
+	if state.eof {
+		wire, err := MarshalPacket(Packet{
+			Version: ProtocolVersion,
+			Type:    PacketTypeDone,
+			Seq:     state.nextSeq,
+			Offset:  state.offset,
+		}, nil)
+		if err != nil {
+			return nil, err
+		}
+		packet := &outboundPacket{seq: state.nextSeq, wire: wire}
+		state.nextSeq++
+		state.doneQueued = true
+		return packet, nil
+	}
+
+	buf := make([]byte, state.chunkSize)
+	n, readErr := state.src.Read(buf)
+	if n > 0 {
+		payload := append([]byte(nil), buf[:n]...)
+		wire, err := MarshalPacket(Packet{
+			Version: ProtocolVersion,
+			Type:    PacketTypeData,
+			Seq:     state.nextSeq,
+			Offset:  state.offset,
+			Payload: payload,
+		}, nil)
+		if err != nil {
+			return nil, err
+		}
+		packet := &outboundPacket{
+			seq:     state.nextSeq,
+			wire:    wire,
+			payload: n,
+		}
+		state.nextSeq++
+		state.offset += uint64(n)
+		if errors.Is(readErr, io.EOF) {
+			state.eof = true
+		}
+		return packet, nil
+	}
+	if errors.Is(readErr, io.EOF) {
+		state.eof = true
+		return nextOutboundPacket(state)
+	}
+	if readErr != nil {
+		return nil, readErr
+	}
+	return nil, nil
+}
+
+func retransmitExpired(ctx context.Context, conn net.PacketConn, peer net.Addr, packets map[uint64]*outboundPacket, stats *TransferStats) error {
 	now := time.Now()
-	for i := range packets {
-		if packets[i].acked || packets[i].sentAt.IsZero() {
+	for _, packet := range packets {
+		if packet.sentAt.IsZero() {
 			continue
 		}
-		if now.Sub(packets[i].sentAt) < defaultRetryInterval {
+		if now.Sub(packet.sentAt) < defaultRetryInterval {
 			continue
 		}
-		if err := sendOutbound(ctx, conn, peer, &packets[i], stats); err != nil {
+		if err := sendOutbound(ctx, conn, peer, packet, stats); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func nextRetransmitDeadline(ctx context.Context, packets []outboundPacket) time.Duration {
+func nextRetransmitDeadline(ctx context.Context, packets map[uint64]*outboundPacket) time.Duration {
 	wait := defaultRetryInterval
 	now := time.Now()
 	for _, packet := range packets {
-		if packet.acked || packet.sentAt.IsZero() {
+		if packet.sentAt.IsZero() {
 			continue
 		}
 		deadline := packet.sentAt.Add(defaultRetryInterval)
@@ -326,28 +345,25 @@ func nextRetransmitDeadline(ctx context.Context, packets []outboundPacket) time.
 	return wait
 }
 
-func applyAck(packets []outboundPacket, ackFloor, ackMask uint64) int {
+func applyAck(packets map[uint64]*outboundPacket, ackFloor, ackMask uint64) int {
 	acked := 0
-	for i := range packets {
-		if packets[i].acked {
-			continue
-		}
-		if packets[i].seq < ackFloor {
-			packets[i].acked = true
+	for seq := range packets {
+		if seq < ackFloor {
+			delete(packets, seq)
 			acked++
 			continue
 		}
-		if packets[i].seq <= ackFloor {
+		if seq <= ackFloor {
 			continue
 		}
-		delta := packets[i].seq - ackFloor - 1
+		delta := seq - ackFloor - 1
 		if delta >= maxAckMaskBits {
 			continue
 		}
 		if ackMask&(uint64(1)<<delta) == 0 {
 			continue
 		}
-		packets[i].acked = true
+		delete(packets, seq)
 		acked++
 	}
 	return acked
