@@ -4,6 +4,10 @@
 
 It uses the public Tailscale DERP relay network for rendezvous and relay fallback, but it is **not** affiliated with Tailscale, does **not** require a Tailscale account or tailnet, and does **not** use `tailscaled` for transport.
 
+`derpcat` is **not** a WireGuard overlay and **not** a VPN. Tailscale is built around WireGuard and is optimized as a general-purpose secure network between machines. `derpcat` is optimized for a different job: one session, one token, one transfer or shared service, with the shortest secure path it can find for that session.
+
+That difference matters. For one-shot transfers and temporary service sharing, `derpcat` can outperform sending the same traffic through a WireGuard-based overlay because it does not first build a general-purpose encrypted network path and then send your application traffic through it. Instead, it uses DERP for rendezvous and fallback, then moves the live session onto direct QUIC or authenticated native TCP as soon as those paths are ready.
+
 It does **not** require:
 
 - a Tailscale account
@@ -62,7 +66,7 @@ Use `--verbose` to see state transitions such as `connected-relay` and `connecte
 npx -y derpcat@latest --verbose listen
 ```
 
-## How It Works
+## Transport Model
 
 At a high level:
 
@@ -73,7 +77,7 @@ At a high level:
 5. Both sides start on the first working path immediately, including DERP relay if direct connectivity is not ready yet.
 6. In parallel, they continue NAT traversal and direct-path probing. If a direct path succeeds, the live session upgrades in place without restarting the transfer.
 
-### Under The Hood
+### Data Plane Selection
 
 DERP is used for **rendezvous** and **relay fallback**:
 
@@ -92,6 +96,34 @@ Candidate discovery is split into two phases:
 
 That keeps startup latency low while still allowing relay-to-direct promotion.
 
+## How This Differs From Tailscale / WireGuard
+
+Tailscale uses WireGuard to build a secure general-purpose network between peers. That is the right abstraction when you want durable machine-to-machine connectivity, stable private addressing, ACLs, subnet routing, exit nodes, and a long-lived encrypted overlay.
+
+`derpcat` does something narrower and faster for its target workload. It creates a session-scoped transport for a single transfer or a single shared service:
+
+- no WireGuard tunnel device
+- no overlay network interface
+- no persistent mesh control plane
+- no need to route arbitrary traffic through a general encrypted network
+
+Instead, `derpcat` uses a bearer token to authorize exactly one session, uses DERP to get both peers talking immediately, and then promotes the session onto the best direct path it can establish for that workload.
+
+For `send/listen` and `share/open`, that can beat routing the same traffic through a WireGuard-based overlay because `derpcat` is purpose-built for the active session rather than for a general secure network abstraction.
+
+## Why It Is Fast
+
+`derpcat` gets its performance from the transport design:
+
+- DERP is used for rendezvous and relay fallback, not as the preferred steady-state data plane.
+- Sessions can start relayed immediately and then promote in place to direct without restarting the transfer.
+- Public-Internet direct paths use QUIC over UDP, which gives fast setup, stream multiplexing, and encrypted user-space transport without requiring a kernel VPN interface.
+- Route-local paths can use authenticated native TCP fast paths for `listen/send`, which avoids extra overlay encapsulation when both peers can safely use a local/private route.
+- Native QUIC can use multiple striped connections for higher throughput on difficult paths where a single UDP flow is not enough.
+- Candidate discovery is front-loaded with local interface candidates and cached mappings, then refined in the background with STUN and port mapping refresh. That keeps the first byte moving quickly instead of stalling the session until every traversal probe finishes.
+
+In practice, that means `derpcat` is optimized to get bytes moving early, keep them moving through relay if necessary, and then shift the live session onto a faster direct path as soon as direct connectivity is ready.
+
 ## Security Model
 
 The session token is a **bearer capability**. Anyone who has the token can claim that session until it expires, so share it over a channel you trust. Tokens expire after one hour.
@@ -100,6 +132,13 @@ DERP relays do **not** get the secret material needed to read or impersonate the
 
 - On the public Internet path, traffic is carried over QUIC with the peer certificate pinned to the public identity encoded in the token. If packets are relayed through DERP, DERP only forwards encrypted bytes.
 - On local/private native TCP fast paths, the connection is authenticated with a per-session handshake derived from the token's bearer secret and both peers' public identities. Internet-facing direct paths stay on authenticated QUIC.
+
+The important security property is that `derpcat` does not trade speed for plaintext shortcuts:
+
+- the token authorizes the session, but does not turn DERP into a trusted decrypting proxy
+- QUIC peers are pinned to the expected public identity from the token
+- native TCP fast paths are only used where allowed and are authenticated per session
+- DERP forwards encrypted traffic but does not have the keys required to decrypt or impersonate the session
 
 That gives a simple operational rule: possession of the token authorizes the session, but intermediaries that only see DERP traffic do not have the keys needed to decrypt it.
 
