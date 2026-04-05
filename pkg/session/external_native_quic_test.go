@@ -200,6 +200,101 @@ func TestDialOrAcceptExternalNativeQUICConnOnTransportReturnsAfterFirstDialSucce
 	}
 }
 
+func TestDialOrAcceptExternalNativeQUICConnWithRoleUsesPreferredStreamRoleWhenAcceptedConnWins(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	senderPacketConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer senderPacketConn.Close()
+
+	listenerPacketConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listenerPacketConn.Close()
+
+	senderIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listenerIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type nativeQUICConnResult struct {
+		transport *quic.Transport
+		conn      *quic.Conn
+		err       error
+	}
+	listenerResultCh := make(chan nativeQUICConnResult, 1)
+	go func() {
+		transport, conn, err := dialOrAcceptExternalNativeQUICConn(
+			ctx,
+			listenerPacketConn,
+			cloneSessionAddr(senderPacketConn.LocalAddr()),
+			quicpath.ClientTLSConfig(listenerIdentity, senderIdentity.Public),
+			quicpath.ServerTLSConfig(listenerIdentity, senderIdentity.Public),
+		)
+		listenerResultCh <- nativeQUICConnResult{transport: transport, conn: conn, err: err}
+	}()
+
+	senderTransport, senderConn, openStream, err := dialOrAcceptExternalNativeQUICConnWithRole(
+		ctx,
+		senderPacketConn,
+		nil,
+		quicpath.ClientTLSConfig(senderIdentity, listenerIdentity.Public),
+		quicpath.ServerTLSConfig(senderIdentity, listenerIdentity.Public),
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer senderTransport.Close()
+	defer senderConn.CloseWithError(0, "")
+
+	listenerResult := <-listenerResultCh
+	if listenerResult.err != nil {
+		t.Fatal(listenerResult.err)
+	}
+	defer listenerResult.transport.Close()
+	defer listenerResult.conn.CloseWithError(0, "")
+
+	if !openStream {
+		t.Fatal("dialOrAcceptExternalNativeQUICConnWithRole() openStream = false, want true for preferDial sender role even when Accept wins")
+	}
+
+	senderStream, err := openExternalNativeQUICStreamForConn(ctx, senderConn, openStream)
+	if err != nil {
+		t.Fatalf("sender openExternalNativeQUICStreamForConn() error = %v", err)
+	}
+	defer senderStream.Close()
+
+	listenerStream, err := openExternalNativeQUICStreamForConn(ctx, listenerResult.conn, false)
+	if err != nil {
+		t.Fatalf("listener openExternalNativeQUICStreamForConn() error = %v", err)
+	}
+	defer listenerStream.Close()
+
+	if _, err := senderStream.Write([]byte("preferred-stream-role")); err != nil {
+		t.Fatal(err)
+	}
+	if err := senderStream.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := io.ReadAll(listenerStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "preferred-stream-role" {
+		t.Fatalf("listener stream payload = %q, want %q", got, "preferred-stream-role")
+	}
+}
+
 func TestExternalNativeQUICTransfersAllowSlowPrimaryHandshake(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

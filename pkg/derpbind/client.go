@@ -231,12 +231,13 @@ func (c *Client) dispatchSubscriber(pkt Packet) bool {
 	}
 	c.subMu.RUnlock()
 
+	delivered := false
 	for _, sub := range matches {
 		if c.tryDeliverSubscriber(sub, pkt) {
-			return true
+			delivered = true
 		}
 	}
-	return false
+	return delivered
 }
 
 func (c *Client) tryDeliverSubscriber(sub *packetSubscriber, pkt Packet) bool {

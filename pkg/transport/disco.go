@@ -41,6 +41,9 @@ func (m *Manager) discoveryLoop(ctx context.Context) {
 
 func (m *Manager) requestDiscovery(ctx context.Context, forceCandidateRefresh bool) {
 	ctx = m.directContext(ctx)
+	if ctx.Err() != nil {
+		return
+	}
 	m.discoveryMu.Lock()
 	if forceCandidateRefresh {
 		m.forceCandidateRefresh = true
@@ -56,7 +59,11 @@ func (m *Manager) requestDiscovery(ctx context.Context, forceCandidateRefresh bo
 	m.discoveryPending = false
 	m.discoveryMu.Unlock()
 
-	go m.discoveryWorker(ctx, forceCandidateRefresh)
+	m.directWG.Add(1)
+	go func() {
+		defer m.directWG.Done()
+		m.discoveryWorker(ctx, forceCandidateRefresh)
+	}()
 }
 
 func (m *Manager) discoveryWorker(ctx context.Context, forceCandidateRefresh bool) {

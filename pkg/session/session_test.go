@@ -541,6 +541,17 @@ func TestExternalListenSendStartsRelayQUICWhenNativeTCPIsUnavailableAndDirectNev
 	externalNativeTCPAddrAllowed = func(net.Addr) bool { return false }
 	t.Cleanup(func() { externalNativeTCPAddrAllowed = prevTCPAddrAllowed })
 
+	prevInterfaceAddrs := publicInterfaceAddrs
+	publicInterfaceAddrs = func() ([]net.Addr, error) {
+		return []net.Addr{
+			&net.IPNet{
+				IP:   net.IPv4(127, 0, 0, 1),
+				Mask: net.CIDRMask(8, 32),
+			},
+		}, nil
+	}
+	t.Cleanup(func() { publicInterfaceAddrs = prevInterfaceAddrs })
+
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
 	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
@@ -721,6 +732,17 @@ func TestExternalListenSendHandsOffToNativeQUICWhenNativeTCPIsUnavailableAndBoth
 	prevTCPAddrAllowed := externalNativeTCPAddrAllowed
 	externalNativeTCPAddrAllowed = func(net.Addr) bool { return false }
 	t.Cleanup(func() { externalNativeTCPAddrAllowed = prevTCPAddrAllowed })
+
+	prevInterfaceAddrs := publicInterfaceAddrs
+	publicInterfaceAddrs = func() ([]net.Addr, error) {
+		return []net.Addr{
+			&net.IPNet{
+				IP:   net.IPv4(127, 0, 0, 1),
+				Mask: net.CIDRMask(8, 32),
+			},
+		}, nil
+	}
+	t.Cleanup(func() { publicInterfaceAddrs = prevInterfaceAddrs })
 
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)

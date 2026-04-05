@@ -227,6 +227,37 @@ func TestClientSubscribeInterceptsMatchingPackets(t *testing.T) {
 	}
 }
 
+func TestClientDispatchSubscriberDeliversToAllMatchingSubscribers(t *testing.T) {
+	c := &Client{
+		stopCh:      make(chan struct{}),
+		subscribers: make(map[uint64]*packetSubscriber),
+	}
+
+	firstCh, unsubscribeFirst := c.SubscribeLossless(func(Packet) bool { return true })
+	defer unsubscribeFirst()
+	secondCh, unsubscribeSecond := c.SubscribeLossless(func(Packet) bool { return true })
+	defer unsubscribeSecond()
+
+	payload := []byte("fanout")
+	if !c.dispatchSubscriber(Packet{From: key.NewNode().Public(), Payload: payload}) {
+		t.Fatal("dispatchSubscriber() = false, want true")
+	}
+
+	for name, ch := range map[string]<-chan Packet{
+		"first":  firstCh,
+		"second": secondCh,
+	} {
+		select {
+		case pkt := <-ch:
+			if !bytes.Equal(pkt.Payload, payload) {
+				t.Fatalf("%s subscriber payload = %q, want %q", name, pkt.Payload, payload)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("%s subscriber did not receive matching packet", name)
+		}
+	}
+}
+
 func TestClientSubscribeDropsOldestWhenSubscriberBackedUp(t *testing.T) {
 	c := &Client{
 		stopCh:      make(chan struct{}),

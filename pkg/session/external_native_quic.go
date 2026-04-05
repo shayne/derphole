@@ -987,7 +987,9 @@ func dialOrAcceptExternalNativeQUICConnsWithStreamRole(
 
 	cancel()
 	_ = listener.Close()
-	return transport, conns, dialRemainder, nil
+	// Stream-open ownership is a protocol role, not a side-effect of which
+	// first connection happened to win the accept-vs-dial race.
+	return transport, conns, preferDial, nil
 }
 
 func dialOrAcceptExternalNativeQUICConnOnTransport(

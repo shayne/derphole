@@ -235,6 +235,71 @@ func TestManagerStartsDiscoveryWithoutWaitingForFirstTick(t *testing.T) {
 	}
 }
 
+func TestManagerStopDirectWaitsForActiveDiscoveryWorker(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000016, 0))
+	direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	direct.useClock(clock)
+	controls := newFakeControlPipe()
+	baseTimers := clock.timerCount()
+
+	candidateSourceStarted := make(chan struct{})
+	releaseCandidateSource := make(chan struct{})
+	candidateSourceEntered := false
+	mgr := NewManager(ManagerConfig{
+		DirectConn: direct,
+		CandidateSource: func(context.Context) []net.Addr {
+			if !candidateSourceEntered {
+				candidateSourceEntered = true
+				close(candidateSourceStarted)
+			}
+			<-releaseCandidateSource
+			return []net.Addr{&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}}
+		},
+		SendControl:             controls.send,
+		ReceiveControl:          controls.receive,
+		Clock:                   clock,
+		DiscoveryInterval:       1 * time.Second,
+		EndpointRefreshInterval: 2 * time.Second,
+		DirectStaleTimeout:      4 * time.Second,
+	})
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+
+	select {
+	case <-candidateSourceStarted:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("startup discovery worker did not call CandidateSource")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		mgr.StopDirect()
+		close(stopDone)
+	}()
+
+	select {
+	case <-stopDone:
+		t.Fatal("StopDirect() returned while discovery worker was still blocked")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseCandidateSource)
+
+	select {
+	case <-stopDone:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("StopDirect() did not return after discovery worker unblocked")
+	}
+}
+
 func TestManagerReadsBatchedDirectPayloadsFromBatchConn(t *testing.T) {
 	t.Helper()
 

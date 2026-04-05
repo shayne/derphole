@@ -46,6 +46,7 @@ const (
 
 const externalNativeQUICWait = 5 * time.Second
 const externalNativeQUICConnectWait = externalNativeQUICWait
+const externalNativeQUICAckRetryInterval = 250 * time.Millisecond
 const externalNativeQUICNackWait = 1 * time.Second
 const externalNativeQUICSetupGraceWait = 0
 const externalNativeQUICSetupSkipRelayTailBytes = 256 << 10
@@ -1561,13 +1562,14 @@ func requestExternalQUICMode(
 			nativeTCPConns = nil
 		}
 	}
-	if err := sendEnvelope(ctx, client, peerDERP, envelope{
+	ackEnv := envelope{
 		Type: envelopeQUICModeAck,
 		QUICModeAck: &quicModeAck{
 			NativeDirect: resp.NativeDirect && ok && addr != nil,
 			NativeTCP:    nativeTCP && len(nativeTCPConns) > 0,
 		},
-	}); err != nil {
+	}
+	if err := sendEnvelope(ctx, client, peerDERP, ackEnv); err != nil {
 		closeExternalNativeTCPConns(nativeTCPConns)
 		return false, nil, nil, err
 	}
@@ -1585,7 +1587,9 @@ func requestExternalQUICMode(
 	}
 	readyCtx, readyCancel := context.WithTimeout(ctx, externalNativeQUICWait)
 	defer readyCancel()
-	ready, err := receiveQUICModeReady(readyCtx, readyCh)
+	ready, err := receiveQUICModeReadyWithAckRetry(readyCtx, readyCh, func(ctx context.Context) error {
+		return sendEnvelope(ctx, client, peerDERP, ackEnv)
+	})
 	if err != nil || !ready.NativeDirect {
 		closeExternalNativeTCPConns(nativeTCPConns)
 		if errors.Is(err, context.Canceled) {
@@ -1616,6 +1620,10 @@ func acceptExternalQUICMode(
 		return pkt.From == peerDERP && isQUICModeAckPayload(pkt.Payload)
 	})
 	defer unsubscribeAck()
+	modeAbortCh, unsubscribeModeAbort := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == peerDERP && isQUICModeAbortAckPayload(pkt.Payload)
+	})
+	defer unsubscribeModeAbort()
 
 	req, err := receiveQUICModeRequest(modeCtx, modeCh)
 	if err != nil {
@@ -1665,7 +1673,7 @@ func acceptExternalQUICMode(
 		}
 	}
 	if req.NativeDirect && !forceRelay && nativeTCPListener == nil {
-		peerDirectAddr, ok, aborted := waitForExternalDirectAddrOrModeAbort(ctx, manager, ackCh, externalNativeQUICWait)
+		peerDirectAddr, ok, aborted := waitForExternalDirectAddrOrModeAbort(ctx, manager, modeAbortCh, externalNativeQUICWait)
 		if aborted {
 			return false, nil, nil, nil
 		}
@@ -1982,19 +1990,34 @@ func receiveQUICModeAck(ctx context.Context, ch <-chan derpbind.Packet) (quicMod
 	}
 }
 
-func receiveQUICModeReady(ctx context.Context, ch <-chan derpbind.Packet) (quicModeReady, error) {
-	select {
-	case pkt, ok := <-ch:
-		if !ok {
-			return quicModeReady{}, net.ErrClosed
+func receiveQUICModeReadyWithAckRetry(
+	ctx context.Context,
+	readyCh <-chan derpbind.Packet,
+	sendAck func(context.Context) error,
+) (quicModeReady, error) {
+	retry := time.NewTicker(externalNativeQUICAckRetryInterval)
+	defer retry.Stop()
+
+	for {
+		select {
+		case pkt, ok := <-readyCh:
+			if !ok {
+				return quicModeReady{}, net.ErrClosed
+			}
+			env, err := decodeEnvelope(pkt.Payload)
+			if err != nil || env.Type != envelopeQUICModeReady || env.QUICModeReady == nil {
+				return quicModeReady{}, errors.New("unexpected quic mode ready")
+			}
+			return *env.QUICModeReady, nil
+		case <-retry.C:
+			if sendAck != nil {
+				if err := sendAck(ctx); err != nil {
+					return quicModeReady{}, err
+				}
+			}
+		case <-ctx.Done():
+			return quicModeReady{}, ctx.Err()
 		}
-		env, err := decodeEnvelope(pkt.Payload)
-		if err != nil || env.Type != envelopeQUICModeReady || env.QUICModeReady == nil {
-			return quicModeReady{}, errors.New("unexpected quic mode ready")
-		}
-		return *env.QUICModeReady, nil
-	case <-ctx.Done():
-		return quicModeReady{}, ctx.Err()
 	}
 }
 
@@ -2019,13 +2042,17 @@ func waitForExternalDirectAddrOrModeAbort(
 
 	for {
 		if addr, ok := manager.DirectAddr(); ok && addr != nil {
+			externalTransferTracef("wait-direct-addr-ready path=%v addr=%v", manager.PathState(), addr)
 			return cloneSessionAddr(addr), true, false
 		}
+		externalTransferTracef("wait-direct-addr-pending path=%v", manager.PathState())
 		select {
 		case <-ctx.Done():
+			externalTransferTracef("wait-direct-addr-context-done err=%v", ctx.Err())
 			return nil, false, false
 		case pkt, ok := <-modeAckCh:
 			if !ok {
+				externalTransferTracef("wait-direct-addr-mode-ack-closed")
 				return nil, false, true
 			}
 			ackEnv, err := decodeEnvelope(pkt.Payload)
@@ -2034,9 +2061,11 @@ func waitForExternalDirectAddrOrModeAbort(
 				ackEnv.QUICModeAck != nil &&
 				!ackEnv.QUICModeAck.NativeDirect &&
 				!ackEnv.QUICModeAck.NativeTCP {
+				externalTransferTracef("wait-direct-addr-mode-abort")
 				return nil, false, true
 			}
 		case <-timer.C:
+			externalTransferTracef("wait-direct-addr-timeout")
 			return nil, false, false
 		case <-ticker.C:
 		}
@@ -2486,6 +2515,18 @@ func isQUICModeAckPayload(payload []byte) bool {
 	}
 	env, err := decodeEnvelope(payload)
 	return err == nil && env.Type == envelopeQUICModeAck && env.QUICModeAck != nil
+}
+
+func isQUICModeAbortAckPayload(payload []byte) bool {
+	if len(payload) == 0 || payload[0] != '{' {
+		return false
+	}
+	env, err := decodeEnvelope(payload)
+	return err == nil &&
+		env.Type == envelopeQUICModeAck &&
+		env.QUICModeAck != nil &&
+		!env.QUICModeAck.NativeDirect &&
+		!env.QUICModeAck.NativeTCP
 }
 
 func isQUICModeReadyPayload(payload []byte) bool {
