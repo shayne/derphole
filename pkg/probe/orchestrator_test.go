@@ -55,13 +55,28 @@ func TestRunOrchestrateInvokesSSHAndReturnsDirectReport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunOrchestrate() error = %v", err)
 	}
-	if !report.Direct {
-		t.Fatal("RunOrchestrate() report.Direct = false, want true")
+	if report.Direct {
+		t.Fatal("RunOrchestrate() report.Direct = true, want false")
 	}
 	if report.Host != "ktzlxc" || report.Mode != "raw" || report.Direction != "forward" {
 		t.Fatalf("RunOrchestrate() report = %#v", report)
 	}
 	if len(gotArgv) < 3 || gotArgv[0] != "ssh" || !strings.Contains(strings.Join(gotArgv, " "), "/tmp/derpcat-probe server --help") {
 		t.Fatalf("RunOrchestrate() argv = %#v", gotArgv)
+	}
+}
+
+func TestRunOrchestrateRejectsAeadMode(t *testing.T) {
+	_, err := RunOrchestrate(context.Background(), OrchestrateConfig{
+		Host:      "ktzlxc",
+		User:      "root",
+		Mode:      "aead",
+		SizeBytes: 1024,
+	})
+	if err == nil {
+		t.Fatal("RunOrchestrate() error = nil, want aead rejection")
+	}
+	if !strings.Contains(err.Error(), "aead not implemented yet") {
+		t.Fatalf("RunOrchestrate() error = %v, want aead rejection", err)
 	}
 }

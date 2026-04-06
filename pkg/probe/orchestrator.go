@@ -115,7 +115,10 @@ func RunOrchestrate(ctx context.Context, cfg OrchestrateConfig) (RunReport, erro
 	if cfg.SizeBytes < 0 {
 		return RunReport{}, errors.New("size bytes must be non-negative")
 	}
-	if cfg.Mode != "raw" && cfg.Mode != "aead" {
+	if cfg.Mode != "raw" {
+		if cfg.Mode == "aead" {
+			return RunReport{}, errors.New("aead not implemented yet")
+		}
 		return RunReport{}, fmt.Errorf("unsupported mode %q", cfg.Mode)
 	}
 	if cfg.Direction != "forward" && cfg.Direction != "reverse" {
@@ -141,6 +144,6 @@ func RunOrchestrate(ctx context.Context, cfg OrchestrateConfig) (RunReport, erro
 		Mode:      cfg.Mode,
 		Direction: cfg.Direction,
 		SizeBytes: cfg.SizeBytes,
-		Direct:    true,
+		Direct:    false,
 	}, nil
 }

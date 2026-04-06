@@ -39,6 +39,11 @@ func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 	if flags.SizeBytes == 0 {
 		flags.SizeBytes = 1 << 20
 	}
+	if flags.Mode == "aead" {
+		fmt.Fprintln(stderr, "aead not implemented yet")
+		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
+		return 2
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

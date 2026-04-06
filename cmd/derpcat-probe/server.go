@@ -36,14 +36,19 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 	if mode == "" {
 		mode = "raw"
 	}
-	if mode != "raw" && mode != "aead" {
+	if mode == "aead" {
+		fmt.Fprintln(stderr, "aead not implemented yet")
+		fmt.Fprint(stderr, subcommandUsageLine("server"))
+		return 2
+	}
+	if mode != "raw" {
 		fmt.Fprintln(stderr, "unsupported mode:", mode)
 		fmt.Fprint(stderr, subcommandUsageLine("server"))
 		return 2
 	}
 	listenAddr := parsed.Flags.ListenAddr
 	if listenAddr == "" {
-		listenAddr = "127.0.0.1:0"
+		listenAddr = ":0"
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

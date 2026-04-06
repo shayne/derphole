@@ -46,6 +46,9 @@ func TestRunOrchestratePrintsJSONReport(t *testing.T) {
 	if strings.Contains(stdout.String(), "user") || strings.Contains(stdout.String(), "remote_path") || strings.Contains(stdout.String(), "listen_addr") {
 		t.Fatalf("stdout included extra fields: %s", stdout.String())
 	}
+	if !strings.Contains(stdout.String(), "\"direct\": false") {
+		t.Fatalf("stdout missing direct=false: %s", stdout.String())
+	}
 }
 
 func TestRunServerInvokesProbeReceive(t *testing.T) {
@@ -59,8 +62,8 @@ func TestRunServerInvokesProbeReceive(t *testing.T) {
 	defer serverConn.Close()
 
 	listenPacket = func(network, address string) (net.PacketConn, error) {
-		if address != serverConn.LocalAddr().String() {
-			t.Fatalf("listen address = %q, want %q", address, serverConn.LocalAddr().String())
+		if address != ":0" {
+			t.Fatalf("listen address = %q, want %q", address, ":0")
 		}
 		return serverConn, nil
 	}
@@ -69,7 +72,7 @@ func TestRunServerInvokesProbeReceive(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		code := runServer([]string{"--listen", serverConn.LocalAddr().String(), "--mode", "raw"}, io.Discard, io.Discard)
+		code := runServer([]string{"--mode", "raw"}, io.Discard, io.Discard)
 		if code != 0 {
 			t.Errorf("runServer() code = %d, want 0", code)
 		}
@@ -92,11 +95,21 @@ func TestRunServerInvokesProbeReceive(t *testing.T) {
 }
 
 func TestRunClientInvokesProbeSend(t *testing.T) {
+	oldListenPacket := listenPacket
+	defer func() { listenPacket = oldListenPacket }()
+
 	serverConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer serverConn.Close()
+
+	listenPacket = func(network, address string) (net.PacketConn, error) {
+		if address != ":0" {
+			t.Fatalf("listen address = %q, want %q", address, ":0")
+		}
+		return net.ListenPacket(network, address)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -121,5 +134,44 @@ func TestRunClientInvokesProbeSend(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for ReceiveToWriter")
+	}
+}
+
+func TestRunOrchestrateRejectsAeadMode(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	code := runOrchestrate([]string{"--host", "ktzlxc", "--mode", "aead"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("runOrchestrate() code = %d, want 2; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "aead not implemented yet") {
+		t.Fatalf("stderr = %q, want aead rejection", stderr.String())
+	}
+}
+
+func TestRunServerRejectsAeadMode(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	code := runServer([]string{"--mode", "aead"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("runServer() code = %d, want 2; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "aead not implemented yet") {
+		t.Fatalf("stderr = %q, want aead rejection", stderr.String())
+	}
+}
+
+func TestRunClientRejectsAeadMode(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	code := runClient([]string{"--host", "127.0.0.1:1", "--mode", "aead"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("runClient() code = %d, want 2; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "aead not implemented yet") {
+		t.Fatalf("stderr = %q, want aead rejection", stderr.String())
 	}
 }

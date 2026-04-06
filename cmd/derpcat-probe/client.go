@@ -34,7 +34,12 @@ func runClient(args []string, stdout, stderr io.Writer) int {
 	if mode == "" {
 		mode = "raw"
 	}
-	if mode != "raw" && mode != "aead" {
+	if mode == "aead" {
+		fmt.Fprintln(stderr, "aead not implemented yet")
+		fmt.Fprint(stderr, subcommandUsageLine("client"))
+		return 2
+	}
+	if mode != "raw" {
 		fmt.Fprintln(stderr, "unsupported mode:", mode)
 		fmt.Fprint(stderr, subcommandUsageLine("client"))
 		return 2
@@ -50,7 +55,7 @@ func runClient(args []string, stdout, stderr io.Writer) int {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	conn, err := listenPacket("udp", "127.0.0.1:0")
+	conn, err := listenPacket("udp", ":0")
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
