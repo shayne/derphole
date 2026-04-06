@@ -16,10 +16,11 @@ This work is intentionally split into two phases:
   - Tailscale `iperf3`
   - derpcat with `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1`
   - new probe, also not over Tailscale
-- Benchmark all three required hosts:
+- Benchmark all required hosts:
   - `ktzlxc`
   - `canlxc`
   - `uklxc`
+  - `orange-india.exe.xyz`
 - Produce repeatable measurements that show:
   - setup time to first byte
   - large-transfer goodput
@@ -197,6 +198,7 @@ Run the full comparison against:
 - `ktzlxc`
 - `canlxc`
 - `uklxc`
+- `orange-india.exe.xyz`
 
 ### Baselines
 

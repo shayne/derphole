@@ -7,7 +7,6 @@ import (
 	"net"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/shayne/derpcat/pkg/probe"
 	"github.com/shayne/yargs"
@@ -53,8 +52,6 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
 
 	conn, err := listenPacket("udp", listenAddr)
 	if err != nil {

@@ -24,16 +24,16 @@ func (r RunReport) JSON() ([]byte, error) {
 
 func (r RunReport) Markdown() string {
 	return fmt.Sprintf(
-		"host=%s mode=%s direction=%s size_bytes=%d duration_ms=%d first_byte_ms=%d goodput_mbps=%.1f loss_rate=%g retransmits=%d direct=%t",
+		"- host=%s mode=%s direction=%s size=%d duration_ms=%d goodput_mbps=%.1f direct=%t first_byte_ms=%d loss_rate=%.4f retransmits=%d",
 		r.Host,
 		r.Mode,
 		r.Direction,
 		r.SizeBytes,
 		r.DurationMS,
-		r.FirstByteMS,
 		r.GoodputMbps,
+		r.Direct,
+		r.FirstByteMS,
 		r.LossRate,
 		r.Retransmits,
-		r.Direct,
 	)
 }

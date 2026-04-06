@@ -6,9 +6,13 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
 
-const defaultProbeRemotePath = "/tmp/derpcat-probe"
+const (
+	defaultProbeRemotePath      = "/tmp/derpcat-probe"
+	defaultSSHConnectTimeoutSec = 5
+)
 
 type OrchestrateConfig struct {
 	Host       string
@@ -61,6 +65,8 @@ func (r SSHRunner) ServerCommand(cfg ServerConfig) []string {
 	}
 	return []string{
 		"ssh",
+		"-o", "BatchMode=yes",
+		"-o", fmt.Sprintf("ConnectTimeout=%d", defaultSSHConnectTimeoutSec),
 		r.target(),
 		fmt.Sprintf("%s server --listen %s --mode %s", r.binaryPath(), listenAddr, mode),
 	}
@@ -73,6 +79,8 @@ func (r SSHRunner) ClientCommand(cfg ClientConfig) []string {
 	}
 	return []string{
 		"ssh",
+		"-o", "BatchMode=yes",
+		"-o", fmt.Sprintf("ConnectTimeout=%d", defaultSSHConnectTimeoutSec),
 		r.target(),
 		fmt.Sprintf("%s client --host %s --mode %s", r.binaryPath(), cfg.Host, mode),
 	}
@@ -85,7 +93,11 @@ var runCommand = func(ctx context.Context, argv []string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return out, fmt.Errorf("%s: %w", strings.Join(argv, " "), err)
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			return out, fmt.Errorf("%s: %w", strings.Join(argv, " "), err)
+		}
+		return out, fmt.Errorf("%s: %w: %s", strings.Join(argv, " "), err, msg)
 	}
 	return out, nil
 }
@@ -97,7 +109,8 @@ func RunOrchestrate(ctx context.Context, cfg OrchestrateConfig) (RunReport, erro
 	if err := ctx.Err(); err != nil {
 		return RunReport{}, err
 	}
-	if strings.TrimSpace(cfg.Host) == "" {
+	cfg.Host = strings.TrimSpace(cfg.Host)
+	if cfg.Host == "" {
 		return RunReport{}, errors.New("host is required")
 	}
 	if cfg.RemotePath == "" {
@@ -130,12 +143,12 @@ func RunOrchestrate(ctx context.Context, cfg OrchestrateConfig) (RunReport, erro
 		Host:       cfg.Host,
 		RemotePath: cfg.RemotePath,
 	}
-	validationCmd := []string{
-		"ssh",
-		runner.target(),
-		fmt.Sprintf("%s server --help", runner.binaryPath()),
-	}
-	if _, err := runCommand(ctx, validationCmd); err != nil {
+	validationCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	validationCmd := runner.ServerCommand(ServerConfig{ListenAddr: cfg.ListenAddr, Mode: cfg.Mode})
+	validationCmd[len(validationCmd)-1] = fmt.Sprintf("%s server --help", runner.binaryPath())
+	if _, err := runCommand(validationCtx, validationCmd); err != nil {
 		return RunReport{}, err
 	}
 

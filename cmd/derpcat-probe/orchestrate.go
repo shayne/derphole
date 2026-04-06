@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/shayne/derpcat/pkg/probe"
@@ -30,17 +31,24 @@ func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 	}
 
 	flags := parsed.Flags
-	if flags.User == "" {
-		flags.User = "root"
-	}
-	if flags.Mode == "" {
-		flags.Mode = "raw"
-	}
-	if flags.SizeBytes == 0 {
-		flags.SizeBytes = 1 << 20
-	}
+	flags.Host = strings.TrimSpace(flags.Host)
 	if flags.Mode == "aead" {
 		fmt.Fprintln(stderr, "aead not implemented yet")
+		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
+		return 2
+	}
+	if strings.TrimSpace(flags.Host) == "" {
+		fmt.Fprintln(stderr, "host is required")
+		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
+		return 2
+	}
+	if flags.SizeBytes < 0 {
+		fmt.Fprintln(stderr, "size bytes must be non-negative")
+		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
+		return 2
+	}
+	if flags.Mode != "raw" {
+		fmt.Fprintln(stderr, "unsupported mode:", flags.Mode)
 		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
 		return 2
 	}
@@ -71,7 +79,7 @@ func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 
 type orchestrateFlags struct {
 	Host      string `flag:"host" help:"Remote host to benchmark"`
-	User      string `flag:"user" help:"SSH user"`
-	Mode      string `flag:"mode" help:"Probe mode"`
-	SizeBytes int64  `flag:"size-bytes" help:"Payload size in bytes"`
+	User      string `flag:"user" help:"SSH user" default:"root"`
+	Mode      string `flag:"mode" help:"raw only in Task 3; AEAD lands in Task 5" default:"raw"`
+	SizeBytes int64  `flag:"size-bytes" help:"Payload size in bytes" default:"1048576"`
 }

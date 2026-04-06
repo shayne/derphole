@@ -1125,8 +1125,8 @@ func TestSendIgnoresImpossibleAckRange(t *testing.T) {
 		}
 	}()
 
-	if _, err := Send(ctx, a, b.LocalAddr().String(), src, SendConfig{Raw: true, ChunkSize: 1200, WindowSize: 2}); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Send() error = %v, want context deadline exceeded", err)
+	if _, err := Send(ctx, a, b.LocalAddr().String(), src, SendConfig{Raw: true, ChunkSize: 1200, WindowSize: 2}); err == nil || (!errors.Is(err, context.DeadlineExceeded) && !isNetTimeout(err)) {
+		t.Fatalf("Send() error = %v, want timeout", err)
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("peer loop error = %v", err)

@@ -96,7 +96,9 @@ func TestRunServerInvokesProbeReceive(t *testing.T) {
 
 func TestRunClientInvokesProbeSend(t *testing.T) {
 	oldListenPacket := listenPacket
+	oldClientTimeout := clientTimeout
 	defer func() { listenPacket = oldListenPacket }()
+	defer func() { clientTimeout = oldClientTimeout }()
 
 	serverConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
@@ -137,6 +139,22 @@ func TestRunClientInvokesProbeSend(t *testing.T) {
 	}
 }
 
+func TestRunClientTimesOutWithoutPeer(t *testing.T) {
+	oldClientTimeout := clientTimeout
+	defer func() { clientTimeout = oldClientTimeout }()
+	clientTimeout = 20 * time.Millisecond
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := runClient([]string{"--host", "127.0.0.1:1", "--mode", "raw"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("runClient() code = %d, want 1; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "deadline exceeded") && !strings.Contains(stderr.String(), "i/o timeout") {
+		t.Fatalf("stderr = %q, want timeout", stderr.String())
+	}
+}
+
 func TestRunOrchestrateRejectsAeadMode(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -147,6 +165,70 @@ func TestRunOrchestrateRejectsAeadMode(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "aead not implemented yet") {
 		t.Fatalf("stderr = %q, want aead rejection", stderr.String())
+	}
+}
+
+func TestRunOrchestrateRejectsMissingHost(t *testing.T) {
+	oldPath := os.Getenv("PATH")
+	sshDir := t.TempDir()
+	sshPath := filepath.Join(sshDir, "ssh")
+	if err := os.WriteFile(sshPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("PATH", sshDir+string(os.PathListSeparator)+oldPath); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Setenv("PATH", oldPath) }()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	code := runOrchestrate([]string{}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("runOrchestrate() code = %d, want 0 for help", code)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = runOrchestrate([]string{"--user", "root"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("runOrchestrate() code = %d, want 2; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "host is required") {
+		t.Fatalf("stderr = %q, want host validation", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = runOrchestrate([]string{"--host", "   "}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("runOrchestrate() code = %d, want 2 for whitespace host; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "host is required") {
+		t.Fatalf("stderr = %q, want whitespace host validation", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = runOrchestrate([]string{"--host", " ktzlxc "}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("runOrchestrate() code = %d, want 0 for trimmed host; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "\"host\": \"ktzlxc\"") {
+		t.Fatalf("stdout = %s, want trimmed host in report", stdout.String())
+	}
+}
+
+func TestRunOrchestrateRejectsNegativeSize(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	code := runOrchestrate([]string{"--host", "ktzlxc", "--size-bytes", "-1"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("runOrchestrate() code = %d, want 2; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "size bytes must be non-negative") {
+		t.Fatalf("stderr = %q, want size validation", stderr.String())
 	}
 }
 

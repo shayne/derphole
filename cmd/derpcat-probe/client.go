@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"io"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/shayne/derpcat/pkg/probe"
 	"github.com/shayne/yargs"
 )
+
+var clientTimeout = 30 * time.Second
 
 func runClient(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || isRootHelpRequest(args) {
@@ -44,7 +47,7 @@ func runClient(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stderr, subcommandUsageLine("client"))
 		return 2
 	}
-	remoteAddr := parsed.Flags.Host
+	remoteAddr := strings.TrimSpace(parsed.Flags.Host)
 	if remoteAddr == "" {
 		fmt.Fprint(stderr, subcommandUsageLine("client"))
 		return 2
@@ -52,7 +55,7 @@ func runClient(args []string, stdout, stderr io.Writer) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, clientTimeout)
 	defer cancel()
 
 	conn, err := listenPacket("udp", ":0")

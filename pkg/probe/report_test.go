@@ -2,7 +2,6 @@ package probe
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
 )
 
@@ -21,10 +20,9 @@ func TestMarkdownReportIncludesCoreMetrics(t *testing.T) {
 	}
 
 	md := report.Markdown()
-	for _, want := range []string{"ktzlxc", "raw", "670.5", "direct=true", "first_byte_ms=18", "loss_rate=0.125", "retransmits=4"} {
-		if !strings.Contains(md, want) {
-			t.Fatalf("markdown missing %q: %s", want, md)
-		}
+	want := "- host=ktzlxc mode=raw direction=forward size=1048576 duration_ms=1250 goodput_mbps=670.5 direct=true first_byte_ms=18 loss_rate=0.1250 retransmits=4"
+	if md != want {
+		t.Fatalf("Markdown() = %q, want %q", md, want)
 	}
 }
 
