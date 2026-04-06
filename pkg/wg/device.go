@@ -23,6 +23,7 @@ type Config struct {
 	LocalAddr      netip.Addr
 	PeerAddr       netip.Addr
 	PacketConn     net.PacketConn
+	Transport      string
 	DERPClient     *derpbind.Client
 	PeerDERP       key.NodePublic
 	PathSelector   PathSelector
@@ -65,6 +66,7 @@ func NewNode(cfg Config) (*Node, error) {
 
 	bind := NewBind(BindConfig{
 		PacketConn:     cfg.PacketConn,
+		Transport:      cfg.Transport,
 		DERPClient:     cfg.DERPClient,
 		PeerDERP:       cfg.PeerDERP,
 		PathSelector:   cfg.PathSelector,

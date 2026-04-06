@@ -62,6 +62,17 @@ func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device,
 	if err := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabledOpt); err != nil {
 		return nil, nil, fmt.Errorf("could not enable TCP SACK: %v", err)
 	}
+	tcpRecoveryOpt := tcpip.TCPRecovery(0)
+	if err := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpRecoveryOpt); err != nil {
+		return nil, nil, fmt.Errorf("could not disable TCP RACK: %v", err)
+	}
+	renoOpt := tcpip.CongestionControlOption("reno")
+	if err := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &renoOpt); err != nil {
+		return nil, nil, fmt.Errorf("could not set reno congestion control: %v", err)
+	}
+	if err := setTCPBufSizes(dev.stack); err != nil {
+		return nil, nil, err
+	}
 	dev.ep.AddNotify(dev)
 	if err := dev.stack.CreateNIC(1, dev.ep); err != nil {
 		return nil, nil, fmt.Errorf("CreateNIC: %v", err)
@@ -94,6 +105,26 @@ func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device,
 	}
 	dev.events <- tun.EventUp
 	return dev, (*Net)(dev), nil
+}
+
+func setTCPBufSizes(ipstack *stack.Stack) error {
+	tcpRXBufOpt := tcpip.TCPReceiveBufferSizeRangeOption{
+		Min:     tcpRXBufMinSize,
+		Default: tcpRXBufDefSize,
+		Max:     tcpRXBufMaxSize,
+	}
+	if err := ipstack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpRXBufOpt); err != nil {
+		return fmt.Errorf("could not set TCP RX buf size: %v", err)
+	}
+	tcpTXBufOpt := tcpip.TCPSendBufferSizeRangeOption{
+		Min:     tcpTXBufMinSize,
+		Default: tcpTXBufDefSize,
+		Max:     tcpTXBufMaxSize,
+	}
+	if err := ipstack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpTXBufOpt); err != nil {
+		return fmt.Errorf("could not set TCP TX buf size: %v", err)
+	}
+	return nil
 }
 
 func (tun *netTun) Name() (string, error) { return "go", nil }

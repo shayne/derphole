@@ -5,17 +5,26 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/shayne/derpcat/pkg/derpbind"
 	"github.com/tailscale/wireguard-go/conn"
+	"golang.org/x/net/ipv6"
+	"tailscale.com/net/batching"
+	"tailscale.com/net/packet"
+	"tailscale.com/net/sockopts"
 	"tailscale.com/types/key"
+	"tailscale.com/types/nettype"
 )
+
+const wireGuardSocketBufferSize = 7 << 20
 
 type BindConfig struct {
 	PacketConn     net.PacketConn
+	Transport      string
 	DERPClient     *derpbind.Client
 	PeerDERP       key.NodePublic
 	PathSelector   PathSelector
@@ -39,17 +48,18 @@ type DirectPacketHandler interface {
 }
 
 type Bind struct {
-	mu       sync.Mutex
-	conn     net.PacketConn
-	ownsConn bool
-	derp     *derpbind.Client
-	peerDERP key.NodePublic
-	selector PathSelector
-	state    *bindState
-	opened   bool
-	direct   directState
-	sent     atomic.Int64
-	received atomic.Int64
+	mu        sync.Mutex
+	conn      net.PacketConn
+	ownsConn  bool
+	transport string
+	derp      *derpbind.Client
+	peerDERP  key.NodePublic
+	selector  PathSelector
+	state     *bindState
+	opened    bool
+	direct    directState
+	sent      atomic.Int64
+	received  atomic.Int64
 }
 
 type directState struct {
@@ -60,12 +70,15 @@ type directState struct {
 type bindState struct {
 	parent   *Bind
 	conn     net.PacketConn
+	pconn    nettype.PacketConn
+	batched  batching.Conn
 	derp     *derpbind.Client
 	peerDERP key.NodePublic
 	recvCh   chan inboundPacket
 	errCh    chan error
 	closeCtx context.Context
 	closeFn  context.CancelFunc
+	msgs     []ipv6.Message
 }
 
 type inboundPacket struct {
@@ -74,17 +87,19 @@ type inboundPacket struct {
 }
 
 type Endpoint struct {
-	dst string
-	ip  netip.Addr
+	dst      string
+	addrPort netip.AddrPort
+	ip       netip.Addr
 }
 
 func NewBind(cfg BindConfig) *Bind {
 	b := &Bind{
-		conn:     cfg.PacketConn,
-		ownsConn: cfg.PacketConn == nil,
-		derp:     cfg.DERPClient,
-		peerDERP: cfg.PeerDERP,
-		selector: cfg.PathSelector,
+		conn:      cfg.PacketConn,
+		ownsConn:  cfg.PacketConn == nil,
+		transport: cfg.Transport,
+		derp:      cfg.DERPClient,
+		peerDERP:  cfg.PeerDERP,
+		selector:  cfg.PathSelector,
 	}
 	if cfg.DirectEndpoint != "" {
 		_ = b.SetDirectEndpoint(cfg.DirectEndpoint)
@@ -108,10 +123,12 @@ func (b *Bind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	} else {
 		_ = b.conn.SetReadDeadline(time.Time{})
 	}
+	upgraded := upgradePacketConn(b.conn, b.transport, b.BatchSize())
 	ctx, cancel := context.WithCancel(context.Background())
 	state := &bindState{
 		parent:   b,
 		conn:     b.conn,
+		pconn:    upgraded,
 		derp:     b.derp,
 		peerDERP: b.peerDERP,
 		recvCh:   make(chan inboundPacket, 128),
@@ -119,11 +136,15 @@ func (b *Bind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		closeCtx: ctx,
 		closeFn:  cancel,
 	}
+	if batched, ok := upgraded.(batching.Conn); ok {
+		state.batched = batched
+		state.msgs = makeReadBatch(b.BatchSize())
+	}
 	b.state = state
 	b.opened = true
 
-	go state.readUDP()
 	if state.derp != nil && !state.peerDERP.IsZero() {
+		go state.readUDP()
 		go state.readDERP()
 	}
 
@@ -169,60 +190,65 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
 
 	directEndpoint, directConfirmed := b.directPath()
 	directAddr := resolveUDPAddr(directEndpoint)
+	sentCount := countNonEmptyPayloads(bufs, offset)
+	if sentCount == 0 {
+		return nil
+	}
 
-	for _, buf := range bufs {
-		payload := buf[offset:]
-		if len(payload) == 0 {
-			continue
+	if directAddr != nil {
+		if pc == nil {
+			return net.ErrClosed
 		}
+		if err := writePackets(state, pc, bufs, directAddr, offset); err != nil {
+			if reporter, ok := b.selector.(directBreakReporter); ok {
+				_ = reporter.MarkDirectBroken()
+			}
+			directConfirmed = false
+			if state == nil || state.derp == nil || state.peerDERP.IsZero() {
+				return err
+			}
+		} else {
+			b.sent.Add(int64(sentCount))
+			b.noteDirectActivity(directAddr)
+		}
+		if directConfirmed || state == nil || state.derp == nil || state.peerDERP.IsZero() {
+			return nil
+		}
+	}
 
-		if directAddr != nil {
-			if pc == nil {
-				return net.ErrClosed
-			}
-			if _, err := pc.WriteTo(payload, directAddr); err != nil {
-				if reporter, ok := b.selector.(directBreakReporter); ok {
-					_ = reporter.MarkDirectBroken()
-				}
-				directConfirmed = false
-				if state == nil || state.derp == nil || state.peerDERP.IsZero() {
-					return err
-				}
-			} else {
-				b.sent.Add(1)
-				b.noteDirectActivity(directAddr)
-			}
-			if directConfirmed || state == nil || state.derp == nil || state.peerDERP.IsZero() {
+	if state != nil && state.derp != nil && !state.peerDERP.IsZero() {
+		for _, buf := range bufs {
+			payload := buf[offset:]
+			if len(payload) == 0 {
 				continue
 			}
-		}
-
-		if state != nil && state.derp != nil && !state.peerDERP.IsZero() {
 			if err := state.derp.Send(state.closeCtx, state.peerDERP, payload); err != nil {
 				return err
 			}
 			b.sent.Add(1)
-			continue
 		}
-
-		if endpoint, ok := ep.(*Endpoint); ok && endpoint.dst != "" {
-			addr, err := net.ResolveUDPAddr("udp", endpoint.dst)
-			if err != nil {
-				return err
-			}
-			if pc == nil {
-				return net.ErrClosed
-			}
-			if _, err := pc.WriteTo(payload, addr); err != nil {
-				return err
-			}
-			b.sent.Add(1)
-			continue
-		}
-
-		return errors.New("wireguard bind has no active transport")
+		return nil
 	}
-	return nil
+
+	if endpoint, ok := ep.(*Endpoint); ok {
+		addr, err := endpoint.udpAddr()
+		if err != nil {
+			return err
+		}
+		if addr == nil {
+			return errors.New("wireguard bind has no active transport")
+		}
+		if pc == nil {
+			return net.ErrClosed
+		}
+		if err := writePackets(state, pc, bufs, addr, offset); err != nil {
+			return err
+		}
+		b.sent.Add(int64(sentCount))
+		return nil
+	}
+
+	return errors.New("wireguard bind has no active transport")
 }
 
 func (b *Bind) ParseEndpoint(s string) (conn.Endpoint, error) {
@@ -233,10 +259,22 @@ func (b *Bind) ParseEndpoint(s string) (conn.Endpoint, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Endpoint{dst: addr.String(), ip: netip.MustParseAddr(addr.IP.String())}, nil
+	addrPort, ok := udpAddrPort(addr)
+	if !ok {
+		return nil, errors.New("invalid udp endpoint")
+	}
+	return &Endpoint{addrPort: addrPort, ip: addrPort.Addr()}, nil
 }
 
-func (b *Bind) BatchSize() int { return 1 }
+func (b *Bind) BatchSize() int {
+	if b.transport != "batched" {
+		return 1
+	}
+	if runtime.GOOS == "linux" {
+		return conn.IdealBatchSize
+	}
+	return 1
+}
 
 func (b *Bind) SetDirectEndpoint(s string) error {
 	if s == "" {
@@ -261,12 +299,24 @@ func (b *Bind) DirectEndpoint() string {
 }
 
 func (s *bindState) receive(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
+	if s.derp == nil || s.peerDERP.IsZero() {
+		if s.batched != nil {
+			return s.receiveDirectBatch(packets, sizes, eps)
+		}
+		return s.receiveDirectUDP(packets, sizes, eps)
+	}
 	select {
 	case pkt := <-s.recvCh:
-		n := copy(packets[0], pkt.payload)
-		sizes[0] = n
-		eps[0] = pkt.ep
-		return 1, nil
+		n := fillReceivePacket(packets[0], sizes, eps, 0, pkt)
+		for n < len(packets) {
+			select {
+			case pkt := <-s.recvCh:
+				n = fillReceivePacket(packets[n], sizes, eps, n, pkt)
+			default:
+				return n, nil
+			}
+		}
+		return n, nil
 	case err := <-s.errCh:
 		return 0, err
 	case <-s.closeCtx.Done():
@@ -274,7 +324,104 @@ func (s *bindState) receive(packets [][]byte, sizes []int, eps []conn.Endpoint) 
 	}
 }
 
+func (s *bindState) receiveDirectBatch(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
+	if len(packets) == 0 {
+		return 0, nil
+	}
+	if len(s.msgs) < len(packets) {
+		s.msgs = makeReadBatch(len(packets))
+	}
+	msgs := s.msgs[:len(packets)]
+	for i := range msgs {
+		msgs[i].Buffers[0] = packets[i]
+		msgs[i].OOB = msgs[i].OOB[:cap(msgs[i].OOB)]
+		msgs[i].N = 0
+		msgs[i].NN = 0
+		msgs[i].Flags = 0
+		msgs[i].Addr = nil
+		sizes[i] = 0
+		eps[i] = nil
+	}
+
+	for {
+		n, err := s.batched.ReadBatch(msgs, 0)
+		if err != nil {
+			if s.closeCtx.Err() != nil {
+				return 0, net.ErrClosed
+			}
+			return 0, err
+		}
+		reportToCaller := false
+		for i := 0; i < n; i++ {
+			msg := &msgs[i]
+			if msg.N == 0 {
+				continue
+			}
+			udpAddr, ok := msg.Addr.(*net.UDPAddr)
+			if !ok {
+				continue
+			}
+			payload := msg.Buffers[0][:msg.N]
+			if handler, ok := s.parent.selector.(DirectPacketHandler); ok && handler.HandleDirectPacket(s.conn, udpAddr, payload) {
+				continue
+			}
+			ip, ok := netip.AddrFromSlice(udpAddr.IP)
+			if !ok {
+				continue
+			}
+			s.parent.noteDirectValidation(udpAddr)
+			s.parent.noteDirectActivity(udpAddr)
+			s.parent.received.Add(1)
+			sizes[i] = msg.N
+			eps[i] = &Endpoint{addrPort: netip.AddrPortFrom(ip, uint16(udpAddr.Port)), ip: ip}
+			reportToCaller = true
+		}
+		if reportToCaller {
+			return n, nil
+		}
+	}
+}
+
+func (s *bindState) receiveDirectUDP(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
+	if len(packets) == 0 {
+		return 0, nil
+	}
+	for {
+		n, addr, err := s.conn.ReadFrom(packets[0])
+		if err != nil {
+			if s.closeCtx.Err() != nil {
+				return 0, net.ErrClosed
+			}
+			if ne, ok := err.(net.Error); ok && ne.Timeout() && s.closeCtx.Err() != nil {
+				return 0, net.ErrClosed
+			}
+			return 0, err
+		}
+		udpAddr, ok := addr.(*net.UDPAddr)
+		if !ok {
+			continue
+		}
+		if handler, ok := s.parent.selector.(DirectPacketHandler); ok && handler.HandleDirectPacket(s.conn, udpAddr, packets[0][:n]) {
+			continue
+		}
+		ip, ok := netip.AddrFromSlice(udpAddr.IP)
+		if !ok {
+			continue
+		}
+		s.parent.noteDirectValidation(udpAddr)
+		s.parent.noteDirectActivity(udpAddr)
+		s.parent.received.Add(1)
+		sizes[0] = n
+		eps[0] = &Endpoint{addrPort: netip.AddrPortFrom(ip, uint16(udpAddr.Port)), ip: ip}
+		return 1, nil
+	}
+}
+
 func (s *bindState) readUDP() {
+	if s.batched != nil {
+		s.readUDPBatch()
+		return
+	}
 	buf := make([]byte, 64<<10)
 	for {
 		n, addr, err := s.conn.ReadFrom(buf)
@@ -298,8 +445,44 @@ func (s *bindState) readUDP() {
 			s.parent.received.Add(1)
 			s.deliver(inboundPacket{
 				payload: append([]byte(nil), buf[:n]...),
-				ep:      &Endpoint{dst: udpAddr.String(), ip: ip},
+				ep:      &Endpoint{addrPort: netip.AddrPortFrom(ip, uint16(udpAddr.Port)), ip: ip},
 			})
+		}
+	}
+}
+
+func (s *bindState) readUDPBatch() {
+	for {
+		n, err := s.batched.ReadBatch(s.msgs, 0)
+		if err != nil {
+			if s.closeCtx.Err() != nil {
+				return
+			}
+			s.reportErr(err)
+			return
+		}
+		for i := 0; i < n; i++ {
+			msg := s.msgs[i]
+			if msg.N == 0 {
+				continue
+			}
+			udpAddr, ok := msg.Addr.(*net.UDPAddr)
+			if !ok {
+				continue
+			}
+			payload := msg.Buffers[0][:msg.N]
+			if handler, ok := s.parent.selector.(DirectPacketHandler); ok && handler.HandleDirectPacket(s.conn, udpAddr, payload) {
+				continue
+			}
+			if ip, ok := netip.AddrFromSlice(udpAddr.IP); ok {
+				s.parent.noteDirectValidation(udpAddr)
+				s.parent.noteDirectActivity(udpAddr)
+				s.parent.received.Add(1)
+				s.deliver(inboundPacket{
+					payload: append([]byte(nil), payload...),
+					ep:      &Endpoint{addrPort: netip.AddrPortFrom(ip, uint16(udpAddr.Port)), ip: ip},
+				})
+			}
 		}
 	}
 }
@@ -420,9 +603,17 @@ func (e *Endpoint) ClearSrc() {}
 
 func (e *Endpoint) SrcToString() string { return "" }
 
-func (e *Endpoint) DstToString() string { return e.dst }
+func (e *Endpoint) DstToString() string {
+	if e.dst != "" {
+		return e.dst
+	}
+	if e.addrPort.IsValid() {
+		return e.addrPort.String()
+	}
+	return ""
+}
 
-func (e *Endpoint) DstToBytes() []byte { return []byte(e.dst) }
+func (e *Endpoint) DstToBytes() []byte { return []byte(e.DstToString()) }
 
 func (e *Endpoint) DstIP() netip.Addr { return e.ip }
 
@@ -434,4 +625,122 @@ func (b *Bind) Stats() (sent, received int64) {
 
 func (b *Bind) DirectConfirmed() bool {
 	return b.directConfirmed()
+}
+
+func (e *Endpoint) udpAddr() (*net.UDPAddr, error) {
+	if e == nil {
+		return nil, nil
+	}
+	if e.dst != "" {
+		if e.dst == "derp" {
+			return nil, nil
+		}
+		return net.ResolveUDPAddr("udp", e.dst)
+	}
+	if !e.addrPort.IsValid() {
+		return nil, nil
+	}
+	return &net.UDPAddr{
+		IP:   e.addrPort.Addr().AsSlice(),
+		Port: int(e.addrPort.Port()),
+		Zone: e.addrPort.Addr().Zone(),
+	}, nil
+}
+
+func writePackets(state *bindState, pc net.PacketConn, bufs [][]byte, addr *net.UDPAddr, offset int) error {
+	if len(bufs) == 0 || addr == nil {
+		return nil
+	}
+	if state != nil && state.batched != nil {
+		ap, ok := udpAddrPort(addr)
+		if ok {
+			return state.batched.WriteBatchTo(bufs, ap, packet.GeneveHeader{}, offset)
+		}
+	}
+	for _, buf := range bufs {
+		payload := buf[offset:]
+		if len(payload) == 0 {
+			continue
+		}
+		if _, err := pc.WriteTo(payload, addr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func countNonEmptyPayloads(bufs [][]byte, offset int) int {
+	count := 0
+	for _, buf := range bufs {
+		if len(buf[offset:]) > 0 {
+			count++
+		}
+	}
+	return count
+}
+
+func upgradePacketConn(pc net.PacketConn, transport string, batchSize int) nettype.PacketConn {
+	udpConn, ok := pc.(*net.UDPConn)
+	if !ok {
+		return nil
+	}
+	if transport == "" {
+		transport = "legacy"
+	}
+	_, _ = sockopts.SetBufferSize(udpConn, sockopts.ReadDirection, wireGuardSocketBufferSize)
+	_, _ = sockopts.SetBufferSize(udpConn, sockopts.WriteDirection, wireGuardSocketBufferSize)
+	if transport != "batched" {
+		return udpConn
+	}
+	network := udpNetwork(udpConn.LocalAddr())
+	if network == "" {
+		return udpConn
+	}
+	return batching.TryUpgradeToConn(udpConn, network, batchSize)
+}
+
+func udpNetwork(addr net.Addr) string {
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return ""
+	}
+	if udpAddr.IP == nil || udpAddr.IP.To4() != nil {
+		return "udp4"
+	}
+	return "udp6"
+}
+
+func makeReadBatch(batchSize int) []ipv6.Message {
+	if batchSize < 1 {
+		batchSize = 1
+	}
+	msgs := make([]ipv6.Message, batchSize)
+	for i := range msgs {
+		msgs[i].Buffers = make([][]byte, 1)
+		msgs[i].Buffers[0] = make([]byte, 64<<10)
+		msgs[i].OOB = make([]byte, batching.MinControlMessageSize())
+	}
+	return msgs
+}
+
+func fillReceivePacket(dst []byte, sizes []int, eps []conn.Endpoint, idx int, pkt inboundPacket) int {
+	n := copy(dst, pkt.payload)
+	sizes[idx] = n
+	eps[idx] = pkt.ep
+	return idx + 1
+}
+
+func udpAddrPort(addr *net.UDPAddr) (netip.AddrPort, bool) {
+	if addr == nil {
+		return netip.AddrPort{}, false
+	}
+	ip, ok := netip.AddrFromSlice(addr.IP)
+	if !ok {
+		return netip.AddrPort{}, false
+	}
+	ip = ip.Unmap()
+	if addr.Zone != "" {
+		ip = ip.WithZone(addr.Zone)
+	}
+	return netip.AddrPortFrom(ip, uint16(addr.Port)), true
 }

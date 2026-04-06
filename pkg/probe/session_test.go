@@ -114,6 +114,159 @@ func TestTransferCompletesAcrossLoopback(t *testing.T) {
 	}
 }
 
+func TestTransferStatsCaptureFirstByte(t *testing.T) {
+	src := bytes.Repeat([]byte("derpcat"), 1<<12)
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveToWriter(ctx, b, a.LocalAddr().String(), io.Discard, ReceiveConfig{Raw: true})
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	if _, err := Send(ctx, a, b.LocalAddr().String(), bytes.NewReader(src), SendConfig{Raw: true}); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ReceiveToWriter() error = %v", err)
+	case stats := <-statsCh:
+		if stats.FirstByteAt.IsZero() {
+			t.Fatal("FirstByteAt is zero, want first byte timestamp")
+		}
+		if stats.CompletedAt.Before(stats.FirstByteAt) {
+			t.Fatalf("CompletedAt = %v, want after FirstByteAt = %v", stats.CompletedAt, stats.FirstByteAt)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for receive stats: %v", ctx.Err())
+	}
+}
+
+func TestEffectiveWindowSizeAllowsLargerThanAckMask(t *testing.T) {
+	if got := effectiveWindowSize(4096); got != 4096 {
+		t.Fatalf("effectiveWindowSize(4096) = %d, want 4096", got)
+	}
+	if got := effectiveWindowSize(0); got != defaultWindowSize {
+		t.Fatalf("effectiveWindowSize(0) = %d, want defaultWindowSize=%d", got, defaultWindowSize)
+	}
+}
+
+func TestBlastTransferCompletesAcrossLoopback(t *testing.T) {
+	src := bytes.Repeat([]byte("blast"), 1<<15)
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveToWriter(ctx, b, a.LocalAddr().String(), io.Discard, ReceiveConfig{Blast: true})
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	sendStats, err := Send(ctx, a, b.LocalAddr().String(), bytes.NewReader(src), SendConfig{Blast: true})
+	if err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if sendStats.BytesSent != int64(len(src)) {
+		t.Fatalf("BytesSent = %d, want %d", sendStats.BytesSent, len(src))
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ReceiveToWriter() error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(src)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(src))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for blast receive: %v", ctx.Err())
+	}
+}
+
+func TestBlastTransferCompletesWhenFirstDonePacketIsDropped(t *testing.T) {
+	src := bytes.Repeat([]byte("blast"), 1<<15)
+	aBase, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer aBase.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	a := &dropFirstDoneConn{PacketConn: aBase}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveToWriter(ctx, b, a.LocalAddr().String(), io.Discard, ReceiveConfig{Blast: true})
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	sendStats, err := Send(ctx, a, b.LocalAddr().String(), bytes.NewReader(src), SendConfig{Blast: true})
+	if err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if sendStats.BytesSent != int64(len(src)) {
+		t.Fatalf("BytesSent = %d, want %d", sendStats.BytesSent, len(src))
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ReceiveToWriter() error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(src)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(src))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for blast receive after dropped DONE: %v", ctx.Err())
+	}
+}
+
 type lossyPacketConn struct {
 	net.PacketConn
 	dropEvery int
@@ -132,6 +285,28 @@ func (l *lossyPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		return len(p), nil
 	}
 	return l.PacketConn.WriteTo(p, addr)
+}
+
+type dropFirstDoneConn struct {
+	net.PacketConn
+
+	mu      sync.Mutex
+	dropped bool
+}
+
+func (d *dropFirstDoneConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	packet, err := UnmarshalPacket(p, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.dropped && packet.Type == PacketTypeDone {
+		d.dropped = true
+		return len(p), nil
+	}
+	return d.PacketConn.WriteTo(p, addr)
 }
 
 type dropMatchingAckConn struct {
@@ -187,8 +362,12 @@ func TestTransferSurvivesDroppedPackets(t *testing.T) {
 		done <- got
 	}()
 
-	if _, err := Send(ctx, lossy, b.LocalAddr().String(), bytes.NewReader(src), SendConfig{Raw: true, ChunkSize: 1200}); err != nil {
+	stats, err := Send(ctx, lossy, b.LocalAddr().String(), bytes.NewReader(src), SendConfig{Raw: true, ChunkSize: 1200})
+	if err != nil {
 		t.Fatalf("Send() error = %v", err)
+	}
+	if stats.Retransmits == 0 {
+		t.Fatal("Send() retransmits = 0, want retransmits on lossy path")
 	}
 
 	select {
@@ -895,6 +1074,12 @@ func TestReceiveToWriterStreamsPayload(t *testing.T) {
 		if stats.BytesReceived != int64(len(src)) {
 			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(src))
 		}
+		if stats.FirstByteAt.IsZero() {
+			t.Fatal("FirstByteAt is zero, want first-byte timing")
+		}
+		if stats.CompletedAt.Before(stats.FirstByteAt) {
+			t.Fatalf("CompletedAt = %v before FirstByteAt = %v", stats.CompletedAt, stats.FirstByteAt)
+		}
 		if !bytes.Equal(got.Bytes(), src) {
 			t.Fatal("received payload mismatch")
 		}
@@ -1052,8 +1237,8 @@ func TestSendIgnoresAckWithWrongRunID(t *testing.T) {
 		}
 	}()
 
-	if _, err := Send(ctx, conn, b.LocalAddr().String(), src, SendConfig{Raw: true, ChunkSize: 1200, WindowSize: 2}); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Send() error = %v, want context deadline exceeded", err)
+	if _, err := Send(ctx, conn, b.LocalAddr().String(), src, SendConfig{Raw: true, ChunkSize: 1200, WindowSize: 2}); err == nil || (!errors.Is(err, context.DeadlineExceeded) && !isNetTimeout(err)) {
+		t.Fatalf("Send() error = %v, want timeout", err)
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("spoof ACK loop error = %v", err)

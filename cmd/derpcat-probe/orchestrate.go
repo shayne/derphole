@@ -13,6 +13,8 @@ import (
 	"github.com/shayne/yargs"
 )
 
+var runOrchestrateProbe = probe.RunOrchestrate
+
 func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || isRootHelpRequest(args) {
 		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
@@ -47,8 +49,19 @@ func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
 		return 2
 	}
-	if flags.Mode != "raw" {
+	if flags.Mode != "raw" && flags.Mode != "blast" && flags.Mode != "wg" && flags.Mode != "wgos" {
 		fmt.Fprintln(stderr, "unsupported mode:", flags.Mode)
+		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
+		return 2
+	}
+	transport, err := probe.NormalizeTransportForCLI(flags.Transport)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
+		return 2
+	}
+	if flags.Direction != "" && flags.Direction != "forward" && flags.Direction != "reverse" {
+		fmt.Fprintln(stderr, "unsupported direction:", flags.Direction)
 		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
 		return 2
 	}
@@ -56,11 +69,14 @@ func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	report, err := probe.RunOrchestrate(ctx, probe.OrchestrateConfig{
+	report, err := runOrchestrateProbe(ctx, probe.OrchestrateConfig{
 		Host:      flags.Host,
 		User:      flags.User,
 		Mode:      flags.Mode,
+		Transport: transport,
+		Direction: flags.Direction,
 		SizeBytes: flags.SizeBytes,
+		Parallel:  flags.Parallel,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -80,6 +96,9 @@ func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 type orchestrateFlags struct {
 	Host      string `flag:"host" help:"Remote host to benchmark"`
 	User      string `flag:"user" help:"SSH user" default:"root"`
-	Mode      string `flag:"mode" help:"raw only in Task 3; AEAD lands in Task 5" default:"raw"`
+	Mode      string `flag:"mode" help:"Probe mode: raw, blast, wg, or wgos; AEAD lands in Task 5" default:"raw"`
+	Transport string `flag:"transport" help:"UDP transport: legacy or batched" default:"legacy"`
+	Direction string `flag:"direction" help:"Transfer direction" default:"forward"`
 	SizeBytes int64  `flag:"size-bytes" help:"Payload size in bytes" default:"1048576"`
+	Parallel  int    `flag:"parallel" help:"Parallel TCP streams for WireGuard tunnel modes" default:"1"`
 }

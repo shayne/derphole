@@ -9,13 +9,17 @@ import (
 	"net"
 	"net/http/httptest"
 	"net/netip"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/shayne/derpcat/pkg/derpbind"
 	"github.com/tailscale/wireguard-go/conn"
+	"golang.org/x/net/ipv6"
 	"tailscale.com/derp/derpserver"
+	"tailscale.com/net/batching"
+	"tailscale.com/net/packet"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -262,6 +266,161 @@ func TestBindNonSelectorDirectRequiresValidationBeforeConfirmation(t *testing.T)
 		t.Fatal("DirectConfirmed() after send without inbound validation = true, want false")
 	}
 }
+
+func TestBindStateReceiveDirectBatchedUsesCallerBuffers(t *testing.T) {
+	pc := newLoopPacketConn(t)
+	defer pc.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	state := &bindState{
+		parent: NewBind(BindConfig{PacketConn: pc, Transport: "batched"}),
+		conn:   pc,
+		batched: &fakeBatchConn{
+			localAddr: pc.LocalAddr(),
+			payloads:  [][]byte{[]byte("first"), []byte("second")},
+			addr:      &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 54321},
+		},
+		recvCh:   make(chan inboundPacket, 1),
+		errCh:    make(chan error, 1),
+		closeCtx: ctx,
+		closeFn:  cancel,
+	}
+
+	packets := [][]byte{
+		make([]byte, 64<<10),
+		make([]byte, 64<<10),
+	}
+	sizes := make([]int, len(packets))
+	eps := make([]conn.Endpoint, len(packets))
+
+	resultCh := make(chan struct {
+		n   int
+		err error
+	}, 1)
+	go func() {
+		n, err := state.receive(packets, sizes, eps)
+		resultCh <- struct {
+			n   int
+			err error
+		}{n: n, err: err}
+	}()
+
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			t.Fatalf("receive() error = %v", result.err)
+		}
+		if result.n != 2 {
+			t.Fatalf("receive() count = %d, want 2", result.n)
+		}
+		if got := string(packets[0][:sizes[0]]); got != "first" {
+			t.Fatalf("first payload = %q, want first", got)
+		}
+		if got := string(packets[1][:sizes[1]]); got != "second" {
+			t.Fatalf("second payload = %q, want second", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("receive() blocked instead of reading directly from batched conn")
+	}
+}
+
+func TestEndpointDstToStringUsesAddrPort(t *testing.T) {
+	ep := &Endpoint{
+		addrPort: netip.MustParseAddrPort("127.0.0.1:54321"),
+		ip:       netip.MustParseAddr("127.0.0.1"),
+	}
+	if got := ep.DstToString(); got != "127.0.0.1:54321" {
+		t.Fatalf("DstToString() = %q, want %q", got, "127.0.0.1:54321")
+	}
+}
+
+func TestBindSendFallsBackToEndpointAddrPort(t *testing.T) {
+	sender := newLoopPacketConn(t)
+	defer sender.Close()
+	receiver := newLoopPacketConn(t)
+	defer receiver.Close()
+
+	bind := NewBind(BindConfig{PacketConn: sender})
+	if _, _, err := bind.Open(0); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer bind.Close()
+
+	receiverAddr, ok := receiver.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("receiver LocalAddr() = %T, want *net.UDPAddr", receiver.LocalAddr())
+	}
+	addrPort, ok := udpAddrPort(receiverAddr)
+	if !ok {
+		t.Fatalf("udpAddrPort(%v) failed", receiverAddr)
+	}
+	payload := []byte("reply")
+	if err := bind.Send([][]byte{payload}, &Endpoint{addrPort: addrPort, ip: addrPort.Addr()}, 0); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	buf := make([]byte, 64)
+	if err := receiver.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+	n, _, err := receiver.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom() error = %v", err)
+	}
+	if got := string(buf[:n]); got != string(payload) {
+		t.Fatalf("received payload = %q, want %q", got, payload)
+	}
+}
+
+type fakeBatchConn struct {
+	localAddr net.Addr
+	payloads  [][]byte
+	addr      *net.UDPAddr
+}
+
+var _ batching.Conn = (*fakeBatchConn)(nil)
+
+func (f *fakeBatchConn) ReadBatch(msgs []ipv6.Message, _ int) (int, error) {
+	n := min(len(msgs), len(f.payloads))
+	for i := 0; i < n; i++ {
+		copy(msgs[i].Buffers[0], f.payloads[i])
+		msgs[i].N = len(f.payloads[i])
+		msgs[i].Addr = cloneUDPAddr(f.addr)
+	}
+	return n, nil
+}
+
+func (f *fakeBatchConn) WriteBatchTo(_ [][]byte, _ netip.AddrPort, _ packet.GeneveHeader, _ int) error {
+	return nil
+}
+
+func (f *fakeBatchConn) ReadFrom([]byte) (int, net.Addr, error) {
+	return 0, nil, errors.New("unsupported")
+}
+
+func (f *fakeBatchConn) ReadFromUDPAddrPort([]byte) (int, netip.AddrPort, error) {
+	return 0, netip.AddrPort{}, errors.New("unsupported")
+}
+
+func (f *fakeBatchConn) WriteTo([]byte, net.Addr) (int, error) {
+	return 0, errors.New("unsupported")
+}
+
+func (f *fakeBatchConn) WriteToUDPAddrPort([]byte, netip.AddrPort) (int, error) {
+	return 0, errors.New("unsupported")
+}
+
+func (f *fakeBatchConn) Close() error { return nil }
+
+func (f *fakeBatchConn) LocalAddr() net.Addr { return f.localAddr }
+
+func (f *fakeBatchConn) SetDeadline(time.Time) error { return nil }
+
+func (f *fakeBatchConn) SetReadDeadline(time.Time) error { return nil }
+
+func (f *fakeBatchConn) SetWriteDeadline(time.Time) error { return nil }
 
 func TestBindNonSelectorReplacementEndpointRequiresNewValidation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -576,6 +735,14 @@ func TestBindSelectorWriteFailureFallsBackToDERPAndMarksDirectBroken(t *testing.
 }
 
 func TestNodeTCPRoundTripOverUDP(t *testing.T) {
+	testNodeTCPRoundTripOverUDP(t, "")
+}
+
+func TestNodeTCPRoundTripOverUDPBatchedTransport(t *testing.T) {
+	testNodeTCPRoundTripOverUDP(t, "batched")
+}
+
+func testNodeTCPRoundTripOverUDP(t *testing.T, transport string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -605,6 +772,7 @@ func TestNodeTCPRoundTripOverUDP(t *testing.T) {
 		LocalAddr:      listenerAddr,
 		PeerAddr:       senderAddr,
 		PacketConn:     aConn,
+		Transport:      transport,
 		DirectEndpoint: bConn.LocalAddr().String(),
 	})
 	if err != nil {
@@ -618,6 +786,7 @@ func TestNodeTCPRoundTripOverUDP(t *testing.T) {
 		LocalAddr:      senderAddr,
 		PeerAddr:       listenerAddr,
 		PacketConn:     bConn,
+		Transport:      transport,
 		DirectEndpoint: aConn.LocalAddr().String(),
 	})
 	if err != nil {
@@ -680,6 +849,19 @@ func TestNodeTCPRoundTripOverUDP(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("server did not complete")
+	}
+}
+
+func TestBindBatchSizeRespectsTransport(t *testing.T) {
+	if got := NewBind(BindConfig{Transport: "legacy"}).BatchSize(); got != 1 {
+		t.Fatalf("legacy BatchSize() = %d, want 1", got)
+	}
+	want := 1
+	if runtime.GOOS == "linux" {
+		want = conn.IdealBatchSize
+	}
+	if got := NewBind(BindConfig{Transport: "batched"}).BatchSize(); got != want {
+		t.Fatalf("batched BatchSize() = %d, want %d", got, want)
 	}
 }
 
@@ -783,6 +965,110 @@ func TestNodeTCPCloseWritePropagatesEOF(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("server did not observe EOF")
+	}
+}
+
+func TestNodeTCPLargeTransferPropagatesEOF(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	aConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer aConn.Close()
+
+	bConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer bConn.Close()
+
+	listenerAddr := netip.MustParseAddr("192.168.4.29")
+	senderAddr := netip.MustParseAddr("192.168.4.28")
+
+	listenerPriv := mustHex32(t, "003ed5d73b55806c30de3f8a7bdab38af13539220533055e635690b8b87ad641")
+	listenerPub := mustHex32(t, "c4c8e984c5322c8184c72265b92b250fdb63688705f504ba003c88f03393cf28")
+	senderPriv := mustHex32(t, "087ec6e14bbed210e7215cdc73468dfa23f080a1bfb8665b2fd809bd99d28379")
+	senderPub := mustHex32(t, "f928d4f6c1b86c12f2562c10b07c555c5c57fd00f59e90c8d8d88767271cbf7c")
+
+	listener, err := NewNode(Config{
+		PrivateKey:     listenerPriv,
+		PeerPublicKey:  senderPub,
+		LocalAddr:      listenerAddr,
+		PeerAddr:       senderAddr,
+		PacketConn:     aConn,
+		DirectEndpoint: bConn.LocalAddr().String(),
+	})
+	if err != nil {
+		t.Fatalf("NewNode(listener) error = %v", err)
+	}
+	defer listener.Close()
+
+	sender, err := NewNode(Config{
+		PrivateKey:     senderPriv,
+		PeerPublicKey:  listenerPub,
+		LocalAddr:      senderAddr,
+		PeerAddr:       listenerAddr,
+		PacketConn:     bConn,
+		DirectEndpoint: aConn.LocalAddr().String(),
+	})
+	if err != nil {
+		t.Fatalf("NewNode(sender) error = %v", err)
+	}
+	defer sender.Close()
+
+	ln, err := listener.ListenTCP(7002)
+	if err != nil {
+		t.Fatalf("ListenTCP() error = %v", err)
+	}
+	defer ln.Close()
+
+	payload := bytes.Repeat([]byte("large-payload"), 1<<13)
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer conn.Close()
+		buf, err := io.ReadAll(conn)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if !bytes.Equal(buf, payload) {
+			serverDone <- errors.New("large payload mismatch")
+			return
+		}
+		serverDone <- nil
+	}()
+
+	conn, err := sender.DialTCP(ctx, netip.AddrPortFrom(listenerAddr, 7002))
+	if err != nil {
+		t.Fatalf("DialTCP() error = %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("client Write() error = %v", err)
+	}
+	if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+		if err := cw.CloseWrite(); err != nil {
+			t.Fatalf("CloseWrite() error = %v", err)
+		}
+	} else {
+		t.Fatal("DialTCP() connection does not support CloseWrite")
+	}
+
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("server error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("server did not observe EOF for large transfer")
 	}
 }
 
