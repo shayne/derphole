@@ -1,3 +1,4 @@
+//lint:file-ignore U1000 Retired public QUIC handoff helpers pending deletion after the WG cutover settles.
 package session
 
 import (
@@ -16,8 +17,6 @@ import (
 	"sync"
 	"time"
 
-	"go4.org/mem"
-
 	quic "github.com/quic-go/quic-go"
 	"github.com/shayne/derpcat/pkg/derpbind"
 	"github.com/shayne/derpcat/pkg/portmap"
@@ -27,6 +26,7 @@ import (
 	"github.com/shayne/derpcat/pkg/token"
 	"github.com/shayne/derpcat/pkg/transport"
 	"github.com/shayne/derpcat/pkg/traversal"
+	wgtransport "github.com/shayne/derpcat/pkg/wg"
 	"tailscale.com/net/batching"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -181,6 +181,11 @@ func issuePublicSession(ctx context.Context) (string, *relaySession, error) {
 		_ = derpClient.Close()
 		return "", nil, err
 	}
+	wgPrivate, wgPublic, err := wgtransport.GenerateKeypair()
+	if err != nil {
+		_ = derpClient.Close()
+		return "", nil, err
+	}
 
 	tokValue := token.Token{
 		Version:         token.SupportedVersion,
@@ -188,7 +193,7 @@ func issuePublicSession(ctx context.Context) (string, *relaySession, error) {
 		ExpiresUnix:     time.Now().Add(time.Hour).Unix(),
 		BootstrapRegion: uint16(node.RegionID),
 		DERPPublic:      derpPublicKeyRaw32(derpClient.PublicKey()),
-		QUICPublic:      quicIdentity.Public,
+		QUICPublic:      wgPublic,
 		BearerSecret:    bearerSecret,
 		Capabilities:    token.CapabilityStdio,
 	}
@@ -215,203 +220,15 @@ func issuePublicSession(ctx context.Context) (string, *relaySession, error) {
 		gate:         rendezvous.NewGate(tokValue),
 		derpMap:      dm,
 		quicIdentity: quicIdentity,
+		wgPrivate:    wgPrivate,
+		wgPublic:     wgPublic,
 	}
 	attachPublicPortmap(session, newBoundPublicPortmap(probeConn, nil))
 	return tok, session, nil
 }
 
 func sendExternal(ctx context.Context, cfg SendConfig) error {
-	tok, err := token.Decode(cfg.Token, time.Now())
-	if err != nil {
-		return err
-	}
-	if tok.Capabilities&token.CapabilityStdio == 0 {
-		return ErrUnknownSession
-	}
-	src, err := openSendSource(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	defer src.Close()
-	externalTransferTracef("sender-source-ready src=%T", src)
-
-	clientIdentity, err := quicpath.GenerateSessionIdentity()
-	if err != nil {
-		return err
-	}
-
-	pathEmitter := newTransportPathEmitter(cfg.Emitter)
-	pathEmitter.Emit(StateProbing)
-	if !cfg.ForceRelay {
-		bootstrapCtx, bootstrapCancel := context.WithTimeout(ctx, externalNativeTCPDirectStartWait)
-		bootstrapConns, bootstrapErr := dialExternalNativeTCPBootstrap(
-			bootstrapCtx,
-			tok,
-			clientIdentity,
-			externalParallelTCPConnCount(cfg.ParallelPolicy),
-		)
-		bootstrapCancel()
-		if bootstrapErr == nil && len(bootstrapConns) > 0 {
-			pathEmitter.Emit(StateDirect)
-			if cfg.Emitter != nil {
-				cfg.Emitter.Debug("sender-tcp-bootstrap")
-				cfg.Emitter.Debug("sender-tcp-direct")
-				cfg.Emitter.Debug("tcp-connected")
-			}
-			if err := sendExternalNativeTCPDirect(ctx, src, bootstrapConns); err != nil {
-				return err
-			}
-			pathEmitter.Complete(nil)
-			return nil
-		}
-	}
-
-	listenerDERP := key.NodePublicFromRaw32(mem.B(tok.DERPPublic[:]))
-	if listenerDERP.IsZero() {
-		return ErrUnknownSession
-	}
-
-	dm, err := derpbind.FetchMap(ctx, publicDERPMapURL())
-	if err != nil {
-		return err
-	}
-	node := firstDERPNode(dm, int(tok.BootstrapRegion))
-	if node == nil {
-		return errors.New("no bootstrap DERP node available")
-	}
-	derpClient, err := derpbind.NewClient(ctx, node, publicDERPServerURL(node))
-	if err != nil {
-		return err
-	}
-	defer derpClient.Close()
-
-	probeConn, err := net.ListenPacket("udp4", ":0")
-	if err != nil {
-		return err
-	}
-	defer probeConn.Close()
-	pm := newBoundPublicPortmap(probeConn, cfg.Emitter)
-	defer pm.Close()
-
-	localCandidates := publicInitialProbeCandidates(probeConn, pm)
-	parsedLocalCandidates := parseCandidateStrings(localCandidates)
-	claim := rendezvous.Claim{
-		Version:      tok.Version,
-		SessionID:    tok.SessionID,
-		DERPPublic:   derpPublicKeyRaw32(derpClient.PublicKey()),
-		QUICPublic:   clientIdentity.Public,
-		Candidates:   localCandidates,
-		Capabilities: tok.Capabilities,
-	}
-	claim.BearerMAC = rendezvous.ComputeBearerMAC(tok.BearerSecret, claim)
-	decision, err := sendClaimAndReceiveDecision(ctx, derpClient, listenerDERP, claim)
-	if err != nil {
-		return err
-	}
-	if !decision.Accepted {
-		if decision.Reject != nil {
-			return errors.New(decision.Reject.Reason)
-		}
-		return errors.New("claim rejected")
-	}
-	ackCh, unsubscribeAck := derpClient.Subscribe(func(pkt derpbind.Packet) bool {
-		return pkt.From == listenerDERP && isAckPayload(pkt.Payload)
-	})
-	defer unsubscribeAck()
-
-	if cfg.Emitter != nil {
-		cfg.Emitter.Debug("claim-accepted")
-	}
-	transportCtx, transportCancel := context.WithCancel(ctx)
-	defer transportCancel()
-	transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, probeConn, dm, derpClient, listenerDERP, parsedLocalCandidates, pm, cfg.ForceRelay)
-	if err != nil {
-		return err
-	}
-	transportCleanupFn := transportCleanup
-	defer func() {
-		if transportCleanupFn != nil {
-			transportCleanupFn()
-		}
-	}()
-	pathEmitter.Watch(transportCtx, transportManager)
-	pathEmitter.Flush(transportManager)
-	seedAcceptedDecisionCandidates(transportCtx, transportManager, decision)
-
-	nativeDirectModeCtx, nativeDirectModeCancel := context.WithCancel(ctx)
-	defer nativeDirectModeCancel()
-	nativeDirectModeCh := requestExternalDirectModeAsync(
-		nativeDirectModeCtx,
-		derpClient,
-		listenerDERP,
-		transportManager,
-		parsedLocalCandidates,
-		dm,
-		probeConn,
-		cfg.Emitter,
-		quicpath.ClientTLSConfig(clientIdentity, tok.QUICPublic),
-		quicpath.ServerTLSConfig(clientIdentity, tok.QUICPublic),
-		externalNativeTCPAuth{
-			Enabled:      true,
-			SessionID:    tok.SessionID,
-			BearerSecret: tok.BearerSecret,
-			LocalPublic:  clientIdentity.Public,
-			PeerPublic:   tok.QUICPublic,
-		},
-		cfg.ParallelPolicy,
-		cfg.ForceRelay,
-	)
-
-	modeCh := nativeDirectModeCh
-	if initialModeResult, ok := waitInitialExternalNativeDirectMode(ctx, nativeDirectModeCh, externalNativeTCPDirectStartWait); ok {
-		if len(initialModeResult.nativeTCPConns) > 0 {
-			pathEmitter.Emit(StateDirect)
-			if cfg.Emitter != nil {
-				cfg.Emitter.Debug("sender-tcp-direct")
-				cfg.Emitter.Debug("tcp-connected")
-			}
-			if err := sendExternalNativeTCPDirect(ctx, src, initialModeResult.nativeTCPConns); err != nil {
-				return err
-			}
-			pathEmitter.Complete(transportManager)
-			return nil
-		}
-		modeCh = singleExternalNativeDirectModeResult(initialModeResult)
-	}
-
-	peerConn := transportManager.PeerDatagramConn(transportCtx)
-	adapter := quicpath.NewAdapter(peerConn)
-	defer adapter.Close()
-	if cfg.Emitter != nil {
-		cfg.Emitter.Debug("sender-quic-ready")
-		cfg.Emitter.Debug("dialing-quic")
-	}
-	quicConn, err := quic.Dial(ctx, adapter, peerConn.RemoteAddr(), quicpath.ClientTLSConfig(clientIdentity, tok.QUICPublic), quicpath.DefaultQUICConfig())
-	if err != nil {
-		return err
-	}
-	if cfg.Emitter != nil {
-		cfg.Emitter.Debug("quic-connected")
-	}
-
-	return runExternalSendStream(
-		ctx,
-		cfg,
-		src,
-		quicConn,
-		derpClient,
-		listenerDERP,
-		ackCh,
-		pathEmitter,
-		transportManager,
-		transportCancel,
-		probeConn,
-		dm,
-		quicpath.ClientTLSConfig(clientIdentity, tok.QUICPublic),
-		quicpath.ServerTLSConfig(clientIdentity, tok.QUICPublic),
-		modeCh,
-		nativeDirectModeCancel,
-	)
+	return sendExternalViaWGTunnel(ctx, cfg)
 }
 
 func runExternalSendStream(
@@ -1331,237 +1148,7 @@ func receiveExternalHandoffCarriers(ctx context.Context, carriers []io.ReadWrite
 }
 
 func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
-	tok, session, err := issuePublicSession(ctx)
-	if err != nil {
-		return "", err
-	}
-	defer deleteRelayMailbox(tok, session)
-	defer closePublicSessionTransport(session)
-	defer session.derp.Close()
-
-	pathEmitter := newTransportPathEmitter(cfg.Emitter)
-	pathEmitter.Emit(StateWaiting)
-	if cfg.TokenSink != nil {
-		select {
-		case cfg.TokenSink <- tok:
-		case <-ctx.Done():
-			return tok, ctx.Err()
-		}
-	}
-
-	bootstrapListener, bootstrapCh, _ := startExternalNativeTCPBootstrapListener(ctx, session.token, session.quicIdentity)
-	if bootstrapListener != nil {
-		defer bootstrapListener.Close()
-	}
-
-	type derpReceiveResult struct {
-		pkt derpbind.Packet
-		err error
-	}
-	recvCh := make(chan derpReceiveResult, 1)
-	go func() {
-		for {
-			pkt, err := session.derp.Receive(ctx)
-			select {
-			case recvCh <- derpReceiveResult{pkt: pkt, err: err}:
-			case <-ctx.Done():
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	for {
-		select {
-		case result := <-bootstrapCh:
-			bootstrapCh = nil
-			bootstrapListener = nil
-			if result.err != nil {
-				if ctx.Err() != nil {
-					return tok, ctx.Err()
-				}
-				break
-			}
-			dst, err := openListenSink(ctx, cfg)
-			if err != nil {
-				return tok, err
-			}
-			defer dst.Close()
-			externalTransferTracef("listener-sink-ready dst=%T", dst)
-			pathEmitter.Emit(StateDirect)
-			if cfg.Emitter != nil {
-				cfg.Emitter.Debug("listener-tcp-bootstrap")
-				cfg.Emitter.Debug("listener-tcp-direct")
-				cfg.Emitter.Debug("tcp-accepted")
-			}
-			if err := receiveExternalNativeTCPDirect(ctx, dst, result.conns); err != nil {
-				return tok, err
-			}
-			return tok, nil
-		case receiveResult := <-recvCh:
-			if receiveResult.err != nil {
-				if ctx.Err() != nil {
-					return tok, ctx.Err()
-				}
-				return tok, receiveResult.err
-			}
-			pkt := receiveResult.pkt
-			if bootstrapListener != nil {
-				_ = bootstrapListener.Close()
-				bootstrapListener = nil
-				bootstrapCh = nil
-			}
-			env, err := decodeEnvelope(pkt.Payload)
-			if err != nil || env.Type != envelopeClaim || env.Claim == nil {
-				continue
-			}
-
-			peerDERP := key.NodePublicFromRaw32(mem.B(env.Claim.DERPPublic[:]))
-			decision, _ := session.gate.Accept(time.Now(), *env.Claim)
-			if !decision.Accepted {
-				if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
-					return tok, err
-				}
-				continue
-			}
-
-			if decision.Accept != nil {
-				decision.Accept.Candidates = publicInitialProbeCandidates(session.probeConn, publicSessionPortmap(session))
-			}
-			localCandidates := parseCandidateStrings(nil)
-			if decision.Accept != nil {
-				localCandidates = parseCandidateStrings(decision.Accept.Candidates)
-			}
-			if cfg.Emitter != nil {
-				cfg.Emitter.Debug("claim-accepted")
-			}
-			modeCh, unsubscribeMode := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
-				return pkt.From == peerDERP && isQUICModeRequestPayload(pkt.Payload)
-			})
-			defer unsubscribeMode()
-			transportCtx, transportCancel := context.WithCancel(ctx)
-			transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, session.probeConn, session.derpMap, session.derp, peerDERP, localCandidates, publicSessionPortmap(session), cfg.ForceRelay)
-			if err != nil {
-				transportCancel()
-				return tok, err
-			}
-			defer transportCancel()
-			transportCleanupFn := transportCleanup
-			defer func() {
-				if transportCleanupFn != nil {
-					transportCleanupFn()
-				}
-			}()
-			pathEmitter.Watch(transportCtx, transportManager)
-			pathEmitter.Flush(transportManager)
-			seedAcceptedClaimCandidates(transportCtx, transportManager, *env.Claim)
-
-			if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
-				return tok, err
-			}
-			if cfg.Emitter != nil {
-				cfg.Emitter.Debug("decision-sent")
-			}
-
-			nativeDirectModeCtx, nativeDirectModeCancel := context.WithCancel(ctx)
-			defer nativeDirectModeCancel()
-			nativeDirectModeCh := acceptExternalDirectModeAsync(
-				nativeDirectModeCtx,
-				session.derp,
-				modeCh,
-				peerDERP,
-				transportManager,
-				localCandidates,
-				cfg.ForceRelay,
-				cfg.Emitter,
-				quicpath.ClientTLSConfig(session.quicIdentity, env.Claim.QUICPublic),
-				quicpath.ServerTLSConfig(session.quicIdentity, env.Claim.QUICPublic),
-				externalNativeTCPAuth{
-					Enabled:      true,
-					SessionID:    session.token.SessionID,
-					BearerSecret: session.token.BearerSecret,
-					LocalPublic:  session.quicIdentity.Public,
-					PeerPublic:   env.Claim.QUICPublic,
-				},
-			)
-
-			dst, err := openListenSink(ctx, cfg)
-			if err != nil {
-				return tok, err
-			}
-			defer dst.Close()
-			externalTransferTracef("listener-sink-ready dst=%T", dst)
-
-			nativeModeCh := nativeDirectModeCh
-			if initialModeResult, ok := waitInitialExternalNativeDirectMode(ctx, nativeDirectModeCh, externalNativeTCPDirectStartWait); ok {
-				if len(initialModeResult.nativeTCPConns) > 0 {
-					pathEmitter.Emit(StateDirect)
-					if cfg.Emitter != nil {
-						cfg.Emitter.Debug("listener-tcp-direct")
-						cfg.Emitter.Debug("tcp-accepted")
-					}
-					if err := receiveExternalNativeTCPDirect(ctx, dst, initialModeResult.nativeTCPConns); err != nil {
-						return tok, err
-					}
-					return tok, nil
-				}
-				nativeModeCh = singleExternalNativeDirectModeResult(initialModeResult)
-			}
-			adapter := quicpath.NewAdapter(transportManager.PeerDatagramConn(transportCtx))
-			defer adapter.Close()
-			if cfg.Emitter != nil {
-				cfg.Emitter.Debug("listener-quic-ready")
-			}
-			quicListener, err := quic.Listen(adapter, quicpath.ServerTLSConfig(session.quicIdentity, env.Claim.QUICPublic), quicpath.DefaultQUICConfig())
-			if err != nil {
-				return tok, err
-			}
-			defer quicListener.Close()
-			if cfg.Emitter != nil {
-				cfg.Emitter.Debug("quic-listening")
-				cfg.Emitter.Debug("accepting-quic")
-			}
-
-			quicConn, err := quicListener.Accept(ctx)
-			if err != nil {
-				return tok, err
-			}
-			defer quicConn.CloseWithError(0, "")
-			streamConn, err := quicConn.AcceptStream(ctx)
-			if err != nil {
-				return tok, err
-			}
-			defer streamConn.Close()
-			if cfg.Emitter != nil {
-				cfg.Emitter.Debug("quic-accepted")
-			}
-			if err := runExternalListenStream(
-				ctx,
-				cfg,
-				dst,
-				streamConn,
-				quicConn,
-				func() {
-					_ = quicListener.Close()
-				},
-				session.derp,
-				peerDERP,
-				pathEmitter,
-				transportManager,
-				transportCancel,
-				session.probeConn,
-				session.derpMap,
-				quicpath.ClientTLSConfig(session.quicIdentity, env.Claim.QUICPublic),
-				quicpath.ServerTLSConfig(session.quicIdentity, env.Claim.QUICPublic),
-				nativeModeCh,
-				nativeDirectModeCancel,
-			); err != nil {
-				return tok, err
-			}
-			return tok, nil
-		}
-	}
+	return listenExternalViaWGTunnel(ctx, cfg)
 }
 
 func sendExternalNativeTCPDirect(ctx context.Context, src io.Reader, conns []net.Conn) error {

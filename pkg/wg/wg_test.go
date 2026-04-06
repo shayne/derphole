@@ -742,6 +742,326 @@ func TestNodeTCPRoundTripOverUDPBatchedTransport(t *testing.T) {
 	testNodeTCPRoundTripOverUDP(t, "batched")
 }
 
+func TestNodeTCPRoundTripOverDERP(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	derpA, derpB := newTestDERPClientPair(t, ctx)
+
+	var sessionID [16]byte
+	sessionID[0] = 11
+	_, listenerAddr, senderAddr := DeriveAddresses(sessionID)
+
+	listenerPriv := mustHex32(t, "003ed5d73b55806c30de3f8a7bdab38af13539220533055e635690b8b87ad641")
+	listenerPub := mustHex32(t, "c4c8e984c5322c8184c72265b92b250fdb63688705f504ba003c88f03393cf28")
+	senderPriv := mustHex32(t, "087ec6e14bbed210e7215cdc73468dfa23f080a1bfb8665b2fd809bd99d28379")
+	senderPub := mustHex32(t, "f928d4f6c1b86c12f2562c10b07c555c5c57fd00f59e90c8d8d88767271cbf7c")
+
+	listener, err := NewNode(Config{
+		PrivateKey:    listenerPriv,
+		PeerPublicKey: senderPub,
+		LocalAddr:     listenerAddr,
+		PeerAddr:      senderAddr,
+		DERPClient:    derpA,
+		PeerDERP:      derpB.PublicKey(),
+	})
+	if err != nil {
+		t.Fatalf("NewNode(listener) error = %v", err)
+	}
+	defer listener.Close()
+
+	sender, err := NewNode(Config{
+		PrivateKey:    senderPriv,
+		PeerPublicKey: listenerPub,
+		LocalAddr:     senderAddr,
+		PeerAddr:      listenerAddr,
+		DERPClient:    derpB,
+		PeerDERP:      derpA.PublicKey(),
+	})
+	if err != nil {
+		t.Fatalf("NewNode(sender) error = %v", err)
+	}
+	defer sender.Close()
+
+	ln, err := listener.ListenTCP(7003)
+	if err != nil {
+		t.Fatalf("ListenTCP() error = %v", err)
+	}
+	defer ln.Close()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer conn.Close()
+
+		buf := make([]byte, 5)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			serverDone <- err
+			return
+		}
+		if string(buf) != "hello" {
+			serverDone <- errors.New("unexpected client payload")
+			return
+		}
+		_, err = conn.Write([]byte("world"))
+		serverDone <- err
+	}()
+
+	conn, err := sender.DialTCP(ctx, netip.AddrPortFrom(listenerAddr, 7003))
+	if err != nil {
+		t.Fatalf("DialTCP() error = %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("hello")); err != nil {
+		t.Fatalf("client Write() error = %v", err)
+	}
+
+	reply := make([]byte, 5)
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		t.Fatalf("client ReadFull() error = %v", err)
+	}
+	if string(reply) != "world" {
+		t.Fatalf("reply = %q, want %q", reply, "world")
+	}
+
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("server error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("server did not complete")
+	}
+}
+
+func TestNodeTCPRoundTripOverDERPWithProvidedPacketConn(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	derpA, derpB := newTestDERPClientPair(t, ctx)
+
+	aConn, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		t.Fatalf("ListenPacket(listener) error = %v", err)
+	}
+	defer aConn.Close()
+
+	bConn, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		t.Fatalf("ListenPacket(sender) error = %v", err)
+	}
+	defer bConn.Close()
+
+	var sessionID [16]byte
+	sessionID[0] = 12
+	_, listenerAddr, senderAddr := DeriveAddresses(sessionID)
+
+	listenerPriv := mustHex32(t, "003ed5d73b55806c30de3f8a7bdab38af13539220533055e635690b8b87ad641")
+	listenerPub := mustHex32(t, "c4c8e984c5322c8184c72265b92b250fdb63688705f504ba003c88f03393cf28")
+	senderPriv := mustHex32(t, "087ec6e14bbed210e7215cdc73468dfa23f080a1bfb8665b2fd809bd99d28379")
+	senderPub := mustHex32(t, "f928d4f6c1b86c12f2562c10b07c555c5c57fd00f59e90c8d8d88767271cbf7c")
+
+	listener, err := NewNode(Config{
+		PrivateKey:    listenerPriv,
+		PeerPublicKey: senderPub,
+		LocalAddr:     listenerAddr,
+		PeerAddr:      senderAddr,
+		PacketConn:    aConn,
+		Transport:     "batched",
+		DERPClient:    derpA,
+		PeerDERP:      derpB.PublicKey(),
+	})
+	if err != nil {
+		t.Fatalf("NewNode(listener) error = %v", err)
+	}
+	defer listener.Close()
+
+	sender, err := NewNode(Config{
+		PrivateKey:    senderPriv,
+		PeerPublicKey: listenerPub,
+		LocalAddr:     senderAddr,
+		PeerAddr:      listenerAddr,
+		PacketConn:    bConn,
+		Transport:     "batched",
+		DERPClient:    derpB,
+		PeerDERP:      derpA.PublicKey(),
+	})
+	if err != nil {
+		t.Fatalf("NewNode(sender) error = %v", err)
+	}
+	defer sender.Close()
+
+	ln, err := listener.ListenTCP(7004)
+	if err != nil {
+		t.Fatalf("ListenTCP() error = %v", err)
+	}
+	defer ln.Close()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer conn.Close()
+
+		buf := make([]byte, 5)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			serverDone <- err
+			return
+		}
+		if string(buf) != "hello" {
+			serverDone <- errors.New("unexpected client payload")
+			return
+		}
+		_, err = conn.Write([]byte("world"))
+		serverDone <- err
+	}()
+
+	conn, err := sender.DialTCP(ctx, netip.AddrPortFrom(listenerAddr, 7004))
+	if err != nil {
+		t.Fatalf("DialTCP() error = %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("hello")); err != nil {
+		t.Fatalf("client Write() error = %v", err)
+	}
+
+	reply := make([]byte, 5)
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		t.Fatalf("client ReadFull() error = %v", err)
+	}
+	if string(reply) != "world" {
+		t.Fatalf("reply = %q, want %q", reply, "world")
+	}
+
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("server error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("server did not complete")
+	}
+}
+
+func TestNodeTCPCloseWritePropagatesEOFOverDERP(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	derpA, derpB := newTestDERPClientPair(t, ctx)
+
+	aConn, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		t.Fatalf("ListenPacket(listener) error = %v", err)
+	}
+	defer aConn.Close()
+
+	bConn, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		t.Fatalf("ListenPacket(sender) error = %v", err)
+	}
+	defer bConn.Close()
+
+	var sessionID [16]byte
+	sessionID[0] = 13
+	_, listenerAddr, senderAddr := DeriveAddresses(sessionID)
+
+	listenerPriv := mustHex32(t, "003ed5d73b55806c30de3f8a7bdab38af13539220533055e635690b8b87ad641")
+	listenerPub := mustHex32(t, "c4c8e984c5322c8184c72265b92b250fdb63688705f504ba003c88f03393cf28")
+	senderPriv := mustHex32(t, "087ec6e14bbed210e7215cdc73468dfa23f080a1bfb8665b2fd809bd99d28379")
+	senderPub := mustHex32(t, "f928d4f6c1b86c12f2562c10b07c555c5c57fd00f59e90c8d8d88767271cbf7c")
+
+	listener, err := NewNode(Config{
+		PrivateKey:    listenerPriv,
+		PeerPublicKey: senderPub,
+		LocalAddr:     listenerAddr,
+		PeerAddr:      senderAddr,
+		PacketConn:    aConn,
+		Transport:     "batched",
+		DERPClient:    derpA,
+		PeerDERP:      derpB.PublicKey(),
+	})
+	if err != nil {
+		t.Fatalf("NewNode(listener) error = %v", err)
+	}
+	defer listener.Close()
+
+	sender, err := NewNode(Config{
+		PrivateKey:    senderPriv,
+		PeerPublicKey: listenerPub,
+		LocalAddr:     senderAddr,
+		PeerAddr:      listenerAddr,
+		PacketConn:    bConn,
+		Transport:     "batched",
+		DERPClient:    derpB,
+		PeerDERP:      derpA.PublicKey(),
+	})
+	if err != nil {
+		t.Fatalf("NewNode(sender) error = %v", err)
+	}
+	defer sender.Close()
+
+	ln, err := listener.ListenTCP(7005)
+	if err != nil {
+		t.Fatalf("ListenTCP() error = %v", err)
+	}
+	defer ln.Close()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer conn.Close()
+
+		buf, err := io.ReadAll(conn)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if string(buf) != "hello" {
+			serverDone <- errors.New("unexpected client payload")
+			return
+		}
+		serverDone <- nil
+	}()
+
+	conn, err := sender.DialTCP(ctx, netip.AddrPortFrom(listenerAddr, 7005))
+	if err != nil {
+		t.Fatalf("DialTCP() error = %v", err)
+	}
+	if _, err := conn.Write([]byte("hello")); err != nil {
+		t.Fatalf("client Write() error = %v", err)
+	}
+	if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+		if err := cw.CloseWrite(); err != nil {
+			t.Fatalf("CloseWrite() error = %v", err)
+		}
+	} else {
+		t.Fatal("DialTCP() connection does not support CloseWrite")
+	}
+	defer conn.Close()
+
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("server error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("server did not observe EOF")
+	}
+}
+
 func testNodeTCPRoundTripOverUDP(t *testing.T, transport string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

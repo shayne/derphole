@@ -24,6 +24,7 @@ func testClaim(tok token.Token) Claim {
 		SessionID:    tok.SessionID,
 		DERPPublic:   [32]byte{1, 2, 3, 4},
 		QUICPublic:   [32]byte{5, 6, 7, 8},
+		Parallel:     4,
 		Candidates:   []string{"udp4:203.0.113.10:12345", "udp6:[2001:db8::10]:12345"},
 		Capabilities: tok.Capabilities,
 	}
@@ -213,6 +214,7 @@ func TestClaimAndDecisionSerializationRoundTrip(t *testing.T) {
 		BearerMAC:    "mac",
 		DERPPublic:   [32]byte{5, 6, 7, 8},
 		QUICPublic:   [32]byte{9, 10, 11, 12},
+		Parallel:     8,
 		Candidates:   []string{"udp4:127.0.0.1:1", "udp6:[::1]:2"},
 		Capabilities: 0x42,
 	}
@@ -233,6 +235,7 @@ func TestClaimAndDecisionSerializationRoundTrip(t *testing.T) {
 		Accept: &AcceptInfo{
 			Version:      token.SupportedVersion,
 			SessionID:    claim.SessionID,
+			Parallel:     claim.Parallel,
 			Candidates:   claim.Candidates,
 			Capabilities: claim.Capabilities,
 		},

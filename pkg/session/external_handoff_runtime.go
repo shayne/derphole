@@ -1,3 +1,4 @@
+//lint:file-ignore U1000 Retired public QUIC handoff runtime pending deletion after the WG cutover settles.
 package session
 
 import (

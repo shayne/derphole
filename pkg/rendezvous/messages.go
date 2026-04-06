@@ -13,6 +13,7 @@ type Claim struct {
 	BearerMAC    string   `json:"bearer_mac"`
 	DERPPublic   [32]byte `json:"derp_public"`
 	QUICPublic   [32]byte `json:"quic_public"`
+	Parallel     int      `json:"parallel,omitempty"`
 	Candidates   []string `json:"candidates,omitempty"`
 	Capabilities uint32   `json:"capabilities"`
 }
@@ -20,6 +21,7 @@ type Claim struct {
 type AcceptInfo struct {
 	Version      uint8    `json:"version"`
 	SessionID    [16]byte `json:"session_id"`
+	Parallel     int      `json:"parallel,omitempty"`
 	Candidates   []string `json:"candidates,omitempty"`
 	Capabilities uint32   `json:"capabilities"`
 }
@@ -53,6 +55,7 @@ func ComputeBearerMAC(secret [32]byte, claim Claim) string {
 		SessionID    [16]byte `json:"session_id"`
 		DERPPublic   [32]byte `json:"derp_public"`
 		QUICPublic   [32]byte `json:"quic_public"`
+		Parallel     int      `json:"parallel,omitempty"`
 		Candidates   []string `json:"candidates,omitempty"`
 		Capabilities uint32   `json:"capabilities"`
 	}{
@@ -60,6 +63,7 @@ func ComputeBearerMAC(secret [32]byte, claim Claim) string {
 		SessionID:    claim.SessionID,
 		DERPPublic:   claim.DERPPublic,
 		QUICPublic:   claim.QUICPublic,
+		Parallel:     claim.Parallel,
 		Candidates:   claim.Candidates,
 		Capabilities: claim.Capabilities,
 	})

@@ -22,7 +22,11 @@ func Send(ctx context.Context, cfg SendConfig) error {
 	session, ok := relayMailbox(cfg.Token)
 	if !ok {
 		if cfg.UsePublicDERP {
-			return sendExternal(ctx, cfg)
+			if err := sendExternal(ctx, cfg); err != nil {
+				return err
+			}
+			emitStatus(cfg.Emitter, StateComplete)
+			return nil
 		}
 		return ErrUnknownSession
 	}

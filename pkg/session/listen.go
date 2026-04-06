@@ -33,6 +33,8 @@ type relaySession struct {
 	gate         *rendezvous.Gate
 	derpMap      *tailcfg.DERPMap
 	quicIdentity quicpath.SessionIdentity
+	wgPrivate    [32]byte
+	wgPublic     [32]byte
 	claimMu      sync.Mutex
 	claimed      bool
 	shareClaimCh chan shareClaim
@@ -90,7 +92,11 @@ func deleteRelayMailbox(tok string, session *relaySession) {
 
 func Listen(ctx context.Context, cfg ListenConfig) (string, error) {
 	if cfg.UsePublicDERP {
-		return listenExternal(ctx, cfg)
+		tok, err := listenExternal(ctx, cfg)
+		if err == nil {
+			emitStatus(cfg.Emitter, StateComplete)
+		}
+		return tok, err
 	}
 
 	tok, session, err := issueLocalToken()

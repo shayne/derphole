@@ -45,6 +45,7 @@ func (g *Gate) Accept(now time.Time, claim Claim) (Decision, error) {
 				Accept: &AcceptInfo{
 					Version:      g.token.Version,
 					SessionID:    g.token.SessionID,
+					Parallel:     claim.Parallel,
 					Candidates:   append([]string(nil), claim.Candidates...),
 					Capabilities: claim.Capabilities,
 				},
@@ -94,6 +95,7 @@ func (g *Gate) Accept(now time.Time, claim Claim) (Decision, error) {
 		Accept: &AcceptInfo{
 			Version:      g.token.Version,
 			SessionID:    g.token.SessionID,
+			Parallel:     claim.Parallel,
 			Candidates:   append([]string(nil), claim.Candidates...),
 			Capabilities: claim.Capabilities,
 		},
@@ -106,6 +108,7 @@ func sameClaim(a, b Claim) bool {
 		a.BearerMAC != b.BearerMAC ||
 		a.DERPPublic != b.DERPPublic ||
 		a.QUICPublic != b.QUICPublic ||
+		a.Parallel != b.Parallel ||
 		a.Capabilities != b.Capabilities ||
 		len(a.Candidates) != len(b.Candidates) {
 		return false
