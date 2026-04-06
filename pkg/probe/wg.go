@@ -77,16 +77,17 @@ func newWireGuardPlan() (wireGuardPlan, error) {
 }
 
 func allocateWireGuardProbePort() (int, error) {
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
+	var raw [2]byte
+	if _, err := rand.Read(raw[:]); err != nil {
 		return 0, fmt.Errorf("allocate wireguard probe port: %w", err)
 	}
-	defer ln.Close()
-	addr, ok := ln.Addr().(*net.TCPAddr)
-	if !ok || addr.Port <= 0 {
-		return 0, fmt.Errorf("allocate wireguard probe port: unexpected listener addr %T", ln.Addr())
+	const minPort = 20000
+	const portSpan = 40000
+	port := minPort + int(uint16(raw[0])<<8|uint16(raw[1]))%portSpan
+	if port == defaultWireGuardProbePort {
+		port++
 	}
-	return addr.Port, nil
+	return port, nil
 }
 
 func deriveProbeIPv4Addrs(_ [16]byte) (netip.Addr, netip.Addr) {

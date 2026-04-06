@@ -208,8 +208,9 @@ func testWireGuardTransfer(t *testing.T, transport string) {
 	payload := bytes.Repeat([]byte("derpcat"), 16<<10)
 	var dst bytes.Buffer
 	serverDone := make(chan error, 1)
+	serverReady := make(chan struct{})
 	go func() {
-		_, err := ReceiveWireGuardToWriter(ctx, serverConn, &dst, WireGuardConfig{
+		cfg := WireGuardConfig{
 			Transport:      transport,
 			PrivateKeyHex:  plan.listenerPrivHex,
 			PeerPublicHex:  plan.senderPubHex,
@@ -217,9 +218,49 @@ func testWireGuardTransfer(t *testing.T, transport string) {
 			PeerAddr:       plan.senderAddr.String(),
 			DirectEndpoint: clientConn.LocalAddr().String(),
 			Port:           uint16(plan.port),
-		})
-		serverDone <- err
+		}
+		node, resolved, err := newWireGuardNode(serverConn, cfg)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer node.Close()
+
+		ln, err := node.ListenTCP(resolved.port)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer ln.Close()
+		close(serverReady)
+
+		tcpConn, err := acceptConn(ctx, ln)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer tcpConn.Close()
+
+		if _, err := io.Copy(&dst, tcpConn); err != nil {
+			serverDone <- err
+			return
+		}
+		if _, err := tcpConn.Write(wireGuardDrainAck); err != nil {
+			serverDone <- err
+			return
+		}
+		serverDone <- nil
 	}()
+	select {
+	case <-serverReady:
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("server setup error = %v", err)
+		}
+		t.Fatal("server exited before becoming ready")
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for server readiness: %v", ctx.Err())
+	}
 
 	if _, err := SendWireGuard(ctx, clientConn, bytes.NewReader(payload), WireGuardConfig{
 		Transport:      transport,
