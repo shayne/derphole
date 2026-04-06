@@ -945,6 +945,67 @@ func TestSendRetriesAfterZeroProgressRead(t *testing.T) {
 	}
 }
 
+func TestReceiveCoalescesRawAcks(t *testing.T) {
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	receiverConn := &countingPacketConn{PacketConn: b}
+	chunkSize := 256
+	packetCount := delayedAckPackets * 4
+	payload := bytes.Repeat([]byte("a"), chunkSize*packetCount)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := Receive(ctx, receiverConn, "", ReceiveConfig{Raw: true})
+		errCh <- err
+	}()
+
+	if _, err := Send(ctx, a, b.LocalAddr().String(), bytes.NewReader(payload), SendConfig{
+		Raw:        true,
+		ChunkSize:  chunkSize,
+		WindowSize: defaultWindowSize,
+	}); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("Receive() error = %v", err)
+	}
+
+	receiverConn.mu.Lock()
+	writes := receiverConn.writes
+	receiverConn.mu.Unlock()
+	if writes >= packetCount {
+		t.Fatalf("receiver ack writes = %d, want fewer than data packets %d", writes, packetCount)
+	}
+}
+
+func TestSessionRetryIntervalClampsToRTT(t *testing.T) {
+	if got := sessionRetryInterval(0); got != minRetryInterval {
+		t.Fatalf("sessionRetryInterval(0) = %v, want %v", got, minRetryInterval)
+	}
+	if got := sessionRetryInterval(5 * time.Millisecond); got != minRetryInterval {
+		t.Fatalf("sessionRetryInterval(5ms) = %v, want %v", got, minRetryInterval)
+	}
+	if got := sessionRetryInterval(30 * time.Millisecond); got != 120*time.Millisecond {
+		t.Fatalf("sessionRetryInterval(30ms) = %v, want %v", got, 120*time.Millisecond)
+	}
+	if got := sessionRetryInterval(200 * time.Millisecond); got != maxRetryInterval {
+		t.Fatalf("sessionRetryInterval(200ms) = %v, want %v", got, maxRetryInterval)
+	}
+}
+
 func TestSendBacksOffRepeatedZeroProgressReads(t *testing.T) {
 	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {

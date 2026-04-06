@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -335,7 +336,7 @@ func TestRunOrchestrateReverseTransfersAndReportsDirect(t *testing.T) {
 		Transport: "batched",
 		Direction: "reverse",
 		SizeBytes: 1024,
-		Parallel:  4,
+		Parallel:  1,
 	})
 	if err != nil {
 		t.Fatalf("RunOrchestrate() error = %v", err)
@@ -390,8 +391,14 @@ func TestProbeSendTuningDefaultsAndOverrides(t *testing.T) {
 		_ = os.Unsetenv(key)
 	}
 
-	if got := probeWindowSize(); got != 1024 {
-		t.Fatalf("probeWindowSize() = %d, want 1024", got)
+	if got := probeWindowSize("raw", probeTransportLegacy); got != 256 {
+		t.Fatalf("probeWindowSize(raw, legacy) = %d, want 256", got)
+	}
+	if got := probeWindowSize("raw", probeTransportBatched); got != 384 {
+		t.Fatalf("probeWindowSize(raw, batched) = %d, want 384", got)
+	}
+	if got := probeWindowSize("blast", probeTransportBatched); got != 1024 {
+		t.Fatalf("probeWindowSize(blast, batched) = %d, want 1024", got)
 	}
 	if got := probeChunkSize(); got != defaultChunkSize {
 		t.Fatalf("probeChunkSize() = %d, want %d", got, defaultChunkSize)
@@ -400,10 +407,92 @@ func TestProbeSendTuningDefaultsAndOverrides(t *testing.T) {
 	_ = os.Setenv("DERPCAT_PROBE_WINDOW_SIZE", strconv.Itoa(256))
 	_ = os.Setenv("DERPCAT_PROBE_CHUNK_SIZE", strconv.Itoa(1300))
 
-	if got := probeWindowSize(); got != 256 {
-		t.Fatalf("probeWindowSize() = %d, want 256", got)
+	if got := probeWindowSize("raw", probeTransportBatched); got != 256 {
+		t.Fatalf("probeWindowSize(raw, batched) override = %d, want 256", got)
 	}
 	if got := probeChunkSize(); got != 1300 {
 		t.Fatalf("probeChunkSize() = %d, want 1300", got)
+	}
+}
+
+func TestSplitOrchestrateShares(t *testing.T) {
+	if got := splitOrchestrateShares(0, 8); len(got) != 1 || got[0] != 0 {
+		t.Fatalf("splitOrchestrateShares(0, 8) = %#v, want [0]", got)
+	}
+	if got := splitOrchestrateShares(8, 16); len(got) != 8 {
+		t.Fatalf("splitOrchestrateShares(8, 16) len = %d, want 8", len(got))
+	}
+	if got := splitOrchestrateShares(10, 3); len(got) != 3 || got[0] != 4 || got[1] != 3 || got[2] != 3 {
+		t.Fatalf("splitOrchestrateShares(10, 3) = %#v, want [4 3 3]", got)
+	}
+}
+
+func TestRunOrchestrateStripesRawParallel(t *testing.T) {
+	oldChild := orchestrateChildRun
+	defer func() {
+		orchestrateChildRun = oldChild
+	}()
+
+	var (
+		mu       sync.Mutex
+		children []OrchestrateConfig
+	)
+	orchestrateChildRun = func(ctx context.Context, cfg OrchestrateConfig) (RunReport, error) {
+		mu.Lock()
+		children = append(children, cfg)
+		mu.Unlock()
+		return RunReport{
+			Host:          cfg.Host,
+			Mode:          cfg.Mode,
+			Transport:     cfg.Transport,
+			Direction:     cfg.Direction,
+			SizeBytes:     cfg.SizeBytes,
+			BytesReceived: cfg.SizeBytes,
+			DurationMS:    100,
+			GoodputMbps:   10,
+			Direct:        true,
+			FirstByteMS:   5,
+			LossRate:      0.25,
+			Retransmits:   2,
+			Local:         TransportCaps{Kind: "legacy"},
+			Remote:        TransportCaps{Kind: "batched"},
+		}, nil
+	}
+
+	report, err := RunOrchestrate(context.Background(), OrchestrateConfig{
+		Host:      "ktzlxc",
+		Mode:      "blast",
+		Transport: "batched",
+		Direction: "forward",
+		SizeBytes: 1024,
+		Parallel:  4,
+	})
+	if err != nil {
+		t.Fatalf("RunOrchestrate() error = %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(children) != 4 {
+		t.Fatalf("child count = %d, want 4", len(children))
+	}
+	var total int64
+	for _, child := range children {
+		total += child.SizeBytes
+		if child.Parallel != 1 {
+			t.Fatalf("child.Parallel = %d, want 1", child.Parallel)
+		}
+	}
+	if total != 1024 {
+		t.Fatalf("striped child sizes total = %d, want 1024", total)
+	}
+	if report.BytesReceived != 1024 {
+		t.Fatalf("report.BytesReceived = %d, want 1024", report.BytesReceived)
+	}
+	if report.Retransmits != 8 {
+		t.Fatalf("report.Retransmits = %d, want 8", report.Retransmits)
+	}
+	if !report.Direct || report.Local.Kind != "legacy" || report.Remote.Kind != "batched" {
+		t.Fatalf("report = %#v", report)
 	}
 }

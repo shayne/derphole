@@ -34,6 +34,7 @@ type WireGuardConfig struct {
 	Port           uint16
 	Streams        int
 	SizeBytes      int64
+	Reverse        bool
 }
 
 type wireGuardPlan struct {

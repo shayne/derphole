@@ -27,6 +27,11 @@ var listenPacket = net.ListenPacket
 var orchestrateDiscoverCandidates = DiscoverCandidates
 var orchestrateSend = Send
 var orchestrateReceive = ReceiveToWriter
+var orchestrateChildRun func(context.Context, OrchestrateConfig) (RunReport, error)
+
+func init() {
+	orchestrateChildRun = RunOrchestrate
+}
 
 type OrchestrateConfig struct {
 	Host       string
@@ -339,7 +344,7 @@ func RunOrchestrate(ctx context.Context, cfg OrchestrateConfig) (RunReport, erro
 		return RunReport{}, errors.New("size bytes must be non-negative")
 	}
 	switch cfg.Mode {
-	case "raw", "blast", "wg", "wgos":
+	case "raw", "blast", "wg", "wgos", "wgiperf":
 	case "aead":
 		return RunReport{}, errors.New("aead not implemented yet")
 	default:
@@ -347,6 +352,9 @@ func RunOrchestrate(ctx context.Context, cfg OrchestrateConfig) (RunReport, erro
 	}
 	if cfg.Direction != "forward" && cfg.Direction != "reverse" {
 		return RunReport{}, fmt.Errorf("unsupported direction %q", cfg.Direction)
+	}
+	if cfg.Parallel > 1 && (cfg.Mode == "raw" || cfg.Mode == "blast") {
+		return runStripedOrchestrate(ctx, cfg)
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -368,10 +376,115 @@ func RunOrchestrate(ctx context.Context, cfg OrchestrateConfig) (RunReport, erro
 		Host:       cfg.Host,
 		RemotePath: cfg.RemotePath,
 	}
+	if cfg.Mode == "wgiperf" {
+		return runWireGuardOSIperfOrchestrate(runCtx, cfg, localConn, localCandidates, runner)
+	}
 	if cfg.Direction == "reverse" {
 		return runReverseOrchestrate(runCtx, cfg, localConn, localCandidates, runner)
 	}
 	return runForwardOrchestrate(runCtx, cfg, localConn, localCandidates, runner)
+}
+
+func runStripedOrchestrate(ctx context.Context, cfg OrchestrateConfig) (RunReport, error) {
+	shares := splitOrchestrateShares(cfg.SizeBytes, cfg.Parallel)
+	if len(shares) == 1 {
+		child := cfg
+		child.Parallel = 1
+		child.SizeBytes = shares[0]
+		return orchestrateChildRun(ctx, child)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	startedAt := time.Now()
+	type stripeResult struct {
+		report RunReport
+		err    error
+	}
+	results := make(chan stripeResult, len(shares))
+	for _, share := range shares {
+		child := cfg
+		child.SizeBytes = share
+		child.Parallel = 1
+		go func(child OrchestrateConfig) {
+			report, err := orchestrateChildRun(runCtx, child)
+			if err != nil {
+				cancel()
+			}
+			results <- stripeResult{report: report, err: err}
+		}(child)
+	}
+
+	reports := make([]RunReport, 0, len(shares))
+	for range shares {
+		result := <-results
+		if result.err != nil {
+			return RunReport{}, result.err
+		}
+		reports = append(reports, result.report)
+	}
+	return aggregateStripedReports(cfg, startedAt, reports), nil
+}
+
+func splitOrchestrateShares(total int64, parallel int) []int64 {
+	if total <= 0 || parallel <= 1 {
+		return []int64{total}
+	}
+	if int64(parallel) > total {
+		parallel = int(total)
+	}
+	base := total / int64(parallel)
+	extra := total % int64(parallel)
+	shares := make([]int64, 0, parallel)
+	for i := 0; i < parallel; i++ {
+		share := base
+		if int64(i) < extra {
+			share++
+		}
+		if share > 0 {
+			shares = append(shares, share)
+		}
+	}
+	if len(shares) == 0 {
+		return []int64{total}
+	}
+	return shares
+}
+
+func aggregateStripedReports(cfg OrchestrateConfig, startedAt time.Time, reports []RunReport) RunReport {
+	aggregate := RunReport{
+		Host:      cfg.Host,
+		Mode:      cfg.Mode,
+		Transport: cfg.Transport,
+		Direction: cfg.Direction,
+		SizeBytes: cfg.SizeBytes,
+		Direct:    true,
+	}
+	var weightedLoss float64
+	var weightedBytes int64
+	for i, report := range reports {
+		aggregate.BytesReceived += report.BytesReceived
+		aggregate.Retransmits += report.Retransmits
+		if report.FirstByteMS > 0 && (aggregate.FirstByteMS == 0 || report.FirstByteMS < aggregate.FirstByteMS) {
+			aggregate.FirstByteMS = report.FirstByteMS
+		}
+		aggregate.Direct = aggregate.Direct && report.Direct
+		if report.BytesReceived > 0 {
+			weightedLoss += report.LossRate * float64(report.BytesReceived)
+			weightedBytes += report.BytesReceived
+		}
+		if i == 0 {
+			aggregate.Local = report.Local
+			aggregate.Remote = report.Remote
+		}
+	}
+	if weightedBytes > 0 {
+		aggregate.LossRate = weightedLoss / float64(weightedBytes)
+	}
+	aggregate.DurationMS = time.Since(startedAt).Milliseconds()
+	aggregate.GoodputMbps = goodputMbps(aggregate.BytesReceived, aggregate.DurationMS)
+	return aggregate
 }
 
 func runForwardOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localConn net.PacketConn, localCandidates []net.Addr, runner SSHRunner) (RunReport, error) {
@@ -487,7 +600,7 @@ func runForwardOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localC
 			Blast:      cfg.Mode == "blast",
 			Transport:  cfg.Transport,
 			ChunkSize:  probeChunkSize(),
-			WindowSize: probeWindowSize(),
+			WindowSize: probeWindowSize(cfg.Mode, cfg.Transport),
 		})
 	}
 	punchCancel()
@@ -718,6 +831,125 @@ func runReverseOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localC
 	}, nil
 }
 
+func runWireGuardOSIperfOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localConn net.PacketConn, localCandidates []net.Addr, runner SSHRunner) (RunReport, error) {
+	wgPlan, err := newWireGuardPlan()
+	if err != nil {
+		return RunReport{}, err
+	}
+	serverCfg := ServerConfig{
+		ListenAddr:        cfg.ListenAddr,
+		Mode:              cfg.Mode,
+		Transport:         cfg.Transport,
+		PeerCandidatesCSV: strings.Join(CandidateStrings(localCandidates), ","),
+		SizeBytes:         cfg.SizeBytes,
+		Parallel:          cfg.Parallel,
+		WGPrivateKeyHex:   wgPlan.listenerPrivHex,
+		WGPeerPublicHex:   wgPlan.senderPubHex,
+		WGLocalAddr:       wgPlan.listenerAddr.String(),
+		WGPeerAddr:        wgPlan.senderAddr.String(),
+		WGPort:            wgPlan.port,
+	}
+	handle, err := launchRemoteServer(runCtx, runner, serverCfg)
+	if err != nil {
+		return RunReport{}, err
+	}
+	completed := false
+	defer func() {
+		if !completed && handle.wait != nil {
+			_ = handle.wait()
+		}
+	}()
+
+	var stderrBuf bytes.Buffer
+	var stderrWG sync.WaitGroup
+	if handle.stderr != nil {
+		stderrWG.Add(1)
+		go func() {
+			defer stderrWG.Done()
+			_, _ = io.Copy(&stderrBuf, handle.stderr)
+		}()
+	}
+
+	events := make(chan outputEvent, 8)
+	go scanRemoteOutput(handle.stdout, events)
+
+	ready, err := waitForRemoteReady(runCtx, events, &stderrBuf)
+	if err != nil {
+		return RunReport{}, err
+	}
+	remoteCandidates := ParseCandidateStrings(ready.Candidates)
+	remoteCandidates = preferredCandidates(remoteCandidates, 8)
+	remoteAddr := ""
+	if len(remoteCandidates) > 0 {
+		remoteAddr = remoteCandidates[0].String()
+	}
+	if remoteAddr == "" && ready.Addr != "" {
+		if addr, err := net.ResolveUDPAddr("udp", ready.Addr); err == nil {
+			if preferred := preferredCandidates([]net.Addr{addr}, 1); len(preferred) > 0 {
+				remoteAddr = preferred[0].String()
+				remoteCandidates = preferred
+			}
+		}
+	}
+	if remoteAddr == "" {
+		return RunReport{}, errors.New("remote server did not report a usable address")
+	}
+
+	sendStats, err := SendWireGuardOSIperf(runCtx, localConn, WireGuardConfig{
+		Transport:      cfg.Transport,
+		PrivateKeyHex:  wgPlan.senderPrivHex,
+		PeerPublicHex:  wgPlan.listenerPubHex,
+		LocalAddr:      wgPlan.senderAddr.String(),
+		PeerAddr:       wgPlan.listenerAddr.String(),
+		DirectEndpoint: remoteAddr,
+		PeerCandidates: remoteCandidates,
+		Port:           uint16(wgPlan.port),
+		Streams:        cfg.Parallel,
+		SizeBytes:      cfg.SizeBytes,
+		Reverse:        cfg.Direction == "reverse",
+	})
+	if err != nil {
+		return RunReport{}, err
+	}
+	done, err := waitForRemoteDone(runCtx, events, &stderrBuf)
+	if err != nil {
+		return RunReport{}, err
+	}
+	if handle.wait != nil {
+		if err := handle.wait(); err != nil {
+			if msg := strings.TrimSpace(stderrBuf.String()); msg != "" {
+				return RunReport{}, fmt.Errorf("remote server failed: %w: %s", err, msg)
+			}
+			return RunReport{}, err
+		}
+	}
+	stderrWG.Wait()
+	completed = true
+
+	durationMS := elapsedMS(sendStats.StartedAt, sendStats.CompletedAt)
+	if durationMS <= 0 {
+		durationMS = done.DurationMS
+	}
+	bytesReceived := sendStats.BytesReceived
+	if bytesReceived <= 0 {
+		bytesReceived = done.BytesReceived
+	}
+	return RunReport{
+		Host:          cfg.Host,
+		Mode:          cfg.Mode,
+		Transport:     cfg.Transport,
+		Direction:     cfg.Direction,
+		SizeBytes:     cfg.SizeBytes,
+		BytesReceived: bytesReceived,
+		DurationMS:    durationMS,
+		GoodputMbps:   goodputMbps(bytesReceived, durationMS),
+		Direct:        true,
+		FirstByteMS:   elapsedMS(sendStats.StartedAt, sendStats.FirstByteAt),
+		Local:         sendStats.Transport,
+		Remote:        ready.Transport,
+	}, nil
+}
+
 func waitForRemoteReady(ctx context.Context, events <-chan outputEvent, stderr *bytes.Buffer) (remoteReady, error) {
 	for {
 		select {
@@ -856,8 +1088,17 @@ func elapsedMS(start, end time.Time) int64 {
 	return end.Sub(start).Milliseconds()
 }
 
-func probeWindowSize() int {
-	return envPositiveInt("DERPCAT_PROBE_WINDOW_SIZE", defaultProbeWindowSize)
+func probeWindowSize(mode, transport string) int {
+	if raw := strings.TrimSpace(os.Getenv("DERPCAT_PROBE_WINDOW_SIZE")); raw != "" {
+		return envPositiveInt("DERPCAT_PROBE_WINDOW_SIZE", defaultProbeWindowSize)
+	}
+	if mode == "raw" {
+		if normalized, err := normalizeTransport(transport); err == nil && normalized == probeTransportBatched {
+			return 384
+		}
+		return 256
+	}
+	return defaultProbeWindowSize
 }
 
 func probeChunkSize() int {

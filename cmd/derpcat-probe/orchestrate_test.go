@@ -212,6 +212,28 @@ func TestRunOrchestrateAcceptsWireGuardMode(t *testing.T) {
 	}
 }
 
+func TestRunOrchestrateAcceptsWireGuardIperfMode(t *testing.T) {
+	oldRunOrchestrateProbe := runOrchestrateProbe
+	defer func() { runOrchestrateProbe = oldRunOrchestrateProbe }()
+	runOrchestrateProbe = func(ctx context.Context, cfg probe.OrchestrateConfig) (probe.RunReport, error) {
+		return probe.RunReport{Host: cfg.Host, Mode: cfg.Mode, Direction: "forward", SizeBytes: cfg.SizeBytes, Direct: true}, nil
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	code := runOrchestrate([]string{"--host", "ktzlxc", "--mode", "wgiperf", "--size-bytes", "1024"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("runOrchestrate() code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "\"mode\": \"wgiperf\"") {
+		t.Fatalf("stdout missing wgiperf JSON: %s", stdout.String())
+	}
+}
+
 func TestRunOrchestrateRejectsMissingHost(t *testing.T) {
 	oldRunOrchestrateProbe := runOrchestrateProbe
 	defer func() { runOrchestrateProbe = oldRunOrchestrateProbe }()

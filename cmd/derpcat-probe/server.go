@@ -59,7 +59,7 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stderr, subcommandUsageLine("server"))
 		return 2
 	}
-	if mode != "raw" && mode != "blast" && mode != "wg" && mode != "wgos" {
+	if mode != "raw" && mode != "blast" && mode != "wg" && mode != "wgos" && mode != "wgiperf" {
 		fmt.Fprintln(stderr, "unsupported mode:", mode)
 		fmt.Fprint(stderr, subcommandUsageLine("server"))
 		return 2
@@ -105,26 +105,9 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, discoverErr)
 		return 1
 	}
-	ready := serverReady{
-		Addr:       conn.LocalAddr().String(),
-		Candidates: probe.CandidateStrings(candidates),
-		Transport:  probe.PreviewTransportCaps(conn, transport),
-	}
-	if len(ready.Candidates) == 0 && ready.Addr != "" {
-		ready.Candidates = []string{ready.Addr}
-	}
-	if err := writeMachineLine(stdout, "READY", ready); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
-	}
-
-	punchCtx, punchCancel := context.WithCancel(ctx)
-	defer punchCancel()
-	go probe.PunchAddrs(punchCtx, conn, peerCandidates, nil, 25*time.Millisecond)
-
 	var stats probe.TransferStats
-	if mode == "wg" {
-		stats, err = probe.ReceiveWireGuardToWriter(ctx, conn, io.Discard, probe.WireGuardConfig{
+	if mode == "wgiperf" {
+		server, err := probe.StartWireGuardOSIperfServer(ctx, conn, probe.WireGuardConfig{
 			Transport:      transport,
 			PrivateKeyHex:  parsed.Flags.WGPrivateKey,
 			PeerPublicHex:  parsed.Flags.WGPeerPublic,
@@ -135,25 +118,90 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 			Streams:        parsed.Flags.Parallel,
 			SizeBytes:      parsed.Flags.SizeBytes,
 		})
-	} else if mode == "wgos" {
-		stats, err = probe.ReceiveWireGuardOSToWriter(ctx, conn, io.Discard, probe.WireGuardConfig{
-			Transport:      transport,
-			PrivateKeyHex:  parsed.Flags.WGPrivateKey,
-			PeerPublicHex:  parsed.Flags.WGPeerPublic,
-			LocalAddr:      parsed.Flags.WGLocalAddr,
-			PeerAddr:       parsed.Flags.WGPeerAddr,
-			PeerCandidates: peerCandidates,
-			Port:           uint16(parsed.Flags.WGPort),
-			Streams:        parsed.Flags.Parallel,
-			SizeBytes:      parsed.Flags.SizeBytes,
-		})
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		defer server.Close()
+		ready := serverReady{
+			Addr:       conn.LocalAddr().String(),
+			Candidates: probe.CandidateStrings(candidates),
+			Transport:  probe.PreviewTransportCaps(conn, transport),
+		}
+		if len(ready.Candidates) == 0 && ready.Addr != "" {
+			ready.Candidates = []string{ready.Addr}
+		}
+		if err := writeMachineLine(stdout, "READY", ready); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		waitStats, waitErr := server.Wait()
+		if waitErr != nil {
+			fmt.Fprintln(stderr, waitErr)
+			return 1
+		}
+		stats = waitStats
 	} else {
-		stats, err = probe.ReceiveToWriter(ctx, conn, "", io.Discard, probe.ReceiveConfig{Raw: mode == "raw", Blast: mode == "blast", Transport: transport})
-	}
-	punchCancel()
-	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
+		ready := serverReady{
+			Addr:       conn.LocalAddr().String(),
+			Candidates: probe.CandidateStrings(candidates),
+			Transport:  probe.PreviewTransportCaps(conn, transport),
+		}
+		if len(ready.Candidates) == 0 && ready.Addr != "" {
+			ready.Candidates = []string{ready.Addr}
+		}
+		if err := writeMachineLine(stdout, "READY", ready); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+
+		punchCtx, punchCancel := context.WithCancel(ctx)
+		defer punchCancel()
+		go probe.PunchAddrs(punchCtx, conn, peerCandidates, nil, 25*time.Millisecond)
+
+		if mode == "wg" {
+			waitStats, waitErr := probe.ReceiveWireGuardToWriter(ctx, conn, io.Discard, probe.WireGuardConfig{
+				Transport:      transport,
+				PrivateKeyHex:  parsed.Flags.WGPrivateKey,
+				PeerPublicHex:  parsed.Flags.WGPeerPublic,
+				LocalAddr:      parsed.Flags.WGLocalAddr,
+				PeerAddr:       parsed.Flags.WGPeerAddr,
+				PeerCandidates: peerCandidates,
+				Port:           uint16(parsed.Flags.WGPort),
+				Streams:        parsed.Flags.Parallel,
+				SizeBytes:      parsed.Flags.SizeBytes,
+			})
+			if waitErr != nil {
+				fmt.Fprintln(stderr, waitErr)
+				return 1
+			}
+			stats = waitStats
+		} else if mode == "wgos" {
+			waitStats, waitErr := probe.ReceiveWireGuardOSToWriter(ctx, conn, io.Discard, probe.WireGuardConfig{
+				Transport:      transport,
+				PrivateKeyHex:  parsed.Flags.WGPrivateKey,
+				PeerPublicHex:  parsed.Flags.WGPeerPublic,
+				LocalAddr:      parsed.Flags.WGLocalAddr,
+				PeerAddr:       parsed.Flags.WGPeerAddr,
+				PeerCandidates: peerCandidates,
+				Port:           uint16(parsed.Flags.WGPort),
+				Streams:        parsed.Flags.Parallel,
+				SizeBytes:      parsed.Flags.SizeBytes,
+			})
+			if waitErr != nil {
+				fmt.Fprintln(stderr, waitErr)
+				return 1
+			}
+			stats = waitStats
+		} else {
+			waitStats, waitErr := probe.ReceiveToWriter(ctx, conn, "", io.Discard, probe.ReceiveConfig{Raw: mode == "raw", Blast: mode == "blast", Transport: transport})
+			if waitErr != nil {
+				fmt.Fprintln(stderr, waitErr)
+				return 1
+			}
+			stats = waitStats
+		}
+		punchCancel()
 	}
 	done := serverDone{
 		BytesReceived: stats.BytesReceived,

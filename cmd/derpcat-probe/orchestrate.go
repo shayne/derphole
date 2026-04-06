@@ -49,7 +49,7 @@ func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
 		return 2
 	}
-	if flags.Mode != "raw" && flags.Mode != "blast" && flags.Mode != "wg" && flags.Mode != "wgos" {
+	if flags.Mode != "raw" && flags.Mode != "blast" && flags.Mode != "wg" && flags.Mode != "wgos" && flags.Mode != "wgiperf" {
 		fmt.Fprintln(stderr, "unsupported mode:", flags.Mode)
 		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
 		return 2
@@ -96,7 +96,7 @@ func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 type orchestrateFlags struct {
 	Host      string `flag:"host" help:"Remote host to benchmark"`
 	User      string `flag:"user" help:"SSH user" default:"root"`
-	Mode      string `flag:"mode" help:"Probe mode: raw, blast, wg, or wgos; AEAD lands in Task 5" default:"raw"`
+	Mode      string `flag:"mode" help:"Probe mode: raw, blast, wg, wgos, or wgiperf; AEAD lands in Task 5" default:"raw"`
 	Transport string `flag:"transport" help:"UDP transport: legacy or batched" default:"legacy"`
 	Direction string `flag:"direction" help:"Transfer direction" default:"forward"`
 	SizeBytes int64  `flag:"size-bytes" help:"Payload size in bytes" default:"1048576"`
