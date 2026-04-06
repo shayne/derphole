@@ -1060,6 +1060,79 @@ func TestSendIgnoresAckWithWrongRunID(t *testing.T) {
 	}
 }
 
+func TestSendIgnoresImpossibleAckRange(t *testing.T) {
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	src := bytes.NewReader(bytes.Repeat([]byte("impossible-ack"), 100))
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64<<10)
+		var runID [16]byte
+		for {
+			if err := b.SetReadDeadline(time.Now().Add(10 * time.Millisecond)); err != nil {
+				done <- err
+				return
+			}
+			n, addr, err := b.ReadFrom(buf)
+			if err != nil {
+				if ctx.Err() != nil {
+					done <- nil
+					return
+				}
+				var netErr net.Error
+				if errors.As(err, &netErr) && netErr.Timeout() {
+					continue
+				}
+				done <- err
+				return
+			}
+			packet, err := UnmarshalPacket(buf[:n], nil)
+			if err != nil {
+				done <- err
+				return
+			}
+			if isZeroRunID(runID) {
+				runID = packet.RunID
+			}
+			switch packet.Type {
+			case PacketTypeHello:
+				writeProbePacket(t, b, addr, Packet{
+					Version: ProtocolVersion,
+					Type:    PacketTypeHelloAck,
+					RunID:   runID,
+				})
+			case PacketTypeData, PacketTypeDone:
+				writeProbePacket(t, b, addr, Packet{
+					Version:  ProtocolVersion,
+					Type:     PacketTypeAck,
+					RunID:    runID,
+					AckFloor: math.MaxUint64,
+				})
+			}
+		}
+	}()
+
+	if _, err := Send(ctx, a, b.LocalAddr().String(), src, SendConfig{Raw: true, ChunkSize: 1200, WindowSize: 2}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Send() error = %v, want context deadline exceeded", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("peer loop error = %v", err)
+	}
+}
+
 func TestReceiveIgnoresPacketsWithWrongRunIDAfterEstablishingSession(t *testing.T) {
 	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
@@ -1155,6 +1228,223 @@ func TestReceiveIgnoresPacketsWithWrongRunIDAfterEstablishingSession(t *testing.
 	case got := <-done:
 		if !bytes.Equal(got, []byte("a")) {
 			t.Fatalf("payload = %q, want %q", got, []byte("a"))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for receive: %v", ctx.Err())
+	}
+}
+
+func TestReceiveIgnoresMalformedPacketBeforeHello(t *testing.T) {
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan []byte, 1)
+	errs := make(chan error, 1)
+	go func() {
+		got, err := Receive(ctx, b, a.LocalAddr().String(), ReceiveConfig{Raw: true})
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- got
+	}()
+
+	if _, err := a.WriteTo([]byte{1, 2, 3}, b.LocalAddr()); err != nil {
+		t.Fatalf("WriteTo() error = %v", err)
+	}
+	expectProbeTimeout(t, a, 100*time.Millisecond)
+
+	establishReceiveSession(t, a, b.LocalAddr(), testRunID(13))
+	writeProbePacket(t, a, b.LocalAddr(), Packet{
+		Version: ProtocolVersion,
+		Type:    PacketTypeData,
+		RunID:   testRunID(13),
+		Seq:     0,
+		Payload: []byte("ok"),
+	})
+	_ = readProbePacket(t, a, 500*time.Millisecond)
+	writeProbePacket(t, a, b.LocalAddr(), Packet{
+		Version: ProtocolVersion,
+		Type:    PacketTypeDone,
+		RunID:   testRunID(13),
+		Seq:     1,
+	})
+	_ = readProbePacket(t, a, 500*time.Millisecond)
+
+	select {
+	case err := <-errs:
+		t.Fatalf("Receive() error = %v", err)
+	case got := <-done:
+		if !bytes.Equal(got, []byte("ok")) {
+			t.Fatalf("payload = %q, want %q", got, []byte("ok"))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for receive: %v", ctx.Err())
+	}
+}
+
+func TestSendIgnoresMalformedPacketDuringHandshake(t *testing.T) {
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64<<10)
+		var runID [16]byte
+		for {
+			if err := b.SetReadDeadline(time.Now().Add(10 * time.Millisecond)); err != nil {
+				done <- err
+				return
+			}
+			n, addr, err := b.ReadFrom(buf)
+			if err != nil {
+				if ctx.Err() != nil {
+					done <- nil
+					return
+				}
+				var netErr net.Error
+				if errors.As(err, &netErr) && netErr.Timeout() {
+					continue
+				}
+				done <- err
+				return
+			}
+			packet, err := UnmarshalPacket(buf[:n], nil)
+			if err != nil {
+				done <- err
+				return
+			}
+			if packet.Type == PacketTypeHello {
+				runID = packet.RunID
+				if _, err := b.WriteTo([]byte{1, 2, 3}, addr); err != nil {
+					done <- err
+					return
+				}
+				writeProbePacket(t, b, addr, Packet{
+					Version: ProtocolVersion,
+					Type:    PacketTypeHelloAck,
+					RunID:   runID,
+				})
+				continue
+			}
+			if packet.RunID != runID {
+				continue
+			}
+			switch packet.Type {
+			case PacketTypeData, PacketTypeDone:
+				writeProbePacket(t, b, addr, Packet{
+					Version:  ProtocolVersion,
+					Type:     PacketTypeAck,
+					RunID:    runID,
+					AckFloor: packet.Seq + 1,
+				})
+				if packet.Type == PacketTypeDone {
+					done <- nil
+					return
+				}
+			}
+		}
+	}()
+
+	if _, err := Send(ctx, a, b.LocalAddr().String(), bytes.NewReader([]byte("ok")), SendConfig{Raw: true, ChunkSize: 1200, WindowSize: 1}); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("peer loop error = %v", err)
+	}
+}
+
+func TestReceivePinsPeerAfterHello(t *testing.T) {
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	intruder, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer intruder.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan []byte, 1)
+	errs := make(chan error, 1)
+	go func() {
+		got, err := Receive(ctx, b, "", ReceiveConfig{Raw: true})
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- got
+	}()
+
+	runID := testRunID(14)
+	establishReceiveSession(t, a, b.LocalAddr(), runID)
+
+	writeProbePacket(t, intruder, b.LocalAddr(), Packet{
+		Version: ProtocolVersion,
+		Type:    PacketTypeData,
+		RunID:   runID,
+		Seq:     0,
+		Payload: []byte("bad"),
+	})
+	expectProbeTimeout(t, intruder, 100*time.Millisecond)
+
+	writeProbePacket(t, a, b.LocalAddr(), Packet{
+		Version: ProtocolVersion,
+		Type:    PacketTypeData,
+		RunID:   runID,
+		Seq:     0,
+		Payload: []byte("good"),
+	})
+	_ = readProbePacket(t, a, 500*time.Millisecond)
+	writeProbePacket(t, a, b.LocalAddr(), Packet{
+		Version: ProtocolVersion,
+		Type:    PacketTypeDone,
+		RunID:   runID,
+		Seq:     1,
+	})
+	_ = readProbePacket(t, a, 500*time.Millisecond)
+
+	select {
+	case err := <-errs:
+		t.Fatalf("Receive() error = %v", err)
+	case got := <-done:
+		if !bytes.Equal(got, []byte("good")) {
+			t.Fatalf("payload = %q, want %q", got, []byte("good"))
 		}
 	case <-ctx.Done():
 		t.Fatalf("timed out waiting for receive: %v", ctx.Err())

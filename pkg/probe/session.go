@@ -121,12 +121,15 @@ func Send(ctx context.Context, conn net.PacketConn, remoteAddr string, src io.Re
 
 		packet, err := UnmarshalPacket(buf[:n], nil)
 		if err != nil {
-			return TransferStats{}, err
+			continue
 		}
 		if packet.Type != PacketTypeAck {
 			continue
 		}
 		if packet.RunID != state.runID {
+			continue
+		}
+		if !ackIsPlausible(state.nextSeq, packet.AckFloor, packet.AckMask) {
 			continue
 		}
 
@@ -187,7 +190,7 @@ func ReceiveToWriter(ctx context.Context, conn net.PacketConn, remoteAddr string
 
 		packet, err := UnmarshalPacket(buf[:n], nil)
 		if err != nil {
-			return TransferStats{}, err
+			continue
 		}
 		if isZeroRunID(packet.RunID) {
 			continue
@@ -198,6 +201,9 @@ func ReceiveToWriter(ctx context.Context, conn net.PacketConn, remoteAddr string
 			}
 			runID = packet.RunID
 			runIDSet = true
+			if peer == nil {
+				peer = cloneAddr(addr)
+			}
 			if err := sendHelloAck(ctx, conn, addr, runID); err != nil {
 				return TransferStats{}, err
 			}
@@ -306,7 +312,7 @@ func performHelloHandshake(ctx context.Context, conn net.PacketConn, peer net.Ad
 		}
 		packet, err := UnmarshalPacket(buf[:n], nil)
 		if err != nil {
-			return err
+			continue
 		}
 		if packet.Type != PacketTypeHelloAck || packet.RunID != runID {
 			continue
@@ -583,6 +589,38 @@ func waitZeroReadRetry(ctx context.Context, zeroReads int) error {
 		return ctx.Err()
 	case <-timer.C:
 		return nil
+	}
+}
+
+func ackIsPlausible(nextSeq, ackFloor, ackMask uint64) bool {
+	if ackFloor > nextSeq {
+		return false
+	}
+	for bit := 0; bit < maxAckMaskBits; bit++ {
+		if ackMask&(uint64(1)<<bit) == 0 {
+			continue
+		}
+		seq := ackFloor + uint64(bit) + 1
+		if seq >= nextSeq {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneAddr(addr net.Addr) net.Addr {
+	if addr == nil {
+		return nil
+	}
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		cp := *a
+		if a.IP != nil {
+			cp.IP = append([]byte(nil), a.IP...)
+		}
+		return &cp
+	default:
+		return addr
 	}
 }
 
