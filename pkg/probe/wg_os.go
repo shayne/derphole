@@ -137,6 +137,7 @@ func ReceiveWireGuardOSToWriter(ctx context.Context, conn net.PacketConn, dst io
 	defer tcpConn.Close()
 
 	buf := make([]byte, 128<<10)
+	ackSent := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return TransferStats{}, err
@@ -156,10 +157,21 @@ func ReceiveWireGuardOSToWriter(ctx context.Context, conn net.PacketConn, dst io
 			if written != n {
 				return TransferStats{}, io.ErrShortWrite
 			}
+			if !ackSent && cfg.SizeBytes > 0 && stats.BytesReceived >= cfg.SizeBytes {
+				if _, err := tcpConn.Write(wireGuardDrainAck); err != nil {
+					return TransferStats{}, err
+				}
+				ackSent = true
+			}
 		}
 		if readErr == io.EOF {
-			if _, err := tcpConn.Write(wireGuardDrainAck); err != nil {
-				return TransferStats{}, err
+			if cfg.SizeBytes > 0 && stats.BytesReceived < cfg.SizeBytes {
+				return TransferStats{}, io.ErrUnexpectedEOF
+			}
+			if !ackSent {
+				if _, err := tcpConn.Write(wireGuardDrainAck); err != nil {
+					return TransferStats{}, err
+				}
 			}
 			stats.CompletedAt = time.Now()
 			return stats, nil

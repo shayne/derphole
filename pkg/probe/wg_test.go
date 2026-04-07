@@ -241,11 +241,15 @@ func testWireGuardTransfer(t *testing.T, transport string) {
 		}
 		defer tcpConn.Close()
 
-		if _, err := io.Copy(&dst, tcpConn); err != nil {
+		if _, err := io.CopyN(&dst, tcpConn, int64(len(payload))); err != nil {
 			serverDone <- err
 			return
 		}
 		if _, err := tcpConn.Write(wireGuardDrainAck); err != nil {
+			serverDone <- err
+			return
+		}
+		if _, err := io.Copy(io.Discard, tcpConn); err != nil {
 			serverDone <- err
 			return
 		}
@@ -270,6 +274,7 @@ func testWireGuardTransfer(t *testing.T, transport string) {
 		PeerAddr:       plan.listenerAddr.String(),
 		DirectEndpoint: serverConn.LocalAddr().String(),
 		Port:           uint16(plan.port),
+		SizeBytes:      int64(len(payload)),
 	}); err != nil {
 		t.Fatalf("SendWireGuard() error = %v", err)
 	}

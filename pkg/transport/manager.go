@@ -184,30 +184,37 @@ func (m *Manager) PathState() Path {
 func (m *Manager) DirectPath() (string, bool) {
 	now := m.now()
 	m.mu.Lock()
-	m.demoteStaleDirectLocked(now)
+	demoted := m.demoteStaleDirectLocked(now)
 	endpoint, active := m.state.directPath()
 	m.mu.Unlock()
+	if demoted {
+		m.requestDiscovery(context.Background(), true)
+	}
 	return endpoint, active
 }
 
 func (m *Manager) DirectAddr() (net.Addr, bool) {
 	now := m.now()
 	m.mu.Lock()
-	m.demoteStaleDirectLocked(now)
+	demoted := m.demoteStaleDirectLocked(now)
 	endpoint, active := m.state.directPath()
 	addr := m.state.endpoints[endpoint]
 	m.mu.Unlock()
+	if demoted {
+		m.requestDiscovery(context.Background(), true)
+	}
 	return addr, active && addr != nil
 }
 
-func (m *Manager) demoteStaleDirectLocked(now time.Time) {
+func (m *Manager) demoteStaleDirectLocked(now time.Time) bool {
 	if m.state.current != PathDirect || !m.state.directIsStale(now, m.directStaleTimeout()) {
-		return
+		return false
 	}
 	m.discoveryGen++
 	if m.state.noteRelay(now) {
 		m.signalStateChangeLocked()
 	}
+	return true
 }
 
 func (m *Manager) now() time.Time {

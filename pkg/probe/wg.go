@@ -210,6 +210,7 @@ func ReceiveWireGuardToWriter(ctx context.Context, conn net.PacketConn, dst io.W
 	defer tcpConn.Close()
 
 	buf := make([]byte, 128<<10)
+	ackSent := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return TransferStats{}, err
@@ -229,11 +230,24 @@ func ReceiveWireGuardToWriter(ctx context.Context, conn net.PacketConn, dst io.W
 			if written != n {
 				return TransferStats{}, io.ErrShortWrite
 			}
+			if !ackSent && cfg.SizeBytes > 0 && stats.BytesReceived >= cfg.SizeBytes {
+				if _, err := tcpConn.Write(wireGuardDrainAck); err != nil {
+					probeWGTracef("recv single target ack write error=%v received=%d", err, stats.BytesReceived)
+					return TransferStats{}, err
+				}
+				probeWGTracef("recv single reached target received=%d", stats.BytesReceived)
+				ackSent = true
+			}
 		}
 		if readErr == io.EOF {
-			if _, err := tcpConn.Write(wireGuardDrainAck); err != nil {
-				probeWGTracef("recv single ack write error=%v received=%d", err, stats.BytesReceived)
-				return TransferStats{}, err
+			if cfg.SizeBytes > 0 && stats.BytesReceived < cfg.SizeBytes {
+				return TransferStats{}, io.ErrUnexpectedEOF
+			}
+			if !ackSent {
+				if _, err := tcpConn.Write(wireGuardDrainAck); err != nil {
+					probeWGTracef("recv single ack write error=%v received=%d", err, stats.BytesReceived)
+					return TransferStats{}, err
+				}
 			}
 			probeWGTracef("recv single done received=%d", stats.BytesReceived)
 			stats.CompletedAt = time.Now()
