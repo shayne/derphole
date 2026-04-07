@@ -47,6 +47,19 @@ func TestDERPPublicKeyRaw32RoundTrip(t *testing.T) {
 	}
 }
 
+func TestDirectUDPReadyAckPayloadIsControl(t *testing.T) {
+	payload, err := json.Marshal(envelope{Type: envelopeDirectUDPReadyAck})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isDirectUDPReadyAckPayload(payload) {
+		t.Fatalf("isDirectUDPReadyAckPayload(%s) = false, want true", payload)
+	}
+	if isTransportDataPayload(payload) {
+		t.Fatalf("isTransportDataPayload(%s) = true, want false for direct UDP ready ack", payload)
+	}
+}
+
 func TestRelayOnlyStdioRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -621,21 +634,7 @@ func TestShareOpenExternalCanUpgradeAfterRelayStartAndServeConnections(t *testin
 	}
 }
 
-func TestExternalListenSendCanUpgradeAfterRelayStart(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	result := runExternalRoundTrip(t, roundTripConfig{
-		payload: []byte("upgrade-me"),
-	})
-
-	if !result.SeenRelay || !result.SeenDirect {
-		t.Fatalf("SeenRelay=%v SeenDirect=%v listener=%q sender=%q", result.SeenRelay, result.SeenDirect, result.ListenerStatus, result.SenderStatus)
-	}
-	if got := result.Output; got != "upgrade-me" {
-		t.Fatalf("output = %q, want %q", got, "upgrade-me")
-	}
-}
-
-func TestExternalListenSendUsesRelayWGWhenDirectNeverBecomesReady(t *testing.T) {
+func TestExternalListenSendUsesRelayUDPWhenDirectNeverBecomesReady(t *testing.T) {
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
 
@@ -698,11 +697,11 @@ func TestExternalListenSendUsesRelayWGWhenDirectNeverBecomesReady(t *testing.T) 
 	if got := listenerOut.String(); got != "native-direct" {
 		t.Fatalf("listener output = %q, want %q", got, "native-direct")
 	}
-	if got := senderStatus.String(); !strings.Contains(got, string(StateRelay)) || !strings.Contains(got, "wg-stripes=4") || strings.Contains(got, string(StateDirect)) {
-		t.Fatalf("sender status = %q, want relay WG without direct promotion", got)
+	if got := senderStatus.String(); !strings.Contains(got, string(StateRelay)) || !strings.Contains(got, "udp-relay=true") || strings.Contains(got, string(StateDirect)) {
+		t.Fatalf("sender status = %q, want relay UDP without direct promotion", got)
 	}
-	if got := listenerStatus.String(); !strings.Contains(got, string(StateRelay)) || !strings.Contains(got, "wg-stripes=4") || strings.Contains(got, string(StateDirect)) {
-		t.Fatalf("listener status = %q, want relay WG without direct promotion", got)
+	if got := listenerStatus.String(); !strings.Contains(got, string(StateRelay)) || !strings.Contains(got, "udp-relay=true") || strings.Contains(got, string(StateDirect)) {
+		t.Fatalf("listener status = %q, want relay UDP without direct promotion", got)
 	}
 }
 
@@ -827,7 +826,7 @@ func TestExternalListenSendSmallRelayPayloadDoesNotStallWhenSenderSkipsNativeQUI
 	}
 }
 
-func TestExternalListenSendPromotesToDirectWGWhenBothSidesAreDirectReady(t *testing.T) {
+func TestExternalListenSendPromotesToDirectUDPWhenBothSidesAreDirectReady(t *testing.T) {
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
 
@@ -884,11 +883,11 @@ func TestExternalListenSendPromotesToDirectWGWhenBothSidesAreDirectReady(t *test
 		gateCtx, gateCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer gateCancel()
 		if err := waitForSessionTestStatusContains(gateCtx, &senderStatus, string(StateDirect)); err != nil {
-			writerErr <- fmt.Errorf("waiting for sender direct WG promotion: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+			writerErr <- fmt.Errorf("waiting for sender direct UDP promotion: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
 			return
 		}
 		if err := waitForSessionTestStatusContains(gateCtx, &listenerStatus, string(StateDirect)); err != nil {
-			writerErr <- fmt.Errorf("waiting for listener direct WG promotion: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+			writerErr <- fmt.Errorf("waiting for listener direct UDP promotion: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
 			return
 		}
 
@@ -919,15 +918,15 @@ func TestExternalListenSendPromotesToDirectWGWhenBothSidesAreDirectReady(t *test
 	if !bytes.Equal(listenerOut.Bytes(), payload) {
 		t.Fatalf("listener output length = %d, want %d", listenerOut.Len(), len(payload))
 	}
-	if got := senderStatus.String(); !strings.Contains(got, string(StateDirect)) || strings.Contains(got, "sender-tcp-direct") {
-		t.Fatalf("sender status = %q, want direct WG promotion", got)
+	if got := senderStatus.String(); !strings.Contains(got, string(StateDirect)) || !strings.Contains(got, "udp-blast=true") || !strings.Contains(got, "udp-repair-payloads=true") || !strings.Contains(got, "udp-fec-group-size=0") || strings.Contains(got, "sender-tcp-direct") {
+		t.Fatalf("sender status = %q, want direct UDP promotion", got)
 	}
-	if got := listenerStatus.String(); !strings.Contains(got, string(StateDirect)) || strings.Contains(got, "listener-tcp-direct") {
-		t.Fatalf("listener status = %q, want direct WG promotion", got)
+	if got := listenerStatus.String(); !strings.Contains(got, string(StateDirect)) || !strings.Contains(got, "udp-blast=true") || !strings.Contains(got, "udp-fec-group-size=0") || strings.Contains(got, "listener-tcp-direct") {
+		t.Fatalf("listener status = %q, want direct UDP promotion", got)
 	}
 }
 
-func TestExternalListenSendDirectWGPromotionDoesNotEmitRelayRegression(t *testing.T) {
+func TestExternalListenSendDirectUDPPromotionDoesNotEmitRelayRegression(t *testing.T) {
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
 
@@ -984,11 +983,11 @@ func TestExternalListenSendDirectWGPromotionDoesNotEmitRelayRegression(t *testin
 		gateCtx, gateCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer gateCancel()
 		if err := waitForSessionTestStatusContains(gateCtx, &senderStatus, string(StateDirect)); err != nil {
-			writerErr <- fmt.Errorf("waiting for sender direct WG promotion: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+			writerErr <- fmt.Errorf("waiting for sender direct UDP promotion: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
 			return
 		}
 		if err := waitForSessionTestStatusContains(gateCtx, &listenerStatus, string(StateDirect)); err != nil {
-			writerErr <- fmt.Errorf("waiting for listener direct WG promotion: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+			writerErr <- fmt.Errorf("waiting for listener direct UDP promotion: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
 			return
 		}
 
@@ -1028,7 +1027,7 @@ func TestExternalListenSendDirectWGPromotionDoesNotEmitRelayRegression(t *testin
 	}
 }
 
-func TestExternalListenSendUsesRequestedParallelPolicyForWG(t *testing.T) {
+func TestExternalListenSendIgnoresLegacyParallelPolicyForDirectUDP(t *testing.T) {
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
 
@@ -1085,9 +1084,9 @@ func TestExternalListenSendUsesRequestedParallelPolicyForWG(t *testing.T) {
 			status *syncBuffer
 			needle string
 		}{
-			{status: &senderStatus, needle: "wg-stripes=8"},
+			{status: &senderStatus, needle: "udp-blast=true"},
 			{status: &senderStatus, needle: string(StateDirect)},
-			{status: &listenerStatus, needle: "wg-stripes=8"},
+			{status: &listenerStatus, needle: "udp-blast=true"},
 			{status: &listenerStatus, needle: string(StateDirect)},
 		} {
 			if err := waitForSessionTestStatusContains(ctx, wait.status, wait.needle); err != nil {
@@ -1121,15 +1120,15 @@ func TestExternalListenSendUsesRequestedParallelPolicyForWG(t *testing.T) {
 	if !bytes.Equal(listenerOut.Bytes(), payload) {
 		t.Fatalf("listener output length = %d, want %d", listenerOut.Len(), len(payload))
 	}
-	if got := senderStatus.String(); !strings.Contains(got, "wg-stripes=8") {
-		t.Fatalf("sender status = %q, want wg-stripes=8", got)
+	if got := senderStatus.String(); !strings.Contains(got, "udp-blast=true") {
+		t.Fatalf("sender status = %q, want udp-blast=true", got)
 	}
-	if got := listenerStatus.String(); !strings.Contains(got, "wg-stripes=8") {
-		t.Fatalf("listener status = %q, want wg-stripes=8", got)
+	if got := listenerStatus.String(); !strings.Contains(got, "udp-blast=true") {
+		t.Fatalf("listener status = %q, want udp-blast=true", got)
 	}
 }
 
-func TestExternalListenSendCompletesWhenDirectWGSetupOverlapsTransfer(t *testing.T) {
+func TestExternalListenSendCompletesWhenDirectUDPSetupOverlapsTransfer(t *testing.T) {
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
 	t.Setenv("DERPCAT_NATIVE_QUIC_CONNS", "4")
@@ -1226,7 +1225,7 @@ func TestExternalListenSendCompletesWhenDirectWGSetupOverlapsTransfer(t *testing
 	}
 
 	if elapsed := time.Since(start); elapsed >= 7500*time.Millisecond {
-		t.Fatalf("Send() elapsed = %v, want completion before context deadline while direct WG setup overlaps transfer; listener=%q sender=%q", elapsed, listenerStatus.String(), senderStatus.String())
+		t.Fatalf("Send() elapsed = %v, want completion before context deadline while direct UDP setup overlaps transfer; listener=%q sender=%q", elapsed, listenerStatus.String(), senderStatus.String())
 	}
 
 	if got := listenerOut.Len(); got != len(payloadChunk)*chunkCount {
@@ -1249,7 +1248,7 @@ func waitForSessionTestStatusContains(ctx context.Context, status *syncBuffer, n
 	}
 }
 
-func TestExternalListenSendUsesDirectWGEvenWhenNativeTCPWouldBeAllowed(t *testing.T) {
+func TestExternalListenSendUsesDirectUDPEvenWhenNativeTCPWouldBeAllowed(t *testing.T) {
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
 
@@ -1329,15 +1328,15 @@ func TestExternalListenSendUsesDirectWGEvenWhenNativeTCPWouldBeAllowed(t *testin
 	if !bytes.Equal(listenerOut.Bytes(), payload) {
 		t.Fatalf("listener output length = %d, want %d", listenerOut.Len(), len(payload))
 	}
-	if got := senderStatus.String(); !strings.Contains(got, string(StateDirect)) || strings.Contains(got, "sender-tcp-direct") {
-		t.Fatalf("sender status = %q, want direct WG without native TCP direct", got)
+	if got := senderStatus.String(); !strings.Contains(got, string(StateDirect)) || !strings.Contains(got, "udp-blast=true") || strings.Contains(got, "sender-tcp-direct") {
+		t.Fatalf("sender status = %q, want direct UDP without native TCP direct", got)
 	}
-	if got := listenerStatus.String(); !strings.Contains(got, string(StateDirect)) || strings.Contains(got, "listener-tcp-direct") {
-		t.Fatalf("listener status = %q, want direct WG without native TCP direct", got)
+	if got := listenerStatus.String(); !strings.Contains(got, string(StateDirect)) || !strings.Contains(got, "udp-blast=true") || strings.Contains(got, "listener-tcp-direct") {
+		t.Fatalf("listener status = %q, want direct UDP without native TCP direct", got)
 	}
 }
 
-func TestExternalListenSendUsesRequestedParallelPolicyForDirectWG(t *testing.T) {
+func TestExternalListenSendIgnoresRequestedParallelPolicyForDirectUDP(t *testing.T) {
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
 	prevTCPAddrAllowed := externalNativeTCPAddrAllowed
@@ -1393,9 +1392,9 @@ func TestExternalListenSendUsesRequestedParallelPolicyForDirectWG(t *testing.T) 
 			status *syncBuffer
 			needle string
 		}{
-			{status: &senderStatus, needle: "wg-stripes=4"},
+			{status: &senderStatus, needle: "udp-blast=true"},
 			{status: &senderStatus, needle: string(StateDirect)},
-			{status: &listenerStatus, needle: "wg-stripes=4"},
+			{status: &listenerStatus, needle: "udp-blast=true"},
 			{status: &listenerStatus, needle: string(StateDirect)},
 		} {
 			if err := waitForSessionTestStatusContains(ctx, wait.status, wait.needle); err != nil {
@@ -1430,17 +1429,17 @@ func TestExternalListenSendUsesRequestedParallelPolicyForDirectWG(t *testing.T) 
 	if !bytes.Equal(listenerOut.Bytes(), payload) {
 		t.Fatalf("listener output length = %d, want %d", listenerOut.Len(), len(payload))
 	}
-	if got := senderStatus.String(); !strings.Contains(got, "wg-stripes=4") {
-		t.Fatalf("sender status = %q, want wg-stripes=4", got)
+	if got := senderStatus.String(); !strings.Contains(got, "udp-blast=true") {
+		t.Fatalf("sender status = %q, want udp-blast=true", got)
 	}
-	if got := listenerStatus.String(); !strings.Contains(got, "wg-stripes=4") {
-		t.Fatalf("listener status = %q, want wg-stripes=4", got)
+	if got := listenerStatus.String(); !strings.Contains(got, "udp-blast=true") {
+		t.Fatalf("listener status = %q, want udp-blast=true", got)
 	}
 }
 
-func TestExternalListenSendUsesRelayWGWhenDirectPromotionIsTooLate(t *testing.T) {
+func TestExternalListenSendUsesRelayUDPWhenDirectPromotionIsTooLate(t *testing.T) {
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(3*time.Second).UnixNano(), 10))
+	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(externalDirectUDPWait+time.Second).UnixNano(), 10))
 
 	prevTCPAddrAllowed := externalNativeTCPAddrAllowed
 	externalNativeTCPAddrAllowed = func(net.Addr) bool { return false }
@@ -1490,11 +1489,11 @@ func TestExternalListenSendUsesRelayWGWhenDirectPromotionIsTooLate(t *testing.T)
 	if got := listenerOut.String(); got != "delayed-native-direct" {
 		t.Fatalf("listener output = %q, want %q", got, "delayed-native-direct")
 	}
-	if got := senderStatus.String(); !strings.Contains(got, string(StateRelay)) || !strings.Contains(got, "wg-stripes=4") || strings.Contains(got, string(StateDirect)) {
-		t.Fatalf("sender status = %q, want relay WG without direct promotion", got)
+	if got := senderStatus.String(); !strings.Contains(got, string(StateRelay)) || !strings.Contains(got, "udp-relay=true") || strings.Contains(got, string(StateDirect)) {
+		t.Fatalf("sender status = %q, want relay UDP without direct promotion", got)
 	}
-	if got := listenerStatus.String(); !strings.Contains(got, string(StateRelay)) || !strings.Contains(got, "wg-stripes=4") || strings.Contains(got, string(StateDirect)) {
-		t.Fatalf("listener status = %q, want relay WG without direct promotion", got)
+	if got := listenerStatus.String(); !strings.Contains(got, string(StateRelay)) || !strings.Contains(got, "udp-relay=true") || strings.Contains(got, string(StateDirect)) {
+		t.Fatalf("listener status = %q, want relay UDP without direct promotion", got)
 	}
 }
 
@@ -2831,21 +2830,9 @@ func TestSeedAcceptedClaimCandidatesUsesClaimCandidates(t *testing.T) {
 	}
 }
 
-type roundTripConfig struct {
-	payload []byte
-}
-
 type shareOpenRoundTripConfig struct {
 	relayPayload    string
 	upgradePayloads []string
-}
-
-type roundTripResult struct {
-	Output         string
-	ListenerStatus string
-	SenderStatus   string
-	SeenRelay      bool
-	SeenDirect     bool
 }
 
 type shareOpenRoundTripResult struct {
@@ -2877,109 +2864,6 @@ func (c *stubPacketConn) SetWriteDeadline(time.Time) error       { return nil }
 func (c *captureCandidateSeeder) SeedRemoteCandidates(_ context.Context, candidates []net.Addr) {
 	c.calls++
 	c.candidates = append([]net.Addr(nil), candidates...)
-}
-
-func runExternalRoundTrip(t *testing.T, cfg roundTripConfig) roundTripResult {
-	t.Helper()
-
-	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	timeout := time.After(40 * time.Second)
-
-	var listenerOut bytes.Buffer
-	var listenerStatus syncBuffer
-	var senderStatus syncBuffer
-
-	tokenSink := make(chan string, 1)
-	listenErr := make(chan error, 1)
-	go func() {
-		_, err := Listen(ctx, ListenConfig{
-			Emitter:       telemetry.New(&listenerStatus, telemetry.LevelDefault),
-			TokenSink:     tokenSink,
-			StdioOut:      &listenerOut,
-			UsePublicDERP: true,
-		})
-		listenErr <- err
-	}()
-
-	token := <-tokenSink
-	releaseEOF := make(chan struct{})
-	sendErr := make(chan error, 1)
-	go func() {
-		sendErr <- Send(ctx, SendConfig{
-			Token:         token,
-			Emitter:       telemetry.New(&senderStatus, telemetry.LevelDefault),
-			StdioIn:       &sessionDirectGateReader{ctx: ctx, payload: cfg.payload, releaseEOF: releaseEOF},
-			UsePublicDERP: true,
-		})
-	}()
-
-	waitForStatusPrefixBuffer(t, &listenerStatus, 20*time.Second, "waiting-for-claim", "connected-relay")
-	waitForStatusPrefixBuffer(t, &senderStatus, 20*time.Second, "probing-direct", "connected-relay")
-	if err := os.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0"); err != nil {
-		t.Fatalf("Setenv(enable direct) error = %v", err)
-	}
-	waitForStatusPrefixBuffer(t, &listenerStatus, 20*time.Second, "waiting-for-claim", "connected-relay", "connected-direct")
-	waitForStatusPrefixBuffer(t, &senderStatus, 20*time.Second, "probing-direct", "connected-relay", "connected-direct")
-	close(releaseEOF)
-
-	select {
-	case err := <-listenErr:
-		if err != nil {
-			t.Fatalf("Listen() error = %v", err)
-		}
-	case <-timeout:
-		cancel()
-		t.Fatalf("timed out waiting for Listen(); listener=%q sender=%q", listenerStatus.String(), senderStatus.String())
-	}
-
-	sendGrace := time.NewTimer(2*externalNativeQUICWait + externalNativeQUICSetupGraceWait + time.Second)
-	defer sendGrace.Stop()
-	select {
-	case err := <-sendErr:
-		if err != nil {
-			t.Fatalf("Send() error = %v", err)
-		}
-	case <-sendGrace.C:
-		select {
-		case err := <-sendErr:
-			if err != nil {
-				t.Fatalf("Send() error = %v", err)
-			}
-			return roundTripResult{
-				Output:         listenerOut.String(),
-				ListenerStatus: listenerStatus.String(),
-				SenderStatus:   senderStatus.String(),
-				SeenRelay:      strings.Contains(listenerStatus.String(), string(StateRelay)) && strings.Contains(senderStatus.String(), string(StateRelay)),
-				SeenDirect:     strings.Contains(listenerStatus.String(), string(StateDirect)) && strings.Contains(senderStatus.String(), string(StateDirect)),
-			}
-		default:
-		}
-		cancel()
-		err := <-sendErr
-		t.Fatalf(
-			"Send() did not exit after listener completion within %v; error after forced cleanup = %v; listener=%q sender=%q",
-			2*externalNativeQUICWait+externalNativeQUICSetupGraceWait+time.Second,
-			err,
-			listenerStatus.String(),
-			senderStatus.String(),
-		)
-	}
-
-	listenerStatuses := listenerStatus.String()
-	senderStatuses := senderStatus.String()
-	return roundTripResult{
-		Output:         listenerOut.String(),
-		ListenerStatus: listenerStatuses,
-		SenderStatus:   senderStatuses,
-		SeenRelay:      strings.Contains(listenerStatuses, string(StateRelay)) && strings.Contains(senderStatuses, string(StateRelay)),
-		SeenDirect:     strings.Contains(listenerStatuses, string(StateDirect)) && strings.Contains(senderStatuses, string(StateDirect)),
-	}
 }
 
 func runExternalShareOpenSession(t *testing.T, cfg shareOpenRoundTripConfig) shareOpenRoundTripResult {
@@ -3094,26 +2978,6 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
-}
-
-type sessionDirectGateReader struct {
-	ctx        context.Context
-	payload    []byte
-	releaseEOF <-chan struct{}
-	sent       bool
-}
-
-func (r *sessionDirectGateReader) Read(p []byte) (int, error) {
-	if !r.sent {
-		r.sent = true
-		return copy(p, r.payload), nil
-	}
-	select {
-	case <-r.releaseEOF:
-		return 0, io.EOF
-	case <-r.ctx.Done():
-		return 0, r.ctx.Err()
-	}
 }
 
 func waitForStatusPrefixBuffer(t *testing.T, buf interface{ String() string }, timeout time.Duration, want ...string) {
@@ -3307,5 +3171,130 @@ func waitNoErr(t *testing.T, err error) {
 	t.Helper()
 	if err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestExternalDirectUDPDedupeAndFillKeepsManagerAddr(t *testing.T) {
+	selected := []string{
+		"68.20.14.192:50001",
+		"10.0.1.254:50001",
+		"68.20.14.192:50003",
+		"",
+	}
+	fallback := []string{
+		"10.0.1.254:50001",
+		"10.0.1.254:50002",
+		"10.0.1.254:50003",
+		"10.0.1.254:50004",
+	}
+
+	got := externalDirectUDPDedupeAndFill(selected, fallback)
+	want := []string{
+		"68.20.14.192:50001",
+		"10.0.1.254:50002",
+		"68.20.14.192:50003",
+		"10.0.1.254:50004",
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("externalDirectUDPDedupeAndFill() = %v, want %v", got, want)
+	}
+}
+
+func TestExternalDirectUDPParallelCandidatesPreferWANForSameEndpoint(t *testing.T) {
+	candidates := []net.Addr{
+		&net.UDPAddr{IP: net.IPv4(10, 0, 1, 254), Port: 50001},
+		&net.UDPAddr{IP: net.IPv4(108, 18, 210, 19), Port: 50001},
+		&net.UDPAddr{IP: net.IPv4(10, 0, 1, 254), Port: 50002},
+		&net.UDPAddr{IP: net.IPv4(108, 18, 210, 19), Port: 50002},
+	}
+
+	got := externalDirectUDPParallelCandidateStrings(candidates, 2)
+	want := []string{"108.18.210.19:50001", "108.18.210.19:50002"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("externalDirectUDPParallelCandidateStrings() = %v, want %v", got, want)
+	}
+}
+
+func TestExternalDirectUDPParallelCandidatesPreserveWANLaneOrder(t *testing.T) {
+	candidates := []net.Addr{
+		&net.UDPAddr{IP: net.IPv4(108, 18, 210, 19), Port: 54908},
+		&net.UDPAddr{IP: net.IPv4(108, 18, 210, 19), Port: 51051},
+		&net.UDPAddr{IP: net.IPv4(108, 18, 210, 19), Port: 63793},
+		&net.UDPAddr{IP: net.IPv4(108, 18, 210, 19), Port: 49808},
+	}
+
+	got := externalDirectUDPParallelCandidateStrings(candidates, 4)
+	want := []string{
+		"108.18.210.19:54908",
+		"108.18.210.19:51051",
+		"108.18.210.19:63793",
+		"108.18.210.19:49808",
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("externalDirectUDPParallelCandidateStrings() = %v, want %v", got, want)
+	}
+}
+
+func TestExternalDirectUDPSelectRemoteAddrsByConnKeepsFallbackLaneEndpoint(t *testing.T) {
+	fallback := []string{
+		"68.20.14.192:38183",
+		"68.20.14.192:34375",
+		"68.20.14.192:44442",
+		"68.20.14.192:40282",
+	}
+	observedByConn := [][]net.Addr{
+		{&net.UDPAddr{IP: net.IPv4(68, 20, 14, 192), Port: 38183}},
+		{&net.UDPAddr{IP: net.IPv4(68, 20, 14, 192), Port: 34375}},
+		{
+			&net.UDPAddr{IP: net.IPv4(68, 20, 14, 192), Port: 40282},
+			&net.UDPAddr{IP: net.IPv4(68, 20, 14, 192), Port: 44442},
+		},
+		{
+			&net.UDPAddr{IP: net.IPv4(68, 20, 14, 192), Port: 44442},
+			&net.UDPAddr{IP: net.IPv4(68, 20, 14, 192), Port: 40282},
+		},
+	}
+
+	got := externalDirectUDPSelectRemoteAddrsByConn(observedByConn, fallback, 4)
+	want := []string{
+		"68.20.14.192:38183",
+		"68.20.14.192:34375",
+		"68.20.14.192:40282",
+		"68.20.14.192:44442",
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("externalDirectUDPSelectRemoteAddrsByConn() = %v, want observed reachable endpoints %v", got, want)
+	}
+}
+
+func TestExternalDirectUDPInferWANPerPortForPrivateOnlyLanes(t *testing.T) {
+	sets := [][]string{
+		{"68.20.14.192:50001", "10.0.1.254:50001"},
+		{"10.0.1.254:50002"},
+		{"10.0.1.254:50003"},
+	}
+
+	got := externalDirectUDPInferWANPerPort(sets)
+	want := [][]string{
+		{"68.20.14.192:50001", "10.0.1.254:50001"},
+		{"68.20.14.192:50002", "10.0.1.254:50002"},
+		{"68.20.14.192:50003", "10.0.1.254:50003"},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("externalDirectUDPInferWANPerPort() = %v, want %v", got, want)
+	}
+}
+
+func TestExternalDirectUDPPreferWANStringsFeedsFirstPerLaneCandidate(t *testing.T) {
+	candidates := []string{
+		"10.0.1.254:50001",
+		"10.0.4.184:50001",
+		"68.20.14.192:50001",
+		"127.0.0.1:50001",
+	}
+
+	got := externalDirectUDPPreferWANStrings(candidates)
+	if got[0] != "68.20.14.192:50001" {
+		t.Fatalf("externalDirectUDPPreferWANStrings()[0] = %q, want WAN candidate", got[0])
 	}
 }

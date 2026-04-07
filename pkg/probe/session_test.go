@@ -1,14 +1,20 @@
 package probe
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"math"
 	"net"
+	"net/netip"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -114,6 +120,66 @@ func TestTransferCompletesAcrossLoopback(t *testing.T) {
 	}
 }
 
+func TestStripedRawTransferCompletesAcrossLoopback(t *testing.T) {
+	src := bytes.Repeat([]byte("striped-raw"), 1<<14)
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	done := make(chan []byte, 1)
+	errs := make(chan error, 1)
+	go func() {
+		got, err := Receive(ctx, b, a.LocalAddr().String(), ReceiveConfig{Raw: true})
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- got
+	}()
+
+	stats, err := Send(ctx, a, b.LocalAddr().String(), bytes.NewReader(src), SendConfig{
+		Raw:        true,
+		ChunkSize:  512,
+		WindowSize: 8,
+		Parallel:   4,
+	})
+	if err != nil {
+		select {
+		case recvErr := <-errs:
+			t.Fatalf("Send() error = %v; Receive() error = %v", err, recvErr)
+		case got := <-done:
+			t.Fatalf("Send() error = %v; Receive() completed with %d bytes", err, len(got))
+		default:
+		}
+		t.Fatalf("Send() error = %v", err)
+	}
+	if stats.BytesSent != int64(len(src)) {
+		t.Fatalf("BytesSent = %d, want %d", stats.BytesSent, len(src))
+	}
+
+	select {
+	case err := <-errs:
+		t.Fatalf("Receive() error = %v", err)
+	case got := <-done:
+		if !bytes.Equal(got, src) {
+			t.Fatal("received payload mismatch")
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for striped receive: %v", ctx.Err())
+	}
+}
+
 func TestTransferStatsCaptureFirstByte(t *testing.T) {
 	src := bytes.Repeat([]byte("derpcat"), 1<<12)
 	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
@@ -205,6 +271,9 @@ func TestBlastTransferCompletesAcrossLoopback(t *testing.T) {
 	if sendStats.BytesSent != int64(len(src)) {
 		t.Fatalf("BytesSent = %d, want %d", sendStats.BytesSent, len(src))
 	}
+	if !sendStats.Transport.Connected {
+		t.Fatalf("send transport = %#v, want connected UDP fast path", sendStats.Transport)
+	}
 
 	select {
 	case err := <-errCh:
@@ -215,6 +284,23 @@ func TestBlastTransferCompletesAcrossLoopback(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatalf("timed out waiting for blast receive: %v", ctx.Err())
+	}
+}
+
+func TestUDPAddrPortMatchesPeer(t *testing.T) {
+	addrPort := netip.MustParseAddrPort("203.0.113.10:4242")
+	peer := &net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 4242}
+	if addrPort.Port() != uint16(peer.Port) {
+		t.Fatalf("test setup port = %d, want %d", addrPort.Port(), peer.Port)
+	}
+	if !udpAddrPortMatchesPeer(addrPort, peer) {
+		t.Fatal("udpAddrPortMatchesPeer() = false, want true")
+	}
+	if udpAddrPortMatchesPeer(addrPort, &net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 4243}) {
+		t.Fatal("udpAddrPortMatchesPeer() = true for different port, want false")
+	}
+	if udpAddrPortMatchesPeer(addrPort, &net.UDPAddr{IP: net.ParseIP("203.0.113.11"), Port: 4242}) {
+		t.Fatal("udpAddrPortMatchesPeer() = true for different IP, want false")
 	}
 }
 
@@ -267,6 +353,2325 @@ func TestBlastTransferCompletesWhenFirstDonePacketIsDropped(t *testing.T) {
 	}
 }
 
+func TestReceiveBlastParallelToWriterAggregatesReusePortFlows(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverA, err := ListenPacketReusePort(ctx, "udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverA.Close()
+
+	serverB, err := ListenPacketReusePort(ctx, "udp4", serverA.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverB.Close()
+
+	clientA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientA.Close()
+
+	clientB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientB.Close()
+
+	srcA := bytes.Repeat([]byte("a"), 1<<15)
+	srcB := bytes.Repeat([]byte("b"), 1<<15)
+	total := int64(len(srcA) + len(srcB))
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{serverA, serverB}, io.Discard, ReceiveConfig{Blast: true}, total)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if _, err := Send(ctx, clientA, serverA.LocalAddr().String(), bytes.NewReader(srcA), SendConfig{Blast: true}); err != nil {
+			errCh <- err
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if _, err := Send(ctx, clientB, serverA.LocalAddr().String(), bytes.NewReader(srcB), SendConfig{Blast: true}); err != nil {
+			errCh <- err
+		}
+	}()
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("parallel blast error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != total {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, total)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for parallel blast receive: %v", ctx.Err())
+	}
+}
+
+func TestReceiveBlastParallelToWriterEchoesStripedHelloAckMetadata(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	runID := testRunID(0x5d)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, io.Discard, ReceiveConfig{
+			Blast:         true,
+			ExpectedRunID: runID,
+		}, 0)
+		errCh <- err
+	}()
+
+	writeProbePacket(t, client, server.LocalAddr(), Packet{
+		Version:  ProtocolVersion,
+		Type:     PacketTypeHello,
+		StripeID: 3,
+		RunID:    runID,
+		Seq:      4,
+	})
+	packet := readProbePacket(t, client, 500*time.Millisecond)
+	if packet.Type != PacketTypeHelloAck {
+		t.Fatalf("packet type = %v, want HELLO_ACK", packet.Type)
+	}
+	if packet.RunID != runID {
+		t.Fatalf("packet RunID = %x, want %x", packet.RunID, runID)
+	}
+	if packet.StripeID != 3 {
+		t.Fatalf("packet StripeID = %d, want 3", packet.StripeID)
+	}
+	if packet.Seq != 4 {
+		t.Fatalf("packet Seq = %d, want total stripes 4", packet.Seq)
+	}
+
+	cancel()
+	select {
+	case <-errCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for receiver to stop")
+	}
+}
+
+func TestBlastParallelStreamPreservesOrderAcrossLoopback(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverA.Close()
+
+	serverB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverB.Close()
+
+	clientA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientA.Close()
+
+	clientB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientB.Close()
+
+	src := bytes.Repeat([]byte("ordered-parallel-blast-"), 1<<13)
+	var got bytes.Buffer
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 2)
+	runID := testRunID(0xa7)
+	go func() {
+		stats, err := ReceiveBlastStreamParallelToWriter(ctx, []net.PacketConn{serverA, serverB}, &got, ReceiveConfig{
+			Blast:           true,
+			ExpectedRunID:   runID,
+			RequireComplete: true,
+		}, 0)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	sendStats, err := SendBlastParallel(ctx, []net.PacketConn{clientA, clientB}, []string{serverA.LocalAddr().String(), serverB.LocalAddr().String()}, bytes.NewReader(src), SendConfig{
+		Blast:          true,
+		ChunkSize:      512,
+		RunID:          runID,
+		RepairPayloads: true,
+	})
+	if err != nil {
+		t.Fatalf("SendBlastParallel() error = %v", err)
+	}
+	if sendStats.BytesSent != int64(len(src)) {
+		t.Fatalf("BytesSent = %d, want %d", sendStats.BytesSent, len(src))
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("parallel ordered blast error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(src)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(src))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for ordered parallel blast: %v", ctx.Err())
+	}
+	if !bytes.Equal(got.Bytes(), src) {
+		t.Fatalf("parallel ordered payload mismatch: got %d bytes, want %d", got.Len(), len(src))
+	}
+}
+
+func TestBlastParallelStreamPreservesOrderWithStripedLanesAcrossLoopback(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverA.Close()
+
+	serverB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverB.Close()
+
+	clientA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientA.Close()
+
+	clientB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientB.Close()
+
+	src := bytes.Repeat([]byte("striped-parallel-blast-"), 1<<13)
+	var got bytes.Buffer
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 2)
+	runID := testRunID(0xa8)
+	go func() {
+		stats, err := ReceiveBlastStreamParallelToWriter(ctx, []net.PacketConn{serverA, serverB}, &got, ReceiveConfig{
+			Blast:           true,
+			ExpectedRunID:   runID,
+			RequireComplete: true,
+		}, 0)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	sendStats, err := SendBlastParallel(ctx, []net.PacketConn{clientA, clientB}, []string{serverA.LocalAddr().String(), serverB.LocalAddr().String()}, bytes.NewReader(src), SendConfig{
+		Blast:          true,
+		ChunkSize:      512,
+		RunID:          runID,
+		RepairPayloads: true,
+		StripedBlast:   true,
+	})
+	if err != nil {
+		t.Fatalf("SendBlastParallel() error = %v", err)
+	}
+	if sendStats.BytesSent != int64(len(src)) {
+		t.Fatalf("BytesSent = %d, want %d", sendStats.BytesSent, len(src))
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("parallel striped blast error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(src)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(src))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for striped parallel blast: %v", ctx.Err())
+	}
+	if !bytes.Equal(got.Bytes(), src) {
+		t.Fatalf("parallel striped payload mismatch: got %d bytes, want %d", got.Len(), len(src))
+	}
+}
+
+func TestSendBlastParallelSkipsUnreachableOptionalLane(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	receiver, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+
+	senderA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer senderA.Close()
+
+	senderB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer senderB.Close()
+
+	payload := bytes.Repeat([]byte("optional-lane-"), 4096)
+	var got bytes.Buffer
+	receiveErr := make(chan error, 1)
+	go func() {
+		_, err := ReceiveBlastStreamParallelToWriter(ctx, []net.PacketConn{receiver}, &got, ReceiveConfig{
+			Blast:           true,
+			Transport:       "legacy",
+			RequireComplete: true,
+		}, int64(len(payload)))
+		receiveErr <- err
+	}()
+
+	stats, err := SendBlastParallel(ctx, []net.PacketConn{senderA, senderB}, []string{
+		receiver.LocalAddr().String(),
+		"127.0.0.1:1",
+	}, bytes.NewReader(payload), SendConfig{
+		Blast:                    true,
+		Transport:                "legacy",
+		ChunkSize:                512,
+		AllowPartialParallel:     true,
+		ParallelHandshakeTimeout: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("SendBlastParallel() error = %v", err)
+	}
+	if stats.BytesSent != int64(len(payload)) {
+		t.Fatalf("BytesSent = %d, want %d", stats.BytesSent, len(payload))
+	}
+
+	select {
+	case err := <-receiveErr:
+		if err != nil {
+			t.Fatalf("ReceiveBlastStreamParallelToWriter() error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for receive: %v", ctx.Err())
+	}
+	if !bytes.Equal(got.Bytes(), payload) {
+		t.Fatalf("payload mismatch after optional-lane skip")
+	}
+}
+
+func TestWriteOrderedParallelBlastPayloadTracksOrderForDiscard(t *testing.T) {
+	state := newBlastReceiveRunState(nil)
+	var writeMu sync.Mutex
+
+	written, err := writeOrderedParallelBlastPayload(io.Discard, state, 1, []byte("bb"), &writeMu)
+	if err != nil {
+		t.Fatalf("writeOrderedParallelBlastPayload() error = %v", err)
+	}
+	if written != 0 {
+		t.Fatalf("out-of-order discard write = %d, want 0", written)
+	}
+	if state.nextWriteSeq != 0 {
+		t.Fatalf("nextWriteSeq after out-of-order discard = %d, want 0", state.nextWriteSeq)
+	}
+
+	written, err = writeOrderedParallelBlastPayload(io.Discard, state, 0, []byte("aa"), &writeMu)
+	if err != nil {
+		t.Fatalf("writeOrderedParallelBlastPayload() in-order error = %v", err)
+	}
+	if written != 4 {
+		t.Fatalf("in-order discard write = %d, want 4", written)
+	}
+	if state.nextWriteSeq != 2 {
+		t.Fatalf("nextWriteSeq after discard flush = %d, want 2", state.nextWriteSeq)
+	}
+}
+
+func TestBlastStreamReceiveCoordinatorWritesOrderedAcrossLanes(t *testing.T) {
+	runID := testRunID(0xb3)
+	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+	lanes := []*blastStreamReceiveLane{
+		{batcher: &capturingBatcher{}, peer: peer},
+		{batcher: &capturingBatcher{}, peer: peer},
+	}
+	var got bytes.Buffer
+	coordinator := newBlastStreamReceiveCoordinator(context.Background(), lanes, &got, ReceiveConfig{
+		Blast:           true,
+		RequireComplete: true,
+		ExpectedRunID:   runID,
+	}, 0, time.Now())
+
+	complete, err := coordinator.handlePacket(context.Background(), lanes[1], PacketTypeData, runID, 1, 2, 0, []byte("bb"), peer)
+	if err != nil {
+		t.Fatalf("handlePacket(seq=1) error = %v", err)
+	}
+	if complete {
+		t.Fatal("handlePacket(seq=1) complete = true, want false")
+	}
+	if got.Len() != 0 {
+		t.Fatalf("buffer after out-of-order packet = %q, want empty", got.String())
+	}
+
+	complete, err = coordinator.handlePacket(context.Background(), lanes[0], PacketTypeData, runID, 0, 0, 0, []byte("aa"), peer)
+	if err != nil {
+		t.Fatalf("handlePacket(seq=0) error = %v", err)
+	}
+	if complete {
+		t.Fatal("handlePacket(seq=0) complete = true before DONE")
+	}
+
+	complete, err = coordinator.handlePacket(context.Background(), lanes[0], PacketTypeDone, runID, 2, 4, 0, nil, peer)
+	if err != nil {
+		t.Fatalf("handlePacket(DONE) error = %v", err)
+	}
+	if !complete {
+		t.Fatal("handlePacket(DONE) complete = false, want true")
+	}
+	if got.String() != "aabb" {
+		t.Fatalf("ordered payload = %q, want aabb", got.String())
+	}
+}
+
+func TestBlastStreamReceiveCoordinatorSpoolsOrderedOutputUntilComplete(t *testing.T) {
+	runID := testRunID(0xba)
+	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+	lanes := []*blastStreamReceiveLane{
+		{batcher: &capturingBatcher{}, peer: peer},
+		{batcher: &capturingBatcher{}, peer: peer},
+	}
+	var got bytes.Buffer
+	coordinator := newBlastStreamReceiveCoordinator(context.Background(), lanes, &got, ReceiveConfig{
+		Blast:           true,
+		RequireComplete: true,
+		ExpectedRunID:   runID,
+		SpoolOutput:     true,
+	}, 0, time.Now())
+
+	if complete, err := coordinator.handlePacket(context.Background(), lanes[1], PacketTypeData, runID, 1, 2, 0, []byte("bb"), peer); err != nil || complete {
+		t.Fatalf("handlePacket(seq=1) complete=%v err=%v, want false nil", complete, err)
+	}
+	if complete, err := coordinator.handlePacket(context.Background(), lanes[0], PacketTypeData, runID, 0, 0, 0, []byte("aa"), peer); err != nil || complete {
+		t.Fatalf("handlePacket(seq=0) complete=%v err=%v, want false nil", complete, err)
+	}
+	if got.Len() != 0 {
+		t.Fatalf("spooled output before DONE = %q, want empty", got.String())
+	}
+	if state := coordinator.runs[runID]; state == nil || state.nextWriteSeq != 2 {
+		t.Fatalf("spooled nextWriteSeq = %v, want 2", state)
+	}
+
+	complete, err := coordinator.handlePacket(context.Background(), lanes[0], PacketTypeDone, runID, 2, 4, 0, nil, peer)
+	if err != nil {
+		t.Fatalf("handlePacket(DONE) error = %v", err)
+	}
+	if !complete {
+		t.Fatal("handlePacket(DONE) complete = false, want true")
+	}
+	if got.String() != "aabb" {
+		t.Fatalf("spooled output = %q, want aabb", got.String())
+	}
+}
+
+func TestBlastStreamReceiveCoordinatorWritesOrderedStripedLaneSequences(t *testing.T) {
+	runID := testRunID(0xb6)
+	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+	lanes := []*blastStreamReceiveLane{
+		{batcher: &capturingBatcher{}, peer: peer},
+		{batcher: &capturingBatcher{}, peer: peer},
+	}
+	var got bytes.Buffer
+	coordinator := newBlastStreamReceiveCoordinator(context.Background(), lanes, &got, ReceiveConfig{
+		Blast:           true,
+		RequireComplete: true,
+		ExpectedRunID:   runID,
+	}, 0, time.Now())
+
+	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[1], 1, 2, PacketTypeHello, runID, 0, 0, 0, nil, peer); err != nil || complete {
+		t.Fatalf("handlePacketStripe(hello stripe 1) complete=%v err=%v, want false nil", complete, err)
+	}
+	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[0], 0, 2, PacketTypeHello, runID, 0, 0, 0, nil, peer); err != nil || complete {
+		t.Fatalf("handlePacketStripe(hello stripe 0) complete=%v err=%v, want false nil", complete, err)
+	}
+	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[1], 1, 2, PacketTypeData, runID, 0, 2, 0, []byte("bb"), peer); err != nil || complete {
+		t.Fatalf("handlePacketStripe(data stripe 1) complete=%v err=%v, want false nil", complete, err)
+	}
+	if got.Len() != 0 {
+		t.Fatalf("buffer after later offset = %q, want empty", got.String())
+	}
+	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[0], 0, 2, PacketTypeData, runID, 0, 0, 0, []byte("aa"), peer); err != nil || complete {
+		t.Fatalf("handlePacketStripe(data stripe 0) complete=%v err=%v, want false nil", complete, err)
+	}
+	if got.String() != "aabb" {
+		t.Fatalf("ordered payload before done = %q, want aabb", got.String())
+	}
+	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[1], 1, 2, PacketTypeDone, runID, 1, 4, 0, nil, peer); err != nil || complete {
+		t.Fatalf("handlePacketStripe(done stripe 1) complete=%v err=%v, want false nil", complete, err)
+	}
+	complete, err := coordinator.handlePacketStripe(context.Background(), lanes[0], 0, 2, PacketTypeDone, runID, 1, 4, 0, nil, peer)
+	if err != nil {
+		t.Fatalf("handlePacketStripe(done stripe 0) error = %v", err)
+	}
+	if !complete {
+		t.Fatal("handlePacketStripe(final done) complete = false, want true")
+	}
+}
+
+func TestBlastStreamReceiveCoordinatorDiscardCompletesStripedOutOfGlobalOrder(t *testing.T) {
+	runID := testRunID(0xbc)
+	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+	lanes := []*blastStreamReceiveLane{
+		{batcher: &capturingBatcher{}, peer: peer},
+		{batcher: &capturingBatcher{}, peer: peer},
+	}
+	coordinator := newBlastStreamReceiveCoordinator(context.Background(), lanes, io.Discard, ReceiveConfig{
+		Blast:           true,
+		RequireComplete: true,
+		ExpectedRunID:   runID,
+	}, 0, time.Now())
+
+	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[1], 1, 2, PacketTypeHello, runID, 0, 0, 0, nil, peer); err != nil || complete {
+		t.Fatalf("handlePacketStripe(hello stripe 1) complete=%v err=%v, want false nil", complete, err)
+	}
+	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[0], 0, 2, PacketTypeHello, runID, 0, 0, 0, nil, peer); err != nil || complete {
+		t.Fatalf("handlePacketStripe(hello stripe 0) complete=%v err=%v, want false nil", complete, err)
+	}
+	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[1], 1, 2, PacketTypeData, runID, 0, 2, 0, []byte("bb"), peer); err != nil || complete {
+		t.Fatalf("handlePacketStripe(data stripe 1) complete=%v err=%v, want false nil", complete, err)
+	}
+	state := coordinator.runs[runID]
+	if state == nil {
+		t.Fatal("missing receive state")
+	}
+	if got := len(state.pendingOutput); got != 0 {
+		t.Fatalf("discard pendingOutput after out-of-global-order packet = %d, want 0", got)
+	}
+	if got, want := coordinator.bytesReceived, int64(2); got != want {
+		t.Fatalf("discard bytesReceived = %d, want %d", got, want)
+	}
+	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[0], 0, 2, PacketTypeData, runID, 0, 0, 0, []byte("aa"), peer); err != nil || complete {
+		t.Fatalf("handlePacketStripe(data stripe 0) complete=%v err=%v, want false nil", complete, err)
+	}
+	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[1], 1, 2, PacketTypeDone, runID, 1, 4, 0, nil, peer); err != nil || complete {
+		t.Fatalf("handlePacketStripe(done stripe 1) complete=%v err=%v, want false nil", complete, err)
+	}
+	complete, err := coordinator.handlePacketStripe(context.Background(), lanes[0], 0, 2, PacketTypeDone, runID, 1, 4, 0, nil, peer)
+	if err != nil {
+		t.Fatalf("handlePacketStripe(done stripe 0) error = %v", err)
+	}
+	if !complete {
+		t.Fatal("handlePacketStripe(final done) complete = false, want true")
+	}
+}
+
+func TestBlastStreamReceiveCoordinatorRequestsStripedKnownGapOnLane(t *testing.T) {
+	runID := testRunID(0xb7)
+	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+	batcher0 := &capturingBatcher{}
+	batcher1 := &capturingBatcher{}
+	lanes := []*blastStreamReceiveLane{
+		{batcher: batcher0, peer: peer},
+		{batcher: batcher1, peer: peer},
+	}
+	coordinator := newBlastStreamReceiveCoordinator(context.Background(), lanes, io.Discard, ReceiveConfig{
+		Blast:           true,
+		RequireComplete: true,
+		ExpectedRunID:   runID,
+	}, 0, time.Now())
+
+	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[1], 1, 2, PacketTypeHello, runID, 0, 0, 0, nil, peer); err != nil || complete {
+		t.Fatalf("handlePacketStripe(hello stripe 1) complete=%v err=%v, want false nil", complete, err)
+	}
+	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[1], 1, 2, PacketTypeData, runID, 1, 2, 0, []byte("bb"), peer); err != nil || complete {
+		t.Fatalf("handlePacketStripe(data stripe 1 seq 1) complete=%v err=%v, want false nil", complete, err)
+	}
+
+	observedAt := time.Now()
+	if err := coordinator.handleRepairTick(context.Background(), observedAt); err != nil {
+		t.Fatalf("first handleRepairTick() error = %v", err)
+	}
+	if err := coordinator.handleRepairTick(context.Background(), observedAt.Add(stripedBlastKnownGapRepairDelay/2)); err != nil {
+		t.Fatalf("early handleRepairTick() error = %v", err)
+	}
+	if got := len(batcher1.writes); got != 0 {
+		t.Fatalf("stripe 1 repair writes before delay = %d, want 0", got)
+	}
+	if err := coordinator.handleRepairTick(context.Background(), observedAt.Add(stripedBlastKnownGapRepairDelay)); err != nil {
+		t.Fatalf("delayed handleRepairTick() error = %v", err)
+	}
+	if got := len(batcher0.writes); got != 0 {
+		t.Fatalf("stripe 0 repair writes = %d, want 0", got)
+	}
+	if got := len(batcher1.writes); got != 1 {
+		t.Fatalf("stripe 1 repair writes = %d, want 1", got)
+	}
+	packet, err := UnmarshalPacket(batcher1.writes[0], nil)
+	if err != nil {
+		t.Fatalf("UnmarshalPacket(repair request) error = %v", err)
+	}
+	if packet.Type != PacketTypeRepairRequest {
+		t.Fatalf("repair packet type = %v, want %v", packet.Type, PacketTypeRepairRequest)
+	}
+	if packet.StripeID != 1 {
+		t.Fatalf("repair packet StripeID = %d, want 1", packet.StripeID)
+	}
+	if len(packet.Payload) != 8 || binary.BigEndian.Uint64(packet.Payload) != 0 {
+		t.Fatalf("repair payload = %x, want missing seq 0", packet.Payload)
+	}
+}
+
+func TestBlastStreamReceiveCoordinatorCanDeferStripedKnownGapRepairs(t *testing.T) {
+	runID := testRunID(0xbd)
+	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+	batcher0 := &capturingBatcher{}
+	batcher1 := &capturingBatcher{}
+	lanes := []*blastStreamReceiveLane{
+		{batcher: batcher0, peer: peer},
+		{batcher: batcher1, peer: peer},
+	}
+	coordinator := newBlastStreamReceiveCoordinator(context.Background(), lanes, io.Discard, ReceiveConfig{
+		Blast:                true,
+		RequireComplete:      true,
+		ExpectedRunID:        runID,
+		DeferKnownGapRepairs: true,
+	}, 0, time.Now())
+
+	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[1], 1, 2, PacketTypeHello, runID, 0, 0, 0, nil, peer); err != nil || complete {
+		t.Fatalf("handlePacketStripe(hello stripe 1) complete=%v err=%v, want false nil", complete, err)
+	}
+	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[1], 1, 2, PacketTypeData, runID, 1, 2, 0, []byte("bb"), peer); err != nil || complete {
+		t.Fatalf("handlePacketStripe(data stripe 1 seq 1) complete=%v err=%v, want false nil", complete, err)
+	}
+
+	if err := coordinator.handleRepairTick(context.Background(), time.Now().Add(stripedBlastKnownGapRepairDelay)); err != nil {
+		t.Fatalf("handleRepairTick() error = %v", err)
+	}
+	if got := len(batcher0.writes) + len(batcher1.writes); got != 0 {
+		t.Fatalf("deferred known-gap repair writes = %d, want 0", got)
+	}
+
+	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[1], 1, 2, PacketTypeDone, runID, 2, 4, 0, nil, peer); err != nil || complete {
+		t.Fatalf("handlePacketStripe(done stripe 1) complete=%v err=%v, want false nil", complete, err)
+	}
+	if err := coordinator.handleRepairTick(context.Background(), time.Now()); err != nil {
+		t.Fatalf("handleRepairTick() after DONE error = %v", err)
+	}
+	if got := len(batcher1.writes); got != 1 {
+		t.Fatalf("DONE-time repair writes = %d, want 1", got)
+	}
+	packet, err := UnmarshalPacket(batcher1.writes[0], nil)
+	if err != nil {
+		t.Fatalf("UnmarshalPacket(repair request) error = %v", err)
+	}
+	if packet.Type != PacketTypeRepairRequest {
+		t.Fatalf("repair packet type = %v, want %v", packet.Type, PacketTypeRepairRequest)
+	}
+	if packet.StripeID != 1 {
+		t.Fatalf("repair packet StripeID = %d, want 1", packet.StripeID)
+	}
+	if len(packet.Payload) != 8 || binary.BigEndian.Uint64(packet.Payload) != 0 {
+		t.Fatalf("repair payload = %x, want missing seq 0", packet.Payload)
+	}
+}
+
+func TestBlastRepairDeduperForLaneScopesStripedLaneHistories(t *testing.T) {
+	global := newBlastRepairDeduper()
+	laneA := &blastParallelSendLane{history: &blastRepairHistory{}}
+	laneB := &blastParallelSendLane{history: &blastRepairHistory{}}
+
+	deduperA := blastRepairDeduperForLane(global, laneA)
+	deduperB := blastRepairDeduperForLane(global, laneB)
+	if deduperA == nil || deduperB == nil {
+		t.Fatal("lane deduper is nil")
+	}
+	if deduperA == global || deduperB == global {
+		t.Fatal("striped lane histories used global deduper")
+	}
+	if deduperA == deduperB {
+		t.Fatal("striped lanes shared a repair deduper")
+	}
+	if got := blastRepairDeduperForLane(global, &blastParallelSendLane{}); got != global {
+		t.Fatal("non-striped lane did not use global deduper")
+	}
+}
+
+func TestBlastParallelLaneIndexForOffsetUsesContiguousBlocks(t *testing.T) {
+	chunkSize := 10
+	blockBytes := uint64(parallelBlastStripeBlockPackets * chunkSize)
+
+	tests := []struct {
+		name   string
+		offset uint64
+		want   int
+	}{
+		{name: "first block start", offset: 0, want: 0},
+		{name: "first block end", offset: blockBytes - 1, want: 0},
+		{name: "second block start", offset: blockBytes, want: 1},
+		{name: "third block start", offset: blockBytes * 2, want: 2},
+		{name: "wraps after all lanes", offset: blockBytes * 4, want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := blastParallelLaneIndexForOffset(tt.offset, 4, chunkSize); got != tt.want {
+				t.Fatalf("blastParallelLaneIndexForOffset(%d, 4, %d) = %d, want %d", tt.offset, chunkSize, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBlastStreamReceiveCoordinatorRequestsKnownGapOnNextRepairTick(t *testing.T) {
+	runID := testRunID(0xb4)
+	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+	batcher := &capturingBatcher{}
+	lane := &blastStreamReceiveLane{batcher: batcher, peer: peer}
+	coordinator := newBlastStreamReceiveCoordinator(context.Background(), []*blastStreamReceiveLane{lane}, io.Discard, ReceiveConfig{
+		Blast:           true,
+		RequireComplete: true,
+		ExpectedRunID:   runID,
+	}, 0, time.Now())
+
+	complete, err := coordinator.handlePacket(context.Background(), lane, PacketTypeData, runID, 1, 2, 0, []byte("bb"), peer)
+	if err != nil {
+		t.Fatalf("handlePacket(seq=1) error = %v", err)
+	}
+	if complete {
+		t.Fatal("handlePacket(seq=1) complete = true, want false")
+	}
+
+	observedAt := time.Now()
+	if err := coordinator.handleRepairTick(context.Background(), observedAt); err != nil {
+		t.Fatalf("first handleRepairTick() error = %v", err)
+	}
+	if got := len(batcher.writes); got != 0 {
+		t.Fatalf("repair writes after first tick = %d, want 0", got)
+	}
+
+	if err := coordinator.handleRepairTick(context.Background(), observedAt.Add(blastRepairInterval)); err != nil {
+		t.Fatalf("second handleRepairTick() error = %v", err)
+	}
+	if got := len(batcher.writes); got != 1 {
+		t.Fatalf("repair writes after next tick = %d, want 1", got)
+	}
+	packet, err := UnmarshalPacket(batcher.writes[0], nil)
+	if err != nil {
+		t.Fatalf("UnmarshalPacket(repair request) error = %v", err)
+	}
+	if packet.Type != PacketTypeRepairRequest {
+		t.Fatalf("repair packet type = %v, want %v", packet.Type, PacketTypeRepairRequest)
+	}
+	if packet.RunID != runID {
+		t.Fatalf("repair RunID = %x, want %x", packet.RunID, runID)
+	}
+	if len(packet.Payload) != 8 || binary.BigEndian.Uint64(packet.Payload) != 0 {
+		t.Fatalf("repair payload = %x, want missing seq 0", packet.Payload)
+	}
+}
+
+func TestReceiveBlastParallelToWriterUsesConnectedUDPAfterHello(t *testing.T) {
+	switch runtime.GOOS {
+	case "darwin", "linux":
+	default:
+		t.Skipf("connected UDP batcher unsupported on %s", runtime.GOOS)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server, err := net.ListenPacket("udp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	src := bytes.Repeat([]byte("connected-receiver"), 1<<12)
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, io.Discard, ReceiveConfig{Blast: true}, int64(len(src)))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	serverAddr := server.LocalAddr().(*net.UDPAddr)
+	remoteAddr := (&net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: serverAddr.Port}).String()
+	if _, err := Send(ctx, client, remoteAddr, bytes.NewReader(src), SendConfig{Blast: true}); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ReceiveBlastParallelToWriter() error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(src)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(src))
+		}
+		if !stats.Transport.Connected {
+			t.Fatalf("receive transport = %#v, want connected UDP fast path", stats.Transport)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for connected receiver: %v", ctx.Err())
+	}
+}
+
+func TestReceiveBlastParallelToWriterRepairsDroppedDataPacket(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	clientBase, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientBase.Close()
+
+	client := &dropFirstBlastDataConn{PacketConn: clientBase}
+	src := bytes.Repeat([]byte("repair-blast"), 1<<12)
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, io.Discard, ReceiveConfig{Blast: true}, int64(len(src)))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	if _, err := Send(ctx, client, server.LocalAddr().String(), bytes.NewReader(src), SendConfig{Blast: true, ChunkSize: 512, RepairPayloads: true}); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ReceiveBlastParallelToWriter() error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(src)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(src))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for repaired blast receive: %v", ctx.Err())
+	}
+}
+
+func TestReceiveBlastParallelToWriterRepairsDroppedDataPacketInOrder(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	clientBase, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientBase.Close()
+
+	client := &dropFirstBlastDataConn{PacketConn: clientBase}
+	src := bytes.Repeat([]byte("repair-content-blast"), 1<<12)
+	var got bytes.Buffer
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, &got, ReceiveConfig{Blast: true, RequireComplete: true}, 0)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	if _, err := Send(ctx, client, server.LocalAddr().String(), bytes.NewReader(src), SendConfig{Blast: true, ChunkSize: 512, RepairPayloads: true}); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ReceiveBlastParallelToWriter() error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(src)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(src))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for repaired blast receive: %v", ctx.Err())
+	}
+	if !bytes.Equal(got.Bytes(), src) {
+		t.Fatalf("repaired payload mismatch: got %d bytes, want %d", got.Len(), len(src))
+	}
+}
+
+func TestReceiveBlastParallelToWriterTailReplayRecoversDroppedDataPacketInOrder(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	clientBase, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientBase.Close()
+
+	client := &dropFirstBlastDataConn{PacketConn: clientBase}
+	src := bytes.Repeat([]byte("tail-replay-content"), 1<<10)
+	var got bytes.Buffer
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, &got, ReceiveConfig{Blast: true, RequireComplete: true}, 0)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	if _, err := Send(ctx, client, server.LocalAddr().String(), bytes.NewReader(src), SendConfig{
+		Blast:           true,
+		ChunkSize:       512,
+		TailReplayBytes: 1 << 15,
+		RepairPayloads:  false,
+	}); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ReceiveBlastParallelToWriter() error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(src)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(src))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for tail replay receive: %v", ctx.Err())
+	}
+	if !bytes.Equal(got.Bytes(), src) {
+		t.Fatalf("tail replay payload mismatch: got %d bytes, want %d", got.Len(), len(src))
+	}
+}
+
+func TestReceiveBlastParallelToWriterFECRecoversDroppedDataPacketInOrder(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	clientBase, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientBase.Close()
+
+	client := &dropFirstBlastDataConn{PacketConn: clientBase}
+	src := bytes.Repeat([]byte("fec-replay-content"), 1<<10)
+	var got bytes.Buffer
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, &got, ReceiveConfig{
+			Blast:           true,
+			RequireComplete: true,
+			FECGroupSize:    32,
+		}, 0)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	if _, err := Send(ctx, client, server.LocalAddr().String(), bytes.NewReader(src), SendConfig{
+		Blast:          true,
+		ChunkSize:      512,
+		FECGroupSize:   32,
+		RepairPayloads: false,
+	}); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ReceiveBlastParallelToWriter() error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(src)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(src))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for FEC receive: %v", ctx.Err())
+	}
+	if !bytes.Equal(got.Bytes(), src) {
+		t.Fatalf("FEC payload mismatch: got %d bytes, want %d", got.Len(), len(src))
+	}
+}
+
+func TestReceiveBlastParallelToWriterRequireCompleteErrorsWhenRepairCannotRecover(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	clientBase, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientBase.Close()
+
+	client := &dropFirstBlastDataConn{PacketConn: clientBase}
+	src := bytes.Repeat([]byte("missing-strict-content"), 1<<10)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, io.Discard, ReceiveConfig{Blast: true, RequireComplete: true}, 0)
+		errCh <- err
+	}()
+
+	if _, err := Send(ctx, client, server.LocalAddr().String(), bytes.NewReader(src), SendConfig{
+		Blast:          true,
+		ChunkSize:      512,
+		RepairPayloads: false,
+	}); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("ReceiveBlastParallelToWriter() error = nil, want incomplete blast error")
+		}
+		if !strings.Contains(err.Error(), "blast incomplete") {
+			t.Fatalf("ReceiveBlastParallelToWriter() error = %v, want blast incomplete", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for incomplete strict receive: %v", ctx.Err())
+	}
+}
+
+func TestReceiveBlastParallelToWriterRequireCompleteWaitsForDone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	runID := testRunID(0x4b)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, io.Discard, ReceiveConfig{Blast: true, RequireComplete: true}, 0)
+		errCh <- err
+	}()
+
+	writeProbePacket(t, client, server.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: runID})
+	writeProbePacket(t, client, server.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runID, Payload: []byte("strict-data-without-done")})
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ReceiveBlastParallelToWriter() returned before DONE with error %v", err)
+	case <-time.After(parallelBlastDataIdle + 250*time.Millisecond):
+	}
+
+	cancel()
+	select {
+	case <-errCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for canceled strict receive")
+	}
+}
+
+func TestReceiveBlastParallelToWriterRequestsKnownGapBeforeDone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	runID := testRunID(0x4d)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, io.Discard, ReceiveConfig{Blast: true, RequireComplete: true}, 0)
+		errCh <- err
+	}()
+
+	writeProbePacket(t, client, server.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: runID})
+	for {
+		packet := readProbePacket(t, client, 500*time.Millisecond)
+		if packet.Type == PacketTypeHelloAck {
+			break
+		}
+	}
+	writeProbePacket(t, client, server.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runID, Seq: 0, Offset: 0, Payload: []byte("seq-0")})
+	writeProbePacket(t, client, server.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runID, Seq: 2, Offset: 10, Payload: []byte("seq-2")})
+
+	deadline := time.After(blastKnownGapRepairDelay + 500*time.Millisecond)
+	for {
+		select {
+		case err := <-errCh:
+			t.Fatalf("ReceiveBlastParallelToWriter() returned before DONE with error %v", err)
+		case <-deadline:
+			t.Fatal("timed out waiting for pre-DONE repair request")
+		default:
+		}
+		packet := readProbePacket(t, client, 500*time.Millisecond)
+		if packet.Type != PacketTypeRepairRequest {
+			continue
+		}
+		if packet.RunID != runID {
+			t.Fatalf("repair request RunID = %x, want %x", packet.RunID, runID)
+		}
+		if len(packet.Payload) < 8 {
+			t.Fatalf("repair request payload len = %d, want at least 8", len(packet.Payload))
+		}
+		if got := binary.BigEndian.Uint64(packet.Payload[:8]); got != 1 {
+			t.Fatalf("repair request seq = %d, want 1", got)
+		}
+		break
+	}
+}
+
+func TestReceiveBlastParallelToWriterDoesNotRequestKnownGapBeforeDelay(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	runID := testRunID(0x4e)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, io.Discard, ReceiveConfig{Blast: true, RequireComplete: true}, 0)
+		errCh <- err
+	}()
+
+	writeProbePacket(t, client, server.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: runID})
+	for {
+		packet := readProbePacket(t, client, 500*time.Millisecond)
+		if packet.Type == PacketTypeHelloAck {
+			break
+		}
+	}
+	writeProbePacket(t, client, server.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runID, Seq: 0, Offset: 0, Payload: []byte("seq-0")})
+	writeProbePacket(t, client, server.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runID, Seq: 2, Offset: 10, Payload: []byte("seq-2")})
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ReceiveBlastParallelToWriter() returned before DONE with error %v", err)
+	case <-time.After(blastKnownGapRepairDelay / 2):
+	}
+
+	if err := client.SetReadDeadline(time.Now().Add(25 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1500)
+	for {
+		n, _, err := client.ReadFrom(buf)
+		if err != nil {
+			if isNetTimeout(err) {
+				return
+			}
+			t.Fatal(err)
+		}
+		packet, err := UnmarshalPacket(buf[:n], nil)
+		if err != nil {
+			continue
+		}
+		if packet.Type == PacketTypeRepairRequest {
+			t.Fatalf("received repair request before known gap delay")
+		}
+	}
+}
+
+func TestBlastSendReturnsPromptlyWhenRepairCompleteIsLostWithoutRepairRequests(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverBase, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverBase.Close()
+	server := &dropRepairCompleteConn{PacketConn: serverBase}
+
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	src := bytes.Repeat([]byte("complete-with-lost-repair-complete"), 128)
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, io.Discard, ReceiveConfig{Blast: true}, int64(len(src)))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	start := time.Now()
+	if _, err := Send(ctx, client, server.LocalAddr().String(), bytes.NewReader(src), SendConfig{Blast: true, ChunkSize: 512}); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed >= parallelBlastRepairGrace/2 {
+		t.Fatalf("Send() elapsed = %v, want prompt completion when no repair requests arrive", elapsed)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ReceiveBlastParallelToWriter() error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(src)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(src))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for receiver: %v", ctx.Err())
+	}
+}
+
+func TestReceiveBlastParallelToWriterBuffersOutOfOrderData(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	clientBase, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientBase.Close()
+
+	client := &reverseFirstTwoBlastDataConn{PacketConn: clientBase}
+	src := bytes.Repeat([]byte("ordered-blast"), 1<<12)
+	var got bytes.Buffer
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, &got, ReceiveConfig{Blast: true, RequireComplete: true}, 0)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	if _, err := Send(ctx, client, server.LocalAddr().String(), bytes.NewReader(src), SendConfig{Blast: true, ChunkSize: 512, RepairPayloads: true}); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ReceiveBlastParallelToWriter() error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(src)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(src))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for ordered blast receive: %v", ctx.Err())
+	}
+	if !bytes.Equal(got.Bytes(), src) {
+		t.Fatalf("ordered payload mismatch: got %d bytes, want %d", got.Len(), len(src))
+	}
+}
+
+func TestReceiveBlastParallelToWriterCompletesOnDoneWithPartialBytes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	serverA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverA.Close()
+	serverB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverB.Close()
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	runID := testRunID(0x42)
+	payload := []byte("partial-blast")
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{serverA, serverB}, io.Discard, ReceiveConfig{Blast: true}, int64(len(payload)+1))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	writeProbePacket(t, client, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: runID})
+	writeProbePacket(t, client, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runID, Payload: payload})
+	writeProbePacket(t, client, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeDone, RunID: runID})
+	writeProbePacket(t, client, serverB.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeDone, RunID: runID})
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("parallel blast error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(payload)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(payload))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for partial parallel blast receive: %v", ctx.Err())
+	}
+}
+
+func TestReceiveBlastParallelToWriterFastModeWaitsForAllLanesWithoutExpectedBytes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	serverA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverA.Close()
+	serverB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverB.Close()
+	clientA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientA.Close()
+	clientB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientB.Close()
+
+	runID := testRunID(0x71)
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{serverA, serverB}, io.Discard, ReceiveConfig{Blast: true, ExpectedRunID: runID}, 0)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	payloadA := []byte("lane-a")
+	writeProbePacket(t, clientA, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: runID})
+	writeProbePacket(t, clientA, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runID, Seq: 0, Offset: 0, Payload: payloadA})
+	writeProbePacket(t, clientA, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeDone, RunID: runID, Seq: 1, Offset: uint64(len(payloadA))})
+
+	select {
+	case stats := <-statsCh:
+		t.Fatalf("ReceiveBlastParallelToWriter() returned after first lane with %d bytes, want wait for all lanes", stats.BytesReceived)
+	case err := <-errCh:
+		t.Fatalf("ReceiveBlastParallelToWriter() error after first lane = %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	payloadB := []byte("lane-bb")
+	writeProbePacket(t, clientB, serverB.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: runID})
+	writeProbePacket(t, clientB, serverB.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runID, Seq: 0, Offset: 0, Payload: payloadB})
+	writeProbePacket(t, clientB, serverB.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeDone, RunID: runID, Seq: 1, Offset: uint64(len(payloadB))})
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ReceiveBlastParallelToWriter() error = %v", err)
+	case stats := <-statsCh:
+		if want := int64(len(payloadA) + len(payloadB)); stats.BytesReceived != want {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, want)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for all lanes: %v", ctx.Err())
+	}
+}
+
+func TestReceiveBlastParallelToWriterFastModeRejectsIncompleteDone(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	runID := testRunID(0x48)
+	payload := []byte("fast-mode-partial-blast")
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, io.Discard, ReceiveConfig{Blast: true}, 0)
+		errCh <- err
+	}()
+
+	writeProbePacket(t, client, server.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: runID})
+	writeProbePacket(t, client, server.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runID, Payload: payload})
+	writeProbePacket(t, client, server.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeDone, RunID: runID, Seq: 2, Offset: uint64(len(payload) + 512)})
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("ReceiveBlastParallelToWriter() error = nil, want incomplete blast error")
+		}
+		if !strings.Contains(err.Error(), "blast incomplete") {
+			t.Fatalf("ReceiveBlastParallelToWriter() error = %v, want blast incomplete", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for incomplete blast failure: %v", ctx.Err())
+	}
+}
+
+func TestReceiveBlastParallelToWriterFastModeRejectsIncompleteDonePerLane(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	serverA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverA.Close()
+	serverB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverB.Close()
+	clientA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientA.Close()
+	clientB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientB.Close()
+
+	runID := testRunID(0x72)
+	payloadA := bytes.Repeat([]byte("a"), 1024)
+	payloadB := []byte("b")
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{serverA, serverB}, io.Discard, ReceiveConfig{Blast: true, ExpectedRunID: runID}, 0)
+		errCh <- err
+	}()
+
+	writeProbePacket(t, clientA, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: runID})
+	writeProbePacket(t, clientA, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runID, Seq: 0, Payload: payloadA})
+	writeProbePacket(t, clientA, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeDone, RunID: runID, Seq: 1, Offset: uint64(len(payloadA))})
+
+	writeProbePacket(t, clientB, serverB.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: runID})
+	writeProbePacket(t, clientB, serverB.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runID, Seq: 0, Payload: payloadB})
+	writeProbePacket(t, clientB, serverB.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeDone, RunID: runID, Seq: 2, Offset: uint64(len(payloadB) + 512)})
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("ReceiveBlastParallelToWriter() error = nil, want incomplete blast error")
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("ReceiveBlastParallelToWriter() error = %v, want blast incomplete before context timeout", err)
+		}
+		if !strings.Contains(err.Error(), "blast incomplete") {
+			t.Fatalf("ReceiveBlastParallelToWriter() error = %v, want blast incomplete", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for per-lane incomplete blast failure: %v", ctx.Err())
+	}
+}
+
+func TestReceiveBlastParallelToWriterFastModeWaitsForLateDataAfterDone(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	runID := testRunID(0x49)
+	firstPayload := []byte("first-fast-mode-payload")
+	latePayload := []byte("late-fast-mode-payload")
+	totalBytes := len(firstPayload) + len(latePayload)
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, io.Discard, ReceiveConfig{Blast: true}, 0)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	writeProbePacket(t, client, server.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: runID})
+	writeProbePacket(t, client, server.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runID, Seq: 0, Offset: 0, Payload: firstPayload})
+	writeProbePacket(t, client, server.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeDone, RunID: runID, Seq: 2, Offset: uint64(totalBytes)})
+	time.Sleep(parallelBlastDataIdle / 4)
+	writeProbePacket(t, client, server.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runID, Seq: 1, Offset: uint64(len(firstPayload)), Payload: latePayload})
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ReceiveBlastParallelToWriter() error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(totalBytes) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, totalBytes)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for late fast-mode data: %v", ctx.Err())
+	}
+}
+
+func TestReceiveBlastParallelToWriterCompletesAfterTerminalGrace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	serverA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverA.Close()
+	serverB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverB.Close()
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	runID := testRunID(0x43)
+	payload := []byte("partial-blast")
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{serverA, serverB}, io.Discard, ReceiveConfig{Blast: true}, int64(len(payload)+1))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	writeProbePacket(t, client, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: runID})
+	writeProbePacket(t, client, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runID, Payload: payload})
+	writeProbePacket(t, client, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeDone, RunID: runID})
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("parallel blast error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(payload)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(payload))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for terminal grace: %v", ctx.Err())
+	}
+}
+
+func TestReceiveBlastParallelToWriterWaitsForLateDataAfterAllDone(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	serverA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverA.Close()
+	serverB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverB.Close()
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	runA := testRunID(0x45)
+	runB := testRunID(0x46)
+	payloadA := []byte("early-data")
+	payloadB := []byte("late-data")
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{serverA, serverB}, io.Discard, ReceiveConfig{Blast: true}, int64(len(payloadA)+len(payloadB)))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	writeProbePacket(t, client, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: runA})
+	writeProbePacket(t, client, serverB.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: runB})
+	writeProbePacket(t, client, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runA, Payload: payloadA})
+	writeProbePacket(t, client, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeDone, RunID: runA})
+	writeProbePacket(t, client, serverB.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeDone, RunID: runB})
+	time.Sleep(parallelBlastDoneGrace / 2)
+	writeProbePacket(t, client, serverB.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runB, Payload: payloadB})
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("parallel blast error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(payloadA)+len(payloadB)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(payloadA)+len(payloadB))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for late data: %v", ctx.Err())
+	}
+}
+
+func TestReceiveBlastParallelToWriterAcceptsExpectedRunIDSet(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	serverA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverA.Close()
+	serverB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverB.Close()
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	runA := testRunID(0x52)
+	runB := testRunID(0x53)
+	badRun := testRunID(0x54)
+	payloadA := []byte("accepted-a")
+	payloadB := []byte("accepted-b")
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{serverA, serverB}, io.Discard, ReceiveConfig{
+			Blast:           true,
+			ExpectedRunIDs:  [][16]byte{runA, runB},
+			RequireComplete: true,
+		}, int64(len(payloadA)+len(payloadB)))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	writeProbePacket(t, client, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: badRun})
+	writeProbePacket(t, client, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: badRun, Payload: []byte("ignored")})
+	writeProbePacket(t, client, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: runA})
+	writeProbePacket(t, client, serverB.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: runB})
+	writeProbePacket(t, client, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runA, Payload: payloadA})
+	writeProbePacket(t, client, serverB.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runB, Payload: payloadB})
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("parallel blast error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(payloadA)+len(payloadB)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(payloadA)+len(payloadB))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for expected run ID set: %v", ctx.Err())
+	}
+}
+
+func TestReceiveBlastParallelToWriterDoesNotStartTerminalGraceBeforeAllDone(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	serverA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverA.Close()
+	serverB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverB.Close()
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	runA := testRunID(0x47)
+	runB := testRunID(0x48)
+	payloadA := []byte("early-data")
+	payloadB := []byte("slow-stripe-data")
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{serverA, serverB}, io.Discard, ReceiveConfig{Blast: true}, int64(len(payloadA)+len(payloadB)))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	writeProbePacket(t, client, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: runA})
+	writeProbePacket(t, client, serverB.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: runB})
+	writeProbePacket(t, client, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runA, Payload: payloadA})
+	writeProbePacket(t, client, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeDone, RunID: runA})
+	time.Sleep(parallelBlastDataIdle / 2)
+	writeProbePacket(t, client, serverB.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runB, Payload: payloadB})
+	writeProbePacket(t, client, serverB.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeDone, RunID: runB})
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("parallel blast error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(payloadA)+len(payloadB)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(payloadA)+len(payloadB))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for slow stripe data: %v", ctx.Err())
+	}
+}
+
+func TestWriteBlastPayloadFastPathForDiscard(t *testing.T) {
+	payload := []byte("payload")
+	n, err := writeBlastPayload(io.Discard, payload)
+	if err != nil {
+		t.Fatalf("writeBlastPayload() error = %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("writeBlastPayload() n = %d, want %d", n, len(payload))
+	}
+}
+
+func TestWriteOrderedParallelBlastPayloadAggregatesBufferedWriter(t *testing.T) {
+	var out bytes.Buffer
+	buffered := bufio.NewWriterSize(&out, 4096)
+	state := newBlastReceiveRunState(nil)
+
+	n, err := writeOrderedParallelBlastPayload(buffered, state, 0, []byte("payload"), &sync.Mutex{})
+	if err != nil {
+		t.Fatalf("writeOrderedParallelBlastPayload() error = %v", err)
+	}
+	if n != len("payload") {
+		t.Fatalf("writeOrderedParallelBlastPayload() n = %d, want %d", n, len("payload"))
+	}
+	if len(state.writeBuf) != len("payload") {
+		t.Fatalf("state.writeBuf len = %d, want aggregated payload", len(state.writeBuf))
+	}
+	if out.Len() != 0 {
+		t.Fatalf("underlying writer len before ordered flush = %d, want 0", out.Len())
+	}
+	if err := buffered.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("underlying writer len before ordered flush after buffered Flush = %d, want 0", out.Len())
+	}
+	if err := flushOrderedParallelBlastPayload(buffered, state, &sync.Mutex{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := buffered.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); got != "payload" {
+		t.Fatalf("underlying writer = %q, want payload", got)
+	}
+}
+
+func TestBlastSeqSetTracksDenseAndSparseSequences(t *testing.T) {
+	var set blastSeqSet
+	for seq := uint64(0); seq < 130; seq++ {
+		if !set.Add(seq) {
+			t.Fatalf("Add(%d) = false, want first insert", seq)
+		}
+	}
+	if set.Add(64) {
+		t.Fatal("Add(64) duplicate = true, want false")
+	}
+	for _, seq := range []uint64{0, 63, 64, 129} {
+		if !set.Has(seq) {
+			t.Fatalf("Has(%d) = false, want true", seq)
+		}
+	}
+	if set.Has(130) {
+		t.Fatal("Has(130) = true, want false")
+	}
+	sparse := uint64(1 << 40)
+	if !set.Add(sparse) {
+		t.Fatal("Add(sparse) = false, want true")
+	}
+	if !set.Has(sparse) {
+		t.Fatal("Has(sparse) = false, want true")
+	}
+	if set.Len() != 131 {
+		t.Fatalf("Len() = %d, want 131", set.Len())
+	}
+}
+
+func TestWriteBlastBatchRetriesNoBufferSpace(t *testing.T) {
+	batcher := &transientNoBufferBatcher{}
+	packet := []byte("packet")
+
+	if err := writeBlastBatch(context.Background(), batcher, nil, [][]byte{packet}); err != nil {
+		t.Fatalf("writeBlastBatch() error = %v", err)
+	}
+	if batcher.calls != 2 {
+		t.Fatalf("calls = %d, want 2", batcher.calls)
+	}
+}
+
+func TestBlastSendReadsSourceInBatches(t *testing.T) {
+	src := bytes.Repeat([]byte("x"), 256*defaultChunkSize)
+	reader := &countingReader{r: bytes.NewReader(src)}
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := ReceiveToWriter(ctx, b, a.LocalAddr().String(), io.Discard, ReceiveConfig{Blast: true})
+		errCh <- err
+	}()
+
+	if _, err := Send(ctx, a, b.LocalAddr().String(), reader, SendConfig{Blast: true}); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("ReceiveToWriter() error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for receive: %v", ctx.Err())
+	}
+	if reader.reads > 8 {
+		t.Fatalf("source reads = %d, want batched reads", reader.reads)
+	}
+}
+
+func TestBlastRepairHistorySynthesizesLastPacketSize(t *testing.T) {
+	runID := testRunID(0x49)
+	history, err := newBlastRepairHistory(runID, 8, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer history.Close()
+	if err := history.Record(0, []byte("12345678")); err != nil {
+		t.Fatal(err)
+	}
+	if err := history.Record(1, []byte("abcdefgh")); err != nil {
+		t.Fatal(err)
+	}
+	if err := history.Record(2, []byte("xy")); err != nil {
+		t.Fatal(err)
+	}
+	history.totalBytes = 18
+	history.packets = 3
+
+	packet, err := UnmarshalPacket(history.packet(2), nil)
+	if err != nil {
+		t.Fatalf("UnmarshalPacket() error = %v", err)
+	}
+	if packet.Type != PacketTypeData || packet.RunID != runID || packet.Seq != 2 || packet.Offset != 16 {
+		t.Fatalf("packet = %+v, want repair data packet at seq 2 offset 16", packet)
+	}
+	if len(packet.Payload) != 2 {
+		t.Fatalf("len(packet.Payload) = %d, want 2", len(packet.Payload))
+	}
+	if !bytes.Equal(packet.Payload, []byte("xy")) {
+		t.Fatalf("packet.Payload = %q, want xy", packet.Payload)
+	}
+}
+
+func TestBlastRepairHistoryPacketBufferSynthesizesRepairPacket(t *testing.T) {
+	runID := testRunID(0x51)
+	history, err := newBlastRepairHistory(runID, 4, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer history.Close()
+
+	packet, err := history.packetBuffer(0, 0, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(packet[headerLen:], []byte("abcd"))
+	history.MarkComplete(4, 1)
+
+	got, err := UnmarshalPacket(history.packet(0), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Type != PacketTypeData || got.RunID != runID || got.Seq != 0 || got.Offset != 0 {
+		t.Fatalf("packet = %+v, want stored data packet", got)
+	}
+	if string(got.Payload) != "abcd" {
+		t.Fatalf("payload = %q, want abcd", got.Payload)
+	}
+}
+
+func TestBlastRepairHistoryWithoutPayloadsDoesNotSynthesizeData(t *testing.T) {
+	history := blastRepairHistory{
+		runID:      testRunID(0x4a),
+		chunkSize:  8,
+		totalBytes: 18,
+		packets:    3,
+	}
+
+	if packet := history.packet(2); packet != nil {
+		t.Fatalf("history.packet(2) = %d bytes, want nil without retained payloads", len(packet))
+	}
+}
+
+func TestBlastRepairHistoryTailPacketsUseRetainedPayloads(t *testing.T) {
+	runID := testRunID(0x50)
+	history, err := newBlastRepairHistory(runID, 4, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer history.Close()
+	for seq, payload := range [][]byte{
+		[]byte("0000"),
+		[]byte("1111"),
+		[]byte("2222"),
+		[]byte("3333"),
+	} {
+		if err := history.Record(uint64(seq), payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	history.MarkComplete(16, 4)
+
+	packets := history.tailPackets(8)
+	if len(packets) != 2 {
+		t.Fatalf("len(tailPackets) = %d, want 2", len(packets))
+	}
+	for i, wantSeq := range []uint64{2, 3} {
+		packet, err := UnmarshalPacket(packets[i], nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if packet.Type != PacketTypeData || packet.RunID != runID || packet.Seq != wantSeq {
+			t.Fatalf("packet %d = %+v, want data seq %d", i, packet, wantSeq)
+		}
+	}
+}
+
+func TestSendBlastRepairsSuppressesImmediateDuplicateSeqs(t *testing.T) {
+	runID := testRunID(0x4f)
+	history, err := newBlastRepairHistory(runID, 4, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer history.Close()
+	if err := history.Record(0, []byte("abcd")); err != nil {
+		t.Fatal(err)
+	}
+	history.MarkComplete(4, 1)
+
+	batcher := &capturingBatcher{}
+	stats := TransferStats{}
+	deduper := newBlastRepairDeduper()
+	payload := make([]byte, 8)
+	binary.BigEndian.PutUint64(payload, 0)
+	now := time.Now()
+
+	if err := sendBlastRepairs(context.Background(), batcher, nil, history, payload, &stats, deduper, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := sendBlastRepairs(context.Background(), batcher, nil, history, payload, &stats, deduper, now.Add(blastRepairResendInterval/2)); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(batcher.writes); got != 1 {
+		t.Fatalf("repair writes after immediate duplicate = %d, want 1", got)
+	}
+	if stats.Retransmits != 1 {
+		t.Fatalf("Retransmits after immediate duplicate = %d, want 1", stats.Retransmits)
+	}
+
+	if err := sendBlastRepairs(context.Background(), batcher, nil, history, payload, &stats, deduper, now.Add(blastRepairResendInterval+time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(batcher.writes); got != 2 {
+		t.Fatalf("repair writes after resend interval = %d, want 2", got)
+	}
+	if stats.Retransmits != 2 {
+		t.Fatalf("Retransmits after resend interval = %d, want 2", stats.Retransmits)
+	}
+}
+
+func TestReceiveBlastParallelToWriterCompletesAfterDataIdle(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	serverA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverA.Close()
+	serverB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverB.Close()
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	runID := testRunID(0x44)
+	payload := []byte("partial-blast")
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{serverA, serverB}, io.Discard, ReceiveConfig{Blast: true}, int64(len(payload)+1))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	writeProbePacket(t, client, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: runID})
+	writeProbePacket(t, client, serverA.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runID, Payload: payload})
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("parallel blast error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(payload)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(payload))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for data idle: %v", ctx.Err())
+	}
+}
+
+func TestReceiveBlastParallelToWriterClearsStaleReadDeadlines(t *testing.T) {
+	serverA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverA.Close()
+	serverB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverB.Close()
+	if err := serverA.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := serverB.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	clientA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientA.Close()
+	clientB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientB.Close()
+
+	srcA := bytes.Repeat([]byte("a"), 1024)
+	srcB := bytes.Repeat([]byte("b"), 1024)
+	total := int64(len(srcA) + len(srcB))
+	recvCtx, recvCancel := context.WithCancel(context.Background())
+	defer recvCancel()
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 2)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(recvCtx, []net.PacketConn{serverA, serverB}, io.Discard, ReceiveConfig{Blast: true}, total)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	sendCtx, sendCancel := context.WithTimeout(context.Background(), time.Second)
+	defer sendCancel()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if _, err := Send(sendCtx, clientA, serverA.LocalAddr().String(), bytes.NewReader(srcA), SendConfig{Blast: true}); err != nil {
+			errCh <- err
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if _, err := Send(sendCtx, clientB, serverB.LocalAddr().String(), bytes.NewReader(srcB), SendConfig{Blast: true}); err != nil {
+			errCh <- err
+		}
+	}()
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("parallel blast error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != total {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, total)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for parallel blast receive")
+	}
+}
+
+func TestReceiveBlastParallelToWriterErrorsWhenContextEndsBeforeExpectedBytes(t *testing.T) {
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, io.Discard, ReceiveConfig{Blast: true}, 1024)
+		errCh <- err
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("ReceiveBlastParallelToWriter() error = nil, want incomplete blast error")
+		}
+		if !strings.Contains(err.Error(), "blast incomplete") {
+			t.Fatalf("ReceiveBlastParallelToWriter() error = %v, want blast incomplete", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for context-canceled receive")
+	}
+}
+
+func TestReceiveBlastParallelToWriterErrorsWhenDoneCompletesWithNoExpectedBytes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, io.Discard, ReceiveConfig{Blast: true}, 1024)
+		errCh <- err
+	}()
+
+	writeProbePacket(t, client, server.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeDone, RunID: testRunID(0x50)})
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("ReceiveBlastParallelToWriter() error = nil, want incomplete blast error")
+		}
+		if !strings.Contains(err.Error(), "blast incomplete") {
+			t.Fatalf("ReceiveBlastParallelToWriter() error = %v, want blast incomplete", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for incomplete done receive: %v", ctx.Err())
+	}
+}
+
+func TestReceiveReliableParallelToWriterAggregatesFlows(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverA.Close()
+	serverB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverB.Close()
+	clientA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientA.Close()
+	clientB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientB.Close()
+
+	srcA := bytes.Repeat([]byte("a"), 1<<15)
+	srcB := bytes.Repeat([]byte("b"), 1<<15)
+	total := int64(len(srcA) + len(srcB))
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 2)
+	go func() {
+		stats, err := ReceiveReliableParallelToWriter(ctx, []net.PacketConn{serverA, serverB}, io.Discard, ReceiveConfig{}, total)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if _, err := Send(ctx, clientA, serverA.LocalAddr().String(), bytes.NewReader(srcA), SendConfig{}); err != nil {
+			errCh <- err
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if _, err := Send(ctx, clientB, serverB.LocalAddr().String(), bytes.NewReader(srcB), SendConfig{}); err != nil {
+			errCh <- err
+		}
+	}()
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("parallel reliable error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != total {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, total)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for parallel reliable receive: %v", ctx.Err())
+	}
+}
+
 type lossyPacketConn struct {
 	net.PacketConn
 	dropEvery int
@@ -309,6 +2714,80 @@ func (d *dropFirstDoneConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	return d.PacketConn.WriteTo(p, addr)
 }
 
+type dropFirstBlastDataConn struct {
+	net.PacketConn
+
+	mu      sync.Mutex
+	dropped bool
+}
+
+func (d *dropFirstBlastDataConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	packet, err := UnmarshalPacket(p, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.dropped && packet.Type == PacketTypeData {
+		d.dropped = true
+		return len(p), nil
+	}
+	return d.PacketConn.WriteTo(p, addr)
+}
+
+type dropRepairCompleteConn struct {
+	net.PacketConn
+}
+
+func (d *dropRepairCompleteConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	packet, err := UnmarshalPacket(p, nil)
+	if err != nil {
+		return 0, err
+	}
+	if packet.Type == PacketTypeRepairComplete {
+		return len(p), nil
+	}
+	return d.PacketConn.WriteTo(p, addr)
+}
+
+type reverseFirstTwoBlastDataConn struct {
+	net.PacketConn
+
+	mu     sync.Mutex
+	first  []byte
+	second []byte
+}
+
+func (d *reverseFirstTwoBlastDataConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	packet, err := UnmarshalPacket(p, nil)
+	if err != nil {
+		return 0, err
+	}
+	if packet.Type != PacketTypeData {
+		return d.PacketConn.WriteTo(p, addr)
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	switch {
+	case d.first == nil:
+		d.first = append([]byte(nil), p...)
+		return len(p), nil
+	case d.second == nil:
+		d.second = append([]byte(nil), p...)
+		if _, err := d.PacketConn.WriteTo(d.second, addr); err != nil {
+			return 0, err
+		}
+		if _, err := d.PacketConn.WriteTo(d.first, addr); err != nil {
+			return 0, err
+		}
+		return len(p), nil
+	default:
+		return d.PacketConn.WriteTo(p, addr)
+	}
+}
+
 type dropMatchingAckConn struct {
 	net.PacketConn
 	matchAckFloor uint64
@@ -331,6 +2810,35 @@ func (d *dropMatchingAckConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		return len(p), nil
 	}
 	return d.PacketConn.WriteTo(p, addr)
+}
+
+type transientNoBufferBatcher struct {
+	calls int
+}
+
+func (b *transientNoBufferBatcher) Capabilities() TransportCaps { return TransportCaps{} }
+func (b *transientNoBufferBatcher) MaxBatch() int               { return 1 }
+
+func (b *transientNoBufferBatcher) WriteBatch(context.Context, net.Addr, [][]byte) (int, error) {
+	b.calls++
+	if b.calls == 1 {
+		return 0, syscall.ENOBUFS
+	}
+	return 1, nil
+}
+
+func (b *transientNoBufferBatcher) ReadBatch(context.Context, time.Duration, []batchReadBuffer) (int, error) {
+	return 0, syscall.ENOBUFS
+}
+
+type countingReader struct {
+	r     *bytes.Reader
+	reads int
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	r.reads++
+	return r.r.Read(p)
 }
 
 func TestTransferSurvivesDroppedPackets(t *testing.T) {
@@ -604,6 +3112,125 @@ func TestReceiveAckSignalsAckMaskBoundaryAtPlus64(t *testing.T) {
 	}
 }
 
+func TestExtendedAckPayloadAcknowledgesBeyondAckMask(t *testing.T) {
+	buffered := map[uint64]Packet{
+		70:  {Type: PacketTypeData},
+		300: {Type: PacketTypeData},
+	}
+	payload := extendedAckPayloadFor(buffered, 1)
+	if len(payload) != extendedAckBytes {
+		t.Fatalf("extended ack payload len = %d, want %d", len(payload), extendedAckBytes)
+	}
+
+	inFlight := map[uint64]*outboundPacket{
+		70:  {seq: 70},
+		300: {seq: 300},
+		500: {seq: 500},
+	}
+	if got := applyAck(inFlight, 1, 0, payload); got != 2 {
+		t.Fatalf("applyAck() = %d, want 2", got)
+	}
+	if _, ok := inFlight[70]; ok {
+		t.Fatal("seq 70 still in flight")
+	}
+	if _, ok := inFlight[300]; ok {
+		t.Fatal("seq 300 still in flight")
+	}
+	if _, ok := inFlight[500]; !ok {
+		t.Fatal("seq 500 was unexpectedly acked")
+	}
+}
+
+func TestFillSendWindowRespectsAckFloorSpanAfterSACK(t *testing.T) {
+	batcher := &capturingBatcher{}
+	state := senderState{
+		src:       bytes.NewReader([]byte("abcdefgh")),
+		chunkSize: 1,
+		window:    4,
+		runID:     testRunID(21),
+		inFlight:  make(map[uint64]*outboundPacket),
+	}
+	stats := TransferStats{}
+	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+
+	if err := fillSendWindow(context.Background(), batcher, peer, &state, &stats); err != nil {
+		t.Fatalf("fillSendWindow() error = %v", err)
+	}
+	if state.nextSeq != 4 {
+		t.Fatalf("nextSeq after initial fill = %d, want 4", state.nextSeq)
+	}
+
+	if got := applyAck(state.inFlight, 0, 0b111, nil); got != 3 {
+		t.Fatalf("applyAck() = %d, want 3 SACKed packets", got)
+	}
+	if err := fillSendWindow(context.Background(), batcher, peer, &state, &stats); err != nil {
+		t.Fatalf("fillSendWindow() after SACK error = %v", err)
+	}
+	if state.nextSeq != 4 {
+		t.Fatalf("nextSeq after SACKed gap = %d, want 4 until cumulative ACK advances", state.nextSeq)
+	}
+
+	state.ackFloor = 4
+	if err := fillSendWindow(context.Background(), batcher, peer, &state, &stats); err != nil {
+		t.Fatalf("fillSendWindow() after ACK floor advance error = %v", err)
+	}
+	if state.nextSeq != 8 {
+		t.Fatalf("nextSeq after ACK floor advance = %d, want 8", state.nextSeq)
+	}
+}
+
+func TestFillSendWindowPacesReliableWrites(t *testing.T) {
+	batcher := &capturingBatcher{}
+	state := senderState{
+		src:       bytes.NewReader(bytes.Repeat([]byte("x"), 1000)),
+		chunkSize: 1000,
+		window:    1,
+		runID:     testRunID(22),
+		rateMbps:  1,
+		inFlight:  make(map[uint64]*outboundPacket),
+	}
+	stats := TransferStats{StartedAt: time.Now()}
+	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+
+	startedAt := time.Now()
+	if err := fillSendWindow(context.Background(), batcher, peer, &state, &stats); err != nil {
+		t.Fatalf("fillSendWindow() error = %v", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed < 2*time.Millisecond {
+		t.Fatalf("fillSendWindow() elapsed = %v, want pacing delay", elapsed)
+	}
+}
+
+type capturingBatcher struct {
+	mu     sync.Mutex
+	writes [][]byte
+}
+
+func (b *capturingBatcher) Capabilities() TransportCaps { return TransportCaps{Kind: "test"} }
+func (b *capturingBatcher) MaxBatch() int               { return 128 }
+
+func (b *capturingBatcher) WriteBatch(ctx context.Context, peer net.Addr, packets [][]byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, packet := range packets {
+		b.writes = append(b.writes, append([]byte(nil), packet...))
+	}
+	return len(packets), ctx.Err()
+}
+
+func (b *capturingBatcher) ReadBatch(ctx context.Context, timeout time.Duration, bufs []batchReadBuffer) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return 0, testTimeoutError{}
+}
+
+type testTimeoutError struct{}
+
+func (testTimeoutError) Error() string   { return "synthetic timeout" }
+func (testTimeoutError) Timeout() bool   { return true }
+func (testTimeoutError) Temporary() bool { return true }
+
 func TestReceiveIgnoresStaleFirstPacketBeforeHello(t *testing.T) {
 	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
@@ -830,6 +3457,131 @@ func (c *countingPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	c.writes++
 	c.mu.Unlock()
 	return c.PacketConn.WriteTo(p, addr)
+}
+
+type writeDeadlineRecordingPacketConn struct {
+	net.PacketConn
+
+	mu        sync.Mutex
+	deadlines []time.Time
+}
+
+func (c *writeDeadlineRecordingPacketConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.deadlines = append(c.deadlines, t)
+	c.mu.Unlock()
+	return c.PacketConn.SetWriteDeadline(t)
+}
+
+func (c *writeDeadlineRecordingPacketConn) writeDeadlines() []time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]time.Time(nil), c.deadlines...)
+}
+
+type readDeadlineRecordingPacketConn struct {
+	net.PacketConn
+
+	mu        sync.Mutex
+	deadlines []time.Time
+}
+
+func (c *readDeadlineRecordingPacketConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.deadlines = append(c.deadlines, t)
+	c.mu.Unlock()
+	return c.PacketConn.SetReadDeadline(t)
+}
+
+func (c *readDeadlineRecordingPacketConn) readDeadlines() []time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]time.Time(nil), c.deadlines...)
+}
+
+func TestWriteWithContextClearsWriteDeadline(t *testing.T) {
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	conn := &writeDeadlineRecordingPacketConn{PacketConn: a}
+	if _, err := writeWithContext(context.Background(), conn, b.LocalAddr(), []byte("hello")); err != nil {
+		t.Fatalf("writeWithContext() error = %v", err)
+	}
+
+	deadlines := conn.writeDeadlines()
+	if len(deadlines) != 2 {
+		t.Fatalf("SetWriteDeadline calls = %d, want 2 (%v)", len(deadlines), deadlines)
+	}
+	if deadlines[0].IsZero() {
+		t.Fatalf("first write deadline is zero, want bounded deadline")
+	}
+	if !deadlines[1].IsZero() {
+		t.Fatalf("last write deadline = %v, want zero deadline reset", deadlines[1])
+	}
+}
+
+func TestPerformHelloHandshakeClearsReadDeadline(t *testing.T) {
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	runID := testRunID(0x91)
+	errCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64<<10)
+		n, addr, err := server.ReadFrom(buf)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		packet, err := UnmarshalPacket(buf[:n], nil)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		if packet.Type != PacketTypeHello {
+			errCh <- errors.New("expected hello packet")
+			return
+		}
+		errCh <- sendHelloAck(context.Background(), server, addr, runID, 0, 1)
+	}()
+
+	conn := &readDeadlineRecordingPacketConn{PacketConn: client}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var stats TransferStats
+	if _, err := performHelloHandshake(ctx, conn, server.LocalAddr(), runID, 0, 1, &stats); err != nil {
+		t.Fatalf("performHelloHandshake() error = %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("server handshake error = %v", err)
+	}
+
+	deadlines := conn.readDeadlines()
+	if len(deadlines) < 2 {
+		t.Fatalf("SetReadDeadline calls = %d, want at least 2 (%v)", len(deadlines), deadlines)
+	}
+	if deadlines[len(deadlines)-2].IsZero() {
+		t.Fatalf("penultimate read deadline is zero, want bounded handshake deadline (%v)", deadlines)
+	}
+	if !deadlines[len(deadlines)-1].IsZero() {
+		t.Fatalf("last read deadline = %v, want zero deadline reset", deadlines[len(deadlines)-1])
+	}
 }
 
 type countingZeroReader struct {

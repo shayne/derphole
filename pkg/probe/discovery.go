@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/netip"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/shayne/derpcat/pkg/derpbind"
@@ -129,6 +131,23 @@ func CandidateStrings(raw []net.Addr) []string {
 	return out
 }
 
+func CandidateStringsInOrder(raw []net.Addr) []string {
+	out := make([]string, 0, len(raw))
+	seen := make(map[string]bool)
+	for _, addr := range raw {
+		if addr == nil {
+			continue
+		}
+		candidate := addr.String()
+		if candidate == "" || seen[candidate] {
+			continue
+		}
+		out = append(out, candidate)
+		seen[candidate] = true
+	}
+	return out
+}
+
 func preferredCandidates(raw []net.Addr, limit int) []net.Addr {
 	candidates := make([]net.Addr, 0, len(raw))
 	for _, addr := range raw {
@@ -212,6 +231,102 @@ func PunchAddrs(ctx context.Context, conn net.PacketConn, addrs []net.Addr, payl
 			send()
 		}
 	}
+}
+
+func ObservePunchAddrs(ctx context.Context, conns []net.PacketConn, wait time.Duration) []net.Addr {
+	observedByConn := ObservePunchAddrsByConn(ctx, conns, wait)
+	seen := make(map[string]net.Addr)
+	for _, observed := range observedByConn {
+		for _, addr := range observed {
+			if addr == nil {
+				continue
+			}
+			seen[addr.String()] = cloneAddr(addr)
+		}
+	}
+
+	out := make([]net.Addr, 0, len(seen))
+	for _, addr := range seen {
+		out = append(out, addr)
+	}
+	return preferredCandidates(out, len(out))
+}
+
+func ObservePunchAddrsByConn(ctx context.Context, conns []net.PacketConn, wait time.Duration) [][]net.Addr {
+	if wait <= 0 {
+		wait = 500 * time.Millisecond
+	}
+	observeCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+
+	observed := make([][]net.Addr, len(conns))
+	expected := int32(0)
+	for _, conn := range conns {
+		if conn != nil {
+			expected++
+		}
+	}
+	if expected == 0 {
+		return observed
+	}
+	var observedConns atomic.Int32
+	var wg sync.WaitGroup
+	for i, conn := range conns {
+		if conn == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, conn net.PacketConn) {
+			defer wg.Done()
+			defer conn.SetReadDeadline(time.Time{})
+			buf := make([]byte, 1500)
+			seen := make(map[string]net.Addr)
+			for {
+				if err := observeCtx.Err(); err != nil {
+					observed[i] = mapAddrs(seen)
+					return
+				}
+				deadline := time.Now().Add(50 * time.Millisecond)
+				if ctxDeadline, ok := observeCtx.Deadline(); ok && ctxDeadline.Before(deadline) {
+					deadline = ctxDeadline
+				}
+				if err := conn.SetReadDeadline(deadline); err != nil {
+					observed[i] = mapAddrs(seen)
+					return
+				}
+				n, addr, err := conn.ReadFrom(buf)
+				if err != nil {
+					if observeCtx.Err() != nil {
+						observed[i] = mapAddrs(seen)
+						return
+					}
+					if isNetTimeout(err) {
+						continue
+					}
+					observed[i] = mapAddrs(seen)
+					return
+				}
+				if string(buf[:n]) != defaultPunchPayload {
+					continue
+				}
+				firstForConn := len(seen) == 0
+				seen[addr.String()] = cloneAddr(addr)
+				if firstForConn && observedConns.Add(1) >= expected {
+					cancel()
+				}
+			}
+		}(i, conn)
+	}
+	wg.Wait()
+	return observed
+}
+
+func mapAddrs(seen map[string]net.Addr) []net.Addr {
+	out := make([]net.Addr, 0, len(seen))
+	for _, addr := range seen {
+		out = append(out, addr)
+	}
+	return preferredCandidates(out, len(out))
 }
 
 func PunchDirect(ctx context.Context, local net.PacketConn, remoteAddr string, remote net.PacketConn, localAddr string) (DirectResult, error) {

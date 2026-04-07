@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"strconv"
@@ -27,6 +28,7 @@ var listenPacket = net.ListenPacket
 var orchestrateDiscoverCandidates = DiscoverCandidates
 var orchestrateSend = Send
 var orchestrateReceive = ReceiveToWriter
+var orchestrateReceiveBlastParallel = ReceiveBlastParallelToWriter
 var orchestrateChildRun func(context.Context, OrchestrateConfig) (RunReport, error)
 
 func init() {
@@ -121,6 +123,26 @@ func (r SSHRunner) binaryPath() string {
 	return defaultProbeRemotePath
 }
 
+func sshProbeEnvVars() []string {
+	var env []string
+	if trace := strings.TrimSpace(os.Getenv("DERPCAT_PROBE_WG_TRACE")); trace != "" {
+		env = append(env, "DERPCAT_PROBE_WG_TRACE="+trace)
+	}
+	if trace := strings.TrimSpace(os.Getenv("DERPCAT_PROBE_TRACE")); trace != "" {
+		env = append(env, "DERPCAT_PROBE_TRACE="+trace)
+	}
+	if rate := strings.TrimSpace(os.Getenv("DERPCAT_PROBE_RATE_MBPS")); rate != "" {
+		env = append(env, "DERPCAT_PROBE_RATE_MBPS="+rate)
+	}
+	if requireComplete := strings.TrimSpace(os.Getenv("DERPCAT_PROBE_REQUIRE_COMPLETE")); requireComplete != "" {
+		env = append(env, "DERPCAT_PROBE_REQUIRE_COMPLETE="+requireComplete)
+	}
+	if repairPayloads := strings.TrimSpace(os.Getenv("DERPCAT_PROBE_REPAIR_PAYLOADS")); repairPayloads != "" {
+		env = append(env, "DERPCAT_PROBE_REPAIR_PAYLOADS="+repairPayloads)
+	}
+	return env
+}
+
 func (r SSHRunner) ServerCommand(cfg ServerConfig) []string {
 	listenAddr := cfg.ListenAddr
 	if listenAddr == "" {
@@ -145,8 +167,9 @@ func (r SSHRunner) ServerCommand(cfg ServerConfig) []string {
 	argv = append(argv,
 		r.target(),
 	)
-	if trace := strings.TrimSpace(os.Getenv("DERPCAT_PROBE_WG_TRACE")); trace != "" {
-		argv = append(argv, "env", "DERPCAT_PROBE_WG_TRACE="+trace)
+	if envVars := sshProbeEnvVars(); len(envVars) > 0 {
+		argv = append(argv, "env")
+		argv = append(argv, envVars...)
 	}
 	argv = append(argv,
 		r.binaryPath(),
@@ -176,7 +199,7 @@ func (r SSHRunner) ServerCommand(cfg ServerConfig) []string {
 	if cfg.SizeBytes > 0 {
 		argv = append(argv, "--size-bytes", strconv.FormatInt(cfg.SizeBytes, 10))
 	}
-	if cfg.Parallel > 1 && (mode == "wg" || mode == "wgos") {
+	if cfg.Parallel > 1 && (mode == "raw" || mode == "blast" || mode == "wg" || mode == "wgos") {
 		argv = append(argv, "--parallel", strconv.Itoa(cfg.Parallel))
 	}
 	return argv
@@ -202,8 +225,9 @@ func (r SSHRunner) ClientCommand(cfg ClientConfig) []string {
 	argv = append(argv,
 		r.target(),
 	)
-	if trace := strings.TrimSpace(os.Getenv("DERPCAT_PROBE_WG_TRACE")); trace != "" {
-		argv = append(argv, "env", "DERPCAT_PROBE_WG_TRACE="+trace)
+	if envVars := sshProbeEnvVars(); len(envVars) > 0 {
+		argv = append(argv, "env")
+		argv = append(argv, envVars...)
 	}
 	argv = append(argv,
 		r.binaryPath(),
@@ -235,8 +259,13 @@ func (r SSHRunner) ClientCommand(cfg ClientConfig) []string {
 	if cfg.WGPort > 0 {
 		argv = append(argv, "--wg-port", strconv.Itoa(cfg.WGPort))
 	}
-	if cfg.Parallel > 1 && (mode == "wg" || mode == "wgos") {
+	if cfg.Parallel > 1 && (mode == "raw" || mode == "blast" || mode == "wg" || mode == "wgos") {
 		argv = append(argv, "--parallel", strconv.Itoa(cfg.Parallel))
+	}
+	if mode == "blast" {
+		if rate := strings.TrimSpace(os.Getenv("DERPCAT_PROBE_RATE_MBPS")); rate != "" {
+			argv = append(argv, "--rate-mbps", rate)
+		}
 	}
 	return argv
 }
@@ -353,8 +382,8 @@ func RunOrchestrate(ctx context.Context, cfg OrchestrateConfig) (RunReport, erro
 	if cfg.Direction != "forward" && cfg.Direction != "reverse" {
 		return RunReport{}, fmt.Errorf("unsupported direction %q", cfg.Direction)
 	}
-	if cfg.Parallel > 1 && (cfg.Mode == "raw" || cfg.Mode == "blast") {
-		return runStripedOrchestrate(ctx, cfg)
+	if cfg.Parallel > 1 && cfg.Mode == "blast" {
+		return runParallelBlastOrchestrate(ctx, cfg)
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -385,46 +414,601 @@ func RunOrchestrate(ctx context.Context, cfg OrchestrateConfig) (RunReport, erro
 	return runForwardOrchestrate(runCtx, cfg, localConn, localCandidates, runner)
 }
 
-func runStripedOrchestrate(ctx context.Context, cfg OrchestrateConfig) (RunReport, error) {
-	shares := splitOrchestrateShares(cfg.SizeBytes, cfg.Parallel)
-	if len(shares) == 1 {
-		child := cfg
-		child.Parallel = 1
-		child.SizeBytes = shares[0]
-		return orchestrateChildRun(ctx, child)
-	}
-
+func runParallelBlastOrchestrate(ctx context.Context, cfg OrchestrateConfig) (RunReport, error) {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-
-	startedAt := time.Now()
-	type stripeResult struct {
-		report RunReport
-		err    error
+	if cfg.RemotePath == "" {
+		cfg.RemotePath = defaultProbeRemotePath
 	}
-	results := make(chan stripeResult, len(shares))
-	for _, share := range shares {
-		child := cfg
-		child.SizeBytes = share
-		child.Parallel = 1
-		go func(child OrchestrateConfig) {
-			report, err := orchestrateChildRun(runCtx, child)
-			if err != nil {
-				cancel()
+	if cfg.ListenAddr == "" {
+		cfg.ListenAddr = ":0"
+	}
+	runner := SSHRunner{
+		User:       cfg.User,
+		Host:       cfg.Host,
+		RemotePath: cfg.RemotePath,
+	}
+	if cfg.Direction == "reverse" {
+		return runReverseParallelBlastOrchestrate(runCtx, cfg, runner)
+	}
+	return runForwardParallelBlastOrchestrate(runCtx, cfg, runner)
+}
+
+func runForwardParallelBlastOrchestrate(runCtx context.Context, cfg OrchestrateConfig, runner SSHRunner) (RunReport, error) {
+	localConns, err := listenParallelPacketConns(runCtx, cfg.Parallel)
+	if err != nil {
+		return RunReport{}, err
+	}
+	defer closePacketConns(localConns)
+
+	localCandidates, err := discoverCandidatesForPacketConns(runCtx, localConns)
+	if err != nil {
+		return RunReport{}, err
+	}
+	localCandidates = limitCandidatesInOrder(localCandidates, parallelCandidateLimit(cfg.Parallel))
+	probeTracef("forward local candidates: %s", strings.Join(CandidateStringsInOrder(localCandidates), ","))
+
+	serverCfg := ServerConfig{
+		ListenAddr:        cfg.ListenAddr,
+		Mode:              cfg.Mode,
+		Transport:         cfg.Transport,
+		PeerCandidatesCSV: strings.Join(CandidateStringsInOrder(localCandidates), ","),
+		SizeBytes:         cfg.SizeBytes,
+		Parallel:          cfg.Parallel,
+	}
+	handle, err := launchRemoteServer(runCtx, runner, serverCfg)
+	if err != nil {
+		return RunReport{}, err
+	}
+	completed := false
+	defer func() {
+		if !completed && handle.wait != nil {
+			_ = handle.wait()
+		}
+	}()
+
+	var stderrBuf bytes.Buffer
+	var stderrWG sync.WaitGroup
+	if handle.stderr != nil {
+		stderrWG.Add(1)
+		go func() {
+			defer stderrWG.Done()
+			_, _ = io.Copy(traceStderrWriter(&stderrBuf), handle.stderr)
+		}()
+	}
+
+	events := make(chan outputEvent, 8)
+	go scanRemoteOutput(handle.stdout, events)
+
+	ready, err := waitForRemoteReady(runCtx, events, &stderrBuf)
+	if err != nil {
+		return RunReport{}, err
+	}
+	remoteCandidates := limitCandidatesInOrder(ParseCandidateStrings(ready.Candidates), parallelCandidateLimit(cfg.Parallel))
+	remoteAddrs := parallelCandidateStringsInOrder(remoteCandidates, len(localConns))
+	probeTracef("forward remote candidates: %s", strings.Join(CandidateStringsInOrder(remoteCandidates), ","))
+	probeTracef("forward initial remote addrs: %s", strings.Join(remoteAddrs, ","))
+	if len(remoteAddrs) == 0 && ready.Addr != "" {
+		remoteAddrs = []string{ready.Addr}
+	}
+	if len(remoteAddrs) == 0 {
+		return RunReport{}, errors.New("remote server did not report usable parallel blast candidates")
+	}
+	if len(localConns) > len(remoteAddrs) {
+		localConns = localConns[:len(remoteAddrs)]
+	}
+
+	punchCtx, punchCancel := context.WithCancel(runCtx)
+	defer punchCancel()
+	for _, conn := range localConns {
+		go PunchAddrs(punchCtx, conn, remoteCandidates, []byte(defaultPunchPayload), defaultPunchInterval)
+	}
+	if observedByConn := ObservePunchAddrsByConn(runCtx, localConns, 1200*time.Millisecond); len(observedByConn) > 0 {
+		probeTracef("forward observed punch addrs by conn: %s", formatObservedAddrsByConn(observedByConn))
+		remoteAddrs = selectRemoteAddrsByConn(observedByConn, remoteAddrs, len(localConns))
+	}
+	probeTracef("forward selected remote addrs: %s", strings.Join(remoteAddrs, ","))
+
+	sendStats, err := sendParallelBlastShares(runCtx, localConns, remoteAddrs, cfg)
+	punchCancel()
+	if err != nil {
+		return RunReport{}, err
+	}
+
+	done, err := waitForRemoteDone(runCtx, events, &stderrBuf)
+	if err != nil {
+		return RunReport{}, err
+	}
+	if handle.wait != nil {
+		if err := handle.wait(); err != nil {
+			if msg := strings.TrimSpace(stderrBuf.String()); msg != "" {
+				return RunReport{}, fmt.Errorf("remote server failed: %w: %s", err, msg)
 			}
-			results <- stripeResult{report: report, err: err}
-		}(child)
+			return RunReport{}, err
+		}
+	}
+	stderrWG.Wait()
+	completed = true
+
+	durationMS := done.DurationMS
+	if durationMS <= 0 {
+		durationMS = elapsedMS(sendStats.StartedAt, sendStats.CompletedAt)
+	}
+	bytesReceived := done.BytesReceived
+	if bytesReceived <= 0 {
+		bytesReceived = sendStats.BytesSent
+	}
+	if err := requireExpectedBytes(bytesReceived, cfg.SizeBytes); err != nil {
+		return RunReport{}, err
+	}
+	return RunReport{
+		Host:          cfg.Host,
+		Mode:          cfg.Mode,
+		Transport:     cfg.Transport,
+		Direction:     cfg.Direction,
+		SizeBytes:     cfg.SizeBytes,
+		BytesReceived: bytesReceived,
+		DurationMS:    durationMS,
+		GoodputMbps:   goodputMbps(bytesReceived, durationMS),
+		Direct:        true,
+		FirstByteMS:   done.FirstByteMS,
+		LossRate:      retransmitRatio(sendStats.Retransmits, sendStats.PacketsSent),
+		Retransmits:   sendStats.Retransmits,
+		Local:         sendStats.Transport,
+		Remote:        ready.Transport,
+	}, nil
+}
+
+func runReverseParallelBlastOrchestrate(runCtx context.Context, cfg OrchestrateConfig, runner SSHRunner) (RunReport, error) {
+	localConns, err := listenParallelPacketConns(runCtx, cfg.Parallel)
+	if err != nil {
+		return RunReport{}, err
+	}
+	defer closePacketConns(localConns)
+
+	localCandidates, err := discoverCandidatesForPacketConns(runCtx, localConns)
+	if err != nil {
+		return RunReport{}, err
+	}
+	localCandidates = limitCandidatesInOrder(localCandidates, parallelCandidateLimit(cfg.Parallel))
+	probeTracef("reverse local candidates: %s", strings.Join(CandidateStringsInOrder(localCandidates), ","))
+
+	clientCfg := ClientConfig{
+		Mode:              cfg.Mode,
+		Transport:         cfg.Transport,
+		SizeBytes:         cfg.SizeBytes,
+		PeerCandidatesCSV: strings.Join(CandidateStringsInOrder(localCandidates), ","),
+		Parallel:          cfg.Parallel,
+	}
+	handle, err := launchRemoteClient(runCtx, runner, clientCfg)
+	if err != nil {
+		return RunReport{}, err
+	}
+	completed := false
+	defer func() {
+		if !completed && handle.wait != nil {
+			_ = handle.wait()
+		}
+	}()
+
+	var stderrBuf bytes.Buffer
+	var stderrWG sync.WaitGroup
+	if handle.stderr != nil {
+		stderrWG.Add(1)
+		go func() {
+			defer stderrWG.Done()
+			_, _ = io.Copy(traceStderrWriter(&stderrBuf), handle.stderr)
+		}()
 	}
 
-	reports := make([]RunReport, 0, len(shares))
-	for range shares {
+	events := make(chan outputEvent, 8)
+	go scanRemoteOutput(handle.stdout, events)
+
+	ready, err := waitForRemoteReady(runCtx, events, &stderrBuf)
+	if err != nil {
+		return RunReport{}, err
+	}
+	remoteCandidates := limitCandidatesInOrder(ParseCandidateStrings(ready.Candidates), parallelCandidateLimit(cfg.Parallel))
+	probeTracef("reverse remote candidates: %s", strings.Join(CandidateStringsInOrder(remoteCandidates), ","))
+
+	punchCtx, punchCancel := context.WithCancel(runCtx)
+	defer punchCancel()
+	for _, conn := range localConns {
+		go PunchAddrs(punchCtx, conn, remoteCandidates, []byte(defaultPunchPayload), defaultPunchInterval)
+	}
+
+	recvCtx, recvCancel := context.WithCancel(runCtx)
+	defer recvCancel()
+	type receiveResult struct {
+		stats TransferStats
+		err   error
+	}
+	type doneResult struct {
+		done remoteDone
+		err  error
+	}
+	recvCh := make(chan receiveResult, 1)
+	doneCh := make(chan doneResult, 1)
+	go func() {
+		stats, err := orchestrateReceiveBlastParallel(recvCtx, localConns, io.Discard, ReceiveConfig{
+			Blast:           true,
+			Transport:       cfg.Transport,
+			RequireComplete: probeRequireComplete(),
+		}, cfg.SizeBytes)
+		recvCh <- receiveResult{stats: stats, err: err}
+	}()
+	go func() {
+		done, err := waitForRemoteDone(runCtx, events, &stderrBuf)
+		doneCh <- doneResult{done: done, err: err}
+	}()
+
+	var recvStats TransferStats
+	var done remoteDone
+	var gotRecv, gotDone bool
+	for !gotRecv || !gotDone {
+		select {
+		case result := <-recvCh:
+			if result.err != nil {
+				recvCancel()
+				punchCancel()
+				return RunReport{}, result.err
+			}
+			recvStats = result.stats
+			gotRecv = true
+		case result := <-doneCh:
+			if result.err != nil {
+				recvCancel()
+				punchCancel()
+				return RunReport{}, result.err
+			}
+			done = result.done
+			gotDone = true
+		case <-runCtx.Done():
+			recvCancel()
+			punchCancel()
+			return RunReport{}, runCtx.Err()
+		}
+	}
+	punchCancel()
+	if handle.wait != nil {
+		if err := handle.wait(); err != nil {
+			if msg := strings.TrimSpace(stderrBuf.String()); msg != "" {
+				return RunReport{}, fmt.Errorf("remote client failed: %w: %s", err, msg)
+			}
+			return RunReport{}, err
+		}
+	}
+	stderrWG.Wait()
+	completed = true
+
+	durationMS := elapsedMS(recvStats.StartedAt, recvStats.CompletedAt)
+	if durationMS <= 0 {
+		durationMS = done.DurationMS
+	}
+	bytesReceived := recvStats.BytesReceived
+	if bytesReceived <= 0 {
+		bytesReceived = done.BytesSent
+	}
+	if err := requireExpectedBytes(bytesReceived, cfg.SizeBytes); err != nil {
+		return RunReport{}, err
+	}
+	return RunReport{
+		Host:          cfg.Host,
+		Mode:          cfg.Mode,
+		Transport:     cfg.Transport,
+		Direction:     cfg.Direction,
+		SizeBytes:     cfg.SizeBytes,
+		BytesReceived: bytesReceived,
+		DurationMS:    durationMS,
+		GoodputMbps:   goodputMbps(bytesReceived, durationMS),
+		Direct:        true,
+		FirstByteMS:   elapsedMS(recvStats.StartedAt, recvStats.FirstByteAt),
+		LossRate:      retransmitRatio(done.Retransmits, done.PacketsSent),
+		Retransmits:   done.Retransmits,
+		Local:         recvStats.Transport,
+		Remote:        ready.Transport,
+	}, nil
+}
+
+func listenParallelPacketConns(ctx context.Context, parallel int) ([]net.PacketConn, error) {
+	if parallel <= 0 {
+		parallel = 1
+	}
+	conns := make([]net.PacketConn, 0, parallel)
+	for len(conns) < parallel {
+		if err := ctx.Err(); err != nil {
+			closePacketConns(conns)
+			return nil, err
+		}
+		conn, err := listenPacket("udp", ":0")
+		if err != nil {
+			closePacketConns(conns)
+			return nil, err
+		}
+		conns = append(conns, conn)
+	}
+	return conns, nil
+}
+
+func closePacketConns(conns []net.PacketConn) {
+	for _, conn := range conns {
+		if conn != nil {
+			_ = conn.Close()
+		}
+	}
+}
+
+func discoverCandidatesForPacketConns(ctx context.Context, conns []net.PacketConn) ([]net.Addr, error) {
+	type result struct {
+		index int
+		addrs []net.Addr
+		err   error
+	}
+	results := make(chan result, len(conns))
+	var wg sync.WaitGroup
+	for i, conn := range conns {
+		if conn == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, conn net.PacketConn) {
+			defer wg.Done()
+			addrs, err := orchestrateDiscoverCandidates(ctx, conn)
+			results <- result{index: i, addrs: addrs, err: err}
+		}(i, conn)
+	}
+	wg.Wait()
+	close(results)
+
+	byConn := make([][]net.Addr, len(conns))
+	seen := make(map[string]net.Addr)
+	var firstErr error
+	for result := range results {
+		if result.err != nil && firstErr == nil {
+			firstErr = result.err
+		}
+		if result.index >= 0 && result.index < len(byConn) {
+			byConn[result.index] = result.addrs
+		}
+	}
+	out := make([]net.Addr, 0)
+	for _, addrs := range byConn {
+		for _, addr := range preferredCandidates(addrs, 1) {
+			if addr == nil || seen[addr.String()] != nil {
+				continue
+			}
+			seen[addr.String()] = addr
+			out = append(out, addr)
+		}
+	}
+	for _, addrs := range byConn {
+		for _, addr := range addrs {
+			if addr == nil {
+				continue
+			}
+			if seen[addr.String()] != nil {
+				continue
+			}
+			seen[addr.String()] = addr
+			out = append(out, addr)
+		}
+	}
+	if len(out) == 0 && firstErr != nil {
+		return nil, firstErr
+	}
+	return out, nil
+}
+
+func parallelCandidateLimit(parallel int) int {
+	if parallel < 1 {
+		parallel = 1
+	}
+	limit := parallel * 8
+	if limit < 8 {
+		return 8
+	}
+	return limit
+}
+
+func parallelCandidateStrings(candidates []net.Addr, parallel int) []string {
+	if parallel <= 0 {
+		parallel = 1
+	}
+	ordered := preferredCandidates(candidates, len(candidates))
+	out := make([]string, 0, parallel)
+	seen := make(map[string]bool)
+	seenPort := make(map[int]bool)
+	for _, addr := range ordered {
+		udpAddr, ok := addr.(*net.UDPAddr)
+		if !ok || seenPort[udpAddr.Port] {
+			continue
+		}
+		candidate := addr.String()
+		out = append(out, candidate)
+		seen[candidate] = true
+		seenPort[udpAddr.Port] = true
+		if len(out) == parallel {
+			return out
+		}
+	}
+	for _, addr := range ordered {
+		candidate := addr.String()
+		if candidate == "" || seen[candidate] {
+			continue
+		}
+		out = append(out, candidate)
+		seen[candidate] = true
+		if len(out) == parallel {
+			return out
+		}
+	}
+	return out
+}
+
+func parallelCandidateStringsInOrder(candidates []net.Addr, parallel int) []string {
+	if parallel <= 0 {
+		parallel = 1
+	}
+	out := make([]string, 0, parallel)
+	seen := make(map[string]bool)
+	seenPort := make(map[int]bool)
+	for _, addr := range candidates {
+		udpAddr, ok := addr.(*net.UDPAddr)
+		if !ok || seenPort[udpAddr.Port] {
+			continue
+		}
+		candidate := addr.String()
+		if candidate == "" || seen[candidate] {
+			continue
+		}
+		out = append(out, candidate)
+		seen[candidate] = true
+		seenPort[udpAddr.Port] = true
+		if len(out) == parallel {
+			return out
+		}
+	}
+	for _, candidate := range CandidateStringsInOrder(candidates) {
+		if candidate == "" || seen[candidate] {
+			continue
+		}
+		out = append(out, candidate)
+		seen[candidate] = true
+		if len(out) == parallel {
+			return out
+		}
+	}
+	return out
+}
+
+func limitCandidatesInOrder(candidates []net.Addr, limit int) []net.Addr {
+	if limit <= 0 || len(candidates) <= limit {
+		return candidates
+	}
+	return candidates[:limit]
+}
+
+func selectRemoteAddrsByConn(observedByConn [][]net.Addr, fallback []string, parallel int) []string {
+	if parallel <= 0 {
+		parallel = len(fallback)
+	}
+	out := make([]string, parallel)
+	seen := make(map[string]bool)
+	seenEndpoint := make(map[string]bool)
+	for i := 0; i < parallel && i < len(observedByConn); i++ {
+		for _, candidate := range parallelCandidateStrings(observedByConn[i], len(observedByConn[i])) {
+			endpoint := remoteCandidateEndpointKey(candidate)
+			if candidate == "" || seen[candidate] || seenEndpoint[endpoint] {
+				continue
+			}
+			out[i] = candidate
+			seen[candidate] = true
+			seenEndpoint[endpoint] = true
+			break
+		}
+	}
+	for i := range out {
+		if out[i] != "" {
+			continue
+		}
+		for _, candidate := range fallback {
+			endpoint := remoteCandidateEndpointKey(candidate)
+			if candidate == "" || seen[candidate] || seenEndpoint[endpoint] {
+				continue
+			}
+			out[i] = candidate
+			seen[out[i]] = true
+			seenEndpoint[endpoint] = true
+			break
+		}
+	}
+
+	return out
+}
+
+func remoteCandidateEndpointKey(candidate string) string {
+	addrPort, err := netip.ParseAddrPort(candidate)
+	if err != nil {
+		return candidate
+	}
+	return strconv.Itoa(int(addrPort.Port()))
+}
+
+func formatObservedAddrsByConn(observedByConn [][]net.Addr) string {
+	parts := make([]string, 0, len(observedByConn))
+	for i, observed := range observedByConn {
+		parts = append(parts, fmt.Sprintf("%d=%s", i, strings.Join(parallelCandidateStrings(observed, len(observed)), "|")))
+	}
+	return strings.Join(parts, ",")
+}
+
+func sendParallelBlastShares(ctx context.Context, conns []net.PacketConn, remotes []string, cfg OrchestrateConfig) (TransferStats, error) {
+	conns, remotes = parallelBlastPairs(conns, remotes)
+	if len(conns) == 0 || len(remotes) == 0 {
+		return TransferStats{}, errors.New("parallel blast requires local sockets and remote candidates")
+	}
+	shares := splitOrchestrateShares(cfg.SizeBytes, len(conns))
+	rateMbps := perShareRateMbps(probeRateMbps(), len(conns))
+	startedAt := time.Now()
+	type result struct {
+		stats TransferStats
+		err   error
+	}
+	results := make(chan result, len(conns))
+	for i, conn := range conns {
+		share := shares[i]
+		remote := remotes[i]
+		go func(conn net.PacketConn, remote string, share int64) {
+			probeTracef("forward sending share bytes=%d remote=%s local=%s", share, remote, conn.LocalAddr())
+			stats, err := orchestrateSend(ctx, conn, remote, newSizedReader(share), SendConfig{
+				Blast:          true,
+				Transport:      cfg.Transport,
+				ChunkSize:      probeChunkSize(),
+				WindowSize:     probeWindowSize(cfg.Mode, cfg.Transport),
+				Parallel:       1,
+				RateMbps:       rateMbps,
+				RepairPayloads: probeRepairPayloads(),
+			})
+			results <- result{stats: stats, err: err}
+		}(conn, remote, share)
+	}
+
+	out := TransferStats{StartedAt: startedAt}
+	for range conns {
 		result := <-results
 		if result.err != nil {
-			return RunReport{}, result.err
+			return TransferStats{}, result.err
 		}
-		reports = append(reports, result.report)
+		out.BytesSent += result.stats.BytesSent
+		out.PacketsSent += result.stats.PacketsSent
+		out.PacketsAcked += result.stats.PacketsAcked
+		out.Retransmits += result.stats.Retransmits
+		if !result.stats.FirstByteAt.IsZero() && (out.FirstByteAt.IsZero() || result.stats.FirstByteAt.Before(out.FirstByteAt)) {
+			out.FirstByteAt = result.stats.FirstByteAt
+		}
+		if out.Transport.Kind == "" {
+			out.Transport = result.stats.Transport
+		}
 	}
-	return aggregateStripedReports(cfg, startedAt, reports), nil
+	out.CompletedAt = time.Now()
+	return out, nil
+}
+
+func parallelBlastPairs(conns []net.PacketConn, remotes []string) ([]net.PacketConn, []string) {
+	limit := len(conns)
+	if len(remotes) < limit {
+		limit = len(remotes)
+	}
+	pairedConns := make([]net.PacketConn, 0, limit)
+	pairedRemotes := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
+		if conns[i] == nil || remotes[i] == "" {
+			continue
+		}
+		pairedConns = append(pairedConns, conns[i])
+		pairedRemotes = append(pairedRemotes, remotes[i])
+	}
+	return pairedConns, pairedRemotes
 }
 
 func splitOrchestrateShares(total int64, parallel int) []int64 {
@@ -452,39 +1036,18 @@ func splitOrchestrateShares(total int64, parallel int) []int64 {
 	return shares
 }
 
-func aggregateStripedReports(cfg OrchestrateConfig, startedAt time.Time, reports []RunReport) RunReport {
-	aggregate := RunReport{
-		Host:      cfg.Host,
-		Mode:      cfg.Mode,
-		Transport: cfg.Transport,
-		Direction: cfg.Direction,
-		SizeBytes: cfg.SizeBytes,
-		Direct:    true,
+func perShareRateMbps(totalRateMbps int, shares int) int {
+	if totalRateMbps <= 0 {
+		return 0
 	}
-	var weightedLoss float64
-	var weightedBytes int64
-	for i, report := range reports {
-		aggregate.BytesReceived += report.BytesReceived
-		aggregate.Retransmits += report.Retransmits
-		if report.FirstByteMS > 0 && (aggregate.FirstByteMS == 0 || report.FirstByteMS < aggregate.FirstByteMS) {
-			aggregate.FirstByteMS = report.FirstByteMS
-		}
-		aggregate.Direct = aggregate.Direct && report.Direct
-		if report.BytesReceived > 0 {
-			weightedLoss += report.LossRate * float64(report.BytesReceived)
-			weightedBytes += report.BytesReceived
-		}
-		if i == 0 {
-			aggregate.Local = report.Local
-			aggregate.Remote = report.Remote
-		}
+	if shares <= 1 {
+		return totalRateMbps
 	}
-	if weightedBytes > 0 {
-		aggregate.LossRate = weightedLoss / float64(weightedBytes)
+	rate := totalRateMbps / shares
+	if rate <= 0 {
+		return 1
 	}
-	aggregate.DurationMS = time.Since(startedAt).Milliseconds()
-	aggregate.GoodputMbps = goodputMbps(aggregate.BytesReceived, aggregate.DurationMS)
-	return aggregate
+	return rate
 }
 
 func runForwardOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localConn net.PacketConn, localCandidates []net.Addr, runner SSHRunner) (RunReport, error) {
@@ -596,11 +1159,14 @@ func runForwardOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localC
 		})
 	} else {
 		sendStats, err = orchestrateSend(runCtx, localConn, remoteAddr, src, SendConfig{
-			Raw:        cfg.Mode == "raw",
-			Blast:      cfg.Mode == "blast",
-			Transport:  cfg.Transport,
-			ChunkSize:  probeChunkSize(),
-			WindowSize: probeWindowSize(cfg.Mode, cfg.Transport),
+			Raw:            cfg.Mode == "raw",
+			Blast:          cfg.Mode == "blast",
+			Transport:      cfg.Transport,
+			ChunkSize:      probeChunkSize(),
+			WindowSize:     probeWindowSize(cfg.Mode, cfg.Transport),
+			Parallel:       cfg.Parallel,
+			RateMbps:       probeRateMbps(),
+			RepairPayloads: probeRepairPayloads(),
 		})
 	}
 	punchCancel()
@@ -631,6 +1197,9 @@ func runForwardOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localC
 	bytesReceived := done.BytesReceived
 	if bytesReceived <= 0 {
 		bytesReceived = cfg.SizeBytes
+	}
+	if err := requireExpectedBytes(bytesReceived, cfg.SizeBytes); err != nil {
+		return RunReport{}, err
 	}
 
 	report := RunReport{
@@ -752,10 +1321,15 @@ func runReverseOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localC
 				Streams:        cfg.Parallel,
 				SizeBytes:      cfg.SizeBytes,
 			})
+		} else if cfg.Mode == "blast" {
+			stats, err = orchestrateReceiveBlastParallel(recvCtx, []net.PacketConn{localConn}, io.Discard, ReceiveConfig{
+				Blast:           true,
+				Transport:       cfg.Transport,
+				RequireComplete: probeRequireComplete(),
+			}, cfg.SizeBytes)
 		} else {
 			stats, err = orchestrateReceive(recvCtx, localConn, "", io.Discard, ReceiveConfig{
 				Raw:       cfg.Mode == "raw",
-				Blast:     cfg.Mode == "blast",
 				Transport: cfg.Transport,
 			})
 		}
@@ -811,6 +1385,9 @@ func runReverseOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localC
 	bytesReceived := recvStats.BytesReceived
 	if bytesReceived <= 0 {
 		bytesReceived = done.BytesSent
+	}
+	if err := requireExpectedBytes(bytesReceived, cfg.SizeBytes); err != nil {
+		return RunReport{}, err
 	}
 
 	return RunReport{
@@ -933,6 +1510,9 @@ func runWireGuardOSIperfOrchestrate(runCtx context.Context, cfg OrchestrateConfi
 	bytesReceived := sendStats.BytesReceived
 	if bytesReceived <= 0 {
 		bytesReceived = done.BytesReceived
+	}
+	if err := requireExpectedBytes(bytesReceived, cfg.SizeBytes); err != nil {
+		return RunReport{}, err
 	}
 	return RunReport{
 		Host:          cfg.Host,
@@ -1057,9 +1637,6 @@ func (r *sizedReader) Read(p []byte) (int, error) {
 	if int64(n) > r.remaining {
 		n = int(r.remaining)
 	}
-	for i := 0; i < n; i++ {
-		p[i] = 0
-	}
 	r.remaining -= int64(n)
 	if n == 0 {
 		return 0, io.EOF
@@ -1088,6 +1665,13 @@ func elapsedMS(start, end time.Time) int64 {
 	return end.Sub(start).Milliseconds()
 }
 
+func requireExpectedBytes(received, expected int64) error {
+	if expected <= 0 || received == expected {
+		return nil
+	}
+	return fmt.Errorf("received %d bytes, want %d", received, expected)
+}
+
 func probeWindowSize(mode, transport string) int {
 	if raw := strings.TrimSpace(os.Getenv("DERPCAT_PROBE_WINDOW")); raw != "" {
 		return envPositiveInt("DERPCAT_PROBE_WINDOW", defaultProbeWindowSize)
@@ -1108,6 +1692,23 @@ func probeChunkSize() int {
 	return envPositiveInt("DERPCAT_PROBE_CHUNK_SIZE", defaultChunkSize)
 }
 
+func probeRateMbps() int {
+	return envPositiveInt("DERPCAT_PROBE_RATE_MBPS", 0)
+}
+
+func probeRequireComplete() bool {
+	return envBool("DERPCAT_PROBE_REQUIRE_COMPLETE")
+}
+
+func probeRepairPayloads() bool {
+	return envBool("DERPCAT_PROBE_REPAIR_PAYLOADS")
+}
+
+func envBool(key string) bool {
+	raw := strings.TrimSpace(os.Getenv(key))
+	return raw == "1" || strings.EqualFold(raw, "true") || strings.EqualFold(raw, "yes")
+}
+
 func envPositiveInt(key string, fallback int) int {
 	raw := strings.TrimSpace(os.Getenv(key))
 	if raw == "" {
@@ -1118,4 +1719,18 @@ func envPositiveInt(key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func probeTracef(format string, args ...any) {
+	if strings.TrimSpace(os.Getenv("DERPCAT_PROBE_TRACE")) == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "probe-trace: "+format+"\n", args...)
+}
+
+func traceStderrWriter(buf *bytes.Buffer) io.Writer {
+	if strings.TrimSpace(os.Getenv("DERPCAT_PROBE_TRACE")) == "" {
+		return buf
+	}
+	return io.MultiWriter(buf, os.Stderr)
 }

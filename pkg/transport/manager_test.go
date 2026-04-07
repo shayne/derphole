@@ -300,6 +300,44 @@ func TestManagerStopDirectWaitsForActiveDiscoveryWorker(t *testing.T) {
 	}
 }
 
+func TestManagerStopDirectReadsLeavesDiscoveryActive(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000017, 0))
+	relay := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	relay.useClock(clock)
+	direct.useClock(clock)
+
+	peerCandidate := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 17), Port: 21717}
+	mgr := NewManager(ManagerConfig{
+		RelayConn:               relay,
+		DirectConn:              direct,
+		Clock:                   clock,
+		DiscoveryInterval:       1 * time.Second,
+		EndpointRefreshInterval: 2 * time.Second,
+		DirectStaleTimeout:      4 * time.Second,
+	})
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if !direct.waitForReadAttempts(1, time.Second) {
+		t.Fatal("manager did not enter the direct read loop")
+	}
+
+	mgr.StopDirectReads()
+
+	before := direct.writeCountTo(peerCandidate)
+	mgr.SeedRemoteCandidates(ctx, []net.Addr{peerCandidate})
+	if !direct.waitForWriteCountTo(peerCandidate, before+1, 200*time.Millisecond) {
+		t.Fatalf("manager did not probe seeded candidate after StopDirectReads(); writes before=%d after=%d", before, direct.writeCountTo(peerCandidate))
+	}
+}
+
 func TestManagerReadsBatchedDirectPayloadsFromBatchConn(t *testing.T) {
 	t.Helper()
 

@@ -21,6 +21,7 @@ import (
 )
 
 const wireGuardSocketBufferSize = 7 << 20
+const derpDirectReceivePoll = 2 * time.Millisecond
 
 type BindConfig struct {
 	PacketConn     net.PacketConn
@@ -144,7 +145,6 @@ func (b *Bind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	b.opened = true
 
 	if state.derp != nil && !state.peerDERP.IsZero() {
-		go state.readUDP()
 		go state.readDERP()
 	}
 
@@ -305,23 +305,77 @@ func (s *bindState) receive(packets [][]byte, sizes []int, eps []conn.Endpoint) 
 		}
 		return s.receiveDirectUDP(packets, sizes, eps)
 	}
-	select {
-	case pkt := <-s.recvCh:
-		n := fillReceivePacket(packets[0], sizes, eps, 0, pkt)
-		for n < len(packets) {
-			select {
-			case pkt := <-s.recvCh:
-				n = fillReceivePacket(packets[n], sizes, eps, n, pkt)
-			default:
-				return n, nil
+	return s.receiveDERPMultiplexed(packets, sizes, eps)
+}
+
+func (s *bindState) receiveDERPMultiplexed(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
+	for {
+		if s.parent != nil && s.parent.directConfirmed() {
+			n, err := s.receiveDirectWithTimeout(packets, sizes, eps, 0)
+			if n > 0 || nonTimeoutErr(err) {
+				return n, err
 			}
 		}
-		return n, nil
-	case err := <-s.errCh:
-		return 0, err
-	case <-s.closeCtx.Done():
-		return 0, net.ErrClosed
+
+		select {
+		case pkt := <-s.recvCh:
+			return s.fillRelayReceiveBatch(packets, sizes, eps, pkt), nil
+		case err := <-s.errCh:
+			return 0, err
+		case <-s.closeCtx.Done():
+			return 0, net.ErrClosed
+		default:
+		}
+
+		n, err := s.receiveDirectWithTimeout(packets, sizes, eps, derpDirectReceivePoll)
+		if n > 0 || nonTimeoutErr(err) {
+			return n, err
+		}
+
+		select {
+		case pkt := <-s.recvCh:
+			return s.fillRelayReceiveBatch(packets, sizes, eps, pkt), nil
+		case err := <-s.errCh:
+			return 0, err
+		case <-s.closeCtx.Done():
+			return 0, net.ErrClosed
+		default:
+		}
 	}
+}
+
+func (s *bindState) receiveDirectWithTimeout(packets [][]byte, sizes []int, eps []conn.Endpoint, timeout time.Duration) (int, error) {
+	if s.conn != nil && timeout > 0 {
+		if err := s.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+			return 0, err
+		}
+		defer s.conn.SetReadDeadline(time.Time{})
+	}
+	if s.batched != nil {
+		return s.receiveDirectBatch(packets, sizes, eps)
+	}
+	return s.receiveDirectUDP(packets, sizes, eps)
+}
+
+func (s *bindState) fillRelayReceiveBatch(packets [][]byte, sizes []int, eps []conn.Endpoint, pkt inboundPacket) int {
+	n := fillReceivePacket(packets[0], sizes, eps, 0, pkt)
+	for n < len(packets) {
+		select {
+		case pkt := <-s.recvCh:
+			n = fillReceivePacket(packets[n], sizes, eps, n, pkt)
+		default:
+			return n
+		}
+	}
+	return n
+}
+
+func nonTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	return !errors.As(err, &netErr) || !netErr.Timeout()
 }
 
 func (s *bindState) receiveDirectBatch(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
@@ -414,76 +468,6 @@ func (s *bindState) receiveDirectUDP(packets [][]byte, sizes []int, eps []conn.E
 		sizes[0] = n
 		eps[0] = &Endpoint{addrPort: netip.AddrPortFrom(ip, uint16(udpAddr.Port)), ip: ip}
 		return 1, nil
-	}
-}
-
-func (s *bindState) readUDP() {
-	if s.batched != nil {
-		s.readUDPBatch()
-		return
-	}
-	buf := make([]byte, 64<<10)
-	for {
-		n, addr, err := s.conn.ReadFrom(buf)
-		if err != nil {
-			if s.closeCtx.Err() != nil {
-				return
-			}
-			s.reportErr(err)
-			return
-		}
-		udpAddr, ok := addr.(*net.UDPAddr)
-		if !ok {
-			continue
-		}
-		if handler, ok := s.parent.selector.(DirectPacketHandler); ok && handler.HandleDirectPacket(s.conn, udpAddr, buf[:n]) {
-			continue
-		}
-		if ip, ok := netip.AddrFromSlice(udpAddr.IP); ok {
-			s.parent.noteDirectValidation(udpAddr)
-			s.parent.noteDirectActivity(udpAddr)
-			s.parent.received.Add(1)
-			s.deliver(inboundPacket{
-				payload: append([]byte(nil), buf[:n]...),
-				ep:      &Endpoint{addrPort: netip.AddrPortFrom(ip, uint16(udpAddr.Port)), ip: ip},
-			})
-		}
-	}
-}
-
-func (s *bindState) readUDPBatch() {
-	for {
-		n, err := s.batched.ReadBatch(s.msgs, 0)
-		if err != nil {
-			if s.closeCtx.Err() != nil {
-				return
-			}
-			s.reportErr(err)
-			return
-		}
-		for i := 0; i < n; i++ {
-			msg := s.msgs[i]
-			if msg.N == 0 {
-				continue
-			}
-			udpAddr, ok := msg.Addr.(*net.UDPAddr)
-			if !ok {
-				continue
-			}
-			payload := msg.Buffers[0][:msg.N]
-			if handler, ok := s.parent.selector.(DirectPacketHandler); ok && handler.HandleDirectPacket(s.conn, udpAddr, payload) {
-				continue
-			}
-			if ip, ok := netip.AddrFromSlice(udpAddr.IP); ok {
-				s.parent.noteDirectValidation(udpAddr)
-				s.parent.noteDirectActivity(udpAddr)
-				s.parent.received.Add(1)
-				s.deliver(inboundPacket{
-					payload: append([]byte(nil), payload...),
-					ep:      &Endpoint{addrPort: netip.AddrPortFrom(ip, uint16(udpAddr.Port)), ip: ip},
-				})
-			}
-		}
 	}
 }
 

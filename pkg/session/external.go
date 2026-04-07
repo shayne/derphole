@@ -37,6 +37,10 @@ const (
 	envelopeDecision           = "decision"
 	envelopeControl            = "control"
 	envelopeAck                = "ack"
+	envelopeDirectUDPReady     = "direct_udp_ready"
+	envelopeDirectUDPReadyAck  = "direct_udp_ready_ack"
+	envelopeDirectUDPStart     = "direct_udp_start"
+	envelopeDirectUDPStartAck  = "direct_udp_start_ack"
 	envelopeQUICModeReq        = "quic_mode_request"
 	envelopeQUICModeResp       = "quic_mode_response"
 	envelopeQUICModeAck        = "quic_mode_ack"
@@ -86,6 +90,8 @@ type envelope struct {
 	Claim              *rendezvous.Claim         `json:"claim,omitempty"`
 	Decision           *rendezvous.Decision      `json:"decision,omitempty"`
 	Control            *transport.ControlMessage `json:"control,omitempty"`
+	DirectUDPReadyAck  *directUDPReadyAck        `json:"direct_udp_ready_ack,omitempty"`
+	DirectUDPStart     *directUDPStart           `json:"direct_udp_start,omitempty"`
 	QUICModeReq        *quicModeRequest          `json:"quic_mode_request,omitempty"`
 	QUICModeResp       *quicModeResponse         `json:"quic_mode_response,omitempty"`
 	QUICModeAck        *quicModeAck              `json:"quic_mode_ack,omitempty"`
@@ -93,6 +99,14 @@ type envelope struct {
 	ParallelGrowReq    *parallelGrowRequest      `json:"parallel_grow_request,omitempty"`
 	ParallelGrowAck    *parallelGrowAck          `json:"parallel_grow_ack,omitempty"`
 	ParallelGrowResult *parallelGrowResult       `json:"parallel_grow_result,omitempty"`
+}
+
+type directUDPReadyAck struct {
+	FastDiscard bool `json:"fast_discard,omitempty"`
+}
+
+type directUDPStart struct {
+	ExpectedBytes int64 `json:"expected_bytes,omitempty"`
 }
 
 type quicModeRequest struct {
@@ -228,7 +242,7 @@ func issuePublicSession(ctx context.Context) (string, *relaySession, error) {
 }
 
 func sendExternal(ctx context.Context, cfg SendConfig) error {
-	return sendExternalViaWGTunnel(ctx, cfg)
+	return sendExternalViaDirectUDP(ctx, cfg)
 }
 
 func runExternalSendStream(
@@ -1148,7 +1162,7 @@ func receiveExternalHandoffCarriers(ctx context.Context, carriers []io.ReadWrite
 }
 
 func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
-	return listenExternalViaWGTunnel(ctx, cfg)
+	return listenExternalViaDirectUDP(ctx, cfg)
 }
 
 func sendExternalNativeTCPDirect(ctx context.Context, src io.Reader, conns []net.Conn) error {
@@ -2460,6 +2474,14 @@ func isAckPayload(payload []byte) bool {
 	return err == nil && env.Type == envelopeAck
 }
 
+func isDirectUDPReadyAckPayload(payload []byte) bool {
+	if len(payload) == 0 || payload[0] != '{' {
+		return false
+	}
+	env, err := decodeEnvelope(payload)
+	return err == nil && env.Type == envelopeDirectUDPReadyAck
+}
+
 func isQUICModeRequestPayload(payload []byte) bool {
 	if len(payload) == 0 || payload[0] != '{' {
 		return false
@@ -2539,6 +2561,7 @@ func isDecisionPayload(payload []byte) bool {
 func isTransportDataPayload(payload []byte) bool {
 	return !isTransportControlPayload(payload) &&
 		!isAckPayload(payload) &&
+		!isDirectUDPReadyAckPayload(payload) &&
 		!isClaimPayload(payload) &&
 		!isDecisionPayload(payload) &&
 		!isQUICModeRequestPayload(payload) &&

@@ -2,10 +2,13 @@ package probe
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,6 +54,48 @@ func TestRemoteClientCommandIncludesProbeBinaryAndPeerCandidates(t *testing.T) {
 	joined := strings.Join(cmd, " ")
 	if !strings.Contains(joined, "/tmp/derpcat-probe client --mode blast --transport batched --size-bytes 1024 --peer-candidates 198.51.100.10:40000,203.0.113.10:50000") {
 		t.Fatalf("client command missing expected remote invocation: %#v", cmd)
+	}
+}
+
+func TestRemoteClientCommandIncludesRawParallel(t *testing.T) {
+	runner := SSHRunner{User: "root", Host: "ktzlxc", RemotePath: "/tmp/derpcat-probe"}
+	cmd := runner.ClientCommand(ClientConfig{
+		Mode:      "raw",
+		Transport: "batched",
+		SizeBytes: 1024,
+		Host:      "198.51.100.10:40000",
+		Parallel:  4,
+	})
+
+	joined := strings.Join(cmd, " ")
+	if !strings.Contains(joined, "/tmp/derpcat-probe client --mode raw --transport batched --size-bytes 1024 --host 198.51.100.10:40000 --parallel 4") {
+		t.Fatalf("client command missing raw parallel: %#v", cmd)
+	}
+}
+
+func TestRemoteCommandsIncludeBlastParallel(t *testing.T) {
+	runner := SSHRunner{User: "root", Host: "ktzlxc", RemotePath: "/tmp/derpcat-probe"}
+
+	serverCmd := strings.Join(runner.ServerCommand(ServerConfig{
+		ListenAddr: ":0",
+		Mode:       "blast",
+		Transport:  "batched",
+		SizeBytes:  1024,
+		Parallel:   4,
+	}), " ")
+	if !strings.Contains(serverCmd, "/tmp/derpcat-probe server --listen :0 --mode blast --transport batched --size-bytes 1024 --parallel 4") {
+		t.Fatalf("server command missing blast parallel: %s", serverCmd)
+	}
+
+	clientCmd := strings.Join(runner.ClientCommand(ClientConfig{
+		Mode:              "blast",
+		Transport:         "batched",
+		SizeBytes:         1024,
+		PeerCandidatesCSV: "198.51.100.10:40000,203.0.113.10:50000",
+		Parallel:          4,
+	}), " ")
+	if !strings.Contains(clientCmd, "/tmp/derpcat-probe client --mode blast --transport batched --size-bytes 1024 --peer-candidates 198.51.100.10:40000,203.0.113.10:50000 --parallel 4") {
+		t.Fatalf("client command missing blast parallel: %s", clientCmd)
 	}
 }
 
@@ -219,6 +264,72 @@ func TestRunOrchestrateForwardTransfersAndReportsDirect(t *testing.T) {
 	}
 }
 
+func TestRunOrchestrateForwardBlastPassesRateToSingleSession(t *testing.T) {
+	t.Setenv("DERPCAT_PROBE_RATE_MBPS", "1200")
+	t.Setenv("DERPCAT_PROBE_REPAIR_PAYLOADS", "1")
+
+	oldListenPacket := listenPacket
+	oldDiscoverCandidates := orchestrateDiscoverCandidates
+	oldLaunchRemoteServer := launchRemoteServer
+	oldSend := orchestrateSend
+	defer func() {
+		listenPacket = oldListenPacket
+		orchestrateDiscoverCandidates = oldDiscoverCandidates
+		launchRemoteServer = oldLaunchRemoteServer
+		orchestrateSend = oldSend
+	}()
+
+	listenPacket = func(network, address string) (net.PacketConn, error) {
+		return net.ListenPacket(network, address)
+	}
+	orchestrateDiscoverCandidates = func(ctx context.Context, conn net.PacketConn) ([]net.Addr, error) {
+		return []net.Addr{&net.UDPAddr{IP: net.ParseIP("198.51.100.10"), Port: 40000}}, nil
+	}
+	launchRemoteServer = func(ctx context.Context, runner SSHRunner, cfg ServerConfig) (*remoteServerHandle, error) {
+		return &remoteServerHandle{
+			stdout: io.NopCloser(strings.NewReader("READY {\"addr\":\":0\",\"candidates\":[\"203.0.113.20:50000\"],\"transport\":{\"kind\":\"batched\",\"requested_kind\":\"batched\"}}\nDONE {\"bytes_received\":1024,\"first_byte_ms\":9,\"duration_ms\":2000}\n")),
+			stderr: io.NopCloser(strings.NewReader("")),
+			wait:   func() error { return nil },
+		}, nil
+	}
+	var gotCfg SendConfig
+	orchestrateSend = func(ctx context.Context, conn net.PacketConn, remoteAddr string, src io.Reader, cfg SendConfig) (TransferStats, error) {
+		gotCfg = cfg
+		if _, err := io.Copy(io.Discard, src); err != nil {
+			return TransferStats{}, err
+		}
+		startedAt := time.Unix(0, 0)
+		return TransferStats{
+			BytesSent:   1024,
+			StartedAt:   startedAt,
+			FirstByteAt: startedAt.Add(9 * time.Millisecond),
+			CompletedAt: startedAt.Add(2 * time.Second),
+			Transport:   TransportCaps{Kind: "legacy", RequestedKind: "batched"},
+		}, nil
+	}
+
+	if _, err := RunOrchestrate(context.Background(), OrchestrateConfig{
+		Host:      "ktzlxc",
+		User:      "root",
+		Mode:      "blast",
+		Transport: "batched",
+		Direction: "forward",
+		SizeBytes: 1024,
+		Parallel:  1,
+	}); err != nil {
+		t.Fatalf("RunOrchestrate() error = %v", err)
+	}
+	if !gotCfg.Blast || gotCfg.Raw {
+		t.Fatalf("send config = %+v, want blast mode only", gotCfg)
+	}
+	if gotCfg.RateMbps != 1200 {
+		t.Fatalf("RateMbps = %d, want 1200", gotCfg.RateMbps)
+	}
+	if !gotCfg.RepairPayloads {
+		t.Fatalf("RepairPayloads = false, want true")
+	}
+}
+
 func TestRunOrchestrateRejectsAeadMode(t *testing.T) {
 	_, err := RunOrchestrate(context.Background(), OrchestrateConfig{
 		Host:      "ktzlxc",
@@ -318,7 +429,7 @@ func TestRunOrchestrateReverseTransfersAndReportsDirect(t *testing.T) {
 			},
 		}, nil
 	}
-	orchestrateReceive = func(ctx context.Context, conn net.PacketConn, remoteAddr string, dst io.Writer, cfg ReceiveConfig) (TransferStats, error) {
+	orchestrateReceive = func(ctx context.Context, conn net.PacketConn, peer string, dst io.Writer, cfg ReceiveConfig) (TransferStats, error) {
 		startedAt := time.Unix(0, 0)
 		return TransferStats{
 			BytesReceived: 1024,
@@ -358,7 +469,216 @@ func TestRunOrchestrateReverseTransfersAndReportsDirect(t *testing.T) {
 		t.Fatalf("RunOrchestrate() argv = %#v", gotArgv)
 	}
 	if strings.Contains(joined, "--parallel") {
-		t.Fatalf("RunOrchestrate() unexpectedly passed --parallel for raw mode: %#v", gotArgv)
+		t.Fatalf("RunOrchestrate() passed raw --parallel with Parallel=1: %#v", gotArgv)
+	}
+}
+
+func TestRunOrchestrateReverseFailsOnShortReceive(t *testing.T) {
+	oldListenPacket := listenPacket
+	oldDiscoverCandidates := orchestrateDiscoverCandidates
+	oldLaunchRemoteClient := launchRemoteClient
+	oldReceiveBlastParallel := orchestrateReceiveBlastParallel
+	defer func() {
+		listenPacket = oldListenPacket
+		orchestrateDiscoverCandidates = oldDiscoverCandidates
+		launchRemoteClient = oldLaunchRemoteClient
+		orchestrateReceiveBlastParallel = oldReceiveBlastParallel
+	}()
+
+	listenPacket = func(network, address string) (net.PacketConn, error) {
+		return net.ListenPacket(network, address)
+	}
+	orchestrateDiscoverCandidates = func(ctx context.Context, conn net.PacketConn) ([]net.Addr, error) {
+		return []net.Addr{&net.UDPAddr{IP: net.ParseIP("198.51.100.10"), Port: 40000}}, nil
+	}
+	launchRemoteClient = func(ctx context.Context, runner SSHRunner, cfg ClientConfig) (*remoteServerHandle, error) {
+		return &remoteServerHandle{
+			stdout: io.NopCloser(strings.NewReader("READY {\"addr\":\":0\",\"candidates\":[\"203.0.113.20:50000\"],\"transport\":{\"kind\":\"batched\",\"requested_kind\":\"batched\"}}\nDONE {\"bytes_sent\":11,\"duration_ms\":100}\n")),
+			stderr: io.NopCloser(strings.NewReader("")),
+			wait:   func() error { return nil },
+		}, nil
+	}
+	orchestrateReceiveBlastParallel = func(ctx context.Context, conns []net.PacketConn, dst io.Writer, cfg ReceiveConfig, expectedBytes int64) (TransferStats, error) {
+		startedAt := time.Unix(0, 0)
+		return TransferStats{
+			BytesReceived: 7,
+			StartedAt:     startedAt,
+			FirstByteAt:   startedAt.Add(5 * time.Millisecond),
+			CompletedAt:   startedAt.Add(100 * time.Millisecond),
+			Transport:     TransportCaps{Kind: "legacy", RequestedKind: "batched"},
+		}, nil
+	}
+
+	_, err := RunOrchestrate(context.Background(), OrchestrateConfig{
+		Host:      "ktzlxc",
+		Mode:      "blast",
+		Transport: "batched",
+		Direction: "reverse",
+		SizeBytes: 11,
+		Parallel:  1,
+	})
+	if err == nil {
+		t.Fatal("RunOrchestrate() error = nil, want short receive error")
+	}
+	if !strings.Contains(err.Error(), "received 7 bytes, want 11") {
+		t.Fatalf("RunOrchestrate() error = %v, want short receive detail", err)
+	}
+}
+
+func TestRunOrchestrateReverseBlastSingleUsesExpectedReceiver(t *testing.T) {
+	t.Setenv("DERPCAT_PROBE_REQUIRE_COMPLETE", "1")
+
+	oldListenPacket := listenPacket
+	oldDiscoverCandidates := orchestrateDiscoverCandidates
+	oldLaunchRemoteClient := launchRemoteClient
+	oldReceiveBlastParallel := orchestrateReceiveBlastParallel
+	defer func() {
+		listenPacket = oldListenPacket
+		orchestrateDiscoverCandidates = oldDiscoverCandidates
+		launchRemoteClient = oldLaunchRemoteClient
+		orchestrateReceiveBlastParallel = oldReceiveBlastParallel
+	}()
+
+	localConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer localConn.Close()
+	listenPacket = func(network, address string) (net.PacketConn, error) {
+		return localConn, nil
+	}
+	orchestrateDiscoverCandidates = func(ctx context.Context, conn net.PacketConn) ([]net.Addr, error) {
+		return []net.Addr{conn.LocalAddr()}, nil
+	}
+	launchRemoteClient = func(ctx context.Context, runner SSHRunner, cfg ClientConfig) (*remoteServerHandle, error) {
+		return &remoteServerHandle{
+			stdout: io.NopCloser(strings.NewReader("READY {\"addr\":\":0\",\"candidates\":[\"203.0.113.20:50000\"],\"transport\":{\"kind\":\"batched\",\"requested_kind\":\"batched\"}}\nDONE {\"bytes_sent\":11,\"duration_ms\":100}\n")),
+			stderr: io.NopCloser(strings.NewReader("")),
+			wait:   func() error { return nil },
+		}, nil
+	}
+
+	called := false
+	orchestrateReceiveBlastParallel = func(ctx context.Context, conns []net.PacketConn, dst io.Writer, cfg ReceiveConfig, expectedBytes int64) (TransferStats, error) {
+		called = true
+		if len(conns) != 1 {
+			t.Fatalf("len(conns) = %d, want 1", len(conns))
+		}
+		if !cfg.Blast || cfg.Raw {
+			t.Fatalf("receive config = %+v, want blast mode only", cfg)
+		}
+		if !cfg.RequireComplete {
+			t.Fatalf("RequireComplete = false, want true")
+		}
+		if expectedBytes != 11 {
+			t.Fatalf("expectedBytes = %d, want 11", expectedBytes)
+		}
+		startedAt := time.Unix(0, 0)
+		return TransferStats{
+			BytesReceived: 11,
+			StartedAt:     startedAt,
+			FirstByteAt:   startedAt.Add(5 * time.Millisecond),
+			CompletedAt:   startedAt.Add(100 * time.Millisecond),
+			Transport:     TransportCaps{Kind: "legacy", RequestedKind: "batched"},
+		}, nil
+	}
+
+	report, err := RunOrchestrate(context.Background(), OrchestrateConfig{
+		Host:      "ktzlxc",
+		Mode:      "blast",
+		Transport: "batched",
+		Direction: "reverse",
+		SizeBytes: 11,
+		Parallel:  1,
+	})
+	if err != nil {
+		t.Fatalf("RunOrchestrate() error = %v", err)
+	}
+	if !called {
+		t.Fatal("blast receiver was not called")
+	}
+	if report.BytesReceived != 11 || !report.Direct {
+		t.Fatalf("report = %#v", report)
+	}
+}
+
+func TestRunOrchestrateReverseBlastParallelUsesBlastReceiver(t *testing.T) {
+	oldListenPacket := listenPacket
+	oldDiscoverCandidates := orchestrateDiscoverCandidates
+	oldLaunchRemoteClient := launchRemoteClient
+	oldReceiveBlastParallel := orchestrateReceiveBlastParallel
+	defer func() {
+		listenPacket = oldListenPacket
+		orchestrateDiscoverCandidates = oldDiscoverCandidates
+		launchRemoteClient = oldLaunchRemoteClient
+		orchestrateReceiveBlastParallel = oldReceiveBlastParallel
+	}()
+
+	var opened []net.PacketConn
+	listenPacket = func(network, address string) (net.PacketConn, error) {
+		conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err == nil {
+			opened = append(opened, conn)
+		}
+		return conn, err
+	}
+	defer func() {
+		for _, conn := range opened {
+			_ = conn.Close()
+		}
+	}()
+	orchestrateDiscoverCandidates = func(ctx context.Context, conn net.PacketConn) ([]net.Addr, error) {
+		return []net.Addr{conn.LocalAddr()}, nil
+	}
+	launchRemoteClient = func(ctx context.Context, runner SSHRunner, cfg ClientConfig) (*remoteServerHandle, error) {
+		if cfg.Parallel != 2 {
+			t.Fatalf("client Parallel = %d, want 2", cfg.Parallel)
+		}
+		return &remoteServerHandle{
+			stdout: io.NopCloser(strings.NewReader("READY {\"addr\":\":0\",\"candidates\":[\"203.0.113.20:50000\",\"203.0.113.20:50001\"],\"transport\":{\"kind\":\"batched\",\"requested_kind\":\"batched\"}}\nDONE {\"bytes_sent\":11,\"duration_ms\":100}\n")),
+			stderr: io.NopCloser(strings.NewReader("")),
+			wait:   func() error { return nil },
+		}, nil
+	}
+
+	called := false
+	orchestrateReceiveBlastParallel = func(ctx context.Context, conns []net.PacketConn, dst io.Writer, cfg ReceiveConfig, expectedBytes int64) (TransferStats, error) {
+		called = true
+		if len(conns) != 2 {
+			t.Fatalf("len(conns) = %d, want 2", len(conns))
+		}
+		if !cfg.Blast || cfg.Raw {
+			t.Fatalf("receive config = %+v, want blast mode only", cfg)
+		}
+		if expectedBytes != 11 {
+			t.Fatalf("expectedBytes = %d, want 11", expectedBytes)
+		}
+		startedAt := time.Unix(0, 0)
+		return TransferStats{
+			BytesReceived: 11,
+			StartedAt:     startedAt,
+			FirstByteAt:   startedAt.Add(5 * time.Millisecond),
+			CompletedAt:   startedAt.Add(100 * time.Millisecond),
+			Transport:     TransportCaps{Kind: "batched", RequestedKind: "batched"},
+		}, nil
+	}
+
+	report, err := RunOrchestrate(context.Background(), OrchestrateConfig{
+		Host:      "ktzlxc",
+		Mode:      "blast",
+		Transport: "batched",
+		Direction: "reverse",
+		SizeBytes: 11,
+		Parallel:  2,
+	})
+	if err != nil {
+		t.Fatalf("RunOrchestrate() error = %v", err)
+	}
+	if !called {
+		t.Fatal("blast parallel receiver was not called")
+	}
+	if report.BytesReceived != 11 || !report.Direct {
+		t.Fatalf("report = %#v", report)
 	}
 }
 
@@ -432,41 +752,129 @@ func TestSplitOrchestrateShares(t *testing.T) {
 	}
 }
 
-func TestRunOrchestrateStripesRawParallel(t *testing.T) {
+func TestSelectRemoteAddrsByConnAvoidsDuplicateRemotePorts(t *testing.T) {
+	observedByConn := [][]net.Addr{
+		{mustUDPAddr(t, "100.107.23.123:51048")},
+		{mustUDPAddr(t, "68.20.14.192:51048"), mustUDPAddr(t, "68.20.14.192:52315")},
+		{mustUDPAddr(t, "68.20.14.192:35365")},
+	}
+	fallback := []string{"68.20.14.192:35365", "68.20.14.192:52315", "68.20.14.192:51048"}
+
+	got := selectRemoteAddrsByConn(observedByConn, fallback, 3)
+	want := []string{"100.107.23.123:51048", "68.20.14.192:52315", "68.20.14.192:35365"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("selectRemoteAddrsByConn() = %v, want %v", got, want)
+	}
+}
+
+func TestSelectRemoteAddrsByConnBackfillsEmptyLanesFromAnyUnusedFallback(t *testing.T) {
+	observedByConn := [][]net.Addr{
+		{mustUDPAddr(t, "68.20.14.192:51048")},
+		{mustUDPAddr(t, "100.107.23.123:51048")},
+		{mustUDPAddr(t, "68.20.14.192:50924")},
+		{mustUDPAddr(t, "68.20.14.192:50924")},
+	}
+	fallback := []string{
+		"68.20.14.192:51048",
+		"68.20.14.192:50924",
+		"68.20.14.192:37597",
+		"68.20.14.192:47634",
+	}
+
+	got := selectRemoteAddrsByConn(observedByConn, fallback, 4)
+	want := []string{"68.20.14.192:51048", "68.20.14.192:37597", "68.20.14.192:50924", "68.20.14.192:47634"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("selectRemoteAddrsByConn() = %v, want %v", got, want)
+	}
+}
+
+func mustUDPAddr(t *testing.T, raw string) net.Addr {
+	t.Helper()
+	addr, err := net.ResolveUDPAddr("udp", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return addr
+}
+
+func TestSizedReaderDoesNotRewritePayloadBuffer(t *testing.T) {
+	reader := newSizedReader(2)
+	buf := []byte{1, 2, 3, 4}
+
+	n, err := reader.Read(buf)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("Read() n = %d, want 2", n)
+	}
+	if got := fmt.Sprint(buf); got != "[1 2 3 4]" {
+		t.Fatalf("buffer = %s, want unchanged probe payload buffer", got)
+	}
+}
+
+func TestRunOrchestratePassesRawParallelToSingleSession(t *testing.T) {
 	oldChild := orchestrateChildRun
+	oldLaunchRemoteServer := launchRemoteServer
+	oldListenPacket := listenPacket
+	oldDiscover := orchestrateDiscoverCandidates
+	oldSend := orchestrateSend
 	defer func() {
 		orchestrateChildRun = oldChild
+		launchRemoteServer = oldLaunchRemoteServer
+		listenPacket = oldListenPacket
+		orchestrateDiscoverCandidates = oldDiscover
+		orchestrateSend = oldSend
 	}()
 
-	var (
-		mu       sync.Mutex
-		children []OrchestrateConfig
-	)
 	orchestrateChildRun = func(ctx context.Context, cfg OrchestrateConfig) (RunReport, error) {
-		mu.Lock()
-		children = append(children, cfg)
-		mu.Unlock()
-		return RunReport{
-			Host:          cfg.Host,
-			Mode:          cfg.Mode,
-			Transport:     cfg.Transport,
-			Direction:     cfg.Direction,
-			SizeBytes:     cfg.SizeBytes,
-			BytesReceived: cfg.SizeBytes,
-			DurationMS:    100,
-			GoodputMbps:   10,
-			Direct:        true,
-			FirstByteMS:   5,
-			LossRate:      0.25,
-			Retransmits:   2,
-			Local:         TransportCaps{Kind: "legacy"},
-			Remote:        TransportCaps{Kind: "batched"},
+		t.Fatalf("orchestrateChildRun should not be used for raw in-session parallel")
+		return RunReport{}, nil
+	}
+
+	localConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer localConn.Close()
+	listenPacket = func(network, address string) (net.PacketConn, error) {
+		return localConn, nil
+	}
+	orchestrateDiscoverCandidates = func(ctx context.Context, conn net.PacketConn) ([]net.Addr, error) {
+		addr, err := net.ResolveUDPAddr("udp", "198.51.100.10:40000")
+		if err != nil {
+			return nil, err
+		}
+		return []net.Addr{addr}, nil
+	}
+
+	var gotServerCfg ServerConfig
+	stdout := io.NopCloser(strings.NewReader("READY {\"addr\":\"203.0.113.10:50000\",\"candidates\":[\"203.0.113.10:50000\"],\"transport\":{\"kind\":\"batched\",\"requested_kind\":\"batched\"}}\nDONE {\"bytes_received\":1024,\"duration_ms\":100,\"first_byte_ms\":5}\n"))
+	launchRemoteServer = func(ctx context.Context, runner SSHRunner, cfg ServerConfig) (*remoteServerHandle, error) {
+		gotServerCfg = cfg
+		return &remoteServerHandle{
+			stdout: stdout,
+			stderr: io.NopCloser(strings.NewReader("")),
+			wait:   func() error { return nil },
+		}, nil
+	}
+
+	var gotSendCfg SendConfig
+	orchestrateSend = func(ctx context.Context, conn net.PacketConn, remoteAddr string, src io.Reader, cfg SendConfig) (TransferStats, error) {
+		gotSendCfg = cfg
+		startedAt := time.Unix(0, 0)
+		return TransferStats{
+			BytesSent:   1024,
+			StartedAt:   startedAt,
+			FirstByteAt: startedAt.Add(5 * time.Millisecond),
+			CompletedAt: startedAt.Add(100 * time.Millisecond),
+			Transport:   TransportCaps{Kind: "batched", RequestedKind: "batched"},
 		}, nil
 	}
 
 	report, err := RunOrchestrate(context.Background(), OrchestrateConfig{
 		Host:      "ktzlxc",
-		Mode:      "blast",
+		Mode:      "raw",
 		Transport: "batched",
 		Direction: "forward",
 		SizeBytes: 1024,
@@ -475,29 +883,194 @@ func TestRunOrchestrateStripesRawParallel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunOrchestrate() error = %v", err)
 	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(children) != 4 {
-		t.Fatalf("child count = %d, want 4", len(children))
+	if gotServerCfg.Parallel != 4 {
+		t.Fatalf("server Parallel = %d, want 4", gotServerCfg.Parallel)
 	}
-	var total int64
-	for _, child := range children {
-		total += child.SizeBytes
-		if child.Parallel != 1 {
-			t.Fatalf("child.Parallel = %d, want 1", child.Parallel)
-		}
-	}
-	if total != 1024 {
-		t.Fatalf("striped child sizes total = %d, want 1024", total)
+	if gotSendCfg.Parallel != 4 {
+		t.Fatalf("send Parallel = %d, want 4", gotSendCfg.Parallel)
 	}
 	if report.BytesReceived != 1024 {
 		t.Fatalf("report.BytesReceived = %d, want 1024", report.BytesReceived)
 	}
-	if report.Retransmits != 8 {
-		t.Fatalf("report.Retransmits = %d, want 8", report.Retransmits)
-	}
-	if !report.Direct || report.Local.Kind != "legacy" || report.Remote.Kind != "batched" {
+	if !report.Direct || report.Local.Kind != "batched" || report.Remote.Kind != "batched" {
 		t.Fatalf("report = %#v", report)
+	}
+}
+
+func TestRunOrchestratePassesBlastParallelToSingleSession(t *testing.T) {
+	t.Setenv("DERPCAT_PROBE_RATE_MBPS", "2000")
+
+	oldChild := orchestrateChildRun
+	oldLaunchRemoteServer := launchRemoteServer
+	oldListenPacket := listenPacket
+	oldDiscover := orchestrateDiscoverCandidates
+	oldSend := orchestrateSend
+	defer func() {
+		orchestrateChildRun = oldChild
+		launchRemoteServer = oldLaunchRemoteServer
+		listenPacket = oldListenPacket
+		orchestrateDiscoverCandidates = oldDiscover
+		orchestrateSend = oldSend
+	}()
+
+	orchestrateChildRun = func(ctx context.Context, cfg OrchestrateConfig) (RunReport, error) {
+		return RunReport{}, errors.New("orchestrateChildRun should not be used for blast in-session parallel")
+	}
+
+	var opened []net.PacketConn
+	listenPacket = func(network, address string) (net.PacketConn, error) {
+		conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err == nil {
+			opened = append(opened, conn)
+		}
+		return conn, err
+	}
+	defer func() {
+		for _, conn := range opened {
+			_ = conn.Close()
+		}
+	}()
+	orchestrateDiscoverCandidates = func(ctx context.Context, conn net.PacketConn) ([]net.Addr, error) {
+		return []net.Addr{conn.LocalAddr()}, nil
+	}
+
+	var gotServerCfg ServerConfig
+	stdout := io.NopCloser(strings.NewReader("READY {\"addr\":\"203.0.113.10:50000\",\"candidates\":[\"203.0.113.10:50000\",\"203.0.113.10:50001\"],\"transport\":{\"kind\":\"batched\",\"requested_kind\":\"batched\"}}\nDONE {\"bytes_received\":11,\"duration_ms\":100,\"first_byte_ms\":5}\n"))
+	launchRemoteServer = func(ctx context.Context, runner SSHRunner, cfg ServerConfig) (*remoteServerHandle, error) {
+		gotServerCfg = cfg
+		return &remoteServerHandle{
+			stdout: stdout,
+			stderr: io.NopCloser(strings.NewReader("")),
+			wait:   func() error { return nil },
+		}, nil
+	}
+
+	var mu sync.Mutex
+	var gotRemotes []string
+	var gotSizes []int64
+	var gotRates []int
+	orchestrateSend = func(ctx context.Context, conn net.PacketConn, remoteAddr string, src io.Reader, cfg SendConfig) (TransferStats, error) {
+		n, err := io.Copy(io.Discard, src)
+		if err != nil {
+			return TransferStats{}, err
+		}
+		if !cfg.Blast || cfg.Raw {
+			return TransferStats{}, fmt.Errorf("send config = %+v, want blast mode only", cfg)
+		}
+		mu.Lock()
+		gotRemotes = append(gotRemotes, remoteAddr)
+		gotSizes = append(gotSizes, n)
+		gotRates = append(gotRates, cfg.RateMbps)
+		mu.Unlock()
+		startedAt := time.Unix(0, 0)
+		return TransferStats{
+			BytesSent:   n,
+			StartedAt:   startedAt,
+			FirstByteAt: startedAt.Add(5 * time.Millisecond),
+			CompletedAt: startedAt.Add(100 * time.Millisecond),
+			Transport:   TransportCaps{Kind: "batched", RequestedKind: "batched"},
+		}, nil
+	}
+
+	report, err := RunOrchestrate(context.Background(), OrchestrateConfig{
+		Host:      "ktzlxc",
+		Mode:      "blast",
+		Transport: "batched",
+		Direction: "forward",
+		SizeBytes: 11,
+		Parallel:  2,
+	})
+	if err != nil {
+		t.Fatalf("RunOrchestrate() error = %v", err)
+	}
+	if gotServerCfg.Parallel != 2 {
+		t.Fatalf("server Parallel = %d, want 2", gotServerCfg.Parallel)
+	}
+	sort.Strings(gotRemotes)
+	sort.Slice(gotSizes, func(i, j int) bool { return gotSizes[i] > gotSizes[j] })
+	if strings.Join(gotRemotes, ",") != "203.0.113.10:50000,203.0.113.10:50001" {
+		t.Fatalf("remote addresses = %v, want both remote candidates", gotRemotes)
+	}
+	if len(gotSizes) != 2 || gotSizes[0] != 6 || gotSizes[1] != 5 {
+		t.Fatalf("share sizes = %v, want [6 5]", gotSizes)
+	}
+	sort.Ints(gotRates)
+	if len(gotRates) != 2 || gotRates[0] != 1000 || gotRates[1] != 1000 {
+		t.Fatalf("rate mbps = %v, want [1000 1000]", gotRates)
+	}
+	if report.BytesReceived != 11 || !report.Direct {
+		t.Fatalf("report = %#v", report)
+	}
+}
+
+func TestRunOrchestrateForwardBlastParallelFailsOnShortReceive(t *testing.T) {
+	oldChild := orchestrateChildRun
+	oldLaunchRemoteServer := launchRemoteServer
+	oldListenPacket := listenPacket
+	oldDiscover := orchestrateDiscoverCandidates
+	oldSend := orchestrateSend
+	defer func() {
+		orchestrateChildRun = oldChild
+		launchRemoteServer = oldLaunchRemoteServer
+		listenPacket = oldListenPacket
+		orchestrateDiscoverCandidates = oldDiscover
+		orchestrateSend = oldSend
+	}()
+
+	orchestrateChildRun = func(ctx context.Context, cfg OrchestrateConfig) (RunReport, error) {
+		return RunReport{}, errors.New("orchestrateChildRun should not be used for blast in-session parallel")
+	}
+
+	var opened []net.PacketConn
+	listenPacket = func(network, address string) (net.PacketConn, error) {
+		conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err == nil {
+			opened = append(opened, conn)
+		}
+		return conn, err
+	}
+	defer func() {
+		for _, conn := range opened {
+			_ = conn.Close()
+		}
+	}()
+	orchestrateDiscoverCandidates = func(ctx context.Context, conn net.PacketConn) ([]net.Addr, error) {
+		return []net.Addr{conn.LocalAddr()}, nil
+	}
+	launchRemoteServer = func(ctx context.Context, runner SSHRunner, cfg ServerConfig) (*remoteServerHandle, error) {
+		return &remoteServerHandle{
+			stdout: io.NopCloser(strings.NewReader("READY {\"addr\":\"203.0.113.10:50000\",\"candidates\":[\"203.0.113.10:50000\",\"203.0.113.10:50001\"],\"transport\":{\"kind\":\"batched\",\"requested_kind\":\"batched\"}}\nDONE {\"bytes_received\":7,\"duration_ms\":100,\"first_byte_ms\":5}\n")),
+			stderr: io.NopCloser(strings.NewReader("")),
+			wait:   func() error { return nil },
+		}, nil
+	}
+	orchestrateSend = func(ctx context.Context, conn net.PacketConn, remoteAddr string, src io.Reader, cfg SendConfig) (TransferStats, error) {
+		n, err := io.Copy(io.Discard, src)
+		if err != nil {
+			return TransferStats{}, err
+		}
+		startedAt := time.Unix(0, 0)
+		return TransferStats{
+			BytesSent:   n,
+			StartedAt:   startedAt,
+			FirstByteAt: startedAt.Add(5 * time.Millisecond),
+			CompletedAt: startedAt.Add(100 * time.Millisecond),
+			Transport:   TransportCaps{Kind: "batched", RequestedKind: "batched"},
+		}, nil
+	}
+
+	_, err := RunOrchestrate(context.Background(), OrchestrateConfig{
+		Host:      "ktzlxc",
+		Mode:      "blast",
+		Transport: "batched",
+		Direction: "forward",
+		SizeBytes: 11,
+		Parallel:  2,
+	})
+	if err == nil {
+		t.Fatal("RunOrchestrate() error = nil, want short receive error")
+	}
+	if !strings.Contains(err.Error(), "received 7 bytes, want 11") {
+		t.Fatalf("RunOrchestrate() error = %v, want short receive detail", err)
 	}
 }

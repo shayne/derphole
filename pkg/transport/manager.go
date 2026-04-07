@@ -52,10 +52,12 @@ type Manager struct {
 	discoveryMu           sync.Mutex
 	wg                    sync.WaitGroup
 	directWG              sync.WaitGroup
+	directReadWG          sync.WaitGroup
 	cfg                   ManagerConfig
 	candidateSourceBase   func(context.Context) []net.Addr
 	directCtx             context.Context
 	directCancel          context.CancelFunc
+	directReadCancel      context.CancelFunc
 	state                 pathState
 	stateNotify           chan struct{}
 	discoveryGen          uint64
@@ -139,12 +141,22 @@ func (m *Manager) Start(ctx context.Context) error {
 		}()
 	}
 	if !m.cfg.DisableDirectReads {
+		readCtx := directCtx
+		var directReadCancel context.CancelFunc
+		if m.cfg.DirectConn != nil {
+			readCtx, directReadCancel = context.WithCancel(directCtx)
+			m.mu.Lock()
+			m.directReadCancel = directReadCancel
+			m.mu.Unlock()
+		}
 		m.wg.Add(1)
 		m.directWG.Add(1)
+		m.directReadWG.Add(1)
 		go func() {
+			defer m.directReadWG.Done()
 			defer m.directWG.Done()
 			defer m.wg.Done()
-			m.directReadLoop(directCtx)
+			m.directReadLoop(readCtx)
 		}()
 	}
 	return nil
@@ -159,12 +171,27 @@ func (m *Manager) StopDirect() {
 	m.noteRelayOnly(m.now())
 	m.mu.Lock()
 	directCancel := m.directCancel
+	directReadCancel := m.directReadCancel
 	m.mu.Unlock()
+	if directReadCancel != nil {
+		directReadCancel()
+	}
 	if directCancel != nil {
 		directCancel()
 	}
 	m.wakeDirectReads()
 	m.directWG.Wait()
+}
+
+func (m *Manager) StopDirectReads() {
+	m.mu.Lock()
+	directReadCancel := m.directReadCancel
+	m.mu.Unlock()
+	if directReadCancel != nil {
+		directReadCancel()
+	}
+	m.wakeDirectReads()
+	m.directReadWG.Wait()
 }
 
 func (m *Manager) wakeDirectReads() {

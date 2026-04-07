@@ -326,6 +326,75 @@ func TestBindStateReceiveDirectBatchedUsesCallerBuffers(t *testing.T) {
 	}
 }
 
+func TestBindStateReceiveWithDERPAndActiveDirectUsesDirectBatchedCallerBuffers(t *testing.T) {
+	pc := newLoopPacketConn(t)
+	defer pc.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	derpA, derpB := newTestDERPClientPair(t, ctx)
+
+	stateCtx, stateCancel := context.WithCancel(context.Background())
+	defer stateCancel()
+	selector := fakeSelector{endpoint: "127.0.0.1:54321", direct: true}
+	batchConn := &fakeBatchConn{
+		localAddr: pc.LocalAddr(),
+		payloads:  [][]byte{[]byte("first"), []byte("second")},
+		addr:      &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 54321},
+	}
+	state := &bindState{
+		parent:   NewBind(BindConfig{PacketConn: batchConn, Transport: "batched", DERPClient: derpA, PeerDERP: derpB.PublicKey(), PathSelector: selector}),
+		conn:     batchConn,
+		batched:  batchConn,
+		derp:     derpA,
+		peerDERP: derpB.PublicKey(),
+		recvCh:   make(chan inboundPacket, 1),
+		errCh:    make(chan error, 1),
+		closeCtx: stateCtx,
+		closeFn:  stateCancel,
+	}
+
+	packets := [][]byte{
+		make([]byte, 64<<10),
+		make([]byte, 64<<10),
+	}
+	sizes := make([]int, len(packets))
+	eps := make([]conn.Endpoint, len(packets))
+
+	resultCh := make(chan struct {
+		n   int
+		err error
+	}, 1)
+	go func() {
+		n, err := state.receive(packets, sizes, eps)
+		resultCh <- struct {
+			n   int
+			err error
+		}{n: n, err: err}
+	}()
+
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			t.Fatalf("receive() error = %v", result.err)
+		}
+		if result.n != 2 {
+			t.Fatalf("receive() count = %d, want 2", result.n)
+		}
+		if got := string(packets[0][:sizes[0]]); got != "first" {
+			t.Fatalf("first payload = %q, want first", got)
+		}
+		if got := string(packets[1][:sizes[1]]); got != "second" {
+			t.Fatalf("second payload = %q, want second", got)
+		}
+		if got := batchConn.readDeadlineCalls; got != 0 {
+			t.Fatalf("active direct receive SetReadDeadline calls = %d, want 0", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("receive() blocked on DERP channel instead of reading active direct batched conn")
+	}
+}
+
 func TestEndpointDstToStringUsesAddrPort(t *testing.T) {
 	ep := &Endpoint{
 		addrPort: netip.MustParseAddrPort("127.0.0.1:54321"),
@@ -375,9 +444,10 @@ func TestBindSendFallsBackToEndpointAddrPort(t *testing.T) {
 }
 
 type fakeBatchConn struct {
-	localAddr net.Addr
-	payloads  [][]byte
-	addr      *net.UDPAddr
+	localAddr         net.Addr
+	payloads          [][]byte
+	addr              *net.UDPAddr
+	readDeadlineCalls int
 }
 
 var _ batching.Conn = (*fakeBatchConn)(nil)
@@ -418,7 +488,10 @@ func (f *fakeBatchConn) LocalAddr() net.Addr { return f.localAddr }
 
 func (f *fakeBatchConn) SetDeadline(time.Time) error { return nil }
 
-func (f *fakeBatchConn) SetReadDeadline(time.Time) error { return nil }
+func (f *fakeBatchConn) SetReadDeadline(time.Time) error {
+	f.readDeadlineCalls++
+	return nil
+}
 
 func (f *fakeBatchConn) SetWriteDeadline(time.Time) error { return nil }
 

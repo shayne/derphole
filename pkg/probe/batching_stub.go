@@ -26,3 +26,7 @@ func platformSetSocketBuffers(conn net.PacketConn, caps *TransportCaps, size int
 	}
 	_ = caps
 }
+
+func platformSetSocketPacing(conn net.PacketConn, bytesPerSecond uint64) bool {
+	return false
+}

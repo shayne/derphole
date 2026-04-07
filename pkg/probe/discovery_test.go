@@ -82,3 +82,116 @@ func TestDiscoverCandidatesIncludesLocalAndTraversalCandidates(t *testing.T) {
 		t.Fatalf("DiscoverCandidates() = %v, want traversal candidate", gotStrings)
 	}
 }
+
+func TestObservePunchAddrsReturnsPacketSources(t *testing.T) {
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	if _, err := b.WriteTo([]byte(defaultPunchPayload), a.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got := ObservePunchAddrs(ctx, []net.PacketConn{a}, 100*time.Millisecond)
+	gotStrings := CandidateStrings(got)
+	if len(gotStrings) != 1 || gotStrings[0] != b.LocalAddr().String() {
+		t.Fatalf("ObservePunchAddrs() = %v, want %s", gotStrings, b.LocalAddr())
+	}
+}
+
+func TestObservePunchAddrsByConnPreservesSocketAssociation(t *testing.T) {
+	receivers := make([]net.PacketConn, 2)
+	for i := range receivers {
+		conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		receivers[i] = conn
+	}
+	senders := make([]net.PacketConn, 2)
+	for i := range senders {
+		conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		senders[i] = conn
+		if _, err := conn.WriteTo([]byte(defaultPunchPayload), receivers[i].LocalAddr()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got := ObservePunchAddrsByConn(ctx, receivers, 100*time.Millisecond)
+	if len(got) != len(receivers) {
+		t.Fatalf("len(ObservePunchAddrsByConn()) = %d, want %d", len(got), len(receivers))
+	}
+	for i := range got {
+		gotStrings := CandidateStrings(got[i])
+		if len(gotStrings) != 1 || gotStrings[0] != senders[i].LocalAddr().String() {
+			t.Fatalf("ObservePunchAddrsByConn()[%d] = %v, want %s", i, gotStrings, senders[i].LocalAddr())
+		}
+	}
+}
+
+func TestObservePunchAddrsByConnReturnsAfterAllConnsObserved(t *testing.T) {
+	receivers := make([]net.PacketConn, 2)
+	for i := range receivers {
+		conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		receivers[i] = conn
+	}
+	senders := make([]net.PacketConn, 2)
+	for i := range senders {
+		conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		senders[i] = conn
+		if _, err := conn.WriteTo([]byte(defaultPunchPayload), receivers[i].LocalAddr()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	startedAt := time.Now()
+	got := ObservePunchAddrsByConn(context.Background(), receivers, 500*time.Millisecond)
+	if elapsed := time.Since(startedAt); elapsed > 250*time.Millisecond {
+		t.Fatalf("ObservePunchAddrsByConn() took %s after all conns were observed", elapsed)
+	}
+	if len(got) != len(receivers) {
+		t.Fatalf("len(ObservePunchAddrsByConn()) = %d, want %d", len(got), len(receivers))
+	}
+}
+
+func TestCandidateStringsInOrderPreservesInputOrder(t *testing.T) {
+	raw := []net.Addr{
+		&net.UDPAddr{IP: net.ParseIP("203.0.113.2"), Port: 2000},
+		&net.UDPAddr{IP: net.ParseIP("203.0.113.1"), Port: 1000},
+		&net.UDPAddr{IP: net.ParseIP("203.0.113.2"), Port: 2000},
+	}
+	got := CandidateStringsInOrder(raw)
+	want := []string{"203.0.113.2:2000", "203.0.113.1:1000"}
+	if len(got) != len(want) {
+		t.Fatalf("CandidateStringsInOrder() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("CandidateStringsInOrder() = %v, want %v", got, want)
+		}
+	}
+}

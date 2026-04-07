@@ -36,7 +36,7 @@ func TestMarkdownReportIncludesCoreMetrics(t *testing.T) {
 	}
 
 	md := report.Markdown()
-	want := "- host=ktzlxc mode=raw transport=batched direction=forward size=1048576 bytes_received=1048576 duration_ms=1250 goodput_mbps=670.5 direct=true first_byte_ms=18 loss_rate=0.1250 retransmits=4 local=legacy(req=batched batch=0 read_buf=425984 write_buf=425984 tx_offload=false rx_offload=false rxq_overflow=false) remote=batched(req=batched batch=128 read_buf=0 write_buf=0 tx_offload=true rx_offload=true rxq_overflow=false)"
+	want := "- host=ktzlxc mode=raw transport=batched direction=forward size=1048576 bytes_received=1048576 duration_ms=1250 goodput_mbps=670.5 direct=true first_byte_ms=18 loss_rate=0.1250 retransmits=4 local=legacy(req=batched batch=0 read_buf=425984 write_buf=425984 tx_offload=false rx_offload=false rxq_overflow=false connected=false) remote=batched(req=batched batch=128 read_buf=0 write_buf=0 tx_offload=true rx_offload=true rxq_overflow=false connected=false)"
 	if md != want {
 		t.Fatalf("Markdown() = %q, want %q", md, want)
 	}

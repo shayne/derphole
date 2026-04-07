@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -26,6 +27,7 @@ type TransportCaps struct {
 	TXOffload        bool   `json:"tx_offload,omitempty"`
 	RXOffload        bool   `json:"rx_offload,omitempty"`
 	RXQOverflow      bool   `json:"rxq_overflow,omitempty"`
+	Connected        bool   `json:"connected,omitempty"`
 }
 
 func (c TransportCaps) Summary() string {
@@ -33,7 +35,7 @@ func (c TransportCaps) Summary() string {
 		return "none"
 	}
 	return fmt.Sprintf(
-		"%s(req=%s batch=%d read_buf=%d write_buf=%d tx_offload=%t rx_offload=%t rxq_overflow=%t)",
+		"%s(req=%s batch=%d read_buf=%d write_buf=%d tx_offload=%t rx_offload=%t rxq_overflow=%t connected=%t)",
 		c.Kind,
 		c.RequestedKind,
 		c.BatchSize,
@@ -42,6 +44,7 @@ func (c TransportCaps) Summary() string {
 		c.TXOffload,
 		c.RXOffload,
 		c.RXQOverflow,
+		c.Connected,
 	)
 }
 
@@ -109,8 +112,11 @@ func newPacketBatcher(conn net.PacketConn, requested string) packetBatcher {
 }
 
 type legacyBatcher struct {
-	conn net.PacketConn
-	caps TransportCaps
+	conn       net.PacketConn
+	caps       TransportCaps
+	deadlineMu sync.Mutex
+	readBy     time.Time
+	writeBy    time.Time
 }
 
 func (b *legacyBatcher) Capabilities() TransportCaps { return b.caps }
@@ -123,14 +129,21 @@ func (b *legacyBatcher) WriteBatch(ctx context.Context, peer net.Addr, packets [
 	if b == nil || b.conn == nil {
 		return 0, errors.New("nil packet conn")
 	}
-	deadline, err := batchWriteDeadline(ctx)
-	if err != nil {
+	if err := b.setWriteDeadline(ctx); err != nil {
 		return 0, err
 	}
-	if err := b.conn.SetWriteDeadline(deadline); err != nil {
-		return 0, err
+
+	if udpConn, ok := b.conn.(*net.UDPConn); ok {
+		if udpPeer, ok := peer.(*net.UDPAddr); ok {
+			addrPort := udpPeer.AddrPort()
+			for i, packet := range packets {
+				if _, err := udpConn.WriteToUDPAddrPort(packet, addrPort); err != nil {
+					return i, err
+				}
+			}
+			return len(packets), nil
+		}
 	}
-	defer b.conn.SetWriteDeadline(time.Time{})
 
 	for i, packet := range packets {
 		if _, err := b.conn.WriteTo(packet, peer); err != nil {
@@ -147,17 +160,28 @@ func (b *legacyBatcher) ReadBatch(ctx context.Context, timeout time.Duration, bu
 	if b == nil || b.conn == nil {
 		return 0, errors.New("nil packet conn")
 	}
-	deadline, err := batchReadDeadline(ctx, timeout)
-	if err != nil {
+	if err := b.setReadDeadline(ctx, timeout); err != nil {
 		return 0, err
 	}
-	if err := b.conn.SetReadDeadline(deadline); err != nil {
-		return 0, err
+
+	if udpConn, ok := b.conn.(*net.UDPConn); ok {
+		n, addr, err := udpConn.ReadFromUDPAddrPort(bufs[0].Bytes)
+		if err != nil {
+			b.invalidateReadDeadline()
+			return 0, err
+		}
+		bufs[0].N = n
+		bufs[0].Addr = net.UDPAddrFromAddrPort(addr)
+		for i := 1; i < len(bufs); i++ {
+			bufs[i].N = 0
+			bufs[i].Addr = nil
+		}
+		return 1, nil
 	}
-	defer b.conn.SetReadDeadline(time.Time{})
 
 	n, addr, err := b.conn.ReadFrom(bufs[0].Bytes)
 	if err != nil {
+		b.invalidateReadDeadline()
 		return 0, err
 	}
 	bufs[0].N = n
@@ -167,6 +191,171 @@ func (b *legacyBatcher) ReadBatch(ctx context.Context, timeout time.Duration, bu
 		bufs[i].Addr = nil
 	}
 	return 1, nil
+}
+
+func (b *legacyBatcher) setReadDeadline(ctx context.Context, timeout time.Duration) error {
+	deadline, err := batchReadDeadline(ctx, timeout)
+	if err != nil {
+		return err
+	}
+	b.deadlineMu.Lock()
+	defer b.deadlineMu.Unlock()
+	if !cachedDeadlineNeedsRefresh(time.Now(), b.readBy, deadline, timeout) {
+		return nil
+	}
+	if err := b.conn.SetReadDeadline(deadline); err != nil {
+		return err
+	}
+	b.readBy = deadline
+	return nil
+}
+
+func (b *legacyBatcher) invalidateReadDeadline() {
+	b.deadlineMu.Lock()
+	defer b.deadlineMu.Unlock()
+	b.readBy = time.Time{}
+}
+
+func (b *legacyBatcher) setWriteDeadline(ctx context.Context) error {
+	deadline, err := batchWriteDeadline(ctx)
+	if err != nil {
+		return err
+	}
+	b.deadlineMu.Lock()
+	defer b.deadlineMu.Unlock()
+	if !cachedDeadlineNeedsRefresh(time.Now(), b.writeBy, deadline, time.Second) {
+		return nil
+	}
+	if err := b.conn.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	b.writeBy = deadline
+	return nil
+}
+
+type connectedUDPBatcher struct {
+	conn       *net.UDPConn
+	peer       net.Addr
+	caps       TransportCaps
+	deadlineMu sync.Mutex
+	readBy     time.Time
+	writeBy    time.Time
+}
+
+func newConnectedUDPBatcher(conn net.PacketConn, peer net.Addr, requested string) (packetBatcher, bool) {
+	udpConn, ok := conn.(*net.UDPConn)
+	if !ok || udpConn == nil || peer == nil {
+		return nil, false
+	}
+	udpPeer, ok := peer.(*net.UDPAddr)
+	if !ok || udpPeer == nil {
+		return nil, false
+	}
+	requested, err := normalizeTransport(requested)
+	if err != nil {
+		requested = probeTransportLegacy
+	}
+	if err := platformConnectUDP(udpConn, udpPeer); err != nil {
+		probeTracef("connected udp disabled local=%s peer=%s err=%v", udpConn.LocalAddr(), udpPeer, err)
+		return nil, false
+	}
+	probeTracef("connected udp enabled local=%s peer=%s", udpConn.LocalAddr(), udpPeer)
+	return &connectedUDPBatcher{
+		conn: udpConn,
+		peer: cloneAddr(udpPeer),
+		caps: tuneSocketCaps(udpConn, TransportCaps{
+			Kind:          probeTransportLegacy,
+			RequestedKind: requested,
+			Connected:     true,
+		}),
+	}, true
+}
+
+func (b *connectedUDPBatcher) Capabilities() TransportCaps { return b.caps }
+func (b *connectedUDPBatcher) MaxBatch() int               { return 1 }
+
+func (b *connectedUDPBatcher) WriteBatch(ctx context.Context, peer net.Addr, packets [][]byte) (int, error) {
+	if len(packets) == 0 {
+		return 0, nil
+	}
+	if b == nil || b.conn == nil {
+		return 0, errors.New("nil packet conn")
+	}
+	if err := b.setWriteDeadline(ctx); err != nil {
+		return 0, err
+	}
+
+	for i, packet := range packets {
+		if _, err := b.conn.Write(packet); err != nil {
+			return i, err
+		}
+	}
+	return len(packets), nil
+}
+
+func (b *connectedUDPBatcher) ReadBatch(ctx context.Context, timeout time.Duration, bufs []batchReadBuffer) (int, error) {
+	if len(bufs) == 0 {
+		return 0, nil
+	}
+	if b == nil || b.conn == nil {
+		return 0, errors.New("nil packet conn")
+	}
+	if err := b.setReadDeadline(ctx, timeout); err != nil {
+		return 0, err
+	}
+
+	n, err := b.conn.Read(bufs[0].Bytes)
+	if err != nil {
+		b.invalidateReadDeadline()
+		return 0, err
+	}
+	bufs[0].N = n
+	bufs[0].Addr = b.peer
+	for i := 1; i < len(bufs); i++ {
+		bufs[i].N = 0
+		bufs[i].Addr = nil
+	}
+	return 1, nil
+}
+
+func (b *connectedUDPBatcher) setReadDeadline(ctx context.Context, timeout time.Duration) error {
+	deadline, err := batchReadDeadline(ctx, timeout)
+	if err != nil {
+		return err
+	}
+	b.deadlineMu.Lock()
+	defer b.deadlineMu.Unlock()
+	if !cachedDeadlineNeedsRefresh(time.Now(), b.readBy, deadline, timeout) {
+		return nil
+	}
+	if err := b.conn.SetReadDeadline(deadline); err != nil {
+		return err
+	}
+	b.readBy = deadline
+	return nil
+}
+
+func (b *connectedUDPBatcher) invalidateReadDeadline() {
+	b.deadlineMu.Lock()
+	defer b.deadlineMu.Unlock()
+	b.readBy = time.Time{}
+}
+
+func (b *connectedUDPBatcher) setWriteDeadline(ctx context.Context) error {
+	deadline, err := batchWriteDeadline(ctx)
+	if err != nil {
+		return err
+	}
+	b.deadlineMu.Lock()
+	defer b.deadlineMu.Unlock()
+	if !cachedDeadlineNeedsRefresh(time.Now(), b.writeBy, deadline, time.Second) {
+		return nil
+	}
+	if err := b.conn.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	b.writeBy = deadline
+	return nil
 }
 
 func readBatchWith(b packetBatcher, ctx context.Context, timeout time.Duration, bufs []batchReadBuffer) (int, error) {
@@ -185,6 +374,36 @@ func tuneSocketCaps(conn net.PacketConn, caps TransportCaps) TransportCaps {
 	caps.ReadBufferBytes = socketBufferSize(conn, syscall.SO_RCVBUF)
 	caps.WriteBufferBytes = socketBufferSize(conn, syscall.SO_SNDBUF)
 	return caps
+}
+
+func setSocketPacing(conn net.PacketConn, rateMbps int) bool {
+	rateBytesPerSecond := socketPacingRateBytesPerSecond(rateMbps)
+	if rateBytesPerSecond == 0 {
+		return false
+	}
+	return platformSetSocketPacing(conn, rateBytesPerSecond)
+}
+
+func socketPacingRateBytesPerSecond(rateMbps int) uint64 {
+	if rateMbps <= 0 {
+		return 0
+	}
+	return uint64(rateMbps) * 1000 * 1000 / 8
+}
+
+func pacedBatchLimit(maxBatch int, chunkSize int, rateMbps int) int {
+	if maxBatch <= 1 || chunkSize <= 0 || rateMbps <= 0 {
+		return maxBatch
+	}
+	bytesPerHalfMillisecond := rateMbps * 1000 * 1000 / 8 / 2000
+	limit := bytesPerHalfMillisecond / chunkSize
+	if limit < 1 {
+		return 1
+	}
+	if limit > maxBatch {
+		return maxBatch
+	}
+	return limit
 }
 
 func socketBufferSize(conn net.PacketConn, opt int) int {
@@ -216,7 +435,9 @@ func batchReadDeadline(ctx context.Context, timeout time.Duration) (time.Time, e
 		return time.Time{}, err
 	}
 	deadline := time.Time{}
-	if timeout > 0 {
+	if timeout <= 0 {
+		deadline = time.Now()
+	} else if timeout > 0 {
 		deadline = time.Now().Add(timeout)
 	}
 	if ctxDeadline, ok := ctx.Deadline(); ok {
@@ -225,6 +446,19 @@ func batchReadDeadline(ctx context.Context, timeout time.Duration) (time.Time, e
 		}
 	}
 	return deadline, nil
+}
+
+func cachedDeadlineNeedsRefresh(now, current, desired time.Time, refreshWindow time.Duration) bool {
+	if desired.IsZero() {
+		return !current.IsZero()
+	}
+	if current.IsZero() || desired.Before(current) {
+		return true
+	}
+	if refreshWindow <= 0 {
+		return true
+	}
+	return !current.After(now.Add(refreshWindow / 2))
 }
 
 func batchWriteDeadline(ctx context.Context) (time.Time, error) {

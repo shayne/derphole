@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +14,18 @@ import (
 
 	"github.com/shayne/derpcat/pkg/probe"
 )
+
+type readyNotifyWriter struct {
+	once sync.Once
+	ch   chan struct{}
+}
+
+func (w *readyNotifyWriter) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("READY ")) {
+		w.once.Do(func() { close(w.ch) })
+	}
+	return len(p), nil
+}
 
 func TestRunOrchestratePrintsJSONReport(t *testing.T) {
 	oldRunOrchestrateProbe := runOrchestrateProbe
@@ -152,6 +166,74 @@ func TestRunClientTimesOutWithoutPeer(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "deadline exceeded") && !strings.Contains(stderr.String(), "i/o timeout") {
 		t.Fatalf("stderr = %q, want timeout", stderr.String())
+	}
+}
+
+func TestRunClientPassesRawTuningFlags(t *testing.T) {
+	oldListenPacket := listenPacket
+	oldDiscoverProbeCandidates := discoverProbeCandidates
+	oldProbeSend := probeSend
+	defer func() {
+		listenPacket = oldListenPacket
+		discoverProbeCandidates = oldDiscoverProbeCandidates
+		probeSend = oldProbeSend
+	}()
+
+	clientConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConn.Close()
+
+	listenPacket = func(network, address string) (net.PacketConn, error) {
+		if address != ":0" {
+			t.Fatalf("listen address = %q, want %q", address, ":0")
+		}
+		return clientConn, nil
+	}
+	discoverProbeCandidates = func(ctx context.Context, conn net.PacketConn) ([]net.Addr, error) {
+		return []net.Addr{conn.LocalAddr()}, nil
+	}
+
+	var gotRemote string
+	var gotCfg probe.SendConfig
+	probeSend = func(ctx context.Context, conn net.PacketConn, remoteAddr string, src io.Reader, cfg probe.SendConfig) (probe.TransferStats, error) {
+		gotRemote = remoteAddr
+		gotCfg = cfg
+		now := time.Now()
+		return probe.TransferStats{StartedAt: now, FirstByteAt: now, CompletedAt: now}, nil
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := runClient([]string{
+		"--host", "127.0.0.1:9999",
+		"--mode", "raw",
+		"--chunk-size", "1234",
+		"--window-size", "321",
+		"--parallel", "4",
+		"--rate-mbps", "123",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("runClient() code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if gotRemote != "127.0.0.1:9999" {
+		t.Fatalf("remote addr = %q, want %q", gotRemote, "127.0.0.1:9999")
+	}
+	if !gotCfg.Raw || gotCfg.Blast {
+		t.Fatalf("send config = %+v, want raw mode only", gotCfg)
+	}
+	if gotCfg.ChunkSize != 1234 {
+		t.Fatalf("chunk size = %d, want %d", gotCfg.ChunkSize, 1234)
+	}
+	if gotCfg.WindowSize != 321 {
+		t.Fatalf("window size = %d, want %d", gotCfg.WindowSize, 321)
+	}
+	if gotCfg.Parallel != 4 {
+		t.Fatalf("parallel = %d, want %d", gotCfg.Parallel, 4)
+	}
+	if gotCfg.RateMbps != 123 {
+		t.Fatalf("rate mbps = %d, want %d", gotCfg.RateMbps, 123)
 	}
 }
 
@@ -348,10 +430,11 @@ func TestRunServerAcceptsBlastMode(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
+	readyCh := make(chan struct{})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		code := runServer([]string{"--mode", "blast"}, io.Discard, io.Discard)
+		code := runServer([]string{"--mode", "blast", "--size-bytes", "5"}, &readyNotifyWriter{ch: readyCh}, io.Discard)
 		if code != 0 {
 			t.Errorf("runServer() code = %d, want 0", code)
 		}
@@ -359,6 +442,11 @@ func TestRunServerAcceptsBlastMode(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
+	select {
+	case <-readyCh:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for server READY: %v", ctx.Err())
+	}
 
 	senderConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
@@ -371,6 +459,71 @@ func TestRunServerAcceptsBlastMode(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func TestOpenServerPacketConnsUsesDistinctPortsForParallelBlast(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	conns, err := openServerPacketConns(ctx, "blast", "127.0.0.1:0", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closePacketConns(conns)
+	if len(conns) != 3 {
+		t.Fatalf("len(conns) = %d, want 3", len(conns))
+	}
+
+	seen := make(map[string]bool)
+	for _, conn := range conns {
+		addr := conn.LocalAddr().String()
+		if seen[addr] {
+			t.Fatalf("parallel blast reused local address %s, want distinct sockets", addr)
+		}
+		seen[addr] = true
+	}
+}
+
+func TestDiscoverServerCandidatesIncludesEveryParallelSocket(t *testing.T) {
+	oldDiscoverProbeCandidates := discoverProbeCandidates
+	defer func() { discoverProbeCandidates = oldDiscoverProbeCandidates }()
+
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	discoverProbeCandidates = func(ctx context.Context, conn net.PacketConn) ([]net.Addr, error) {
+		return []net.Addr{conn.LocalAddr()}, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	got, err := discoverServerCandidates(ctx, []net.PacketConn{a, b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotStrings := probe.CandidateStrings(got)
+	for _, want := range []string{a.LocalAddr().String(), b.LocalAddr().String()} {
+		if !containsString(gotStrings, want) {
+			t.Fatalf("discoverServerCandidates() = %v, missing %s", gotStrings, want)
+		}
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestRunClientRejectsAeadMode(t *testing.T) {
@@ -428,5 +581,134 @@ func TestRunClientAcceptsBlastMode(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for ReceiveToWriter")
+	}
+}
+
+func TestRunClientBlastParallelSendsOneSharePerPeerCandidate(t *testing.T) {
+	oldListenPacket := listenPacket
+	oldDiscoverProbeCandidates := discoverProbeCandidates
+	oldProbeSend := probeSend
+	oldClientTimeout := clientTimeout
+	defer func() {
+		listenPacket = oldListenPacket
+		discoverProbeCandidates = oldDiscoverProbeCandidates
+		probeSend = oldProbeSend
+		clientTimeout = oldClientTimeout
+	}()
+	clientTimeout = 2 * time.Second
+
+	listenPacket = func(network, address string) (net.PacketConn, error) {
+		return net.ListenPacket("udp4", "127.0.0.1:0")
+	}
+	discoverProbeCandidates = func(ctx context.Context, conn net.PacketConn) ([]net.Addr, error) {
+		return []net.Addr{conn.LocalAddr()}, nil
+	}
+
+	var mu sync.Mutex
+	var gotRemotes []string
+	var gotSizes []int64
+	var gotRates []int
+	probeSend = func(ctx context.Context, conn net.PacketConn, remoteAddr string, src io.Reader, cfg probe.SendConfig) (probe.TransferStats, error) {
+		if !cfg.Blast || cfg.Raw {
+			return probe.TransferStats{}, fmt.Errorf("send config = %+v, want blast mode only", cfg)
+		}
+		n, err := io.Copy(io.Discard, src)
+		if err != nil {
+			return probe.TransferStats{}, err
+		}
+		mu.Lock()
+		gotRemotes = append(gotRemotes, remoteAddr)
+		gotSizes = append(gotSizes, n)
+		gotRates = append(gotRates, cfg.RateMbps)
+		mu.Unlock()
+		now := time.Now()
+		return probe.TransferStats{BytesSent: n, StartedAt: now, FirstByteAt: now, CompletedAt: now}, nil
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := runClient([]string{
+		"--mode", "blast",
+		"--transport", "batched",
+		"--peer-candidates", "203.0.113.1:4001,203.0.113.1:4002",
+		"--parallel", "2",
+		"--rate-mbps", "2000",
+		"--size-bytes", "11",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("runClient() code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	sort.Strings(gotRemotes)
+	sort.Slice(gotSizes, func(i, j int) bool { return gotSizes[i] > gotSizes[j] })
+	if strings.Join(gotRemotes, ",") != "203.0.113.1:4001,203.0.113.1:4002" {
+		t.Fatalf("remote addresses = %v, want both peer candidates", gotRemotes)
+	}
+	if len(gotSizes) != 2 || gotSizes[0] != 6 || gotSizes[1] != 5 {
+		t.Fatalf("share sizes = %v, want [6 5]", gotSizes)
+	}
+	sort.Ints(gotRates)
+	if len(gotRates) != 2 || gotRates[0] != 1000 || gotRates[1] != 1000 {
+		t.Fatalf("rate mbps = %v, want [1000 1000]", gotRates)
+	}
+}
+
+func TestSelectClientRemoteAddrsByConnAvoidsDuplicateRemotePorts(t *testing.T) {
+	observedByConn := [][]net.Addr{
+		{mustClientUDPAddr(t, "100.107.23.123:51048")},
+		{mustClientUDPAddr(t, "68.20.14.192:51048"), mustClientUDPAddr(t, "68.20.14.192:52315")},
+		{mustClientUDPAddr(t, "68.20.14.192:35365")},
+	}
+	fallback := []string{"68.20.14.192:35365", "68.20.14.192:52315", "68.20.14.192:51048"}
+
+	got := selectClientRemoteAddrsByConn(observedByConn, fallback, 3)
+	want := []string{"100.107.23.123:51048", "68.20.14.192:52315", "68.20.14.192:35365"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("selectClientRemoteAddrsByConn() = %v, want %v", got, want)
+	}
+}
+
+func TestSelectClientRemoteAddrsByConnBackfillsEmptyLanesFromAnyUnusedFallback(t *testing.T) {
+	observedByConn := [][]net.Addr{
+		{mustClientUDPAddr(t, "68.20.14.192:51048")},
+		{mustClientUDPAddr(t, "100.107.23.123:51048")},
+		{mustClientUDPAddr(t, "68.20.14.192:50924")},
+		{mustClientUDPAddr(t, "68.20.14.192:50924")},
+	}
+	fallback := []string{
+		"68.20.14.192:51048",
+		"68.20.14.192:50924",
+		"68.20.14.192:37597",
+		"68.20.14.192:47634",
+	}
+
+	got := selectClientRemoteAddrsByConn(observedByConn, fallback, 4)
+	want := []string{"68.20.14.192:51048", "68.20.14.192:37597", "68.20.14.192:50924", "68.20.14.192:47634"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("selectClientRemoteAddrsByConn() = %v, want %v", got, want)
+	}
+}
+
+func mustClientUDPAddr(t *testing.T, raw string) net.Addr {
+	t.Helper()
+	addr, err := net.ResolveUDPAddr("udp", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return addr
+}
+
+func TestClientSizedReaderDoesNotRewritePayloadBuffer(t *testing.T) {
+	reader := sizedReader(2)
+	buf := []byte{1, 2, 3, 4}
+
+	n, err := reader.Read(buf)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("Read() n = %d, want 2", n)
+	}
+	if got := fmt.Sprint(buf); got != "[1 2 3 4]" {
+		t.Fatalf("buffer = %s, want unchanged probe payload buffer", got)
 	}
 }

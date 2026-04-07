@@ -8,6 +8,7 @@ import (
 	"net"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -91,15 +92,16 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	conn, err := listenPacket("udp", listenAddr)
+	conns, err := openServerPacketConns(ctx, mode, listenAddr, parsed.Flags.Parallel)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	defer conn.Close()
+	defer closePacketConns(conns)
+	conn := conns[0]
 
 	discoverCtx, cancelDiscover := context.WithTimeout(ctx, 750*time.Millisecond)
-	candidates, discoverErr := discoverProbeCandidates(discoverCtx, conn)
+	candidates, discoverErr := discoverServerCandidates(discoverCtx, conns)
 	cancelDiscover()
 	if discoverErr != nil && len(candidates) == 0 {
 		fmt.Fprintln(stderr, discoverErr)
@@ -125,7 +127,7 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 		defer server.Close()
 		ready := serverReady{
 			Addr:       conn.LocalAddr().String(),
-			Candidates: probe.CandidateStrings(candidates),
+			Candidates: probe.CandidateStringsInOrder(candidates),
 			Transport:  probe.PreviewTransportCaps(conn, transport),
 		}
 		if len(ready.Candidates) == 0 && ready.Addr != "" {
@@ -144,7 +146,7 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 	} else {
 		ready := serverReady{
 			Addr:       conn.LocalAddr().String(),
-			Candidates: probe.CandidateStrings(candidates),
+			Candidates: probe.CandidateStringsInOrder(candidates),
 			Transport:  probe.PreviewTransportCaps(conn, transport),
 		}
 		if len(ready.Candidates) == 0 && ready.Addr != "" {
@@ -157,7 +159,9 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 
 		punchCtx, punchCancel := context.WithCancel(ctx)
 		defer punchCancel()
-		go probe.PunchAddrs(punchCtx, conn, peerCandidates, nil, 25*time.Millisecond)
+		for _, punchConn := range conns {
+			go probe.PunchAddrs(punchCtx, punchConn, peerCandidates, nil, 25*time.Millisecond)
+		}
 
 		if mode == "wg" {
 			waitStats, waitErr := probe.ReceiveWireGuardToWriter(ctx, conn, io.Discard, probe.WireGuardConfig{
@@ -193,6 +197,21 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 				return 1
 			}
 			stats = waitStats
+		} else if mode == "blast" {
+			if parsed.Flags.SizeBytes <= 0 {
+				fmt.Fprintln(stderr, "size bytes is required for blast server mode")
+				return 2
+			}
+			waitStats, waitErr := probe.ReceiveBlastParallelToWriter(ctx, conns, io.Discard, probe.ReceiveConfig{
+				Blast:           true,
+				Transport:       transport,
+				RequireComplete: probeEnvBool("DERPCAT_PROBE_REQUIRE_COMPLETE"),
+			}, parsed.Flags.SizeBytes)
+			if waitErr != nil {
+				fmt.Fprintln(stderr, waitErr)
+				return 1
+			}
+			stats = waitStats
 		} else {
 			waitStats, waitErr := probe.ReceiveToWriter(ctx, conn, "", io.Discard, probe.ReceiveConfig{Raw: mode == "raw", Blast: mode == "blast", Transport: transport})
 			if waitErr != nil {
@@ -218,6 +237,130 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 
 	_ = stdout
 	return 0
+}
+
+func openServerPacketConns(ctx context.Context, mode, listenAddr string, parallel int) ([]net.PacketConn, error) {
+	if parallel <= 0 {
+		parallel = 1
+	}
+	conns := make([]net.PacketConn, 0, parallel)
+	first, err := listenPacket("udp", listenAddr)
+	if err != nil {
+		return nil, err
+	}
+	conns = append(conns, first)
+	if mode != "blast" || parallel <= 1 {
+		return conns, nil
+	}
+	extraListenAddr := parallelListenAddr(listenAddr)
+	for len(conns) < parallel {
+		if err := ctx.Err(); err != nil {
+			closePacketConns(conns)
+			return nil, err
+		}
+		extra, err := listenPacket("udp", extraListenAddr)
+		if err != nil {
+			closePacketConns(conns)
+			return nil, err
+		}
+		conns = append(conns, extra)
+	}
+	return conns, nil
+}
+
+func parallelListenAddr(listenAddr string) string {
+	host, _, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return ":0"
+	}
+	return net.JoinHostPort(host, "0")
+}
+
+func closePacketConns(conns []net.PacketConn) {
+	for _, conn := range conns {
+		if conn != nil {
+			_ = conn.Close()
+		}
+	}
+}
+
+func discoverServerCandidates(ctx context.Context, conns []net.PacketConn) ([]net.Addr, error) {
+	type result struct {
+		index int
+		addrs []net.Addr
+		err   error
+	}
+	results := make(chan result, len(conns))
+	var wg sync.WaitGroup
+	for i, conn := range conns {
+		if conn == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, conn net.PacketConn) {
+			defer wg.Done()
+			addrs, err := discoverProbeCandidates(ctx, conn)
+			results <- result{index: i, addrs: addrs, err: err}
+		}(i, conn)
+	}
+	wg.Wait()
+	close(results)
+
+	byConn := make([][]net.Addr, len(conns))
+	seen := make(map[string]net.Addr)
+	var firstErr error
+	for result := range results {
+		if result.err != nil && firstErr == nil {
+			firstErr = result.err
+		}
+		if result.index >= 0 && result.index < len(byConn) {
+			byConn[result.index] = result.addrs
+		}
+	}
+	out := make([]net.Addr, 0)
+	for _, addrs := range byConn {
+		for _, addr := range firstPreferredCandidate(addrs) {
+			if addr == nil {
+				continue
+			}
+			key := addr.String()
+			if seen[key] != nil {
+				continue
+			}
+			seen[key] = addr
+			out = append(out, addr)
+		}
+	}
+	for _, addrs := range byConn {
+		for _, addr := range addrs {
+			if addr == nil {
+				continue
+			}
+			key := addr.String()
+			if seen[key] != nil {
+				continue
+			}
+			seen[key] = addr
+			out = append(out, addr)
+		}
+	}
+	if len(out) == 0 && firstErr != nil {
+		return nil, firstErr
+	}
+	return out, nil
+}
+
+func firstPreferredCandidate(addrs []net.Addr) []net.Addr {
+	ordered := probe.CandidateStrings(addrs)
+	if len(ordered) == 0 {
+		return nil
+	}
+	for _, addr := range addrs {
+		if addr != nil && addr.String() == ordered[0] {
+			return []net.Addr{addr}
+		}
+	}
+	return nil
 }
 
 func writeMachineLine(w io.Writer, prefix string, v any) error {
@@ -247,5 +390,5 @@ type serverFlags struct {
 	WGPeerAddr     string `flag:"wg-peer-addr" help:"WireGuard peer IP"`
 	WGPort         int    `flag:"wg-port" help:"WireGuard TCP port" default:"7000"`
 	SizeBytes      int64  `flag:"size-bytes" help:"Expected payload size for parallel WireGuard tunnel modes"`
-	Parallel       int    `flag:"parallel" help:"Parallel TCP streams for WireGuard tunnel modes" default:"1"`
+	Parallel       int    `flag:"parallel" help:"Parallel blast sockets or TCP streams for WireGuard tunnel modes" default:"1"`
 }
