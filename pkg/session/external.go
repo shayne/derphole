@@ -106,7 +106,9 @@ type directUDPReadyAck struct {
 }
 
 type directUDPStart struct {
-	ExpectedBytes int64 `json:"expected_bytes,omitempty"`
+	ExpectedBytes int64    `json:"expected_bytes,omitempty"`
+	SectionSizes  []int64  `json:"section_sizes,omitempty"`
+	SectionAddrs  []string `json:"section_addrs,omitempty"`
 }
 
 type quicModeRequest struct {

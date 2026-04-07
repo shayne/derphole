@@ -28,7 +28,7 @@ import (
 
 const (
 	externalDirectUDPTransportLabel  = "batched"
-	externalDirectUDPParallelism     = 4
+	externalDirectUDPParallelism     = 8
 	externalDirectUDPChunkSize       = 1400
 	externalDirectUDPRateMbps        = 2150
 	externalDirectUDPWait            = 750 * time.Millisecond
@@ -39,7 +39,7 @@ const (
 	externalDirectUDPRepairPayloads  = true
 	externalDirectUDPTailReplayBytes = 0
 	externalDirectUDPFECGroupSize    = 0
-	externalDirectUDPStripedBlast    = true
+	externalDirectUDPStripedBlast    = false
 	externalDirectUDPDiscardQueue    = 32
 )
 
@@ -170,7 +170,7 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) error {
 			} else {
 				transportManager.StopDirectReads()
 				pathEmitter.Emit(StateDirect)
-				remoteAddrs := externalDirectUDPSelectRemoteAddrs(ctx, probeConns, remoteCandidates, cfg.Emitter)
+				remoteAddrs := externalDirectUDPSelectRemoteAddrs(ctx, probeConns, remoteCandidates, peerAddr, cfg.Emitter)
 				probeConns, remoteAddrs = externalDirectUDPPairs(probeConns, remoteAddrs)
 				if len(probeConns) == 0 {
 					return errors.New("direct UDP established without usable remote addresses")
@@ -182,7 +182,7 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) error {
 					cfg.Emitter.Debug("udp-repair-payloads=" + strconv.FormatBool(externalDirectUDPRepairPayloads))
 					cfg.Emitter.Debug("udp-tail-replay-bytes=" + strconv.Itoa(externalDirectUDPTailReplayBytes))
 					cfg.Emitter.Debug("udp-fec-group-size=" + strconv.Itoa(externalDirectUDPFECGroupSize))
-					cfg.Emitter.Debug("udp-striped-blast=" + strconv.FormatBool(externalDirectUDPStripedBlast && !readyAck.FastDiscard))
+					cfg.Emitter.Debug("udp-striped-blast=false")
 					cfg.Emitter.Debug("udp-fast-discard=" + strconv.FormatBool(readyAck.FastDiscard))
 					cfg.Emitter.Debug("udp-direct-addr=" + peerAddr.String())
 					cfg.Emitter.Debug("udp-direct-addrs=" + strings.Join(remoteAddrs, ","))
@@ -201,33 +201,30 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) error {
 					ParallelHandshakeTimeout: externalDirectUDPHandshakeWait,
 				}
 				var stats probe.TransferStats
-				if readyAck.FastDiscard {
-					spool, spoolErr := externalDirectUDPSpoolDiscardLanes(ctx, externalDirectUDPBufferedReader(src), len(probeConns), sendCfg.ChunkSize)
-					if spoolErr != nil {
-						return spoolErr
-					}
-					defer spool.Close()
-					emitExternalDirectUDPReceiveStartDebug(cfg.Emitter, spool.TotalBytes)
-					if err := sendEnvelope(ctx, derpClient, listenerDERP, envelope{
-						Type: envelopeDirectUDPStart,
-						DirectUDPStart: &directUDPStart{
-							ExpectedBytes: spool.TotalBytes,
-						},
-					}); err != nil {
-						return err
-					}
-					if err := waitForDirectUDPStartAck(ctx, startAckCh); err != nil {
-						return err
-					}
-					discardSendCfg := sendCfg
-					// Fast-discard mirrors the probe harness: each independent lane gets its own generated run ID.
-					discardSendCfg.RunID = [16]byte{}
-					externalDirectUDPStopPunchingForBlast(punchCancel)
-					stats, err = externalDirectUDPSendDiscardSpoolParallel(ctx, probeConns, remoteAddrs, spool, discardSendCfg)
-				} else {
-					externalDirectUDPStopPunchingForBlast(punchCancel)
-					stats, err = probe.SendBlastParallel(ctx, probeConns, remoteAddrs, externalDirectUDPBufferedReader(src), sendCfg)
+				spool, spoolErr := externalDirectUDPSpoolDiscardLanes(ctx, externalDirectUDPBufferedReader(src), len(probeConns), sendCfg.ChunkSize)
+				if spoolErr != nil {
+					return spoolErr
 				}
+				defer spool.Close()
+				emitExternalDirectUDPReceiveStartDebug(cfg.Emitter, spool.TotalBytes)
+				if err := sendEnvelope(ctx, derpClient, listenerDERP, envelope{
+					Type: envelopeDirectUDPStart,
+					DirectUDPStart: &directUDPStart{
+						ExpectedBytes: spool.TotalBytes,
+						SectionSizes:  append([]int64(nil), spool.Sizes...),
+						SectionAddrs:  append([]string(nil), remoteAddrs...),
+					},
+				}); err != nil {
+					return err
+				}
+				if err := waitForDirectUDPStartAck(ctx, startAckCh); err != nil {
+					return err
+				}
+				sectionSendCfg := sendCfg
+				// Sectioned direct UDP mirrors the probe harness: each independent lane gets its own generated run ID.
+				sectionSendCfg.RunID = [16]byte{}
+				externalDirectUDPStopPunchingForBlast(punchCancel)
+				stats, err = externalDirectUDPSendDiscardSpoolParallel(ctx, probeConns, remoteAddrs, spool, sectionSendCfg)
 				if cfg.Emitter != nil {
 					cfg.Emitter.Debug("udp-send-transport=" + stats.Transport.Summary())
 					if stats.Lanes > 0 {
@@ -398,7 +395,7 @@ func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (string, 
 						cfg.Emitter.Debug("udp-lanes=" + strconv.Itoa(len(probeConns)))
 						cfg.Emitter.Debug("udp-require-complete=" + strconv.FormatBool(!fastDiscard))
 						cfg.Emitter.Debug("udp-fec-group-size=" + strconv.Itoa(externalDirectUDPFECGroupSize))
-						cfg.Emitter.Debug("udp-striped-blast=" + strconv.FormatBool(externalDirectUDPStripedBlast && !fastDiscard))
+						cfg.Emitter.Debug("udp-striped-blast=false")
 						cfg.Emitter.Debug("udp-fast-discard=" + strconv.FormatBool(fastDiscard))
 						if peerAddr != nil {
 							cfg.Emitter.Debug("udp-direct-addr=" + peerAddr.String())
@@ -407,22 +404,25 @@ func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (string, 
 					}
 					receiveCfg := externalDirectUDPFastDiscardReceiveConfig()
 					var stats probe.TransferStats
+					var start directUDPStart
+					start, receiveErr = waitForDirectUDPStart(ctx, startCh)
+					if receiveErr != nil {
+						return tok, receiveErr
+					}
+					emitExternalDirectUDPReceiveStartDebug(cfg.Emitter, start.ExpectedBytes)
+					if receiveErr = sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDirectUDPStartAck}); receiveErr != nil {
+						return tok, receiveErr
+					}
+					externalDirectUDPStopPunchingForBlast(punchCancel)
 					if fastDiscard {
-						var start directUDPStart
-						start, receiveErr = waitForDirectUDPStart(ctx, startCh)
+						stats, receiveErr = probe.ReceiveBlastParallelToWriter(ctx, probeConns, receiveDst, receiveCfg, start.ExpectedBytes)
+					} else {
+						receiveCfg.RequireComplete = true
+						probeConns, receiveErr = externalDirectUDPOrderConnsForSections(probeConns, decision.Accept.Candidates, start.SectionAddrs)
 						if receiveErr != nil {
 							return tok, receiveErr
 						}
-						emitExternalDirectUDPReceiveStartDebug(cfg.Emitter, start.ExpectedBytes)
-						if receiveErr = sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDirectUDPStartAck}); receiveErr != nil {
-							return tok, receiveErr
-						}
-						externalDirectUDPStopPunchingForBlast(punchCancel)
-						stats, receiveErr = probe.ReceiveBlastParallelToWriter(ctx, probeConns, receiveDst, receiveCfg, start.ExpectedBytes)
-					} else {
-						receiveCfg.ExpectedRunID = session.token.SessionID
-						externalDirectUDPStopPunchingForBlast(punchCancel)
-						stats, receiveErr = probe.ReceiveBlastStreamParallelToWriter(ctx, probeConns, receiveDst, receiveCfg, 0)
+						stats, receiveErr = externalDirectUDPReceiveSectionSpoolParallel(ctx, probeConns, receiveDst, receiveCfg, start.ExpectedBytes, start.SectionSizes)
 					}
 					emitExternalDirectUDPReceiveResultDebug(cfg.Emitter, stats, receiveErr)
 					if cfg.Emitter != nil {
@@ -462,8 +462,12 @@ func externalDirectUDPConns(_ net.PacketConn, _ publicPortmap, parallel int, emi
 	portmaps := make([]publicPortmap, 0, parallel)
 	owned := make([]net.PacketConn, 0, parallel)
 	ownedPMs := make([]publicPortmap, 0, parallel)
+	network, address := "udp", ":0"
+	if fakeTransportEnabled() {
+		network, address = "udp4", "127.0.0.1:0"
+	}
 	for len(conns) < parallel {
-		conn, err := net.ListenPacket("udp", ":0")
+		conn, err := net.ListenPacket(network, address)
 		if err != nil {
 			for _, ownedConn := range owned {
 				_ = ownedConn.Close()
@@ -507,12 +511,17 @@ func externalDirectUDPCandidates(ctx context.Context, conns []net.PacketConn, dm
 		}
 		if fakeTransportEnabled() {
 			sets[i] = publicInitialProbeCandidates(conn, pm)
+			sets[i] = externalDirectUDPPreferLoopbackStrings(sets[i])
 		} else {
 			sets[i] = publicProbeCandidates(ctx, conn, dm, pm)
+			sets[i] = externalDirectUDPPreferWANStrings(sets[i])
 		}
-		sets[i] = externalDirectUDPPreferWANStrings(sets[i])
 	}
 	sets = externalDirectUDPInferWANPerPort(sets)
+	return externalDirectUDPFlattenCandidateSets(sets)
+}
+
+func externalDirectUDPFlattenCandidateSets(sets [][]string) []string {
 	out := make([]string, 0, rendezvous.MaxClaimCandidates)
 	seen := make(map[string]bool)
 	add := func(candidate string) bool {
@@ -523,19 +532,21 @@ func externalDirectUDPCandidates(ctx context.Context, conns []net.PacketConn, dm
 		seen[candidate] = true
 		return len(out) == rendezvous.MaxClaimCandidates
 	}
-	for _, candidates := range sets {
-		if len(candidates) > 0 && add(candidates[0]) {
-			return out
-		}
-	}
-	for _, candidates := range sets {
-		for _, candidate := range candidates {
-			if add(candidate) {
+	for depth := 0; ; depth++ {
+		progressed := false
+		for _, candidates := range sets {
+			if depth >= len(candidates) {
+				continue
+			}
+			progressed = true
+			if add(candidates[depth]) {
 				return out
 			}
 		}
+		if !progressed {
+			return out
+		}
 	}
-	return out
 }
 
 func externalDirectUDPInferWANPerPort(sets [][]string) [][]string {
@@ -597,14 +608,17 @@ func externalDirectUDPStartPunching(ctx context.Context, conns []net.PacketConn,
 	}
 }
 
-func externalDirectUDPSelectRemoteAddrs(ctx context.Context, conns []net.PacketConn, remoteCandidates []net.Addr, emitter *telemetry.Emitter) []string {
-	fallback := externalDirectUDPParallelCandidateStrings(remoteCandidates, len(conns))
+func externalDirectUDPSelectRemoteAddrs(ctx context.Context, conns []net.PacketConn, remoteCandidates []net.Addr, peer net.Addr, emitter *telemetry.Emitter) []string {
+	fallback := externalDirectUDPParallelCandidateStringsForPeer(remoteCandidates, len(conns), peer)
+	if fakeTransportEnabled() {
+		return fallback
+	}
 	observedByConn := probe.ObservePunchAddrsByConn(ctx, conns, externalDirectUDPPunchWait)
 	if emitter != nil {
 		emitter.Debug("udp-remote-fallback-addrs=" + strings.Join(fallback, ","))
 		emitter.Debug("udp-observed-addrs-by-conn=" + externalDirectUDPFormatObservedAddrsByConn(observedByConn))
 	}
-	selected := externalDirectUDPSelectRemoteAddrsByConn(observedByConn, fallback, len(conns))
+	selected := externalDirectUDPSelectRemoteAddrsByConn(observedByConn, fallback, len(conns), peer)
 	if emitter != nil {
 		emitter.Debug("udp-selected-addrs=" + strings.Join(selected, ","))
 	}
@@ -623,7 +637,7 @@ func externalDirectUDPFormatObservedAddrsByConn(observedByConn [][]net.Addr) str
 	return strings.Join(parts, ",")
 }
 
-func externalDirectUDPSelectRemoteAddrsByConn(observedByConn [][]net.Addr, fallback []string, parallel int) []string {
+func externalDirectUDPSelectRemoteAddrsByConn(observedByConn [][]net.Addr, fallback []string, parallel int, peer net.Addr) []string {
 	if parallel <= 0 {
 		parallel = len(fallback)
 	}
@@ -641,7 +655,7 @@ func externalDirectUDPSelectRemoteAddrsByConn(observedByConn [][]net.Addr, fallb
 		return true
 	}
 	for i := 0; i < parallel && i < len(observedByConn); i++ {
-		for _, candidate := range externalDirectUDPParallelCandidateStrings(observedByConn[i], len(observedByConn[i])) {
+		for _, candidate := range externalDirectUDPParallelCandidateStringsForPeer(observedByConn[i], len(observedByConn[i]), peer) {
 			if selectCandidate(i, candidate) {
 				break
 			}
@@ -661,10 +675,19 @@ func externalDirectUDPSelectRemoteAddrsByConn(observedByConn [][]net.Addr, fallb
 }
 
 func externalDirectUDPParallelCandidateStrings(candidates []net.Addr, parallel int) []string {
+	return externalDirectUDPParallelCandidateStringsForPeer(candidates, parallel, nil)
+}
+
+func externalDirectUDPParallelCandidateStringsForPeer(candidates []net.Addr, parallel int, peer net.Addr) []string {
 	if parallel <= 0 {
 		parallel = 1
 	}
-	ordered := externalDirectUDPPreferWANStrings(probe.CandidateStringsInOrder(candidates))
+	ordered := probe.CandidateStringsInOrder(candidates)
+	if fakeTransportEnabled() {
+		ordered = externalDirectUDPPreferLoopbackStrings(ordered)
+	} else {
+		ordered = externalDirectUDPPreferPeerAddrStrings(ordered, peer)
+	}
 	out := make([]string, 0, parallel)
 	seen := make(map[string]bool)
 	seenEndpoint := make(map[string]bool)
@@ -691,6 +714,75 @@ func externalDirectUDPParallelCandidateStrings(candidates []net.Addr, parallel i
 		}
 	}
 	return out
+}
+
+func externalDirectUDPPreferPeerAddrStrings(candidates []string, peer net.Addr) []string {
+	out := externalDirectUDPPreferWANStrings(candidates)
+	peerAddr, ok := externalDirectUDPAddrPort(peer)
+	if !ok {
+		return out
+	}
+	for i := 1; i < len(out); i++ {
+		candidate := out[i]
+		j := i - 1
+		for j >= 0 && externalDirectUDPShouldPromotePeerCandidate(candidate, out[j], peerAddr.Addr()) {
+			out[j+1] = out[j]
+			j--
+		}
+		out[j+1] = candidate
+	}
+	return out
+}
+
+func externalDirectUDPShouldPromotePeerCandidate(candidate string, existing string, peer netip.Addr) bool {
+	candidatePeer := externalDirectUDPMatchesPeerAddr(candidate, peer)
+	existingPeer := externalDirectUDPMatchesPeerAddr(existing, peer)
+	if candidatePeer != existingPeer {
+		return candidatePeer
+	}
+	return candidatePeer && externalDirectUDPShouldPromoteCandidate(candidate, existing)
+}
+
+func externalDirectUDPMatchesPeerAddr(candidate string, peer netip.Addr) bool {
+	candidateAddr, err := netip.ParseAddrPort(candidate)
+	return err == nil && candidateAddr.Addr() == peer
+}
+
+func externalDirectUDPAddrPort(addr net.Addr) (netip.AddrPort, bool) {
+	if addr == nil {
+		return netip.AddrPort{}, false
+	}
+	addrPort, err := netip.ParseAddrPort(addr.String())
+	if err != nil || !addrPort.Addr().IsValid() || addrPort.Addr().IsUnspecified() {
+		return netip.AddrPort{}, false
+	}
+	return addrPort, true
+}
+
+func externalDirectUDPPreferLoopbackStrings(candidates []string) []string {
+	out := append([]string(nil), candidates...)
+	for i := 1; i < len(out); i++ {
+		candidate := out[i]
+		j := i - 1
+		for j >= 0 && externalDirectUDPShouldPromoteLoopbackCandidate(candidate, out[j]) {
+			out[j+1] = out[j]
+			j--
+		}
+		out[j+1] = candidate
+	}
+	return out
+}
+
+func externalDirectUDPShouldPromoteLoopbackCandidate(candidate string, existing string) bool {
+	candidateLoopback := externalDirectUDPCandidateRank(candidate) == 5
+	existingLoopback := externalDirectUDPCandidateRank(existing) == 5
+	if candidateLoopback != existingLoopback {
+		return candidateLoopback
+	}
+	if candidateLoopback {
+		return externalDirectUDPShouldPromoteCandidate(candidate, existing)
+	}
+	return false
 }
 
 func externalDirectUDPPreferWANStrings(candidates []string) []string {
@@ -762,25 +854,6 @@ func externalDirectUDPEndpointKey(candidate string) string {
 
 func externalDirectUDPDedupeAndFill(selected []string, fallback []string) []string {
 	out := append([]string(nil), selected...)
-	bestFallback := make(map[string]string)
-	for _, candidate := range fallback {
-		if candidate == "" {
-			continue
-		}
-		endpoint := externalDirectUDPEndpointKey(candidate)
-		if existing := bestFallback[endpoint]; existing == "" || externalDirectUDPBetterCandidate(candidate, existing) {
-			bestFallback[endpoint] = candidate
-		}
-	}
-	for i, candidate := range out {
-		if candidate == "" {
-			continue
-		}
-		endpoint := externalDirectUDPEndpointKey(candidate)
-		if replacement := bestFallback[endpoint]; replacement != "" && externalDirectUDPBetterCandidate(replacement, candidate) {
-			out[i] = replacement
-		}
-	}
 	seenEndpoint := make(map[string]int)
 	for i, candidate := range out {
 		if candidate == "" {
@@ -839,6 +912,58 @@ func externalDirectUDPPairs(conns []net.PacketConn, remoteAddrs []string) ([]net
 		outAddrs = append(outAddrs, remoteAddrs[i])
 	}
 	return outConns, outAddrs
+}
+
+func externalDirectUDPOrderConnsForSections(conns []net.PacketConn, localCandidates []string, sectionAddrs []string) ([]net.PacketConn, error) {
+	if len(sectionAddrs) == 0 {
+		return conns, nil
+	}
+	endpointToConn := make(map[string]int)
+	addEndpoint := func(endpoint string, index int) {
+		if endpoint == "" || index < 0 || index >= len(conns) {
+			return
+		}
+		if _, ok := endpointToConn[endpoint]; !ok {
+			endpointToConn[endpoint] = index
+		}
+	}
+	nextConn := 0
+	for _, candidate := range localCandidates {
+		endpoint := externalDirectUDPEndpointKey(candidate)
+		if endpoint == "" {
+			continue
+		}
+		if _, ok := endpointToConn[endpoint]; ok {
+			continue
+		}
+		addEndpoint(endpoint, nextConn)
+		nextConn++
+		if nextConn == len(conns) {
+			break
+		}
+	}
+	for i, conn := range conns {
+		if conn == nil || conn.LocalAddr() == nil {
+			continue
+		}
+		addEndpoint(externalDirectUDPEndpointKey(conn.LocalAddr().String()), i)
+	}
+
+	ordered := make([]net.PacketConn, 0, len(sectionAddrs))
+	seen := make(map[int]bool)
+	for _, addr := range sectionAddrs {
+		endpoint := externalDirectUDPEndpointKey(addr)
+		index, ok := endpointToConn[endpoint]
+		if !ok {
+			return nil, fmt.Errorf("direct UDP section address %q does not match a local lane", addr)
+		}
+		if seen[index] {
+			return nil, fmt.Errorf("direct UDP section address %q duplicates local lane %d", addr, index)
+		}
+		seen[index] = true
+		ordered = append(ordered, conns[index])
+	}
+	return ordered, nil
 }
 
 func externalDirectUDPFastDiscardReceiveConfig() probe.ReceiveConfig {
@@ -981,6 +1106,11 @@ func isDirectUDPStartAckPayload(payload []byte) bool {
 }
 
 type externalDirectUDPDiscardSendResult struct {
+	stats probe.TransferStats
+	err   error
+}
+
+type externalDirectUDPReceiveResult struct {
 	stats probe.TransferStats
 	err   error
 }
@@ -1132,6 +1262,152 @@ func externalDirectUDPSendDiscardSpoolParallel(ctx context.Context, conns []net.
 		stats.FirstByteAt = startedAt
 	}
 	return stats, nil
+}
+
+type externalDirectUDPOffsetWriter struct {
+	file   *os.File
+	offset int64
+}
+
+func (w *externalDirectUDPOffsetWriter) Write(p []byte) (int, error) {
+	if w == nil || w.file == nil {
+		return 0, errors.New("nil offset writer")
+	}
+	n, err := w.file.WriteAt(p, w.offset)
+	w.offset += int64(n)
+	if err != nil {
+		return n, err
+	}
+	if n != len(p) {
+		return n, io.ErrShortWrite
+	}
+	return n, nil
+}
+
+func externalDirectUDPReceiveSectionSpoolParallel(ctx context.Context, conns []net.PacketConn, dst io.Writer, cfg probe.ReceiveConfig, totalBytes int64, sectionSizes []int64) (probe.TransferStats, error) {
+	if len(conns) == 0 {
+		return probe.TransferStats{}, errors.New("no packet conns")
+	}
+	if totalBytes < 0 {
+		return probe.TransferStats{}, errors.New("negative expected bytes")
+	}
+	sizes, offsets, err := externalDirectUDPReceiveSectionLayout(totalBytes, len(conns), sectionSizes)
+	if err != nil {
+		return probe.TransferStats{}, err
+	}
+	conns = conns[:len(sizes)]
+	if dst == nil {
+		dst = io.Discard
+	}
+	file, err := os.CreateTemp("", "derpcat-receive-spool-*")
+	if err != nil {
+		return probe.TransferStats{}, err
+	}
+	path := file.Name()
+	defer func() {
+		_ = file.Close()
+		_ = os.Remove(path)
+	}()
+
+	receiveCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan externalDirectUDPReceiveResult, len(conns))
+	startedAt := time.Now()
+	for i, conn := range conns {
+		laneCfg := cfg
+		laneCfg.ExpectedRunID = [16]byte{}
+		laneCfg.ExpectedRunIDs = nil
+		laneCfg.RequireComplete = true
+		writer := bufio.NewWriterSize(&externalDirectUDPOffsetWriter{file: file, offset: offsets[i]}, externalDirectUDPBufferSize)
+		go func(conn net.PacketConn, writer *bufio.Writer, expected int64, laneCfg probe.ReceiveConfig) {
+			stats, err := probe.ReceiveBlastParallelToWriter(receiveCtx, []net.PacketConn{conn}, writer, laneCfg, expected)
+			if flushErr := writer.Flush(); err == nil {
+				err = flushErr
+			}
+			if err != nil {
+				cancel()
+			}
+			results <- externalDirectUDPReceiveResult{stats: stats, err: err}
+		}(conn, writer, sizes[i], laneCfg)
+	}
+
+	stats := probe.TransferStats{StartedAt: startedAt, Lanes: len(conns)}
+	var receiveErr error
+	for range conns {
+		result := <-results
+		if result.err != nil && receiveErr == nil {
+			receiveErr = result.err
+		}
+		externalDirectUDPMergeReceiveStats(&stats, result.stats)
+	}
+	if receiveErr != nil {
+		return probe.TransferStats{}, receiveErr
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return probe.TransferStats{}, err
+	}
+	if totalBytes > 0 {
+		written, err := io.CopyN(dst, file, totalBytes)
+		if err != nil {
+			return probe.TransferStats{}, err
+		}
+		if written != totalBytes {
+			return probe.TransferStats{}, io.ErrShortWrite
+		}
+	}
+	stats.CompletedAt = time.Now()
+	if stats.FirstByteAt.IsZero() && stats.BytesReceived > 0 {
+		stats.FirstByteAt = startedAt
+	}
+	return stats, nil
+}
+
+func externalDirectUDPReceiveSectionLayout(totalBytes int64, connCount int, sectionSizes []int64) ([]int64, []int64, error) {
+	if connCount <= 0 {
+		return nil, nil, errors.New("no packet conns")
+	}
+	if len(sectionSizes) == 0 {
+		sizes, offsets := externalDirectUDPSectionSizes(totalBytes, connCount)
+		return sizes, offsets, nil
+	}
+	if len(sectionSizes) > connCount {
+		return nil, nil, fmt.Errorf("direct UDP start section count %d exceeds receiver lane count %d", len(sectionSizes), connCount)
+	}
+	sizes := append([]int64(nil), sectionSizes...)
+	offsets := make([]int64, len(sizes))
+	var offset int64
+	for i, size := range sizes {
+		if size < 0 {
+			return nil, nil, fmt.Errorf("negative direct UDP section size at lane %d", i)
+		}
+		offsets[i] = offset
+		offset += size
+	}
+	if offset != totalBytes {
+		return nil, nil, fmt.Errorf("direct UDP section sizes total %d bytes, want %d", offset, totalBytes)
+	}
+	return sizes, offsets, nil
+}
+
+func externalDirectUDPSectionSizes(totalBytes int64, lanes int) ([]int64, []int64) {
+	if lanes <= 0 {
+		return nil, nil
+	}
+	sizes := make([]int64, lanes)
+	offsets := make([]int64, lanes)
+	base := totalBytes / int64(lanes)
+	extra := totalBytes % int64(lanes)
+	var offset int64
+	for i := range sizes {
+		size := base
+		if int64(i) < extra {
+			size++
+		}
+		offsets[i] = offset
+		sizes[i] = size
+		offset += size
+	}
+	return sizes, offsets
 }
 
 func externalDirectUDPSendDiscardParallel(ctx context.Context, conns []net.PacketConn, remoteAddrs []string, src io.Reader, cfg probe.SendConfig) (probe.TransferStats, error) {
@@ -1379,6 +1655,19 @@ func externalDirectUDPPerLaneRateMbps(totalRateMbps int, lanes int) int {
 
 func externalDirectUDPMergeSendStats(dst *probe.TransferStats, src probe.TransferStats) {
 	dst.BytesSent += src.BytesSent
+	dst.PacketsSent += src.PacketsSent
+	dst.PacketsAcked += src.PacketsAcked
+	dst.Retransmits += src.Retransmits
+	if !src.FirstByteAt.IsZero() && (dst.FirstByteAt.IsZero() || src.FirstByteAt.Before(dst.FirstByteAt)) {
+		dst.FirstByteAt = src.FirstByteAt
+	}
+	if dst.Transport.Kind == "" {
+		dst.Transport = src.Transport
+	}
+}
+
+func externalDirectUDPMergeReceiveStats(dst *probe.TransferStats, src probe.TransferStats) {
+	dst.BytesReceived += src.BytesReceived
 	dst.PacketsSent += src.PacketsSent
 	dst.PacketsAcked += src.PacketsAcked
 	dst.Retransmits += src.Retransmits

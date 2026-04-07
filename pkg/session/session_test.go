@@ -3200,6 +3200,17 @@ func TestExternalDirectUDPDedupeAndFillKeepsManagerAddr(t *testing.T) {
 	}
 }
 
+func TestExternalDirectUDPDedupeAndFillPreservesObservedCandidateForEndpoint(t *testing.T) {
+	selected := []string{"10.0.1.254:50001"}
+	fallback := []string{"108.18.210.19:50001"}
+
+	got := externalDirectUDPDedupeAndFill(selected, fallback)
+	want := []string{"10.0.1.254:50001"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("externalDirectUDPDedupeAndFill() = %v, want observed candidate %v", got, want)
+	}
+}
+
 func TestExternalDirectUDPParallelCandidatesPreferWANForSameEndpoint(t *testing.T) {
 	candidates := []net.Addr{
 		&net.UDPAddr{IP: net.IPv4(10, 0, 1, 254), Port: 50001},
@@ -3255,7 +3266,7 @@ func TestExternalDirectUDPSelectRemoteAddrsByConnKeepsFallbackLaneEndpoint(t *te
 		},
 	}
 
-	got := externalDirectUDPSelectRemoteAddrsByConn(observedByConn, fallback, 4)
+	got := externalDirectUDPSelectRemoteAddrsByConn(observedByConn, fallback, 4, nil)
 	want := []string{
 		"68.20.14.192:38183",
 		"68.20.14.192:34375",

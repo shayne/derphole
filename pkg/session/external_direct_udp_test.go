@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -17,8 +19,8 @@ import (
 	"tailscale.com/types/key"
 )
 
-func TestExternalDirectUDPDefaultUsesFourStripedLanesWithoutFEC(t *testing.T) {
-	if got, want := externalDirectUDPParallelism, 4; got != want {
+func TestExternalDirectUDPDefaultUsesEightSectionedLanesWithoutFEC(t *testing.T) {
+	if got, want := externalDirectUDPParallelism, 8; got != want {
 		t.Fatalf("externalDirectUDPParallelism = %d, want %d", got, want)
 	}
 	if got, want := externalDirectUDPRateMbps, 2150; got != want {
@@ -27,8 +29,8 @@ func TestExternalDirectUDPDefaultUsesFourStripedLanesWithoutFEC(t *testing.T) {
 	if got, want := externalDirectUDPFECGroupSize, 0; got != want {
 		t.Fatalf("externalDirectUDPFECGroupSize = %d, want %d", got, want)
 	}
-	if !externalDirectUDPStripedBlast {
-		t.Fatal("externalDirectUDPStripedBlast = false, want true")
+	if externalDirectUDPStripedBlast {
+		t.Fatal("externalDirectUDPStripedBlast = true, want false")
 	}
 }
 
@@ -84,6 +86,24 @@ func TestExternalDirectUDPConnsUseProbeCompatibleDualStackSockets(t *testing.T) 
 	}
 	if udpAddr.IP == nil || udpAddr.IP.To4() != nil {
 		t.Fatalf("LocalAddr() = %v, want dual-stack UDP wildcard like the probe benchmark", conns[0].LocalAddr())
+	}
+}
+
+func TestExternalDirectUDPConnsUseLoopbackIPv4SocketsForFakeTransport(t *testing.T) {
+	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
+
+	conns, _, cleanup, err := externalDirectUDPConns(nil, nil, 1, nil)
+	if err != nil {
+		t.Fatalf("externalDirectUDPConns() error = %v", err)
+	}
+	defer cleanup()
+
+	udpAddr, ok := conns[0].LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("LocalAddr() = %T, want *net.UDPAddr", conns[0].LocalAddr())
+	}
+	if !udpAddr.IP.IsLoopback() || udpAddr.IP.To4() == nil {
+		t.Fatalf("LocalAddr() = %v, want IPv4 loopback for fake transport", conns[0].LocalAddr())
 	}
 }
 
@@ -158,6 +178,8 @@ func TestWaitForDirectUDPStartReturnsExpectedBytes(t *testing.T) {
 		Type: envelopeDirectUDPStart,
 		DirectUDPStart: &directUDPStart{
 			ExpectedBytes: 12345,
+			SectionSizes:  []int64{6173, 6172},
+			SectionAddrs:  []string{"68.20.14.192:38183", "68.20.14.192:34375"},
 		},
 	})
 	if err != nil {
@@ -175,6 +197,12 @@ func TestWaitForDirectUDPStartReturnsExpectedBytes(t *testing.T) {
 	}
 	if got.ExpectedBytes != 12345 {
 		t.Fatalf("waitForDirectUDPStart() ExpectedBytes = %d, want 12345", got.ExpectedBytes)
+	}
+	if fmt.Sprint(got.SectionSizes) != fmt.Sprint([]int64{6173, 6172}) {
+		t.Fatalf("waitForDirectUDPStart() SectionSizes = %v, want [6173 6172]", got.SectionSizes)
+	}
+	if fmt.Sprint(got.SectionAddrs) != fmt.Sprint([]string{"68.20.14.192:38183", "68.20.14.192:34375"}) {
+		t.Fatalf("waitForDirectUDPStart() SectionAddrs = %v, want selected section addresses", got.SectionAddrs)
 	}
 }
 
@@ -245,6 +273,118 @@ func TestExternalDirectUDPSpoolDiscardLanesSplitsAndRewinds(t *testing.T) {
 		if !bytes.Equal(got, want) {
 			t.Fatalf("lane %d contents = %q, want %q", i, got, want)
 		}
+	}
+}
+
+func TestExternalDirectUDPReceiveSectionLayoutUsesSenderSizes(t *testing.T) {
+	sizes, offsets, err := externalDirectUDPReceiveSectionLayout(10, 3, []int64{7, 3})
+	if err != nil {
+		t.Fatalf("externalDirectUDPReceiveSectionLayout() error = %v", err)
+	}
+	if fmt.Sprint(sizes) != fmt.Sprint([]int64{7, 3}) {
+		t.Fatalf("sizes = %v, want [7 3]", sizes)
+	}
+	if fmt.Sprint(offsets) != fmt.Sprint([]int64{0, 7}) {
+		t.Fatalf("offsets = %v, want [0 7]", offsets)
+	}
+}
+
+func TestExternalDirectUDPParallelCandidateStringsPreferEstablishedPeerAddr(t *testing.T) {
+	peer, err := net.ResolveUDPAddr("udp", "127.0.0.1:44321")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := externalDirectUDPParallelCandidateStringsForPeer(parseCandidateStrings([]string{
+		"10.0.1.254:11111",
+		"10.0.1.254:22222",
+		"127.0.0.1:11111",
+		"127.0.0.1:22222",
+	}), 2, peer)
+	want := []string{"127.0.0.1:11111", "127.0.0.1:22222"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("externalDirectUDPParallelCandidateStringsForPeer() = %v, want %v", got, want)
+	}
+}
+
+func TestExternalDirectUDPParallelCandidateStringsPreferLoopbackForFakeTransport(t *testing.T) {
+	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
+	peer, err := net.ResolveUDPAddr("udp", "10.0.1.254:44321")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := externalDirectUDPParallelCandidateStringsForPeer(parseCandidateStrings([]string{
+		"10.0.1.254:11111",
+		"10.0.1.254:22222",
+		"127.0.0.1:11111",
+		"127.0.0.1:22222",
+	}), 2, peer)
+	want := []string{"127.0.0.1:11111", "127.0.0.1:22222"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("externalDirectUDPParallelCandidateStringsForPeer(fake) = %v, want %v", got, want)
+	}
+}
+
+func TestExternalDirectUDPFlattenCandidateSetsRoundRobinsAlternatesAcrossLanes(t *testing.T) {
+	sets := make([][]string, 8)
+	for i := range sets {
+		port := 60000 + i
+		sets[i] = []string{
+			fmt.Sprintf("10.0.1.254:%d", port),
+			fmt.Sprintf("127.0.0.1:%d", port),
+			fmt.Sprintf("10.0.4.184:%d", port),
+			fmt.Sprintf("[fd37:89f2:37b4:4af8::%x]:%d", i+1, port),
+			fmt.Sprintf("[fd37:89f2:37b4:4af9::%x]:%d", i+1, port),
+			fmt.Sprintf("[::1]:%d", port),
+		}
+	}
+
+	got := externalDirectUDPFlattenCandidateSets(sets)
+	for _, want := range []string{"127.0.0.1:60006", "127.0.0.1:60007"} {
+		if !slices.Contains(got, want) {
+			t.Fatalf("externalDirectUDPFlattenCandidateSets() missing %q in %v", want, got)
+		}
+	}
+}
+
+func TestExternalDirectUDPOrderConnsForSectionsUsesSelectedEndpoints(t *testing.T) {
+	connA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connA.Close()
+	connB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connB.Close()
+	connC, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connC.Close()
+
+	conns := []net.PacketConn{connA, connB, connC}
+	ordered, err := externalDirectUDPOrderConnsForSections(conns, []string{
+		"108.18.210.19:38183",
+		"108.18.210.19:34375",
+		"108.18.210.19:44442",
+		"10.0.1.254:38183",
+		"10.0.1.254:34375",
+		"10.0.1.254:44442",
+	}, []string{
+		"68.20.14.192:44442",
+		"68.20.14.192:38183",
+	})
+	if err != nil {
+		t.Fatalf("externalDirectUDPOrderConnsForSections() error = %v", err)
+	}
+	if len(ordered) != 2 {
+		t.Fatalf("ordered conns length = %d, want 2", len(ordered))
+	}
+	if ordered[0] != connC || ordered[1] != connA {
+		t.Fatalf("ordered conns = [%v %v], want [%v %v]", ordered[0].LocalAddr(), ordered[1].LocalAddr(), connC.LocalAddr(), connA.LocalAddr())
 	}
 }
 
@@ -406,6 +546,89 @@ func TestExternalDirectUDPDiscardSpoolParallelSendsIndependentLanes(t *testing.T
 		}
 	case <-ctx.Done():
 		t.Fatalf("timed out waiting for receive: %v", ctx.Err())
+	}
+}
+
+func TestExternalDirectUDPSectionSpoolRoundTripsAcrossLoopback(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	const lanes = 8
+	serverConns := make([]net.PacketConn, 0, lanes)
+	clientConns := make([]net.PacketConn, 0, lanes)
+	defer func() {
+		for _, conn := range serverConns {
+			_ = conn.Close()
+		}
+		for _, conn := range clientConns {
+			_ = conn.Close()
+		}
+	}()
+	for i := 0; i < lanes; i++ {
+		server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		serverConns = append(serverConns, server)
+		client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		clientConns = append(clientConns, client)
+	}
+
+	src := bytes.Repeat([]byte("sectioned-loopback-"), 1<<13)
+	spool, err := externalDirectUDPSpoolDiscardLanes(ctx, bytes.NewReader(src), lanes, externalDirectUDPChunkSize)
+	if err != nil {
+		t.Fatalf("externalDirectUDPSpoolDiscardLanes() error = %v", err)
+	}
+	defer spool.Close()
+
+	var got bytes.Buffer
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := externalDirectUDPReceiveSectionSpoolParallel(ctx, serverConns, &got, probe.ReceiveConfig{
+			Blast:           true,
+			Transport:       externalDirectUDPTransportLabel,
+			RequireComplete: true,
+			FECGroupSize:    externalDirectUDPFECGroupSize,
+			ExpectedRunID:   [16]byte{},
+			ExpectedRunIDs:  nil,
+		}, int64(len(src)), spool.Sizes)
+		errCh <- err
+	}()
+
+	remoteAddrs := make([]string, 0, lanes)
+	for _, conn := range serverConns {
+		remoteAddrs = append(remoteAddrs, conn.LocalAddr().String())
+	}
+	sendStats, err := externalDirectUDPSendDiscardSpoolParallel(ctx, clientConns, remoteAddrs, spool, probe.SendConfig{
+		Blast:                    true,
+		Transport:                externalDirectUDPTransportLabel,
+		ChunkSize:                externalDirectUDPChunkSize,
+		RateMbps:                 0,
+		RepairPayloads:           true,
+		TailReplayBytes:          externalDirectUDPTailReplayBytes,
+		FECGroupSize:             externalDirectUDPFECGroupSize,
+		ParallelHandshakeTimeout: externalDirectUDPHandshakeWait,
+	})
+	if err != nil {
+		t.Fatalf("externalDirectUDPSendDiscardSpoolParallel() error = %v", err)
+	}
+	if sendStats.BytesSent != int64(len(src)) {
+		t.Fatalf("send BytesSent = %d, want %d", sendStats.BytesSent, len(src))
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("externalDirectUDPReceiveSectionSpoolParallel() error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for sectioned receive: %v", ctx.Err())
+	}
+	if !bytes.Equal(got.Bytes(), src) {
+		t.Fatalf("received bytes length=%d want=%d equal=%t", got.Len(), len(src), bytes.Equal(got.Bytes(), src))
 	}
 }
 

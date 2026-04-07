@@ -478,6 +478,52 @@ func TestReceiveBlastParallelToWriterEchoesStripedHelloAckMetadata(t *testing.T)
 	}
 }
 
+func TestReceiveBlastParallelRequireCompleteExpectedBytesRejectsPartialIdle(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	runID := testRunID(0x5e)
+	payload := []byte("partial")
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, io.Discard, ReceiveConfig{
+			Blast:           true,
+			ExpectedRunID:   runID,
+			RequireComplete: true,
+		}, int64(len(payload)+1))
+		errCh <- err
+	}()
+
+	establishReceiveSession(t, client, server.LocalAddr(), runID)
+	writeProbePacket(t, client, server.LocalAddr(), Packet{
+		Version: ProtocolVersion,
+		Type:    PacketTypeData,
+		RunID:   runID,
+		Payload: payload,
+	})
+
+	select {
+	case err := <-errCh:
+		if err == nil || !strings.Contains(err.Error(), "blast incomplete") {
+			t.Fatalf("ReceiveBlastParallelToWriter() error = %v, want blast incomplete", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for incomplete receive error")
+	}
+}
+
 func TestBlastParallelStreamPreservesOrderAcrossLoopback(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -832,8 +878,15 @@ func TestBlastStreamReceiveCoordinatorWritesOrderedStripedLaneSequences(t *testi
 	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[0], 0, 2, PacketTypeData, runID, 0, 0, 0, []byte("aa"), peer); err != nil || complete {
 		t.Fatalf("handlePacketStripe(data stripe 0) complete=%v err=%v, want false nil", complete, err)
 	}
-	if got.String() != "aabb" {
-		t.Fatalf("ordered payload before done = %q, want aabb", got.String())
+	if got.Len() != 0 {
+		t.Fatalf("ordered payload before done = %q, want buffered output", got.String())
+	}
+	state := coordinator.runs[runID]
+	if state == nil {
+		t.Fatal("missing receive state")
+	}
+	if string(state.writeBuf) != "aabb" {
+		t.Fatalf("buffered striped payload = %q, want aabb", state.writeBuf)
 	}
 	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[1], 1, 2, PacketTypeDone, runID, 1, 4, 0, nil, peer); err != nil || complete {
 		t.Fatalf("handlePacketStripe(done stripe 1) complete=%v err=%v, want false nil", complete, err)
@@ -844,6 +897,9 @@ func TestBlastStreamReceiveCoordinatorWritesOrderedStripedLaneSequences(t *testi
 	}
 	if !complete {
 		t.Fatal("handlePacketStripe(final done) complete = false, want true")
+	}
+	if got.String() != "aabb" {
+		t.Fatalf("ordered payload after done = %q, want aabb", got.String())
 	}
 }
 

@@ -1787,7 +1787,7 @@ func ReceiveBlastParallelToWriter(ctx context.Context, conns []net.PacketConn, d
 		for {
 			select {
 			case <-ticker.C:
-				if cfg.RequireComplete && expectedBytes <= 0 {
+				if cfg.RequireComplete {
 					continue
 				}
 				if bytesReceived.Load() <= 0 {
@@ -1837,6 +1837,9 @@ func ReceiveBlastParallelToWriter(ctx context.Context, conns []net.PacketConn, d
 	}
 	received := bytesReceived.Load()
 	sessionTracef("parallel recv return expected=%d received=%d ctx_err=%v repair_expired=%t incomplete_done_runs=%d", expectedBytes, received, ctx.Err(), repairGraceExpired.Load(), incompleteDoneRuns.Load())
+	if cfg.RequireComplete && expectedBytes > 0 && received < expectedBytes {
+		return TransferStats{}, fmt.Errorf("blast incomplete: received %d bytes, want %d", received, expectedBytes)
+	}
 	if expectedBytes > 0 && received < expectedBytes && (received == 0 || ctx.Err() != nil) {
 		return TransferStats{}, fmt.Errorf("blast incomplete: received %d bytes, want %d", received, expectedBytes)
 	}
@@ -2073,6 +2076,9 @@ func (c *blastStreamReceiveCoordinator) handleStripedDataOrDoneLocked(ctx contex
 		state.done = true
 	}
 	if c.stripedCompleteLocked(state) {
+		if err := c.flushStripedPayloadLocked(state); err != nil {
+			return false, err
+		}
 		if err := sendBlastStreamRepairCompleteAll(ctx, c.lanes, runID); err != nil {
 			return false, err
 		}
@@ -2136,16 +2142,20 @@ func (c *blastStreamReceiveCoordinator) writeStripedPayloadLocked(state *blastRe
 		return nil
 	}
 	if c.dst != io.Discard {
-		c.writeMu.Lock()
-		err := writeFullPayload(c.dst, payload)
-		c.writeMu.Unlock()
-		if err != nil {
+		if err := bufferOrderedParallelBlastPayload(c.dst, state, payload); err != nil {
 			return err
 		}
 	}
 	state.nextOffset += uint64(len(payload))
 	c.bytesReceived += int64(len(payload))
 	return nil
+}
+
+func (c *blastStreamReceiveCoordinator) flushStripedPayloadLocked(state *blastReceiveRunState) error {
+	if c.dst == io.Discard || state == nil {
+		return nil
+	}
+	return flushOrderedParallelBlastPayloadLocked(c.dst, state)
 }
 
 func (c *blastStreamReceiveCoordinator) flushStripedPendingPayloadsLocked(state *blastReceiveRunState) error {
@@ -2464,7 +2474,7 @@ func readBlastStreamReceiveLaneDirect(ctx context.Context, laneIndex int, lane *
 			}
 			addr := readBufs[i].Addr
 			if packetType == PacketTypeHello {
-				if lane.batcher.MaxBatch() == 1 {
+				if lane.batcher.MaxBatch() == 1 && !lane.batcher.Capabilities().Connected {
 					if connectedBatcher, ok := newConnectedUDPBatcher(lane.conn, addr, cfg.Transport); ok {
 						lane.batcher = connectedBatcher
 						if connected != nil {
@@ -3314,7 +3324,7 @@ func receiveBlastParallelConn(ctx context.Context, conn net.PacketConn, dst io.W
 				if traceEnabled {
 					sessionTracef("parallel recv hello local=%s from=%s run=%x", conn.LocalAddr(), addr, runID[:4])
 				}
-				if batcher.MaxBatch() == 1 {
+				if batcher.MaxBatch() == 1 && !batcher.Capabilities().Connected {
 					if connectedBatcher, ok := newConnectedUDPBatcher(conn, addr, cfg.Transport); ok {
 						batcher = connectedBatcher
 						if connected != nil {
@@ -3559,17 +3569,6 @@ func bufferOrderedParallelBlastPayload(dst io.Writer, state *blastReceiveRunStat
 		return nil
 	}
 	return flushOrderedParallelBlastPayloadLocked(dst, state)
-}
-
-func writeFullPayload(dst io.Writer, payload []byte) error {
-	written, err := dst.Write(payload)
-	if err != nil {
-		return err
-	}
-	if written != len(payload) {
-		return io.ErrShortWrite
-	}
-	return nil
 }
 
 func flushOrderedParallelBlastPayload(dst io.Writer, state *blastReceiveRunState, writeMu *sync.Mutex) error {
