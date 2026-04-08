@@ -204,11 +204,13 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) error {
 			if len(probeConns) == 0 {
 				return errors.New("direct UDP established without usable remote addresses")
 			}
-			activeRateMbps := externalDirectUDPRateMbpsForLanes(externalDirectUDPRateMbps, len(probeConns))
+			maxRateMbps := externalDirectUDPRateMbpsForLanes(externalDirectUDPRateMbps, len(probeConns))
+			activeRateMbps := maxRateMbps
 			if cfg.Emitter != nil {
 				cfg.Emitter.Debug("udp-blast=true")
 				cfg.Emitter.Debug("udp-lanes=" + strconv.Itoa(len(probeConns)))
-				cfg.Emitter.Debug("udp-rate-max-mbps=" + strconv.Itoa(activeRateMbps))
+				cfg.Emitter.Debug("udp-rate-max-mbps=" + strconv.Itoa(maxRateMbps))
+				cfg.Emitter.Debug("udp-adaptive-rate=true")
 				cfg.Emitter.Debug("udp-repair-payloads=" + strconv.FormatBool(externalDirectUDPRepairPayloads))
 				cfg.Emitter.Debug("udp-tail-replay-bytes=" + strconv.Itoa(externalDirectUDPTailReplayBytes))
 				cfg.Emitter.Debug("udp-fec-group-size=" + strconv.Itoa(externalDirectUDPFECGroupSize))
@@ -226,6 +228,7 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) error {
 				Transport:                externalDirectUDPTransportLabel,
 				ChunkSize:                externalDirectUDPChunkSize,
 				RateMbps:                 activeRateMbps,
+				RateCeilingMbps:          maxRateMbps,
 				RunID:                    tok.SessionID,
 				RepairPayloads:           externalDirectUDPRepairPayloads,
 				TailReplayBytes:          externalDirectUDPTailReplayBytes,
@@ -1741,12 +1744,14 @@ func externalDirectUDPSendDiscardSpoolParallel(ctx context.Context, conns []net.
 		cfg.ChunkSize = externalDirectUDPChunkSize
 	}
 	laneRate := externalDirectUDPPerLaneRateMbps(cfg.RateMbps, len(conns))
+	laneRateCeiling := externalDirectUDPPerLaneRateMbps(cfg.RateCeilingMbps, len(conns))
 	startedAt := time.Now()
 	results := make(chan externalDirectUDPDiscardSendResult, len(conns))
 	for i, conn := range conns {
 		laneCfg := cfg
 		laneCfg.RunID = externalDirectUDPDiscardLaneRunID(cfg.RunID, i)
 		laneCfg.RateMbps = laneRate
+		laneCfg.RateCeilingMbps = laneRateCeiling
 		src := io.NewSectionReader(spool.File, spool.Offsets[i], spool.Sizes[i])
 		go func(conn net.PacketConn, remoteAddr string, src io.Reader, laneCfg probe.SendConfig) {
 			stats, err := probe.Send(ctx, conn, remoteAddr, src, laneCfg)
@@ -2018,6 +2023,7 @@ func externalDirectUDPSendDiscardParallel(ctx context.Context, conns []net.Packe
 	defer cancel()
 	startedAt := time.Now()
 	laneRate := externalDirectUDPPerLaneRateMbps(cfg.RateMbps, len(conns))
+	laneRateCeiling := externalDirectUDPPerLaneRateMbps(cfg.RateCeilingMbps, len(conns))
 	writers := make([]*io.PipeWriter, len(conns))
 	results := make(chan externalDirectUDPDiscardSendResult, len(conns))
 	for i, conn := range conns {
@@ -2027,6 +2033,7 @@ func externalDirectUDPSendDiscardParallel(ctx context.Context, conns []net.Packe
 		laneCfg := cfg
 		laneCfg.RunID = externalDirectUDPLaneRunID(cfg.RunID, i)
 		laneCfg.RateMbps = laneRate
+		laneCfg.RateCeilingMbps = laneRateCeiling
 		go func(conn net.PacketConn, remoteAddr string, reader *io.PipeReader, laneCfg probe.SendConfig) {
 			defer reader.Close()
 			stats, err := probe.Send(sendCtx, conn, remoteAddr, reader, laneCfg)

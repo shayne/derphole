@@ -2698,7 +2698,7 @@ func TestSendBlastServicesRepairRequestsDuringDataPhase(t *testing.T) {
 	batcher := &inflightRepairBatcher{runID: runID, repairSeq: 0}
 	src := bytes.Repeat([]byte("abcd"), 160)
 
-	if _, err := sendBlast(ctx, batcher, nil, nil, runID, bytes.NewReader(src), 4, 0, true, 0, 0, nil, TransferStats{}); err != nil {
+	if _, err := sendBlast(ctx, batcher, nil, nil, runID, bytes.NewReader(src), 4, 0, 0, true, 0, 0, nil, TransferStats{}); err != nil {
 		t.Fatalf("sendBlast() error = %v", err)
 	}
 
