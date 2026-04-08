@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -1270,6 +1272,69 @@ func TestReceiveBlastParallelToWriterRepairsDroppedDataPacket(t *testing.T) {
 	}
 }
 
+func TestBlastPacketAEADEncryptsWirePayloadAndRoundTrips(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	clientBase, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientBase.Close()
+
+	client := &capturePacketConn{PacketConn: &dropFirstBlastDataConn{PacketConn: clientBase}}
+	src := bytes.Repeat([]byte("encrypted-blast-payload:"), 512)
+	var got bytes.Buffer
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, &got, ReceiveConfig{
+			Blast:           true,
+			RequireComplete: true,
+			PacketAEAD:      testPacketAEAD(t),
+		}, int64(len(src)))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	if _, err := Send(ctx, client, server.LocalAddr().String(), bytes.NewReader(src), SendConfig{
+		Blast:          true,
+		ChunkSize:      512,
+		RepairPayloads: true,
+		PacketAEAD:     testPacketAEAD(t),
+	}); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ReceiveBlastParallelToWriter() error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(src)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(src))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for encrypted blast receive: %v", ctx.Err())
+	}
+	if !bytes.Equal(got.Bytes(), src) {
+		t.Fatalf("encrypted blast payload mismatch: got %d bytes, want %d", got.Len(), len(src))
+	}
+	for _, packet := range client.Packets() {
+		if bytes.Contains(packet, []byte("encrypted-blast-payload")) {
+			t.Fatal("captured blast packet contains plaintext payload")
+		}
+	}
+}
+
 func TestReceiveBlastParallelToWriterRepairsDroppedDataPacketInOrder(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -2476,7 +2541,7 @@ func TestBlastSendReadsSourceInBatches(t *testing.T) {
 
 func TestBlastRepairHistorySynthesizesLastPacketSize(t *testing.T) {
 	runID := testRunID(0x49)
-	history, err := newBlastRepairHistory(runID, 8, true)
+	history, err := newBlastRepairHistory(runID, 8, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2510,7 +2575,7 @@ func TestBlastRepairHistorySynthesizesLastPacketSize(t *testing.T) {
 
 func TestBlastRepairHistoryPacketBufferSynthesizesRepairPacket(t *testing.T) {
 	runID := testRunID(0x51)
-	history, err := newBlastRepairHistory(runID, 4, true)
+	history, err := newBlastRepairHistory(runID, 4, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2550,7 +2615,7 @@ func TestBlastRepairHistoryWithoutPayloadsDoesNotSynthesizeData(t *testing.T) {
 
 func TestBlastRepairHistoryTailPacketsUseRetainedPayloads(t *testing.T) {
 	runID := testRunID(0x50)
-	history, err := newBlastRepairHistory(runID, 4, true)
+	history, err := newBlastRepairHistory(runID, 4, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2584,7 +2649,7 @@ func TestBlastRepairHistoryTailPacketsUseRetainedPayloads(t *testing.T) {
 
 func TestSendBlastRepairsSuppressesImmediateDuplicateSeqs(t *testing.T) {
 	runID := testRunID(0x4f)
-	history, err := newBlastRepairHistory(runID, 4, true)
+	history, err := newBlastRepairHistory(runID, 4, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2633,7 +2698,7 @@ func TestSendBlastServicesRepairRequestsDuringDataPhase(t *testing.T) {
 	batcher := &inflightRepairBatcher{runID: runID, repairSeq: 0}
 	src := bytes.Repeat([]byte("abcd"), 160)
 
-	if _, err := sendBlast(ctx, batcher, nil, nil, runID, bytes.NewReader(src), 4, 0, true, 0, 0, TransferStats{}); err != nil {
+	if _, err := sendBlast(ctx, batcher, nil, nil, runID, bytes.NewReader(src), 4, 0, true, 0, 0, nil, TransferStats{}); err != nil {
 		t.Fatalf("sendBlast() error = %v", err)
 	}
 
@@ -2662,6 +2727,65 @@ func TestSendBlastServicesRepairRequestsDuringDataPhase(t *testing.T) {
 	}
 	if repairIndex > doneIndex {
 		t.Fatalf("repair packet index = %d, want before done index %d", repairIndex, doneIndex)
+	}
+}
+
+func TestReceiveBlastParallelToWriterCompletesWhenFECReachesExpectedBytesBeforeDone(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	runID := testRunID(0x92)
+	payload0 := []byte("first-fec-packet")
+	payload1 := []byte("other-fec-packet")
+	parity := append([]byte(nil), payload0...)
+	for i := range parity {
+		parity[i] ^= payload1[i]
+	}
+	total := int64(len(payload0) + len(payload1))
+	var got bytes.Buffer
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, &got, ReceiveConfig{
+			Blast:           true,
+			RequireComplete: true,
+			FECGroupSize:    2,
+		}, total)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	writeProbePacket(t, client, server.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeHello, RunID: runID})
+	writeProbePacket(t, client, server.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeData, RunID: runID, Seq: 0, Offset: 0, Payload: payload0})
+	writeProbePacket(t, client, server.LocalAddr(), Packet{Version: ProtocolVersion, Type: PacketTypeParity, RunID: runID, Seq: 0, Offset: 0, AckFloor: 2, Payload: parity})
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ReceiveBlastParallelToWriter() error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != total {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, total)
+		}
+		if got.String() != string(payload0)+string(payload1) {
+			t.Fatalf("payload = %q, want %q", got.String(), string(payload0)+string(payload1))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for FEC expected-byte completion: %v", ctx.Err())
 	}
 }
 
@@ -2997,6 +3121,43 @@ func (l *lossyPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		return len(p), nil
 	}
 	return l.PacketConn.WriteTo(p, addr)
+}
+
+type capturePacketConn struct {
+	net.PacketConn
+
+	mu      sync.Mutex
+	packets [][]byte
+}
+
+func (c *capturePacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.mu.Lock()
+	c.packets = append(c.packets, append([]byte(nil), p...))
+	c.mu.Unlock()
+	return c.PacketConn.WriteTo(p, addr)
+}
+
+func (c *capturePacketConn) Packets() [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([][]byte, len(c.packets))
+	for i := range c.packets {
+		out[i] = append([]byte(nil), c.packets[i]...)
+	}
+	return out
+}
+
+func testPacketAEAD(t *testing.T) cipher.AEAD {
+	t.Helper()
+	block, err := aes.NewCipher([]byte("derpcat-test-key"))
+	if err != nil {
+		t.Fatalf("aes.NewCipher() error = %v", err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("cipher.NewGCM() error = %v", err)
+	}
+	return aead
 }
 
 type dropFirstDoneConn struct {

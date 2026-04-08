@@ -3,6 +3,7 @@ package probe
 import (
 	"bytes"
 	"context"
+	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -90,6 +91,7 @@ type SendConfig struct {
 	TailReplayBytes          int
 	FECGroupSize             int
 	StripedBlast             bool
+	PacketAEAD               cipher.AEAD
 	AllowPartialParallel     bool
 	ParallelHandshakeTimeout time.Duration
 }
@@ -104,6 +106,7 @@ type ReceiveConfig struct {
 	DeferKnownGapRepairs bool
 	FECGroupSize         int
 	SpoolOutput          bool
+	PacketAEAD           cipher.AEAD
 }
 
 type TransferStats struct {
@@ -179,7 +182,7 @@ func Send(ctx context.Context, conn net.PacketConn, remoteAddr string, src io.Re
 				batcher = connectedBatcher
 			}
 		}
-		return sendBlast(ctx, batcher, conn, peer, state.runID, src, cfg.ChunkSize, cfg.RateMbps, cfg.RepairPayloads, cfg.TailReplayBytes, cfg.FECGroupSize, stats)
+		return sendBlast(ctx, batcher, conn, peer, state.runID, src, cfg.ChunkSize, cfg.RateMbps, cfg.RepairPayloads, cfg.TailReplayBytes, cfg.FECGroupSize, cfg.PacketAEAD, stats)
 	}
 
 	for {
@@ -371,7 +374,7 @@ func ReceiveToWriter(ctx context.Context, conn net.PacketConn, remoteAddr string
 					return TransferStats{}, err
 				}
 				if cfg.Blast {
-					return receiveBlastData(ctx, conn, cloneAddr(addr), runID, dst, &stats, buf)
+					return receiveBlastData(ctx, conn, cloneAddr(addr), runID, dst, &stats, buf, cfg.PacketAEAD)
 				}
 				continue
 			}
@@ -473,7 +476,7 @@ func ReceiveToWriter(ctx context.Context, conn net.PacketConn, remoteAddr string
 	}
 }
 
-func sendBlast(ctx context.Context, batcher packetBatcher, conn net.PacketConn, peer net.Addr, runID [16]byte, src io.Reader, chunkSize int, rateMbps int, repairPayloads bool, tailReplayBytes int, fecGroupSize int, stats TransferStats) (TransferStats, error) {
+func sendBlast(ctx context.Context, batcher packetBatcher, conn net.PacketConn, peer net.Addr, runID [16]byte, src io.Reader, chunkSize int, rateMbps int, repairPayloads bool, tailReplayBytes int, fecGroupSize int, packetAEAD cipher.AEAD, stats TransferStats) (TransferStats, error) {
 	if chunkSize <= 0 {
 		chunkSize = defaultChunkSize
 	}
@@ -490,15 +493,19 @@ func sendBlast(ctx context.Context, batcher packetBatcher, conn net.PacketConn, 
 	wireBatch := make([][]byte, batchLimit)
 	packetBatch := make([][]byte, 0, batchLimit)
 	readBatch := make([]byte, batchLimit*chunkSize)
-	for i := range wireBatch {
-		wireBatch[i] = make([]byte, headerLen+chunkSize)
+	packetOverhead := 0
+	if packetAEAD != nil {
+		packetOverhead = packetAEAD.Overhead()
 	}
-	history, err := newBlastRepairHistory(runID, chunkSize, repairPayloads || tailReplayBytes > 0)
+	for i := range wireBatch {
+		wireBatch[i] = make([]byte, headerLen+chunkSize+packetOverhead)
+	}
+	history, err := newBlastRepairHistory(runID, chunkSize, repairPayloads || tailReplayBytes > 0, packetAEAD)
 	if err != nil {
 		return TransferStats{}, err
 	}
 	defer history.Close()
-	fec := newBlastFECGroup(runID, chunkSize, fecGroupSize)
+	fec := newBlastFECGroup(runID, chunkSize, fecGroupSize, packetAEAD)
 	repairReadBufs := make([]batchReadBuffer, batcher.MaxBatch())
 	for i := range repairReadBufs {
 		repairReadBufs[i].Bytes = make([]byte, 64<<10)
@@ -523,7 +530,17 @@ func sendBlast(ctx context.Context, batcher packetBatcher, conn net.PacketConn, 
 				}
 				var wire []byte
 				var payloadBuf []byte
-				if repairPayloads {
+				if packetAEAD != nil {
+					payloadBuf = remaining[:payloadLen]
+					if err := history.Record(seq, payloadBuf); err != nil {
+						return TransferStats{}, err
+					}
+					var err error
+					wire, err = marshalBlastPayloadPacket(PacketTypeData, runID, 0, seq, offset, 0, 0, payloadBuf, packetAEAD)
+					if err != nil {
+						return TransferStats{}, err
+					}
+				} else if repairPayloads {
 					var err error
 					wire, err = history.packetBuffer(seq, offset, payloadLen)
 					if err != nil {
@@ -536,13 +553,15 @@ func sendBlast(ctx context.Context, batcher packetBatcher, conn net.PacketConn, 
 					payloadBuf = wire[headerLen : headerLen+payloadLen]
 					encodePacketHeader(wire[:headerLen], PacketTypeData, runID, 0, seq, offset, 0, 0)
 				}
-				copy(payloadBuf, remaining[:payloadLen])
-				if !repairPayloads {
+				if packetAEAD == nil {
+					copy(payloadBuf, remaining[:payloadLen])
+				}
+				if !repairPayloads && packetAEAD == nil {
 					if err := history.Record(seq, payloadBuf); err != nil {
 						return TransferStats{}, err
 					}
 				}
-				packet := wire[:headerLen+payloadLen]
+				packet := wire[:headerLen+payloadLen+packetOverhead]
 				packetBatch = append(packetBatch, packet)
 				stats.PacketsSent++
 				stats.BytesSent += int64(payloadLen)
@@ -760,21 +779,21 @@ func SendBlastParallel(ctx context.Context, conns []net.PacketConn, remoteAddrs 
 		lane.startedAt = sendStartedAt
 	}
 
-	history, err := newBlastRepairHistory(runID, cfg.ChunkSize, cfg.RepairPayloads || cfg.TailReplayBytes > 0)
+	history, err := newBlastRepairHistory(runID, cfg.ChunkSize, cfg.RepairPayloads || cfg.TailReplayBytes > 0, cfg.PacketAEAD)
 	if err != nil {
 		return TransferStats{}, err
 	}
 	defer history.Close()
 	if stripedBlast {
 		for _, lane := range lanes {
-			lane.history, err = newBlastRepairHistory(runID, cfg.ChunkSize, true)
+			lane.history, err = newBlastRepairHistory(runID, cfg.ChunkSize, true, cfg.PacketAEAD)
 			if err != nil {
 				return TransferStats{}, err
 			}
 			defer lane.history.Close()
 		}
 	}
-	fec := newBlastFECGroup(runID, cfg.ChunkSize, cfg.FECGroupSize)
+	fec := newBlastFECGroup(runID, cfg.ChunkSize, cfg.FECGroupSize, cfg.PacketAEAD)
 	if stripedBlast {
 		fec = nil
 	}
@@ -836,7 +855,7 @@ func SendBlastParallel(ctx context.Context, conns []net.PacketConn, remoteAddrs 
 				}
 				stats.PacketsSent++
 				stats.BytesSent += int64(payloadLen)
-				if parity := fec.Record(seq, offset, wire[headerLen:]); parity != nil {
+				if parity := fec.Record(seq, offset, remaining[:payloadLen]); parity != nil {
 					parityLane := lanes[int(seq%uint64(len(lanes)))]
 					if err := enqueueBlastParallelPacket(sendCtx, parityLane, parity); err != nil {
 						readErr = err
@@ -943,6 +962,12 @@ func blastParallelDataPacket(history *blastRepairHistory, runID [16]byte, stripe
 	payloadLen := len(payload)
 	if payloadLen == 0 {
 		return nil, errors.New("empty blast payload")
+	}
+	if cfg.PacketAEAD != nil {
+		if err := history.Record(seq, payload); err != nil {
+			return nil, err
+		}
+		return marshalBlastPayloadPacket(PacketTypeData, runID, stripeID, seq, offset, 0, 0, payload, cfg.PacketAEAD)
 	}
 	if cfg.RepairPayloads {
 		wire, err := history.packetBufferForStripe(stripeID, seq, offset, payloadLen)
@@ -1196,6 +1221,7 @@ type blastFECGroup struct {
 	runID      [16]byte
 	chunkSize  int
 	groupSize  int
+	packetAEAD cipher.AEAD
 	startSeq   uint64
 	startOff   uint64
 	count      int
@@ -1203,15 +1229,16 @@ type blastFECGroup struct {
 	seenPacket bool
 }
 
-func newBlastFECGroup(runID [16]byte, chunkSize int, groupSize int) *blastFECGroup {
+func newBlastFECGroup(runID [16]byte, chunkSize int, groupSize int, packetAEAD cipher.AEAD) *blastFECGroup {
 	if chunkSize <= 0 || groupSize <= 1 {
 		return nil
 	}
 	return &blastFECGroup{
-		runID:     runID,
-		chunkSize: chunkSize,
-		groupSize: groupSize,
-		parity:    make([]byte, chunkSize),
+		runID:      runID,
+		chunkSize:  chunkSize,
+		groupSize:  groupSize,
+		packetAEAD: packetAEAD,
+		parity:     make([]byte, chunkSize),
 	}
 }
 
@@ -1242,9 +1269,7 @@ func (g *blastFECGroup) Flush() []byte {
 }
 
 func (g *blastFECGroup) flush() []byte {
-	wire := make([]byte, headerLen+len(g.parity))
-	encodePacketHeader(wire[:headerLen], PacketTypeParity, g.runID, 0, g.startSeq, g.startOff, uint64(g.count), 0)
-	copy(wire[headerLen:], g.parity)
+	wire, _ := marshalBlastPayloadPacket(PacketTypeParity, g.runID, 0, g.startSeq, g.startOff, uint64(g.count), 0, g.parity, g.packetAEAD)
 	for i := range g.parity {
 		g.parity[i] = 0
 	}
@@ -1296,10 +1321,11 @@ type blastRepairHistory struct {
 	packetCapacity  uint64
 	packetLens      []int
 	packetSlabs     [][]byte
+	packetAEAD      cipher.AEAD
 }
 
-func newBlastRepairHistory(runID [16]byte, chunkSize int, retainPayloads bool) (*blastRepairHistory, error) {
-	return &blastRepairHistory{runID: runID, chunkSize: chunkSize, retainPayloads: retainPayloads}, nil
+func newBlastRepairHistory(runID [16]byte, chunkSize int, retainPayloads bool, packetAEAD cipher.AEAD) (*blastRepairHistory, error) {
+	return &blastRepairHistory{runID: runID, chunkSize: chunkSize, retainPayloads: retainPayloads, packetAEAD: packetAEAD}, nil
 }
 
 func maxInt() int {
@@ -1438,10 +1464,13 @@ func (h *blastRepairHistory) packet(seq uint64) []byte {
 	if !h.hasPayloadRange(offset, payloadLen) {
 		return nil
 	}
-	wire := make([]byte, headerLen+payloadLen)
-	encodePacketHeader(wire[:headerLen], PacketTypeData, h.runID, 0, seq, offset, 0, 0)
+	payload := make([]byte, payloadLen)
 	if payloadLen > 0 {
-		h.readPayloadAt(wire[headerLen:], offset)
+		h.readPayloadAt(payload, offset)
+	}
+	wire, err := marshalBlastPayloadPacket(PacketTypeData, h.runID, 0, seq, offset, 0, 0, payload, h.packetAEAD)
+	if err != nil {
+		return nil
 	}
 	return wire
 }
@@ -1453,6 +1482,9 @@ func (h *blastRepairHistory) packetBuffer(seq uint64, offset uint64, payloadLen 
 func (h *blastRepairHistory) packetBufferForStripe(stripeID uint16, seq uint64, offset uint64, payloadLen int) ([]byte, error) {
 	if h == nil || !h.retainPayloads || h.chunkSize <= 0 || payloadLen <= 0 {
 		return nil, errors.New("invalid blast repair packet buffer")
+	}
+	if h.packetAEAD != nil {
+		return nil, errors.New("encrypted blast repair packets require retained payload assembly")
 	}
 	if payloadLen > h.chunkSize {
 		return nil, errors.New("blast repair packet payload too large")
@@ -1495,7 +1527,11 @@ func (h *blastRepairHistory) packetFromBufferLocked(seq uint64) []byte {
 }
 
 func (h *blastRepairHistory) packetStride() int {
-	return headerLen + h.chunkSize
+	overhead := 0
+	if h.packetAEAD != nil {
+		overhead = h.packetAEAD.Overhead()
+	}
+	return headerLen + h.chunkSize + overhead
 }
 
 func (h *blastRepairHistory) ensurePacketCapacityForSeq(seq uint64) error {
@@ -1704,11 +1740,11 @@ func paceBlastSend(ctx context.Context, startedAt time.Time, bytesSent uint64, r
 	return sleepWithContext(ctx, sleepFor)
 }
 
-func receiveBlastData(ctx context.Context, conn net.PacketConn, peer net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, buf []byte) (TransferStats, error) {
+func receiveBlastData(ctx context.Context, conn net.PacketConn, peer net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, buf []byte, packetAEAD cipher.AEAD) (TransferStats, error) {
 	batcher := newPacketBatcher(conn, stats.Transport.RequestedKind)
 	stats.Transport = batcher.Capabilities()
 	if udpConn, ok := conn.(*net.UDPConn); ok && batcher.MaxBatch() == 1 {
-		return receiveBlastDataUDP(ctx, udpConn, peer, runID, dst, stats, buf)
+		return receiveBlastDataUDP(ctx, udpConn, peer, runID, dst, stats, buf, packetAEAD)
 	}
 	readBufs := make([]batchReadBuffer, batcher.MaxBatch())
 	for i := range readBufs {
@@ -1733,7 +1769,7 @@ func receiveBlastData(ctx context.Context, conn net.PacketConn, peer net.Addr, r
 			if peer != nil && !sameAddr(addr, peer) {
 				continue
 			}
-			packetType, payload, packetRunID, ok := decodeBlastPacket(readBufs[i].Bytes[:readBufs[i].N])
+			packetType, payload, packetRunID, ok := decodeBlastPacketWithAEAD(readBufs[i].Bytes[:readBufs[i].N], packetAEAD)
 			if !ok || packetRunID != runID {
 				continue
 			}
@@ -1765,7 +1801,7 @@ func receiveBlastData(ctx context.Context, conn net.PacketConn, peer net.Addr, r
 	}
 }
 
-func receiveBlastDataUDP(ctx context.Context, conn *net.UDPConn, peer net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, buf []byte) (TransferStats, error) {
+func receiveBlastDataUDP(ctx context.Context, conn *net.UDPConn, peer net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, buf []byte, packetAEAD cipher.AEAD) (TransferStats, error) {
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetReadDeadline(deadline); err != nil {
 			return TransferStats{}, err
@@ -1799,7 +1835,7 @@ func receiveBlastDataUDP(ctx context.Context, conn *net.UDPConn, peer net.Addr, 
 		if !udpAddrPortMatchesPeer(addrPort, peer) {
 			continue
 		}
-		packetType, payload, packetRunID, ok := decodeBlastPacket(buf[:n])
+		packetType, payload, packetRunID, ok := decodeBlastPacketWithAEAD(buf[:n], packetAEAD)
 		if !ok || packetRunID != runID {
 			continue
 		}
@@ -2607,7 +2643,7 @@ func readBlastStreamReceiveLaneDirect(ctx context.Context, laneIndex int, lane *
 			continue
 		}
 		for i := 0; i < n; i++ {
-			packetType, payload, runID, seq, offset, ok := decodeBlastPacketFull(readBufs[i].Bytes[:readBufs[i].N])
+			packetType, payload, runID, seq, offset, ok := decodeBlastPacketFullWithAEAD(readBufs[i].Bytes[:readBufs[i].N], cfg.PacketAEAD)
 			if !ok || !receiveConfigAllowsRunID(cfg, runID) {
 				continue
 			}
@@ -3388,7 +3424,17 @@ func receiveBlastParallelConn(ctx context.Context, conn net.PacketConn, dst io.W
 				if err != nil {
 					return err
 				}
-				bytesReceived.Add(int64(written))
+				received := bytesReceived.Add(int64(written))
+				if expectedBytes > 0 && received >= expectedBytes {
+					if err := flushOrderedParallelBlastPayload(dst, state, writeMu); err != nil {
+						return err
+					}
+					if err := sendRepairComplete(ctx, batcher, state.addr, runID); err != nil {
+						return err
+					}
+					closeDone()
+					return nil
+				}
 			}
 			if err := maybeFinishRun(runID, state); err != nil {
 				return err
@@ -3429,7 +3475,7 @@ func receiveBlastParallelConn(ctx context.Context, conn net.PacketConn, dst io.W
 			continue
 		}
 		for i := 0; i < n; i++ {
-			packetType, payload, runID, seq, offset, ok := decodeBlastPacketFull(readBufs[i].Bytes[:readBufs[i].N])
+			packetType, payload, runID, seq, offset, ok := decodeBlastPacketFullWithAEAD(readBufs[i].Bytes[:readBufs[i].N], cfg.PacketAEAD)
 			if !ok {
 				continue
 			}
@@ -3836,6 +3882,26 @@ func encodePacketHeader(dst []byte, packetType PacketType, runID [16]byte, strip
 	binary.BigEndian.PutUint64(dst[44:52], ackMask)
 }
 
+func marshalBlastPayloadPacket(packetType PacketType, runID [16]byte, stripeID uint16, seq uint64, offset uint64, ackFloor uint64, ackMask uint64, payload []byte, packetAEAD cipher.AEAD) ([]byte, error) {
+	if packetAEAD != nil {
+		return MarshalPacket(Packet{
+			Version:  ProtocolVersion,
+			Type:     packetType,
+			StripeID: stripeID,
+			RunID:    runID,
+			Seq:      seq,
+			Offset:   offset,
+			AckFloor: ackFloor,
+			AckMask:  ackMask,
+			Payload:  payload,
+		}, packetAEAD)
+	}
+	wire := make([]byte, headerLen+len(payload))
+	encodePacketHeader(wire[:headerLen], packetType, runID, stripeID, seq, offset, ackFloor, ackMask)
+	copy(wire[headerLen:], payload)
+	return wire, nil
+}
+
 func sessionTracef(format string, args ...any) {
 	if !sessionTraceEnabled() {
 		return
@@ -3851,20 +3917,32 @@ func sessionPacketTraceEnabled() bool {
 	return strings.TrimSpace(os.Getenv("DERPCAT_PROBE_TRACE_PACKETS")) != ""
 }
 
-func decodeBlastPacket(buf []byte) (PacketType, []byte, [16]byte, bool) {
-	packetType, payload, runID, _, _, ok := decodeBlastPacketFull(buf)
+func decodeBlastPacketFull(buf []byte) (PacketType, []byte, [16]byte, uint64, uint64, bool) {
+	return decodeBlastPacketFullWithAEAD(buf, nil)
+}
+
+func decodeBlastPacketWithAEAD(buf []byte, packetAEAD cipher.AEAD) (PacketType, []byte, [16]byte, bool) {
+	packetType, payload, runID, _, _, ok := decodeBlastPacketFullWithAEAD(buf, packetAEAD)
 	return packetType, payload, runID, ok
 }
 
-func decodeBlastPacketFull(buf []byte) (PacketType, []byte, [16]byte, uint64, uint64, bool) {
+func decodeBlastPacketFullWithAEAD(buf []byte, packetAEAD cipher.AEAD) (PacketType, []byte, [16]byte, uint64, uint64, bool) {
 	if len(buf) < headerLen || buf[0] != ProtocolVersion {
 		return 0, nil, [16]byte{}, 0, 0, false
+	}
+	packetType := PacketType(buf[1])
+	if packetAEAD != nil && (packetType == PacketTypeData || packetType == PacketTypeParity) {
+		packet, err := UnmarshalPacket(buf, packetAEAD)
+		if err != nil {
+			return 0, nil, [16]byte{}, 0, 0, false
+		}
+		return packet.Type, packet.Payload, packet.RunID, packet.Seq, packet.Offset, true
 	}
 	var runID [16]byte
 	copy(runID[:], buf[4:20])
 	seq := binary.BigEndian.Uint64(buf[20:28])
 	offset := binary.BigEndian.Uint64(buf[28:36])
-	return PacketType(buf[1]), buf[headerLen:], runID, seq, offset, true
+	return packetType, buf[headerLen:], runID, seq, offset, true
 }
 
 func sleepWithContext(ctx context.Context, delay time.Duration) error {

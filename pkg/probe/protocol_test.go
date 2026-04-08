@@ -56,7 +56,7 @@ func TestUnmarshalPacketRejectsWrongVersion(t *testing.T) {
 	}
 }
 
-func TestPacketRejectsAEAD(t *testing.T) {
+func TestPacketRoundTripAEADAuthenticatesPayloadAndHeader(t *testing.T) {
 	block, err := aes.NewCipher(make([]byte, 16))
 	if err != nil {
 		t.Fatalf("aes.NewCipher() error = %v", err)
@@ -66,11 +66,37 @@ func TestPacketRejectsAEAD(t *testing.T) {
 		t.Fatalf("cipher.NewGCM() error = %v", err)
 	}
 
-	if _, err := MarshalPacket(Packet{}, aead); err == nil {
-		t.Fatal("MarshalPacket() error = nil, want encrypted mode error")
+	packet := Packet{
+		Version:  ProtocolVersion,
+		Type:     PacketTypeData,
+		StripeID: 7,
+		RunID:    [16]byte{1, 2, 3, 4},
+		Seq:      42,
+		Offset:   8192,
+		AckFloor: 4096,
+		AckMask:  0x8040201008040201,
+		Payload:  []byte("wire-secret-payload"),
 	}
 
-	if _, err := UnmarshalPacket(make([]byte, headerLen), aead); err == nil {
-		t.Fatal("UnmarshalPacket() error = nil, want encrypted mode error")
+	buf, err := MarshalPacket(packet, aead)
+	if err != nil {
+		t.Fatalf("MarshalPacket() error = %v", err)
+	}
+	if bytes.Contains(buf, packet.Payload) {
+		t.Fatal("encrypted packet contains plaintext payload")
+	}
+
+	got, err := UnmarshalPacket(buf, aead)
+	if err != nil {
+		t.Fatalf("UnmarshalPacket() error = %v", err)
+	}
+	if got.Version != packet.Version || got.Type != packet.Type || got.StripeID != packet.StripeID || !bytes.Equal(got.RunID[:], packet.RunID[:]) || got.Seq != packet.Seq || got.Offset != packet.Offset || got.AckFloor != packet.AckFloor || got.AckMask != packet.AckMask || !bytes.Equal(got.Payload, packet.Payload) {
+		t.Fatalf("round trip mismatch: got %#v want %#v", got, packet)
+	}
+
+	tampered := append([]byte(nil), buf...)
+	tampered[20] ^= 0x80
+	if _, err := UnmarshalPacket(tampered, aead); err == nil {
+		t.Fatal("UnmarshalPacket() error = nil after authenticated header tamper")
 	}
 }

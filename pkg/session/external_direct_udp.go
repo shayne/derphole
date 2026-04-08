@@ -3,6 +3,9 @@ package session
 import (
 	"bufio"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -30,7 +33,7 @@ import (
 const (
 	externalDirectUDPTransportLabel     = "batched"
 	externalDirectUDPParallelism        = 8
-	externalDirectUDPChunkSize          = 1400
+	externalDirectUDPChunkSize          = 1384 // 52-byte probe header + 16-byte GCM tag keeps UDP payload at 1452 bytes.
 	externalDirectUDPRateMbps           = 2250
 	externalDirectUDPWait               = 5 * time.Second
 	externalDirectUDPPunchWait          = 1200 * time.Millisecond
@@ -54,6 +57,20 @@ const (
 var externalDirectUDPRateProbeMagic = [16]byte{0, 'd', 'e', 'r', 'p', 'c', 'a', 't', '-', 'r', 'a', 't', 'e', '-', 'v', '1'}
 
 var externalDirectUDPPreviewTransportCaps = probe.PreviewTransportCaps
+
+var externalDirectUDPPacketAEADDomain = []byte("derpcat-direct-udp-packet-aead-v1")
+
+func externalDirectUDPPacketAEAD(tok token.Token) (cipher.AEAD, error) {
+	hash := sha256.New()
+	_, _ = hash.Write(externalDirectUDPPacketAEADDomain)
+	_, _ = hash.Write(tok.SessionID[:])
+	_, _ = hash.Write(tok.BearerSecret[:])
+	block, err := aes.NewCipher(hash.Sum(nil))
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
 
 func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) error {
 	tok, err := token.Decode(cfg.Token, time.Now())
@@ -199,6 +216,10 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) error {
 				cfg.Emitter.Debug("udp-direct-addr=" + peerAddr.String())
 				cfg.Emitter.Debug("udp-direct-addrs=" + strings.Join(remoteAddrs, ","))
 			}
+			packetAEAD, err := externalDirectUDPPacketAEAD(tok)
+			if err != nil {
+				return err
+			}
 			sendCfg := probe.SendConfig{
 				Blast:                    true,
 				Transport:                externalDirectUDPTransportLabel,
@@ -209,6 +230,7 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) error {
 				TailReplayBytes:          externalDirectUDPTailReplayBytes,
 				FECGroupSize:             externalDirectUDPFECGroupSize,
 				StripedBlast:             externalDirectUDPStripedBlast && !readyAck.FastDiscard,
+				PacketAEAD:               packetAEAD,
 				AllowPartialParallel:     true,
 				ParallelHandshakeTimeout: externalDirectUDPHandshakeWait,
 			}
@@ -446,7 +468,12 @@ func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (string, 
 						}
 						cfg.Emitter.Debug("udp-direct-addrs=" + strings.Join(remoteAddrs, ","))
 					}
+					packetAEAD, err := externalDirectUDPPacketAEAD(session.token)
+					if err != nil {
+						return tok, err
+					}
 					receiveCfg := externalDirectUDPFastDiscardReceiveConfig()
+					receiveCfg.PacketAEAD = packetAEAD
 					var stats probe.TransferStats
 					var start directUDPStart
 					start, receiveErr = waitForDirectUDPStart(ctx, startCh)
@@ -1229,6 +1256,39 @@ func externalDirectUDPSelectRateFromProbeSamples(maxRateMbps int, sent []directU
 		highThroughputKnee := current.goodput >= float64(maxRateMbps)*externalDirectUDPRateProbeHighShare && current.goodput >= prev.goodput*externalDirectUDPRateProbeHighGain
 		if current.delivery >= 0.70 && current.goodput >= prev.goodput*0.75 && (efficiency >= 0.85 || highThroughputKnee) {
 			continue
+		}
+		midProbeSoftLoss := current.rate < maxRateMbps && current.delivery >= 0.70 && current.goodput >= prev.goodput
+		if midProbeSoftLoss {
+			selected := prev.rate
+			if selected < externalDirectUDPRateProbeMinMbps {
+				selected = externalDirectUDPRateProbeMinMbps
+			}
+			if selected > maxRateMbps {
+				selected = maxRateMbps
+			}
+			return selected
+		}
+		midProbeCollapseAfterCleanTier := current.rate < maxRateMbps && prev.delivery >= 0.90
+		if midProbeCollapseAfterCleanTier {
+			selected := prev.rate
+			if selected < externalDirectUDPRateProbeMinMbps {
+				selected = externalDirectUDPRateProbeMinMbps
+			}
+			if selected > maxRateMbps {
+				selected = maxRateMbps
+			}
+			return selected
+		}
+		topProbeStillGaining := (i == len(candidates)-1 || current.rate == maxRateMbps) && current.delivery >= 0.98 && current.goodput >= prev.goodput*externalDirectUDPRateProbeHighGain
+		if topProbeStillGaining {
+			selected := int(current.goodput*1.15 + 0.5)
+			if selected < externalDirectUDPRateProbeMinMbps {
+				selected = externalDirectUDPRateProbeMinMbps
+			}
+			if selected > maxRateMbps {
+				selected = maxRateMbps
+			}
+			return selected
 		}
 		backoffIndex := i - 2
 		if backoffIndex < 0 {

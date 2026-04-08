@@ -44,13 +44,13 @@ Examples:
 - `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPCAT_PARALLEL_ARGS='--parallel=auto' ./scripts/promotion-test.sh canlxc 1024`
 - `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPCAT_PARALLEL_ARGS='--parallel=8' ./scripts/promotion-test-reverse.sh ktzlxc 1024`
 
-## Direct UDP Proof Gate
+## Direct UDP Probe Harness
 
-The raw-mode direct UDP probe is a separate benchmark path from the current derpcat transport. Keep it in raw mode for this phase, and compare it only against the no-Tailscale derpcat baseline.
+The raw-mode direct UDP probe harness is a microbenchmark for packet-engine experiments. Production `listen/send` now uses DERP-coordinated direct UDP by default, so treat this harness as a lower-level comparison tool rather than the proof of the default transport.
 
-Every derpcat baseline command in this proof gate must set `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1`.
+Every derpcat baseline command in this validation path must set `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1`.
 
-At the current scaffold stage, these harnesses validate probe deployment and orchestration wiring. They do not yet prove a live cross-host direct UDP transfer until the cross-host endpoint-exchange work lands.
+Use the promotion scripts above for end-to-end default-transport validation. Use the raw probe harnesses when you need to isolate packet-engine throughput, pacing, repair, or batching behavior outside the full DERP coordination path.
 
 Use these harnesses for the proof run:
 

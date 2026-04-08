@@ -6,7 +6,7 @@ It uses the public Tailscale [DERP](#what-is-derp) relay network for rendezvous 
 
 `derpcat` is **not** a WireGuard overlay and **not** a VPN. Tailscale builds a general-purpose secure network on WireGuard. `derpcat` is optimized for a different job: one session, one token, one transfer or shared service, on the shortest secure path it can find for that session. See [Transport Model](#transport-model), [Why It Is Fast](#why-it-is-fast), and [Security Model](#security-model).
 
-For one-shot transfers and temporary service sharing, `derpcat` can beat sending the same traffic through a WireGuard-based overlay because it does not first build a general-purpose encrypted network path and then send application traffic through it. It uses DERP for rendezvous and fallback, then moves the live session onto direct QUIC or, when the path allows it, authenticated native TCP. Details are in [Transport Model](#transport-model) and [How This Differs From Tailscale / WireGuard](#how-this-differs-from-tailscale--wireguard).
+For one-shot transfers and temporary service sharing, `derpcat` can beat sending the same traffic through a WireGuard-based overlay because it does not first build a general-purpose encrypted network path and then send application traffic through it. It uses DERP for rendezvous and fallback, then moves the live session onto the best direct path it can establish for that workload. Details are in [Transport Model](#transport-model) and [How This Differs From Tailscale / WireGuard](#how-this-differs-from-tailscale--wireguard).
 
 It does **not** require:
 
@@ -130,7 +130,7 @@ DERP is used for **rendezvous** and **relay fallback**. If the term is new, see 
 The data plane is selected per session:
 
 - `share/open` uses multiplexed QUIC streams over `derpcat`'s relay/direct UDP transport, so one claimed session can carry many independent TCP connections to the shared service.
-- `listen/send` uses a one-shot byte stream. If an allowed native TCP path exists, `derpcat` can use it as a fast path; otherwise it falls back to an authenticated QUIC stream over the relay/direct UDP transport.
+- `listen/send` uses a one-shot byte stream. By default, `derpcat` coordinates through DERP, promotes to a rate-adaptive direct UDP blast when traversal succeeds, and stays on encrypted relay fallback when no direct path is available.
 
 Candidate discovery splits into two phases:
 
@@ -160,9 +160,9 @@ For `send/listen` and `share/open`, that can beat routing the same traffic throu
 
 - DERP is for rendezvous and relay fallback, not the preferred steady-state data plane.
 - Sessions can start relayed immediately, then promote in place to direct without restarting the transfer.
-- Public-Internet direct paths use QUIC over UDP. That gives fast setup, stream multiplexing, and encrypted user-space transport without a kernel VPN interface.
-- `listen/send` can use authenticated native TCP fast paths when the selected path allows it. That avoids extra overlay encapsulation on suitable direct routes.
-- Native QUIC can use multiple striped connections for higher throughput on difficult paths where a single UDP flow is not enough.
+- `listen/send` uses multiple direct UDP lanes, a short path-rate probe, paced sending, FEC, and targeted repair. That lets fast links run near their WAN ceiling without forcing slower links into the same send rate.
+- Direct UDP payload packets are AEAD-protected with a per-session key derived from the bearer secret. The packet header stays visible for sequencing and repair, while user bytes stay encrypted and authenticated.
+- `share/open` keeps QUIC stream multiplexing for service sharing, where many independent TCP streams need one claimed session.
 - Candidate discovery is front-loaded with local interface candidates and cached mappings, then refined in the background with STUN and port mapping refresh. That keeps the first byte moving quickly instead of stalling the session until every traversal probe finishes.
 
 In practice: get bytes moving early, keep them moving through relay if needed, then shift the live session onto a faster direct path as soon as direct connectivity is ready.
@@ -173,14 +173,15 @@ The session token is a **bearer capability**. Anyone who has the token can claim
 
 DERP relays do **not** get the secret material needed to read or impersonate the session:
 
-- On the public-Internet path, traffic is carried over QUIC with the peer certificate pinned to the public identity encoded in the token. If packets are relayed through DERP, DERP only forwards encrypted bytes.
-- On native TCP fast paths, the connection is authenticated either with a per-session bearer-secret handshake on Tailscale-addressed paths or with pinned TLS on other direct TCP paths. Public direct paths also support authenticated QUIC.
+- On the default `listen/send` direct UDP path, payload packets are encrypted and authenticated with session AEAD derived from the bearer secret in the token.
+- On `share/open`, stream traffic is carried over authenticated QUIC streams for the claimed session.
+- If packets are relayed through DERP, DERP only forwards encrypted session bytes.
 
 Important security property: `derpcat` does not trade speed for plaintext shortcuts:
 
 - the token authorizes the session, but does not turn DERP into a trusted decrypting proxy
-- QUIC peers are pinned to the expected public identity from the token
-- native TCP fast paths are only used where allowed and are authenticated per session
+- direct UDP data packets are encrypted and authenticated per session
+- QUIC stream-mode peers are pinned to the expected public identity from the token
 - DERP forwards encrypted traffic but does not have the keys required to decrypt or impersonate the session
 
 Simple rule: possession of the token authorizes the session, but intermediaries that only see DERP traffic do not have the keys needed to decrypt it.
@@ -218,7 +219,7 @@ Sender:
 tar -cpf - /srv/data | npx -y derpcat@latest send <token>
 ```
 
-This is still tar pipe. Difference: no public listener to expose, no SSH daemon required for data path, no VPN to join, and no permanent mesh to set up. `derpcat` starts with DERP if needed, then promotes the live transfer onto direct QUIC or native TCP when a faster direct path becomes available.
+This is still tar pipe. Difference: no public listener to expose, no SSH daemon required for data path, no VPN to join, and no permanent mesh to set up. `derpcat` starts with DERP if needed, then promotes the live transfer onto direct UDP when a faster direct path becomes available.
 
 ## Development
 
@@ -263,4 +264,4 @@ In `derpcat`, DERP has two jobs:
 - rendezvous: carry the initial claim, decision, and direct-path coordination messages so the two peers can find each other without a separate account-backed control plane
 - fallback relay: carry encrypted session traffic when NAT traversal has not succeeded yet or when direct connectivity is unavailable
 
-DERP is not the preferred steady-state path. It is the safety net that gets the session started and keeps it working. If a direct QUIC or native TCP path becomes available, `derpcat` promotes the live session onto that direct path. DERP only forwards bytes; it does not get the session keys needed to decrypt the traffic.
+DERP is not the preferred steady-state path. It is the safety net that gets the session started and keeps it working. If a direct UDP path becomes available, `derpcat` promotes the live session onto that direct path. DERP only forwards bytes; it does not get the session keys needed to decrypt the traffic.

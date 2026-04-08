@@ -647,6 +647,69 @@ func TestExternalDirectUDPSelectRateFromProbeSamplesBacksOffAtRateCollapse(t *te
 	}
 }
 
+func TestExternalDirectUDPSelectRateFromProbeSamplesBacksOffOneTierAtMidProbeLoss(t *testing.T) {
+	sent := []directUDPRateProbeSample{
+		{RateMbps: 150, BytesSent: 3_606_704, DurationMillis: 200},
+		{RateMbps: 350, BytesSent: 8_602_944, DurationMillis: 200},
+		{RateMbps: 700, BytesSent: 17_348_440, DurationMillis: 200},
+		{RateMbps: 1200, BytesSent: 29_803_000, DurationMillis: 200},
+		{RateMbps: 2250, BytesSent: 47_925_152, DurationMillis: 200},
+	}
+	received := []directUDPRateProbeSample{
+		{RateMbps: 150, BytesReceived: 3_606_704, DurationMillis: 200},
+		{RateMbps: 350, BytesReceived: 8_602_944, DurationMillis: 200},
+		{RateMbps: 700, BytesReceived: 17_348_440, DurationMillis: 200},
+		{RateMbps: 1200, BytesReceived: 22_650_544, DurationMillis: 200},
+		{RateMbps: 2250, BytesReceived: 11_981_288, DurationMillis: 200},
+	}
+
+	if got, want := externalDirectUDPSelectRateFromProbeSamples(2250, sent, received), 700; got != want {
+		t.Fatalf("externalDirectUDPSelectRateFromProbeSamples(mid-probe loss) = %d, want %d", got, want)
+	}
+}
+
+func TestExternalDirectUDPSelectRateFromProbeSamplesBacksOffOneTierAtMidProbeCollapse(t *testing.T) {
+	sent := []directUDPRateProbeSample{
+		{RateMbps: 150, BytesSent: 3_587_328, DurationMillis: 200},
+		{RateMbps: 350, BytesSent: 8_569_728, DurationMillis: 200},
+		{RateMbps: 700, BytesSent: 17_401_032, DurationMillis: 200},
+		{RateMbps: 1200, BytesSent: 29_949_760, DurationMillis: 200},
+		{RateMbps: 2250, BytesSent: 57_384_100, DurationMillis: 200},
+	}
+	received := []directUDPRateProbeSample{
+		{RateMbps: 150, BytesReceived: 3_587_328, DurationMillis: 200},
+		{RateMbps: 350, BytesReceived: 8_569_728, DurationMillis: 200},
+		{RateMbps: 700, BytesReceived: 17_401_032, DurationMillis: 200},
+		{RateMbps: 1200, BytesReceived: 14_974_880, DurationMillis: 200},
+		{RateMbps: 2250, BytesReceived: 9_181_456, DurationMillis: 200},
+	}
+
+	if got, want := externalDirectUDPSelectRateFromProbeSamples(2250, sent, received), 700; got != want {
+		t.Fatalf("externalDirectUDPSelectRateFromProbeSamples(mid-probe collapse) = %d, want %d", got, want)
+	}
+}
+
+func TestExternalDirectUDPSelectRateFromProbeSamplesBacksOffTwoTiersAtTopProbeCollapse(t *testing.T) {
+	sent := []directUDPRateProbeSample{
+		{RateMbps: 150, BytesSent: 3_598_400, DurationMillis: 200},
+		{RateMbps: 350, BytesSent: 8_591_872, DurationMillis: 200},
+		{RateMbps: 700, BytesSent: 17_394_112, DurationMillis: 200},
+		{RateMbps: 1200, BytesSent: 29_854_264, DurationMillis: 200},
+		{RateMbps: 2250, BytesSent: 55_990_000, DurationMillis: 200},
+	}
+	received := []directUDPRateProbeSample{
+		{RateMbps: 150, BytesReceived: 3_598_400, DurationMillis: 200},
+		{RateMbps: 350, BytesReceived: 8_591_872, DurationMillis: 200},
+		{RateMbps: 700, BytesReceived: 17_394_112, DurationMillis: 200},
+		{RateMbps: 1200, BytesReceived: 29_854_264, DurationMillis: 200},
+		{RateMbps: 2250, BytesReceived: 34_154_352, DurationMillis: 200},
+	}
+
+	if got, want := externalDirectUDPSelectRateFromProbeSamples(2250, sent, received), 700; got != want {
+		t.Fatalf("externalDirectUDPSelectRateFromProbeSamples(top-probe collapse) = %d, want %d", got, want)
+	}
+}
+
 func TestExternalDirectUDPSelectRateFromProbeSamplesKeepsHighThroughputKnee(t *testing.T) {
 	sent := []directUDPRateProbeSample{
 		{RateMbps: 150, BytesSent: 3_595_200, DurationMillis: 200},
@@ -665,6 +728,27 @@ func TestExternalDirectUDPSelectRateFromProbeSamplesKeepsHighThroughputKnee(t *t
 
 	if got, want := externalDirectUDPSelectRateFromProbeSamples(2250, sent, received), 2069; got != want {
 		t.Fatalf("externalDirectUDPSelectRateFromProbeSamples(high-throughput knee) = %d, want %d", got, want)
+	}
+}
+
+func TestExternalDirectUDPSelectRateFromProbeSamplesUsesObservedCeilingWhenTopProbeStillGains(t *testing.T) {
+	sent := []directUDPRateProbeSample{
+		{RateMbps: 150, BytesSent: 3_597_000, DurationMillis: 200},
+		{RateMbps: 350, BytesSent: 8_603_000, DurationMillis: 200},
+		{RateMbps: 700, BytesSent: 17_384_500, DurationMillis: 200},
+		{RateMbps: 1200, BytesSent: 29_988_500, DurationMillis: 200},
+		{RateMbps: 2250, BytesSent: 42_790_500, DurationMillis: 200},
+	}
+	received := []directUDPRateProbeSample{
+		{RateMbps: 150, BytesReceived: 3_597_000, DurationMillis: 200},
+		{RateMbps: 350, BytesReceived: 8_603_000, DurationMillis: 200},
+		{RateMbps: 700, BytesReceived: 17_384_500, DurationMillis: 200},
+		{RateMbps: 1200, BytesReceived: 29_988_500, DurationMillis: 200},
+		{RateMbps: 2250, BytesReceived: 42_790_500, DurationMillis: 200},
+	}
+
+	if got, want := externalDirectUDPSelectRateFromProbeSamples(2250, sent, received), 1968; got != want {
+		t.Fatalf("externalDirectUDPSelectRateFromProbeSamples(observed ceiling) = %d, want %d", got, want)
 	}
 }
 
