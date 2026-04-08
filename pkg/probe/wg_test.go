@@ -209,6 +209,8 @@ func testWireGuardTransfer(t *testing.T, transport string) {
 	var dst bytes.Buffer
 	serverDone := make(chan error, 1)
 	serverReady := make(chan struct{})
+	sendDone := make(chan error, 1)
+	senderFinished := make(chan struct{})
 	go func() {
 		cfg := WireGuardConfig{
 			Transport:      transport,
@@ -245,13 +247,17 @@ func testWireGuardTransfer(t *testing.T, transport string) {
 			serverDone <- err
 			return
 		}
-		if _, err := tcpConn.Write(wireGuardDrainAck); err != nil {
+		if err := writeWireGuardDrainAck(tcpConn); err != nil {
 			serverDone <- err
 			return
 		}
 		if _, err := io.Copy(io.Discard, tcpConn); err != nil {
 			serverDone <- err
 			return
+		}
+		select {
+		case <-senderFinished:
+		case <-ctx.Done():
 		}
 		serverDone <- nil
 	}()
@@ -266,17 +272,44 @@ func testWireGuardTransfer(t *testing.T, transport string) {
 		t.Fatalf("timed out waiting for server readiness: %v", ctx.Err())
 	}
 
-	if _, err := SendWireGuard(ctx, clientConn, bytes.NewReader(payload), WireGuardConfig{
-		Transport:      transport,
-		PrivateKeyHex:  plan.senderPrivHex,
-		PeerPublicHex:  plan.listenerPubHex,
-		LocalAddr:      plan.senderAddr.String(),
-		PeerAddr:       plan.listenerAddr.String(),
-		DirectEndpoint: serverConn.LocalAddr().String(),
-		Port:           uint16(plan.port),
-		SizeBytes:      int64(len(payload)),
-	}); err != nil {
-		t.Fatalf("SendWireGuard() error = %v", err)
+	go func() {
+		defer close(senderFinished)
+		_, err := SendWireGuard(ctx, clientConn, bytes.NewReader(payload), WireGuardConfig{
+			Transport:      transport,
+			PrivateKeyHex:  plan.senderPrivHex,
+			PeerPublicHex:  plan.listenerPubHex,
+			LocalAddr:      plan.senderAddr.String(),
+			PeerAddr:       plan.listenerAddr.String(),
+			DirectEndpoint: serverConn.LocalAddr().String(),
+			Port:           uint16(plan.port),
+			SizeBytes:      int64(len(payload)),
+		})
+		sendDone <- err
+	}()
+
+	select {
+	case err := <-sendDone:
+		if err != nil {
+			t.Fatalf("SendWireGuard() error = %v", err)
+		}
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("ReceiveWireGuardToWriter() error = %v", err)
+		}
+		select {
+		case err := <-sendDone:
+			if err != nil {
+				t.Fatalf("SendWireGuard() error = %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for SendWireGuard after receiver completed; received=%d want=%d", dst.Len(), len(payload))
+		}
+		if !bytes.Equal(dst.Bytes(), payload) {
+			t.Fatalf("received payload mismatch: got %d bytes want %d", dst.Len(), len(payload))
+		}
+		return
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for SendWireGuard; received=%d want=%d", dst.Len(), len(payload))
 	}
 
 	select {

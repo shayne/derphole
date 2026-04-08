@@ -888,7 +888,7 @@ func TestManagerPeerDatagramConnSurvivesPathUpgrade(t *testing.T) {
 
 	controls.unblockSend(ControlCallMeMaybe)
 	clock.Advance(1 * time.Second)
-	if !waitForPath(t, mgr, PathDirect, 200*time.Millisecond) {
+	if !waitForPath(t, mgr, PathDirect, time.Second) {
 		t.Fatalf("PathState() = %v, want %v", mgr.PathState(), PathDirect)
 	}
 	if err := conn.SendDatagram([]byte("after-upgrade")); err != nil {

@@ -231,7 +231,7 @@ func ReceiveWireGuardToWriter(ctx context.Context, conn net.PacketConn, dst io.W
 				return TransferStats{}, io.ErrShortWrite
 			}
 			if !ackSent && cfg.SizeBytes > 0 && stats.BytesReceived >= cfg.SizeBytes {
-				if _, err := tcpConn.Write(wireGuardDrainAck); err != nil {
+				if err := writeWireGuardDrainAck(tcpConn); err != nil {
 					probeWGTracef("recv single target ack write error=%v received=%d", err, stats.BytesReceived)
 					return TransferStats{}, err
 				}
@@ -244,7 +244,7 @@ func ReceiveWireGuardToWriter(ctx context.Context, conn net.PacketConn, dst io.W
 				return TransferStats{}, io.ErrUnexpectedEOF
 			}
 			if !ackSent {
-				if _, err := tcpConn.Write(wireGuardDrainAck); err != nil {
+				if err := writeWireGuardDrainAck(tcpConn); err != nil {
 					probeWGTracef("recv single ack write error=%v received=%d", err, stats.BytesReceived)
 					return TransferStats{}, err
 				}
@@ -542,7 +542,7 @@ func receiveWireGuardParallel(ctx context.Context, stats *TransferStats, ln net.
 						}
 					}
 					if readErr == io.EOF {
-						if _, err := conn.Write(wireGuardDrainAck); err != nil {
+						if err := writeWireGuardDrainAck(conn); err != nil {
 							probeWGTracef("recv stream=%d ack write error=%v received=%d total=%d", streamID, err, received, total.Load())
 							select {
 							case errCh <- err:
@@ -703,6 +703,16 @@ func waitForWireGuardAck(ctx context.Context, conn net.Conn) error {
 	}
 	if !bytes.Equal(buf, wireGuardDrainAck) {
 		return fmt.Errorf("unexpected wireguard drain ack %q", buf)
+	}
+	return nil
+}
+
+func writeWireGuardDrainAck(conn net.Conn) error {
+	if _, err := conn.Write(wireGuardDrainAck); err != nil {
+		return err
+	}
+	if closer, ok := conn.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
 	}
 	return nil
 }
