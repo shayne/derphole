@@ -761,6 +761,7 @@ func TestExternalListenSendSmallRelayPayloadDoesNotStallWhenSenderSkipsNativeQUI
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(250*time.Millisecond).UnixNano(), 10))
 	t.Setenv("DERPCAT_NATIVE_QUIC_CONNS", "4")
+	const nativeQUICCandidateDelay = 10 * time.Second
 
 	prevTCPAddrAllowed := externalNativeTCPAddrAllowed
 	externalNativeTCPAddrAllowed = func(net.Addr) bool { return false }
@@ -769,7 +770,7 @@ func TestExternalListenSendSmallRelayPayloadDoesNotStallWhenSenderSkipsNativeQUI
 	prevStripeCandidates := externalNativeQUICStripeProbeCandidates
 	externalNativeQUICStripeProbeCandidates = func(ctx context.Context, packetConn net.PacketConn, _ *tailcfg.DERPMap, _ publicPortmap) []string {
 		select {
-		case <-time.After(3 * time.Second):
+		case <-time.After(nativeQUICCandidateDelay):
 		case <-ctx.Done():
 			return nil
 		}
@@ -815,8 +816,8 @@ func TestExternalListenSendSmallRelayPayloadDoesNotStallWhenSenderSkipsNativeQUI
 	if err := <-listenErr; err != nil {
 		t.Fatalf("Listen() error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
 	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Fatalf("small relay transfer took %v, want < 2s when sender skips native QUIC setup; listener=%q sender=%q", elapsed, listenerStatus.String(), senderStatus.String())
+	if elapsed := time.Since(start); elapsed > nativeQUICCandidateDelay/2 {
+		t.Fatalf("small relay transfer took %v, want < %v when sender skips native QUIC setup; listener=%q sender=%q", elapsed, nativeQUICCandidateDelay/2, listenerStatus.String(), senderStatus.String())
 	}
 	if !bytes.Equal(listenerOut.Bytes(), payload) {
 		t.Fatalf("listener output length = %d, want %d", listenerOut.Len(), len(payload))
