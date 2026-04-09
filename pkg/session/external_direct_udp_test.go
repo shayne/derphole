@@ -652,6 +652,86 @@ func TestExternalDirectUDPRateProbeRatesSkipSmallTransfers(t *testing.T) {
 	}
 }
 
+func TestExternalDirectUDPRateProbePayloadEncodesIndex(t *testing.T) {
+	payload, err := externalDirectUDPRateProbePayload(3, 128)
+	if err != nil {
+		t.Fatalf("externalDirectUDPRateProbePayload() error = %v", err)
+	}
+	if len(payload) != 128 {
+		t.Fatalf("payload len = %d, want 128", len(payload))
+	}
+	index, ok := externalDirectUDPRateProbeIndex(payload, 10)
+	if !ok {
+		t.Fatal("externalDirectUDPRateProbeIndex() did not recognize payload")
+	}
+	if index != 3 {
+		t.Fatalf("probe index = %d, want 3", index)
+	}
+}
+
+func TestExternalDirectUDPSendRateProbesWritesSyntheticPackets(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	rates := []int{8, 25}
+	readCh := make(chan int, 16)
+	go func() {
+		defer close(readCh)
+		buf := make([]byte, 2048)
+		deadline := time.Now().Add(1200 * time.Millisecond)
+		_ = server.SetReadDeadline(deadline)
+		for {
+			n, _, err := server.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			index, ok := externalDirectUDPRateProbeIndex(buf[:n], len(rates))
+			if ok {
+				readCh <- index
+			}
+		}
+	}()
+
+	sent, err := externalDirectUDPSendRateProbes(ctx, client, server.LocalAddr().String(), rates)
+	if err != nil {
+		t.Fatalf("externalDirectUDPSendRateProbes() error = %v", err)
+	}
+	if len(sent) != len(rates) {
+		t.Fatalf("sent samples len = %d, want %d", len(sent), len(rates))
+	}
+	for i, sample := range sent {
+		if sample.RateMbps != rates[i] {
+			t.Fatalf("sent[%d].RateMbps = %d, want %d", i, sample.RateMbps, rates[i])
+		}
+		if sample.BytesSent <= 0 {
+			t.Fatalf("sent[%d].BytesSent = %d, want > 0", i, sample.BytesSent)
+		}
+	}
+	seen := map[int]bool{}
+	for index := range readCh {
+		seen[index] = true
+		if len(seen) == len(rates) {
+			break
+		}
+	}
+	for i := range rates {
+		if !seen[i] {
+			t.Fatalf("probe index %d was not observed; seen=%v", i, seen)
+		}
+	}
+}
+
 func TestExternalDirectUDPSelectRateFromProbeSamplesUsesDeliveredGoodput(t *testing.T) {
 	sent := []directUDPRateProbeSample{
 		{RateMbps: 350, BytesSent: 9_000_000, DurationMillis: 200},

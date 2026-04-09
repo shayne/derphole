@@ -1561,6 +1561,89 @@ func externalDirectUDPRateProbeRates(maxRateMbps int, totalBytes int64) []int {
 	return out
 }
 
+func externalDirectUDPRateProbePayload(index int, size int) ([]byte, error) {
+	if index < 0 {
+		return nil, fmt.Errorf("negative rate probe index %d", index)
+	}
+	if size < 20 {
+		size = 20
+	}
+	payload := make([]byte, size)
+	copy(payload[:16], externalDirectUDPRateProbeMagic[:])
+	binary.BigEndian.PutUint32(payload[16:20], uint32(index))
+	return payload, nil
+}
+
+func externalDirectUDPSendRateProbes(ctx context.Context, conn net.PacketConn, remoteAddr string, rates []int) ([]directUDPRateProbeSample, error) {
+	if len(rates) == 0 {
+		return nil, nil
+	}
+	if conn == nil {
+		return nil, errors.New("nil rate probe conn")
+	}
+	if remoteAddr == "" {
+		return nil, errors.New("empty rate probe remote addr")
+	}
+	remote, err := net.ResolveUDPAddr("udp", remoteAddr)
+	if err != nil {
+		return nil, err
+	}
+	samples := make([]directUDPRateProbeSample, len(rates))
+	payload, err := externalDirectUDPRateProbePayload(0, externalDirectUDPChunkSize)
+	if err != nil {
+		return nil, err
+	}
+	for i, rate := range rates {
+		if rate <= 0 {
+			return nil, fmt.Errorf("invalid rate probe rate %d", rate)
+		}
+		samples[i].RateMbps = rate
+		samples[i].DurationMillis = externalDirectUDPRateProbeDuration.Milliseconds()
+		tierStart := time.Now()
+		deadline := tierStart.Add(externalDirectUDPRateProbeDuration)
+		binary.BigEndian.PutUint32(payload[16:20], uint32(i))
+		var sent int64
+		for time.Now().Before(deadline) {
+			if err := ctx.Err(); err != nil {
+				return samples, err
+			}
+			n, err := conn.WriteTo(payload, remote)
+			if err != nil {
+				return samples, err
+			}
+			sent += int64(n)
+			elapsed := time.Since(tierStart)
+			target := int64(float64(rate*1000*1000)/8.0*elapsed.Seconds() + 0.5)
+			if sent <= target {
+				continue
+			}
+			sleepFor := time.Duration(float64(sent-target) * 8.0 / float64(rate*1000*1000) * float64(time.Second))
+			if sleepFor <= 0 {
+				continue
+			}
+			if err := sleepWithContext(ctx, sleepFor); err != nil {
+				return samples, err
+			}
+		}
+		samples[i].BytesSent = sent
+	}
+	return samples, nil
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func externalDirectUDPReceiveRateProbes(ctx context.Context, conns []net.PacketConn, rates []int) ([]directUDPRateProbeSample, error) {
 	if len(rates) == 0 {
 		return nil, nil
