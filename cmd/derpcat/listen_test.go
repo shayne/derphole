@@ -7,8 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -258,7 +256,7 @@ func runUpgradingExternalListenAndSend(t *testing.T) (listenerStderr string, sen
 	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
 	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
 	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
+	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
 	t.Setenv("DERPCAT_TEST_LOCAL_RELAY", "")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -276,24 +274,19 @@ func runUpgradingExternalListenAndSend(t *testing.T) (listenerStderr string, sen
 	var senderStdout bytes.Buffer
 	var senderStderrBuf lockedBuffer
 	releaseEOF := make(chan struct{})
+	payload := strings.Repeat("upgrade-me", (2<<20)/len("upgrade-me"))
 	senderDone := make(chan int, 1)
 	go func() {
-		senderDone <- runSend([]string{issuedToken}, telemetry.LevelDefault, &directGateReader{
+		senderDone <- runSend([]string{issuedToken}, telemetry.LevelVerbose, &directGateReader{
 			ctx:        ctx,
-			payload:    []byte("upgrade-me"),
+			payload:    []byte(payload),
 			releaseEOF: releaseEOF,
 		}, &senderStdout, &senderStderrBuf)
 	}()
 
 	waitForStatusPrefix(t, listenerStderrBuf, 10*time.Second, "waiting-for-claim", "connected-relay")
 	waitForStatusPrefix(t, &senderStderrBuf, 10*time.Second, "probing-direct", "connected-relay")
-
-	if err := os.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0"); err != nil {
-		t.Fatalf("Setenv(enable direct) error = %v", err)
-	}
-
-	waitForStatusPrefix(t, listenerStderrBuf, 10*time.Second, "waiting-for-claim", "connected-relay", "connected-direct")
-	waitForStatusPrefix(t, &senderStderrBuf, 10*time.Second, "probing-direct", "connected-relay", "connected-direct")
+	waitForRawLine(t, &senderStderrBuf, 10*time.Second, "udp-stream=true")
 	close(releaseEOF)
 
 	select {
@@ -305,8 +298,8 @@ func runUpgradingExternalListenAndSend(t *testing.T) (listenerStderr string, sen
 		t.Fatal("runListen() did not return after sender completed")
 	}
 
-	if got := listenerStdoutBuf.String(); got != "upgrade-me" {
-		t.Fatalf("listener stdout = %q, want %q", got, "upgrade-me")
+	if got := listenerStdoutBuf.String(); got != payload {
+		t.Fatalf("listener stdout length = %d, want %d", len(got), len(payload))
 	}
 
 	sendGrace := time.NewTimer(3 * time.Second)
@@ -347,13 +340,14 @@ type directGateReader struct {
 	ctx        context.Context
 	payload    []byte
 	releaseEOF <-chan struct{}
-	sent       bool
+	offset     int
 }
 
 func (r *directGateReader) Read(p []byte) (int, error) {
-	if !r.sent {
-		r.sent = true
-		return copy(p, r.payload), nil
+	if r.offset < len(r.payload) {
+		n := copy(p, r.payload[r.offset:])
+		r.offset += n
+		return n, nil
 	}
 	select {
 	case <-r.releaseEOF:
@@ -374,6 +368,21 @@ func waitForStatusPrefix(t *testing.T, buf outputBuffer, timeout time.Duration, 
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("statuses = %q, want prefix %v", buf.String(), want)
+}
+
+func waitForRawLine(t *testing.T, buf outputBuffer, timeout time.Duration, want string) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, line := range strings.Split(buf.String(), "\n") {
+			if strings.TrimSpace(line) == want {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("statuses = %q, want status %q", buf.String(), want)
 }
 
 func assertStatusLinesPrefix(t *testing.T, got, label string, want ...string) {
