@@ -25,8 +25,14 @@ func TestExternalDirectUDPDefaultUsesEightSectionedLanesWithFEC(t *testing.T) {
 	if got, want := externalDirectUDPParallelism, 8; got != want {
 		t.Fatalf("externalDirectUDPParallelism = %d, want %d", got, want)
 	}
-	if got, want := externalDirectUDPRateMbps, 2250; got != want {
-		t.Fatalf("externalDirectUDPRateMbps = %d, want %d", got, want)
+	if got, want := externalDirectUDPMaxRateMbps, 10_000; got != want {
+		t.Fatalf("externalDirectUDPMaxRateMbps = %d, want %d", got, want)
+	}
+	if got, want := externalDirectUDPInitialProbeFallbackMbps, 150; got != want {
+		t.Fatalf("externalDirectUDPInitialProbeFallbackMbps = %d, want %d", got, want)
+	}
+	if got, want := externalDirectUDPRateProbeMinMbps, 1; got != want {
+		t.Fatalf("externalDirectUDPRateProbeMinMbps = %d, want %d", got, want)
 	}
 	if got, want := externalDirectUDPTransportLabel, "batched"; got != want {
 		t.Fatalf("externalDirectUDPTransportLabel = %q, want %q", got, want)
@@ -609,10 +615,10 @@ func TestExternalDirectUDPRateMbpsForLanesScalesToVerifiedLaneCount(t *testing.T
 		want  int
 	}{
 		{name: "disabled", rate: 0, lanes: 4, want: 0},
-		{name: "none", rate: externalDirectUDPRateMbps, lanes: 0, want: 0},
-		{name: "one", rate: externalDirectUDPRateMbps, lanes: 1, want: 281},
-		{name: "four", rate: externalDirectUDPRateMbps, lanes: 4, want: 1124},
-		{name: "full", rate: externalDirectUDPRateMbps, lanes: externalDirectUDPParallelism, want: externalDirectUDPRateMbps},
+		{name: "none", rate: externalDirectUDPMaxRateMbps, lanes: 0, want: 0},
+		{name: "one", rate: externalDirectUDPMaxRateMbps, lanes: 1, want: 1250},
+		{name: "four", rate: externalDirectUDPMaxRateMbps, lanes: 4, want: 5000},
+		{name: "full", rate: externalDirectUDPMaxRateMbps, lanes: externalDirectUDPParallelism, want: externalDirectUDPMaxRateMbps},
 	}
 
 	for _, tt := range tests {
@@ -625,15 +631,23 @@ func TestExternalDirectUDPRateMbpsForLanesScalesToVerifiedLaneCount(t *testing.T
 }
 
 func TestExternalDirectUDPRateProbeRatesScaleUpToMax(t *testing.T) {
-	got := externalDirectUDPRateProbeRates(2250, 1<<30)
-	want := []int{150, 350, 700, 1200, 2250}
+	got := externalDirectUDPRateProbeRates(10_000, 1<<30)
+	want := []int{8, 25, 75, 150, 350, 700, 1200, 2250, 5000, 10000}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("externalDirectUDPRateProbeRates() = %v, want %v", got, want)
 	}
 }
 
+func TestExternalDirectUDPRateProbeRatesCoverSlowAndTenGigabitUnknownStreams(t *testing.T) {
+	got := externalDirectUDPRateProbeRates(10_000, -1)
+	want := []int{8, 25, 75, 150, 350, 700, 1200, 2250, 5000, 10000}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("externalDirectUDPRateProbeRates(unknown) = %v, want %v", got, want)
+	}
+}
+
 func TestExternalDirectUDPRateProbeRatesSkipSmallTransfers(t *testing.T) {
-	if got := externalDirectUDPRateProbeRates(2250, 64<<20); len(got) != 0 {
+	if got := externalDirectUDPRateProbeRates(10_000, 64<<20); len(got) != 0 {
 		t.Fatalf("externalDirectUDPRateProbeRates(small) = %v, want none", got)
 	}
 }

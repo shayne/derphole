@@ -30,35 +30,36 @@ import (
 )
 
 const (
-	externalDirectUDPTransportLabel     = "batched"
-	externalDirectUDPParallelism        = 8
-	externalDirectUDPChunkSize          = 1384 // 52-byte probe header + 16-byte GCM tag keeps UDP payload at 1452 bytes.
-	externalDirectUDPRateMbps           = 2250
-	externalDirectUDPWait               = 5 * time.Second
-	externalDirectUDPPunchWait          = 1200 * time.Millisecond
-	externalDirectUDPHandshakeWait      = 1500 * time.Millisecond
-	externalDirectUDPStartWait          = 30 * time.Second
-	externalDirectUDPAckWait            = 60 * time.Second
-	externalDirectUDPBufferSize         = 4 << 20
-	externalDirectUDPRepairPayloads     = true
-	externalDirectUDPTailReplayBytes    = 0
-	externalDirectUDPStreamReplayBytes  = 256 << 20
-	externalDirectUDPFECGroupSize       = 32
-	externalDirectUDPStreamFECGroupSize = 0
-	externalDirectUDPStripedBlast       = false
-	externalDirectUDPDiscardQueue       = 32
-	externalDirectUDPRateProbeMinBytes  = 256 << 20
-	externalDirectUDPRateProbeDuration  = 200 * time.Millisecond
-	externalDirectUDPRateProbeGrace     = 300 * time.Millisecond
-	externalDirectUDPRateProbeMinMbps   = 64
-	externalDirectUDPRateProbeHighShare = 0.79
-	externalDirectUDPRateProbeHighGain  = 1.40
-	externalDirectUDPRateProbeClean     = 0.98
-	externalRelayPrefixSkipDirectTail   = 256 << 10
-	externalRelayPrefixDERPChunkSize    = 32 << 10
-	externalRelayPrefixDERPMaxUnacked   = 512 << 10
-	externalRelayPrefixDERPSustainedMax = 64 << 10
-	externalRelayPrefixDERPStartupBytes = 4 << 20
+	externalDirectUDPTransportLabel           = "batched"
+	externalDirectUDPParallelism              = 8
+	externalDirectUDPChunkSize                = 1384 // 52-byte probe header + 16-byte GCM tag keeps UDP payload at 1452 bytes.
+	externalDirectUDPMaxRateMbps              = 10_000
+	externalDirectUDPInitialProbeFallbackMbps = 150
+	externalDirectUDPWait                     = 5 * time.Second
+	externalDirectUDPPunchWait                = 1200 * time.Millisecond
+	externalDirectUDPHandshakeWait            = 1500 * time.Millisecond
+	externalDirectUDPStartWait                = 30 * time.Second
+	externalDirectUDPAckWait                  = 60 * time.Second
+	externalDirectUDPBufferSize               = 4 << 20
+	externalDirectUDPRepairPayloads           = true
+	externalDirectUDPTailReplayBytes          = 0
+	externalDirectUDPStreamReplayBytes        = 256 << 20
+	externalDirectUDPFECGroupSize             = 32
+	externalDirectUDPStreamFECGroupSize       = 0
+	externalDirectUDPStripedBlast             = false
+	externalDirectUDPDiscardQueue             = 32
+	externalDirectUDPRateProbeMinBytes        = 256 << 20
+	externalDirectUDPRateProbeDuration        = 200 * time.Millisecond
+	externalDirectUDPRateProbeGrace           = 300 * time.Millisecond
+	externalDirectUDPRateProbeMinMbps         = 1
+	externalDirectUDPRateProbeHighShare       = 0.79
+	externalDirectUDPRateProbeHighGain        = 1.40
+	externalDirectUDPRateProbeClean           = 0.98
+	externalRelayPrefixSkipDirectTail         = 256 << 10
+	externalRelayPrefixDERPChunkSize          = 32 << 10
+	externalRelayPrefixDERPMaxUnacked         = 512 << 10
+	externalRelayPrefixDERPSustainedMax       = 64 << 10
+	externalRelayPrefixDERPStartupBytes       = 4 << 20
 )
 
 var externalDirectUDPRateProbeMagic = [16]byte{0, 'd', 'e', 'r', 'p', 'c', 'a', 't', '-', 'r', 'a', 't', 'e', '-', 'v', '1'}
@@ -244,7 +245,7 @@ func sendExternalViaDirectUDPOnly(ctx context.Context, src io.Reader, tok token.
 			}
 			streamProbeConn := probeConns[0]
 			streamRemoteAddr := remoteAddrs[0]
-			maxRateMbps := externalDirectUDPRateMbps
+			maxRateMbps := externalDirectUDPMaxRateMbps
 			activeRateMbps := maxRateMbps
 			if cfg.Emitter != nil {
 				cfg.Emitter.Debug("udp-blast=true")
@@ -1538,10 +1539,13 @@ func externalDirectUDPPairs(conns []net.PacketConn, remoteAddrs []string) ([]net
 }
 
 func externalDirectUDPRateProbeRates(maxRateMbps int, totalBytes int64) []int {
-	if maxRateMbps <= 0 || totalBytes < externalDirectUDPRateProbeMinBytes {
+	if maxRateMbps <= 0 {
 		return nil
 	}
-	bases := []int{150, 350, 700, 1200, maxRateMbps}
+	if totalBytes >= 0 && totalBytes < externalDirectUDPRateProbeMinBytes {
+		return nil
+	}
+	bases := []int{8, 25, 75, 150, 350, 700, 1200, 2250, 5000, maxRateMbps}
 	out := make([]int, 0, len(bases))
 	seen := make(map[int]bool)
 	for _, rate := range bases {
