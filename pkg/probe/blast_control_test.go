@@ -3,6 +3,7 @@ package probe
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"net"
 	"testing"
 	"time"
@@ -73,8 +74,8 @@ type queuedControlBatcher struct {
 func (b *queuedControlBatcher) Capabilities() TransportCaps { return TransportCaps{} }
 func (b *queuedControlBatcher) MaxBatch() int               { return 8 }
 
-func (b *queuedControlBatcher) WriteBatch(context.Context, net.Addr, [][]byte) (int, error) {
-	return 0, nil
+func (b *queuedControlBatcher) WriteBatch(_ context.Context, _ net.Addr, packets [][]byte) (int, error) {
+	return len(packets), nil
 }
 
 func (b *queuedControlBatcher) ReadBatch(ctx context.Context, timeout time.Duration, bufs []batchReadBuffer) (int, error) {
@@ -135,6 +136,82 @@ func TestHandleBlastSendControlEventUpdatesAdaptiveRate(t *testing.T) {
 	}
 	if got := control.RateMbps(); got <= 100 {
 		t.Fatalf("rate = %d, want increase above 100", got)
+	}
+}
+
+func TestHandleBlastSendControlEventRepairRequestBacksOffAdaptiveRate(t *testing.T) {
+	now := time.Unix(15, 0)
+	control := newBlastSendControl(525, 700, now)
+	history, err := newBlastRepairHistory([16]byte{2}, 4, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer history.Close()
+	if err := history.Record(0, []byte("abcd")); err != nil {
+		t.Fatal(err)
+	}
+	if err := history.Record(1, []byte("efgh")); err != nil {
+		t.Fatal(err)
+	}
+	history.MarkComplete(8, 2)
+	stats := TransferStats{}
+	deduper := newBlastRepairDeduper()
+	event := blastSendControlEvent{
+		typ:        PacketTypeRepairRequest,
+		payload:    make([]byte, 8),
+		receivedAt: now.Add(blastRateFeedbackInterval),
+	}
+
+	complete, repaired, err := handleBlastSendControlEvent(context.Background(), &queuedControlBatcher{}, controlTestAddr("peer"), history, &stats, deduper, control, event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if complete {
+		t.Fatal("repair request completed transfer")
+	}
+	if !repaired {
+		t.Fatal("repair request was not handled")
+	}
+	if stats.Retransmits != 1 {
+		t.Fatalf("Retransmits = %d, want 1", stats.Retransmits)
+	}
+	if got := control.RateMbps(); got != 525 {
+		t.Fatalf("RateMbps() = %d, want one small repair request to keep rate 525", got)
+	}
+	heldRate := control.RateMbps()
+
+	event.receivedAt = event.receivedAt.Add(blastRateFeedbackInterval)
+	_, _, err = handleBlastSendControlEvent(context.Background(), &queuedControlBatcher{}, controlTestAddr("peer"), history, &stats, deduper, control, event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := control.RateMbps(); got != heldRate {
+		t.Fatalf("RateMbps() after duplicate repair inside pressure interval = %d, want %d", got, heldRate)
+	}
+
+	event.receivedAt = event.receivedAt.Add(blastRateRepairPressureEvery)
+	_, _, err = handleBlastSendControlEvent(context.Background(), &queuedControlBatcher{}, controlTestAddr("peer"), history, &stats, deduper, control, event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := control.RateMbps(); got != heldRate {
+		t.Fatalf("RateMbps() after small repair request past pressure interval = %d, want %d", got, heldRate)
+	}
+	if stats.Retransmits != 3 {
+		t.Fatalf("Retransmits after small repair request past pressure interval = %d, want 3", stats.Retransmits)
+	}
+
+	binary.BigEndian.PutUint64(event.payload, 1)
+	event.receivedAt = event.receivedAt.Add(blastRateRepairPressureEvery)
+	_, _, err = handleBlastSendControlEvent(context.Background(), &queuedControlBatcher{}, controlTestAddr("peer"), history, &stats, deduper, control, event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := control.RateMbps(); got != heldRate {
+		t.Fatalf("RateMbps() after a second small repair request = %d, want %d", got, heldRate)
+	}
+	if stats.Retransmits != 4 {
+		t.Fatalf("Retransmits after a second small repair request = %d, want 4", stats.Retransmits)
 	}
 }
 

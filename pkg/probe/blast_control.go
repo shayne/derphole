@@ -117,8 +117,12 @@ func handleBlastSendControlEvent(ctx context.Context, batcher packetBatcher, pee
 		if batcher == nil || stats == nil {
 			return false, false, nil
 		}
-		if err := sendBlastRepairs(ctx, batcher, peer, history, event.payload, stats, deduper, event.receivedAt); err != nil {
+		retransmits, err := sendBlastRepairs(ctx, batcher, peer, history, event.payload, stats, deduper, event.receivedAt)
+		if err != nil {
 			return false, false, err
+		}
+		if control != nil && retransmits > 0 {
+			control.ObserveRepairPressure(event.receivedAt, retransmits)
 		}
 		return false, true, nil
 	case PacketTypeStats:

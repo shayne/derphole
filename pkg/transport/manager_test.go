@@ -631,6 +631,19 @@ func TestManagerCountsDroppedPeerDatagrams(t *testing.T) {
 	}
 }
 
+func TestManagerPeerRecvQueueBuffersHighRateBurst(t *testing.T) {
+	mgr := NewManager(ManagerConfig{})
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443}
+
+	for i := 0; i < 1024; i++ {
+		mgr.enqueuePeerDatagram(addr, []byte("payload"))
+	}
+
+	if got := mgr.DroppedPeerDatagrams(); got != 0 {
+		t.Fatalf("DroppedPeerDatagrams() = %d, want high-rate burst buffered without drops", got)
+	}
+}
+
 func TestManagerCountsRejectedDirectDatagrams(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

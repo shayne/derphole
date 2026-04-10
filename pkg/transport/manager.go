@@ -86,6 +86,8 @@ type DirectBatchConn interface {
 	SetReadDeadline(time.Time) error
 }
 
+const defaultPeerRecvQueueDepth = 4096
+
 func NewManager(cfg ManagerConfig) *Manager {
 	cfg = normalizeConfig(cfg)
 	hasRelay := cfg.RelayConn != nil || cfg.RelaySend != nil || cfg.ReceiveRelay != nil || cfg.RelayAddr != nil
@@ -94,7 +96,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		candidateSourceBase: cfg.CandidateSource,
 		state:               newPathState(cfg.Clock.Now(), hasRelay, cfg.DirectConn != nil),
 		stateNotify:         make(chan struct{}),
-		peerRecvCh:          make(chan peerPacket, 256),
+		peerRecvCh:          make(chan peerPacket, defaultPeerRecvQueueDepth),
 		peerRecvErrCh:       make(chan error, 1),
 	}
 	m.cfg.CandidateSource = m.candidateSource
