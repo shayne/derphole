@@ -11,8 +11,8 @@ type SeriesSummary struct {
 	PeakGoodputMbps     float64 `json:"peak_goodput_mbps"`
 	AverageWallTimeMS   float64 `json:"average_wall_time_ms"`
 	FirstByteCount      int     `json:"first_byte_count"`
-	AverageFirstByteMS  float64 `json:"average_first_byte_ms,omitempty"`
-	PeakFirstByteMS     int64   `json:"peak_first_byte_ms,omitempty"`
+	AverageFirstByteMS  float64 `json:"average_first_byte_ms"`
+	PeakFirstByteMS     int64   `json:"peak_first_byte_ms"`
 	HasFirstByteMetrics bool    `json:"has_first_byte_metrics"`
 }
 

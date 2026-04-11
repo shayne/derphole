@@ -1,6 +1,9 @@
 package probe
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestSummarizeRunsComputesWallPeakAverageAndFailures(t *testing.T) {
 	runs := []RunReport{
@@ -91,6 +94,40 @@ func TestSummarizeRunsCountsZeroFirstByteForSuccessfulRun(t *testing.T) {
 	}
 	if got, want := summary.AverageFirstByteMS, 0.0; !almostEqual(got, want) {
 		t.Fatalf("AverageFirstByteMS = %f, want %f", got, want)
+	}
+}
+
+func TestSeriesSummaryJSONIncludesZeroFirstByteMetrics(t *testing.T) {
+	summary := SeriesSummary{
+		RunCount:            1,
+		SuccessCount:        1,
+		FailureCount:        0,
+		FailureRate:         0,
+		AverageGoodputMbps:  1,
+		PeakGoodputMbps:     1,
+		AverageWallTimeMS:   10,
+		FirstByteCount:      1,
+		AverageFirstByteMS:  0,
+		PeakFirstByteMS:     0,
+		HasFirstByteMetrics: true,
+	}
+
+	got, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(got, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if _, ok := decoded["average_first_byte_ms"]; !ok {
+		t.Fatalf("decoded summary missing average_first_byte_ms: %#v", decoded)
+	}
+	if _, ok := decoded["peak_first_byte_ms"]; !ok {
+		t.Fatalf("decoded summary missing peak_first_byte_ms: %#v", decoded)
+	}
+	if decoded["average_first_byte_ms"] != float64(0) || decoded["peak_first_byte_ms"] != float64(0) {
+		t.Fatalf("decoded summary = %#v", decoded)
 	}
 }
 

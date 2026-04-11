@@ -5,8 +5,6 @@ import (
 	"fmt"
 )
 
-var runReportSuccessTrue = boolPtr(true)
-
 type RunReport struct {
 	Host            string        `json:"host"`
 	Mode            string        `json:"mode"`

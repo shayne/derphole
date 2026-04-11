@@ -555,7 +555,7 @@ func runForwardParallelBlastOrchestrate(runCtx context.Context, cfg OrchestrateC
 		FirstByteMS:     done.FirstByteMS,
 		LossRate:        retransmitRatio(sendStats.Retransmits, sendStats.PacketsSent),
 		Retransmits:     sendStats.Retransmits,
-		Success:         runReportSuccessTrue,
+		Success:         boolPtr(true),
 		Local:           sendStats.Transport,
 		Remote:          ready.Transport,
 	}, nil
@@ -708,7 +708,7 @@ func runReverseParallelBlastOrchestrate(runCtx context.Context, cfg OrchestrateC
 		FirstByteMS:     elapsedMS(recvStats.StartedAt, recvStats.FirstByteAt),
 		LossRate:        retransmitRatio(done.Retransmits, done.PacketsSent),
 		Retransmits:     done.Retransmits,
-		Success:         runReportSuccessTrue,
+		Success:         boolPtr(true),
 		Local:           recvStats.Transport,
 		Remote:          ready.Transport,
 	}, nil
@@ -1220,7 +1220,7 @@ func runForwardOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localC
 		FirstByteMS:     done.FirstByteMS,
 		LossRate:        retransmitRatio(sendStats.Retransmits, sendStats.PacketsSent),
 		Retransmits:     sendStats.Retransmits,
-		Success:         runReportSuccessTrue,
+		Success:         boolPtr(true),
 		Local:           sendStats.Transport,
 		Remote:          ready.Transport,
 	}
@@ -1410,7 +1410,7 @@ func runReverseOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localC
 		FirstByteMS:     elapsedMS(recvStats.StartedAt, recvStats.FirstByteAt),
 		LossRate:        retransmitRatio(done.Retransmits, done.PacketsSent),
 		Retransmits:     done.Retransmits,
-		Success:         runReportSuccessTrue,
+		Success:         boolPtr(true),
 		Local:           recvStats.Transport,
 		Remote:          ready.Transport,
 	}, nil
@@ -1534,7 +1534,7 @@ func runWireGuardOSIperfOrchestrate(runCtx context.Context, cfg OrchestrateConfi
 		PeakGoodputMbps: goodputMbps(bytesReceived, durationMS),
 		Direct:          true,
 		FirstByteMS:     elapsedMS(sendStats.StartedAt, sendStats.FirstByteAt),
-		Success:         runReportSuccessTrue,
+		Success:         boolPtr(true),
 		Local:           sendStats.Transport,
 		Remote:          ready.Transport,
 	}, nil
