@@ -6,20 +6,23 @@ import (
 )
 
 type RunReport struct {
-	Host          string        `json:"host"`
-	Mode          string        `json:"mode"`
-	Transport     string        `json:"transport,omitempty"`
-	Direction     string        `json:"direction"`
-	SizeBytes     int64         `json:"size_bytes"`
-	BytesReceived int64         `json:"bytes_received"`
-	DurationMS    int64         `json:"duration_ms"`
-	GoodputMbps   float64       `json:"goodput_mbps"`
-	Direct        bool          `json:"direct"`
-	FirstByteMS   int64         `json:"first_byte_ms"`
-	LossRate      float64       `json:"loss_rate"`
-	Retransmits   int64         `json:"retransmits"`
-	Local         TransportCaps `json:"local,omitempty"`
-	Remote        TransportCaps `json:"remote,omitempty"`
+	Host            string        `json:"host"`
+	Mode            string        `json:"mode"`
+	Transport       string        `json:"transport,omitempty"`
+	Direction       string        `json:"direction"`
+	SizeBytes       int64         `json:"size_bytes"`
+	BytesReceived   int64         `json:"bytes_received"`
+	DurationMS      int64         `json:"duration_ms"`
+	GoodputMbps     float64       `json:"goodput_mbps"`
+	PeakGoodputMbps float64       `json:"peak_goodput_mbps,omitempty"`
+	Direct          bool          `json:"direct"`
+	FirstByteMS     int64         `json:"first_byte_ms"`
+	LossRate        float64       `json:"loss_rate"`
+	Retransmits     int64         `json:"retransmits"`
+	Success         bool          `json:"success"`
+	Error           string        `json:"error,omitempty"`
+	Local           TransportCaps `json:"local,omitempty"`
+	Remote          TransportCaps `json:"remote,omitempty"`
 }
 
 func (r RunReport) JSON() ([]byte, error) {
