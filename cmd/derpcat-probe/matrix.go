@@ -207,7 +207,11 @@ func parsePromotionSummary(raw []byte) (probe.RunReport, error) {
 			out.FirstByteMS = parsed
 			haveFirstByte = true
 		case strings.HasPrefix(text, "benchmark-success="):
-			success := strings.TrimPrefix(text, "benchmark-success=") == "true"
+			value := strings.TrimPrefix(text, "benchmark-success=")
+			if value != "true" && value != "false" {
+				return probe.RunReport{}, fmt.Errorf("parse benchmark-success: invalid value %q", value)
+			}
+			success := value == "true"
 			out.Success = &success
 			haveSuccess = true
 		case strings.HasPrefix(text, "benchmark-error="):

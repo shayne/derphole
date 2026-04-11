@@ -250,10 +250,10 @@ require_direct_blast_log "listener" "${listener_log}" "udp-receive"
 sender_goodput_mbps="$(last_metric_value "${send_log}" "udp-send-goodput-mbps")"
 sender_peak_goodput_mbps="$(last_metric_value "${send_log}" "udp-send-peak-goodput-mbps")"
 sender_first_byte_ms="$(last_metric_value "${send_log}" "udp-send-session-first-byte-ms")"
+assert_no_derpcat_leaks
 end_ms="$(now_ms)"
 duration_ms="$((end_ms - start_ms))"
 duration="$((duration_ms / 1000))"
-assert_no_derpcat_leaks
 emit_benchmark_footer 1 true "" "${sender_goodput_mbps:-0}" "${sender_peak_goodput_mbps:-0}" "${sender_first_byte_ms:-0}"
 
 echo "target=${target}"
