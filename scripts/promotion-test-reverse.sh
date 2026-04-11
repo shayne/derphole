@@ -182,7 +182,7 @@ assert_no_derpcat_leaks() {
   fi
 }
 
-trap 'rc=$?; if [[ ${rc} -ne 0 ]]; then dump_failure; emit_benchmark_footer 2 false "promotion-test-reverse-exit-${rc}"; fi; cleanup; if [[ ${rc} -eq 0 ]]; then assert_no_derpcat_leaks; fi; exit ${rc}' EXIT
+trap 'rc=$?; if [[ ${rc} -ne 0 ]]; then dump_failure; emit_benchmark_footer 2 false "promotion-test-reverse-exit-${rc}"; cleanup; fi; exit ${rc}' EXIT
 
 mise run build
 mise run build-linux-amd64
@@ -219,9 +219,6 @@ fi
 duration_ms=0
 start_ms="$(now_ms)"
 remote "'${remote_bin}' --verbose send ${parallel_args_remote} '${token}' <'${payload}' >/dev/null 2>'${remote_base}.err'"
-end_ms="$(now_ms)"
-duration_ms="$((end_ms - start_ms))"
-duration="$((duration_ms / 1000))"
 
 wait "${listener_pid}"
 listener_pid=""
@@ -253,6 +250,10 @@ require_direct_blast_log "listener" "${listener_log}" "udp-receive"
 sender_goodput_mbps="$(last_metric_value "${sender_log}" "udp-send-goodput-mbps")"
 sender_peak_goodput_mbps="$(last_metric_value "${sender_log}" "udp-send-peak-goodput-mbps")"
 sender_first_byte_ms="$(last_metric_value "${sender_log}" "udp-send-session-first-byte-ms")"
+end_ms="$(now_ms)"
+duration_ms="$((end_ms - start_ms))"
+duration="$((duration_ms / 1000))"
+assert_no_derpcat_leaks
 emit_benchmark_footer 1 true "" "${sender_goodput_mbps:-0}" "${sender_peak_goodput_mbps:-0}" "${sender_first_byte_ms:-0}"
 
 echo "target=${target}"
@@ -267,3 +268,5 @@ echo "--- sender log"
 cat "${sender_log}"
 echo "--- listener log"
 cat "${listener_log}"
+cleanup
+trap - EXIT

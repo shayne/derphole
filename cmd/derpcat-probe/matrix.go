@@ -101,6 +101,9 @@ func runMatrixCmd(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
+	if matrixHasFailures(runs) {
+		return 1
+	}
 	return 0
 }
 
@@ -144,31 +147,74 @@ func runMatrix(ctx context.Context, cfg matrixConfig) ([]probe.RunReport, error)
 
 func parsePromotionSummary(raw []byte) (probe.RunReport, error) {
 	var out probe.RunReport
+	var (
+		haveHost      bool
+		haveDirection bool
+		haveSize      bool
+		haveDuration  bool
+		haveGoodput   bool
+		havePeak      bool
+		haveFirstByte bool
+		haveSuccess   bool
+	)
 	for _, line := range bytes.Split(raw, []byte{'\n'}) {
 		text := string(bytes.TrimSpace(line))
 		switch {
 		case strings.HasPrefix(text, "benchmark-host="):
 			out.Host = strings.TrimPrefix(text, "benchmark-host=")
+			haveHost = true
 		case strings.HasPrefix(text, "benchmark-direction="):
 			out.Direction = strings.TrimPrefix(text, "benchmark-direction=")
+			haveDirection = true
 		case strings.HasPrefix(text, "benchmark-size-bytes="):
-			out.SizeBytes, _ = strconv.ParseInt(strings.TrimPrefix(text, "benchmark-size-bytes="), 10, 64)
+			value := strings.TrimPrefix(text, "benchmark-size-bytes=")
+			parsed, err := strconv.ParseInt(value, 10, 64)
+			if err != nil {
+				return probe.RunReport{}, fmt.Errorf("parse benchmark-size-bytes: %w", err)
+			}
+			out.SizeBytes = parsed
+			haveSize = true
 		case strings.HasPrefix(text, "benchmark-total-duration-ms="):
-			out.DurationMS, _ = strconv.ParseInt(strings.TrimPrefix(text, "benchmark-total-duration-ms="), 10, 64)
+			value := strings.TrimPrefix(text, "benchmark-total-duration-ms=")
+			parsed, err := strconv.ParseInt(value, 10, 64)
+			if err != nil {
+				return probe.RunReport{}, fmt.Errorf("parse benchmark-total-duration-ms: %w", err)
+			}
+			out.DurationMS = parsed
+			haveDuration = true
 		case strings.HasPrefix(text, "benchmark-goodput-mbps="):
-			out.GoodputMbps, _ = strconv.ParseFloat(strings.TrimPrefix(text, "benchmark-goodput-mbps="), 64)
+			value := strings.TrimPrefix(text, "benchmark-goodput-mbps=")
+			parsed, err := strconv.ParseFloat(value, 64)
+			if err != nil {
+				return probe.RunReport{}, fmt.Errorf("parse benchmark-goodput-mbps: %w", err)
+			}
+			out.GoodputMbps = parsed
+			haveGoodput = true
 		case strings.HasPrefix(text, "benchmark-peak-goodput-mbps="):
-			out.PeakGoodputMbps, _ = strconv.ParseFloat(strings.TrimPrefix(text, "benchmark-peak-goodput-mbps="), 64)
+			value := strings.TrimPrefix(text, "benchmark-peak-goodput-mbps=")
+			parsed, err := strconv.ParseFloat(value, 64)
+			if err != nil {
+				return probe.RunReport{}, fmt.Errorf("parse benchmark-peak-goodput-mbps: %w", err)
+			}
+			out.PeakGoodputMbps = parsed
+			havePeak = true
 		case strings.HasPrefix(text, "benchmark-first-byte-ms="):
-			out.FirstByteMS, _ = strconv.ParseInt(strings.TrimPrefix(text, "benchmark-first-byte-ms="), 10, 64)
+			value := strings.TrimPrefix(text, "benchmark-first-byte-ms=")
+			parsed, err := strconv.ParseInt(value, 10, 64)
+			if err != nil {
+				return probe.RunReport{}, fmt.Errorf("parse benchmark-first-byte-ms: %w", err)
+			}
+			out.FirstByteMS = parsed
+			haveFirstByte = true
 		case strings.HasPrefix(text, "benchmark-success="):
 			success := strings.TrimPrefix(text, "benchmark-success=") == "true"
 			out.Success = &success
+			haveSuccess = true
 		case strings.HasPrefix(text, "benchmark-error="):
 			out.Error = strings.TrimPrefix(text, "benchmark-error=")
 		}
 	}
-	if out.Host == "" || out.Direction == "" {
+	if !haveHost || !haveDirection || !haveSize || !haveDuration || !haveGoodput || !havePeak || !haveFirstByte || !haveSuccess {
 		return probe.RunReport{}, fmt.Errorf("missing benchmark footer in output")
 	}
 	return out, nil
@@ -212,4 +258,16 @@ func summarizeMatrixRuns(runs []probe.RunReport) []matrixSeries {
 		return out[i].Direction < out[j].Direction
 	})
 	return out
+}
+
+func matrixHasFailures(runs []probe.RunReport) bool {
+	for _, run := range runs {
+		if run.Error != "" {
+			return true
+		}
+		if run.Success != nil && !*run.Success {
+			return true
+		}
+	}
+	return false
 }
