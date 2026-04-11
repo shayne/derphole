@@ -81,11 +81,15 @@ On the machine running the local web app or API:
 npx -y derpcat@latest share 127.0.0.1:3000
 ```
 
+`share` prints a token to stderr. Copy that token to the machine that will open the shared service.
+
 On another machine, expose that shared service locally:
 
 ```bash
 npx -y derpcat@latest open <token>
 ```
+
+`open` prints the local listening address to stderr.
 
 Bind `open` to a specific local port if you want:
 
@@ -101,7 +105,7 @@ Use the development channel for the latest commit published from `main`:
 npx -y derpcat@dev version
 ```
 
-Use `--verbose` to see state transitions like `connected-relay` and `connected-direct`:
+By default, `listen`, `send`, `share`, and `open` keep transport status quiet. `listen` and `share` still print the token you need, and `open` still prints the local listening address. Use `--verbose` to see state transitions like `connected-relay` and `connected-direct`:
 
 ```bash
 npx -y derpcat@latest --verbose listen
@@ -160,7 +164,7 @@ For `send/listen` and `share/open`, that can beat routing the same traffic throu
 
 - DERP is for rendezvous and relay fallback, not the preferred steady-state data plane.
 - Sessions can start relayed immediately, then promote in place to direct without restarting the transfer.
-- `listen/send` uses multiple direct UDP lanes, a short path-rate probe, paced sending, FEC, and targeted repair. That lets fast links run near their WAN ceiling without forcing slower links into the same send rate.
+- `listen/send` can scale from one to multiple direct UDP lanes, runs a short path-rate probe, then uses paced sending, adaptive rate control, and targeted replay/repair. That lets fast links run near their WAN ceiling without forcing slower links into the same send rate.
 - Direct UDP payload packets are AEAD-protected with a per-session key derived from the bearer secret. The packet header stays visible for sequencing and repair, while user bytes stay encrypted and authenticated.
 - `share/open` keeps QUIC stream multiplexing for service sharing, where many independent TCP streams need one claimed session.
 - Candidate discovery is front-loaded with local interface candidates and cached mappings, then refined in the background with STUN and port mapping refresh. That keeps the first byte moving quickly instead of stalling the session until every traversal probe finishes.
@@ -188,7 +192,7 @@ Simple rule: possession of the token authorizes the session, but intermediaries 
 
 ## Behavior
 
-Sessions can start on DERP relay and later promote to a direct path without restarting. Use `--verbose` to inspect path changes and NAT traversal state.
+Sessions can start on DERP relay and later promote to a direct path without restarting. In default mode, the CLI keeps transport status quiet and only prints the token or local bind address needed to use the session. Use `--verbose` to inspect path changes, NAT traversal state, and direct-path tuning details.
 
 ## Use Cases
 
