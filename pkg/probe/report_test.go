@@ -154,3 +154,29 @@ func TestRunReportJSONLegacyOmittedSuccessPreservesLegacyBehavior(t *testing.T) 
 		t.Fatalf("legacy round-tripped report did not count as successful")
 	}
 }
+
+func TestRunReportJSONOmitsEmptyTransportCaps(t *testing.T) {
+	report := RunReport{
+		Host:        "ktzlxc",
+		Mode:        "raw",
+		Direction:   "forward",
+		DurationMS:  1,
+		GoodputMbps: 1,
+	}
+
+	got, err := report.JSON()
+	if err != nil {
+		t.Fatalf("JSON() error = %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(got, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if _, ok := decoded["local"]; ok {
+		t.Fatalf("decoded unexpectedly included local: %#v", decoded)
+	}
+	if _, ok := decoded["remote"]; ok {
+		t.Fatalf("decoded unexpectedly included remote: %#v", decoded)
+	}
+}

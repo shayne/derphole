@@ -22,6 +22,12 @@ func TestSummarizeRunsComputesWallPeakAverageAndFailures(t *testing.T) {
 			Success:         boolPtr(true),
 		},
 		{
+			GoodputMbps: 75,
+			DurationMS:  12,
+			FirstByteMS: 0,
+			Success:     nil,
+		},
+		{
 			GoodputMbps:     200,
 			PeakGoodputMbps: 250,
 			DurationMS:      20,
@@ -39,25 +45,25 @@ func TestSummarizeRunsComputesWallPeakAverageAndFailures(t *testing.T) {
 
 	summary := SummarizeRuns(runs)
 
-	if summary.RunCount != 4 {
-		t.Fatalf("RunCount = %d, want 4", summary.RunCount)
+	if summary.RunCount != 5 {
+		t.Fatalf("RunCount = %d, want 5", summary.RunCount)
 	}
-	if summary.SuccessCount != 3 {
-		t.Fatalf("SuccessCount = %d, want 3", summary.SuccessCount)
+	if summary.SuccessCount != 4 {
+		t.Fatalf("SuccessCount = %d, want 4", summary.SuccessCount)
 	}
 	if summary.FailureCount != 1 {
 		t.Fatalf("FailureCount = %d, want 1", summary.FailureCount)
 	}
-	if got, want := summary.FailureRate, 0.25; !almostEqual(got, want) {
+	if got, want := summary.FailureRate, 0.2; !almostEqual(got, want) {
 		t.Fatalf("FailureRate = %f, want %f", got, want)
 	}
-	if got, want := summary.AverageGoodputMbps, (100.0+150.0+200.0+50.0)/4.0; !almostEqual(got, want) {
+	if got, want := summary.AverageGoodputMbps, (100.0+150.0+75.0+200.0+50.0)/5.0; !almostEqual(got, want) {
 		t.Fatalf("AverageGoodputMbps = %f, want %f", got, want)
 	}
 	if got, want := summary.PeakGoodputMbps, 250.0; got != want {
 		t.Fatalf("PeakGoodputMbps = %f, want %f", got, want)
 	}
-	if got, want := summary.AverageWallTimeMS, (10.0+15.0+20.0+40.0)/4.0; !almostEqual(got, want) {
+	if got, want := summary.AverageWallTimeMS, (10.0+15.0+12.0+20.0+40.0)/5.0; !almostEqual(got, want) {
 		t.Fatalf("AverageWallTimeMS = %f, want %f", got, want)
 	}
 	if summary.FirstByteCount != 3 {
@@ -94,6 +100,24 @@ func TestSummarizeRunsCountsZeroFirstByteForSuccessfulRun(t *testing.T) {
 	}
 	if got, want := summary.AverageFirstByteMS, 0.0; !almostEqual(got, want) {
 		t.Fatalf("AverageFirstByteMS = %f, want %f", got, want)
+	}
+}
+
+func TestSummarizeRunsDoesNotCountLegacyZeroFirstByteAsMeasured(t *testing.T) {
+	summary := SummarizeRuns([]RunReport{{
+		GoodputMbps: 1,
+		DurationMS:  10,
+		FirstByteMS: 0,
+	}})
+
+	if summary.SuccessCount != 1 {
+		t.Fatalf("SuccessCount = %d, want 1", summary.SuccessCount)
+	}
+	if summary.FirstByteCount != 0 {
+		t.Fatalf("FirstByteCount = %d, want 0", summary.FirstByteCount)
+	}
+	if summary.HasFirstByteMetrics {
+		t.Fatalf("HasFirstByteMetrics = true, want false")
 	}
 }
 
