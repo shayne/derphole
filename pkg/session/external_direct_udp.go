@@ -4067,8 +4067,12 @@ func externalDirectUDPStartBudget(rateCeilingMbps int) externalDirectUDPBudget {
 		budget.ReplayWindowBytes = 64 << 20
 	case rateCeilingMbps <= externalDirectUDPDataStartHighMbps:
 		budget.RateMbps = 900
+		budget.ActiveLanes = 2
+		budget.ReplayWindowBytes = 64 << 20
+	case rateCeilingMbps <= 1800:
+		budget.RateMbps = externalDirectUDPDataStartHighMbps
 		budget.ActiveLanes = 4
-		budget.ReplayWindowBytes = 96 << 20
+		budget.ReplayWindowBytes = 128 << 20
 	default:
 		budget.RateMbps = externalDirectUDPDataStartHighMbps
 		budget.ActiveLanes = externalDirectUDPParallelism

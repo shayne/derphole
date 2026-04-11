@@ -1477,7 +1477,8 @@ func TestExternalDirectUDPStartBudgetScalesDownForSlowCeilings(t *testing.T) {
 		{name: "eighty five", rateCeiling: 85, wantRateMbps: 85, wantLanes: 1, wantReplayWin: 16 << 20},
 		{name: "three hundred fifty", rateCeiling: 350, wantRateMbps: 250, wantLanes: 1, wantReplayWin: 32 << 20},
 		{name: "seven hundred", rateCeiling: 700, wantRateMbps: 525, wantLanes: 2, wantReplayWin: 64 << 20},
-		{name: "twelve hundred", rateCeiling: 1200, wantRateMbps: 900, wantLanes: 4, wantReplayWin: 96 << 20},
+		{name: "twelve hundred", rateCeiling: 1200, wantRateMbps: 900, wantLanes: 2, wantReplayWin: 64 << 20},
+		{name: "eighteen hundred", rateCeiling: 1800, wantRateMbps: 1200, wantLanes: 4, wantReplayWin: 128 << 20},
 	}
 
 	for _, tt := range tests {
