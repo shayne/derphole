@@ -824,6 +824,91 @@ func TestRunOrchestrateReverseBlastParallelUsesBlastReceiver(t *testing.T) {
 	}
 }
 
+func TestRunOrchestrateReverseBlastParallelLeavesFirstByteMeasuredNilWhenUnmeasured(t *testing.T) {
+	oldListenPacket := listenPacket
+	oldDiscoverCandidates := orchestrateDiscoverCandidates
+	oldLaunchRemoteClient := launchRemoteClient
+	oldReceiveBlastParallel := orchestrateReceiveBlastParallel
+	defer func() {
+		listenPacket = oldListenPacket
+		orchestrateDiscoverCandidates = oldDiscoverCandidates
+		launchRemoteClient = oldLaunchRemoteClient
+		orchestrateReceiveBlastParallel = oldReceiveBlastParallel
+	}()
+
+	var opened []net.PacketConn
+	listenPacket = func(network, address string) (net.PacketConn, error) {
+		conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err == nil {
+			opened = append(opened, conn)
+		}
+		return conn, err
+	}
+	defer func() {
+		for _, conn := range opened {
+			_ = conn.Close()
+		}
+	}()
+	orchestrateDiscoverCandidates = func(ctx context.Context, conn net.PacketConn) ([]net.Addr, error) {
+		return []net.Addr{conn.LocalAddr()}, nil
+	}
+	launchRemoteClient = func(ctx context.Context, runner SSHRunner, cfg ClientConfig) (*remoteServerHandle, error) {
+		if cfg.Parallel != 2 {
+			t.Fatalf("client Parallel = %d, want 2", cfg.Parallel)
+		}
+		return &remoteServerHandle{
+			stdout: io.NopCloser(strings.NewReader("READY {\"addr\":\":0\",\"candidates\":[\"203.0.113.20:50000\",\"203.0.113.20:50001\"],\"transport\":{\"kind\":\"batched\",\"requested_kind\":\"batched\"}}\nDONE {\"bytes_sent\":11,\"duration_ms\":100,\"first_byte_ms\":0}\n")),
+			stderr: io.NopCloser(strings.NewReader("")),
+			wait:   func() error { return nil },
+		}, nil
+	}
+
+	called := false
+	orchestrateReceiveBlastParallel = func(ctx context.Context, conns []net.PacketConn, dst io.Writer, cfg ReceiveConfig, expectedBytes int64) (TransferStats, error) {
+		called = true
+		if len(conns) != 2 {
+			t.Fatalf("len(conns) = %d, want 2", len(conns))
+		}
+		if !cfg.Blast || cfg.Raw {
+			t.Fatalf("receive config = %+v, want blast mode only", cfg)
+		}
+		if expectedBytes != 11 {
+			t.Fatalf("expectedBytes = %d, want 11", expectedBytes)
+		}
+		startedAt := time.Unix(0, 0)
+		return TransferStats{
+			BytesReceived: 11,
+			StartedAt:     startedAt,
+			CompletedAt:   startedAt.Add(100 * time.Millisecond),
+			Transport:     TransportCaps{Kind: "batched", RequestedKind: "batched"},
+		}, nil
+	}
+
+	report, err := RunOrchestrate(context.Background(), OrchestrateConfig{
+		Host:      "ktzlxc",
+		Mode:      "blast",
+		Transport: "batched",
+		Direction: "reverse",
+		SizeBytes: 11,
+		Parallel:  2,
+	})
+	if err != nil {
+		t.Fatalf("RunOrchestrate() error = %v", err)
+	}
+	if !called {
+		t.Fatal("blast parallel receiver was not called")
+	}
+	if report.BytesReceived != 11 || !report.Direct {
+		t.Fatalf("report = %#v", report)
+	}
+	if report.FirstByteMeasured != nil {
+		t.Fatalf("report.FirstByteMeasured = %#v, want nil", report.FirstByteMeasured)
+	}
+	if report.FirstByteMS != 0 {
+		t.Fatalf("report.FirstByteMS = %d, want 0", report.FirstByteMS)
+	}
+}
+
 func TestRunCommandIncludesCombinedOutputOnFailure(t *testing.T) {
 	scriptDir := t.TempDir()
 	scriptPath := filepath.Join(scriptDir, "fail.sh")

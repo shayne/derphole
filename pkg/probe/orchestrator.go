@@ -555,7 +555,7 @@ func runForwardParallelBlastOrchestrate(runCtx context.Context, cfg OrchestrateC
 		PeakGoodputMbps:   goodputMbps(bytesReceived, durationMS),
 		Direct:            true,
 		FirstByteMS:       done.FirstByteMS,
-		FirstByteMeasured: boolPtr(true),
+		FirstByteMeasured: firstByteMeasuredFlag(sendStats.FirstByteAt, done.FirstByteMeasured, done.FirstByteMS),
 		LossRate:          retransmitRatio(sendStats.Retransmits, sendStats.PacketsSent),
 		Retransmits:       sendStats.Retransmits,
 		Success:           boolPtr(true),
@@ -709,7 +709,7 @@ func runReverseParallelBlastOrchestrate(runCtx context.Context, cfg OrchestrateC
 		PeakGoodputMbps:   goodputMbps(bytesReceived, durationMS),
 		Direct:            true,
 		FirstByteMS:       elapsedMS(recvStats.StartedAt, recvStats.FirstByteAt),
-		FirstByteMeasured: boolPtr(true),
+		FirstByteMeasured: firstByteMeasuredFlag(recvStats.FirstByteAt, done.FirstByteMeasured, done.FirstByteMS),
 		LossRate:          retransmitRatio(done.Retransmits, done.PacketsSent),
 		Retransmits:       done.Retransmits,
 		Success:           boolPtr(true),
@@ -1236,6 +1236,19 @@ func runForwardOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localC
 	return report, nil
 }
 
+func firstByteMeasuredFlag(localFirstByteAt time.Time, remoteMeasured *bool, remoteFirstByteMS int64) *bool {
+	if !localFirstByteAt.IsZero() {
+		return boolPtr(true)
+	}
+	if remoteMeasured != nil {
+		return remoteMeasured
+	}
+	if remoteFirstByteMS > 0 {
+		return boolPtr(true)
+	}
+	return nil
+}
+
 func runReverseOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localConn net.PacketConn, localCandidates []net.Addr, runner SSHRunner) (RunReport, error) {
 	var wgPlan wireGuardPlan
 	if cfg.Mode == "wg" || cfg.Mode == "wgos" {
@@ -1414,7 +1427,7 @@ func runReverseOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localC
 		PeakGoodputMbps:   goodputMbps(bytesReceived, durationMS),
 		Direct:            true,
 		FirstByteMS:       elapsedMS(recvStats.StartedAt, recvStats.FirstByteAt),
-		FirstByteMeasured: boolPtr(true),
+		FirstByteMeasured: firstByteMeasuredFlag(recvStats.FirstByteAt, done.FirstByteMeasured, done.FirstByteMS),
 		LossRate:          retransmitRatio(done.Retransmits, done.PacketsSent),
 		Retransmits:       done.Retransmits,
 		Success:           boolPtr(true),
