@@ -137,6 +137,12 @@ type externalDirectUDPSendPlan struct {
 	receivedProbeSamples []directUDPRateProbeSample
 }
 
+type externalDirectUDPBudget struct {
+	RateMbps          int
+	ActiveLanes       int
+	ReplayWindowBytes uint64
+}
+
 type externalDirectUDPReceivePlan struct {
 	probeConns  []net.PacketConn
 	remoteAddrs []string
@@ -392,13 +398,27 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 		selectedRateMbps = externalDirectUDPSelectInitialRateMbps(maxRateMbps, sentProbeSamples, probeResult.Samples)
 		rateCeilingMbps = externalDirectUDPSelectRateCeilingMbps(maxRateMbps, selectedRateMbps, sentProbeSamples, probeResult.Samples)
 		activeRateMbps = externalDirectUDPDataStartRateMbpsForProbeSamples(selectedRateMbps, rateCeilingMbps, sentProbeSamples, probeResult.Samples)
+		startBudget := externalDirectUDPStartBudget(rateCeilingMbps)
+		if activeRateMbps <= 0 || activeRateMbps > startBudget.RateMbps {
+			activeRateMbps = startBudget.RateMbps
+		}
 		sendCfg.RateMbps = activeRateMbps
 		sendCfg.RateCeilingMbps = rateCeilingMbps
 		sendCfg.RateExplorationCeilingMbps = externalDirectUDPDataExplorationCeilingMbps(maxRateMbps, selectedRateMbps, rateCeilingMbps)
+		sendCfg.StreamReplayWindowBytes = startBudget.ReplayWindowBytes
 	}
 
-	laneRateBasisMbps := externalDirectUDPDataLaneRateBasisMbps(activeRateMbps, rateCeilingMbps, probeRates)
-	retainedLanes := externalDirectUDPRetainedLanesForRate(laneRateBasisMbps, len(probeConns), sendCfg.StripedBlast)
+	var retainedLanes int
+	if len(sentProbeSamples) > 0 || len(probeResult.Samples) > 0 {
+		startBudget := externalDirectUDPStartBudget(rateCeilingMbps)
+		retainedLanes = startBudget.ActiveLanes
+		if retainedLanes > len(probeConns) {
+			retainedLanes = len(probeConns)
+		}
+	} else {
+		laneRateBasisMbps := externalDirectUDPDataLaneRateBasisMbps(activeRateMbps, rateCeilingMbps, probeRates)
+		retainedLanes = externalDirectUDPRetainedLanesForRate(laneRateBasisMbps, len(probeConns), sendCfg.StripedBlast)
+	}
 	if retainedLanes == 0 {
 		return plan, errors.New("direct UDP established without active send lanes")
 	}
@@ -4024,6 +4044,43 @@ func externalDirectUDPDataLaneRateBasisMbps(activeRateMbps int, rateCeilingMbps 
 		}
 	}
 	return basis
+}
+
+func externalDirectUDPStartBudget(rateCeilingMbps int) externalDirectUDPBudget {
+	budget := externalDirectUDPBudget{
+		RateMbps:          externalDirectUDPRateProbeMinMbps,
+		ActiveLanes:       1,
+		ReplayWindowBytes: 16 << 20,
+	}
+	if rateCeilingMbps <= 0 {
+		return budget
+	}
+	switch {
+	case rateCeilingMbps <= 100:
+		budget.RateMbps = rateCeilingMbps
+	case rateCeilingMbps <= externalDirectUDPActiveLaneOneMaxMbps:
+		budget.RateMbps = 250
+		budget.ReplayWindowBytes = 32 << 20
+	case rateCeilingMbps <= externalDirectUDPActiveLaneTwoMaxMbps:
+		budget.RateMbps = 525
+		budget.ActiveLanes = 2
+		budget.ReplayWindowBytes = 64 << 20
+	case rateCeilingMbps <= externalDirectUDPDataStartHighMbps:
+		budget.RateMbps = 900
+		budget.ActiveLanes = 4
+		budget.ReplayWindowBytes = 96 << 20
+	default:
+		budget.RateMbps = externalDirectUDPDataStartHighMbps
+		budget.ActiveLanes = externalDirectUDPParallelism
+		budget.ReplayWindowBytes = externalDirectUDPStreamReplayBytes
+	}
+	if budget.RateMbps < externalDirectUDPRateProbeMinMbps {
+		budget.RateMbps = externalDirectUDPRateProbeMinMbps
+	}
+	if budget.RateMbps > rateCeilingMbps {
+		budget.RateMbps = rateCeilingMbps
+	}
+	return budget
 }
 
 func externalDirectUDPDataStartRateMbps(selectedRateMbps int) int {

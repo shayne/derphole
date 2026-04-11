@@ -1465,6 +1465,50 @@ func TestExternalDirectUDPDataStartRateUsesHighCeilingForSenderLimitedProbe(t *t
 	}
 }
 
+func TestExternalDirectUDPStartBudgetScalesDownForSlowCeilings(t *testing.T) {
+	tests := []struct {
+		name          string
+		rateCeiling   int
+		wantRateMbps  int
+		wantLanes     int
+		wantReplayWin uint64
+	}{
+		{name: "zero", rateCeiling: 0, wantRateMbps: externalDirectUDPRateProbeMinMbps, wantLanes: 1, wantReplayWin: 16 << 20},
+		{name: "eighty five", rateCeiling: 85, wantRateMbps: 85, wantLanes: 1, wantReplayWin: 16 << 20},
+		{name: "three hundred fifty", rateCeiling: 350, wantRateMbps: 250, wantLanes: 1, wantReplayWin: 32 << 20},
+		{name: "seven hundred", rateCeiling: 700, wantRateMbps: 525, wantLanes: 2, wantReplayWin: 64 << 20},
+		{name: "twelve hundred", rateCeiling: 1200, wantRateMbps: 900, wantLanes: 4, wantReplayWin: 96 << 20},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := externalDirectUDPStartBudget(tt.rateCeiling)
+			if got.RateMbps != tt.wantRateMbps {
+				t.Fatalf("RateMbps = %d, want %d", got.RateMbps, tt.wantRateMbps)
+			}
+			if got.ActiveLanes != tt.wantLanes {
+				t.Fatalf("ActiveLanes = %d, want %d", got.ActiveLanes, tt.wantLanes)
+			}
+			if got.ReplayWindowBytes != tt.wantReplayWin {
+				t.Fatalf("ReplayWindowBytes = %d, want %d", got.ReplayWindowBytes, tt.wantReplayWin)
+			}
+		})
+	}
+}
+
+func TestExternalDirectUDPStartBudgetPreservesHighCeilingShape(t *testing.T) {
+	got := externalDirectUDPStartBudget(2250)
+	if got.ActiveLanes != 8 {
+		t.Fatalf("ActiveLanes = %d, want 8", got.ActiveLanes)
+	}
+	if got.RateMbps < 1000 {
+		t.Fatalf("RateMbps = %d, want at least 1000", got.RateMbps)
+	}
+	if got.ReplayWindowBytes != externalDirectUDPStreamReplayBytes {
+		t.Fatalf("ReplayWindowBytes = %d, want %d", got.ReplayWindowBytes, externalDirectUDPStreamReplayBytes)
+	}
+}
+
 func TestExternalDirectUDPDataStartRateKeepsCleanSelectedTierDuringBufferedCollapse(t *testing.T) {
 	sent := []directUDPRateProbeSample{
 		{RateMbps: 8, BytesSent: 200_680, DurationMillis: 200},
