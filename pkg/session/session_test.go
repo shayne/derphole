@@ -1097,6 +1097,12 @@ func TestExternalListenSendPromotesToDirectUDPWhenBothSidesAreDirectReady(t *tes
 	if got := listenerStatus.String(); !strings.Contains(got, string(StateDirect)) || !strings.Contains(got, "udp-blast=true") || !strings.Contains(got, "udp-stream=true") || !strings.Contains(got, "udp-fec-group-size=0") || strings.Contains(got, "listener-tcp-direct") {
 		t.Fatalf("listener status = %q, want direct UDP promotion", got)
 	}
+	if got := countSessionStatus(sessionStatusLines(senderStatus.String()), StateComplete); got != 1 {
+		t.Fatalf("sender stream-complete count = %d, want 1; sender=%q", got, senderStatus.String())
+	}
+	if got := countSessionStatus(sessionStatusLines(listenerStatus.String()), StateComplete); got != 1 {
+		t.Fatalf("listener stream-complete count = %d, want 1; listener=%q", got, listenerStatus.String())
+	}
 }
 
 func TestExternalListenSendDirectUDPPromotionDoesNotEmitRelayRegression(t *testing.T) {
@@ -3186,6 +3192,16 @@ func sessionStatusLines(got string) []string {
 		}
 	}
 	return lines
+}
+
+func countSessionStatus(lines []string, want State) int {
+	count := 0
+	for _, line := range lines {
+		if line == string(want) {
+			count++
+		}
+	}
+	return count
 }
 
 type sessionTestDERPServer struct {

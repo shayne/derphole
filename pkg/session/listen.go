@@ -92,11 +92,7 @@ func deleteRelayMailbox(tok string, session *relaySession) {
 
 func Listen(ctx context.Context, cfg ListenConfig) (string, error) {
 	if cfg.UsePublicDERP {
-		tok, err := listenExternal(ctx, cfg)
-		if err == nil {
-			emitStatus(cfg.Emitter, StateComplete)
-		}
-		return tok, err
+		return listenExternal(ctx, cfg)
 	}
 
 	tok, session, err := issueLocalToken()
