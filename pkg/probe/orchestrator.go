@@ -553,8 +553,8 @@ func runForwardParallelBlastOrchestrate(runCtx context.Context, cfg OrchestrateC
 		DurationMS:        durationMS,
 		GoodputMbps:       goodputMbps(bytesReceived, durationMS),
 		Direct:            true,
-		FirstByteMS:       done.FirstByteMS,
-		FirstByteMeasured: firstByteMeasuredFlag(sendStats.FirstByteAt, done.FirstByteMeasured, done.FirstByteMS),
+		FirstByteMS:       firstByteMetrics(sendStats.StartedAt, sendStats.FirstByteAt, done.FirstByteMS, done.FirstByteMeasured).ms,
+		FirstByteMeasured: firstByteMetrics(sendStats.StartedAt, sendStats.FirstByteAt, done.FirstByteMS, done.FirstByteMeasured).measured,
 		LossRate:          retransmitRatio(sendStats.Retransmits, sendStats.PacketsSent),
 		Retransmits:       sendStats.Retransmits,
 		Success:           boolPtr(true),
@@ -706,8 +706,8 @@ func runReverseParallelBlastOrchestrate(runCtx context.Context, cfg OrchestrateC
 		DurationMS:        durationMS,
 		GoodputMbps:       goodputMbps(bytesReceived, durationMS),
 		Direct:            true,
-		FirstByteMS:       elapsedMS(recvStats.StartedAt, recvStats.FirstByteAt),
-		FirstByteMeasured: firstByteMeasuredFlag(recvStats.FirstByteAt, done.FirstByteMeasured, done.FirstByteMS),
+		FirstByteMS:       firstByteMetrics(recvStats.StartedAt, recvStats.FirstByteAt, done.FirstByteMS, done.FirstByteMeasured).ms,
+		FirstByteMeasured: firstByteMetrics(recvStats.StartedAt, recvStats.FirstByteAt, done.FirstByteMS, done.FirstByteMeasured).measured,
 		LossRate:          retransmitRatio(done.Retransmits, done.PacketsSent),
 		Retransmits:       done.Retransmits,
 		Success:           boolPtr(true),
@@ -1218,32 +1218,45 @@ func runForwardOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localC
 		DurationMS:    durationMS,
 		GoodputMbps:   goodputMbps(bytesReceived, durationMS),
 		Direct:        true,
-		FirstByteMS:   done.FirstByteMS,
+		FirstByteMS:   firstByteMetrics(sendStats.StartedAt, sendStats.FirstByteAt, done.FirstByteMS, done.FirstByteMeasured).ms,
 		LossRate:      retransmitRatio(sendStats.Retransmits, sendStats.PacketsSent),
 		Retransmits:   sendStats.Retransmits,
 		Success:       boolPtr(true),
 		Local:         sendStats.Transport,
 		Remote:        ready.Transport,
 	}
-	if done.FirstByteMeasured != nil {
-		report.FirstByteMeasured = done.FirstByteMeasured
-	} else if done.FirstByteMS > 0 {
-		report.FirstByteMeasured = boolPtr(true)
-	}
+	report.FirstByteMeasured = firstByteMetrics(sendStats.StartedAt, sendStats.FirstByteAt, done.FirstByteMS, done.FirstByteMeasured).measured
 	return report, nil
 }
 
-func firstByteMeasuredFlag(localFirstByteAt time.Time, remoteMeasured *bool, remoteFirstByteMS int64) *bool {
-	if !localFirstByteAt.IsZero() {
-		return boolPtr(true)
+type firstByteMetricsResult struct {
+	ms       int64
+	measured *bool
+}
+
+func firstByteMetrics(primaryStart, primaryFirstByteAt time.Time, fallbackFirstByteMS int64, fallbackMeasured *bool) firstByteMetricsResult {
+	if !primaryFirstByteAt.IsZero() {
+		return firstByteMetricsResult{
+			ms:       elapsedMS(primaryStart, primaryFirstByteAt),
+			measured: boolPtr(true),
+		}
 	}
-	if remoteMeasured != nil {
-		return remoteMeasured
+	if fallbackMeasured != nil {
+		if *fallbackMeasured {
+			return firstByteMetricsResult{
+				ms:       fallbackFirstByteMS,
+				measured: boolPtr(true),
+			}
+		}
+		return firstByteMetricsResult{ms: 0, measured: boolPtr(false)}
 	}
-	if remoteFirstByteMS > 0 {
-		return boolPtr(true)
+	if fallbackFirstByteMS > 0 {
+		return firstByteMetricsResult{
+			ms:       fallbackFirstByteMS,
+			measured: boolPtr(true),
+		}
 	}
-	return nil
+	return firstByteMetricsResult{}
 }
 
 func runReverseOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localConn net.PacketConn, localCandidates []net.Addr, runner SSHRunner) (RunReport, error) {
@@ -1422,8 +1435,8 @@ func runReverseOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localC
 		DurationMS:        durationMS,
 		GoodputMbps:       goodputMbps(bytesReceived, durationMS),
 		Direct:            true,
-		FirstByteMS:       elapsedMS(recvStats.StartedAt, recvStats.FirstByteAt),
-		FirstByteMeasured: firstByteMeasuredFlag(recvStats.FirstByteAt, done.FirstByteMeasured, done.FirstByteMS),
+		FirstByteMS:       firstByteMetrics(recvStats.StartedAt, recvStats.FirstByteAt, done.FirstByteMS, done.FirstByteMeasured).ms,
+		FirstByteMeasured: firstByteMetrics(recvStats.StartedAt, recvStats.FirstByteAt, done.FirstByteMS, done.FirstByteMeasured).measured,
 		LossRate:          retransmitRatio(done.Retransmits, done.PacketsSent),
 		Retransmits:       done.Retransmits,
 		Success:           boolPtr(true),

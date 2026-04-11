@@ -105,6 +105,9 @@ func TestSummarizeRunsCountsZeroFirstByteForSuccessfulRun(t *testing.T) {
 	if got, want := summary.AverageFirstByteMS, 0.0; !almostEqual(got, want) {
 		t.Fatalf("AverageFirstByteMS = %f, want %f", got, want)
 	}
+	if summary.PeakGoodputMbps != 0 {
+		t.Fatalf("PeakGoodputMbps = %f, want 0", summary.PeakGoodputMbps)
+	}
 }
 
 func TestSummarizeRunsDoesNotCountExplicitFalseFirstByteMeasuredAsMeasured(t *testing.T) {
@@ -143,6 +146,9 @@ func TestSummarizeRunsDoesNotCountUnmeasuredZeroFirstByteAsMeasured(t *testing.T
 	}
 	if summary.HasFirstByteMetrics {
 		t.Fatalf("HasFirstByteMetrics = true, want false")
+	}
+	if summary.PeakGoodputMbps != 0 {
+		t.Fatalf("PeakGoodputMbps = %f, want 0", summary.PeakGoodputMbps)
 	}
 }
 

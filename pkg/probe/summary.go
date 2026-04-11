@@ -1,7 +1,5 @@
 package probe
 
-import "math"
-
 type SeriesSummary struct {
 	RunCount            int     `json:"run_count"`
 	SuccessCount        int     `json:"success_count"`
@@ -103,10 +101,7 @@ func CompareSummaries(base, head SeriesSummary) RegressionResult {
 }
 
 func runPeakGoodput(run RunReport) float64 {
-	if run.PeakGoodputMbps > 0 {
-		return run.PeakGoodputMbps
-	}
-	return math.Max(run.GoodputMbps, 0)
+	return run.PeakGoodputMbps
 }
 
 func isRunSuccessful(run RunReport) bool {
