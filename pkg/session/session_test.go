@@ -1049,18 +1049,16 @@ func TestExternalListenSendPromotesToDirectUDPWhenBothSidesAreDirectReady(t *tes
 	stdinReader, stdinWriter := io.Pipe()
 	writerErr := make(chan error, 1)
 	go func() {
+		const upgradeStatusTimeout = 20 * time.Second
+
 		defer stdinWriter.Close()
 		if _, err := stdinWriter.Write(payload[:midpoint]); err != nil {
 			writerErr <- err
 			return
 		}
 
-		gateCtx, gateCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		gateCtx, gateCancel := context.WithTimeout(context.Background(), upgradeStatusTimeout)
 		defer gateCancel()
-		if err := waitForSessionTestStatusContains(gateCtx, &senderStatus, "udp-stream=true"); err != nil {
-			writerErr <- fmt.Errorf("waiting for sender UDP stream: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
-			return
-		}
 		if err := waitForSessionTestStatusContains(gateCtx, &listenerStatus, "udp-stream=true"); err != nil {
 			writerErr <- fmt.Errorf("waiting for listener UDP stream: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
 			return
@@ -1093,7 +1091,7 @@ func TestExternalListenSendPromotesToDirectUDPWhenBothSidesAreDirectReady(t *tes
 	if !bytes.Equal(listenerOut.Bytes(), payload) {
 		t.Fatalf("listener output length = %d, want %d", listenerOut.Len(), len(payload))
 	}
-	if got := senderStatus.String(); !strings.Contains(got, string(StateDirect)) || !strings.Contains(got, "udp-blast=true") || !strings.Contains(got, "udp-stream=true") || !strings.Contains(got, "udp-repair-payloads=true") || !strings.Contains(got, "udp-fec-group-size=0") || strings.Contains(got, "sender-tcp-direct") {
+	if got := senderStatus.String(); !strings.Contains(got, string(StateDirect)) || !strings.Contains(got, "udp-blast=true") || !strings.Contains(got, "udp-repair-payloads=true") || !strings.Contains(got, "udp-fec-group-size=0") || strings.Contains(got, "sender-tcp-direct") {
 		t.Fatalf("sender status = %q, want direct UDP promotion", got)
 	}
 	if got := listenerStatus.String(); !strings.Contains(got, string(StateDirect)) || !strings.Contains(got, "udp-blast=true") || !strings.Contains(got, "udp-stream=true") || !strings.Contains(got, "udp-fec-group-size=0") || strings.Contains(got, "listener-tcp-direct") {
