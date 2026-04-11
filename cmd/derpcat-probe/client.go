@@ -187,6 +187,17 @@ func runClient(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	done := buildClientDone(stats)
+	if err := writeMachineLine(stdout, "DONE", done); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	_ = stdout
+	return 0
+}
+
+func buildClientDone(stats probe.TransferStats) clientDone {
 	done := clientDone{
 		BytesSent:    stats.BytesSent,
 		DurationMS:   durationMS(stats.StartedAt, stats.CompletedAt),
@@ -195,16 +206,12 @@ func runClient(args []string, stdout, stderr io.Writer) int {
 		PacketsSent:  stats.PacketsSent,
 		PacketsAcked: stats.PacketsAcked,
 	}
-	if !stats.FirstByteAt.IsZero() {
+	if stats.FirstByteAt.IsZero() {
+		done.FirstByteMeasured = boolPtr(false)
+	} else {
 		done.FirstByteMeasured = boolPtr(true)
 	}
-	if err := writeMachineLine(stdout, "DONE", done); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
-	}
-
-	_ = stdout
-	return 0
+	return done
 }
 
 func sendBlastParallelClient(ctx context.Context, conns []net.PacketConn, remoteAddr string, peerCandidates []net.Addr, sizeBytes int64, cfg probe.SendConfig) (probe.TransferStats, error) {

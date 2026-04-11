@@ -227,6 +227,17 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 		}
 		punchCancel()
 	}
+	done := buildServerDone(stats)
+	if err := writeMachineLine(stdout, "DONE", done); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	_ = stdout
+	return 0
+}
+
+func buildServerDone(stats probe.TransferStats) serverDone {
 	done := serverDone{
 		BytesReceived: stats.BytesReceived,
 		DurationMS:    durationMS(stats.StartedAt, stats.CompletedAt),
@@ -235,16 +246,12 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 		PacketsSent:   stats.PacketsSent,
 		PacketsAcked:  stats.PacketsAcked,
 	}
-	if !stats.FirstByteAt.IsZero() {
+	if stats.FirstByteAt.IsZero() {
+		done.FirstByteMeasured = boolPtr(false)
+	} else {
 		done.FirstByteMeasured = boolPtr(true)
 	}
-	if err := writeMachineLine(stdout, "DONE", done); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
-	}
-
-	_ = stdout
-	return 0
+	return done
 }
 
 func openServerPacketConns(ctx context.Context, mode, listenAddr string, parallel int) ([]net.PacketConn, error) {

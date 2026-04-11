@@ -89,6 +89,51 @@ func TestClientDoneJSONRoundTripsFirstByteMeasured(t *testing.T) {
 	}
 }
 
+func TestBuildServerDoneMarksUnmeasuredFirstByteExplicitFalse(t *testing.T) {
+	done := buildServerDone(probe.TransferStats{
+		StartedAt:     time.Unix(0, 0),
+		CompletedAt:   time.Unix(1, 0),
+		BytesReceived: 10,
+	})
+	if done.FirstByteMeasured == nil || *done.FirstByteMeasured {
+		t.Fatalf("done.FirstByteMeasured = %#v, want false", done.FirstByteMeasured)
+	}
+	got, err := json.Marshal(done)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(got, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if decoded["first_byte_measured"] != false {
+		t.Fatalf("decoded first_byte_measured = %#v, want false", decoded["first_byte_measured"])
+	}
+}
+
+func TestBuildClientDoneMarksMeasuredFirstByteExplicitTrue(t *testing.T) {
+	done := buildClientDone(probe.TransferStats{
+		StartedAt:   time.Unix(0, 0),
+		FirstByteAt: time.Unix(0, 5),
+		CompletedAt: time.Unix(1, 0),
+		BytesSent:   10,
+	})
+	if done.FirstByteMeasured == nil || !*done.FirstByteMeasured {
+		t.Fatalf("done.FirstByteMeasured = %#v, want true", done.FirstByteMeasured)
+	}
+	got, err := json.Marshal(done)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(got, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if decoded["first_byte_measured"] != true {
+		t.Fatalf("decoded first_byte_measured = %#v, want true", decoded["first_byte_measured"])
+	}
+}
+
 func (w *readyNotifyWriter) Write(p []byte) (int, error) {
 	if bytes.Contains(p, []byte("READY ")) {
 		w.once.Do(func() { close(w.ch) })

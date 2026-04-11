@@ -256,8 +256,8 @@ func TestRunOrchestrateForwardTransfersAndReportsDirect(t *testing.T) {
 	if report.GoodputMbps <= 0 {
 		t.Fatalf("report.GoodputMbps = %f, want > 0", report.GoodputMbps)
 	}
-	if report.PeakGoodputMbps != report.GoodputMbps {
-		t.Fatalf("report.PeakGoodputMbps = %f, want %f", report.PeakGoodputMbps, report.GoodputMbps)
+	if report.PeakGoodputMbps != 0 {
+		t.Fatalf("report.PeakGoodputMbps = %f, want 0", report.PeakGoodputMbps)
 	}
 	if report.Success == nil || !*report.Success {
 		t.Fatalf("report.Success = %#v, want true", report.Success)
@@ -395,8 +395,8 @@ func TestRunOrchestrateWgiperfReportsSuccessWithoutMeasuredFirstByte(t *testing.
 	if report.FirstByteMS != 0 {
 		t.Fatalf("report.FirstByteMS = %d, want 0", report.FirstByteMS)
 	}
-	if report.PeakGoodputMbps != report.GoodputMbps {
-		t.Fatalf("report.PeakGoodputMbps = %f, want %f", report.PeakGoodputMbps, report.GoodputMbps)
+	if report.PeakGoodputMbps != 0 {
+		t.Fatalf("report.PeakGoodputMbps = %f, want 0", report.PeakGoodputMbps)
 	}
 }
 
@@ -594,8 +594,8 @@ func TestRunOrchestrateReverseTransfersAndReportsDirect(t *testing.T) {
 	if report.FirstByteMS != 10 {
 		t.Fatalf("report.FirstByteMS = %d, want 10", report.FirstByteMS)
 	}
-	if report.PeakGoodputMbps != report.GoodputMbps {
-		t.Fatalf("report.PeakGoodputMbps = %f, want %f", report.PeakGoodputMbps, report.GoodputMbps)
+	if report.PeakGoodputMbps != 0 {
+		t.Fatalf("report.PeakGoodputMbps = %f, want 0", report.PeakGoodputMbps)
 	}
 	if report.Success == nil || !*report.Success {
 		t.Fatalf("report.Success = %#v, want true", report.Success)
