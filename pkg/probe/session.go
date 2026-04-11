@@ -4026,11 +4026,7 @@ func ReceiveReliableParallelToWriter(ctx context.Context, conns []net.PacketConn
 	defer cancel()
 
 	startedAt := time.Now()
-	var writeMu sync.Mutex
-	receiverDst := dst
-	if dst != io.Discard {
-		receiverDst = lockedWriter{w: dst, mu: &writeMu}
-	}
+	receiverDst := newPeakTrackingWriter(dst, startedAt)
 
 	type result struct {
 		stats TransferStats
@@ -4055,7 +4051,10 @@ func ReceiveReliableParallelToWriter(ctx context.Context, conns []net.PacketConn
 	wg.Wait()
 	close(results)
 
-	out := TransferStats{StartedAt: startedAt}
+	out := TransferStats{
+		StartedAt:       startedAt,
+		PeakGoodputMbps: receiverDst.PeakMbps(),
+	}
 	for result := range results {
 		if result.err != nil {
 			return TransferStats{}, result.err
@@ -4064,7 +4063,6 @@ func ReceiveReliableParallelToWriter(ctx context.Context, conns []net.PacketConn
 		out.PacketsSent += result.stats.PacketsSent
 		out.PacketsAcked += result.stats.PacketsAcked
 		out.Retransmits += result.stats.Retransmits
-		out.PeakGoodputMbps = aggregatePeakGoodputMbps(out.PeakGoodputMbps, result.stats.PeakGoodputMbps)
 		if !result.stats.FirstByteAt.IsZero() && (out.FirstByteAt.IsZero() || result.stats.FirstByteAt.Before(out.FirstByteAt)) {
 			out.FirstByteAt = result.stats.FirstByteAt
 		}
@@ -4079,22 +4077,42 @@ func ReceiveReliableParallelToWriter(ctx context.Context, conns []net.PacketConn
 	return out, nil
 }
 
-func aggregatePeakGoodputMbps(current, next float64) float64 {
-	if next <= 0 {
-		return current
+type peakTrackingWriter struct {
+	w     io.Writer
+	mu    sync.Mutex
+	total int64
+	peak  intervalStats
+	now   func() time.Time
+}
+
+func newPeakTrackingWriter(w io.Writer, startedAt time.Time) *peakTrackingWriter {
+	if w == nil {
+		w = io.Discard
 	}
-	return current + next
+	writer := &peakTrackingWriter{w: w}
+	writer.peak.Observe(startedAt, 0)
+	writer.now = time.Now
+	return writer
 }
 
-type lockedWriter struct {
-	w  io.Writer
-	mu *sync.Mutex
-}
-
-func (w lockedWriter) Write(p []byte) (int, error) {
+func (w *peakTrackingWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.w.Write(p)
+	n, err := w.w.Write(p)
+	if n > 0 {
+		w.total += int64(n)
+		w.peak.Observe(w.now(), w.total)
+	}
+	return n, err
+}
+
+func (w *peakTrackingWriter) PeakMbps() float64 {
+	if w == nil {
+		return 0
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.peak.PeakMbps()
 }
 
 type blastReceiveRunState struct {

@@ -320,6 +320,32 @@ func TestTransferStatsCapturePeakGoodputAcrossLoopback(t *testing.T) {
 	}
 }
 
+func TestPeakTrackingWriterTracksAggregatePeak(t *testing.T) {
+	started := time.Unix(300, 0)
+	writer := newPeakTrackingWriter(io.Discard, started)
+	times := []time.Time{
+		started.Add(100 * time.Millisecond),
+		started.Add(200 * time.Millisecond),
+	}
+	writer.now = func() time.Time {
+		now := times[0]
+		times = times[1:]
+		return now
+	}
+
+	if _, err := writer.Write(bytes.Repeat([]byte("a"), 1024)); err != nil {
+		t.Fatalf("first Write() error = %v", err)
+	}
+	if _, err := writer.Write(bytes.Repeat([]byte("b"), 2048)); err != nil {
+		t.Fatalf("second Write() error = %v", err)
+	}
+
+	want := float64(2048*8) / 0.1 / 1_000_000
+	if got := writer.PeakMbps(); !almostEqual(got, want) {
+		t.Fatalf("PeakMbps() = %f, want %f", got, want)
+	}
+}
+
 func TestEffectiveWindowSizeAllowsLargerThanAckMask(t *testing.T) {
 	if got := effectiveWindowSize(4096); got != 4096 {
 		t.Fatalf("effectiveWindowSize(4096) = %d, want 4096", got)
@@ -4383,15 +4409,6 @@ func TestReceiveReliableParallelToWriterAggregatesFlows(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatalf("timed out waiting for parallel reliable receive: %v", ctx.Err())
-	}
-}
-
-func TestAggregatePeakGoodputMbpsSumsParallelLanes(t *testing.T) {
-	if got, want := aggregatePeakGoodputMbps(125.5, 250.25), 375.75; !almostEqual(got, want) {
-		t.Fatalf("aggregatePeakGoodputMbps() = %f, want %f", got, want)
-	}
-	if got, want := aggregatePeakGoodputMbps(125.5, 0), 125.5; !almostEqual(got, want) {
-		t.Fatalf("aggregatePeakGoodputMbps() = %f, want %f", got, want)
 	}
 }
 
