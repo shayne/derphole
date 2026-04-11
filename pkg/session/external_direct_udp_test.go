@@ -133,8 +133,9 @@ func TestSendExternalHandoffDERPStopUsesReceiverHandoffAckBelowReadBoundary(t *t
 
 	stopCh := make(chan struct{})
 	errCh := make(chan error, 1)
+	metrics := newExternalTransferMetrics(time.Now())
 	go func() {
-		errCh <- sendExternalHandoffDERP(ctx, senderDERP, listenerDERP.PublicKey(), spool, stopCh)
+		errCh <- sendExternalHandoffDERP(ctx, senderDERP, listenerDERP.PublicKey(), spool, stopCh, metrics)
 	}()
 
 	for dataFrames := 0; dataFrames < 2; {
@@ -193,6 +194,9 @@ func TestSendExternalHandoffDERPStopUsesReceiverHandoffAckBelowReadBoundary(t *t
 			t.Fatal("sendExternalHandoffDERP() blocked waiting for unACKed relay-prefix bytes after stop")
 		}
 	}
+	if got := metrics.RelayBytes(); got == 0 {
+		t.Fatal("relay bytes = 0, want relay-prefix progress to be tracked")
+	}
 }
 
 func TestReceiveExternalViaDirectUDPOnlyLetsPrepareConsumeReady(t *testing.T) {
@@ -216,7 +220,7 @@ func TestReceiveExternalViaDirectUDPOnlyLetsPrepareConsumeReady(t *testing.T) {
 		prepareCalled = true
 		return externalDirectUDPReceivePlan{}, nil
 	}
-	externalExecutePreparedDirectUDPReceiveFn = func(ctx context.Context, plan externalDirectUDPReceivePlan, tok token.Token, cfg ListenConfig) error {
+	externalExecutePreparedDirectUDPReceiveFn = func(ctx context.Context, plan externalDirectUDPReceivePlan, tok token.Token, cfg ListenConfig, metrics *externalTransferMetrics) error {
 		executeCalled = true
 		return nil
 	}
@@ -267,7 +271,7 @@ func TestSendExternalHandoffDERPStopBeforeRelayProgressStillStartsRelayData(t *t
 	stopCh := make(chan struct{})
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- sendExternalHandoffDERP(ctx, senderDERP, listenerDERP.PublicKey(), spool, stopCh)
+		errCh <- sendExternalHandoffDERP(ctx, senderDERP, listenerDERP.PublicKey(), spool, stopCh, nil)
 	}()
 	close(stopCh)
 
@@ -342,9 +346,10 @@ func TestReceiveExternalHandoffDERPReturnsCurrentWatermarkOnHandoffBelowBoundary
 
 	var out bytes.Buffer
 	rx := newExternalHandoffReceiver(&out, 32)
+	metrics := newExternalTransferMetrics(time.Now())
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- receiveExternalHandoffDERP(ctx, listenerDERP, senderDERP.PublicKey(), rx, relayFrames)
+		errCh <- receiveExternalHandoffDERP(ctx, listenerDERP, senderDERP.PublicKey(), rx, relayFrames, metrics)
 	}()
 
 	if err := externalRelayPrefixDERPSendChunk(ctx, senderDERP, listenerDERP.PublicKey(), externalHandoffChunk{Offset: 0, Payload: []byte("abcd")}); err != nil {
@@ -376,6 +381,9 @@ func TestReceiveExternalHandoffDERPReturnsCurrentWatermarkOnHandoffBelowBoundary
 	}
 	if got := out.String(); got != "abcd" {
 		t.Fatalf("receiver output = %q, want %q", got, "abcd")
+	}
+	if got := metrics.RelayBytes(); got != 4 {
+		t.Fatalf("relay bytes = %d, want 4", got)
 	}
 }
 
@@ -409,7 +417,7 @@ func TestSendExternalViaRelayPrefixThenDirectUDPCompletesSmallPayloadBeforeSlowD
 	receiveErrCh := make(chan error, 1)
 	go func() {
 		rx := newExternalHandoffReceiver(&out, externalHandoffMaxUnackedBytes)
-		receiveErrCh <- receiveExternalHandoffDERP(ctx, listenerDERP, senderDERP.PublicKey(), rx, relayFrames)
+		receiveErrCh <- receiveExternalHandoffDERP(ctx, listenerDERP, senderDERP.PublicKey(), rx, relayFrames, nil)
 	}()
 
 	prevWaitDirectUDPAddr := waitExternalDirectUDPAddr
@@ -431,7 +439,7 @@ func TestSendExternalViaRelayPrefixThenDirectUDPCompletesSmallPayloadBeforeSlowD
 
 	prevExecutePreparedDirectUDPSend := externalExecutePreparedDirectUDPSendFn
 	directInvoked := make(chan struct{}, 1)
-	externalExecutePreparedDirectUDPSendFn = func(ctx context.Context, src io.Reader, plan externalDirectUDPSendPlan, cfg SendConfig) error {
+	externalExecutePreparedDirectUDPSendFn = func(ctx context.Context, src io.Reader, plan externalDirectUDPSendPlan, cfg SendConfig, metrics *externalTransferMetrics) error {
 		select {
 		case directInvoked <- struct{}{}:
 		default:
@@ -440,12 +448,14 @@ func TestSendExternalViaRelayPrefixThenDirectUDPCompletesSmallPayloadBeforeSlowD
 	}
 	t.Cleanup(func() { externalExecutePreparedDirectUDPSendFn = prevExecutePreparedDirectUDPSend })
 
+	var status bytes.Buffer
 	start := time.Now()
 	err = sendExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixSendConfig{
 		src:          bytes.NewReader(payload),
 		decision:     rendezvous.Decision{Accept: &rendezvous.AcceptInfo{}},
 		derpClient:   senderDERP,
 		listenerDERP: listenerDERP.PublicKey(),
+		cfg:          SendConfig{Emitter: telemetry.New(&status, telemetry.LevelVerbose)},
 	})
 	if err != nil {
 		t.Fatalf("sendExternalViaRelayPrefixThenDirectUDP() error = %v", err)
@@ -463,6 +473,16 @@ func TestSendExternalViaRelayPrefixThenDirectUDPCompletesSmallPayloadBeforeSlowD
 	}
 	if !bytes.Equal(out.Bytes(), payload) {
 		t.Fatalf("receiver output length = %d, want %d", out.Len(), len(payload))
+	}
+	for _, needle := range []string{
+		"udp-send-wall-duration-ms=",
+		"udp-send-relay-bytes=1048576",
+		"udp-send-direct-bytes=0",
+		"udp-send-peak-goodput-mbps=0.00",
+	} {
+		if !strings.Contains(status.String(), needle) {
+			t.Fatalf("status output missing %q in %q", needle, status.String())
+		}
 	}
 }
 
@@ -546,6 +566,144 @@ func TestEmitExternalDirectUDPSendStatsIncludesReplayPressure(t *testing.T) {
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("emitted stats = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestExternalExecutePreparedDirectUDPSendEmitsSessionMetrics(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverConn.Close()
+	clientConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConn.Close()
+
+	runID := [16]byte{0x91}
+	payload := bytes.Repeat([]byte("direct-session-metrics"), 1<<16)
+
+	recvCh := make(chan error, 1)
+	go func() {
+		_, err := probe.ReceiveBlastParallelToWriter(ctx, []net.PacketConn{serverConn}, io.Discard, probe.ReceiveConfig{
+			Blast:           true,
+			Transport:       externalDirectUDPTransportLabel,
+			ExpectedRunID:   runID,
+			RequireComplete: true,
+		}, int64(len(payload)))
+		recvCh <- err
+	}()
+
+	var buf bytes.Buffer
+	emitter := telemetry.New(&buf, telemetry.LevelVerbose)
+	metrics := newExternalTransferMetrics(time.Now())
+	err = externalExecutePreparedDirectUDPSend(ctx, bytes.NewReader(payload), externalDirectUDPSendPlan{
+		probeConns:  []net.PacketConn{clientConn},
+		remoteAddrs: []string{serverConn.LocalAddr().String()},
+		sendCfg: probe.SendConfig{
+			Blast:          true,
+			Transport:      externalDirectUDPTransportLabel,
+			ChunkSize:      externalDirectUDPChunkSize,
+			RateMbps:       0,
+			RunID:          runID,
+			RepairPayloads: true,
+		},
+	}, SendConfig{Emitter: emitter}, metrics)
+	if err != nil {
+		t.Fatalf("externalExecutePreparedDirectUDPSend() error = %v", err)
+	}
+	select {
+	case recvErr := <-recvCh:
+		if recvErr != nil {
+			t.Fatalf("ReceiveBlastParallelToWriter() error = %v", recvErr)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for receive: %v", ctx.Err())
+	}
+
+	got := buf.String()
+	for _, want := range []string{
+		"udp-send-wall-duration-ms=",
+		"udp-send-session-first-byte-ms=",
+		"udp-send-relay-bytes=0",
+		"udp-send-direct-bytes=",
+		"udp-send-peak-goodput-mbps=",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("emitted metrics missing %q in %q", want, got)
+		}
+	}
+}
+
+func TestExternalExecutePreparedDirectUDPReceiveEmitsSessionMetrics(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverConn.Close()
+	clientConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConn.Close()
+
+	runID := [16]byte{0x92}
+	payload := bytes.Repeat([]byte("direct-receive-session-metrics"), 1<<16)
+
+	sendCh := make(chan error, 1)
+	go func() {
+		_, err := probe.SendBlastParallel(ctx, []net.PacketConn{clientConn}, []string{serverConn.LocalAddr().String()}, bytes.NewReader(payload), probe.SendConfig{
+			Blast:          true,
+			Transport:      externalDirectUDPTransportLabel,
+			ChunkSize:      externalDirectUDPChunkSize,
+			RateMbps:       0,
+			RunID:          runID,
+			RepairPayloads: true,
+		})
+		sendCh <- err
+	}()
+
+	var buf bytes.Buffer
+	emitter := telemetry.New(&buf, telemetry.LevelVerbose)
+	metrics := newExternalTransferMetrics(time.Now())
+	err = externalExecutePreparedDirectUDPReceive(ctx, externalDirectUDPReceivePlan{
+		probeConns:  []net.PacketConn{serverConn},
+		receiveDst:  io.Discard,
+		flushDst:    func() error { return nil },
+		receiveCfg:  externalDirectUDPFastDiscardReceiveConfig(),
+		fastDiscard: true,
+		start:       directUDPStart{ExpectedBytes: int64(len(payload))},
+	}, token.Token{SessionID: runID}, ListenConfig{Emitter: emitter}, metrics)
+	if err != nil {
+		t.Fatalf("externalExecutePreparedDirectUDPReceive() error = %v", err)
+	}
+	select {
+	case sendErr := <-sendCh:
+		if sendErr != nil {
+			t.Fatalf("SendBlastParallel() error = %v", sendErr)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for send: %v", ctx.Err())
+	}
+
+	got := buf.String()
+	for _, want := range []string{
+		"udp-receive-wall-duration-ms=",
+		"udp-receive-session-first-byte-ms=",
+		"udp-receive-relay-bytes=0",
+		"udp-receive-direct-bytes=",
+		"udp-receive-peak-goodput-mbps=",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("emitted metrics missing %q in %q", want, got)
 		}
 	}
 }
