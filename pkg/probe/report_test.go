@@ -44,21 +44,23 @@ func TestMarkdownReportIncludesCoreMetrics(t *testing.T) {
 
 func TestRunReportJSONEncodesCoreMetrics(t *testing.T) {
 	report := RunReport{
-		Host:          "ktzlxc",
-		Mode:          "raw",
-		Transport:     "batched",
-		Direction:     "forward",
-		SizeBytes:     1024,
-		BytesReceived: 1000,
-		DurationMS:    10,
-		GoodputMbps:   8.5,
-		Direct:        true,
-		FirstByteMS:   3,
-		LossRate:      0.02,
-		Retransmits:   1,
-		Success:       true,
-		Local:         TransportCaps{Kind: "legacy", RequestedKind: "batched"},
-		Remote:        TransportCaps{Kind: "batched", RequestedKind: "batched", BatchSize: 128, TXOffload: true},
+		Host:            "ktzlxc",
+		Mode:            "raw",
+		Transport:       "batched",
+		Direction:       "forward",
+		SizeBytes:       1024,
+		BytesReceived:   1000,
+		DurationMS:      10,
+		GoodputMbps:     8.5,
+		PeakGoodputMbps: 8.5,
+		Direct:          true,
+		FirstByteMS:     3,
+		LossRate:        0.02,
+		Retransmits:     1,
+		Success:         true,
+		successSet:      true,
+		Local:           TransportCaps{Kind: "legacy", RequestedKind: "batched"},
+		Remote:          TransportCaps{Kind: "batched", RequestedKind: "batched", BatchSize: 128, TXOffload: true},
 	}
 
 	got, err := report.JSON()
@@ -75,7 +77,7 @@ func TestRunReportJSONEncodesCoreMetrics(t *testing.T) {
 			t.Fatalf("JSON unexpectedly included %q: %#v", forbidden, decoded)
 		}
 	}
-	if decoded["host"] != "ktzlxc" || decoded["mode"] != "raw" || decoded["transport"] != "batched" || decoded["direct"] != true || decoded["first_byte_ms"] != float64(3) || decoded["loss_rate"] != float64(0.02) || decoded["retransmits"] != float64(1) || decoded["bytes_received"] != float64(1000) || decoded["success"] != true {
+	if decoded["host"] != "ktzlxc" || decoded["mode"] != "raw" || decoded["transport"] != "batched" || decoded["direct"] != true || decoded["first_byte_ms"] != float64(3) || decoded["loss_rate"] != float64(0.02) || decoded["retransmits"] != float64(1) || decoded["bytes_received"] != float64(1000) || decoded["success"] != true || decoded["peak_goodput_mbps"] != float64(8.5) {
 		t.Fatalf("decoded report = %#v", decoded)
 	}
 	local, ok := decoded["local"].(map[string]any)
@@ -85,5 +87,75 @@ func TestRunReportJSONEncodesCoreMetrics(t *testing.T) {
 	remote, ok := decoded["remote"].(map[string]any)
 	if !ok || remote["kind"] != "batched" || remote["batch_size"] != float64(128) || remote["tx_offload"] != true {
 		t.Fatalf("decoded remote transport = %#v", decoded["remote"])
+	}
+}
+
+func TestRunReportJSONRoundTripsExplicitFalseSuccess(t *testing.T) {
+	report := RunReport{
+		Host:        "ktzlxc",
+		Mode:        "raw",
+		Direction:   "forward",
+		DurationMS:  1,
+		GoodputMbps: 1,
+		Success:     false,
+		successSet:  true,
+	}
+
+	got, err := report.JSON()
+	if err != nil {
+		t.Fatalf("JSON() error = %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(got, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal(map) error = %v", err)
+	}
+	if decoded["success"] != false {
+		t.Fatalf("decoded success = %#v, want false", decoded["success"])
+	}
+
+	var roundTripped RunReport
+	if err := json.Unmarshal(got, &roundTripped); err != nil {
+		t.Fatalf("json.Unmarshal(RunReport) error = %v", err)
+	}
+	if roundTripped.Success {
+		t.Fatalf("roundTripped.Success = true, want false")
+	}
+	if !roundTripped.successSet {
+		t.Fatalf("roundTripped.successSet = false, want true")
+	}
+}
+
+func TestRunReportJSONLegacyOmittedSuccessPreservesLegacyBehavior(t *testing.T) {
+	report := RunReport{
+		Host:        "ktzlxc",
+		Mode:        "raw",
+		Direction:   "forward",
+		DurationMS:  1,
+		GoodputMbps: 1,
+	}
+
+	got, err := report.JSON()
+	if err != nil {
+		t.Fatalf("JSON() error = %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(got, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal(map) error = %v", err)
+	}
+	if _, ok := decoded["success"]; ok {
+		t.Fatalf("decoded unexpectedly included success: %#v", decoded)
+	}
+
+	var roundTripped RunReport
+	if err := json.Unmarshal(got, &roundTripped); err != nil {
+		t.Fatalf("json.Unmarshal(RunReport) error = %v", err)
+	}
+	if roundTripped.successSet {
+		t.Fatalf("roundTripped.successSet = true, want false")
+	}
+	if got := SummarizeRuns([]RunReport{roundTripped}); got.SuccessCount != 1 {
+		t.Fatalf("legacy round-tripped report did not count as successful")
 	}
 }
