@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"sort"
 	"strconv"
@@ -21,12 +22,15 @@ type matrixConfig struct {
 	Hosts      []string `json:"hosts"`
 	Iterations int      `json:"iterations"`
 	SizeMiB    int      `json:"size_mib"`
+	Baseline   string   `json:"baseline,omitempty"`
 }
 
 type matrixFlags struct {
 	Hosts      string `flag:"hosts" help:"Comma-separated remote hosts" default:"ktzlxc,canlxc,uklxc,orange-india.exe.xyz"`
 	Iterations int    `flag:"iterations" help:"Runs per host per direction" default:"10"`
 	SizeMiB    int    `flag:"size-mib" help:"Payload size in MiB" default:"1024"`
+	Out        string `flag:"out" help:"Write the JSON report to this path"`
+	Baseline   string `flag:"baseline" help:"Compare the current run against a prior matrix JSON report"`
 }
 
 type matrixSeries struct {
@@ -36,9 +40,16 @@ type matrixSeries struct {
 }
 
 type matrixReport struct {
-	Config    matrixConfig      `json:"config"`
-	Runs      []probe.RunReport `json:"runs"`
-	Summaries []matrixSeries    `json:"summaries"`
+	Config      matrixConfig       `json:"config"`
+	Runs        []probe.RunReport  `json:"runs"`
+	Summaries   []matrixSeries     `json:"summaries"`
+	Comparisons []matrixComparison `json:"comparisons,omitempty"`
+}
+
+type matrixComparison struct {
+	Host      string                 `json:"host"`
+	Direction string                 `json:"direction"`
+	Result    probe.RegressionResult `json:"result"`
 }
 
 var runMatrixCommand = func(ctx context.Context, script string, host string, sizeMiB int) ([]byte, error) {
@@ -67,6 +78,7 @@ func runMatrixCmd(args []string, stdout, stderr io.Writer) int {
 		Hosts:      splitMatrixHosts(parsed.Flags.Hosts),
 		Iterations: parsed.Flags.Iterations,
 		SizeMiB:    parsed.Flags.SizeMiB,
+		Baseline:   strings.TrimSpace(parsed.Flags.Baseline),
 	}
 	if len(cfg.Hosts) == 0 {
 		fmt.Fprintln(stderr, "at least one host is required")
@@ -95,13 +107,33 @@ func runMatrixCmd(args []string, stdout, stderr io.Writer) int {
 		Runs:      runs,
 		Summaries: summarizeMatrixRuns(runs),
 	}
-	enc := json.NewEncoder(stdout)
+	if cfg.Baseline != "" {
+		comparisons, err := loadMatrixBaselineComparisons(cfg.Baseline, report.Summaries)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		report.Comparisons = comparisons
+	}
+
+	var encoded bytes.Buffer
+	enc := json.NewEncoder(&encoded)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(report); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	if matrixHasFailures(runs) {
+	if parsed.Flags.Out != "" {
+		if err := os.WriteFile(parsed.Flags.Out, encoded.Bytes(), 0o644); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+	}
+	if _, err := stdout.Write(encoded.Bytes()); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if matrixHasFailures(runs) || matrixHasRegressions(report.Comparisons) {
 		return 1
 	}
 	return 0
@@ -270,6 +302,76 @@ func matrixHasFailures(runs []probe.RunReport) bool {
 			return true
 		}
 		if run.Success != nil && !*run.Success {
+			return true
+		}
+	}
+	return false
+}
+
+func loadMatrixBaselineComparisons(path string, head []matrixSeries) ([]matrixComparison, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var baseline matrixReport
+	if err := json.Unmarshal(raw, &baseline); err != nil {
+		return nil, err
+	}
+	return compareMatrixSummaries(baseline.Summaries, head), nil
+}
+
+func compareMatrixSummaries(base, head []matrixSeries) []matrixComparison {
+	baseByKey := make(map[string]matrixSeries, len(base))
+	headByKey := make(map[string]matrixSeries, len(head))
+	keys := make(map[string]struct{}, len(base)+len(head))
+	for _, series := range base {
+		key := series.Host + "\x00" + series.Direction
+		baseByKey[key] = series
+		keys[key] = struct{}{}
+	}
+	for _, series := range head {
+		key := series.Host + "\x00" + series.Direction
+		headByKey[key] = series
+		keys[key] = struct{}{}
+	}
+
+	orderedKeys := make([]string, 0, len(keys))
+	for key := range keys {
+		orderedKeys = append(orderedKeys, key)
+	}
+	sort.Strings(orderedKeys)
+
+	comparisons := make([]matrixComparison, 0, len(orderedKeys))
+	for _, key := range orderedKeys {
+		host, direction, _ := strings.Cut(key, "\x00")
+		baseSeries, haveBase := baseByKey[key]
+		headSeries, haveHead := headByKey[key]
+		comparison := matrixComparison{
+			Host:      host,
+			Direction: direction,
+		}
+		switch {
+		case haveBase && haveHead:
+			comparison.Result = probe.CompareSummaries(baseSeries.Summary, headSeries.Summary)
+		case haveBase:
+			comparison.Result = probe.RegressionResult{
+				Base:   baseSeries.Summary,
+				Reason: "missing candidate summary for host/direction",
+			}
+		default:
+			comparison.Result = probe.RegressionResult{
+				Head:   headSeries.Summary,
+				Reason: "missing baseline summary for host/direction",
+			}
+		}
+		comparisons = append(comparisons, comparison)
+	}
+	return comparisons
+}
+
+func matrixHasRegressions(comparisons []matrixComparison) bool {
+	for _, comparison := range comparisons {
+		if !comparison.Result.Comparable || comparison.Result.IsRegression {
 			return true
 		}
 	}

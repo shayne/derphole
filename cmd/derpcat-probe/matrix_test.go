@@ -3,8 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/shayne/derpcat/pkg/probe"
 )
 
 func TestParsePromotionSummaryReadsBenchmarkFooter(t *testing.T) {
@@ -138,6 +143,126 @@ func TestRunMatrixCmdReturnsNonZeroWhenAnyRunFails(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "\"error\": \"simulated failure\"") {
 		t.Fatalf("stdout missing failure report: %s", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestRunMatrixCmdWritesOutFile(t *testing.T) {
+	prev := runMatrixCommand
+	defer func() { runMatrixCommand = prev }()
+
+	runMatrixCommand = func(_ context.Context, script string, host string, sizeMiB int) ([]byte, error) {
+		direction := "forward"
+		if strings.Contains(script, "reverse") {
+			direction = "reverse"
+		}
+		return []byte(strings.Join([]string{
+			"benchmark-host=" + host,
+			"benchmark-direction=" + direction,
+			"benchmark-size-bytes=1073741824",
+			"benchmark-total-duration-ms=5000",
+			"benchmark-goodput-mbps=1700.0",
+			"benchmark-peak-goodput-mbps=2000.0",
+			"benchmark-first-byte-ms=20",
+			"benchmark-success=true",
+		}, "\n")), nil
+	}
+
+	outPath := filepath.Join(t.TempDir(), "matrix.json")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := runMatrixCmd([]string{"--hosts", "ktzlxc", "--iterations", "1", "--size-mib", "1024", "--out", outPath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("runMatrixCmd() code = %d, want 0", code)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+
+	raw, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", outPath, err)
+	}
+	var report matrixReport
+	if err := json.Unmarshal(raw, &report); err != nil {
+		t.Fatalf("json.Unmarshal(out file) error = %v", err)
+	}
+	if got, want := len(report.Runs), 2; got != want {
+		t.Fatalf("len(report.Runs) = %d, want %d", got, want)
+	}
+}
+
+func TestRunMatrixCmdReturnsNonZeroOnBaselineRegression(t *testing.T) {
+	prev := runMatrixCommand
+	defer func() { runMatrixCommand = prev }()
+
+	runMatrixCommand = func(_ context.Context, script string, host string, sizeMiB int) ([]byte, error) {
+		direction := "forward"
+		if strings.Contains(script, "reverse") {
+			direction = "reverse"
+		}
+		return []byte(strings.Join([]string{
+			"benchmark-host=" + host,
+			"benchmark-direction=" + direction,
+			"benchmark-size-bytes=1073741824",
+			"benchmark-total-duration-ms=6000",
+			"benchmark-goodput-mbps=1500.0",
+			"benchmark-peak-goodput-mbps=1600.0",
+			"benchmark-first-byte-ms=20",
+			"benchmark-success=true",
+		}, "\n")), nil
+	}
+
+	baseline := matrixReport{
+		Config: matrixConfig{
+			Hosts:      []string{"ktzlxc"},
+			Iterations: 1,
+			SizeMiB:    1024,
+		},
+		Summaries: []matrixSeries{
+			{
+				Host:      "ktzlxc",
+				Direction: "forward",
+				Summary: probe.SeriesSummary{
+					RunCount:           1,
+					SuccessCount:       1,
+					AverageGoodputMbps: 2000.0,
+					PeakGoodputMbps:    2100.0,
+					AverageWallTimeMS:  5000,
+				},
+			},
+			{
+				Host:      "ktzlxc",
+				Direction: "reverse",
+				Summary: probe.SeriesSummary{
+					RunCount:           1,
+					SuccessCount:       1,
+					AverageGoodputMbps: 2000.0,
+					PeakGoodputMbps:    2100.0,
+					AverageWallTimeMS:  5000,
+				},
+			},
+		},
+	}
+	basePath := filepath.Join(t.TempDir(), "baseline.json")
+	raw, err := json.Marshal(baseline)
+	if err != nil {
+		t.Fatalf("json.Marshal(baseline) error = %v", err)
+	}
+	if err := os.WriteFile(basePath, raw, 0o644); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", basePath, err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := runMatrixCmd([]string{"--hosts", "ktzlxc", "--iterations", "1", "--size-mib", "1024", "--baseline", basePath}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("runMatrixCmd() code = %d, want 1", code)
+	}
+	if !strings.Contains(stdout.String(), "\"goodput_regression\": true") {
+		t.Fatalf("stdout missing regression result: %s", stdout.String())
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
