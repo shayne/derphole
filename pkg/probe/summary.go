@@ -71,7 +71,7 @@ func SummarizeRuns(runs []RunReport) SeriesSummary {
 		return summary
 	}
 
-	var totalGoodput float64
+	var successfulGoodput float64
 	var totalWallTime float64
 	var peakGoodput float64
 	var firstByteTotal float64
@@ -81,11 +81,11 @@ func SummarizeRuns(runs []RunReport) SeriesSummary {
 		summary.RunCount++
 		if isRunSuccessful(run) {
 			summary.SuccessCount++
+			successfulGoodput += run.GoodputMbps
 		} else {
 			summary.FailureCount++
 		}
 
-		totalGoodput += run.GoodputMbps
 		totalWallTime += float64(run.DurationMS)
 		if runPeak := runPeakGoodput(run); runPeak > peakGoodput {
 			peakGoodput = runPeak
@@ -101,7 +101,9 @@ func SummarizeRuns(runs []RunReport) SeriesSummary {
 	}
 
 	summary.FailureRate = float64(summary.FailureCount) / float64(summary.RunCount)
-	summary.AverageGoodputMbps = totalGoodput / float64(summary.RunCount)
+	if summary.SuccessCount > 0 {
+		summary.AverageGoodputMbps = successfulGoodput / float64(summary.SuccessCount)
+	}
 	summary.PeakGoodputMbps = peakGoodput
 	summary.AverageWallTimeMS = totalWallTime / float64(summary.RunCount)
 	if summary.FirstByteCount > 0 {
@@ -119,6 +121,10 @@ func CompareSummaries(base, head SeriesSummary) RegressionResult {
 	}
 	if base.RunCount == 0 || head.RunCount == 0 {
 		result.Reason = "summaries are not comparable when either side has zero runs"
+		return result
+	}
+	if base.RunCount != head.RunCount {
+		result.Reason = "summaries are not comparable when run counts differ"
 		return result
 	}
 	result.Comparable = true

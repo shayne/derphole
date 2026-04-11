@@ -60,7 +60,7 @@ func TestSummarizeRunsComputesWallPeakAverageAndFailures(t *testing.T) {
 	if got, want := summary.FailureRate, 0.2; !almostEqual(got, want) {
 		t.Fatalf("FailureRate = %f, want %f", got, want)
 	}
-	if got, want := summary.AverageGoodputMbps, (100.0+150.0+75.0+200.0+50.0)/5.0; !almostEqual(got, want) {
+	if got, want := summary.AverageGoodputMbps, (100.0+150.0+75.0+200.0)/4.0; !almostEqual(got, want) {
 		t.Fatalf("AverageGoodputMbps = %f, want %f", got, want)
 	}
 	if got, want := summary.PeakGoodputMbps, 250.0; got != want {
@@ -98,6 +98,9 @@ func TestSummarizeRunsCountsZeroFirstByteForSuccessfulRun(t *testing.T) {
 
 	if summary.SuccessCount != 1 {
 		t.Fatalf("SuccessCount = %d, want 1", summary.SuccessCount)
+	}
+	if got, want := summary.AverageGoodputMbps, 1.0; !almostEqual(got, want) {
+		t.Fatalf("AverageGoodputMbps = %f, want %f", got, want)
 	}
 	if summary.FirstByteCount != 1 {
 		t.Fatalf("FirstByteCount = %d, want 1", summary.FirstByteCount)
@@ -318,6 +321,23 @@ func TestCompareSummariesRejectsWallTimeAndFailureRegression(t *testing.T) {
 	}
 	if len(result.Reasons) != 2 {
 		t.Fatalf("Reasons = %#v, want 2 entries", result.Reasons)
+	}
+}
+
+func TestCompareSummariesRejectsMismatchedRunCounts(t *testing.T) {
+	base := SeriesSummary{RunCount: 10, AverageWallTimeMS: 100, FailureRate: 0.1}
+	head := SeriesSummary{RunCount: 8, AverageWallTimeMS: 110, FailureRate: 0.2}
+
+	result := CompareSummaries(base, head)
+
+	if result.Comparable {
+		t.Fatalf("Comparable = true, want false")
+	}
+	if result.Reason == "" {
+		t.Fatalf("Reason = empty, want mismatch explanation")
+	}
+	if result.IsRegression {
+		t.Fatalf("IsRegression = true, want false")
 	}
 }
 
