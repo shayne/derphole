@@ -16,7 +16,7 @@ import (
 	"github.com/shayne/yargs"
 )
 
-const defaultMatrixHosts = "ktzlxc,canlxc,uklxc,orange-india.exe.xyz"
+const defaultMatrixHosts = "ktzlxc,canlxc,uklxc,orange-india.exe.xyz,eric@eric-nuc"
 
 type matrixConfig struct {
 	Hosts      []string `json:"hosts"`
@@ -26,7 +26,7 @@ type matrixConfig struct {
 }
 
 type matrixFlags struct {
-	Hosts      string `flag:"hosts" help:"Comma-separated remote hosts" default:"ktzlxc,canlxc,uklxc,orange-india.exe.xyz"`
+	Hosts      string `flag:"hosts" help:"Comma-separated remote hosts" default:"ktzlxc,canlxc,uklxc,orange-india.exe.xyz,eric@eric-nuc"`
 	Iterations int    `flag:"iterations" help:"Runs per host per direction" default:"10"`
 	SizeMiB    int    `flag:"size-mib" help:"Payload size in MiB" default:"1024"`
 	Out        string `flag:"out" help:"Write the JSON report to this path"`

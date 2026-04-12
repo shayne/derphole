@@ -71,6 +71,9 @@ The matrix runner covers:
 - `canlxc`
 - `uklxc`
 - `orange-india.exe.xyz`
+- `eric@eric-nuc`
+
+`eric@eric-nuc` is the asymmetric long-haul residential host in the standard matrix. As of April 12, 2026, a fresh Ookla run from that machine measured about `409.8 Mbps` download and `33.0 Mbps` upload, so reverse and forward expectations should be judged against that ceiling instead of the `ktzlxc` class hosts.
 
 Keep the raw probe comparison separate from the derpcat baseline runs. The baseline commands should continue to use the no-Tailscale guardrail, for example:
 
@@ -78,6 +81,7 @@ Keep the raw probe comparison separate from the derpcat baseline runs. The basel
 - `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh canlxc 1024`
 - `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh uklxc 1024`
 - `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh orange-india.exe.xyz 1024`
+- `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh eric@eric-nuc 1024`
 
 The reverse probe harness is only valid when the remote host can actually SSH to the peer host and user you supply. Do not rely on the local hostname unless that name is resolvable and reachable from the remote side.
 
