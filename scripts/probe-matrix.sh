@@ -12,7 +12,7 @@ if [[ -z "${probe_transport}" ]]; then
   fi
 fi
 
-for host in ktzlxc canlxc uklxc orange-india.exe.xyz eric@eric-nuc; do
+for host in ktzlxc canlxc uklxc november-oscar.exe.xyz eric@eric-nuc; do
   for size_bytes in "${size_bytes_values[@]}"; do
     DERPCAT_PROBE_MODE="${probe_mode}" DERPCAT_PROBE_TRANSPORT="${probe_transport}" ./scripts/probe-benchmark.sh "${host}" "${size_bytes}"
   done

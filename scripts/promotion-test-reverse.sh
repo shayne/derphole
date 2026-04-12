@@ -9,8 +9,13 @@ start_ms=0
 duration_ms=0
 remote_base="/tmp/derpcat-promotion-reverse-$$"
 remote_upload="/tmp/derpcat-promotion-reverse-bin-$$"
-remote_user="${DERPCAT_REMOTE_USER:-root}"
-remote_bin_dir="${DERPCAT_REMOTE_BIN_DIR:-/usr/local/bin}"
+remote_target="${target}"
+if [[ "${target}" != *"@"* ]]; then
+  remote_user="${DERPCAT_REMOTE_USER:-root}"
+  remote_target="${remote_user}@${target}"
+fi
+requested_remote_bin_dir="${DERPCAT_REMOTE_BIN_DIR:-/usr/local/bin}"
+remote_bin_dir="${requested_remote_bin_dir}"
 remote_bin="${remote_bin_dir%/}/derpcat"
 remote_env=()
 
@@ -39,8 +44,16 @@ if [[ -n "${DERPCAT_PARALLEL_ARGS:-}" ]]; then
 fi
 parallel_args_remote="${parallel_args[*]-}"
 remote() {
-  ssh "${remote_user}@${target}" "${remote_env[@]}" 'bash -se' <<<"$1"
+  ssh "${remote_target}" "${remote_env[@]}" 'bash -se' <<<"$1"
 }
+
+remote_home="$(remote 'printf %s "$HOME"')"
+fallback_remote_bin_dirs=(
+  "${remote_home}/.local/share/derpcat-bench/bin"
+  "${remote_home}/.cache/derpcat-bench/bin"
+  "/var/tmp/derpcat-bench-bin"
+  "/tmp/derpcat-bench-bin"
+)
 
 install_remote_bin() {
   local desired_dir="$1"
@@ -54,6 +67,15 @@ now_ms() {
     return 0
   fi
   perl -MTime::HiRes=time -e 'print int(time() * 1000), "\n"'
+}
+
+wall_goodput_mbps() {
+  python3 - <<'PY' "$1" "$2"
+import sys
+size = int(sys.argv[1])
+duration_ms = max(int(sys.argv[2]), 1)
+print(f"{(size * 8.0) / (duration_ms * 1000.0):.2f}")
+PY
 }
 
 last_metric_value() {
@@ -72,6 +94,7 @@ emit_benchmark_footer() {
 
   {
     echo "benchmark-host=${target}"
+    echo "benchmark-tool=derpcat"
     echo "benchmark-direction=reverse"
     echo "benchmark-size-bytes=${expected_size}"
     echo "benchmark-total-duration-ms=${duration_ms:-0}"
@@ -116,6 +139,19 @@ dump_failure() {
   wc -c <"${tmp}/listen.out" >&2 || true
 }
 
+preserve_logs() {
+  local log_dir="${DERPCAT_BENCH_LOG_DIR:-}"
+  if [[ -z "${log_dir}" ]]; then
+    return 0
+  fi
+  mkdir -p "${log_dir}"
+  local stamp
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  local prefix="derpcat-reverse-${target//[^A-Za-z0-9_.-]/_}-${size_mib}MiB-${stamp}"
+  cp "${sender_log}" "${log_dir}/${prefix}-sender.log"
+  cp "${listener_log}" "${log_dir}/${prefix}-receiver.log"
+}
+
 path_trace() {
   local file="$1"
   grep -Eo 'connected-(relay|direct)' "${file}" 2>/dev/null || true
@@ -157,7 +193,7 @@ require_direct_blast_log() {
 }
 
 cleanup() {
-  remote "rm -f '${remote_base}.payload' '${remote_base}.err' '${remote_upload}'; if [[ '${remote_bin_dir}' == /tmp* ]]; then rm -f '${remote_bin}'; fi" >/dev/null 2>&1 || true
+  remote "rm -f '${remote_base}.payload' '${remote_base}.err' '${remote_upload}'; if [[ '${remote_bin_dir}' != '${requested_remote_bin_dir}' ]]; then rm -f '${remote_bin}'; fi" >/dev/null 2>&1 || true
   rm -rf "${tmp}"
 }
 
@@ -194,15 +230,25 @@ trap 'rc=$?; if [[ ${rc} -ne 0 ]]; then if [[ ${start_ms} -gt 0 && ${duration_ms
 
 mise run build
 mise run build-linux-amd64
-scp dist/derpcat-linux-amd64 "${remote_user}@${target}:${remote_upload}" >/dev/null
+scp dist/derpcat-linux-amd64 "${remote_target}:${remote_upload}" >/dev/null
 if ! install_remote_bin "${remote_bin_dir}"; then
   if [[ -n "${DERPCAT_REMOTE_BIN_DIR:-}" ]]; then
     exit 1
   fi
-  remote_bin_dir="/tmp/derpcat-bench-bin"
-  remote_bin="${remote_bin_dir}/derpcat"
-  scp dist/derpcat-linux-amd64 "${remote_user}@${target}:${remote_upload}" >/dev/null
-  install_remote_bin "${remote_bin_dir}"
+  installed_fallback=0
+  for fallback_dir in "${fallback_remote_bin_dirs[@]}"; do
+    remote_bin_dir="${fallback_dir}"
+    remote_bin="${remote_bin_dir}/derpcat"
+    scp dist/derpcat-linux-amd64 "${remote_target}:${remote_upload}" >/dev/null
+    if install_remote_bin "${remote_bin_dir}"; then
+      installed_fallback=1
+      break
+    fi
+  done
+  if [[ "${installed_fallback}" != "1" ]]; then
+    echo "failed to install remote benchmark binary in any writable exec-capable directory" >&2
+    exit 1
+  fi
 fi
 
 payload="${remote_base}.payload"
@@ -269,6 +315,9 @@ assert_no_derpcat_leaks
 end_ms="$(now_ms)"
 duration_ms="$((end_ms - start_ms))"
 duration="$((duration_ms / 1000))"
+wall_goodput="$(wall_goodput_mbps "${expected_size}" "${duration_ms}")"
+echo "benchmark-wall-goodput-mbps=${wall_goodput}"
+preserve_logs
 emit_benchmark_footer 1 true "" "${sender_goodput_mbps:-0}" "${sender_peak_goodput_mbps:-0}" "${sender_first_byte_ms:-0}"
 
 echo "target=${target}"

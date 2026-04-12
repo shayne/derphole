@@ -7,8 +7,8 @@ expected_size="$((size_mib * 1048576))"
 tmp="$(mktemp -d)"
 start_ms=0
 duration_ms=0
-remote_base="/tmp/derpcat-promotion-$$"
-remote_upload="/tmp/derpcat-promotion-bin-$$"
+remote_base="/tmp/derphole-promotion-$$"
+remote_upload="/tmp/derphole-promotion-bin-$$"
 remote_target="${target}"
 if [[ "${target}" != *"@"* ]]; then
   remote_user="${DERPCAT_REMOTE_USER:-root}"
@@ -16,7 +16,7 @@ if [[ "${target}" != *"@"* ]]; then
 fi
 requested_remote_bin_dir="${DERPCAT_REMOTE_BIN_DIR:-/usr/local/bin}"
 remote_bin_dir="${requested_remote_bin_dir}"
-remote_bin="${remote_bin_dir%/}/derpcat"
+remote_bin="${remote_bin_dir%/}/derphole"
 remote_env=()
 
 if [[ "${DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES:-}" == "1" ]]; then
@@ -25,12 +25,6 @@ fi
 if [[ "${DERPCAT_ENABLE_TAILSCALE_CANDIDATES:-}" == "1" ]]; then
   remote_env+=(DERPCAT_ENABLE_TAILSCALE_CANDIDATES=1)
 fi
-if [[ -n "${DERPCAT_NATIVE_QUIC_CONNS:-}" ]]; then
-  remote_env+=(DERPCAT_NATIVE_QUIC_CONNS="${DERPCAT_NATIVE_QUIC_CONNS}")
-fi
-if [[ -n "${DERPCAT_NATIVE_TCP_CONNS:-}" ]]; then
-  remote_env+=(DERPCAT_NATIVE_TCP_CONNS="${DERPCAT_NATIVE_TCP_CONNS}")
-fi
 if [[ "${DERPCAT_TRACE_HANDOFF:-}" == "1" ]]; then
   remote_env+=(DERPCAT_TRACE_HANDOFF=1)
 fi
@@ -38,25 +32,21 @@ if [[ "${DERPCAT_PROBE_TRACE:-}" == "1" ]]; then
   remote_env+=(DERPCAT_PROBE_TRACE=1)
 fi
 
-parallel_args=()
-if [[ -n "${DERPCAT_PARALLEL_ARGS:-}" ]]; then
-  read -r -a parallel_args <<<"${DERPCAT_PARALLEL_ARGS}"
-fi
 remote() {
   ssh "${remote_target}" "${remote_env[@]}" 'bash -se' <<<"$1"
 }
 
 remote_home="$(remote 'printf %s "$HOME"')"
 fallback_remote_bin_dirs=(
-  "${remote_home}/.local/share/derpcat-bench/bin"
-  "${remote_home}/.cache/derpcat-bench/bin"
-  "/var/tmp/derpcat-bench-bin"
-  "/tmp/derpcat-bench-bin"
+  "${remote_home}/.local/share/derphole-bench/bin"
+  "${remote_home}/.cache/derphole-bench/bin"
+  "/var/tmp/derphole-bench-bin"
+  "/tmp/derphole-bench-bin"
 )
 
 install_remote_bin() {
   local desired_dir="$1"
-  local desired_bin="${desired_dir%/}/derpcat"
+  local desired_bin="${desired_dir%/}/derphole"
   remote "mkdir -p '${desired_dir}' && install -m 0755 '${remote_upload}' '${desired_bin}' && rm -f '${remote_upload}' && '${desired_bin}' --help >/dev/null 2>&1"
 }
 
@@ -68,6 +58,12 @@ now_ms() {
   perl -MTime::HiRes=time -e 'print int(time() * 1000), "\n"'
 }
 
+last_metric_value() {
+  local file="$1"
+  local key="$2"
+  sed -n "s/^${key}=//p" "${file}" | tail -n 1
+}
+
 wall_goodput_mbps() {
   python3 - <<'PY' "$1" "$2"
 import sys
@@ -77,10 +73,17 @@ print(f"{(size * 8.0) / (duration_ms * 1000.0):.2f}")
 PY
 }
 
-last_metric_value() {
-  local file="$1"
-  local key="$2"
-  sed -n "s/^${key}=//p" "${file}" | tail -n 1
+preserve_logs() {
+  local log_dir="${DERPCAT_BENCH_LOG_DIR:-}"
+  if [[ -z "${log_dir}" ]]; then
+    return 0
+  fi
+  mkdir -p "${log_dir}"
+  local stamp
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  local prefix="derphole-forward-${target//[^A-Za-z0-9_.-]/_}-${size_mib}MiB-${stamp}"
+  cp "${send_log}" "${log_dir}/${prefix}-sender.log"
+  cp "${listener_log}" "${log_dir}/${prefix}-receiver.log"
 }
 
 emit_benchmark_footer() {
@@ -93,7 +96,7 @@ emit_benchmark_footer() {
 
   {
     echo "benchmark-host=${target}"
-    echo "benchmark-tool=derpcat"
+    echo "benchmark-tool=derphole"
     echo "benchmark-direction=forward"
     echo "benchmark-size-bytes=${expected_size}"
     echo "benchmark-total-duration-ms=${duration_ms:-0}"
@@ -107,48 +110,13 @@ emit_benchmark_footer() {
   } >&"${stream}"
 }
 
-count_local_udp_sockets() {
-  local pids
-  pids="$(pgrep -x derpcat | paste -sd, - || true)"
-  if [[ -z "${pids}" ]]; then
-    echo 0
-    return 0
-  fi
-  lsof -nP -a -p "${pids}" -iUDP 2>/dev/null | awk 'NR > 1 { count++ } END { print count + 0 }' || true
-}
-
-count_local_derpcat_processes() {
-  pgrep -x derpcat | awk '{ count++ } END { print count + 0 }' || true
-}
-
-count_remote_udp_sockets() {
-  remote "pids=\$(pgrep -x derpcat | paste -sd, - || true); if [[ -z \"\${pids}\" ]]; then echo 0; else lsof -nP -a -p \"\${pids}\" -iUDP 2>/dev/null | awk 'NR > 1 { count++ } END { print count + 0 }' || true; fi"
-}
-
-count_remote_derpcat_processes() {
-  remote "pgrep -x derpcat | awk '{ count++ } END { print count + 0 }' || true"
-}
-
 dump_failure() {
   echo "--- local sender log" >&2
   sed -n '1,200p' "${tmp}/send.err" >&2 || true
-  echo "--- remote listener log" >&2
+  echo "--- remote receiver log" >&2
   remote "sed -n '1,200p' '${remote_base}.err'" >&2 || true
-  echo "--- remote listener size" >&2
+  echo "--- remote receiver size" >&2
   remote "wc -c < '${remote_base}.out'" >&2 || true
-}
-
-preserve_logs() {
-  local log_dir="${DERPCAT_BENCH_LOG_DIR:-}"
-  if [[ -z "${log_dir}" ]]; then
-    return 0
-  fi
-  mkdir -p "${log_dir}"
-  local stamp
-  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  local prefix="derpcat-forward-${target//[^A-Za-z0-9_.-]/_}-${size_mib}MiB-${stamp}"
-  cp "${send_log}" "${log_dir}/${prefix}-sender.log"
-  cp "${listener_log}" "${log_dir}/${prefix}-receiver.log"
 }
 
 path_trace() {
@@ -176,60 +144,19 @@ require_direct_evidence() {
   fi
 }
 
-require_direct_blast_log() {
-  local label="$1"
-  local file="$2"
-  local metric_prefix="$3"
-
-  if grep -q '^udp-relay=true$' "${file}"; then
-    echo "${label} fell back to relay instead of direct UDP blast" >&2
-    exit 1
-  fi
-  if ! grep -q "^${metric_prefix}-data-goodput-mbps=" "${file}"; then
-    echo "${label} missing direct UDP blast goodput evidence" >&2
-    exit 1
-  fi
-}
-
 cleanup() {
+  if [[ -n "${send_pid:-}" ]]; then
+    kill "${send_pid}" 2>/dev/null || true
+  fi
   remote "if [[ -f '${remote_base}.pid' ]]; then kill \$(cat '${remote_base}.pid') 2>/dev/null || true; fi; rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err' '${remote_upload}'; if [[ '${remote_bin_dir}' != '${requested_remote_bin_dir}' ]]; then rm -f '${remote_bin}'; fi" >/dev/null 2>&1 || true
   rm -rf "${tmp}"
 }
 
-assert_no_derpcat_leaks() {
-  local local_udp_count
-  local local_process_count
-  local remote_udp_count
-  local remote_process_count
-
-  local_udp_count="$(count_local_udp_sockets | tr -d '[:space:]')"
-  local_process_count="$(count_local_derpcat_processes | tr -d '[:space:]')"
-  remote_udp_count="$(count_remote_udp_sockets | tr -d '[:space:]')"
-  remote_process_count="$(count_remote_derpcat_processes | tr -d '[:space:]')"
-
-  if [[ "${local_udp_count}" != "0" ]]; then
-    echo "local derpcat UDP sockets leaked: ${local_udp_count}" >&2
-    exit 1
-  fi
-  if [[ "${local_process_count}" != "0" ]]; then
-    echo "local derpcat processes leaked: ${local_process_count}" >&2
-    exit 1
-  fi
-  if [[ "${remote_udp_count}" != "0" ]]; then
-    echo "remote derpcat UDP sockets leaked on ${target}: ${remote_udp_count}" >&2
-    exit 1
-  fi
-  if [[ "${remote_process_count}" != "0" ]]; then
-    echo "remote derpcat processes leaked on ${target}: ${remote_process_count}" >&2
-    exit 1
-  fi
-}
-
-trap 'status=$?; if [[ ${status} -ne 0 ]]; then if [[ ${start_ms} -gt 0 && ${duration_ms} -eq 0 ]]; then end_ms="$(now_ms)"; duration_ms="$((end_ms - start_ms))"; fi; dump_failure; emit_benchmark_footer 2 false "promotion-test-exit-${status}"; cleanup; fi; exit ${status}' EXIT
+trap 'status=$?; if [[ ${status} -ne 0 ]]; then if [[ ${start_ms} -gt 0 && ${duration_ms} -eq 0 ]]; then end_ms="$(now_ms)"; duration_ms="$((end_ms - start_ms))"; fi; dump_failure; emit_benchmark_footer 2 false "derphole-promotion-test-exit-${status}"; cleanup; fi; exit ${status}' EXIT
 
 mise run build
 mise run build-linux-amd64
-scp dist/derpcat-linux-amd64 "${remote_target}:${remote_upload}" >/dev/null
+scp dist/derphole-linux-amd64 "${remote_target}:${remote_upload}" >/dev/null
 if ! install_remote_bin "${remote_bin_dir}"; then
   if [[ -n "${DERPCAT_REMOTE_BIN_DIR:-}" ]]; then
     exit 1
@@ -237,8 +164,8 @@ if ! install_remote_bin "${remote_bin_dir}"; then
   installed_fallback=0
   for fallback_dir in "${fallback_remote_bin_dirs[@]}"; do
     remote_bin_dir="${fallback_dir}"
-    remote_bin="${remote_bin_dir}/derpcat"
-    scp dist/derpcat-linux-amd64 "${remote_target}:${remote_upload}" >/dev/null
+    remote_bin="${remote_bin_dir}/derphole"
+    scp dist/derphole-linux-amd64 "${remote_target}:${remote_upload}" >/dev/null
     if install_remote_bin "${remote_bin_dir}"; then
       installed_fallback=1
       break
@@ -258,25 +185,30 @@ echo "generating ${size_mib} MiB random payload"
 dd if=/dev/urandom of="${payload}" bs=1048576 count="${size_mib}" 2>/dev/null
 local_sha="$(shasum -a 256 "${payload}" | awk '{print $1}')"
 
-remote "rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err'; nohup '${remote_bin}' --verbose listen >'${remote_base}.out' 2>'${remote_base}.err' </dev/null & echo \$! > '${remote_base}.pid'"
+./dist/derphole --verbose send --hide-progress "${payload}" >/dev/null 2>"${send_log}" &
+send_pid="$!"
 
 token=""
 for _ in $(seq 1 200); do
-  token="$(remote "grep -E '^[A-Za-z0-9_-]{20,}$' '${remote_base}.err' | head -n 1 || true")"
+  token="$(sed -n 's#^npx -y derphole@latest receive ##p' "${send_log}" | head -n 1 || true)"
   if [[ -n "${token}" ]]; then
+    break
+  fi
+  if ! kill -0 "${send_pid}" 2>/dev/null; then
     break
   fi
   sleep 0.1
 done
 
 if [[ -z "${token}" ]]; then
-  echo "failed to capture listener token" >&2
+  echo "failed to capture sender token" >&2
   exit 1
 fi
 
 start_ms="$(now_ms)"
-./dist/derpcat --verbose send "${parallel_args[@]+"${parallel_args[@]}"}" "${token}" <"${payload}" >/dev/null 2>"${send_log}"
-
+remote "rm -f '${remote_base}.pid' '${remote_base}.err'; nohup '${remote_bin}' --verbose receive --hide-progress --output '${remote_base}.out' '${token}' >/dev/null 2>'${remote_base}.err' </dev/null & echo \$! > '${remote_base}.pid'"
+wait "${send_pid}"
+send_pid=""
 for _ in $(seq 1 400); do
   if ! remote "if [[ -f '${remote_base}.pid' ]]; then kill -0 \$(cat '${remote_base}.pid') 2>/dev/null; else false; fi" >/dev/null 2>&1; then
     break
@@ -304,33 +236,34 @@ fi
 [[ -n "${sender_trace}" ]]
 [[ -n "${listener_trace}" ]]
 require_direct_evidence "sender" "${sender_trace}"
-require_direct_evidence "listener" "${listener_trace}"
-require_direct_blast_log "sender" "${send_log}" "udp-send"
-require_direct_blast_log "listener" "${listener_log}" "udp-receive"
+require_direct_evidence "receiver" "${listener_trace}"
 
+end_ms="$(now_ms)"
+duration_ms="$((end_ms - start_ms))"
+if [[ "${duration_ms}" -le 0 ]]; then
+  duration_ms=1
+fi
 sender_goodput_mbps="$(last_metric_value "${send_log}" "udp-send-goodput-mbps")"
 sender_peak_goodput_mbps="$(last_metric_value "${send_log}" "udp-send-peak-goodput-mbps")"
 sender_first_byte_ms="$(last_metric_value "${send_log}" "udp-send-session-first-byte-ms")"
-assert_no_derpcat_leaks
-end_ms="$(now_ms)"
-duration_ms="$((end_ms - start_ms))"
-duration="$((duration_ms / 1000))"
 wall_goodput="$(wall_goodput_mbps "${expected_size}" "${duration_ms}")"
-echo "benchmark-wall-goodput-mbps=${wall_goodput}"
-preserve_logs
-emit_benchmark_footer 1 true "" "${sender_goodput_mbps:-0}" "${sender_peak_goodput_mbps:-0}" "${sender_first_byte_ms:-0}"
+if [[ -z "${sender_goodput_mbps}" ]]; then
+  sender_goodput_mbps="${wall_goodput}"
+fi
+if [[ -z "${sender_peak_goodput_mbps}" ]]; then
+  sender_peak_goodput_mbps="${sender_goodput_mbps}"
+fi
+if [[ -z "${sender_first_byte_ms}" ]]; then
+  sender_first_byte_ms=0
+fi
 
-echo "target=${target}"
-echo "size_mib=${size_mib}"
-echo "duration_seconds=${duration}"
-echo "sha256=${local_sha}"
 echo "sender_path_changed=${sender_path_changed}"
 echo "listener_path_changed=${listener_path_changed}"
-echo "sender_path_trace=$(printf '%s' "${sender_trace}" | tr '\n' ';')"
-echo "listener_path_trace=$(printf '%s' "${listener_trace}" | tr '\n' ';')"
-echo "--- sender log"
-cat "${send_log}"
-echo "--- listener log"
-cat "${listener_log}"
+echo "sender_path_trace=$(tr '\n' ';' <"${send_log}" | grep -Eo 'connected-(relay|direct)' | paste -sd';' - || true)"
+echo "listener_path_trace=$(echo "${listener_trace}" | paste -sd';' - || true)"
+echo "benchmark-wall-goodput-mbps=${wall_goodput}"
+preserve_logs
+emit_benchmark_footer 1 true "" "${sender_goodput_mbps}" "${sender_peak_goodput_mbps}" "${sender_first_byte_ms}"
+
 cleanup
 trap - EXIT

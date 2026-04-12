@@ -110,6 +110,39 @@ func TestRunMatrixIteratesAllHostsDirectionsAndIterations(t *testing.T) {
 	}
 }
 
+func TestRunMatrixIteratesRequestedTools(t *testing.T) {
+	prev := runMatrixCommand
+	defer func() { runMatrixCommand = prev }()
+
+	var calls []string
+	runMatrixCommand = func(_ context.Context, script string, host string, sizeMiB int) ([]byte, error) {
+		calls = append(calls, script+":"+host)
+		return []byte(strings.Join([]string{
+			"benchmark-host=" + host,
+			"benchmark-direction=forward",
+			"benchmark-size-bytes=1073741824",
+			"benchmark-total-duration-ms=5000",
+			"benchmark-goodput-mbps=1700.0",
+			"benchmark-peak-goodput-mbps=2000.0",
+			"benchmark-first-byte-ms=20",
+			"benchmark-success=true",
+		}, "\n")), nil
+	}
+
+	_, err := runMatrix(context.Background(), matrixConfig{
+		Hosts:      []string{"ktzlxc"},
+		Tools:      []string{"derpcat", "derphole", "iperf"},
+		Iterations: 1,
+		SizeMiB:    1024,
+	})
+	if err != nil {
+		t.Fatalf("runMatrix() error = %v", err)
+	}
+	if got, want := len(calls), 6; got != want {
+		t.Fatalf("len(calls) = %d, want %d", got, want)
+	}
+}
+
 func TestRunMatrixCmdReturnsNonZeroWhenAnyRunFails(t *testing.T) {
 	prev := runMatrixCommand
 	defer func() { runMatrixCommand = prev }()
@@ -191,6 +224,21 @@ func TestRunMatrixCmdWritesOutFile(t *testing.T) {
 	}
 	if got, want := len(report.Runs), 2; got != want {
 		t.Fatalf("len(report.Runs) = %d, want %d", got, want)
+	}
+}
+
+func TestSummarizeMatrixRunsSeparatesTools(t *testing.T) {
+	runs := []probe.RunReport{
+		{Host: "ktzlxc", Mode: "derpcat", Direction: "forward", DurationMS: 1000, GoodputMbps: 100, Success: boolPtr(true)},
+		{Host: "ktzlxc", Mode: "derphole", Direction: "forward", DurationMS: 1000, GoodputMbps: 90, Success: boolPtr(true)},
+	}
+
+	got := summarizeMatrixRuns(runs)
+	if gotCount, wantCount := len(got), 2; gotCount != wantCount {
+		t.Fatalf("len(summaries) = %d, want %d", gotCount, wantCount)
+	}
+	if got[0].Tool == got[1].Tool {
+		t.Fatalf("summaries = %#v, want distinct tool keys", got)
 	}
 }
 

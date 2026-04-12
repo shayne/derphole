@@ -120,6 +120,7 @@ type transportPathEmitter struct {
 	last                    transport.Path
 	closed                  bool
 	suppressRelayRegression bool
+	suppressWatcherDirect   bool
 	cancel                  context.CancelFunc
 	done                    chan struct{}
 }
@@ -139,6 +140,9 @@ func (e *transportPathEmitter) Handle(path transport.Path) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed || path == e.last {
+		return
+	}
+	if path == transport.PathDirect && e.suppressWatcherDirect {
 		return
 	}
 	if path == transport.PathRelay && e.suppressRelayRegression && e.last == transport.PathDirect {
@@ -219,6 +223,24 @@ func (e *transportPathEmitter) SuppressRelayRegression() {
 	e.suppressRelayRegression = true
 }
 
+func (e *transportPathEmitter) SuppressWatcherDirect() {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.suppressWatcherDirect = true
+}
+
+func (e *transportPathEmitter) ResumeWatcherDirect() {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.suppressWatcherDirect = false
+}
+
 func (e *transportPathEmitter) ResumeRelayRegression() {
 	if e == nil {
 		return
@@ -248,7 +270,7 @@ func (e *transportPathEmitter) Complete(manager *transport.Manager) {
 		if depth := manager.MaxPeerRecvQueueDepth(); depth > 0 {
 			e.emitter.Debug(fmt.Sprintf("transport-max-peer-recv-queue-depth=%d", depth))
 		}
-		if path := manager.PathState(); path == transport.PathDirect && e.last != transport.PathDirect {
+		if path := manager.PathState(); path == transport.PathDirect && e.last != transport.PathDirect && !e.suppressWatcherDirect {
 			e.last = transport.PathDirect
 			e.emitter.Status(string(StateDirect))
 		}

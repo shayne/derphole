@@ -63,13 +63,18 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (string, error) {
 			return tok, errors.New("accepted decision missing accept payload")
 		}
 
-		extraProbeConns, extraPortmaps, cleanupProbeConns, err := externalDirectUDPConns(nil, nil, externalDirectUDPParallelism-1, cfg.Emitter)
-		if err != nil {
-			return tok, err
+		probeConn := session.probeConn
+		probeConns := []net.PacketConn{session.probeConn}
+		portmaps := []publicPortmap{publicSessionPortmap(session)}
+		cleanupProbeConns := func() {}
+		if !cfg.ForceRelay {
+			probeConn, probeConns, portmaps, cleanupProbeConns, err = externalAcceptedDirectUDPSet(cfg.Emitter)
+			if err != nil {
+				return tok, err
+			}
 		}
 		defer cleanupProbeConns()
-		probeConns := append([]net.PacketConn{session.probeConn}, extraProbeConns...)
-		portmaps := append([]publicPortmap{publicSessionPortmap(session)}, extraPortmaps...)
+		pm := portmaps[0]
 		decision.Accept.Parallel = len(probeConns)
 		if !cfg.ForceRelay {
 			decision.Accept.Candidates = externalDirectUDPFlattenCandidateSets(externalDirectUDPCandidateSets(ctx, probeConns, session.derpMap, portmaps))
@@ -97,12 +102,13 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (string, error) {
 
 		transportCtx, transportCancel := context.WithCancel(ctx)
 		defer transportCancel()
-		transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, session.probeConn, session.derpMap, session.derp, peerDERP, localCandidates, publicSessionPortmap(session), cfg.ForceRelay)
+		transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, probeConn, session.derpMap, session.derp, peerDERP, localCandidates, pm, cfg.ForceRelay)
 		if err != nil {
 			return tok, err
 		}
 		defer transportCleanup()
 		pathEmitter.Emit(StateClaimed)
+		pathEmitter.SuppressWatcherDirect()
 		pathEmitter.Watch(transportCtx, transportManager)
 		pathEmitter.Flush(transportManager)
 		seedAcceptedClaimCandidates(transportCtx, transportManager, *env.Claim)
@@ -144,7 +150,7 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (string, error) {
 				transportManager: transportManager,
 				pathEmitter:      pathEmitter,
 				punchCancel:      punchCancel,
-				probeConn:        session.probeConn,
+				probeConn:        probeConn,
 				probeConns:       probeConns,
 				remoteCandidates: remoteCandidates,
 				readyAckCh:       readyAckCh,
@@ -201,7 +207,7 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) error {
 		defer unsubscribeRelayPrefix()
 	}
 
-	probeConns, portmaps, cleanupProbeConns, err := externalDirectUDPConns(nil, nil, externalDirectUDPParallelism, cfg.Emitter)
+	probeConns, portmaps, cleanupProbeConns, err := externalDirectUDPConnsFn(nil, nil, externalDirectUDPParallelism, cfg.Emitter)
 	if err != nil {
 		return err
 	}
@@ -261,6 +267,7 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) error {
 		return err
 	}
 	defer transportCleanup()
+	pathEmitter.SuppressWatcherDirect()
 	pathEmitter.Watch(transportCtx, transportManager)
 	pathEmitter.Flush(transportManager)
 	seedAcceptedDecisionCandidates(transportCtx, transportManager, decision)

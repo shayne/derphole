@@ -13,11 +13,13 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/shayne/derpcat/pkg/derpbind"
 	"github.com/shayne/derpcat/pkg/portmap"
@@ -1674,6 +1676,71 @@ func TestExternalListenSendUsesRelayUDPWhenDirectPromotionIsTooLate(t *testing.T
 	}
 }
 
+func TestExternalListenSendLargeRelayPayloadDoesNotStallWhenDirectPromotionTimesOut(t *testing.T) {
+	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(externalDirectUDPWait+time.Second).UnixNano(), 10))
+
+	prevTCPAddrAllowed := externalNativeTCPAddrAllowed
+	externalNativeTCPAddrAllowed = func(net.Addr) bool { return false }
+	t.Cleanup(func() { externalNativeTCPAddrAllowed = prevTCPAddrAllowed })
+
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	payloadSize := externalHandoffMaxUnackedBytes + (16 << 20)
+	payloadSeed := []byte("relay-prefix-large-delayed-direct:")
+	payload := bytes.Repeat(payloadSeed, payloadSize/len(payloadSeed)+1)
+	payload = payload[:payloadSize]
+
+	var listenerOut bytes.Buffer
+	var listenerStatus syncBuffer
+	var senderStatus syncBuffer
+
+	tokenSink := make(chan string, 1)
+	listenErr := make(chan error, 1)
+	go func() {
+		_, err := Listen(ctx, ListenConfig{
+			Emitter:       telemetry.New(&listenerStatus, telemetry.LevelVerbose),
+			TokenSink:     tokenSink,
+			StdioOut:      &listenerOut,
+			UsePublicDERP: true,
+		})
+		listenErr <- err
+	}()
+
+	token := <-tokenSink
+	sendErr := make(chan error, 1)
+	go func() {
+		sendErr <- Send(ctx, SendConfig{
+			Token:         token,
+			Emitter:       telemetry.New(&senderStatus, telemetry.LevelVerbose),
+			StdioIn:       bytes.NewReader(payload),
+			UsePublicDERP: true,
+		})
+	}()
+
+	if err := <-listenErr; err != nil {
+		t.Fatalf("Listen() error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+	}
+	if err := <-sendErr; err != nil {
+		t.Fatalf("Send() error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+	}
+
+	if !bytes.Equal(listenerOut.Bytes(), payload) {
+		t.Fatalf("listener output length = %d, want %d", listenerOut.Len(), len(payload))
+	}
+	if got := senderStatus.String(); !strings.Contains(got, string(StateRelay)) || strings.Contains(got, "udp-relay=true") || strings.Contains(got, string(StateDirect)) || strings.Contains(got, "udp-stream=true") {
+		t.Fatalf("sender status = %q, want relay-prefix completion without UDP fallback or direct promotion", got)
+	}
+	if got := listenerStatus.String(); !strings.Contains(got, string(StateRelay)) || strings.Contains(got, "udp-relay=true") || strings.Contains(got, string(StateDirect)) || strings.Contains(got, "udp-stream=true") {
+		t.Fatalf("listener status = %q, want relay-prefix completion without UDP fallback or direct promotion", got)
+	}
+}
+
 func TestTransportPathEmitterCompletionIsTerminal(t *testing.T) {
 	var status bytes.Buffer
 	emitter := newTransportPathEmitter(telemetry.New(&status, telemetry.LevelDefault))
@@ -1707,6 +1774,57 @@ func TestTransportPathEmitterCanSuppressTemporaryRelayRegression(t *testing.T) {
 	if got := sessionStatusLines(status.String()); len(got) != 3 || got[0] != string(StateRelay) || got[1] != string(StateDirect) || got[2] != string(StateRelay) {
 		t.Fatalf("status lines = %q, want [%q %q %q] after suppression lifted", got, StateRelay, StateDirect, StateRelay)
 	}
+}
+
+func TestTransportPathEmitterCanSuppressWatcherDirectUntilExplicitEmit(t *testing.T) {
+	var status bytes.Buffer
+	emitter := newTransportPathEmitter(telemetry.New(&status, telemetry.LevelDefault))
+
+	emitter.Handle(transport.PathRelay)
+	emitter.SuppressWatcherDirect()
+	emitter.Handle(transport.PathDirect)
+	if got := sessionStatusLines(status.String()); len(got) != 1 || got[0] != string(StateRelay) {
+		t.Fatalf("status lines = %q, want [%q] while watcher direct is suppressed", got, StateRelay)
+	}
+
+	emitter.Emit(StateDirect)
+	if got := sessionStatusLines(status.String()); len(got) != 2 || got[0] != string(StateRelay) || got[1] != string(StateDirect) {
+		t.Fatalf("status lines = %q, want [%q %q] after explicit direct emit", got, StateRelay, StateDirect)
+	}
+
+	emitter.ResumeWatcherDirect()
+	emitter.Handle(transport.PathRelay)
+	emitter.Handle(transport.PathDirect)
+	if got := sessionStatusLines(status.String()); len(got) != 4 || got[2] != string(StateRelay) || got[3] != string(StateDirect) {
+		t.Fatalf("status lines = %q, want relay/direct watcher updates after resume", got)
+	}
+}
+
+func TestTransportPathEmitterCompleteDoesNotSynthesizeDirectWhileWatcherDirectSuppressed(t *testing.T) {
+	var status bytes.Buffer
+	emitter := newTransportPathEmitter(telemetry.New(&status, telemetry.LevelDefault))
+
+	emitter.Handle(transport.PathRelay)
+	emitter.SuppressWatcherDirect()
+	manager := transport.NewManager(transport.ManagerConfig{})
+	forceTransportManagerPathState(t, manager, transport.PathDirect)
+
+	emitter.Complete(manager)
+
+	if got := sessionStatusLines(status.String()); len(got) != 2 || got[0] != string(StateRelay) || got[1] != string(StateComplete) {
+		t.Fatalf("status lines = %q, want [%q %q] without synthesized direct on completion", got, StateRelay, StateComplete)
+	}
+}
+
+func forceTransportManagerPathState(t *testing.T, manager *transport.Manager, path transport.Path) {
+	t.Helper()
+	if manager == nil {
+		t.Fatal("forceTransportManagerPathState() manager = nil")
+	}
+
+	stateField := reflect.ValueOf(manager).Elem().FieldByName("state")
+	currentField := stateField.FieldByName("current")
+	reflect.NewAt(currentField.Type(), unsafe.Pointer(currentField.UnsafeAddr())).Elem().SetInt(int64(path))
 }
 
 func TestPublicProbeCandidatesIncludesMappedCandidate(t *testing.T) {

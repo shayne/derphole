@@ -199,6 +199,61 @@ func TestSendExternalHandoffDERPStopUsesReceiverHandoffAckBelowReadBoundary(t *t
 	}
 }
 
+func TestSendExternalHandoffDERPWaitsForRelayPauseControlBeforeSendingFrames(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	node := srv.Map.Regions[1].Nodes[0]
+	listenerDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(listener) error = %v", err)
+	}
+	defer listenerDERP.Close()
+	senderDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(sender) error = %v", err)
+	}
+	defer senderDERP.Close()
+
+	relayFrames, unsubscribe := listenerDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == senderDERP.PublicKey() && externalRelayPrefixDERPFrameKindOf(pkt.Payload) != 0
+	})
+	defer unsubscribe()
+
+	spool, err := newExternalHandoffSpool(strings.NewReader("abcdefghijklmnop"), 4, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spool.Close()
+
+	ctx, relayPauseControl := withExternalDirectUDPHandoffRelayPauseControl(ctx)
+	relayPauseControl.Pause()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sendExternalHandoffDERP(ctx, senderDERP, listenerDERP.PublicKey(), spool, nil, nil)
+	}()
+
+	select {
+	case <-relayFrames:
+		t.Fatal("sendExternalHandoffDERP() sent relay-prefix data while relay pause control was active")
+	case <-time.After(150 * time.Millisecond):
+	case err := <-errCh:
+		t.Fatalf("sendExternalHandoffDERP() returned early while paused: %v", err)
+	}
+
+	relayPauseControl.Resume()
+
+	select {
+	case <-relayFrames:
+	case err := <-errCh:
+		t.Fatalf("sendExternalHandoffDERP() returned before sending after relay pause resumed: %v", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for sendExternalHandoffDERP() to resume after relay pause")
+	}
+}
+
 func TestSendExternalHandoffDERPStopToleratesDelayedReceiverHandoffAck(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
@@ -877,6 +932,124 @@ func TestSendExternalViaRelayPrefixThenDirectUDPWaitsForHandoffReadyBeforeStoppi
 	}
 }
 
+func TestExternalPrepareDirectUDPSendWaitsForHandoffProceedBeforeSendingStart(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	srv := newSessionTestDERPServer(t)
+	node := srv.Map.Regions[1].Nodes[0]
+	listenerDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(listener) error = %v", err)
+	}
+	defer listenerDERP.Close()
+	senderDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(sender) error = %v", err)
+	}
+	defer senderDERP.Close()
+
+	readyCh, unsubscribeReady := listenerDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == senderDERP.PublicKey() && isDirectUDPReadyPayload(pkt.Payload)
+	})
+	defer unsubscribeReady()
+	startCh, unsubscribeStart := listenerDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == senderDERP.PublicKey() && isDirectUDPStartPayload(pkt.Payload)
+	})
+	defer unsubscribeStart()
+	readyAckCh, unsubscribeReadyAck := senderDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == listenerDERP.PublicKey() && isDirectUDPReadyAckPayload(pkt.Payload)
+	})
+	defer unsubscribeReadyAck()
+	startAckCh, unsubscribeStartAck := senderDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == listenerDERP.PublicKey() && isDirectUDPStartAckPayload(pkt.Payload)
+	})
+	defer unsubscribeStartAck()
+
+	probeConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer probeConn.Close()
+
+	prevSendRateProbes := externalDirectUDPSendRateProbesParallelFn
+	externalDirectUDPSendRateProbesParallelFn = func(context.Context, []net.PacketConn, []string, []int) ([]directUDPRateProbeSample, error) {
+		return nil, nil
+	}
+	t.Cleanup(func() { externalDirectUDPSendRateProbesParallelFn = prevSendRateProbes })
+
+	prevWaitRateProbe := externalDirectUDPWaitRateProbeFn
+	externalDirectUDPWaitRateProbeFn = func(context.Context, <-chan derpbind.Packet) (directUDPRateProbeResult, error) {
+		return directUDPRateProbeResult{}, nil
+	}
+	t.Cleanup(func() { externalDirectUDPWaitRateProbeFn = prevWaitRateProbe })
+
+	prepCtx, handoffReadyCh := withExternalDirectUDPHandoffReadySignal(ctx)
+	prepCtx, signalHandoffProceed := withExternalDirectUDPHandoffProceedSignal(prepCtx)
+
+	tok := token.Token{
+		SessionID:    [16]byte{0x91},
+		BearerSecret: [32]byte{0x42},
+	}
+	prepareErrCh := make(chan error, 1)
+	go func() {
+		_, err := externalPrepareDirectUDPSend(prepCtx, tok, senderDERP, listenerDERP.PublicKey(), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, []net.PacketConn{probeConn}, nil, readyAckCh, startAckCh, nil, SendConfig{})
+		prepareErrCh <- err
+	}()
+
+	select {
+	case <-readyCh:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for direct UDP ready before proceed gate")
+	}
+	if err := sendEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{
+		Type: envelopeDirectUDPReadyAck,
+		DirectUDPReadyAck: &directUDPReadyAck{
+			FastDiscard: true,
+		},
+	}); err != nil {
+		t.Fatalf("sendEnvelope(ready-ack) error = %v", err)
+	}
+
+	select {
+	case <-handoffReadyCh:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for handoff-ready signal before proceed gate")
+	}
+
+	select {
+	case <-startCh:
+		t.Fatal("direct UDP start was sent before handoff proceed was signaled")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	select {
+	case err := <-prepareErrCh:
+		t.Fatalf("externalPrepareDirectUDPSend() returned before proceed gate: %v", err)
+	default:
+	}
+
+	signalHandoffProceed()
+
+	select {
+	case <-startCh:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for direct UDP start after proceed gate")
+	}
+	if err := sendEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{Type: envelopeDirectUDPStartAck}); err != nil {
+		t.Fatalf("sendEnvelope(start-ack) error = %v", err)
+	}
+
+	select {
+	case err := <-prepareErrCh:
+		if err != nil {
+			t.Fatalf("externalPrepareDirectUDPSend() error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for externalPrepareDirectUDPSend() to finish after proceed gate")
+	}
+}
+
 func TestExternalDirectUDPBufferedWriterUsesDiscardForNullDevice(t *testing.T) {
 	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if err != nil {
@@ -1180,6 +1353,59 @@ func TestExternalDirectUDPConnsPrimeBlastSockets(t *testing.T) {
 
 	if calls != 2 {
 		t.Fatalf("prime calls = %d, want 2", calls)
+	}
+}
+
+func TestExternalAcceptedDirectUDPSetUsesDedicatedAllocatorOutput(t *testing.T) {
+	oldConnsFn := externalDirectUDPConnsFn
+	defer func() { externalDirectUDPConnsFn = oldConnsFn }()
+
+	connA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(connA) error = %v", err)
+	}
+	defer connA.Close()
+	connB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(connB) error = %v", err)
+	}
+	defer connB.Close()
+
+	pmA := newBoundPublicPortmap(connA, nil)
+	if pmA != nil {
+		defer pmA.Close()
+	}
+	pmB := newBoundPublicPortmap(connB, nil)
+	if pmB != nil {
+		defer pmB.Close()
+	}
+
+	var calls int
+	externalDirectUDPConnsFn = func(_ net.PacketConn, _ publicPortmap, parallel int, emitter *telemetry.Emitter) ([]net.PacketConn, []publicPortmap, func(), error) {
+		calls++
+		if parallel != externalDirectUDPParallelism {
+			t.Fatalf("parallel = %d, want %d", parallel, externalDirectUDPParallelism)
+		}
+		return []net.PacketConn{connA, connB}, []publicPortmap{pmA, pmB}, func() {}, nil
+	}
+
+	probeConn, probeConns, portmaps, cleanup, err := externalAcceptedDirectUDPSet(nil)
+	if err != nil {
+		t.Fatalf("externalAcceptedDirectUDPSet() error = %v", err)
+	}
+	defer cleanup()
+
+	if calls != 1 {
+		t.Fatalf("allocator calls = %d, want 1", calls)
+	}
+	if probeConn != connA {
+		t.Fatalf("probeConn = %v, want first dedicated conn %v", probeConn, connA)
+	}
+	if len(probeConns) != 2 || probeConns[0] != connA || probeConns[1] != connB {
+		t.Fatalf("probeConns = %v, want dedicated allocator output", probeConns)
+	}
+	if len(portmaps) != 2 || portmaps[0] != pmA || portmaps[1] != pmB {
+		t.Fatalf("portmaps = %v, want dedicated allocator output", portmaps)
 	}
 }
 
@@ -1559,6 +1785,115 @@ func TestExternalDirectUDPFillMissingSelectedAddrsBackfillsUnusedFallback(t *tes
 	}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("externalDirectUDPFillMissingSelectedAddrs() = %v, want %v", got, want)
+	}
+}
+
+func TestExternalDirectUDPFillMissingSelectedAddrsDoesNotMixPrivateFallbackIntoPublicObservedSet(t *testing.T) {
+	selected := []string{
+		"198.51.100.1:10001",
+		"",
+		"",
+	}
+	fallback := []string{
+		"198.51.100.1:10001",
+		"172.17.0.1:10002",
+		"10.0.1.25:10003",
+	}
+
+	got := externalDirectUDPFillMissingSelectedAddrs(selected, fallback)
+	want := []string{
+		"198.51.100.1:10001",
+		"",
+		"",
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("externalDirectUDPFillMissingSelectedAddrs(public observed) = %v, want %v", got, want)
+	}
+}
+
+func TestExternalDirectUDPSelectRemoteAddrsUsesFallbackWithoutObservationWhenCandidatesAvailable(t *testing.T) {
+	origObserve := externalDirectUDPObservePunchAddrsByConn
+	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = origObserve })
+
+	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+		t.Fatal("externalDirectUDPObservePunchAddrsByConn should not be called when fallback candidates are available")
+		return nil
+	}
+
+	got := externalDirectUDPSelectRemoteAddrs(
+		context.Background(),
+		make([]net.PacketConn, 2),
+		parseCandidateStrings([]string{"198.51.100.10:40000", "198.51.100.10:40001"}),
+		&net.UDPAddr{IP: net.IPv4(198, 51, 100, 10), Port: 40000},
+		nil,
+	)
+	want := []string{"198.51.100.10:40000", "198.51.100.10:40001"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("externalDirectUDPSelectRemoteAddrs() = %v, want %v", got, want)
+	}
+}
+
+func TestExternalDirectUDPSelectRemoteAddrsObservesWhenFallbackUnavailable(t *testing.T) {
+	origObserve := externalDirectUDPObservePunchAddrsByConn
+	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = origObserve })
+
+	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+		return [][]net.Addr{
+			parseCandidateStrings([]string{"198.51.100.20:41000"}),
+			parseCandidateStrings([]string{"198.51.100.20:41001"}),
+		}
+	}
+
+	got := externalDirectUDPSelectRemoteAddrs(
+		context.Background(),
+		make([]net.PacketConn, 2),
+		nil,
+		nil,
+		nil,
+	)
+	want := []string{"198.51.100.20:41000", "198.51.100.20:41001"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("externalDirectUDPSelectRemoteAddrs(observed) = %v, want %v", got, want)
+	}
+}
+
+func TestExternalDirectUDPSelectInitialRateSkipsLeadingZeroWarmupTiersOnLiveKtzlxcReverse(t *testing.T) {
+	sent := []directUDPRateProbeSample{
+		{RateMbps: 8, BytesSent: 200_000, DurationMillis: 200},
+		{RateMbps: 25, BytesSent: 625_000, DurationMillis: 200},
+		{RateMbps: 75, BytesSent: 1_875_000, DurationMillis: 200},
+		{RateMbps: 150, BytesSent: 3_750_000, DurationMillis: 200},
+		{RateMbps: 350, BytesSent: 8_750_000, DurationMillis: 200},
+		{RateMbps: 700, BytesSent: 17_500_000, DurationMillis: 200},
+		{RateMbps: 1200, BytesSent: 30_000_000, DurationMillis: 200},
+		{RateMbps: 1800, BytesSent: 112_500_000, DurationMillis: 500},
+		{RateMbps: 2000, BytesSent: 125_000_000, DurationMillis: 500},
+		{RateMbps: 2250, BytesSent: 140_625_000, DurationMillis: 500},
+	}
+	received := []directUDPRateProbeSample{
+		{RateMbps: 8, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 25, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 75, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 150, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 350, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 700, BytesReceived: 8_719_200, DurationMillis: 200},
+		{RateMbps: 1200, BytesReceived: 22_459_552, DurationMillis: 200},
+		{RateMbps: 1800, BytesReceived: 59_534_144, DurationMillis: 500},
+		{RateMbps: 2000, BytesReceived: 51_794_816, DurationMillis: 500},
+		{RateMbps: 2250, BytesReceived: 44_696_280, DurationMillis: 500},
+	}
+
+	selected := externalDirectUDPSelectInitialRateMbps(10_000, sent, received)
+	ceiling := externalDirectUDPSelectRateCeilingMbps(10_000, selected, sent, received)
+	if selected < 1200 {
+		t.Fatalf("externalDirectUDPSelectInitialRateMbps(live ktzlxc reverse zero warmup) = %d, want at least 1200 after 1200 Mbps probe materially outperforms 700 Mbps", selected)
+	}
+	if ceiling < 1800 {
+		t.Fatalf("externalDirectUDPSelectRateCeilingMbps(live ktzlxc reverse zero warmup) = %d, want at least 1800", ceiling)
+	}
+	basis := externalDirectUDPDataLaneRateBasisMbps(externalDirectUDPDataStartRateMbpsForProbeSamples(selected, ceiling, sent, received), ceiling, externalDirectUDPRateProbeRates(10_000, -1))
+	if got := externalDirectUDPActiveLanesForRate(basis, 8); got < 4 {
+		t.Fatalf("externalDirectUDPActiveLanesForRate(live ktzlxc reverse zero warmup) = %d, want at least 4 active lanes", got)
 	}
 }
 
@@ -2160,6 +2495,68 @@ func TestExternalDirectUDPDataExplorationCeilingOpensCleanSevenHundredKnee(t *te
 func TestExternalDirectUDPDataExplorationCeilingKeepsMediumTierCapped(t *testing.T) {
 	if got, want := externalDirectUDPDataExplorationCeilingMbps(10_000, 600, 700), 700; got != want {
 		t.Fatalf("externalDirectUDPDataExplorationCeilingMbps(medium tier) = %d, want %d", got, want)
+	}
+}
+
+func TestExternalDirectUDPDataExplorationCeilingForProbeSamplesKeepsLossyHighSelectedTierCappedWithoutHigherRecovery(t *testing.T) {
+	sent := []directUDPRateProbeSample{
+		{RateMbps: 8, BytesSent: 200_000, DurationMillis: 200},
+		{RateMbps: 25, BytesSent: 625_000, DurationMillis: 200},
+		{RateMbps: 75, BytesSent: 1_875_000, DurationMillis: 200},
+		{RateMbps: 150, BytesSent: 3_750_000, DurationMillis: 200},
+		{RateMbps: 350, BytesSent: 8_750_000, DurationMillis: 200},
+		{RateMbps: 700, BytesSent: 17_500_000, DurationMillis: 200},
+		{RateMbps: 1200, BytesSent: 30_000_000, DurationMillis: 200},
+		{RateMbps: 1800, BytesSent: 112_500_000, DurationMillis: 500},
+		{RateMbps: 2000, BytesSent: 125_000_000, DurationMillis: 500},
+		{RateMbps: 2250, BytesSent: 140_625_000, DurationMillis: 500},
+	}
+	received := []directUDPRateProbeSample{
+		{RateMbps: 8, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 25, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 75, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 150, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 350, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 700, BytesReceived: 8_724_736, DurationMillis: 200},
+		{RateMbps: 1200, BytesReceived: 22_408_344, DurationMillis: 200},
+		{RateMbps: 1800, BytesReceived: 53_760_096, DurationMillis: 500},
+		{RateMbps: 2000, BytesReceived: 47_260_832, DurationMillis: 500},
+		{RateMbps: 2250, BytesReceived: 45_266_488, DurationMillis: 500},
+	}
+
+	if got, want := externalDirectUDPDataExplorationCeilingMbpsForProbeSamples(10_000, 1200, 1200, sent, received), 1200; got != want {
+		t.Fatalf("externalDirectUDPDataExplorationCeilingMbpsForProbeSamples(lossy selected tier without higher recovery) = %d, want %d", got, want)
+	}
+}
+
+func TestExternalDirectUDPDataExplorationCeilingForProbeSamplesAllowsLossyHighSelectedTierRecovery(t *testing.T) {
+	sent := []directUDPRateProbeSample{
+		{RateMbps: 8, BytesSent: 200_000, DurationMillis: 200},
+		{RateMbps: 25, BytesSent: 625_000, DurationMillis: 200},
+		{RateMbps: 75, BytesSent: 1_875_000, DurationMillis: 200},
+		{RateMbps: 150, BytesSent: 3_750_000, DurationMillis: 200},
+		{RateMbps: 350, BytesSent: 8_750_000, DurationMillis: 200},
+		{RateMbps: 700, BytesSent: 17_500_000, DurationMillis: 200},
+		{RateMbps: 1200, BytesSent: 30_000_000, DurationMillis: 200},
+		{RateMbps: 1800, BytesSent: 112_500_000, DurationMillis: 500},
+		{RateMbps: 2000, BytesSent: 125_000_000, DurationMillis: 500},
+		{RateMbps: 2250, BytesSent: 140_625_000, DurationMillis: 500},
+	}
+	received := []directUDPRateProbeSample{
+		{RateMbps: 8, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 25, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 75, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 150, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 350, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 700, BytesReceived: 8_719_200, DurationMillis: 200},
+		{RateMbps: 1200, BytesReceived: 22_459_552, DurationMillis: 200},
+		{RateMbps: 1800, BytesReceived: 59_534_144, DurationMillis: 500},
+		{RateMbps: 2000, BytesReceived: 51_794_816, DurationMillis: 500},
+		{RateMbps: 2250, BytesReceived: 44_696_280, DurationMillis: 500},
+	}
+
+	if got, want := externalDirectUDPDataExplorationCeilingMbpsForProbeSamples(10_000, 1200, 1200, sent, received), 1800; got != want {
+		t.Fatalf("externalDirectUDPDataExplorationCeilingMbpsForProbeSamples(lossy selected tier with higher recovery) = %d, want %d", got, want)
 	}
 }
 
@@ -3313,6 +3710,36 @@ func TestExternalDirectUDPSelectRateFromProbeSamplesKeepsStableLowBandwidthTierW
 	}
 	if got, want := externalDirectUDPSelectInitialRateMbps(10_000, sent, received), 56; got != want {
 		t.Fatalf("externalDirectUDPSelectInitialRateMbps(low-bandwidth plateau) = %d, want %d", got, want)
+	}
+}
+
+func TestExternalDirectUDPSelectInitialRateFallsBackConservativelyWhenProbesReceiveNothing(t *testing.T) {
+	sent := []directUDPRateProbeSample{
+		{RateMbps: 8, BytesSent: 200_680, DurationMillis: 200},
+		{RateMbps: 25, BytesSent: 625_568, DurationMillis: 200},
+		{RateMbps: 75, BytesSent: 1_876_720, DurationMillis: 200},
+		{RateMbps: 150, BytesSent: 3_751_440, DurationMillis: 200},
+		{RateMbps: 350, BytesSent: 8_751_032, DurationMillis: 200},
+	}
+	received := []directUDPRateProbeSample{
+		{RateMbps: 8, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 25, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 75, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 150, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 350, BytesReceived: 0, DurationMillis: 200},
+	}
+
+	if got, want := externalDirectUDPSelectRateFromProbeSamples(10_000, sent, received), 0; got != want {
+		t.Fatalf("externalDirectUDPSelectRateFromProbeSamples(all-zero probes) = %d, want %d", got, want)
+	}
+	if got, want := externalDirectUDPSelectInitialRateMbps(10_000, sent, received), externalDirectUDPInitialProbeFallbackMbps; got != want {
+		t.Fatalf("externalDirectUDPSelectInitialRateMbps(all-zero probes) = %d, want %d", got, want)
+	}
+	if got, want := externalDirectUDPSelectRateCeilingMbps(10_000, externalDirectUDPInitialProbeFallbackMbps, sent, received), externalDirectUDPInitialProbeFallbackMbps; got != want {
+		t.Fatalf("externalDirectUDPSelectRateCeilingMbps(all-zero probes) = %d, want %d", got, want)
+	}
+	if got, want := externalDirectUDPDataStartRateMbpsForProbeSamples(externalDirectUDPInitialProbeFallbackMbps, externalDirectUDPInitialProbeFallbackMbps, sent, received), externalDirectUDPInitialProbeFallbackMbps; got != want {
+		t.Fatalf("externalDirectUDPDataStartRateMbpsForProbeSamples(all-zero probes) = %d, want %d", got, want)
 	}
 }
 

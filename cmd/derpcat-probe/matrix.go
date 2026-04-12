@@ -16,17 +16,20 @@ import (
 	"github.com/shayne/yargs"
 )
 
-const defaultMatrixHosts = "ktzlxc,canlxc,uklxc,orange-india.exe.xyz,eric@eric-nuc"
+const defaultMatrixHosts = "ktzlxc,canlxc,uklxc,november-oscar.exe.xyz,eric@eric-nuc"
+const defaultMatrixTools = "derpcat"
 
 type matrixConfig struct {
 	Hosts      []string `json:"hosts"`
+	Tools      []string `json:"tools,omitempty"`
 	Iterations int      `json:"iterations"`
 	SizeMiB    int      `json:"size_mib"`
 	Baseline   string   `json:"baseline,omitempty"`
 }
 
 type matrixFlags struct {
-	Hosts      string `flag:"hosts" help:"Comma-separated remote hosts" default:"ktzlxc,canlxc,uklxc,orange-india.exe.xyz,eric@eric-nuc"`
+	Hosts      string `flag:"hosts" help:"Comma-separated remote hosts" default:"ktzlxc,canlxc,uklxc,november-oscar.exe.xyz,eric@eric-nuc"`
+	Tools      string `flag:"tools" help:"Comma-separated benchmark tools: derpcat, derphole, iperf" default:"derpcat"`
 	Iterations int    `flag:"iterations" help:"Runs per host per direction" default:"10"`
 	SizeMiB    int    `flag:"size-mib" help:"Payload size in MiB" default:"1024"`
 	Out        string `flag:"out" help:"Write the JSON report to this path"`
@@ -34,6 +37,7 @@ type matrixFlags struct {
 }
 
 type matrixSeries struct {
+	Tool      string              `json:"tool,omitempty"`
 	Host      string              `json:"host"`
 	Direction string              `json:"direction"`
 	Summary   probe.SeriesSummary `json:"summary"`
@@ -47,9 +51,16 @@ type matrixReport struct {
 }
 
 type matrixComparison struct {
+	Tool      string                 `json:"tool,omitempty"`
 	Host      string                 `json:"host"`
 	Direction string                 `json:"direction"`
 	Result    probe.RegressionResult `json:"result"`
+}
+
+type matrixCase struct {
+	tool      string
+	script    string
+	direction string
 }
 
 var runMatrixCommand = func(ctx context.Context, script string, host string, sizeMiB int) ([]byte, error) {
@@ -76,12 +87,18 @@ func runMatrixCmd(args []string, stdout, stderr io.Writer) int {
 
 	cfg := matrixConfig{
 		Hosts:      splitMatrixHosts(parsed.Flags.Hosts),
+		Tools:      splitMatrixTools(parsed.Flags.Tools),
 		Iterations: parsed.Flags.Iterations,
 		SizeMiB:    parsed.Flags.SizeMiB,
 		Baseline:   strings.TrimSpace(parsed.Flags.Baseline),
 	}
 	if len(cfg.Hosts) == 0 {
 		fmt.Fprintln(stderr, "at least one host is required")
+		fmt.Fprint(stderr, subcommandUsageLine("matrix"))
+		return 2
+	}
+	if len(cfg.Tools) == 0 {
+		fmt.Fprintln(stderr, "at least one tool is required")
 		fmt.Fprint(stderr, subcommandUsageLine("matrix"))
 		return 2
 	}
@@ -141,12 +158,12 @@ func runMatrixCmd(args []string, stdout, stderr io.Writer) int {
 
 func runMatrix(ctx context.Context, cfg matrixConfig) ([]probe.RunReport, error) {
 	var runs []probe.RunReport
-	cases := []struct {
-		script    string
-		direction string
-	}{
-		{script: "./scripts/promotion-test.sh", direction: "forward"},
-		{script: "./scripts/promotion-test-reverse.sh", direction: "reverse"},
+	if len(cfg.Tools) == 0 {
+		cfg.Tools = splitMatrixTools("")
+	}
+	cases, err := matrixCases(cfg.Tools)
+	if err != nil {
+		return nil, err
 	}
 
 	for _, host := range cfg.Hosts {
@@ -159,6 +176,7 @@ func runMatrix(ctx context.Context, cfg matrixConfig) ([]probe.RunReport, error)
 						failed := false
 						runs = append(runs, probe.RunReport{
 							Host:      host,
+							Mode:      tc.tool,
 							Direction: tc.direction,
 							SizeBytes: int64(cfg.SizeMiB) * 1024 * 1024,
 							Success:   &failed,
@@ -169,6 +187,7 @@ func runMatrix(ctx context.Context, cfg matrixConfig) ([]probe.RunReport, error)
 					return nil, parseErr
 				}
 				report.Host = host
+				report.Mode = tc.tool
 				report.Direction = tc.direction
 				runs = append(runs, report)
 			}
@@ -271,23 +290,72 @@ func splitMatrixHosts(raw string) []string {
 	return hosts
 }
 
+func splitMatrixTools(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		raw = defaultMatrixTools
+	}
+	parts := strings.Split(raw, ",")
+	tools := make([]string, 0, len(parts))
+	seen := make(map[string]bool, len(parts))
+	for _, part := range parts {
+		tool := strings.TrimSpace(part)
+		if tool == "" || seen[tool] {
+			continue
+		}
+		tools = append(tools, tool)
+		seen[tool] = true
+	}
+	return tools
+}
+
+func matrixCases(tools []string) ([]matrixCase, error) {
+	var cases []matrixCase
+	for _, tool := range tools {
+		switch tool {
+		case "derpcat":
+			cases = append(cases,
+				matrixCase{tool: tool, script: "./scripts/promotion-test.sh", direction: "forward"},
+				matrixCase{tool: tool, script: "./scripts/promotion-test-reverse.sh", direction: "reverse"},
+			)
+		case "derphole":
+			cases = append(cases,
+				matrixCase{tool: tool, script: "./scripts/derphole-promotion-test.sh", direction: "forward"},
+				matrixCase{tool: tool, script: "./scripts/derphole-promotion-test-reverse.sh", direction: "reverse"},
+			)
+		case "iperf":
+			cases = append(cases,
+				matrixCase{tool: tool, script: "./scripts/iperf-benchmark.sh", direction: "forward"},
+				matrixCase{tool: tool, script: "./scripts/iperf-benchmark-reverse.sh", direction: "reverse"},
+			)
+		default:
+			return nil, fmt.Errorf("unsupported matrix tool %q", tool)
+		}
+	}
+	return cases, nil
+}
+
 func summarizeMatrixRuns(runs []probe.RunReport) []matrixSeries {
 	grouped := make(map[string][]probe.RunReport)
 	for _, run := range runs {
-		key := run.Host + "\x00" + run.Direction
+		key := run.Mode + "\x00" + run.Host + "\x00" + run.Direction
 		grouped[key] = append(grouped[key], run)
 	}
 
 	out := make([]matrixSeries, 0, len(grouped))
 	for key, group := range grouped {
-		host, direction, _ := strings.Cut(key, "\x00")
+		tool, rest, _ := strings.Cut(key, "\x00")
+		host, direction, _ := strings.Cut(rest, "\x00")
 		out = append(out, matrixSeries{
+			Tool:      tool,
 			Host:      host,
 			Direction: direction,
 			Summary:   probe.SummarizeRuns(group),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
+		if out[i].Tool != out[j].Tool {
+			return out[i].Tool < out[j].Tool
+		}
 		if out[i].Host != out[j].Host {
 			return out[i].Host < out[j].Host
 		}
@@ -325,12 +393,14 @@ func compareMatrixSummaries(base, head []matrixSeries) []matrixComparison {
 	headByKey := make(map[string]matrixSeries, len(head))
 	keys := make(map[string]struct{}, len(base)+len(head))
 	for _, series := range base {
-		key := series.Host + "\x00" + series.Direction
+		series = normalizeMatrixSeries(series)
+		key := series.Tool + "\x00" + series.Host + "\x00" + series.Direction
 		baseByKey[key] = series
 		keys[key] = struct{}{}
 	}
 	for _, series := range head {
-		key := series.Host + "\x00" + series.Direction
+		series = normalizeMatrixSeries(series)
+		key := series.Tool + "\x00" + series.Host + "\x00" + series.Direction
 		headByKey[key] = series
 		keys[key] = struct{}{}
 	}
@@ -343,10 +413,12 @@ func compareMatrixSummaries(base, head []matrixSeries) []matrixComparison {
 
 	comparisons := make([]matrixComparison, 0, len(orderedKeys))
 	for _, key := range orderedKeys {
-		host, direction, _ := strings.Cut(key, "\x00")
+		tool, rest, _ := strings.Cut(key, "\x00")
+		host, direction, _ := strings.Cut(rest, "\x00")
 		baseSeries, haveBase := baseByKey[key]
 		headSeries, haveHead := headByKey[key]
 		comparison := matrixComparison{
+			Tool:      tool,
 			Host:      host,
 			Direction: direction,
 		}
@@ -376,4 +448,11 @@ func matrixHasRegressions(comparisons []matrixComparison) bool {
 		}
 	}
 	return false
+}
+
+func normalizeMatrixSeries(series matrixSeries) matrixSeries {
+	if series.Tool == "" {
+		series.Tool = defaultMatrixTools
+	}
+	return series
 }
