@@ -2039,6 +2039,47 @@ func TestPublicCandidateSourceRefreshesTraversalCandidatesFromSTUNPackets(t *tes
 	}
 }
 
+func TestPublicCandidateSourceAllowsLongEnoughTraversalGatherWindow(t *testing.T) {
+	ctx := context.Background()
+	conn := &stubPacketConn{localAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242}}
+	localCandidates := []net.Addr{&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242}}
+	stunPackets := make(chan traversal.STUNPacket, 1)
+
+	prevSTUNGather := gatherTraversalCandidatesFromSTUNPackets
+	gatherTraversalCandidatesFromSTUNPackets = func(
+		gotCtx context.Context,
+		gotConn net.PacketConn,
+		_ *tailcfg.DERPMap,
+		_ func() (netip.AddrPort, bool),
+		gotPackets <-chan traversal.STUNPacket,
+	) ([]string, error) {
+		deadline, ok := gotCtx.Deadline()
+		if !ok {
+			t.Fatal("gatherTraversalCandidatesFromSTUNPackets() ctx has no deadline, want bounded timeout context")
+		}
+		if remaining := time.Until(deadline); remaining < 500*time.Millisecond {
+			t.Fatalf("gatherTraversalCandidatesFromSTUNPackets() deadline in %s, want at least 500ms for traversal gather", remaining)
+		}
+		if gotConn != conn {
+			t.Fatalf("gatherTraversalCandidatesFromSTUNPackets() conn = %v, want %v", gotConn, conn)
+		}
+		if gotPackets != stunPackets {
+			t.Fatalf("gatherTraversalCandidatesFromSTUNPackets() packets = %v, want %v", gotPackets, stunPackets)
+		}
+		return []string{"203.0.113.12:4242"}, nil
+	}
+	t.Cleanup(func() {
+		gatherTraversalCandidatesFromSTUNPackets = prevSTUNGather
+	})
+
+	source := publicCandidateSource(conn, &tailcfg.DERPMap{}, nil, localCandidates, stunPackets)
+	got := source(ctx)
+
+	if !containsAddrString(got, "203.0.113.12:4242") {
+		t.Fatalf("publicCandidateSource() = %v, want STUN packet gathered candidate 203.0.113.12:4242", got)
+	}
+}
+
 func TestPublicCandidateSourceReturnsQuicklyWhenSTUNGatherBlocks(t *testing.T) {
 	parentCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -1849,7 +1849,7 @@ func externalDirectUDPCandidateSets(ctx context.Context, conns []net.PacketConn,
 	for i := range conns {
 		go func() {
 			defer wg.Done()
-			probeCtx, cancel := context.WithTimeout(ctx, externalPublicCandidateRefreshWait)
+			probeCtx, cancel := context.WithTimeout(ctx, externalDirectUDPCandidateGatherWait)
 			defer cancel()
 			var pm publicPortmap
 			if i < len(portmaps) {
