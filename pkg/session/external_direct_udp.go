@@ -2008,6 +2008,7 @@ func externalDirectUDPSelectRemoteAddrs(ctx context.Context, conns []net.PacketC
 		emitter.Debug("udp-remote-fallback-addrs=" + strings.Join(fallback, ","))
 	}
 	if len(fallback) > 0 {
+		fallback = externalDirectUDPFilterFallbackAddrsForSelectedScope(nil, fallback)
 		if emitter != nil {
 			emitter.Debug("udp-observed-addrs-by-conn=" + externalDirectUDPFormatObservedAddrsByConn(make([][]net.Addr, len(conns))))
 			emitter.Debug("udp-selected-addrs=" + strings.Join(fallback, ","))
@@ -2088,18 +2089,12 @@ func externalDirectUDPFillMissingSelectedAddrs(selected []string, fallback []str
 }
 
 func externalDirectUDPFilterFallbackAddrsForSelectedScope(selected []string, fallback []string) []string {
-	selectedRank := -1
-	for _, candidate := range selected {
-		if candidate == "" {
-			continue
-		}
-		rank := externalDirectUDPCandidateRank(candidate)
-		if selectedRank == -1 || rank < selectedRank {
-			selectedRank = rank
-		}
-	}
+	selectedRank := externalDirectUDPBestCandidateRank(selected)
 	if selectedRank == -1 {
-		return fallback
+		selectedRank = externalDirectUDPBestCandidateRank(fallback)
+		if selectedRank == -1 {
+			return fallback
+		}
 	}
 
 	filtered := make([]string, 0, len(fallback))
@@ -2110,6 +2105,20 @@ func externalDirectUDPFilterFallbackAddrsForSelectedScope(selected []string, fal
 		filtered = append(filtered, candidate)
 	}
 	return filtered
+}
+
+func externalDirectUDPBestCandidateRank(candidates []string) int {
+	bestRank := -1
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		rank := externalDirectUDPCandidateRank(candidate)
+		if bestRank == -1 || rank < bestRank {
+			bestRank = rank
+		}
+	}
+	return bestRank
 }
 
 func externalDirectUDPParallelCandidateStrings(candidates []net.Addr, parallel int) []string {

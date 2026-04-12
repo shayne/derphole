@@ -1833,6 +1833,37 @@ func TestExternalDirectUDPSelectRemoteAddrsUsesFallbackWithoutObservationWhenCan
 	}
 }
 
+func TestExternalDirectUDPSelectRemoteAddrsFallbackPrefersBestRankScope(t *testing.T) {
+	origObserve := externalDirectUDPObservePunchAddrsByConn
+	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = origObserve })
+
+	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+		t.Fatal("externalDirectUDPObservePunchAddrsByConn should not be called when fallback candidates are available")
+		return nil
+	}
+
+	got := externalDirectUDPSelectRemoteAddrs(
+		context.Background(),
+		make([]net.PacketConn, 8),
+		parseCandidateStrings([]string{
+			"98.238.217.49:60709",
+			"172.17.0.1:58006",
+			"172.17.0.1:59744",
+			"172.17.0.1:51285",
+			"172.17.0.1:37925",
+			"172.17.0.1:33312",
+			"172.17.0.1:32895",
+			"172.17.0.1:34758",
+		}),
+		&net.UDPAddr{IP: net.IPv4(98, 238, 217, 49), Port: 60709},
+		nil,
+	)
+	want := []string{"98.238.217.49:60709"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("externalDirectUDPSelectRemoteAddrs(mixed fallback scopes) = %v, want %v", got, want)
+	}
+}
+
 func TestExternalDirectUDPSelectRemoteAddrsObservesWhenFallbackUnavailable(t *testing.T) {
 	origObserve := externalDirectUDPObservePunchAddrsByConn
 	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = origObserve })
