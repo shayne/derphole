@@ -459,8 +459,8 @@ jobs:
           registry-url: https://registry.npmjs.org
       - name: Publish npm packages
         run: |
-          npm publish ./dist/npm-derpcat --access public
-          npm publish ./dist/npm-derphole --access public
+          bash ./tools/packaging/publish-npm-if-missing.sh ./dist/npm-derpcat
+          bash ./tools/packaging/publish-npm-if-missing.sh ./dist/npm-derphole
 
   publish-npm-dev:
     name: Publish npm package (dev tag)
@@ -494,5 +494,5 @@ jobs:
           registry-url: https://registry.npmjs.org
       - name: Publish npm packages (dev tag)
         run: |
-          npm publish ./dist/npm-derpcat --access public --tag dev
-          npm publish ./dist/npm-derphole --access public --tag dev
+          bash ./tools/packaging/publish-npm-if-missing.sh --tag dev ./dist/npm-derpcat
+          bash ./tools/packaging/publish-npm-if-missing.sh --tag dev ./dist/npm-derphole
