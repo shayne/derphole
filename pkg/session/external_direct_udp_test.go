@@ -951,6 +951,56 @@ func TestSendExternalViaRelayPrefixThenDirectUDPWaitsForHandoffReadyBeforeStoppi
 	}
 }
 
+func TestSendExternalViaRelayPrefixThenDirectUDPStartsPrepareBeforeTransportManagerDirect(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	prevSendRelay := externalSendExternalHandoffDERPFn
+	externalSendExternalHandoffDERPFn = func(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, spool *externalHandoffSpool, stop <-chan struct{}, metrics *externalTransferMetrics) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	t.Cleanup(func() { externalSendExternalHandoffDERPFn = prevSendRelay })
+
+	prevWaitDirectUDPAddr := waitExternalDirectUDPAddr
+	waitExternalDirectUDPAddr = func(ctx context.Context, conn net.PacketConn, manager *transport.Manager) (net.Addr, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	t.Cleanup(func() { waitExternalDirectUDPAddr = prevWaitDirectUDPAddr })
+
+	prevPrepareDirectUDPSend := externalPrepareDirectUDPSendFn
+	prepared := make(chan struct{})
+	externalPrepareDirectUDPSendFn = func(ctx context.Context, tok token.Token, derpClient *derpbind.Client, listenerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, readyAckCh <-chan derpbind.Packet, startAckCh <-chan derpbind.Packet, rateProbeCh <-chan derpbind.Packet, cfg SendConfig) (externalDirectUDPSendPlan, error) {
+		close(prepared)
+		<-ctx.Done()
+		return externalDirectUDPSendPlan{}, ctx.Err()
+	}
+	t.Cleanup(func() { externalPrepareDirectUDPSendFn = prevPrepareDirectUDPSend })
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sendExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixSendConfig{
+			src:          bytes.NewReader(bytes.Repeat([]byte("prepare-before-direct-addr"), 1024)),
+			decision:     rendezvous.Decision{Accept: &rendezvous.AcceptInfo{}},
+			derpClient:   nil,
+			listenerDERP: key.NodePublic{},
+			cfg:          SendConfig{},
+		})
+	}()
+
+	select {
+	case <-prepared:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("sendExternalViaRelayPrefixThenDirectUDP() did not start direct preparation before transport manager direct path became active")
+	}
+
+	cancel()
+	if err := <-errCh; err == nil {
+		t.Fatal("sendExternalViaRelayPrefixThenDirectUDP() error = nil, want canceled context after test shutdown")
+	}
+}
+
 func TestExternalPrepareDirectUDPSendWaitsForHandoffProceedBeforeSendingStart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -1066,6 +1116,56 @@ func TestExternalPrepareDirectUDPSendWaitsForHandoffProceedBeforeSendingStart(t 
 		}
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for externalPrepareDirectUDPSend() to finish after proceed gate")
+	}
+}
+
+func TestReceiveExternalViaRelayPrefixThenDirectUDPStartsPrepareBeforeTransportManagerDirect(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	prevReceiveRelay := externalReceiveExternalHandoffDERPFn
+	externalReceiveExternalHandoffDERPFn = func(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, rx *externalHandoffReceiver, packets <-chan derpbind.Packet, metrics *externalTransferMetrics) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	t.Cleanup(func() { externalReceiveExternalHandoffDERPFn = prevReceiveRelay })
+
+	prevWaitDirectUDPAddr := waitExternalDirectUDPAddr
+	waitExternalDirectUDPAddr = func(ctx context.Context, conn net.PacketConn, manager *transport.Manager) (net.Addr, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	t.Cleanup(func() { waitExternalDirectUDPAddr = prevWaitDirectUDPAddr })
+
+	prevPrepareDirectUDPReceive := externalPrepareDirectUDPReceiveFn
+	prepared := make(chan struct{})
+	externalPrepareDirectUDPReceiveFn = func(ctx context.Context, dst io.Writer, tok token.Token, derpClient *derpbind.Client, peerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, decision rendezvous.Decision, readyCh <-chan derpbind.Packet, startCh <-chan derpbind.Packet, cfg ListenConfig) (externalDirectUDPReceivePlan, error) {
+		close(prepared)
+		<-ctx.Done()
+		return externalDirectUDPReceivePlan{}, ctx.Err()
+	}
+	t.Cleanup(func() { externalPrepareDirectUDPReceiveFn = prevPrepareDirectUDPReceive })
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- receiveExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixReceiveConfig{
+			dst:          io.Discard,
+			derpClient:   nil,
+			peerDERP:     key.NodePublic{},
+			relayPackets: nil,
+			cfg:          ListenConfig{},
+		})
+	}()
+
+	select {
+	case <-prepared:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("receiveExternalViaRelayPrefixThenDirectUDP() did not start direct preparation before transport manager direct path became active")
+	}
+
+	cancel()
+	if err := <-errCh; err == nil {
+		t.Fatal("receiveExternalViaRelayPrefixThenDirectUDP() error = nil, want canceled context after test shutdown")
 	}
 }
 
