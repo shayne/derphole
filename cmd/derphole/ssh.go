@@ -1,22 +1,50 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
+	pkgssh "github.com/shayne/derpcat/pkg/derphole/ssh"
+	"github.com/shayne/derpcat/pkg/session"
 	"github.com/shayne/derpcat/pkg/telemetry"
 	"github.com/shayne/yargs"
 )
 
-type sshInviteFlags struct{}
-type sshInviteArgs struct {
-	PublicKey string `pos:"0?" help:"Path to a public key file"`
+type sshInviteFlags struct {
+	User       string `flag:"user" short:"u" help:"Append to USER's ~/.ssh/authorized_keys"`
+	ForceRelay bool   `flag:"force-relay" help:"Disable direct probing"`
+}
+type sshInviteArgs struct{}
+
+type sshAcceptFlags struct {
+	KeyFile    string `flag:"key-file" short:"F" help:"SSH public key file to send"`
+	Yes        bool   `flag:"yes" short:"y" help:"Skip confirmation prompt"`
+	ForceRelay bool   `flag:"force-relay" help:"Disable direct probing"`
+}
+type sshAcceptArgs struct {
+	Token string `pos:"0?" help:"Receive token from ssh invite"`
 }
 
-type sshAcceptFlags struct{}
-type sshAcceptArgs struct {
-	Code string `pos:"0?" help:"Optional receive code"`
+type sshInviteCommandConfig struct {
+	User          string
+	Stderr        io.Writer
+	Emitter       *telemetry.Emitter
+	UsePublicDERP bool
+	ForceRelay    bool
+}
+
+type sshAcceptCommandConfig struct {
+	Token         string
+	KeyFile       string
+	Yes           bool
+	Stdin         io.Reader
+	Stderr        io.Writer
+	UsePublicDERP bool
+	ForceRelay    bool
 }
 
 var sshHelpConfig = yargs.HelpConfig{
@@ -24,8 +52,8 @@ var sshHelpConfig = yargs.HelpConfig{
 		Name:        "derphole",
 		Description: "Exchange SSH access invites with derphole.",
 		Examples: []string{
-			"derphole ssh invite ~/.ssh/id_ed25519.pub",
-			"derphole ssh accept",
+			"derphole ssh invite",
+			"derphole ssh accept <token>",
 		},
 	},
 	SubCommands: map[string]yargs.SubCommandInfo{
@@ -37,19 +65,22 @@ var sshHelpConfig = yargs.HelpConfig{
 		"invite": {
 			Name:        "invite",
 			Description: "Add a public key to authorized_keys on the receiving host.",
-			Usage:       "[public-key]",
+			Usage:       "[--user USER] [--force-relay]",
 		},
 		"accept": {
 			Name:        "accept",
 			Description: "Accept an SSH key invite and update authorized_keys.",
-			Usage:       "[code]",
+			Usage:       "[--key-file PATH] [--yes] [--force-relay] <token>",
 		},
 	},
 }
 
+var (
+	runSSHInviteCommand = executeSSHInviteCommand
+	runSSHAcceptCommand = executeSSHAcceptCommand
+)
+
 func runSSH(args []string, level telemetry.Level, stdin io.Reader, stdout, stderr io.Writer) int {
-	_ = level
-	_ = stdin
 	_ = stdout
 
 	if len(args) == 0 || isRootHelpRequest(args) {
@@ -59,9 +90,9 @@ func runSSH(args []string, level telemetry.Level, stdin io.Reader, stdout, stder
 
 	switch canonicalSSHCommand(args[0]) {
 	case "invite":
-		return runSSHInvite(args[1:], stderr)
+		return runSSHInvite(args[1:], level, stdin, stderr)
 	case "accept":
-		return runSSHAccept(args[1:], stderr)
+		return runSSHAccept(args[1:], level, stdin, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown ssh command: %s\n", args[0])
 		fmt.Fprint(stderr, sshHelpText())
@@ -69,7 +100,9 @@ func runSSH(args []string, level telemetry.Level, stdin io.Reader, stdout, stder
 	}
 }
 
-func runSSHInvite(args []string, stderr io.Writer) int {
+func runSSHInvite(args []string, level telemetry.Level, stdin io.Reader, stderr io.Writer) int {
+	_ = stdin
+
 	parsed, err := yargs.ParseWithCommandAndHelp[struct{}, sshInviteFlags, sshInviteArgs](append([]string{"invite"}, args...), sshHelpConfig)
 	if err != nil {
 		switch {
@@ -92,11 +125,20 @@ func runSSHInvite(args []string, stderr io.Writer) int {
 		return 2
 	}
 
-	fmt.Fprintln(stderr, "derphole ssh invite is not implemented yet")
-	return 1
+	if err := runSSHInviteCommand(commandContext(), sshInviteCommandConfig{
+		User:          parsed.SubCommandFlags.User,
+		Stderr:        stderr,
+		Emitter:       telemetry.New(stderr, commandSessionTelemetryLevel(level)),
+		UsePublicDERP: usePublicDERPTransport(),
+		ForceRelay:    parsed.SubCommandFlags.ForceRelay,
+	}); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
 }
 
-func runSSHAccept(args []string, stderr io.Writer) int {
+func runSSHAccept(args []string, level telemetry.Level, stdin io.Reader, stderr io.Writer) int {
 	parsed, err := yargs.ParseWithCommandAndHelp[struct{}, sshAcceptFlags, sshAcceptArgs](append([]string{"accept"}, args...), sshHelpConfig)
 	if err != nil {
 		switch {
@@ -118,9 +160,24 @@ func runSSHAccept(args []string, stderr io.Writer) int {
 		fmt.Fprint(stderr, sshAcceptHelpText())
 		return 2
 	}
+	if parsed.Args.Token == "" {
+		fmt.Fprint(stderr, sshAcceptHelpText())
+		return 2
+	}
 
-	fmt.Fprintln(stderr, "derphole ssh accept is not implemented yet")
-	return 1
+	if err := runSSHAcceptCommand(commandContext(), sshAcceptCommandConfig{
+		Token:         parsed.Args.Token,
+		KeyFile:       parsed.SubCommandFlags.KeyFile,
+		Yes:           parsed.SubCommandFlags.Yes,
+		Stdin:         stdin,
+		Stderr:        stderr,
+		UsePublicDERP: usePublicDERPTransport(),
+		ForceRelay:    parsed.SubCommandFlags.ForceRelay,
+	}); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
 }
 
 func canonicalSSHCommand(name string) string {
@@ -137,4 +194,77 @@ func sshInviteHelpText() string {
 
 func sshAcceptHelpText() string {
 	return yargs.GenerateSubCommandHelp(sshHelpConfig, "accept", struct{}{}, sshAcceptFlags{}, sshAcceptArgs{})
+}
+
+func executeSSHInviteCommand(ctx context.Context, cfg sshInviteCommandConfig) error {
+	authPath, err := pkgssh.AuthorizedKeysPath(cfg.User)
+	if err != nil {
+		return err
+	}
+
+	listener, err := session.ListenAttach(ctx, session.AttachListenConfig{
+		Emitter:       cfg.Emitter,
+		UsePublicDERP: cfg.UsePublicDERP,
+		ForceRelay:    cfg.ForceRelay,
+	})
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+
+	fmt.Fprintln(cfg.Stderr, "On the other machine, run:")
+	fmt.Fprintf(cfg.Stderr, "derphole ssh accept %s\n", listener.Token)
+
+	if err := pkgssh.Invite(ctx, pkgssh.InviteConfig{
+		Listener:       listener,
+		AuthorizedKeys: authPath,
+	}); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(cfg.Stderr, "Appended SSH public key to %s\n", authPath)
+	return nil
+}
+
+func executeSSHAcceptCommand(ctx context.Context, cfg sshAcceptCommandConfig) error {
+	kind, keyID, pubkey, err := pkgssh.FindPublicKey(cfg.KeyFile)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(cfg.Stderr, "Sending public key type='%s' keyid='%s'\n", kind, keyID)
+	if !cfg.Yes {
+		ok, err := confirmSSHSend(cfg.Stdin, cfg.Stderr, keyID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("aborted")
+		}
+	}
+
+	if err := pkgssh.Accept(ctx, pkgssh.AcceptConfig{
+		Token:         cfg.Token,
+		PublicKey:     pubkey,
+		UsePublicDERP: cfg.UsePublicDERP,
+		ForceRelay:    cfg.ForceRelay,
+	}); err != nil {
+		return err
+	}
+
+	fmt.Fprintln(cfg.Stderr, "Public key sent.")
+	return nil
+}
+
+func confirmSSHSend(stdin io.Reader, stderr io.Writer, keyID string) (bool, error) {
+	if stdin == nil {
+		return false, errors.New("confirmation required; rerun with --yes")
+	}
+	fmt.Fprintf(stderr, "Really send public key %q? [y/N] ", keyID)
+	line, err := bufio.NewReader(stdin).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	answer := strings.ToLower(strings.TrimSpace(line))
+	return answer == "y" || answer == "yes", nil
 }
