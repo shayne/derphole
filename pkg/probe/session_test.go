@@ -857,6 +857,77 @@ func TestSendBlastParallelSkipsUnreachableOptionalLane(t *testing.T) {
 	}
 }
 
+func TestSendBlastParallelRetriesTransientNoBufferSpaceDuringStripedRehandshake(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	receiver, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+
+	senderABase, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer senderABase.Close()
+
+	senderA := &failWriteOnNthPacketConn{
+		PacketConn: senderABase,
+		failAt:     2,
+		failErr:    syscall.ENOBUFS,
+	}
+
+	senderB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer senderB.Close()
+
+	payload := bytes.Repeat([]byte("optional-lane-rehandshake-"), 4096)
+	var got bytes.Buffer
+	receiveErr := make(chan error, 1)
+	go func() {
+		_, err := ReceiveBlastStreamParallelToWriter(ctx, []net.PacketConn{receiver}, &got, ReceiveConfig{
+			Blast:           true,
+			Transport:       "legacy",
+			RequireComplete: true,
+		}, int64(len(payload)))
+		receiveErr <- err
+	}()
+
+	stats, err := SendBlastParallel(ctx, []net.PacketConn{senderA, senderB}, []string{
+		receiver.LocalAddr().String(),
+		"127.0.0.1:1",
+	}, bytes.NewReader(payload), SendConfig{
+		Blast:                    true,
+		Transport:                "legacy",
+		ChunkSize:                512,
+		AllowPartialParallel:     true,
+		ParallelHandshakeTimeout: 50 * time.Millisecond,
+		StripedBlast:             true,
+	})
+	if err != nil {
+		t.Fatalf("SendBlastParallel() error = %v", err)
+	}
+	if stats.BytesSent != int64(len(payload)) {
+		t.Fatalf("BytesSent = %d, want %d", stats.BytesSent, len(payload))
+	}
+
+	select {
+	case err := <-receiveErr:
+		if err != nil {
+			t.Fatalf("ReceiveBlastStreamParallelToWriter() error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for receive: %v", ctx.Err())
+	}
+	if !bytes.Equal(got.Bytes(), payload) {
+		t.Fatalf("payload mismatch after transient striped rehandshake ENOBUFS")
+	}
+}
+
 func TestWriteOrderedParallelBlastPayloadTracksOrderForDiscard(t *testing.T) {
 	state := newBlastReceiveRunState(nil)
 	var writeMu sync.Mutex
@@ -4741,6 +4812,72 @@ func (b *transientNoBufferBatcher) WriteBatch(context.Context, net.Addr, [][]byt
 
 func (b *transientNoBufferBatcher) ReadBatch(context.Context, time.Duration, []batchReadBuffer) (int, error) {
 	return 0, syscall.ENOBUFS
+}
+
+type failWriteOnNthPacketConn struct {
+	net.PacketConn
+
+	mu      sync.Mutex
+	writes  int
+	failAt  int
+	failErr error
+}
+
+func (c *failWriteOnNthPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writes++
+	if c.failAt > 0 && c.writes == c.failAt {
+		return 0, c.failErr
+	}
+	return c.PacketConn.WriteTo(p, addr)
+}
+
+func TestWriteWithContextRetriesTransientNoBufferSpace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	serverConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverConn.Close()
+
+	clientBase, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientBase.Close()
+
+	clientConn := &failWriteOnNthPacketConn{
+		PacketConn: clientBase,
+		failAt:     1,
+		failErr:    syscall.ENOBUFS,
+	}
+
+	received := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 2048)
+		_ = serverConn.SetReadDeadline(time.Now().Add(time.Second))
+		n, _, err := serverConn.ReadFrom(buf)
+		if err != nil {
+			received <- nil
+			return
+		}
+		received <- append([]byte(nil), buf[:n]...)
+	}()
+
+	payload := []byte("hello-no-buffer")
+	n, err := writeWithContext(ctx, clientConn, serverConn.LocalAddr(), payload)
+	if err != nil {
+		t.Fatalf("writeWithContext() error = %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("writeWithContext() bytes = %d, want %d", n, len(payload))
+	}
+	if got := <-received; !bytes.Equal(got, payload) {
+		t.Fatalf("server payload = %q, want %q", got, payload)
+	}
 }
 
 type countingReader struct {

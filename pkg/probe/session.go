@@ -5789,7 +5789,7 @@ func performHelloHandshakeBatch(ctx context.Context, batcher packetBatcher, peer
 	}
 	for {
 		sentAt := time.Now()
-		if _, err := batcher.WriteBatch(ctx, peer, [][]byte{hello}); err != nil {
+		if err := writeBlastBatch(ctx, batcher, peer, [][]byte{hello}); err != nil {
 			return 0, err
 		}
 		if stats != nil {
@@ -5836,8 +5836,7 @@ func sendHelloAckBatch(ctx context.Context, batcher packetBatcher, peer net.Addr
 	if err != nil {
 		return err
 	}
-	_, err = batcher.WriteBatch(ctx, peer, [][]byte{packet})
-	return err
+	return writeBlastBatch(ctx, batcher, peer, [][]byte{packet})
 }
 
 func sendRepairRequest(ctx context.Context, batcher packetBatcher, peer net.Addr, runID [16]byte, seqs []uint64) error {
@@ -5874,8 +5873,7 @@ func sendRepairRequestStripe(ctx context.Context, batcher packetBatcher, peer ne
 	if err != nil {
 		return err
 	}
-	_, err = batcher.WriteBatch(ctx, peer, [][]byte{packet})
-	return err
+	return writeBlastBatch(ctx, batcher, peer, [][]byte{packet})
 }
 
 func sendRepairComplete(ctx context.Context, batcher packetBatcher, peer net.Addr, runID [16]byte) error {
@@ -5887,8 +5885,7 @@ func sendRepairComplete(ctx context.Context, batcher packetBatcher, peer net.Add
 	if err != nil {
 		return err
 	}
-	_, err = batcher.WriteBatch(ctx, peer, [][]byte{packet})
-	return err
+	return writeBlastBatch(ctx, batcher, peer, [][]byte{packet})
 }
 
 func sendBlastStatsBestEffort(ctx context.Context, batcher packetBatcher, peer net.Addr, runID [16]byte, stats blastReceiverStats) {
@@ -5909,7 +5906,7 @@ func sendBlastStatsBestEffortStripe(ctx context.Context, batcher packetBatcher, 
 	if err != nil {
 		return
 	}
-	if _, err := batcher.WriteBatch(ctx, peer, [][]byte{packet}); err != nil {
+	if err := writeBlastBatch(ctx, batcher, peer, [][]byte{packet}); err != nil {
 		sessionTracef("blast stats write ignored peer=%s err=%v", peer, err)
 		return
 	}
@@ -6425,22 +6422,32 @@ func setReadDeadlineAbsolute(ctx context.Context, conn net.PacketConn, deadline 
 }
 
 func writeWithContext(ctx context.Context, conn net.PacketConn, peer net.Addr, packet []byte) (int, error) {
-	deadline, err := writeDeadline(ctx)
-	if err != nil {
-		return 0, err
+	for {
+		deadline, err := writeDeadline(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if err := conn.SetWriteDeadline(deadline); err != nil {
+			return 0, err
+		}
+		n, writeErr := conn.WriteTo(packet, peer)
+		clearErr := conn.SetWriteDeadline(time.Time{})
+		if writeErr == nil {
+			if clearErr != nil {
+				return n, clearErr
+			}
+			return n, nil
+		}
+		if !isNoBufferSpace(writeErr) {
+			return n, writeErr
+		}
+		if clearErr != nil {
+			return n, clearErr
+		}
+		if err := sleepWithContext(ctx, 250*time.Microsecond); err != nil {
+			return n, err
+		}
 	}
-	if err := conn.SetWriteDeadline(deadline); err != nil {
-		return 0, err
-	}
-	n, writeErr := conn.WriteTo(packet, peer)
-	clearErr := conn.SetWriteDeadline(time.Time{})
-	if writeErr != nil {
-		return n, writeErr
-	}
-	if clearErr != nil {
-		return n, clearErr
-	}
-	return n, nil
 }
 
 func resolveRemoteAddr(remoteAddr string) (net.Addr, error) {
