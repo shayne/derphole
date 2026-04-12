@@ -3558,6 +3558,12 @@ func externalDirectUDPAddProbeKneeHeadroom(maxRateMbps int, selected int, sent [
 			selectedProbeViable &&
 			delivery >= externalDirectUDPRateProbeLossyDelivery &&
 			goodput >= selectedGoodput*externalDirectUDPRateProbeLossyGain {
+			if selected >= externalDirectUDPRateProbeCollapseMinMbps &&
+				sample.RateMbps >= externalDirectUDPRateProbeConfirmMinMbps &&
+				delivery >= externalDirectUDPRateProbeCeilingDelivery &&
+				goodput >= selectedGoodput*externalDirectUDPRateProbeMaterialGain {
+				return sample.RateMbps
+			}
 			return selected
 		}
 		if selected == externalDirectUDPActiveLaneTwoMaxMbps &&

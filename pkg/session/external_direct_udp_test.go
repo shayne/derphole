@@ -2619,6 +2619,46 @@ func TestExternalDirectUDPSelectInitialRateUsesHighGoodputCappedTopProbe(t *test
 	}
 }
 
+func TestExternalDirectUDPSelectInitialRateKeepsLiveKtzlxcForwardNearClean1800Tier(t *testing.T) {
+	sent := []directUDPRateProbeSample{
+		{RateMbps: 8, BytesSent: 200_680, DurationMillis: 200},
+		{RateMbps: 25, BytesSent: 625_568, DurationMillis: 200},
+		{RateMbps: 75, BytesSent: 1_875_320, DurationMillis: 200},
+		{RateMbps: 150, BytesSent: 3_750_640, DurationMillis: 200},
+		{RateMbps: 350, BytesSent: 8_751_032, DurationMillis: 200},
+		{RateMbps: 700, BytesSent: 17_449_472, DurationMillis: 200},
+		{RateMbps: 1200, BytesSent: 29_816_896, DurationMillis: 200},
+		{RateMbps: 1800, BytesSent: 110_246_865, DurationMillis: 500},
+		{RateMbps: 2000, BytesSent: 87_354_262, DurationMillis: 500},
+		{RateMbps: 2250, BytesSent: 79_883_236, DurationMillis: 500},
+	}
+	received := []directUDPRateProbeSample{
+		{RateMbps: 8, BytesReceived: 200_680, DurationMillis: 200},
+		{RateMbps: 25, BytesReceived: 625_568, DurationMillis: 200},
+		{RateMbps: 75, BytesReceived: 1_875_320, DurationMillis: 200},
+		{RateMbps: 150, BytesReceived: 3_750_640, DurationMillis: 200},
+		{RateMbps: 350, BytesReceived: 8_751_032, DurationMillis: 200},
+		{RateMbps: 700, BytesReceived: 8_724_736, DurationMillis: 200},
+		{RateMbps: 1200, BytesReceived: 22_362_672, DurationMillis: 200},
+		{RateMbps: 1800, BytesReceived: 94_812_304, DurationMillis: 500},
+		{RateMbps: 2000, BytesReceived: 75_998_208, DurationMillis: 500},
+		{RateMbps: 2250, BytesReceived: 71_096_080, DurationMillis: 500},
+	}
+
+	selected := externalDirectUDPSelectInitialRateMbps(10_000, sent, received)
+	if got, wantMin := selected, 1800; got < wantMin {
+		t.Fatalf("externalDirectUDPSelectInitialRateMbps(live ktzlxc forward near-clean 1800 tier) = %d, want at least %d", got, wantMin)
+	}
+	ceiling := externalDirectUDPSelectRateCeilingMbps(10_000, selected, sent, received)
+	if got, wantMin := ceiling, 1800; got < wantMin {
+		t.Fatalf("externalDirectUDPSelectRateCeilingMbps(live ktzlxc forward near-clean 1800 tier) = %d, want at least %d", got, wantMin)
+	}
+	start := externalDirectUDPDataStartRateMbpsForProbeSamples(selected, ceiling, sent, received)
+	if got, wantMin := start, 1800; got < wantMin {
+		t.Fatalf("externalDirectUDPDataStartRateMbpsForProbeSamples(live ktzlxc forward near-clean 1800 tier) = %d, want at least %d", got, wantMin)
+	}
+}
+
 func TestExternalDirectUDPSelectInitialRateKeepsCleanKtzlxcReverseTierBeforeTopCollapse(t *testing.T) {
 	sent := []directUDPRateProbeSample{
 		{RateMbps: 8, BytesSent: 200_680, DurationMillis: 200},
