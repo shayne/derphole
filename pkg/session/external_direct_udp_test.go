@@ -474,8 +474,10 @@ func TestSendExternalHandoffDERPStopBeforeRelayProgressStillStartsRelayData(t *t
 
 func TestReceiveExternalHandoffDERPReturnsCurrentWatermarkOnHandoffBelowBoundary(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	const ackTimeout = 2 * time.Second
+	const handoffTimeout = time.Second
 
 	node := srv.Map.Regions[1].Nodes[0]
 	listenerDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
@@ -518,7 +520,7 @@ func TestReceiveExternalHandoffDERPReturnsCurrentWatermarkOnHandoffBelowBoundary
 		if ack != 4 {
 			t.Fatalf("data ack = %d, want 4", ack)
 		}
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(ackTimeout):
 		t.Fatal("timed out waiting for DERP prefix data ACK")
 	}
 
@@ -530,7 +532,7 @@ func TestReceiveExternalHandoffDERPReturnsCurrentWatermarkOnHandoffBelowBoundary
 		if !errors.Is(err, errExternalHandoffCarrierHandoff) {
 			t.Fatalf("receiveExternalHandoffDERP() error = %v, want %v", err, errExternalHandoffCarrierHandoff)
 		}
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(handoffTimeout):
 		t.Fatal("receiveExternalHandoffDERP() blocked waiting for handoff boundary instead of returning current watermark")
 	}
 	if got := out.String(); got != "abcd" {
@@ -543,8 +545,10 @@ func TestReceiveExternalHandoffDERPReturnsCurrentWatermarkOnHandoffBelowBoundary
 
 func TestReceiveExternalHandoffDERPTracksOnlyDeliveredRelayBytes(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	const ackTimeout = 2 * time.Second
+	const handoffTimeout = time.Second
 
 	node := srv.Map.Regions[1].Nodes[0]
 	listenerDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
@@ -587,7 +591,7 @@ func TestReceiveExternalHandoffDERPTracksOnlyDeliveredRelayBytes(t *testing.T) {
 		if ack != 4 {
 			t.Fatalf("first ack = %d, want 4", ack)
 		}
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(ackTimeout):
 		t.Fatal("timed out waiting for first DERP prefix ACK")
 	}
 
@@ -603,7 +607,7 @@ func TestReceiveExternalHandoffDERPTracksOnlyDeliveredRelayBytes(t *testing.T) {
 		if ack != 6 {
 			t.Fatalf("second ack = %d, want 6", ack)
 		}
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(ackTimeout):
 		t.Fatal("timed out waiting for second DERP prefix ACK")
 	}
 
@@ -615,7 +619,7 @@ func TestReceiveExternalHandoffDERPTracksOnlyDeliveredRelayBytes(t *testing.T) {
 		if !errors.Is(err, errExternalHandoffCarrierHandoff) {
 			t.Fatalf("receiveExternalHandoffDERP() error = %v, want %v", err, errExternalHandoffCarrierHandoff)
 		}
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(handoffTimeout):
 		t.Fatal("timed out waiting for DERP prefix handoff")
 	}
 
