@@ -1,11 +1,17 @@
 package derphole
 
-import "testing"
+import (
+	"bytes"
+	"testing"
+)
 
-func TestVerificationStringIsStable(t *testing.T) {
-	got := VerificationString("token-value")
-	want := VerificationString("token-value")
-	if got != want {
-		t.Fatalf("VerificationString() = %q, want stable output %q", got, want)
+func TestWriteSendInstructionUsesNpxLatestCommand(t *testing.T) {
+	var stderr bytes.Buffer
+	WriteSendInstruction(&stderr, "token-123")
+
+	const want = "On the other machine, run:\n" +
+		"npx -y derphole@latest receive token-123\n"
+	if got := stderr.String(); got != want {
+		t.Fatalf("WriteSendInstruction() = %q, want %q", got, want)
 	}
 }

@@ -255,7 +255,7 @@ func waitForTokenLine(t *testing.T, stderr *bytes.Buffer) string {
 			if line == "" || strings.HasPrefix(line, "On the other machine") {
 				continue
 			}
-			if strings.HasPrefix(line, "derphole receive ") {
+			if strings.Contains(line, " receive ") {
 				fields := strings.Fields(line)
 				return fields[len(fields)-1]
 			}

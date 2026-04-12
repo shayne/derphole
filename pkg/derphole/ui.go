@@ -19,7 +19,7 @@ func WriteSendInstruction(stderr io.Writer, token string) {
 		return
 	}
 	fmt.Fprintln(stderr, "On the other machine, run:")
-	fmt.Fprintf(stderr, "derphole receive %s\n", token)
+	fmt.Fprintf(stderr, "npx -y derphole@latest receive %s\n", token)
 }
 
 func WriteReceiveToken(stderr io.Writer, token string) {
