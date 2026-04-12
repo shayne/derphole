@@ -24,6 +24,12 @@ func TestRunHelpReceiveAliasesShowReceiveHelp(t *testing.T) {
 	}
 }
 
+func TestReceiveHelpIncludesHideProgress(t *testing.T) {
+	if !strings.Contains(receiveHelpText(), "--hide-progress") {
+		t.Fatalf("receiveHelpText() missing --hide-progress:\n%s", receiveHelpText())
+	}
+}
+
 func TestRunReceiveWithoutCodeAllocatesTransfer(t *testing.T) {
 	prev := runReceiveTransfer
 	t.Cleanup(func() {

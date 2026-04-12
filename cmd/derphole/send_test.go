@@ -24,6 +24,12 @@ func TestRunHelpSendShowsSendHelp(t *testing.T) {
 	}
 }
 
+func TestSendHelpIncludesHideProgress(t *testing.T) {
+	if !strings.Contains(sendHelpText(), "--hide-progress") {
+		t.Fatalf("sendHelpText() missing --hide-progress:\n%s", sendHelpText())
+	}
+}
+
 func TestRunSendInvokesTransfer(t *testing.T) {
 	prev := runSendTransfer
 	t.Cleanup(func() {

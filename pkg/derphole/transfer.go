@@ -3,6 +3,7 @@ package derphole
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,37 +19,52 @@ import (
 )
 
 type SendConfig struct {
-	Token         string
-	Text          string
-	What          string
-	Stdin         io.Reader
-	Stdout        io.Writer
-	Stderr        io.Writer
-	Emitter       *telemetry.Emitter
-	UsePublicDERP bool
-	ForceRelay    bool
+	Token          string
+	Text           string
+	What           string
+	Stdin          io.Reader
+	Stdout         io.Writer
+	Stderr         io.Writer
+	ProgressOutput io.Writer
+	Emitter        *telemetry.Emitter
+	UsePublicDERP  bool
+	ForceRelay     bool
 }
 
 type ReceiveConfig struct {
-	Token         string
-	Allocate      bool
-	OutputPath    string
-	Stdin         io.Reader
-	Stdout        io.Writer
-	Stderr        io.Writer
-	PromptFor     func(io.Reader, io.Writer) (string, error)
-	Emitter       *telemetry.Emitter
-	UsePublicDERP bool
-	ForceRelay    bool
+	Token          string
+	Allocate       bool
+	OutputPath     string
+	Stdin          io.Reader
+	Stdout         io.Writer
+	Stderr         io.Writer
+	ProgressOutput io.Writer
+	PromptFor      func(io.Reader, io.Writer) (string, error)
+	Emitter        *telemetry.Emitter
+	UsePublicDERP  bool
+	ForceRelay     bool
+}
+
+type directorySummary struct {
+	FileCount         int   `json:"file_count"`
+	UncompressedBytes int64 `json:"uncompressed_bytes"`
+}
+
+type sendTransfer struct {
+	header        protocol.Header
+	body          io.Reader
+	cleanup       func() error
+	summary       string
+	progressTotal int64
 }
 
 func Send(ctx context.Context, cfg SendConfig) error {
-	header, body, cleanup, err := prepareSendTransfer(cfg)
+	tx, err := prepareSendTransfer(cfg)
 	if err != nil {
 		return err
 	}
-	if cleanup != nil {
-		defer cleanup()
+	if tx.cleanup != nil {
+		defer tx.cleanup()
 	}
 
 	if cfg.Token == "" {
@@ -62,7 +78,7 @@ func Send(ctx context.Context, cfg SendConfig) error {
 		}
 		defer listener.Close()
 
-		header.Verify = VerificationString(listener.Token)
+		tx.header.Verify = VerificationString(listener.Token)
 		WriteSendInstruction(cfg.Stderr, listener.Token)
 
 		conn, err := listener.Accept(ctx)
@@ -71,10 +87,10 @@ func Send(ctx context.Context, cfg SendConfig) error {
 		}
 		defer conn.Close()
 
-		return writeTransfer(conn, header, body)
+		return writeTransfer(conn, tx, cfg.ProgressOutput, cfg.Stderr)
 	}
 
-	header.Verify = VerificationString(cfg.Token)
+	tx.header.Verify = VerificationString(cfg.Token)
 	conn, err := session.DialAttach(ctx, session.AttachDialConfig{
 		Token:         cfg.Token,
 		Emitter:       cfg.Emitter,
@@ -86,7 +102,7 @@ func Send(ctx context.Context, cfg SendConfig) error {
 	}
 	defer conn.Close()
 
-	return writeTransfer(conn, header, body)
+	return writeTransfer(conn, tx, cfg.ProgressOutput, cfg.Stderr)
 }
 
 func Receive(ctx context.Context, cfg ReceiveConfig) error {
@@ -114,7 +130,7 @@ func Receive(ctx context.Context, cfg ReceiveConfig) error {
 		}
 		defer conn.Close()
 
-		return readTransfer(conn, listener.Token, cfg.Stdout, cfg.OutputPath)
+		return readTransfer(conn, listener.Token, cfg.Stdout, cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput)
 	}
 
 	token := cfg.Token
@@ -140,12 +156,17 @@ func Receive(ctx context.Context, cfg ReceiveConfig) error {
 	}
 	defer conn.Close()
 
-	return readTransfer(conn, token, cfg.Stdout, cfg.OutputPath)
+	return readTransfer(conn, token, cfg.Stdout, cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput)
 }
 
-func prepareSendTransfer(cfg SendConfig) (protocol.Header, io.Reader, func() error, error) {
+func prepareSendTransfer(cfg SendConfig) (sendTransfer, error) {
 	if cfg.Text != "" {
-		return protocol.Header{Version: 1, Kind: protocol.KindText}, strings.NewReader(cfg.Text), nil, nil
+		return sendTransfer{
+			header:        protocol.Header{Version: 1, Kind: protocol.KindText},
+			body:          strings.NewReader(cfg.Text),
+			summary:       fmt.Sprintf("Sending text message (%s)", formatProgressBytes(int64(len(cfg.Text)))),
+			progressTotal: -1,
+		}, nil
 	}
 	if cfg.What != "" {
 		if info, err := os.Stat(cfg.What); err == nil {
@@ -154,42 +175,93 @@ func prepareSendTransfer(cfg SendConfig) (protocol.Header, io.Reader, func() err
 				go func() {
 					writer.CloseWithError(dharchive.StreamTar(writer, cfg.What))
 				}()
-				return protocol.Header{
-					Version: 1,
-					Kind:    protocol.KindDirectoryTar,
-					Name:    filepath.Base(cfg.What),
-				}, reader, reader.Close, nil
+				stats, err := dharchive.DescribeTar(cfg.What)
+				if err != nil {
+					return sendTransfer{}, err
+				}
+				meta, err := json.Marshal(directorySummary{
+					FileCount:         stats.FileCount,
+					UncompressedBytes: stats.UncompressedBytes,
+				})
+				if err != nil {
+					return sendTransfer{}, err
+				}
+				return sendTransfer{
+					header: protocol.Header{
+						Version:  1,
+						Kind:     protocol.KindDirectoryTar,
+						Name:     filepath.Base(cfg.What),
+						Size:     stats.TarBytes,
+						Metadata: meta,
+					},
+					body:          reader,
+					cleanup:       reader.Close,
+					summary:       fmt.Sprintf("Sending directory (%s tar) named %q", formatProgressBytes(stats.TarBytes), filepath.Base(cfg.What)),
+					progressTotal: stats.TarBytes,
+				}, nil
 			}
 			file, err := os.Open(cfg.What)
 			if err != nil {
-				return protocol.Header{}, nil, nil, err
+				return sendTransfer{}, err
 			}
-			return protocol.Header{
-				Version: 1,
-				Kind:    protocol.KindFile,
-				Name:    filepath.Base(cfg.What),
-				Size:    info.Size(),
-			}, file, file.Close, nil
+			return sendTransfer{
+				header: protocol.Header{
+					Version: 1,
+					Kind:    protocol.KindFile,
+					Name:    filepath.Base(cfg.What),
+					Size:    info.Size(),
+				},
+				body:          file,
+				cleanup:       file.Close,
+				summary:       fmt.Sprintf("Sending %s file named %q", formatProgressBytes(info.Size()), filepath.Base(cfg.What)),
+				progressTotal: info.Size(),
+			}, nil
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return protocol.Header{}, nil, nil, err
+			return sendTransfer{}, err
 		}
-		return protocol.Header{Version: 1, Kind: protocol.KindText}, strings.NewReader(cfg.What), nil, nil
+		return sendTransfer{
+			header:        protocol.Header{Version: 1, Kind: protocol.KindText},
+			body:          strings.NewReader(cfg.What),
+			summary:       fmt.Sprintf("Sending text message (%s)", formatProgressBytes(int64(len(cfg.What)))),
+			progressTotal: -1,
+		}, nil
 	}
 	if cfg.Stdin != nil {
-		return protocol.Header{Version: 1, Kind: protocol.KindText}, cfg.Stdin, nil, nil
+		return sendTransfer{
+			header:        protocol.Header{Version: 1, Kind: protocol.KindText},
+			body:          cfg.Stdin,
+			progressTotal: -1,
+		}, nil
 	}
-	return protocol.Header{Version: 1, Kind: protocol.KindText}, strings.NewReader(""), nil, nil
+	return sendTransfer{
+		header:        protocol.Header{Version: 1, Kind: protocol.KindText},
+		body:          strings.NewReader(""),
+		summary:       "Sending text message (0B)",
+		progressTotal: -1,
+	}, nil
 }
 
-func writeTransfer(w io.Writer, header protocol.Header, body io.Reader) error {
-	if err := protocol.WriteHeader(w, header); err != nil {
+func writeTransfer(w io.Writer, tx sendTransfer, progressOut, stderr io.Writer) error {
+	if tx.summary != "" && stderr != nil {
+		fmt.Fprintln(stderr, tx.summary)
+	}
+	body := tx.body
+	progress := NewProgressReporter(progressOut, tx.progressTotal)
+	if progress != nil {
+		body = progress.Wrap(body)
+	}
+
+	if err := protocol.WriteHeader(w, tx.header); err != nil {
 		return err
 	}
 	_, err := io.Copy(w, body)
+	if err == nil {
+		progress.Finish()
+	}
 	return err
 }
 
-func readTransfer(conn net.Conn, token string, stdout io.Writer, outputPath string) error {
+func readTransfer(conn net.Conn, token string, stdout io.Writer, outputPath string, stderr, progressOut io.Writer) error {
 	if stdout == nil {
 		stdout = io.Discard
 	}
@@ -208,18 +280,21 @@ func readTransfer(conn net.Conn, token string, stdout io.Writer, outputPath stri
 		_, err = io.Copy(stdout, reader)
 		return err
 	case protocol.KindFile:
-		return receiveFile(reader, header, outputPath)
+		return receiveFile(reader, header, outputPath, stderr, progressOut)
 	case protocol.KindDirectoryTar:
-		return receiveDirectory(reader, header, outputPath)
+		return receiveDirectory(reader, header, outputPath, stderr, progressOut)
 	default:
 		return fmt.Errorf("unsupported derphole transfer kind %q", header.Kind)
 	}
 }
 
-func receiveFile(r io.Reader, header protocol.Header, outputPath string) error {
+func receiveFile(r io.Reader, header protocol.Header, outputPath string, stderr, progressOut io.Writer) error {
 	target, err := ResolveOutputPath(outputPath, header.Name)
 	if err != nil {
 		return err
+	}
+	if stderr != nil {
+		fmt.Fprintf(stderr, "Receiving file (%s) into: %q\n", formatProgressBytes(header.Size), filepath.Base(target))
 	}
 	if dir := filepath.Dir(target); dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -233,18 +308,51 @@ func receiveFile(r io.Reader, header protocol.Header, outputPath string) error {
 	}
 	defer f.Close()
 
+	progress := NewProgressReporter(progressOut, header.Size)
+	if progress != nil {
+		r = progress.Wrap(r)
+	}
+
 	if header.Size > 0 {
 		_, err = io.CopyN(f, r, header.Size)
+		if err == nil {
+			progress.Finish()
+		}
 		return err
 	}
 	_, err = io.Copy(f, r)
 	return err
 }
 
-func receiveDirectory(r io.Reader, header protocol.Header, outputPath string) error {
+func receiveDirectory(r io.Reader, header protocol.Header, outputPath string, stderr, progressOut io.Writer) error {
 	destRoot, topLevel, err := ResolveDirectoryOutput(outputPath, header.Name)
 	if err != nil {
 		return err
 	}
-	return dharchive.ExtractTar(r, destRoot, topLevel)
+	if stderr != nil {
+		fmt.Fprintf(stderr, "Receiving directory (%s) into: %q/\n", formatProgressBytes(header.Size), topLevel)
+		if meta, ok := decodeDirectorySummary(header.Metadata); ok {
+			fmt.Fprintf(stderr, "%d files, %s (uncompressed)\n", meta.FileCount, formatProgressBytes(meta.UncompressedBytes))
+		}
+	}
+	progress := NewProgressReporter(progressOut, header.Size)
+	if progress != nil {
+		r = progress.Wrap(r)
+	}
+	err = dharchive.ExtractTar(r, destRoot, topLevel)
+	if err == nil {
+		progress.Finish()
+	}
+	return err
+}
+
+func decodeDirectorySummary(raw []byte) (directorySummary, bool) {
+	if len(raw) == 0 {
+		return directorySummary{}, false
+	}
+	var meta directorySummary
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return directorySummary{}, false
+	}
+	return meta, true
 }

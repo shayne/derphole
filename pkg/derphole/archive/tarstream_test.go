@@ -64,3 +64,30 @@ func TestStreamTarAndExtractTarRoundTrip(t *testing.T) {
 		t.Fatalf("child.txt = %q, want %q", got, "child")
 	}
 }
+
+func TestTarSizeMatchesStreamTarOutput(t *testing.T) {
+	srcRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(srcRoot, "nested"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcRoot, "hello.txt"), []byte("hello"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcRoot, "nested", "child.txt"), []byte("child"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	size, err := TarSize(srcRoot)
+	if err != nil {
+		t.Fatalf("TarSize() error = %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := StreamTar(&buf, srcRoot); err != nil {
+		t.Fatalf("StreamTar() error = %v", err)
+	}
+
+	if got, want := int64(buf.Len()), size; got != want {
+		t.Fatalf("streamed tar size = %d, want %d", got, want)
+	}
+}

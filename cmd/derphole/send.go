@@ -11,7 +11,8 @@ import (
 )
 
 type sendFlags struct {
-	ForceRelay bool `flag:"force-relay" help:"Disable direct probing"`
+	ForceRelay   bool `flag:"force-relay" help:"Disable direct probing"`
+	HideProgress bool `flag:"hide-progress" help:"Suppress progress-bar display"`
 }
 
 type sendArgs struct {
@@ -67,10 +68,16 @@ func runSend(args []string, level telemetry.Level, stdin io.Reader, stdout, stde
 	}
 
 	if err := runSendTransfer(commandContext(), pkgderphole.SendConfig{
-		What:          parsed.Args.What,
-		Stdin:         stdin,
-		Stdout:        stdout,
-		Stderr:        stderr,
+		What:   parsed.Args.What,
+		Stdin:  stdin,
+		Stdout: stdout,
+		Stderr: stderr,
+		ProgressOutput: func() io.Writer {
+			if parsed.SubCommandFlags.HideProgress {
+				return nil
+			}
+			return stderr
+		}(),
 		Emitter:       telemetry.New(stderr, commandSessionTelemetryLevel(level)),
 		UsePublicDERP: usePublicDERPTransport(),
 		ForceRelay:    parsed.SubCommandFlags.ForceRelay,

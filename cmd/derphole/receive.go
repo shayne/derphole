@@ -11,8 +11,9 @@ import (
 )
 
 type receiveFlags struct {
-	ForceRelay bool   `flag:"force-relay" help:"Disable direct probing"`
-	Output     string `flag:"output" short:"o" help:"Write a received file to this path or directory"`
+	ForceRelay   bool   `flag:"force-relay" help:"Disable direct probing"`
+	HideProgress bool   `flag:"hide-progress" help:"Suppress progress-bar display"`
+	Output       string `flag:"output" short:"o" help:"Write a received file to this path or directory"`
 }
 
 type receiveArgs struct {
@@ -69,12 +70,18 @@ func runReceive(args []string, level telemetry.Level, stdin io.Reader, stdout, s
 
 	token := parsed.Args.Code
 	if err := runReceiveTransfer(commandContext(), pkgderphole.ReceiveConfig{
-		Token:         token,
-		Allocate:      token == "",
-		OutputPath:    parsed.SubCommandFlags.Output,
-		Stdin:         stdin,
-		Stdout:        stdout,
-		Stderr:        stderr,
+		Token:      token,
+		Allocate:   token == "",
+		OutputPath: parsed.SubCommandFlags.Output,
+		Stdin:      stdin,
+		Stdout:     stdout,
+		Stderr:     stderr,
+		ProgressOutput: func() io.Writer {
+			if parsed.SubCommandFlags.HideProgress {
+				return nil
+			}
+			return stderr
+		}(),
 		Emitter:       telemetry.New(stderr, commandSessionTelemetryLevel(level)),
 		UsePublicDERP: usePublicDERPTransport(),
 		ForceRelay:    parsed.SubCommandFlags.ForceRelay,

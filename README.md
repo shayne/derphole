@@ -74,6 +74,8 @@ npx -y derphole@latest send ./photo.jpg
 npx -y derphole@latest receive <code>
 ```
 
+For known-size file and directory transfers, `derphole` prints wormhole-shaped progress and rate output on stderr. Use `--hide-progress` if you want a quiet transfer UI.
+
 Text uses the same shape:
 
 ```bash
@@ -156,7 +158,7 @@ npx -y derpcat@dev version
 npx -y derphole@dev version
 ```
 
-By default, `listen`, `send`, `share`, and `open` keep transport status quiet. `listen` and `share` still print the token you need, and `open` still prints the local listening address. `derphole` keeps the same quiet default and only prints the user-facing instruction or token needed to complete the transfer. Use `--verbose` to see state transitions like `connected-relay` and `connected-direct`:
+By default, `listen`, `send`, `share`, and `open` keep transport status quiet. `listen` and `share` still print the token you need, and `open` still prints the local listening address. `derphole` also keeps transport status quiet by default, but it still prints the user-facing instruction or token needed to complete the transfer, plus wormhole-shaped transfer summaries and known-size progress on stderr. Use `--hide-progress` to suppress the progress bar. Use `--verbose` to see state transitions like `connected-relay` and `connected-direct`:
 
 ```bash
 npx -y derpcat@latest --verbose listen
@@ -244,7 +246,7 @@ Simple rule: possession of the token authorizes the session, but intermediaries 
 
 ## Behavior
 
-Sessions can start on DERP relay and later promote to a direct path without restarting. In default mode, the CLI keeps transport status quiet and only prints the token or local bind address needed to use the session. Use `--verbose` to inspect path changes, NAT traversal state, and direct-path tuning details.
+Sessions can start on DERP relay and later promote to a direct path without restarting. In default mode, the CLI keeps transport status quiet and prints only the user-facing token, bind address, or transfer UI needed to use the session. Use `--verbose` to inspect path changes, NAT traversal state, and direct-path tuning details.
 
 ## Use Cases
 

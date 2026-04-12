@@ -163,6 +163,88 @@ func TestSendDirectoryTransfersTopLevelDirectory(t *testing.T) {
 	}
 }
 
+func TestSendFileReportsProgressOnBothSides(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	srcDir := t.TempDir()
+	srcPath := filepath.Join(srcDir, "hello.txt")
+	if err := os.WriteFile(srcPath, bytes.Repeat([]byte("a"), 64*1024), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	recvDir := t.TempDir()
+	var sendErr, recvErr bytes.Buffer
+	sendDone := make(chan error, 1)
+	go func() {
+		sendDone <- Send(ctx, SendConfig{
+			What:           srcPath,
+			Stderr:         &sendErr,
+			ProgressOutput: &sendErr,
+		})
+	}()
+
+	token := waitForTokenLine(t, &sendErr)
+	if err := Receive(ctx, ReceiveConfig{
+		Token:          token,
+		OutputPath:     recvDir,
+		Stderr:         &recvErr,
+		ProgressOutput: &recvErr,
+	}); err != nil {
+		t.Fatalf("Receive() error = %v", err)
+	}
+	if err := <-sendDone; err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	if got := sendErr.String(); !strings.Contains(got, "Sending ") || !strings.Contains(got, "file named") || !strings.Contains(got, "100%|") {
+		t.Fatalf("send stderr = %q, want summary and progress", got)
+	}
+	if got := recvErr.String(); !strings.Contains(got, "Receiving file") || !strings.Contains(got, "100%|") {
+		t.Fatalf("receive stderr = %q, want summary and progress", got)
+	}
+}
+
+func TestSendTextDoesNotEmitProgressBar(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var sendErr, recvErr, out bytes.Buffer
+	sendDone := make(chan error, 1)
+	go func() {
+		sendDone <- Send(ctx, SendConfig{
+			Text:           "hello progressless text",
+			Stderr:         &sendErr,
+			ProgressOutput: &sendErr,
+		})
+	}()
+
+	token := waitForTokenLine(t, &sendErr)
+	if err := Receive(ctx, ReceiveConfig{
+		Token:          token,
+		Stdout:         &out,
+		Stderr:         &recvErr,
+		ProgressOutput: &recvErr,
+	}); err != nil {
+		t.Fatalf("Receive() error = %v", err)
+	}
+	if err := <-sendDone; err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if got := out.String(); got != "hello progressless text" {
+		t.Fatalf("stdout = %q, want %q", got, "hello progressless text")
+	}
+	if got := sendErr.String(); !strings.Contains(got, "Sending text message") {
+		t.Fatalf("send stderr = %q, want text summary", got)
+	}
+	if strings.Contains(sendErr.String(), "100%|") {
+		t.Fatalf("send stderr = %q, want no progress bar for text", sendErr.String())
+	}
+	if strings.Contains(recvErr.String(), "100%|") {
+		t.Fatalf("receive stderr = %q, want no progress bar for text", recvErr.String())
+	}
+}
+
 func waitForTokenLine(t *testing.T, stderr *bytes.Buffer) string {
 	t.Helper()
 
