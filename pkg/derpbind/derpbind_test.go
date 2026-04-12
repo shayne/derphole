@@ -5,13 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"tailscale.com/derp/derpserver"
+	"tailscale.com/net/netmon"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -256,6 +259,93 @@ func TestClientDispatchSubscriberDeliversToAllMatchingSubscribers(t *testing.T) 
 			t.Fatalf("%s subscriber did not receive matching packet", name)
 		}
 	}
+}
+
+func TestNewDERPNodeDialerFallsBackToIPv4WhenIPv6TargetFails(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen(tcp4) error = %v", err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan struct{}, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			accepted <- struct{}{}
+			_ = conn.Close()
+		}
+	}()
+
+	node := &tailcfg.DERPNode{
+		HostName: "derp.example.test",
+		IPv4:     "127.0.0.1",
+		IPv6:     "2001:db8::1",
+	}
+	dialer := newDERPNodeDialer(node, t.Logf, netmon.NewStatic())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	conn, err := dialer(ctx, "tcp", net.JoinHostPort(node.HostName, portString(t, ln.Addr())))
+	if err != nil {
+		t.Fatalf("dialer() error = %v", err)
+	}
+	_ = conn.Close()
+
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("dialer() did not reach IPv4 listener")
+	}
+}
+
+func TestNewDERPNodeDialerUsesOverrideHostInsteadOfNodeIPs(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen(tcp4) error = %v", err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan struct{}, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			accepted <- struct{}{}
+			_ = conn.Close()
+		}
+	}()
+
+	node := &tailcfg.DERPNode{
+		HostName: "derp.example.test",
+		IPv4:     "203.0.113.10",
+		IPv6:     "2001:db8::1",
+	}
+	dialer := newDERPNodeDialer(node, t.Logf, netmon.NewStatic())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	conn, err := dialer(ctx, "tcp", net.JoinHostPort("127.0.0.1", portString(t, ln.Addr())))
+	if err != nil {
+		t.Fatalf("dialer() with override host error = %v", err)
+	}
+	_ = conn.Close()
+
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("dialer() did not reach override host listener")
+	}
+}
+
+func portString(t *testing.T, addr net.Addr) string {
+	t.Helper()
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("addr = %T, want *net.TCPAddr", addr)
+	}
+	return strconv.Itoa(tcpAddr.Port)
 }
 
 func TestClientSubscribeDropsOldestWhenSubscriberBackedUp(t *testing.T) {

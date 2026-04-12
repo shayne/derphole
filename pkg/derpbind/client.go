@@ -4,14 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/net/netmon"
+	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+	"tailscale.com/types/logger"
 )
 
 type Packet struct {
@@ -62,10 +65,13 @@ func NewClient(ctx context.Context, node *tailcfg.DERPNode, serverURL string) (*
 	}
 
 	priv := key.NewNode()
-	dc, err := derphttp.NewClient(priv, serverURL, func(string, ...any) {}, netmon.NewStatic())
+	logf := logger.Logf(func(string, ...any) {})
+	netMon := netmon.NewStatic()
+	dc, err := derphttp.NewClient(priv, serverURL, logf, netMon)
 	if err != nil {
 		return nil, err
 	}
+	dc.SetURLDialer(newDERPNodeDialer(node, logf, netMon))
 	if err := dc.Connect(ctx); err != nil {
 		_ = dc.Close()
 		return nil, fmt.Errorf("connect derp client: %w", err)
@@ -81,6 +87,127 @@ func NewClient(ctx context.Context, node *tailcfg.DERPNode, serverURL string) (*
 	}
 	go c.recvLoop()
 	return c, nil
+}
+
+type derpDialTarget struct {
+	network string
+	addr    string
+}
+
+func newDERPNodeDialer(node *tailcfg.DERPNode, logf logger.Logf, netMon *netmon.Monitor) func(context.Context, string, string) (net.Conn, error) {
+	if node == nil {
+		return nil
+	}
+	if netMon == nil {
+		panic("nil netMon")
+	}
+	return func(ctx context.Context, _ string, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		targets, explicitDisable := derpDialTargets(node, host, port)
+		if explicitDisable && len(targets) == 0 {
+			return nil, errors.New("both IPv4 and IPv6 are explicitly disabled for node")
+		}
+		if len(targets) == 0 {
+			targets = append(targets, derpDialTarget{
+				network: "tcp",
+				addr:    net.JoinHostPort(host, port),
+			})
+		}
+		return raceDERPDial(ctx, logf, netMon, targets)
+	}
+}
+
+func derpDialTargets(node *tailcfg.DERPNode, host, port string) ([]derpDialTarget, bool) {
+	if node == nil {
+		return nil, false
+	}
+	add := func(targets []derpDialTarget, network, host, port string) []derpDialTarget {
+		return append(targets, derpDialTarget{
+			network: network,
+			addr:    net.JoinHostPort(host, port),
+		})
+	}
+	var targets []derpDialTarget
+	explicitDisable := false
+
+	if host == node.HostName {
+		switch ip := net.ParseIP(node.IPv4); {
+		case ip != nil && ip.To4() != nil:
+			targets = add(targets, "tcp4", ip.String(), port)
+		case node.IPv4 == "":
+			targets = add(targets, "tcp4", host, port)
+		default:
+			explicitDisable = true
+		}
+		switch ip := net.ParseIP(node.IPv6); {
+		case ip != nil && ip.To4() == nil:
+			targets = add(targets, "tcp6", ip.String(), port)
+		case node.IPv6 == "":
+			targets = add(targets, "tcp6", host, port)
+		default:
+			explicitDisable = true
+		}
+		return targets, explicitDisable
+	}
+
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.To4() != nil {
+			targets = add(targets, "tcp4", ip.String(), port)
+			return targets, false
+		}
+		targets = add(targets, "tcp6", ip.String(), port)
+		return targets, false
+	}
+
+	targets = add(targets, "tcp4", host, port)
+	targets = add(targets, "tcp6", host, port)
+	return targets, false
+}
+
+func raceDERPDial(ctx context.Context, logf logger.Logf, netMon *netmon.Monitor, targets []derpDialTarget) (net.Conn, error) {
+	if len(targets) == 0 {
+		return nil, errors.New("no DERP dial targets")
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	dialer := netns.NewDialer(logf, netMon)
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	results := make(chan result, len(targets))
+	for _, target := range targets {
+		target := target
+		go func() {
+			conn, err := dialer.DialContext(ctx, target.network, target.addr)
+			select {
+			case results <- result{conn: conn, err: err}:
+			case <-ctx.Done():
+				if conn != nil {
+					_ = conn.Close()
+				}
+			}
+		}()
+	}
+
+	var firstErr error
+	for range targets {
+		res := <-results
+		if res.err == nil {
+			return res.conn, nil
+		}
+		if firstErr == nil {
+			firstErr = res.err
+		}
+	}
+	if firstErr == nil {
+		firstErr = context.Canceled
+	}
+	return nil, firstErr
 }
 
 func (c *Client) PublicKey() key.NodePublic { return c.pub }
