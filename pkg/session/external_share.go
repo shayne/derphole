@@ -2,7 +2,6 @@ package session
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"net"
 	"sync"
@@ -20,68 +19,8 @@ import (
 )
 
 func issuePublicShareSession(ctx context.Context, cfg ShareConfig) (string, *relaySession, error) {
-	dm, err := derpbind.FetchMap(ctx, publicDERPMapURL())
-	if err != nil {
-		return "", nil, err
-	}
-	node := firstDERPNode(dm, 0)
-	if node == nil {
-		return "", nil, errors.New("no DERP node available")
-	}
-
-	derpClient, err := derpbind.NewClient(ctx, node, publicDERPServerURL(node))
-	if err != nil {
-		return "", nil, err
-	}
-
-	var sessionID [16]byte
-	if _, err := rand.Read(sessionID[:]); err != nil {
-		_ = derpClient.Close()
-		return "", nil, err
-	}
-	var bearerSecret [32]byte
-	if _, err := rand.Read(bearerSecret[:]); err != nil {
-		_ = derpClient.Close()
-		return "", nil, err
-	}
-	quicIdentity, err := quicpath.GenerateSessionIdentity()
-	if err != nil {
-		_ = derpClient.Close()
-		return "", nil, err
-	}
-
-	tokValue := token.Token{
-		Version:         token.SupportedVersion,
-		SessionID:       sessionID,
-		ExpiresUnix:     time.Now().Add(time.Hour).Unix(),
-		BootstrapRegion: uint16(node.RegionID),
-		DERPPublic:      derpPublicKeyRaw32(derpClient.PublicKey()),
-		QUICPublic:      quicIdentity.Public,
-		BearerSecret:    bearerSecret,
-		Capabilities:    token.CapabilityShare,
-	}
-	tok, err := token.Encode(tokValue)
-	if err != nil {
-		_ = derpClient.Close()
-		return "", nil, err
-	}
-
-	probeConn, err := net.ListenPacket("udp4", ":0")
-	if err != nil {
-		_ = derpClient.Close()
-		return "", nil, err
-	}
-
-	session := &relaySession{
-		probeConn:    probeConn,
-		derp:         derpClient,
-		token:        tokValue,
-		gate:         rendezvous.NewGate(tokValue),
-		derpMap:      dm,
-		quicIdentity: quicIdentity,
-	}
-	attachPublicPortmap(session, newBoundPublicPortmap(probeConn, nil))
-	return tok, session, nil
+	_ = cfg
+	return issuePublicQUICSession(ctx, token.CapabilityShare)
 }
 
 func shareExternal(ctx context.Context, cfg ShareConfig) (string, error) {

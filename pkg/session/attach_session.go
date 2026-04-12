@@ -91,7 +91,9 @@ func closeAttachSession(tok string, session *attachSession) {
 }
 
 func ListenAttach(ctx context.Context, cfg AttachListenConfig) (*AttachListener, error) {
-	_ = cfg
+	if cfg.UsePublicDERP {
+		return listenAttachExternal(ctx, cfg)
+	}
 	tok, session, err := issueLocalAttachToken()
 	if err != nil {
 		return nil, err
@@ -151,7 +153,16 @@ func ListenAttach(ctx context.Context, cfg AttachListenConfig) (*AttachListener,
 }
 
 func DialAttach(ctx context.Context, cfg AttachDialConfig) (net.Conn, error) {
-	_ = cfg
+	if cfg.UsePublicDERP {
+		tok, err := token.Decode(cfg.Token, time.Now())
+		if err != nil {
+			return nil, err
+		}
+		if tok.Capabilities&token.CapabilityAttach == 0 {
+			return nil, ErrUnknownSession
+		}
+		return dialAttachExternal(ctx, cfg, tok)
+	}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
