@@ -12,6 +12,8 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -85,6 +87,23 @@ func readExternalDirectUDPProbePacket(t *testing.T, conn net.PacketConn, timeout
 		t.Fatalf("UnmarshalPacket() error = %v", err)
 	}
 	return packet
+}
+
+type transientNoBufferPacketConn struct {
+	net.PacketConn
+
+	mu        sync.Mutex
+	remaining int
+}
+
+func (c *transientNoBufferPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.remaining > 0 {
+		c.remaining--
+		return 0, syscall.ENOBUFS
+	}
+	return c.PacketConn.WriteTo(p, addr)
 }
 
 func TestWaitForPeerAckWithTimeoutReturnsWhenPeerNeverAcks(t *testing.T) {
@@ -3592,6 +3611,53 @@ func TestExternalDirectUDPSendRateProbesParallelUsesActiveLaneSubset(t *testing.
 	}
 	if <-seenB {
 		t.Fatal("lane B received a low-rate probe packet, want low probe to use one active lane")
+	}
+}
+
+func TestExternalDirectUDPSendRateProbesParallelRetriesTransientNoBufferSpace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	serverConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverConn.Close()
+
+	clientBase, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientBase.Close()
+
+	clientConn := &transientNoBufferPacketConn{PacketConn: clientBase, remaining: 1}
+
+	seen := make(chan bool, 1)
+	go func() {
+		defer close(seen)
+		buf := make([]byte, 2048)
+		_ = serverConn.SetReadDeadline(time.Now().Add(time.Second))
+		for {
+			n, _, err := serverConn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if _, ok := externalDirectUDPRateProbeIndex(buf[:n], 1); ok {
+				seen <- true
+				return
+			}
+		}
+	}()
+
+	sent, err := externalDirectUDPSendRateProbesParallel(ctx, []net.PacketConn{clientConn}, []string{serverConn.LocalAddr().String()}, []int{8})
+	if err != nil {
+		t.Fatalf("externalDirectUDPSendRateProbesParallel() error = %v", err)
+	}
+	if len(sent) != 1 || sent[0].BytesSent <= 0 {
+		t.Fatalf("sent samples = %#v, want one sample with bytes", sent)
+	}
+	if !<-seen {
+		t.Fatal("server did not receive a rate probe packet after transient ENOBUFS")
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/shayne/derpcat/pkg/derpbind"
@@ -2484,6 +2485,17 @@ func externalDirectUDPSendRateProbesParallel(ctx context.Context, conns []net.Pa
 					}
 					n, err := conns[lane].WriteTo(payload, remotes[lane])
 					if err != nil {
+						if errors.Is(err, syscall.ENOBUFS) {
+							if err := sleepWithContext(tierCtx, 250*time.Microsecond); err != nil {
+								if errors.Is(err, context.Canceled) && ctx.Err() == nil {
+									return
+								}
+								errCh <- err
+								cancel()
+								return
+							}
+							continue
+						}
 						errCh <- err
 						cancel()
 						return
