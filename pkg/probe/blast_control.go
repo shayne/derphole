@@ -141,3 +141,26 @@ func handleBlastSendControlEvent(ctx context.Context, batcher packetBatcher, pee
 	}
 	return false, false, nil
 }
+
+func observeStripedBlastStatsEvent(stats *TransferStats, history *blastRepairHistory, control *blastSendControl, event blastSendControlEvent) bool {
+	if event.typ != PacketTypeStats {
+		return false
+	}
+	receiverStats, ok := unmarshalBlastStatsPayload(event.payload)
+	if !ok {
+		return false
+	}
+	if history != nil {
+		history.AckFloor(receiverStats.AckFloor)
+		if stats != nil {
+			stats.MaxReplayBytes = max(stats.MaxReplayBytes, history.MaxReplayBytes())
+		}
+	}
+	if control != nil {
+		control.ObserveReceiverStatsPayload(receiverStats, event.receivedAt, false)
+	}
+	if stats != nil {
+		stats.observePeakGoodput(event.receivedAt, int64(receiverStats.ReceivedPayloadBytes))
+	}
+	return true
+}

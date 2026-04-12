@@ -166,7 +166,7 @@ func SendWireGuard(ctx context.Context, conn net.PacketConn, src io.Reader, cfg 
 				return TransferStats{}, err
 			}
 			probeWGTracef("send single done sent=%d", stats.BytesSent)
-			stats.CompletedAt = time.Now()
+			stats.markComplete(time.Now())
 			return stats, nil
 		}
 		if readErr != nil {
@@ -252,7 +252,7 @@ func ReceiveWireGuardToWriter(ctx context.Context, conn net.PacketConn, dst io.W
 				}
 			}
 			probeWGTracef("recv single done received=%d", stats.BytesReceived)
-			stats.CompletedAt = time.Now()
+			stats.markComplete(time.Now())
 			return stats, nil
 		}
 		if readErr != nil {
@@ -419,7 +419,7 @@ func sendWireGuardParallel(ctx context.Context, stats *TransferStats, dial func(
 	}
 	stats.BytesSent = total.Load()
 	stats.PeakGoodputMbps = peak.PeakMbps()
-	stats.CompletedAt = time.Now()
+	stats.markComplete(time.Now())
 	return *stats, nil
 }
 
@@ -617,7 +617,7 @@ func receiveWireGuardParallel(ctx context.Context, stats *TransferStats, ln net.
 	}
 	stats.BytesReceived = min(total.Load(), cfg.SizeBytes)
 	stats.PeakGoodputMbps = peak.PeakMbps()
-	stats.CompletedAt = time.Now()
+	stats.markComplete(time.Now())
 	return *stats, nil
 }
 

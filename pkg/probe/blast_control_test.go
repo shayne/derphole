@@ -200,6 +200,26 @@ func TestHandleBlastSendControlEventTracksPeakGoodput(t *testing.T) {
 	}
 }
 
+func TestObserveStripedBlastStatsEventTracksPeakGoodput(t *testing.T) {
+	now := time.Unix(13, 0)
+	control := newBlastSendControl(100, 400, now)
+	stats := TransferStats{}
+	stats.observePeakGoodput(now, 0)
+
+	event := blastSendControlEvent{
+		typ:        PacketTypeStats,
+		payload:    marshalBlastStatsPayload(blastReceiverStats{ReceivedPayloadBytes: 1 << 20, AckFloor: 1}),
+		receivedAt: now.Add(100 * time.Millisecond),
+	}
+
+	if ok := observeStripedBlastStatsEvent(&stats, nil, control, event); !ok {
+		t.Fatal("observeStripedBlastStatsEvent() = false, want true")
+	}
+	if stats.PeakGoodputMbps <= 0 {
+		t.Fatalf("PeakGoodputMbps = %f, want > 0", stats.PeakGoodputMbps)
+	}
+}
+
 func TestHandleBlastSendControlEventRepairRequestBacksOffAdaptiveRate(t *testing.T) {
 	now := time.Unix(15, 0)
 	control := newBlastSendControl(525, 700, now)
