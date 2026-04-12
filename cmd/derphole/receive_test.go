@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	pkgderphole "github.com/shayne/derpcat/pkg/derphole"
+	"github.com/shayne/derpcat/pkg/session"
 )
 
 func TestRunHelpReceiveAliasesShowReceiveHelp(t *testing.T) {
@@ -48,6 +49,9 @@ func TestRunReceiveWithoutCodeAllocatesTransfer(t *testing.T) {
 		if !cfg.UsePublicDERP {
 			t.Fatal("cfg.UsePublicDERP = false, want true")
 		}
+		if got, want := cfg.ParallelPolicy, session.DefaultParallelPolicy(); got != want {
+			t.Fatalf("cfg.ParallelPolicy = %#v, want %#v", got, want)
+		}
 		return nil
 	}
 
@@ -75,6 +79,9 @@ func TestRunReceiveWithCodeInvokesTransfer(t *testing.T) {
 		}
 		if cfg.Token != "7-purple-sausages" {
 			t.Fatalf("cfg.Token = %q, want %q", cfg.Token, "7-purple-sausages")
+		}
+		if got, want := cfg.ParallelPolicy, session.DefaultParallelPolicy(); got != want {
+			t.Fatalf("cfg.ParallelPolicy = %#v, want %#v", got, want)
 		}
 		return nil
 	}

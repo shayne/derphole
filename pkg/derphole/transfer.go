@@ -30,6 +30,7 @@ type SendConfig struct {
 	Emitter        *telemetry.Emitter
 	UsePublicDERP  bool
 	ForceRelay     bool
+	ParallelPolicy session.ParallelPolicy
 }
 
 type ReceiveConfig struct {
@@ -44,6 +45,7 @@ type ReceiveConfig struct {
 	Emitter        *telemetry.Emitter
 	UsePublicDERP  bool
 	ForceRelay     bool
+	ParallelPolicy session.ParallelPolicy
 }
 
 type directorySummary struct {
@@ -59,7 +61,24 @@ type sendTransfer struct {
 	progressTotal int64
 }
 
+var (
+	derpholeSessionDialAttach = session.DialAttach
+	derpholeSessionListen     = session.Listen
+	derpholeSessionOffer      = session.Offer
+	derpholeSessionReceive    = session.Receive
+	derpholeSessionSend       = session.Send
+)
+
+func normalizeParallelPolicy(policy session.ParallelPolicy) session.ParallelPolicy {
+	if policy == (session.ParallelPolicy{}) {
+		return session.DefaultParallelPolicy()
+	}
+	return policy
+}
+
 func Send(ctx context.Context, cfg SendConfig) error {
+	cfg.ParallelPolicy = normalizeParallelPolicy(cfg.ParallelPolicy)
+
 	tx, err := prepareSendTransfer(cfg)
 	if err != nil {
 		return err
@@ -83,11 +102,12 @@ func Send(ctx context.Context, cfg SendConfig) error {
 		return errors.New("this code expects `derphole receive`, not `derphole send`")
 	case tok.Capabilities&token.CapabilityAttach != 0:
 		tx.header.Verify = VerificationString(cfg.Token)
-		conn, err := session.DialAttach(ctx, session.AttachDialConfig{
-			Token:         cfg.Token,
-			Emitter:       cfg.Emitter,
-			UsePublicDERP: cfg.UsePublicDERP,
-			ForceRelay:    cfg.ForceRelay,
+		conn, err := derpholeSessionDialAttach(ctx, session.AttachDialConfig{
+			Token:          cfg.Token,
+			Emitter:        cfg.Emitter,
+			UsePublicDERP:  cfg.UsePublicDERP,
+			ForceRelay:     cfg.ForceRelay,
+			ParallelPolicy: cfg.ParallelPolicy,
 		})
 		if err != nil {
 			return err
@@ -100,6 +120,8 @@ func Send(ctx context.Context, cfg SendConfig) error {
 }
 
 func Receive(ctx context.Context, cfg ReceiveConfig) error {
+	cfg.ParallelPolicy = normalizeParallelPolicy(cfg.ParallelPolicy)
+
 	stdin := cfg.Stdin
 	if stdin == nil {
 		stdin = strings.NewReader("")
@@ -110,7 +132,7 @@ func Receive(ctx context.Context, cfg ReceiveConfig) error {
 		pipeReader, pipeWriter := io.Pipe()
 		listenErrCh := make(chan error, 1)
 		go func() {
-			_, err := session.Listen(ctx, session.ListenConfig{
+			_, err := derpholeSessionListen(ctx, session.ListenConfig{
 				Emitter:       cfg.Emitter,
 				TokenSink:     tokenSink,
 				StdioOut:      pipeWriter,
@@ -162,7 +184,7 @@ func Receive(ctx context.Context, cfg ReceiveConfig) error {
 		pipeReader, pipeWriter := io.Pipe()
 		receiveErrCh := make(chan error, 1)
 		go func() {
-			err := session.Receive(ctx, session.ReceiveConfig{
+			err := derpholeSessionReceive(ctx, session.ReceiveConfig{
 				Token:         receiveToken,
 				Emitter:       cfg.Emitter,
 				StdioOut:      pipeWriter,
@@ -183,11 +205,12 @@ func Receive(ctx context.Context, cfg ReceiveConfig) error {
 	case tok.Capabilities&token.CapabilityStdio != 0:
 		return errors.New("this code expects `derphole send`, not `derphole receive`")
 	case tok.Capabilities&token.CapabilityAttach != 0:
-		conn, err := session.DialAttach(ctx, session.AttachDialConfig{
-			Token:         receiveToken,
-			Emitter:       cfg.Emitter,
-			UsePublicDERP: cfg.UsePublicDERP,
-			ForceRelay:    cfg.ForceRelay,
+		conn, err := derpholeSessionDialAttach(ctx, session.AttachDialConfig{
+			Token:          receiveToken,
+			Emitter:        cfg.Emitter,
+			UsePublicDERP:  cfg.UsePublicDERP,
+			ForceRelay:     cfg.ForceRelay,
+			ParallelPolicy: cfg.ParallelPolicy,
 		})
 		if err != nil {
 			return err
@@ -306,12 +329,13 @@ func offerTransfer(ctx context.Context, cfg SendConfig, tx sendTransfer) error {
 	tokenSink := make(chan string, 1)
 	offerErrCh := make(chan error, 1)
 	go func() {
-		_, err := session.Offer(ctx, session.OfferConfig{
-			Emitter:       cfg.Emitter,
-			TokenSink:     tokenSink,
-			StdioIn:       pipeReader,
-			UsePublicDERP: cfg.UsePublicDERP,
-			ForceRelay:    cfg.ForceRelay,
+		_, err := derpholeSessionOffer(ctx, session.OfferConfig{
+			Emitter:        cfg.Emitter,
+			TokenSink:      tokenSink,
+			StdioIn:        pipeReader,
+			UsePublicDERP:  cfg.UsePublicDERP,
+			ForceRelay:     cfg.ForceRelay,
+			ParallelPolicy: cfg.ParallelPolicy,
 		})
 		offerErrCh <- err
 	}()
@@ -341,12 +365,13 @@ func sendViaSession(ctx context.Context, cfg SendConfig, tx sendTransfer) error 
 	pipeReader, pipeWriter := io.Pipe()
 	sendErrCh := make(chan error, 1)
 	go func() {
-		sendErrCh <- session.Send(ctx, session.SendConfig{
-			Token:         cfg.Token,
-			Emitter:       cfg.Emitter,
-			StdioIn:       pipeReader,
-			UsePublicDERP: cfg.UsePublicDERP,
-			ForceRelay:    cfg.ForceRelay,
+		sendErrCh <- derpholeSessionSend(ctx, session.SendConfig{
+			Token:          cfg.Token,
+			Emitter:        cfg.Emitter,
+			StdioIn:        pipeReader,
+			UsePublicDERP:  cfg.UsePublicDERP,
+			ForceRelay:     cfg.ForceRelay,
+			ParallelPolicy: cfg.ParallelPolicy,
 		})
 	}()
 

@@ -3,11 +3,16 @@ package derphole
 import (
 	"bytes"
 	"context"
+	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/shayne/derpcat/pkg/session"
+	"github.com/shayne/derpcat/pkg/token"
 )
 
 func TestSendTextIssuesTokenAndTransfersPayload(t *testing.T) {
@@ -242,6 +247,65 @@ func TestSendTextDoesNotEmitProgressBar(t *testing.T) {
 	}
 	if strings.Contains(recvErr.String(), "100%|") {
 		t.Fatalf("receive stderr = %q, want no progress bar for text", recvErr.String())
+	}
+}
+
+func TestSendDefaultsParallelPolicyForOffer(t *testing.T) {
+	prev := derpholeSessionOffer
+	t.Cleanup(func() {
+		derpholeSessionOffer = prev
+	})
+
+	sentinel := errors.New("sentinel-offer")
+	var got session.OfferConfig
+	derpholeSessionOffer = func(_ context.Context, cfg session.OfferConfig) (string, error) {
+		got = cfg
+		return "", sentinel
+	}
+
+	err := Send(context.Background(), SendConfig{Text: "hello"})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Send() error = %v, want %v", err, sentinel)
+	}
+	if got.TokenSink == nil {
+		t.Fatal("got.TokenSink = nil, want allocated sink")
+	}
+	if gotPolicy, want := got.ParallelPolicy, session.DefaultParallelPolicy(); gotPolicy != want {
+		t.Fatalf("got.ParallelPolicy = %#v, want %#v", gotPolicy, want)
+	}
+}
+
+func TestReceiveDefaultsParallelPolicyForAttachDial(t *testing.T) {
+	prev := derpholeSessionDialAttach
+	t.Cleanup(func() {
+		derpholeSessionDialAttach = prev
+	})
+
+	sentinel := errors.New("sentinel-attach")
+	var got session.AttachDialConfig
+	derpholeSessionDialAttach = func(_ context.Context, cfg session.AttachDialConfig) (net.Conn, error) {
+		got = cfg
+		return nil, sentinel
+	}
+
+	tok, err := token.Encode(token.Token{
+		Version:      token.SupportedVersion,
+		ExpiresUnix:  time.Now().Add(time.Hour).Unix(),
+		Capabilities: token.CapabilityAttach,
+	})
+	if err != nil {
+		t.Fatalf("token.Encode() error = %v", err)
+	}
+
+	err = Receive(context.Background(), ReceiveConfig{Token: tok})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Receive() error = %v, want %v", err, sentinel)
+	}
+	if got.Token != tok {
+		t.Fatalf("got.Token = %q, want %q", got.Token, tok)
+	}
+	if gotPolicy, want := got.ParallelPolicy, session.DefaultParallelPolicy(); gotPolicy != want {
+		t.Fatalf("got.ParallelPolicy = %#v, want %#v", gotPolicy, want)
 	}
 }
 

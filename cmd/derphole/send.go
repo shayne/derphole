@@ -6,6 +6,7 @@ import (
 	"io"
 
 	pkgderphole "github.com/shayne/derpcat/pkg/derphole"
+	"github.com/shayne/derpcat/pkg/session"
 	"github.com/shayne/derpcat/pkg/telemetry"
 	"github.com/shayne/yargs"
 )
@@ -78,9 +79,10 @@ func runSend(args []string, level telemetry.Level, stdin io.Reader, stdout, stde
 			}
 			return stderr
 		}(),
-		Emitter:       telemetry.New(stderr, commandSessionTelemetryLevel(level)),
-		UsePublicDERP: usePublicDERPTransport(),
-		ForceRelay:    parsed.SubCommandFlags.ForceRelay,
+		Emitter:        telemetry.New(stderr, commandSessionTelemetryLevel(level)),
+		UsePublicDERP:  usePublicDERPTransport(),
+		ForceRelay:     parsed.SubCommandFlags.ForceRelay,
+		ParallelPolicy: session.DefaultParallelPolicy(),
 	}); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
