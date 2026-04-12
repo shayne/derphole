@@ -200,11 +200,23 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) error {
 
 	var relayPrefixPackets <-chan derpbind.Packet
 	var unsubscribeRelayPrefix func()
+	var readyCh <-chan derpbind.Packet
+	var unsubscribeReady func()
+	var startCh <-chan derpbind.Packet
+	var unsubscribeStart func()
 	if !cfg.ForceRelay {
 		relayPrefixPackets, unsubscribeRelayPrefix = derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
 			return pkt.From == listenerDERP && externalRelayPrefixDERPFrameKindOf(pkt.Payload) != 0
 		})
 		defer unsubscribeRelayPrefix()
+		readyCh, unsubscribeReady = derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
+			return pkt.From == listenerDERP && isDirectUDPReadyPayload(pkt.Payload)
+		})
+		defer unsubscribeReady()
+		startCh, unsubscribeStart = derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
+			return pkt.From == listenerDERP && isDirectUDPStartPayload(pkt.Payload)
+		})
+		defer unsubscribeStart()
 	}
 
 	probeConns, portmaps, cleanupProbeConns, err := externalDirectUDPConnsFn(nil, nil, externalDirectUDPParallelism, cfg.Emitter)
@@ -250,15 +262,6 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) error {
 
 	pathEmitter := newTransportPathEmitter(cfg.Emitter)
 	pathEmitter.Emit(StateProbing)
-
-	readyCh, unsubscribeReady := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
-		return pkt.From == listenerDERP && isDirectUDPReadyPayload(pkt.Payload)
-	})
-	defer unsubscribeReady()
-	startCh, unsubscribeStart := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
-		return pkt.From == listenerDERP && isDirectUDPStartPayload(pkt.Payload)
-	})
-	defer unsubscribeStart()
 
 	transportCtx, transportCancel := context.WithCancel(ctx)
 	defer transportCancel()
