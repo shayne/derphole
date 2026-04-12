@@ -11,11 +11,33 @@ import (
 )
 
 var (
-	attachMu        sync.Mutex
-	attachMailboxes = map[string]chan net.Conn{}
+	attachMu       sync.Mutex
+	attachSessions = map[string]*attachSession{}
 )
 
-func issueLocalAttachToken() (string, chan net.Conn, error) {
+type attachSession struct {
+	mailbox chan net.Conn
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func newAttachSession() *attachSession {
+	return &attachSession{
+		mailbox: make(chan net.Conn),
+		closed:  make(chan struct{}),
+	}
+}
+
+func (s *attachSession) close() {
+	if s == nil {
+		return
+	}
+	s.once.Do(func() {
+		close(s.closed)
+	})
+}
+
+func issueLocalAttachToken() (string, *attachSession, error) {
 	var sessionID [16]byte
 	if _, err := rand.Read(sessionID[:]); err != nil {
 		return "", nil, err
@@ -37,41 +59,45 @@ func issueLocalAttachToken() (string, chan net.Conn, error) {
 		return "", nil, err
 	}
 
-	mailbox := make(chan net.Conn)
+	session := newAttachSession()
 	attachMu.Lock()
-	attachMailboxes[tok] = mailbox
+	attachSessions[tok] = session
 	attachMu.Unlock()
-	return tok, mailbox, nil
+	return tok, session, nil
+}
+
+func finishAttachSession(tok string, session *attachSession) {
+	if session == nil {
+		return
+	}
+	attachMu.Lock()
+	if attachSessions[tok] == session {
+		delete(attachSessions, tok)
+	}
+	attachMu.Unlock()
+	session.close()
 }
 
 func ListenAttach(ctx context.Context, cfg AttachListenConfig) (*AttachListener, error) {
-	tok, mailbox, err := issueLocalAttachToken()
+	tok, session, err := issueLocalAttachToken()
 	if err != nil {
 		return nil, err
 	}
 
-	closed := make(chan struct{})
-	var closeOnce sync.Once
 	listener := &AttachListener{Token: tok}
 	listener.accept = func(ctx context.Context) (net.Conn, error) {
 		select {
-		case conn := <-mailbox:
+		case conn := <-session.mailbox:
+			finishAttachSession(tok, session)
 			return conn, nil
-		case <-closed:
+		case <-session.closed:
 			return nil, net.ErrClosed
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 	}
 	listener.close = func() error {
-		closeOnce.Do(func() {
-			close(closed)
-			attachMu.Lock()
-			if attachMailboxes[tok] == mailbox {
-				delete(attachMailboxes, tok)
-			}
-			attachMu.Unlock()
-		})
+		finishAttachSession(tok, session)
 		return nil
 	}
 	return listener, nil
@@ -79,7 +105,7 @@ func ListenAttach(ctx context.Context, cfg AttachListenConfig) (*AttachListener,
 
 func DialAttach(ctx context.Context, cfg AttachDialConfig) (net.Conn, error) {
 	attachMu.Lock()
-	mailbox, ok := attachMailboxes[cfg.Token]
+	session, ok := attachSessions[cfg.Token]
 	attachMu.Unlock()
 	if !ok {
 		return nil, ErrUnknownSession
@@ -87,8 +113,13 @@ func DialAttach(ctx context.Context, cfg AttachDialConfig) (net.Conn, error) {
 
 	left, right := net.Pipe()
 	select {
-	case mailbox <- right:
+	case session.mailbox <- right:
+		finishAttachSession(cfg.Token, session)
 		return left, nil
+	case <-session.closed:
+		_ = left.Close()
+		_ = right.Close()
+		return nil, net.ErrClosed
 	case <-ctx.Done():
 		_ = left.Close()
 		_ = right.Close()

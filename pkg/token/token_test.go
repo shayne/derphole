@@ -182,7 +182,7 @@ func TestEncodeDecodeRoundTripAttachToken(t *testing.T) {
 		SessionID:    [16]byte{9, 8, 7, 6},
 		ExpiresUnix:  now.Add(time.Hour).Unix(),
 		BearerSecret: [32]byte{6, 7, 8, 9},
-		Capabilities: CapabilityAttach,
+		Capabilities: CapabilityStdio | CapabilityShare | CapabilityAttach,
 	}
 
 	encoded, err := Encode(tok)
@@ -194,8 +194,11 @@ func TestEncodeDecodeRoundTripAttachToken(t *testing.T) {
 		t.Fatalf("Decode() error = %v", err)
 	}
 
-	if decoded.Capabilities != CapabilityAttach {
-		t.Fatalf("Capabilities = %08b, want %08b", decoded.Capabilities, CapabilityAttach)
+	if decoded.Capabilities&CapabilityAttach == 0 {
+		t.Fatalf("Capabilities = %08b, want attach bit set", decoded.Capabilities)
+	}
+	if decoded.Capabilities&CapabilityStdio == 0 || decoded.Capabilities&CapabilityShare == 0 {
+		t.Fatalf("Capabilities = %08b, want mixed capability bits preserved", decoded.Capabilities)
 	}
 }
 
