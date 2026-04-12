@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"io"
 
+	pkgderphole "github.com/shayne/derpcat/pkg/derphole"
 	"github.com/shayne/derpcat/pkg/telemetry"
 	"github.com/shayne/yargs"
 )
 
-type sendFlags struct{}
+type sendFlags struct {
+	ForceRelay bool `flag:"force-relay" help:"Disable direct probing"`
+}
 
 type sendArgs struct {
 	What string `pos:"0?" help:"Optional text, file, or directory to send"`
@@ -29,7 +32,7 @@ var sendHelpConfig = yargs.HelpConfig{
 		"send": {
 			Name:        "send",
 			Description: "Send text, a file, or a directory.",
-			Usage:       "[what]",
+			Usage:       "[--force-relay] [what]",
 			Examples: []string{
 				"derphole send hello",
 				"derphole send ./photo.jpg",
@@ -38,11 +41,9 @@ var sendHelpConfig = yargs.HelpConfig{
 	},
 }
 
-func runSend(args []string, level telemetry.Level, stdin io.Reader, stdout, stderr io.Writer) int {
-	_ = level
-	_ = stdin
-	_ = stdout
+var runSendTransfer = pkgderphole.Send
 
+func runSend(args []string, level telemetry.Level, stdin io.Reader, stdout, stderr io.Writer) int {
 	parsed, err := yargs.ParseWithCommandAndHelp[struct{}, sendFlags, sendArgs](append([]string{"send"}, args...), sendHelpConfig)
 	if err != nil {
 		switch {
@@ -65,8 +66,20 @@ func runSend(args []string, level telemetry.Level, stdin io.Reader, stdout, stde
 		return 2
 	}
 
-	fmt.Fprintln(stderr, "derphole send is not implemented yet")
-	return 1
+	if err := runSendTransfer(commandContext(), pkgderphole.SendConfig{
+		What:          parsed.Args.What,
+		Stdin:         stdin,
+		Stdout:        stdout,
+		Stderr:        stderr,
+		Emitter:       telemetry.New(stderr, commandSessionTelemetryLevel(level)),
+		UsePublicDERP: usePublicDERPTransport(),
+		ForceRelay:    parsed.SubCommandFlags.ForceRelay,
+	}); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	return 0
 }
 
 func sendHelpText() string {

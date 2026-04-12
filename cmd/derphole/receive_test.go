@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
+
+	pkgderphole "github.com/shayne/derpcat/pkg/derphole"
 )
 
 func TestRunHelpReceiveAliasesShowReceiveHelp(t *testing.T) {
@@ -18,5 +21,64 @@ func TestRunHelpReceiveAliasesShowReceiveHelp(t *testing.T) {
 				t.Fatalf("stderr = %q, want %q", got, want)
 			}
 		})
+	}
+}
+
+func TestRunReceiveWithoutCodeAllocatesTransfer(t *testing.T) {
+	prev := runReceiveTransfer
+	t.Cleanup(func() {
+		runReceiveTransfer = prev
+	})
+
+	called := false
+	runReceiveTransfer = func(_ context.Context, cfg pkgderphole.ReceiveConfig) error {
+		called = true
+		if !cfg.Allocate {
+			t.Fatal("cfg.Allocate = false, want true")
+		}
+		if cfg.Token != "" {
+			t.Fatalf("cfg.Token = %q, want empty", cfg.Token)
+		}
+		if !cfg.UsePublicDERP {
+			t.Fatal("cfg.UsePublicDERP = false, want true")
+		}
+		return nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"receive"}, strings.NewReader("ignored"), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0, stderr=%q", code, stderr.String())
+	}
+	if !called {
+		t.Fatal("runReceiveTransfer was not called")
+	}
+}
+
+func TestRunReceiveWithCodeInvokesTransfer(t *testing.T) {
+	prev := runReceiveTransfer
+	t.Cleanup(func() {
+		runReceiveTransfer = prev
+	})
+
+	called := false
+	runReceiveTransfer = func(_ context.Context, cfg pkgderphole.ReceiveConfig) error {
+		called = true
+		if cfg.Allocate {
+			t.Fatal("cfg.Allocate = true, want false")
+		}
+		if cfg.Token != "7-purple-sausages" {
+			t.Fatalf("cfg.Token = %q, want %q", cfg.Token, "7-purple-sausages")
+		}
+		return nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"receive", "7-purple-sausages"}, strings.NewReader("ignored"), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0, stderr=%q", code, stderr.String())
+	}
+	if !called {
+		t.Fatal("runReceiveTransfer was not called")
 	}
 }
