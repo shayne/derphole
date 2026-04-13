@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/shayne/derpcat/pkg/derphole/protocol"
+	"github.com/shayne/derpcat/pkg/derphole/webproto"
+	"github.com/shayne/derpcat/pkg/derphole/webrelay"
 	"github.com/shayne/derpcat/pkg/session"
 	"github.com/shayne/derpcat/pkg/token"
 )
@@ -308,6 +310,79 @@ func TestReceiveDefaultsParallelPolicyForAttachDial(t *testing.T) {
 	}
 	if gotPolicy, want := got.ParallelPolicy, session.DefaultParallelPolicy(); gotPolicy != want {
 		t.Fatalf("got.ParallelPolicy = %#v, want %#v", gotPolicy, want)
+	}
+}
+
+func TestReceiveWebFileTokenUsesWebRelayReceiver(t *testing.T) {
+	prev := derpholeWebRelayReceive
+	t.Cleanup(func() {
+		derpholeWebRelayReceive = prev
+	})
+
+	tok, err := token.Encode(token.Token{
+		Version:      token.SupportedVersion,
+		ExpiresUnix:  time.Now().Add(time.Hour).Unix(),
+		Capabilities: token.CapabilityWebFile,
+	})
+	if err != nil {
+		t.Fatalf("token.Encode() error = %v", err)
+	}
+
+	var gotToken string
+	var gotSink webrelay.FileSink
+	var gotProgressOutput bool
+	derpholeWebRelayReceive = func(_ context.Context, encodedToken string, sink webrelay.FileSink, cb webrelay.Callbacks) error {
+		gotToken = encodedToken
+		gotSink = sink
+		gotProgressOutput = cb.Progress != nil
+		return nil
+	}
+
+	var recvErr bytes.Buffer
+	err = Receive(context.Background(), ReceiveConfig{
+		Token:          tok,
+		OutputPath:     t.TempDir(),
+		Stderr:         &recvErr,
+		ProgressOutput: &recvErr,
+	})
+	if err != nil {
+		t.Fatalf("Receive() error = %v", err)
+	}
+	if gotToken != tok {
+		t.Fatalf("web relay token = %q, want %q", gotToken, tok)
+	}
+	if gotSink == nil {
+		t.Fatal("web relay sink = nil, want native file sink")
+	}
+	if !gotProgressOutput {
+		t.Fatal("web relay progress callback not configured")
+	}
+}
+
+func TestNativeWebFileSinkWritesFileAndProgress(t *testing.T) {
+	dir := t.TempDir()
+	var stderr bytes.Buffer
+	sink := newNativeWebFileSink(dir, &stderr, &stderr)
+
+	if err := sink.Open(context.Background(), webproto.Meta{Name: "../payload.txt", Size: 5}); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := sink.WriteChunk(context.Background(), []byte("hello")); err != nil {
+		t.Fatalf("WriteChunk() error = %v", err)
+	}
+	if err := sink.Close(context.Background()); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dir, "payload.txt"))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("received = %q, want %q", got, "hello")
+	}
+	if log := stderr.String(); !strings.Contains(log, "Receiving file") || !strings.Contains(log, "100%|") {
+		t.Fatalf("stderr = %q, want receive summary and progress", log)
 	}
 }
 

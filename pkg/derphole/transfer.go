@@ -14,6 +14,8 @@ import (
 
 	dharchive "github.com/shayne/derpcat/pkg/derphole/archive"
 	"github.com/shayne/derpcat/pkg/derphole/protocol"
+	"github.com/shayne/derpcat/pkg/derphole/webproto"
+	"github.com/shayne/derpcat/pkg/derphole/webrelay"
 	"github.com/shayne/derpcat/pkg/session"
 	"github.com/shayne/derpcat/pkg/telemetry"
 	"github.com/shayne/derpcat/pkg/token"
@@ -69,6 +71,7 @@ var (
 	derpholeSessionOffer      = session.Offer
 	derpholeSessionReceive    = session.Receive
 	derpholeSessionSend       = session.Send
+	derpholeWebRelayReceive   = webrelay.Receive
 )
 
 func normalizeParallelPolicy(policy session.ParallelPolicy) session.ParallelPolicy {
@@ -219,9 +222,24 @@ func Receive(ctx context.Context, cfg ReceiveConfig) error {
 		}
 		defer conn.Close()
 		return readTransfer(conn, receiveToken, cfg.Stdout, cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput)
+	case tok.Capabilities&token.CapabilityWebFile != 0:
+		return receiveViaWebRelay(ctx, cfg, receiveToken)
 	default:
 		return errors.New("unsupported send code")
 	}
+}
+
+func receiveViaWebRelay(ctx context.Context, cfg ReceiveConfig, receiveToken string) error {
+	sink := newNativeWebFileSink(cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput)
+	cb := webrelay.Callbacks{
+		Status: func(status string) {
+			if cfg.Emitter != nil {
+				cfg.Emitter.Debug(status)
+			}
+		},
+		Progress: func(webrelay.Progress) {},
+	}
+	return derpholeWebRelayReceive(ctx, receiveToken, sink, cb)
 }
 
 func prepareSendTransfer(cfg SendConfig) (sendTransfer, error) {
@@ -478,6 +496,76 @@ func receiveFile(r io.Reader, header protocol.Header, outputPath string, stderr,
 	}
 	_, err = io.Copy(f, r)
 	return err
+}
+
+type nativeWebFileSink struct {
+	outputPath  string
+	stderr      io.Writer
+	progressOut io.Writer
+	progress    *ProgressReporter
+	file        *os.File
+}
+
+func newNativeWebFileSink(outputPath string, stderr, progressOut io.Writer) *nativeWebFileSink {
+	return &nativeWebFileSink{
+		outputPath:  outputPath,
+		stderr:      stderr,
+		progressOut: progressOut,
+	}
+}
+
+func (s *nativeWebFileSink) Open(_ context.Context, meta webproto.Meta) error {
+	target, err := ResolveOutputPath(s.outputPath, meta.Name)
+	if err != nil {
+		return err
+	}
+	if s.stderr != nil {
+		fmt.Fprintf(s.stderr, "Receiving file (%s) into: %q\n", formatProgressBytes(meta.Size), filepath.Base(target))
+	}
+	if dir := filepath.Dir(target); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+
+	f, err := os.Create(target)
+	if err != nil {
+		return err
+	}
+	s.file = f
+	s.progress = NewProgressReporter(s.progressOut, meta.Size)
+	return nil
+}
+
+func (s *nativeWebFileSink) WriteChunk(_ context.Context, chunk []byte) error {
+	if s.file == nil {
+		return errors.New("file sink is not open")
+	}
+	n, err := s.file.Write(chunk)
+	if n > 0 {
+		s.progress.Add(n)
+	}
+	if err != nil {
+		return err
+	}
+	if n != len(chunk) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func (s *nativeWebFileSink) Close(_ context.Context) error {
+	if s.file == nil {
+		return nil
+	}
+	err := s.file.Close()
+	s.file = nil
+	if err != nil {
+		s.progress.Abort()
+		return err
+	}
+	s.progress.Finish()
+	return nil
 }
 
 func receiveDirectory(r io.Reader, header protocol.Header, outputPath string, stderr, progressOut io.Writer) error {
