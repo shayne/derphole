@@ -338,7 +338,7 @@ func externalDirectUDPPacketAEAD(tok token.Token) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
-func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) error {
+func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) (retErr error) {
 	tok, err := token.Decode(cfg.Token, time.Now())
 	if err != nil {
 		return err
@@ -410,9 +410,24 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) error {
 		return errors.New("claim rejected")
 	}
 	ackCh, unsubscribeAck := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
-		return pkt.From == listenerDERP && isAckPayload(pkt.Payload)
+		return pkt.From == listenerDERP && isAckOrAbortPayload(pkt.Payload)
 	})
 	defer unsubscribeAck()
+	abortCh, unsubscribeAbort := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == listenerDERP && isAbortPayload(pkt.Payload)
+	})
+	defer unsubscribeAbort()
+	heartbeatCh, unsubscribeHeartbeat := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == listenerDERP && isHeartbeatPayload(pkt.Payload)
+	})
+	defer unsubscribeHeartbeat()
+	ctx, stopPeerAbort := withPeerControlContext(ctx, derpClient, listenerDERP, abortCh, heartbeatCh, func() int64 {
+		return countedSrc.Count()
+	})
+	defer stopPeerAbort()
+	defer notifyPeerAbortOnError(&retErr, ctx, derpClient, listenerDERP, func() int64 {
+		return countedSrc.Count()
+	})
 	readyAckCh, unsubscribeReadyAck := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == listenerDERP && isDirectUDPReadyAckPayload(pkt.Payload)
 	})
@@ -864,7 +879,7 @@ func sendExternalViaDirectUDPOnly(ctx context.Context, src io.Reader, tok token.
 	return externalExecutePreparedDirectUDPSendFn(ctx, src, plan, cfg, metrics)
 }
 
-func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (string, error) {
+func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (retTok string, retErr error) {
 	tok, session, err := issuePublicSession(ctx)
 	if err != nil {
 		return "", err
@@ -913,6 +928,28 @@ func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (string, 
 		if decision.Accept == nil {
 			return tok, errors.New("accepted decision missing accept payload")
 		}
+		abortCh, unsubscribeAbort := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
+			return pkt.From == peerDERP && isAbortPayload(pkt.Payload)
+		})
+		defer unsubscribeAbort()
+		var countedDst *byteCountingWriteCloser
+		heartbeatCh, unsubscribeHeartbeat := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
+			return pkt.From == peerDERP && isHeartbeatPayload(pkt.Payload)
+		})
+		defer unsubscribeHeartbeat()
+		ctx, stopPeerAbort := withPeerControlContext(ctx, session.derp, peerDERP, abortCh, heartbeatCh, func() int64 {
+			if countedDst == nil {
+				return 0
+			}
+			return countedDst.Count()
+		})
+		defer stopPeerAbort()
+		defer notifyPeerAbortOnError(&retErr, ctx, session.derp, peerDERP, func() int64 {
+			if countedDst == nil {
+				return 0
+			}
+			return countedDst.Count()
+		})
 		probeConn := session.probeConn
 		probeConns := []net.PacketConn{session.probeConn}
 		portmaps := []publicPortmap{publicSessionPortmap(session)}
@@ -966,7 +1003,7 @@ func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (string, 
 		if err != nil {
 			return tok, err
 		}
-		countedDst := newByteCountingWriteCloser(dst)
+		countedDst = newByteCountingWriteCloser(dst)
 		defer countedDst.Close()
 		var relayPrefixPackets <-chan derpbind.Packet
 		if !cfg.ForceRelay {

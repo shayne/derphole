@@ -70,7 +70,9 @@ func runReceive(args []string, level telemetry.Level, stdin io.Reader, stdout, s
 	}
 
 	token := parsed.Args.Code
-	if err := runReceiveTransfer(commandContext(), pkgderphole.ReceiveConfig{
+	ctx, stop := commandContext()
+	defer stop()
+	if err := runReceiveTransfer(ctx, pkgderphole.ReceiveConfig{
 		Token:      token,
 		Allocate:   token == "",
 		OutputPath: parsed.SubCommandFlags.Output,

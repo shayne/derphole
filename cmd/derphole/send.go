@@ -68,7 +68,9 @@ func runSend(args []string, level telemetry.Level, stdin io.Reader, stdout, stde
 		return 2
 	}
 
-	if err := runSendTransfer(commandContext(), pkgderphole.SendConfig{
+	ctx, stop := commandContext()
+	defer stop()
+	if err := runSendTransfer(ctx, pkgderphole.SendConfig{
 		What:   parsed.Args.What,
 		Stdin:  stdin,
 		Stdout: stdout,

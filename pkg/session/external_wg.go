@@ -200,7 +200,7 @@ func acceptExternalWGConns(ctx context.Context, ln net.Listener, count int) ([]n
 	return conns, nil
 }
 
-func sendExternalViaWGTunnel(ctx context.Context, cfg SendConfig) error {
+func sendExternalViaWGTunnel(ctx context.Context, cfg SendConfig) (retErr error) {
 	tok, err := token.Decode(cfg.Token, time.Now())
 	if err != nil {
 		return err
@@ -273,9 +273,24 @@ func sendExternalViaWGTunnel(ctx context.Context, cfg SendConfig) error {
 		return errors.New("claim rejected")
 	}
 	ackCh, unsubscribeAck := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
-		return pkt.From == listenerDERP && isAckPayload(pkt.Payload)
+		return pkt.From == listenerDERP && isAckOrAbortPayload(pkt.Payload)
 	})
 	defer unsubscribeAck()
+	abortCh, unsubscribeAbort := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == listenerDERP && isAbortPayload(pkt.Payload)
+	})
+	defer unsubscribeAbort()
+	heartbeatCh, unsubscribeHeartbeat := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == listenerDERP && isHeartbeatPayload(pkt.Payload)
+	})
+	defer unsubscribeHeartbeat()
+	ctx, stopPeerAbort := withPeerControlContext(ctx, derpClient, listenerDERP, abortCh, heartbeatCh, func() int64 {
+		return countedSrc.Count()
+	})
+	defer stopPeerAbort()
+	defer notifyPeerAbortOnError(&retErr, ctx, derpClient, listenerDERP, func() int64 {
+		return countedSrc.Count()
+	})
 
 	pathEmitter := newTransportPathEmitter(cfg.Emitter)
 	pathEmitter.Emit(StateProbing)
@@ -322,7 +337,7 @@ func sendExternalViaWGTunnel(ctx context.Context, cfg SendConfig) error {
 	return nil
 }
 
-func listenExternalViaWGTunnel(ctx context.Context, cfg ListenConfig) (string, error) {
+func listenExternalViaWGTunnel(ctx context.Context, cfg ListenConfig) (retTok string, retErr error) {
 	tok, session, err := issuePublicSession(ctx)
 	if err != nil {
 		return "", err
@@ -371,6 +386,28 @@ func listenExternalViaWGTunnel(ctx context.Context, cfg ListenConfig) (string, e
 		if decision.Accept == nil {
 			return tok, errors.New("accepted decision missing accept payload")
 		}
+		abortCh, unsubscribeAbort := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
+			return pkt.From == peerDERP && isAbortPayload(pkt.Payload)
+		})
+		defer unsubscribeAbort()
+		var countedDst *byteCountingWriteCloser
+		heartbeatCh, unsubscribeHeartbeat := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
+			return pkt.From == peerDERP && isHeartbeatPayload(pkt.Payload)
+		})
+		defer unsubscribeHeartbeat()
+		ctx, stopPeerAbort := withPeerControlContext(ctx, session.derp, peerDERP, abortCh, heartbeatCh, func() int64 {
+			if countedDst == nil {
+				return 0
+			}
+			return countedDst.Count()
+		})
+		defer stopPeerAbort()
+		defer notifyPeerAbortOnError(&retErr, ctx, session.derp, peerDERP, func() int64 {
+			if countedDst == nil {
+				return 0
+			}
+			return countedDst.Count()
+		})
 		decision.Accept.Parallel = clampExternalWGParallel(env.Claim.Parallel)
 
 		decision.Accept.Candidates = publicInitialProbeCandidates(session.probeConn, publicSessionPortmap(session))
@@ -394,7 +431,7 @@ func listenExternalViaWGTunnel(ctx context.Context, cfg ListenConfig) (string, e
 		if err != nil {
 			return tok, err
 		}
-		countedDst := newByteCountingWriteCloser(dst)
+		countedDst = newByteCountingWriteCloser(dst)
 		defer countedDst.Close()
 
 		tunnel, err := newExternalWGTunnel(externalWGTunnelConfig{

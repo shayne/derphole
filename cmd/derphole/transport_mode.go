@@ -3,11 +3,15 @@ package main
 import (
 	"context"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/shayne/derpcat/pkg/telemetry"
 )
 
-var commandContext = context.Background
+var commandContext = func() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+}
 
 func usePublicDERPTransport() bool {
 	return os.Getenv("DERPCAT_TEST_LOCAL_RELAY") != "1"

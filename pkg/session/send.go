@@ -10,6 +10,8 @@ import (
 )
 
 var ErrUnknownSession = errors.New("unknown session")
+var ErrPeerAborted = errors.New("peer aborted transfer")
+var ErrPeerDisconnected = errors.New("peer disconnected")
 
 func relayMailbox(tok string) (*relaySession, bool) {
 	relayMu.Lock()

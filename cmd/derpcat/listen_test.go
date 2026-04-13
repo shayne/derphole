@@ -328,7 +328,7 @@ func withCommandContext(t *testing.T, ctx context.Context) {
 	t.Helper()
 
 	prev := commandContext
-	commandContext = func() context.Context { return ctx }
+	commandContext = func() (context.Context, context.CancelFunc) { return ctx, func() {} }
 	t.Cleanup(func() {
 		commandContext = prev
 	})

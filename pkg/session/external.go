@@ -37,6 +37,8 @@ const (
 	envelopeDecision           = "decision"
 	envelopeControl            = "control"
 	envelopeAck                = "ack"
+	envelopeAbort              = "abort"
+	envelopeHeartbeat          = "heartbeat"
 	envelopeDirectUDPReady     = "direct_udp_ready"
 	envelopeDirectUDPReadyAck  = "direct_udp_ready_ack"
 	envelopeDirectUDPStart     = "direct_udp_start"
@@ -66,6 +68,9 @@ const externalCopyBufferSize = 256 << 10
 const defaultExternalNativeQUICConns = 4
 const externalClaimRetryInterval = 250 * time.Millisecond
 
+var peerHeartbeatInterval = 2 * time.Second
+var peerHeartbeatTimeout = 30 * time.Second
+
 var (
 	publicProbeTailscaleCGNATPrefix = netip.MustParsePrefix("100.64.0.0/10")
 	publicProbeTailscaleULAPrefix   = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
@@ -93,6 +98,8 @@ type envelope struct {
 	Decision           *rendezvous.Decision      `json:"decision,omitempty"`
 	Control            *transport.ControlMessage `json:"control,omitempty"`
 	Ack                *peerAck                  `json:"ack,omitempty"`
+	Abort              *peerAbort                `json:"abort,omitempty"`
+	Heartbeat          *peerHeartbeat            `json:"heartbeat,omitempty"`
 	DirectUDPReadyAck  *directUDPReadyAck        `json:"direct_udp_ready_ack,omitempty"`
 	DirectUDPStart     *directUDPStart           `json:"direct_udp_start,omitempty"`
 	DirectUDPRateProbe *directUDPRateProbeResult `json:"direct_udp_rate_probe,omitempty"`
@@ -111,6 +118,26 @@ type peerAck struct {
 
 func newPeerAck(bytesReceived int64) *peerAck {
 	return &peerAck{BytesReceived: &bytesReceived}
+}
+
+type peerAbort struct {
+	Reason           string `json:"reason,omitempty"`
+	BytesTransferred *int64 `json:"bytes_transferred,omitempty"`
+}
+
+func newPeerAbort(reason string, bytesTransferred int64) *peerAbort {
+	return &peerAbort{
+		Reason:           reason,
+		BytesTransferred: &bytesTransferred,
+	}
+}
+
+type peerHeartbeat struct {
+	BytesTransferred *int64 `json:"bytes_transferred,omitempty"`
+}
+
+func newPeerHeartbeat(bytesTransferred int64) *peerHeartbeat {
+	return &peerHeartbeat{BytesTransferred: &bytesTransferred}
 }
 
 type directUDPReadyAck struct {
@@ -2018,6 +2045,178 @@ func sendPeerAck(ctx context.Context, client *derpbind.Client, peerDERP key.Node
 	return sendEnvelope(ctx, client, peerDERP, envelope{Type: envelopeAck, Ack: newPeerAck(bytesReceived)})
 }
 
+func sendPeerAbortBestEffort(client *derpbind.Client, peerDERP key.NodePublic, reason string, bytesTransferred int64) {
+	if client == nil || peerDERP.IsZero() {
+		return
+	}
+	if reason == "" {
+		reason = "aborted"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+	defer cancel()
+	_ = sendEnvelope(ctx, client, peerDERP, envelope{
+		Type:  envelopeAbort,
+		Abort: newPeerAbort(reason, bytesTransferred),
+	})
+}
+
+func sendPeerHeartbeat(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, bytesTransferred int64) error {
+	if client == nil || peerDERP.IsZero() {
+		return nil
+	}
+	return sendEnvelope(ctx, client, peerDERP, envelope{
+		Type:      envelopeHeartbeat,
+		Heartbeat: newPeerHeartbeat(bytesTransferred),
+	})
+}
+
+func withPeerControlContext(parent context.Context, client *derpbind.Client, peerDERP key.NodePublic, abortCh <-chan derpbind.Packet, heartbeatCh <-chan derpbind.Packet, bytesTransferred func() int64) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancelCause(parent)
+	var stopOnce sync.Once
+	stopCh := make(chan struct{})
+	stop := func() {
+		stopOnce.Do(func() {
+			close(stopCh)
+			cancel(context.Canceled)
+		})
+	}
+	currentBytes := func() int64 {
+		if bytesTransferred == nil {
+			return 0
+		}
+		return bytesTransferred()
+	}
+
+	if abortCh != nil || heartbeatCh != nil {
+		go func() {
+			var timer *time.Timer
+			var timerC <-chan time.Time
+			if heartbeatCh != nil {
+				timeout := peerHeartbeatTimeout
+				if timeout <= 0 {
+					timeout = 30 * time.Second
+				}
+				timer = time.NewTimer(timeout)
+				timerC = timer.C
+				defer timer.Stop()
+			}
+			resetHeartbeatTimer := func() {
+				if timer == nil {
+					return
+				}
+				timeout := peerHeartbeatTimeout
+				if timeout <= 0 {
+					timeout = 30 * time.Second
+				}
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(timeout)
+			}
+			for {
+				select {
+				case pkt, ok := <-abortCh:
+					if !ok {
+						abortCh = nil
+						continue
+					}
+					env, err := decodeEnvelope(pkt.Payload)
+					if err == nil && env.Type == envelopeAbort {
+						cancel(ErrPeerAborted)
+						return
+					}
+				case pkt, ok := <-heartbeatCh:
+					if !ok {
+						heartbeatCh = nil
+						timerC = nil
+						continue
+					}
+					env, err := decodeEnvelope(pkt.Payload)
+					if err != nil || env.Type != envelopeHeartbeat {
+						continue
+					}
+					resetHeartbeatTimer()
+				case <-timerC:
+					cancel(ErrPeerDisconnected)
+					return
+				case <-ctx.Done():
+					return
+				case <-stopCh:
+					return
+				}
+				if abortCh == nil && heartbeatCh == nil {
+					return
+				}
+			}
+		}()
+	}
+
+	if client != nil && !peerDERP.IsZero() {
+		go func() {
+			interval := peerHeartbeatInterval
+			if interval <= 0 {
+				interval = 2 * time.Second
+			}
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				_ = sendPeerHeartbeat(ctx, client, peerDERP, currentBytes())
+				select {
+				case <-ticker.C:
+				case <-ctx.Done():
+					return
+				case <-stopCh:
+					return
+				}
+			}
+		}()
+	}
+
+	return ctx, stop
+}
+
+func normalizePeerAbortError(ctx context.Context, err error) error {
+	cause := context.Cause(ctx)
+	switch {
+	case errors.Is(cause, ErrPeerAborted):
+		return ErrPeerAborted
+	case errors.Is(cause, ErrPeerDisconnected):
+		return ErrPeerDisconnected
+	}
+	return err
+}
+
+func notifyPeerAbortOnError(errp *error, ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, bytesTransferred func() int64) {
+	if errp == nil {
+		return
+	}
+	*errp = normalizePeerAbortError(ctx, *errp)
+	if *errp == nil || errors.Is(*errp, ErrPeerAborted) || errors.Is(*errp, ErrPeerDisconnected) {
+		return
+	}
+	var bytes int64
+	if bytesTransferred != nil {
+		bytes = bytesTransferred()
+	}
+	sendPeerAbortBestEffort(client, peerDERP, peerAbortReason(*errp), bytes)
+}
+
+func peerAbortReason(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline_exceeded"
+	default:
+		return err.Error()
+	}
+}
+
 func waitForPeerAck(ctx context.Context, ch <-chan derpbind.Packet, bytesSent int64) error {
 	select {
 	case pkt, ok := <-ch:
@@ -2025,6 +2224,9 @@ func waitForPeerAck(ctx context.Context, ch <-chan derpbind.Packet, bytesSent in
 			return net.ErrClosed
 		}
 		env, err := decodeEnvelope(pkt.Payload)
+		if err == nil && env.Type == envelopeAbort {
+			return ErrPeerAborted
+		}
 		if err != nil || env.Type != envelopeAck {
 			return errors.New("unexpected peer ack payload")
 		}
@@ -2111,7 +2313,7 @@ func sendClaimAndReceiveDecisionWithTelemetry(
 	prefix string,
 ) (rendezvous.Decision, error) {
 	decisionCh, unsubscribe := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
-		return pkt.From == dst && isDecisionPayload(pkt.Payload)
+		return pkt.From == dst && isDecisionOrAbortPayload(pkt.Payload)
 	})
 	defer unsubscribe()
 
@@ -2136,7 +2338,13 @@ func sendClaimAndReceiveDecisionWithTelemetry(
 				return rendezvous.Decision{}, net.ErrClosed
 			}
 			env, err := decodeEnvelope(pkt.Payload)
-			if err != nil || env.Type != envelopeDecision || env.Decision == nil {
+			if err != nil {
+				continue
+			}
+			if env.Type == envelopeAbort {
+				return rendezvous.Decision{}, ErrPeerAborted
+			}
+			if env.Type != envelopeDecision || env.Decision == nil {
 				continue
 			}
 			if emitter != nil {
@@ -2566,6 +2774,30 @@ func isAckPayload(payload []byte) bool {
 	return err == nil && env.Type == envelopeAck
 }
 
+func isAckOrAbortPayload(payload []byte) bool {
+	if len(payload) == 0 || payload[0] != '{' {
+		return false
+	}
+	env, err := decodeEnvelope(payload)
+	return err == nil && (env.Type == envelopeAck || env.Type == envelopeAbort)
+}
+
+func isAbortPayload(payload []byte) bool {
+	if len(payload) == 0 || payload[0] != '{' {
+		return false
+	}
+	env, err := decodeEnvelope(payload)
+	return err == nil && env.Type == envelopeAbort
+}
+
+func isHeartbeatPayload(payload []byte) bool {
+	if len(payload) == 0 || payload[0] != '{' {
+		return false
+	}
+	env, err := decodeEnvelope(payload)
+	return err == nil && env.Type == envelopeHeartbeat
+}
+
 func isDirectUDPReadyAckPayload(payload []byte) bool {
 	if len(payload) == 0 || payload[0] != '{' {
 		return false
@@ -2650,10 +2882,20 @@ func isDecisionPayload(payload []byte) bool {
 	return err == nil && env.Type == envelopeDecision && env.Decision != nil
 }
 
+func isDecisionOrAbortPayload(payload []byte) bool {
+	if len(payload) == 0 || payload[0] != '{' {
+		return false
+	}
+	env, err := decodeEnvelope(payload)
+	return err == nil && (env.Type == envelopeDecision || env.Type == envelopeAbort)
+}
+
 func isTransportDataPayload(payload []byte) bool {
 	return !isTransportControlPayload(payload) &&
 		externalRelayPrefixDERPFrameKindOf(payload) == 0 &&
 		!isAckPayload(payload) &&
+		!isAbortPayload(payload) &&
+		!isHeartbeatPayload(payload) &&
 		!isDirectUDPReadyAckPayload(payload) &&
 		!isDirectUDPRateProbePayload(payload) &&
 		!isClaimPayload(payload) &&

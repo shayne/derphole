@@ -125,7 +125,9 @@ func runSSHInvite(args []string, level telemetry.Level, stdin io.Reader, stderr 
 		return 2
 	}
 
-	if err := runSSHInviteCommand(commandContext(), sshInviteCommandConfig{
+	ctx, stop := commandContext()
+	defer stop()
+	if err := runSSHInviteCommand(ctx, sshInviteCommandConfig{
 		User:          parsed.SubCommandFlags.User,
 		Stderr:        stderr,
 		Emitter:       telemetry.New(stderr, commandSessionTelemetryLevel(level)),
@@ -165,7 +167,9 @@ func runSSHAccept(args []string, level telemetry.Level, stdin io.Reader, stderr 
 		return 2
 	}
 
-	if err := runSSHAcceptCommand(commandContext(), sshAcceptCommandConfig{
+	ctx, stop := commandContext()
+	defer stop()
+	if err := runSSHAcceptCommand(ctx, sshAcceptCommandConfig{
 		Token:         parsed.Args.Token,
 		KeyFile:       parsed.SubCommandFlags.KeyFile,
 		Yes:           parsed.SubCommandFlags.Yes,

@@ -16,7 +16,7 @@ import (
 	"tailscale.com/types/key"
 )
 
-func offerExternal(ctx context.Context, cfg OfferConfig) (string, error) {
+func offerExternal(ctx context.Context, cfg OfferConfig) (retTok string, retErr error) {
 	tok, session, err := issuePublicSessionWithCapabilities(ctx, token.CapabilityStdioOffer)
 	if err != nil {
 		return "", err
@@ -73,6 +73,28 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (string, error) {
 		if decision.Accept == nil {
 			return tok, errors.New("accepted decision missing accept payload")
 		}
+		abortCh, unsubscribeAbort := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
+			return pkt.From == peerDERP && isAbortPayload(pkt.Payload)
+		})
+		defer unsubscribeAbort()
+		var countedSrc *byteCountingReadCloser
+		heartbeatCh, unsubscribeHeartbeat := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
+			return pkt.From == peerDERP && isHeartbeatPayload(pkt.Payload)
+		})
+		defer unsubscribeHeartbeat()
+		ctx, stopPeerAbort := withPeerControlContext(ctx, session.derp, peerDERP, abortCh, heartbeatCh, func() int64 {
+			if countedSrc == nil {
+				return 0
+			}
+			return countedSrc.Count()
+		})
+		defer stopPeerAbort()
+		defer notifyPeerAbortOnError(&retErr, ctx, session.derp, peerDERP, func() int64 {
+			if countedSrc == nil {
+				return 0
+			}
+			return countedSrc.Count()
+		})
 
 		probeConn := session.probeConn
 		probeConns := []net.PacketConn{session.probeConn}
@@ -95,7 +117,7 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (string, error) {
 
 		localCandidates := parseCandidateStrings(decision.Accept.Candidates)
 		ackCh, unsubscribeAck := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
-			return pkt.From == peerDERP && isAckPayload(pkt.Payload)
+			return pkt.From == peerDERP && isAckOrAbortPayload(pkt.Payload)
 		})
 		defer unsubscribeAck()
 		readyAckCh, unsubscribeReadyAck := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
@@ -134,7 +156,7 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (string, error) {
 		if err != nil {
 			return tok, err
 		}
-		countedSrc := newByteCountingReadCloser(src)
+		countedSrc = newByteCountingReadCloser(src)
 		defer countedSrc.Close()
 
 		if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
@@ -186,7 +208,7 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (string, error) {
 	}
 }
 
-func receiveExternal(ctx context.Context, cfg ReceiveConfig) error {
+func receiveExternal(ctx context.Context, cfg ReceiveConfig) (retErr error) {
 	tok, err := token.Decode(cfg.Token, time.Now())
 	if err != nil {
 		return err
@@ -296,6 +318,28 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) error {
 	if decision.Accept == nil {
 		return errors.New("accepted decision missing accept payload")
 	}
+	abortCh, unsubscribeAbort := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == listenerDERP && isAbortPayload(pkt.Payload)
+	})
+	defer unsubscribeAbort()
+	var countedDst *byteCountingWriteCloser
+	heartbeatCh, unsubscribeHeartbeat := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == listenerDERP && isHeartbeatPayload(pkt.Payload)
+	})
+	defer unsubscribeHeartbeat()
+	ctx, stopPeerAbort := withPeerControlContext(ctx, derpClient, listenerDERP, abortCh, heartbeatCh, func() int64 {
+		if countedDst == nil {
+			return 0
+		}
+		return countedDst.Count()
+	})
+	defer stopPeerAbort()
+	defer notifyPeerAbortOnError(&retErr, ctx, derpClient, listenerDERP, func() int64 {
+		if countedDst == nil {
+			return 0
+		}
+		return countedDst.Count()
+	})
 
 	pathEmitter := newTransportPathEmitter(cfg.Emitter)
 	pathEmitter.Emit(StateProbing)
@@ -322,7 +366,7 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) error {
 	if err != nil {
 		return err
 	}
-	countedDst := newByteCountingWriteCloser(dst)
+	countedDst = newByteCountingWriteCloser(dst)
 	defer countedDst.Close()
 
 	var receiveErr error

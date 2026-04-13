@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os/signal"
+	"syscall"
 
 	"github.com/shayne/derpcat/pkg/session"
 	"github.com/shayne/derpcat/pkg/telemetry"
@@ -39,7 +41,9 @@ var listenHelpConfig = yargs.HelpConfig{
 	},
 }
 
-var commandContext = context.Background
+var commandContext = func() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+}
 
 func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) int {
 	parsed, err := yargs.ParseWithCommandAndHelp[struct{}, listenFlags, struct{}](append([]string{"listen"}, args...), listenHelpConfig)
@@ -67,8 +71,10 @@ func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) i
 	emitter := telemetry.New(stderr, commandSessionTelemetryLevel(level))
 	tokenSink := make(chan string, 1)
 	done := make(chan error, 1)
+	ctx, stop := commandContext()
+	defer stop()
 	go func() {
-		_, err := session.Listen(commandContext(), session.ListenConfig{
+		_, err := session.Listen(ctx, session.ListenConfig{
 			Emitter:       emitter,
 			TokenSink:     tokenSink,
 			StdioOut:      stdout,

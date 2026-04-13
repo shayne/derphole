@@ -201,6 +201,74 @@ func TestPublicRelayOnlyStdioRoundTripSingleStripe(t *testing.T) {
 	}
 }
 
+func TestPublicRelayOnlyListenerExitsWhenSenderCancels(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var listenerOut bytes.Buffer
+	var listenerStatus syncBuffer
+	var senderStatus syncBuffer
+	tokenSink := make(chan string, 1)
+	listenErr := make(chan error, 1)
+	go func() {
+		_, err := Listen(ctx, ListenConfig{
+			Emitter:       telemetry.New(&listenerStatus, telemetry.LevelVerbose),
+			TokenSink:     tokenSink,
+			StdioOut:      &listenerOut,
+			ForceRelay:    true,
+			UsePublicDERP: true,
+		})
+		listenErr <- err
+	}()
+
+	token := <-tokenSink
+	sendCtx, cancelSend := context.WithCancel(ctx)
+	pr, pw := io.Pipe()
+	sendErr := make(chan error, 1)
+	go func() {
+		sendErr <- Send(sendCtx, SendConfig{
+			Token:         token,
+			Emitter:       telemetry.New(&senderStatus, telemetry.LevelVerbose),
+			StdioIn:       pr,
+			ForceRelay:    true,
+			UsePublicDERP: true,
+		})
+	}()
+
+	waitCtx, waitCancel := context.WithTimeout(ctx, 3*time.Second)
+	if err := waitForSessionTestStatusContains(waitCtx, &senderStatus, string(StateRelay)); err != nil {
+		waitCancel()
+		t.Fatalf("sender did not reach relay before cancellation: %v; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+	}
+	waitCancel()
+
+	cancelSend()
+	_ = pw.CloseWithError(context.Canceled)
+	_ = pr.Close()
+
+	select {
+	case err := <-sendErr:
+		if err == nil {
+			t.Fatal("Send() error = nil, want cancellation error")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Send() did not exit after cancellation; listener=%q sender=%q", listenerStatus.String(), senderStatus.String())
+	}
+
+	select {
+	case err := <-listenErr:
+		if !errors.Is(err, ErrPeerAborted) {
+			t.Fatalf("Listen() error = %v, want %v; listener=%q sender=%q", err, ErrPeerAborted, listenerStatus.String(), senderStatus.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Listen() did not exit after sender cancellation; listener=%q sender=%q", listenerStatus.String(), senderStatus.String())
+	}
+}
+
 func TestSessionPromotesDirectStateWhenProbeSucceeds(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

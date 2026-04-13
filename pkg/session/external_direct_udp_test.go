@@ -189,6 +189,168 @@ func TestWaitForPeerAckAcceptsMatchingReceivedByteCount(t *testing.T) {
 	}
 }
 
+func TestWaitForPeerAckReturnsPeerAborted(t *testing.T) {
+	payload := []byte(`{"type":"abort","abort":{"reason":"canceled","bytes_transferred":7}}`)
+	ackCh := make(chan derpbind.Packet, 1)
+	ackCh <- derpbind.Packet{Payload: payload}
+
+	err := waitForPeerAck(context.Background(), ackCh, 11)
+	if !errors.Is(err, ErrPeerAborted) {
+		t.Fatalf("waitForPeerAck() error = %v, want %v", err, ErrPeerAborted)
+	}
+}
+
+func TestPeerControlContextCancelsOnPeerAbort(t *testing.T) {
+	payload := []byte(`{"type":"abort","abort":{"reason":"canceled","bytes_transferred":7}}`)
+	abortCh := make(chan derpbind.Packet, 1)
+	abortCh <- derpbind.Packet{Payload: payload}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	transferCtx, stop := withPeerControlContext(ctx, nil, key.NodePublic{}, abortCh, nil, nil)
+	defer stop()
+
+	select {
+	case <-transferCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("peer abort did not cancel transfer context")
+	}
+	if !errors.Is(context.Cause(transferCtx), ErrPeerAborted) {
+		t.Fatalf("context cause = %v, want %v", context.Cause(transferCtx), ErrPeerAborted)
+	}
+}
+
+func TestPeerControlContextCancelsWhenHeartbeatsStop(t *testing.T) {
+	prevTimeout := peerHeartbeatTimeout
+	prevInterval := peerHeartbeatInterval
+	peerHeartbeatTimeout = 25 * time.Millisecond
+	peerHeartbeatInterval = 5 * time.Millisecond
+	t.Cleanup(func() {
+		peerHeartbeatTimeout = prevTimeout
+		peerHeartbeatInterval = prevInterval
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	transferCtx, stop := withPeerControlContext(ctx, nil, key.NodePublic{}, nil, make(chan derpbind.Packet), nil)
+	defer stop()
+
+	select {
+	case <-transferCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("missing heartbeat did not cancel transfer context")
+	}
+	if !errors.Is(context.Cause(transferCtx), ErrPeerDisconnected) {
+		t.Fatalf("context cause = %v, want %v", context.Cause(transferCtx), ErrPeerDisconnected)
+	}
+}
+
+func TestPeerControlContextWithoutHeartbeatDoesNotTimeout(t *testing.T) {
+	prevTimeout := peerHeartbeatTimeout
+	peerHeartbeatTimeout = 25 * time.Millisecond
+	t.Cleanup(func() {
+		peerHeartbeatTimeout = prevTimeout
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	transferCtx, stop := withPeerControlContext(ctx, nil, key.NodePublic{}, make(chan derpbind.Packet), nil, nil)
+	defer stop()
+
+	select {
+	case <-transferCtx.Done():
+		t.Fatalf("transfer context canceled with cause %v, want no heartbeat timeout when heartbeat channel is nil", context.Cause(transferCtx))
+	case <-time.After(75 * time.Millisecond):
+	}
+}
+
+func TestSendPeerAbortBestEffortSendsAbortEnvelope(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	node := srv.Map.Regions[1].Nodes[0]
+	senderDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(sender) error = %v", err)
+	}
+	defer senderDERP.Close()
+	listenerDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(listener) error = %v", err)
+	}
+	defer listenerDERP.Close()
+
+	abortCh, unsubscribe := listenerDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == senderDERP.PublicKey() && isAbortPayload(pkt.Payload)
+	})
+	defer unsubscribe()
+
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	_, _ = listenerDERP.Receive(readyCtx)
+	readyCancel()
+
+	sendPeerAbortBestEffort(senderDERP, listenerDERP.PublicKey(), "canceled", 7)
+
+	select {
+	case pkt := <-abortCh:
+		env, err := decodeEnvelope(pkt.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if env.Abort == nil || env.Abort.Reason != "canceled" || env.Abort.BytesTransferred == nil || *env.Abort.BytesTransferred != 7 {
+			t.Fatalf("abort envelope = %#v, want reason and bytes", env.Abort)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
+func TestSendClaimAndReceiveDecisionReturnsPeerAborted(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	node := srv.Map.Regions[1].Nodes[0]
+	senderDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(sender) error = %v", err)
+	}
+	defer senderDERP.Close()
+	listenerDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(listener) error = %v", err)
+	}
+	defer listenerDERP.Close()
+
+	claimCh, unsubscribe := listenerDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == senderDERP.PublicKey() && isClaimPayload(pkt.Payload)
+	})
+	defer unsubscribe()
+
+	go func() {
+		select {
+		case <-claimCh:
+			sendPeerAbortBestEffort(listenerDERP, senderDERP.PublicKey(), "canceled", 0)
+		case <-ctx.Done():
+		}
+	}()
+
+	decisionCtx, decisionCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer decisionCancel()
+	_, err = sendClaimAndReceiveDecisionWithTelemetry(
+		decisionCtx,
+		senderDERP,
+		listenerDERP.PublicKey(),
+		rendezvous.Claim{},
+		nil,
+		"",
+	)
+	if !errors.Is(err, ErrPeerAborted) {
+		t.Fatalf("sendClaimAndReceiveDecisionWithTelemetry() error = %v, want %v", err, ErrPeerAborted)
+	}
+}
+
 func TestSendExternalHandoffDERPStopUsesReceiverHandoffAckBelowReadBoundary(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
