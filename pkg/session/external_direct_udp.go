@@ -512,7 +512,6 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 	}
 
 	maxRateMbps := externalDirectUDPMaxRateMbps
-	probeRates := externalDirectUDPRateProbeRates(maxRateMbps, -1)
 	activeRateMbps := externalDirectUDPInitialProbeFallbackMbps
 	rateCeilingMbps := maxRateMbps
 	if cfg.Emitter != nil {
@@ -563,6 +562,7 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 	}
 	emitExternalDirectUDPReceiveStartDebug(cfg.Emitter, directExpectedBytes)
 	start := externalDirectUDPStreamStart(maxRateMbps, directExpectedBytes)
+	probeRates := append([]int(nil), start.ProbeRates...)
 	start.StripedBlast = sendCfg.StripedBlast
 	externalTransferTracef("direct-udp-send-start-send addr=%v", peerAddr)
 	if err := sendEnvelope(ctx, derpClient, listenerDERP, envelope{
@@ -661,7 +661,9 @@ func externalExecutePreparedDirectUDPSend(ctx context.Context, src io.Reader, pl
 	if metrics == nil {
 		metrics = newExternalTransferMetrics(time.Now())
 	}
+	externalTransferTracef("direct-udp-send-execute-start lanes=%d addrs=%s rate=%d ceiling=%d", len(plan.probeConns), strings.Join(plan.remoteAddrs, ","), plan.sendCfg.RateMbps, plan.sendCfg.RateCeilingMbps)
 	stats, err := probe.SendBlastParallel(ctx, plan.probeConns, plan.remoteAddrs, externalDirectUDPBufferedReader(src), plan.sendCfg)
+	externalTransferTracef("direct-udp-send-execute-done err=%v bytes=%d lanes=%d first-byte-zero=%v complete-zero=%v", err, stats.BytesSent, stats.Lanes, stats.FirstByteAt.IsZero(), stats.CompletedAt.IsZero())
 	if cfg.Emitter != nil {
 		cfg.Emitter.Debug("udp-send-transport=" + stats.Transport.Summary())
 		cfg.Emitter.Debug("udp-send-active-lanes=" + strconv.Itoa(stats.Lanes))
@@ -785,8 +787,10 @@ func externalExecutePreparedDirectUDPReceive(ctx context.Context, plan externalD
 		receiveCfg.RequireComplete = true
 		receiveCfg.FECGroupSize = externalDirectUDPStreamFECGroupSize
 		receiveCfg.ExpectedRunID = tok.SessionID
+		externalTransferTracef("direct-udp-recv-execute-start stream=true lanes=%d expected=%d", len(plan.probeConns), plan.start.ExpectedBytes)
 		stats, err = probe.ReceiveBlastStreamParallelToWriter(ctx, plan.probeConns, plan.receiveDst, receiveCfg, plan.start.ExpectedBytes)
 	} else if plan.fastDiscard {
+		externalTransferTracef("direct-udp-recv-execute-start fast-discard=true lanes=%d expected=%d", len(plan.probeConns), plan.start.ExpectedBytes)
 		stats, err = probe.ReceiveBlastParallelToWriter(ctx, plan.probeConns, plan.receiveDst, receiveCfg, plan.start.ExpectedBytes)
 	} else {
 		receiveCfg.RequireComplete = true
@@ -795,8 +799,10 @@ func externalExecutePreparedDirectUDPReceive(ctx context.Context, plan externalD
 			return orderErr
 		}
 		receiveCfg.ExpectedRunIDs = externalDirectUDPLaneRunIDs(tok.SessionID, len(probeConns))
+		externalTransferTracef("direct-udp-recv-execute-start sections=true lanes=%d expected=%d", len(probeConns), plan.start.ExpectedBytes)
 		stats, err = externalDirectUDPReceiveSectionSpoolParallel(ctx, probeConns, plan.receiveDst, receiveCfg, plan.start.ExpectedBytes, plan.start.SectionSizes)
 	}
+	externalTransferTracef("direct-udp-recv-execute-done err=%v bytes=%d lanes=%d first-byte-zero=%v complete-zero=%v", err, stats.BytesReceived, stats.Lanes, stats.FirstByteAt.IsZero(), stats.CompletedAt.IsZero())
 	emitExternalDirectUDPReceiveResultDebug(cfg.Emitter, stats, err)
 	if cfg.Emitter != nil {
 		cfg.Emitter.Debug("udp-receive-transport=" + stats.Transport.Summary())
@@ -1032,7 +1038,6 @@ func sendExternalViaRelayPrefixThenDirectUDP(ctx context.Context, rcfg externalR
 	}
 	metrics := newExternalTransferMetrics(time.Now())
 	ctx = withExternalTransferMetrics(ctx, metrics)
-	ctx, relayPauseControl := withExternalDirectUDPHandoffRelayPauseControl(ctx)
 	spool, err := newExternalHandoffSpool(rcfg.src, externalRelayPrefixDERPChunkSize, externalRelayPrefixDERPMaxUnacked)
 	if err != nil {
 		return err
@@ -1086,7 +1091,6 @@ func sendExternalViaRelayPrefixThenDirectUDP(ctx context.Context, rcfg externalR
 	defer stallTimer.Stop()
 	stallFired := false
 	handoffReady := false
-	relayPaused := false
 	directActivated := false
 	activateDirect := func() {
 		if directActivated {
@@ -1094,20 +1098,6 @@ func sendExternalViaRelayPrefixThenDirectUDP(ctx context.Context, rcfg externalR
 		}
 		externalDirectUDPActivateDirectPath(rcfg.pathEmitter, rcfg.transportManager, rcfg.punchCancel)
 		directActivated = true
-	}
-	pauseRelay := func() {
-		if relayPaused || !externalRelayPrefixShouldPauseForDirectPrep(spool) {
-			return
-		}
-		relayPauseControl.Pause()
-		relayPaused = true
-	}
-	resumeRelay := func() {
-		if !relayPaused {
-			return
-		}
-		relayPauseControl.Resume()
-		relayPaused = false
 	}
 	postHandoff := func() error {
 		externalTransferTracef("relay-prefix-send-post-handoff-start")
@@ -1171,7 +1161,6 @@ func sendExternalViaRelayPrefixThenDirectUDP(ctx context.Context, rcfg externalR
 			return nil
 		case prep := <-prepCh:
 			if prep.err != nil {
-				resumeRelay()
 				if rcfg.cfg.Emitter != nil {
 					rcfg.cfg.Emitter.Debug("udp-handoff-send-prepare-error=" + prep.err.Error())
 				}
@@ -1186,7 +1175,6 @@ func sendExternalViaRelayPrefixThenDirectUDP(ctx context.Context, rcfg externalR
 				return nil
 			}
 			if externalRelayPrefixShouldFinishRelay(spool) {
-				resumeRelay()
 				relayErr := <-relayErrCh
 				if relayErr != nil {
 					return relayErr
@@ -1215,7 +1203,6 @@ func sendExternalViaRelayPrefixThenDirectUDP(ctx context.Context, rcfg externalR
 			if handoffReady {
 				return postHandoff()
 			}
-			pauseRelay()
 		case <-handoffReadyCh:
 			handoffReady = true
 			handoffReadyCh = nil
@@ -1778,18 +1765,6 @@ func externalRelayPrefixShouldFinishRelay(spool *externalHandoffSpool) bool {
 		return false
 	}
 	return spool.sourceOffset-spool.ackedWatermark <= externalRelayPrefixSkipDirectTail
-}
-
-func externalRelayPrefixShouldPauseForDirectPrep(spool *externalHandoffSpool) bool {
-	if spool == nil {
-		return true
-	}
-
-	snapshot := spool.Snapshot()
-	if snapshot.EOF && snapshot.SourceOffset <= externalRelayPrefixDERPStartupBytes {
-		return false
-	}
-	return true
 }
 
 func externalDirectUDPConns(_ net.PacketConn, _ publicPortmap, parallel int, emitter *telemetry.Emitter) ([]net.PacketConn, []publicPortmap, func(), error) {

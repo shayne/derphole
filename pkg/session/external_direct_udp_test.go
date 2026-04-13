@@ -879,19 +879,48 @@ func TestSendExternalViaRelayPrefixThenDirectUDPFallsBackToRelayWhenDirectPrepar
 	}
 }
 
-func TestSendExternalViaRelayPrefixThenDirectUDPPausesRelayBeforeDirectPrep(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+func TestSendExternalViaRelayPrefixThenDirectUDPContinuesRelayWhileDirectPrepPending(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
 	prevSendRelay := externalSendExternalHandoffDERPFn
-	relayPaused := make(chan struct{})
+	start := time.Now()
+	prepDone := make(chan struct{})
+	relayProgressAfterStall := make(chan struct{}, 1)
 	externalSendExternalHandoffDERPFn = func(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, spool *externalHandoffSpool, stop <-chan struct{}, metrics *externalTransferMetrics) error {
-		select {
-		case <-stop:
-			close(relayPaused)
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
+		for {
+			select {
+			case <-stop:
+				return nil
+			default:
+			}
+			if err := externalDirectUDPHandoffRelayPauseWait(ctx, stop); err != nil {
+				return err
+			}
+			chunk, err := spool.NextChunk()
+			switch {
+			case err == nil:
+				if err := spool.AckTo(chunk.Offset + int64(len(chunk.Payload))); err != nil {
+					return err
+				}
+				if time.Since(start) > externalRelayPrefixDirectPrepStallWait+100*time.Millisecond {
+					select {
+					case <-prepDone:
+					default:
+						select {
+						case relayProgressAfterStall <- struct{}{}:
+						default:
+						}
+					}
+				}
+				time.Sleep(2 * time.Millisecond)
+			case errors.Is(err, errExternalHandoffSourcePending):
+				time.Sleep(time.Millisecond)
+			case errors.Is(err, io.EOF):
+				return nil
+			default:
+				return err
+			}
 		}
 	}
 	t.Cleanup(func() { externalSendExternalHandoffDERPFn = prevSendRelay })
@@ -904,10 +933,10 @@ func TestSendExternalViaRelayPrefixThenDirectUDPPausesRelayBeforeDirectPrep(t *t
 
 	prevPrepareDirectUDPSend := externalPrepareDirectUDPSendFn
 	externalPrepareDirectUDPSendFn = func(ctx context.Context, tok token.Token, derpClient *derpbind.Client, listenerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, readyAckCh <-chan derpbind.Packet, startAckCh <-chan derpbind.Packet, rateProbeCh <-chan derpbind.Packet, cfg SendConfig) (externalDirectUDPSendPlan, error) {
-		signalExternalDirectUDPHandoffReady(ctx)
 		select {
-		case <-relayPaused:
-			return externalDirectUDPSendPlan{}, nil
+		case <-time.After(600 * time.Millisecond):
+			close(prepDone)
+			return externalDirectUDPSendPlan{}, errors.New("direct unavailable")
 		case <-ctx.Done():
 			return externalDirectUDPSendPlan{}, ctx.Err()
 		}
@@ -918,11 +947,12 @@ func TestSendExternalViaRelayPrefixThenDirectUDPPausesRelayBeforeDirectPrep(t *t
 	directInvoked := false
 	externalExecutePreparedDirectUDPSendFn = func(ctx context.Context, src io.Reader, plan externalDirectUDPSendPlan, cfg SendConfig, metrics *externalTransferMetrics) error {
 		directInvoked = true
-		return nil
+		return errors.New("prepared direct send should not run after prepare error")
 	}
 	t.Cleanup(func() { externalExecutePreparedDirectUDPSendFn = prevExecutePreparedDirectUDPSend })
 
-	payload := bytes.Repeat([]byte("relay-pause-before-direct"), 1<<15)
+	payload := bytes.Repeat([]byte("relay-continues-before-direct"), (8<<20)/len("relay-continues-before-direct")+1)
+	payload = payload[:8<<20]
 	err := sendExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixSendConfig{
 		src:          bytes.NewReader(payload),
 		decision:     rendezvous.Decision{Accept: &rendezvous.AcceptInfo{}},
@@ -933,8 +963,13 @@ func TestSendExternalViaRelayPrefixThenDirectUDPPausesRelayBeforeDirectPrep(t *t
 	if err != nil {
 		t.Fatalf("sendExternalViaRelayPrefixThenDirectUDP() error = %v", err)
 	}
-	if !directInvoked {
-		t.Fatal("sendExternalViaRelayPrefixThenDirectUDP() did not execute direct send after pausing relay")
+	if directInvoked {
+		t.Fatal("sendExternalViaRelayPrefixThenDirectUDP() executed direct send after prepare error")
+	}
+	select {
+	case <-relayProgressAfterStall:
+	default:
+		t.Fatal("relay made no progress while direct preparation was pending past stall timer")
 	}
 }
 
@@ -1272,6 +1307,140 @@ func TestExternalPrepareDirectUDPSendWaitsForHandoffProceedBeforeSendingStart(t 
 		}
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for externalPrepareDirectUDPSend() to finish after proceed gate")
+	}
+}
+
+func TestExternalPrepareDirectUDPSendSkipsRateProbesForSmallKnownTransfer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	srv := newSessionTestDERPServer(t)
+	node := srv.Map.Regions[1].Nodes[0]
+	listenerDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(listener) error = %v", err)
+	}
+	defer listenerDERP.Close()
+	senderDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(sender) error = %v", err)
+	}
+	defer senderDERP.Close()
+	warmExternalQUICModeTestDERPRoute(t, ctx, senderDERP, listenerDERP)
+
+	readyCh, unsubscribeReady := listenerDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == senderDERP.PublicKey() && isDirectUDPReadyPayload(pkt.Payload)
+	})
+	defer unsubscribeReady()
+	startCh, unsubscribeStart := listenerDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == senderDERP.PublicKey() && isDirectUDPStartPayload(pkt.Payload)
+	})
+	defer unsubscribeStart()
+	readyAckCh, unsubscribeReadyAck := senderDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == listenerDERP.PublicKey() && isDirectUDPReadyAckPayload(pkt.Payload)
+	})
+	defer unsubscribeReadyAck()
+	startAckCh, unsubscribeStartAck := senderDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == listenerDERP.PublicKey() && isDirectUDPStartAckPayload(pkt.Payload)
+	})
+	defer unsubscribeStartAck()
+
+	probeConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer probeConn.Close()
+
+	var rateProbeSendCalled bool
+	prevSendRateProbes := externalDirectUDPSendRateProbesParallelFn
+	externalDirectUDPSendRateProbesParallelFn = func(context.Context, []net.PacketConn, []string, []int) ([]directUDPRateProbeSample, error) {
+		rateProbeSendCalled = true
+		return nil, errors.New("unexpected rate probe send for small known transfer")
+	}
+	t.Cleanup(func() { externalDirectUDPSendRateProbesParallelFn = prevSendRateProbes })
+
+	var rateProbeWaitCalled bool
+	prevWaitRateProbe := externalDirectUDPWaitRateProbeFn
+	externalDirectUDPWaitRateProbeFn = func(context.Context, <-chan derpbind.Packet) (directUDPRateProbeResult, error) {
+		rateProbeWaitCalled = true
+		return directUDPRateProbeResult{}, errors.New("unexpected rate probe wait for small known transfer")
+	}
+	t.Cleanup(func() { externalDirectUDPWaitRateProbeFn = prevWaitRateProbe })
+
+	prepCtx, handoffReadyCh := withExternalDirectUDPHandoffReadySignal(ctx)
+	prepCtx, signalHandoffProceed := withExternalDirectUDPHandoffProceedSignal(prepCtx)
+	recordExternalDirectUDPHandoffProceedWatermark(prepCtx, 512<<10)
+
+	tok := token.Token{
+		SessionID:    [16]byte{0x91},
+		BearerSecret: [32]byte{0x42},
+	}
+	prepareErrCh := make(chan error, 1)
+	go func() {
+		_, err := externalPrepareDirectUDPSend(prepCtx, tok, senderDERP, listenerDERP.PublicKey(), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, []net.PacketConn{probeConn}, nil, readyAckCh, startAckCh, nil, SendConfig{StdioExpectedBytes: 64 << 20})
+		prepareErrCh <- err
+	}()
+
+	select {
+	case <-readyCh:
+	case err := <-prepareErrCh:
+		t.Fatalf("externalPrepareDirectUDPSend() returned before direct UDP ready: %v", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for direct UDP ready")
+	}
+	if err := sendEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{
+		Type: envelopeDirectUDPReadyAck,
+		DirectUDPReadyAck: &directUDPReadyAck{
+			FastDiscard: true,
+		},
+	}); err != nil {
+		t.Fatalf("sendEnvelope(ready-ack) error = %v", err)
+	}
+
+	select {
+	case <-handoffReadyCh:
+	case err := <-prepareErrCh:
+		t.Fatalf("externalPrepareDirectUDPSend() returned before handoff-ready: %v", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for handoff-ready signal")
+	}
+	signalHandoffProceed()
+
+	var startPkt derpbind.Packet
+	select {
+	case startPkt = <-startCh:
+	case err := <-prepareErrCh:
+		t.Fatalf("externalPrepareDirectUDPSend() returned before start: %v", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for direct UDP start")
+	}
+	startEnv, err := decodeEnvelope(startPkt.Payload)
+	if err != nil {
+		t.Fatalf("decodeEnvelope(start) error = %v", err)
+	}
+	if startEnv.DirectUDPStart == nil {
+		t.Fatal("direct UDP start payload is nil")
+	}
+	if got := startEnv.DirectUDPStart.ProbeRates; len(got) != 0 {
+		t.Fatalf("direct UDP start ProbeRates = %v, want none for small known transfer", got)
+	}
+	if err := sendEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{Type: envelopeDirectUDPStartAck}); err != nil {
+		t.Fatalf("sendEnvelope(start-ack) error = %v", err)
+	}
+
+	select {
+	case err := <-prepareErrCh:
+		if err != nil {
+			t.Fatalf("externalPrepareDirectUDPSend() error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for externalPrepareDirectUDPSend() to finish")
+	}
+	if rateProbeSendCalled {
+		t.Fatal("externalPrepareDirectUDPSend() sent rate probes for small known transfer")
+	}
+	if rateProbeWaitCalled {
+		t.Fatal("externalPrepareDirectUDPSend() waited for rate probe result for small known transfer")
 	}
 }
 

@@ -1091,17 +1091,20 @@ func SendBlastParallel(ctx context.Context, conns []net.PacketConn, remoteAddrs 
 			handshakeStripeID = uint16(i)
 			handshakeTotalStripes = uint16(len(conns))
 		}
+		sessionTracef("parallel hello start lane=%d local=%s peer=%s run=%x stripe=%d total=%d", i, conn.LocalAddr(), peer, runID[:4], handshakeStripeID, handshakeTotalStripes)
 		_, err = performHelloHandshake(handshakeCtx, conn, peer, runID, handshakeStripeID, handshakeTotalStripes, &stats)
 		if cancelHandshake != nil {
 			cancelHandshake()
 		}
 		if err != nil {
+			sessionTracef("parallel hello fail lane=%d local=%s peer=%s run=%x stripe=%d err=%v", i, conn.LocalAddr(), peer, runID[:4], handshakeStripeID, err)
 			if cfg.AllowPartialParallel {
 				skippedHandshakeErr = err
 				continue
 			}
 			return TransferStats{}, err
 		}
+		sessionTracef("parallel hello ok lane=%d local=%s peer=%s run=%x stripe=%d", i, conn.LocalAddr(), peer, runID[:4], handshakeStripeID)
 		if shouldUseConnectedBatcherForParallelSend(batcher, len(conns), cfg) {
 			if connectedBatcher, ok := newConnectedUDPBatcher(conn, peer, cfg.Transport); ok {
 				batcher = connectedBatcher
@@ -3938,6 +3941,7 @@ func ReceiveBlastStreamParallelToWriter(ctx context.Context, conns []net.PacketC
 		if conn == nil {
 			return TransferStats{}, fmt.Errorf("nil packet conn at lane %d", i)
 		}
+		sessionTracef("stream receive lane start lane=%d local=%s run=%x", i, conn.LocalAddr(), cfg.ExpectedRunID[:4])
 		lanes[i] = &blastStreamReceiveLane{conn: conn, batcher: newPacketBatcher(conn, cfg.Transport)}
 	}
 	coordinator := newBlastStreamReceiveCoordinator(receiveCtx, lanes, dst, cfg, expectedBytes, startedAt)
