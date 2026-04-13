@@ -557,6 +557,8 @@ func TestReceiveExternalHandoffDERPReturnsCurrentWatermarkOnHandoffBelowBoundary
 		t.Fatalf("NewClient(sender) error = %v", err)
 	}
 	defer senderDERP.Close()
+	warmExternalQUICModeTestDERPRoute(t, ctx, senderDERP, listenerDERP)
+	warmExternalQUICModeTestDERPRoute(t, ctx, listenerDERP, senderDERP)
 
 	relayFrames, unsubscribeRelay := listenerDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == senderDERP.PublicKey() && externalRelayPrefixDERPFrameKindOf(pkt.Payload) != 0
@@ -628,6 +630,8 @@ func TestReceiveExternalHandoffDERPTracksOnlyDeliveredRelayBytes(t *testing.T) {
 		t.Fatalf("NewClient(sender) error = %v", err)
 	}
 	defer senderDERP.Close()
+	warmExternalQUICModeTestDERPRoute(t, ctx, senderDERP, listenerDERP)
+	warmExternalQUICModeTestDERPRoute(t, ctx, listenerDERP, senderDERP)
 
 	relayFrames, unsubscribeRelay := listenerDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == senderDERP.PublicKey() && externalRelayPrefixDERPFrameKindOf(pkt.Payload) != 0
