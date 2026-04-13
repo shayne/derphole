@@ -1194,6 +1194,7 @@ func TestManagerRefreshesDiscoveryWhenPortmapChanges(t *testing.T) {
 	if endpoint, active := mgr.DirectPath(); endpoint != peerCandidate.String() || !active {
 		t.Fatalf("DirectPath() before portmap change = (%q, %t), want (%q, true)", endpoint, active, peerCandidate.String())
 	}
+	waitForManagerTimers(t, clock, 0, 2)
 
 	portmap.activate()
 	clock.Advance(1 * time.Second)
