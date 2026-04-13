@@ -976,7 +976,7 @@ func TestWaitExternalNativeQUICRelayTailPeerAckReturnsReadyAckForShortEOFRelayTa
 		eof:            true,
 	}
 	ackCh := make(chan derpbind.Packet, 1)
-	ackCh <- derpbind.Packet{}
+	ackCh <- derpbind.Packet{Payload: testPeerAckPayload(t, spool.sourceOffset)}
 
 	done, err := waitExternalNativeQUICRelayTailPeerAck(context.Background(), spool, ackCh)
 	if err != nil {
@@ -994,7 +994,7 @@ func TestWaitExternalNativeQUICRelayTailPeerAckReturnsFalseForLargeEOFRelayTailW
 		eof:            true,
 	}
 	ackCh := make(chan derpbind.Packet, 1)
-	ackCh <- derpbind.Packet{}
+	ackCh <- derpbind.Packet{Payload: testPeerAckPayload(t, spool.sourceOffset)}
 
 	done, err := waitExternalNativeQUICRelayTailPeerAck(context.Background(), spool, ackCh)
 	if err != nil {

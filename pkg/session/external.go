@@ -92,6 +92,7 @@ type envelope struct {
 	Claim              *rendezvous.Claim         `json:"claim,omitempty"`
 	Decision           *rendezvous.Decision      `json:"decision,omitempty"`
 	Control            *transport.ControlMessage `json:"control,omitempty"`
+	Ack                *peerAck                  `json:"ack,omitempty"`
 	DirectUDPReadyAck  *directUDPReadyAck        `json:"direct_udp_ready_ack,omitempty"`
 	DirectUDPStart     *directUDPStart           `json:"direct_udp_start,omitempty"`
 	DirectUDPRateProbe *directUDPRateProbeResult `json:"direct_udp_rate_probe,omitempty"`
@@ -102,6 +103,14 @@ type envelope struct {
 	ParallelGrowReq    *parallelGrowRequest      `json:"parallel_grow_request,omitempty"`
 	ParallelGrowAck    *parallelGrowAck          `json:"parallel_grow_ack,omitempty"`
 	ParallelGrowResult *parallelGrowResult       `json:"parallel_grow_result,omitempty"`
+}
+
+type peerAck struct {
+	BytesReceived *int64 `json:"bytes_received,omitempty"`
+}
+
+func newPeerAck(bytesReceived int64) *peerAck {
+	return &peerAck{BytesReceived: &bytesReceived}
 }
 
 type directUDPReadyAck struct {
@@ -287,6 +296,7 @@ func runExternalSendStream(
 	nativeDirectModeCancel context.CancelFunc,
 ) error {
 	defer quicConn.CloseWithError(0, "")
+	countedSrc := newByteCountingReadCloser(src)
 
 	externalTransferTracef("sender-open-relay-stream-start")
 	streamConn, err := quicConn.OpenStreamSync(ctx)
@@ -296,7 +306,7 @@ func runExternalSendStream(
 	defer streamConn.Close()
 	externalTransferTracef("sender-open-relay-stream-complete")
 
-	spool, err := newExternalHandoffSpool(src, externalCopyBufferSize, externalHandoffMaxUnackedBytes)
+	spool, err := newExternalHandoffSpool(countedSrc, externalCopyBufferSize, externalHandoffMaxUnackedBytes)
 	if err != nil {
 		return err
 	}
@@ -333,7 +343,7 @@ func runExternalSendStream(
 			if err := <-relayErrCh; err != nil {
 				return err
 			}
-			if err := waitForPeerAck(ctx, ackCh); err != nil {
+			if err := waitForPeerAck(ctx, ackCh, countedSrc.Count()); err != nil {
 				return err
 			}
 			if err := quicConn.CloseWithError(0, ""); err != nil {
@@ -383,7 +393,7 @@ func runExternalSendStream(
 			if err := <-relayErrCh; err != nil {
 				return err
 			}
-			if err := waitForPeerAck(ctx, ackCh); err != nil {
+			if err := waitForPeerAck(ctx, ackCh, countedSrc.Count()); err != nil {
 				return err
 			}
 			if err := quicConn.CloseWithError(0, ""); err != nil {
@@ -398,7 +408,7 @@ func runExternalSendStream(
 			if relayErr != nil {
 				return relayErr
 			}
-			if err := waitForPeerAck(ctx, ackCh); err != nil {
+			if err := waitForPeerAck(ctx, ackCh, countedSrc.Count()); err != nil {
 				return err
 			}
 			if err := quicConn.CloseWithError(0, ""); err != nil {
@@ -471,7 +481,7 @@ func runExternalSendStream(
 			if relayErr != nil {
 				return relayErr
 			}
-			if err := waitForPeerAck(ctx, ackCh); err != nil {
+			if err := waitForPeerAck(ctx, ackCh, countedSrc.Count()); err != nil {
 				return err
 			}
 			if err := quicConn.CloseWithError(0, ""); err != nil {
@@ -502,7 +512,7 @@ func runExternalSendStream(
 			if err := <-relayErrCh; err != nil {
 				return err
 			}
-			if err := waitForPeerAck(ctx, ackCh); err != nil {
+			if err := waitForPeerAck(ctx, ackCh, countedSrc.Count()); err != nil {
 				return err
 			}
 			if err := quicConn.CloseWithError(0, ""); err != nil {
@@ -594,7 +604,7 @@ func runExternalSendStream(
 		if err != nil {
 			return err
 		}
-		if err := waitForPeerAck(ctx, ackCh); err != nil {
+		if err := waitForPeerAck(ctx, ackCh, countedSrc.Count()); err != nil {
 			return err
 		}
 		if err := quicConn.CloseWithError(0, ""); err != nil {
@@ -604,7 +614,7 @@ func runExternalSendStream(
 		return nil
 	}
 
-	if err := waitForPeerAck(ctx, ackCh); err != nil {
+	if err := waitForPeerAck(ctx, ackCh, countedSrc.Count()); err != nil {
 		return err
 	}
 	if err := quicConn.CloseWithError(0, ""); err != nil {
@@ -928,7 +938,7 @@ func runExternalListenStream(
 		}
 	}
 
-	if err := sendEnvelope(ctx, derpClient, peerDERP, envelope{Type: envelopeAck}); err != nil {
+	if err := sendPeerAck(ctx, derpClient, peerDERP, rx.Watermark()); err != nil {
 		return err
 	}
 	pathEmitter.Complete(transportManager)
@@ -1825,7 +1835,7 @@ func waitExternalNativeQUICRelayTailPeerAck(ctx context.Context, spool *external
 	ackCtx, cancel := context.WithTimeout(ctx, externalNativeQUICRelayTailPeerAckWait)
 	defer cancel()
 
-	if err := waitForPeerAck(ackCtx, ackCh); err != nil {
+	if err := waitForPeerAck(ackCtx, ackCh, spool.sourceOffset); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return false, nil
 		}
@@ -2004,11 +2014,25 @@ func waitForExternalDirectAddrOrModeAbort(
 	}
 }
 
-func waitForPeerAck(ctx context.Context, ch <-chan derpbind.Packet) error {
+func sendPeerAck(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, bytesReceived int64) error {
+	return sendEnvelope(ctx, client, peerDERP, envelope{Type: envelopeAck, Ack: newPeerAck(bytesReceived)})
+}
+
+func waitForPeerAck(ctx context.Context, ch <-chan derpbind.Packet, bytesSent int64) error {
 	select {
-	case _, ok := <-ch:
+	case pkt, ok := <-ch:
 		if !ok {
 			return net.ErrClosed
+		}
+		env, err := decodeEnvelope(pkt.Payload)
+		if err != nil || env.Type != envelopeAck {
+			return errors.New("unexpected peer ack payload")
+		}
+		if env.Ack == nil || env.Ack.BytesReceived == nil {
+			return errors.New("peer ack missing bytes_received")
+		}
+		if *env.Ack.BytesReceived != bytesSent {
+			return fmt.Errorf("peer received %d bytes, sent %d", *env.Ack.BytesReceived, bytesSent)
 		}
 		return nil
 	case <-ctx.Done():
@@ -2016,13 +2040,13 @@ func waitForPeerAck(ctx context.Context, ch <-chan derpbind.Packet) error {
 	}
 }
 
-func waitForPeerAckWithTimeout(ctx context.Context, ch <-chan derpbind.Packet, timeout time.Duration) error {
+func waitForPeerAckWithTimeout(ctx context.Context, ch <-chan derpbind.Packet, bytesSent int64, timeout time.Duration) error {
 	if timeout <= 0 {
-		return waitForPeerAck(ctx, ch)
+		return waitForPeerAck(ctx, ch, bytesSent)
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return waitForPeerAck(waitCtx, ch)
+	return waitForPeerAck(waitCtx, ch, bytesSent)
 }
 
 func firstDERPNode(dm *tailcfg.DERPMap, regionID int) *tailcfg.DERPNode {

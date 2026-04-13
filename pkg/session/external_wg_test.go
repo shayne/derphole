@@ -818,7 +818,7 @@ func TestSendExternalViaWGTunnelAgainstManualListener(t *testing.T) {
 			listenerErr <- err
 			return
 		}
-		listenerErr <- sendEnvelope(ctx, session.derp, keyNodePublicFromRaw32(env.Claim.DERPPublic), envelope{Type: envelopeAck})
+		listenerErr <- sendPeerAck(ctx, session.derp, keyNodePublicFromRaw32(env.Claim.DERPPublic), int64(received.Len()))
 	}()
 
 	if err := sendExternalViaWGTunnel(ctx, SendConfig{
@@ -1089,7 +1089,7 @@ func runExternalWGTunnelIssuedPublicSessionPiecesWithTransportManager(t *testing
 			listenerErr <- err
 			return
 		}
-		listenerErr <- sendEnvelope(ctx, session.derp, senderDERP.PublicKey(), envelope{Type: envelopeAck})
+		listenerErr <- sendPeerAck(ctx, session.derp, senderDERP.PublicKey(), int64(received.Len()))
 	}()
 
 	claim := rendezvous.Claim{

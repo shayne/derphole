@@ -212,7 +212,8 @@ func sendExternalViaWGTunnel(ctx context.Context, cfg SendConfig) error {
 	if err != nil {
 		return err
 	}
-	defer src.Close()
+	countedSrc := newByteCountingReadCloser(src)
+	defer countedSrc.Close()
 
 	listenerDERP := key.NodePublicFromRaw32(mem.B(tok.DERPPublic[:]))
 	if listenerDERP.IsZero() {
@@ -312,10 +313,10 @@ func sendExternalViaWGTunnel(ctx context.Context, cfg SendConfig) error {
 	if cfg.Emitter != nil {
 		cfg.Emitter.Debug("wg-stripes=" + itoa(len(conns)))
 	}
-	if err := sendExternalNativeTCPDirect(ctx, src, conns); err != nil {
+	if err := sendExternalNativeTCPDirect(ctx, countedSrc, conns); err != nil {
 		return err
 	}
-	if err := waitForPeerAck(ctx, ackCh); err != nil {
+	if err := waitForPeerAck(ctx, ackCh, countedSrc.Count()); err != nil {
 		return err
 	}
 	return nil
@@ -393,7 +394,8 @@ func listenExternalViaWGTunnel(ctx context.Context, cfg ListenConfig) (string, e
 		if err != nil {
 			return tok, err
 		}
-		defer dst.Close()
+		countedDst := newByteCountingWriteCloser(dst)
+		defer countedDst.Close()
 
 		tunnel, err := newExternalWGTunnel(externalWGTunnelConfig{
 			SessionID:     session.token.SessionID,
@@ -431,10 +433,10 @@ func listenExternalViaWGTunnel(ctx context.Context, cfg ListenConfig) (string, e
 		if cfg.Emitter != nil {
 			cfg.Emitter.Debug("wg-stripes=" + itoa(len(conns)))
 		}
-		if err := receiveExternalNativeTCPDirect(ctx, dst, conns); err != nil {
+		if err := receiveExternalNativeTCPDirect(ctx, countedDst, conns); err != nil {
 			return tok, err
 		}
-		if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeAck}); err != nil {
+		if err := sendPeerAck(ctx, session.derp, peerDERP, countedDst.Count()); err != nil {
 			return tok, err
 		}
 		return tok, nil

@@ -134,7 +134,8 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (string, error) {
 		if err != nil {
 			return tok, err
 		}
-		defer src.Close()
+		countedSrc := newByteCountingReadCloser(src)
+		defer countedSrc.Close()
 
 		if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
 			return tok, err
@@ -153,10 +154,10 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (string, error) {
 		}
 		var sendErr error
 		if cfg.ForceRelay {
-			sendErr = sendExternalRelayUDP(ctx, src, transportManager, session.token.SessionID, cfg.Emitter)
+			sendErr = sendExternalRelayUDP(ctx, countedSrc, transportManager, session.token.SessionID, cfg.Emitter)
 		} else {
 			sendErr = sendExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixSendConfig{
-				src:              src,
+				src:              countedSrc,
 				tok:              session.token,
 				decision:         decision,
 				derpClient:       session.derp,
@@ -177,7 +178,7 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (string, error) {
 		if sendErr != nil {
 			return tok, sendErr
 		}
-		if err := waitForPeerAckWithTimeout(ctx, ackCh, externalDirectUDPAckWait); err != nil {
+		if err := waitForPeerAckWithTimeout(ctx, ackCh, countedSrc.Count(), externalDirectUDPAckWait); err != nil {
 			return tok, err
 		}
 		pathEmitter.Complete(transportManager)
@@ -321,11 +322,12 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) error {
 	if err != nil {
 		return err
 	}
-	defer dst.Close()
+	countedDst := newByteCountingWriteCloser(dst)
+	defer countedDst.Close()
 
 	var receiveErr error
 	if cfg.ForceRelay {
-		receiveErr = receiveExternalRelayUDP(ctx, dst, transportManager, tok.SessionID, cfg.Emitter)
+		receiveErr = receiveExternalRelayUDP(ctx, countedDst, transportManager, tok.SessionID, cfg.Emitter)
 	} else {
 		listenCfg := ListenConfig{
 			Emitter:       cfg.Emitter,
@@ -334,7 +336,7 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) error {
 			UsePublicDERP: cfg.UsePublicDERP,
 		}
 		receiveErr = receiveExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixReceiveConfig{
-			dst:              dst,
+			dst:              countedDst,
 			tok:              tok,
 			derpClient:       derpClient,
 			peerDERP:         listenerDERP,
@@ -354,7 +356,7 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) error {
 	if receiveErr != nil {
 		return receiveErr
 	}
-	if err := sendEnvelope(ctx, derpClient, listenerDERP, envelope{Type: envelopeAck}); err != nil {
+	if err := sendPeerAck(ctx, derpClient, listenerDERP, countedDst.Count()); err != nil {
 		return err
 	}
 	pathEmitter.Complete(transportManager)

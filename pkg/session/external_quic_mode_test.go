@@ -812,7 +812,7 @@ func warmExternalQUICModeTestDERPRoute(t *testing.T, ctx context.Context, sender
 		defer ticker.Stop()
 
 		for {
-			_ = sendEnvelope(warmCtx, senderDERP, listenerDERP.PublicKey(), envelope{Type: envelopeAck})
+			_ = sendEnvelope(warmCtx, senderDERP, listenerDERP.PublicKey(), envelope{Type: envelopeAck, Ack: newPeerAck(0)})
 			select {
 			case <-ticker.C:
 			case <-warmCtx.Done():

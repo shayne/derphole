@@ -130,7 +130,7 @@ func TestWaitForPeerAckWithTimeoutReturnsWhenPeerNeverAcks(t *testing.T) {
 	ackCh := make(chan derpbind.Packet)
 	start := time.Now()
 
-	err := waitForPeerAckWithTimeout(context.Background(), ackCh, 25*time.Millisecond)
+	err := waitForPeerAckWithTimeout(context.Background(), ackCh, 0, 25*time.Millisecond)
 	if err == nil {
 		t.Fatal("waitForPeerAckWithTimeout() error = nil, want timeout")
 	}
@@ -139,6 +139,53 @@ func TestWaitForPeerAckWithTimeoutReturnsWhenPeerNeverAcks(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed < 25*time.Millisecond {
 		t.Fatalf("waitForPeerAckWithTimeout() returned after %v, want to wait for timeout", elapsed)
+	}
+}
+
+func TestWaitForPeerAckRequiresReceivedByteCount(t *testing.T) {
+	payload, err := json.Marshal(envelope{Type: envelopeAck})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackCh := make(chan derpbind.Packet, 1)
+	ackCh <- derpbind.Packet{Payload: payload}
+
+	err = waitForPeerAck(context.Background(), ackCh, 0)
+	if err == nil {
+		t.Fatal("waitForPeerAck() error = nil, want missing byte count error")
+	}
+	if !strings.Contains(err.Error(), "missing bytes_received") {
+		t.Fatalf("waitForPeerAck() error = %v, want missing bytes_received", err)
+	}
+}
+
+func TestWaitForPeerAckRejectsReceivedByteMismatch(t *testing.T) {
+	payload, err := json.Marshal(envelope{Type: envelopeAck, Ack: newPeerAck(7)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackCh := make(chan derpbind.Packet, 1)
+	ackCh <- derpbind.Packet{Payload: payload}
+
+	err = waitForPeerAck(context.Background(), ackCh, 11)
+	if err == nil {
+		t.Fatal("waitForPeerAck() error = nil, want byte mismatch")
+	}
+	if !strings.Contains(err.Error(), "received 7 bytes, sent 11") {
+		t.Fatalf("waitForPeerAck() error = %v, want byte mismatch", err)
+	}
+}
+
+func TestWaitForPeerAckAcceptsMatchingReceivedByteCount(t *testing.T) {
+	payload, err := json.Marshal(envelope{Type: envelopeAck, Ack: newPeerAck(11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackCh := make(chan derpbind.Packet, 1)
+	ackCh <- derpbind.Packet{Payload: payload}
+
+	if err := waitForPeerAck(context.Background(), ackCh, 11); err != nil {
+		t.Fatalf("waitForPeerAck() error = %v", err)
 	}
 }
 
