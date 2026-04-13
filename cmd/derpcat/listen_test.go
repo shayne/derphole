@@ -275,21 +275,24 @@ func runUpgradingExternalListenAndSend(t *testing.T) (listenerStderr string, sen
 
 	var senderStdout bytes.Buffer
 	var senderStderrBuf lockedBuffer
-	releaseEOF := make(chan struct{})
+	releaseRest := make(chan struct{})
 	payload := strings.Repeat("upgrade-me", (2<<20)/len("upgrade-me"))
 	senderDone := make(chan int, 1)
 	go func() {
 		senderDone <- runSend([]string{issuedToken}, telemetry.LevelVerbose, &directGateReader{
-			ctx:        ctx,
-			payload:    []byte(payload),
-			releaseEOF: releaseEOF,
+			ctx:       ctx,
+			payload:   []byte(payload),
+			gateAfter: 128 << 10,
+			release:   releaseRest,
 		}, &senderStdout, &senderStderrBuf)
 	}()
 
 	waitForStatusPrefix(t, listenerStderrBuf, upgradeStatusTimeout, "waiting-for-claim", "connected-relay")
 	waitForStatusPrefix(t, &senderStderrBuf, upgradeStatusTimeout, "probing-direct", "connected-relay")
 	waitForRawLine(t, listenerStderrBuf, upgradeStatusTimeout, "udp-stream=true")
-	close(releaseEOF)
+	waitForStatusPrefix(t, listenerStderrBuf, upgradeStatusTimeout, "waiting-for-claim", "connected-relay", "connected-direct")
+	waitForStatusPrefix(t, &senderStderrBuf, upgradeStatusTimeout, "probing-direct", "connected-relay", "connected-direct")
+	close(releaseRest)
 
 	select {
 	case code := <-listenerDone:
@@ -339,24 +342,35 @@ type outputBuffer interface {
 }
 
 type directGateReader struct {
-	ctx        context.Context
-	payload    []byte
-	releaseEOF <-chan struct{}
-	offset     int
+	ctx       context.Context
+	payload   []byte
+	gateAfter int
+	release   <-chan struct{}
+	offset    int
+	released  bool
 }
 
 func (r *directGateReader) Read(p []byte) (int, error) {
+	if r.gateAfter > 0 && r.offset >= r.gateAfter && !r.released {
+		select {
+		case <-r.release:
+			r.released = true
+		case <-r.ctx.Done():
+			return 0, r.ctx.Err()
+		}
+	}
 	if r.offset < len(r.payload) {
+		if r.gateAfter > 0 && !r.released {
+			remainingBeforeGate := r.gateAfter - r.offset
+			if remainingBeforeGate > 0 && remainingBeforeGate < len(p) {
+				p = p[:remainingBeforeGate]
+			}
+		}
 		n := copy(p, r.payload[r.offset:])
 		r.offset += n
 		return n, nil
 	}
-	select {
-	case <-r.releaseEOF:
-		return 0, io.EOF
-	case <-r.ctx.Done():
-		return 0, r.ctx.Err()
-	}
+	return 0, io.EOF
 }
 
 func waitForStatusPrefix(t *testing.T, buf outputBuffer, timeout time.Duration, want ...string) {
