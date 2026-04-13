@@ -3,27 +3,91 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>derphole web</title>
+    <meta
+      name="description"
+      content="DERP-rendezvoused file transfer in your browser, with relay-first startup and WebRTC direct upgrade when available."
+    />
+    <title>derphole web demo</title>
+    <link
+      rel="icon"
+      href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="%231f2a2e"/><path d="M15 37c9-17 25-17 34 0" fill="none" stroke="%23f2b66d" stroke-width="6" stroke-linecap="round"/><path d="M20 44h24" stroke="%23f7efe1" stroke-width="6" stroke-linecap="round"/></svg>'
+    />
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
+    <header class="topbar">
+      <a class="brand" href="#top" aria-label="derphole home">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span>derphole</span>
+      </a>
+      <nav aria-label="Primary">
+        <a href="#demo">Demo</a>
+        <a href="#cli">CLI</a>
+        <a href="https://github.com/shayne/derpcat">GitHub</a>
+      </nav>
+    </header>
+
     <main class="shell">
-      <section class="hero">
-        <p class="eyebrow">DERP relay-first proof of concept</p>
-        <h1>derphole web</h1>
-        <p class="lede">
-          Send one file through the same DERP rendezvous infrastructure as derphole,
-          directly from a browser tab with WebRTC upgrade when available.
+      <section id="top" class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">DERP rendezvous, browser native</p>
+          <h1>Send a file without opening a port.</h1>
+          <p class="lede">
+            derphole starts immediately over Tailscale DERP relay, then upgrades
+            the live browser transfer to WebRTC direct when the network allows it.
+            The native CLIs use the same session model with the faster UDP engine.
+          </p>
+          <div class="actions" aria-label="Project links">
+            <a class="button primary" href="#demo">Try the web demo</a>
+            <a class="button secondary" href="https://github.com/shayne/derpcat">View on GitHub</a>
+          </div>
+        </div>
+        <aside class="terminal-card" aria-label="CLI install commands">
+          <div class="terminal-dots" aria-hidden="true"><span></span><span></span><span></span></div>
+          <pre><code>npx -y derphole@latest send ./file
+npx -y derphole@latest receive &lt;token&gt;
+
+cat image.img | npx -y derpcat@latest send &lt;token&gt;</code></pre>
+        </aside>
+      </section>
+
+      <section class="value-grid" aria-label="Capabilities">
+        <article>
+          <strong>Relay first</strong>
+          <span>Small transfers do not wait for traversal before bytes move.</span>
+        </article>
+        <article>
+          <strong>Direct when possible</strong>
+          <span>Browser transfers try WebRTC. Native transfers use DERP-coordinated UDP.</span>
+        </article>
+        <article>
+          <strong>One token</strong>
+          <span>The token authorizes one session and carries the session material.</span>
+        </article>
+      </section>
+
+      <section id="demo" class="section-heading">
+        <p class="eyebrow">Live demo</p>
+        <h2>Browser to browser file transfer</h2>
+        <p>
+          Open this page in two browsers or on two machines. Select a file on
+          the sender, paste the token on the receiver, and watch the same
+          wormhole-shaped progress used by the CLI.
         </p>
       </section>
 
-      <section class="grid">
+      <section class="grid" aria-label="Browser file transfer demo">
         <article class="panel">
-          <h2>Send</h2>
-          <p class="muted">Select a file, create a token, and paste it on the receiving browser.</p>
-          <button id="select-send-file" type="button">Select File</button>
+          <div class="panel-header">
+            <span class="step">1</span>
+            <div>
+              <h3>Send</h3>
+              <p class="muted">Select a file, create a token, and paste it on the receiving browser.</p>
+            </div>
+          </div>
+          <button id="select-send-file" type="button">Select file</button>
           <p id="send-file" class="file-label">No file selected.</p>
-          <button id="start-send" type="button" disabled>Create Token And Send</button>
+          <button id="start-send" type="button" disabled>Create token and send</button>
           <label class="token-label" for="send-token">Token</label>
           <textarea id="send-token" readonly placeholder="Token appears here after the file offer starts."></textarea>
           <button id="copy-token" type="button" disabled>Copy Token</button>
@@ -32,26 +96,63 @@
         </article>
 
         <article class="panel">
-          <h2>Receive</h2>
-          <p class="muted">Paste a token, choose where to save, then receive the file.</p>
+          <div class="panel-header">
+            <span class="step">2</span>
+            <div>
+              <h3>Receive</h3>
+              <p class="muted">Paste a token, choose where to save, then receive the file.</p>
+            </div>
+          </div>
           <label class="token-label" for="receive-token">Token</label>
           <textarea id="receive-token" placeholder="Paste sender token here."></textarea>
-          <button id="start-receive" type="button">Receive File</button>
+          <button id="start-receive" type="button">Receive file</button>
           <pre id="receive-progress" class="progress">idle</pre>
           <p id="receive-status" class="status">idle</p>
         </article>
       </section>
 
+      <section id="cli" class="cli-section">
+        <div>
+          <p class="eyebrow">Native tools</p>
+          <h2>Use the CLI for the fastest path.</h2>
+          <p>
+            The web demo proves the static browser flow. For multi-gigabit paths,
+            long streams, directories, service sharing, and SSH invites, use the
+            native npm packages.
+          </p>
+        </div>
+        <div class="command-grid">
+          <article>
+            <h3>derphole</h3>
+            <pre><code>npx -y derphole@latest send ./photo.jpg
+npx -y derphole@latest receive &lt;token&gt;
+npx -y derphole@latest ssh invite --user deploy</code></pre>
+          </article>
+          <article>
+            <h3>derpcat</h3>
+            <pre><code>npx -y derpcat@latest listen &gt; disk.img
+cat ./disk.img | npx -y derpcat@latest send &lt;token&gt;
+npx -y derpcat@latest share 127.0.0.1:3000</code></pre>
+          </article>
+        </div>
+      </section>
+
       <section class="notes">
-        <h2>Current POC Limits</h2>
+        <h2>What this page is honest about</h2>
         <p>
-          This browser build starts on DERP relay immediately, then upgrades to a
-          WebRTC DataChannel when the browser and network allow it. Native derpcat
-          and derphole still own the direct UDP upgrade path and highest-throughput
-          transfer engine.
+          Browser JavaScript cannot open raw UDP sockets, so this build uses DERP
+          WebSockets for rendezvous and relay fallback, plus WebRTC DataChannel
+          for browser direct paths. The native derpcat and derphole binaries use
+          the same DERP coordination model, but they can also use the optimized
+          direct UDP transport that browsers do not expose.
         </p>
       </section>
     </main>
+
+    <footer class="footer">
+      <span>derpcat and derphole are session-scoped transfer tools.</span>
+      <a href="https://github.com/shayne/derpcat">github.com/shayne/derpcat</a>
+    </footer>
 
     <script src="wasm_exec.js"></script>
     <script src="wasm_payload.js"></script>

@@ -14,6 +14,7 @@ cp "${ROOT_DIR}/web/derphole/index.html" "${OUT_DIR}/index.html"
 cp "${ROOT_DIR}/web/derphole/styles.css" "${OUT_DIR}/styles.css"
 cp "${ROOT_DIR}/web/derphole/webrtc.js" "${OUT_DIR}/webrtc.js"
 cp "${ROOT_DIR}/web/derphole/app.js" "${OUT_DIR}/app.js"
+touch "${OUT_DIR}/.nojekyll"
 
 {
   printf 'window.derpholeWasmBase64 = "'

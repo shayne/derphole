@@ -24,7 +24,7 @@ type Packet struct {
 
 type Client struct {
 	pub      key.NodePublic
-	dc       *derphttp.Client
+	dc       derpClientConn
 	packetCh chan Packet
 	stopCh   chan struct{}
 	doneCh   chan struct{}
@@ -33,6 +33,13 @@ type Client struct {
 	subscribers map[uint64]*packetSubscriber
 	nextSubID   uint64
 	stopOnce    sync.Once
+}
+
+type derpClientConn interface {
+	Close() error
+	Send(key.NodePublic, []byte) error
+	Recv() (derp.ReceivedMessage, error)
+	SendPong([8]byte) error
 }
 
 type packetSubscriber struct {
@@ -72,6 +79,7 @@ func NewClient(ctx context.Context, node *tailcfg.DERPNode, serverURL string) (*
 		return nil, err
 	}
 	dc.SetURLDialer(newDERPNodeDialer(node, logf, netMon))
+	dc.SetCanAckPings(true)
 	if err := dc.Connect(ctx); err != nil {
 		_ = dc.Close()
 		return nil, fmt.Errorf("connect derp client: %w", err)
@@ -330,6 +338,12 @@ func (c *Client) recvLoop() {
 		}
 		pkt, ok := msg.(derp.ReceivedPacket)
 		if !ok {
+			if ping, ok := msg.(derp.PingMessage); ok {
+				pingData := [8]byte(ping)
+				go func() {
+					_ = c.dc.SendPong(pingData)
+				}()
+			}
 			continue
 		}
 		out := Packet{

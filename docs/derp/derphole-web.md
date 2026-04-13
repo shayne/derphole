@@ -18,6 +18,11 @@ Unzip the artifact and open `index.html`. The build embeds the WASM payload in
 `wasm_payload.js` so the page can load from `file://` without a local static
 server. Serving the directory over HTTP also works.
 
+The same static directory is also built for GitHub Pages from
+`dist/web/derphole-web`. The page doubles as the project demo landing page and
+keeps the live browser sender/receiver UI on the same page as the CLI install
+examples.
+
 ## Scope
 
 The browser build reuses the repository's DERP rendezvous primitives:
@@ -50,7 +55,10 @@ compiled for `GOOS=js GOARCH=wasm`.
 Data is sent as bounded binary frames defined in `pkg/derphole/webproto`. The
 sender waits for cumulative ACKs before advancing, and retries the current frame
 when an ACK does not arrive. This keeps browser memory bounded and avoids
-overrunning DERP server queues.
+overrunning DERP server queues. Browser relay frames are capped below DERP's
+theoretical packet maximum because near-64 KiB WebSocket frames have been
+observed to close public DERP browser connections; the current frame payload
+limit is 16 KiB.
 
 ## Browser Storage
 

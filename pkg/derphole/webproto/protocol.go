@@ -6,8 +6,10 @@ import (
 )
 
 const (
-	// Keep DERP payloads comfortably under tailscale.com/derp.MaxPacketSize.
-	MaxPayloadBytes = 60 << 10
+	// Keep browser DERP/WebSocket packets close to real WireGuard packet
+	// sizing. Public DERP accepts larger theoretical packets, but browser
+	// WebSocket connections have been observed to close on near-64KiB frames.
+	MaxPayloadBytes = 16 << 10
 
 	magic     = "DHPW"
 	version   = 1

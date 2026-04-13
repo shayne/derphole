@@ -13,6 +13,8 @@ import (
 	"github.com/shayne/derpcat/pkg/derphole/webrelay"
 )
 
+const jsDirectReceiveQueueFrames = 512
+
 type jsDirectTransport struct {
 	api     js.Value
 	readyCh chan struct{}
@@ -34,7 +36,7 @@ func newJSDirectTransport(v js.Value) webrelay.DirectTransport {
 		api:     v,
 		readyCh: make(chan struct{}),
 		failCh:  make(chan error, 1),
-		recvCh:  make(chan []byte, 32),
+		recvCh:  make(chan []byte, jsDirectReceiveQueueFrames),
 	}
 }
 

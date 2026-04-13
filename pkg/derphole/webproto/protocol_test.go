@@ -36,6 +36,13 @@ func TestFrameRejectsOversizedPayload(t *testing.T) {
 	}
 }
 
+func TestMaxPayloadBytesStaysBrowserDERPFriendly(t *testing.T) {
+	const want = 16 << 10
+	if MaxPayloadBytes != want {
+		t.Fatalf("MaxPayloadBytes = %d, want %d", MaxPayloadBytes, want)
+	}
+}
+
 func TestParseRejectsInvalidFrame(t *testing.T) {
 	raw, err := Marshal(FrameData, 0, []byte("ok"))
 	if err != nil {

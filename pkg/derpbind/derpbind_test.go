@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"tailscale.com/derp"
 	"tailscale.com/derp/derpserver"
 	"tailscale.com/net/netmon"
 	"tailscale.com/tailcfg"
@@ -24,6 +25,45 @@ type testDERPServer struct {
 	DERPURL string
 	Map     *tailcfg.DERPMap
 	http    *httptest.Server
+}
+
+type fakeDERPClientConn struct {
+	messages chan derp.ReceivedMessage
+	pongs    chan [8]byte
+	closed   chan struct{}
+	once     sync.Once
+}
+
+func newFakeDERPClientConn() *fakeDERPClientConn {
+	return &fakeDERPClientConn{
+		messages: make(chan derp.ReceivedMessage, 4),
+		pongs:    make(chan [8]byte, 4),
+		closed:   make(chan struct{}),
+	}
+}
+
+func (f *fakeDERPClientConn) Close() error {
+	f.once.Do(func() { close(f.closed) })
+	return nil
+}
+
+func (f *fakeDERPClientConn) Send(key.NodePublic, []byte) error { return nil }
+
+func (f *fakeDERPClientConn) Recv() (derp.ReceivedMessage, error) {
+	select {
+	case msg := <-f.messages:
+		return msg, nil
+	case <-f.closed:
+		return nil, errors.New("closed")
+	}
+}
+
+func (f *fakeDERPClientConn) SendPong(data [8]byte) error {
+	select {
+	case f.pongs <- data:
+	case <-f.closed:
+	}
+	return nil
 }
 
 func newTestDERPServer(t *testing.T) *testDERPServer {
@@ -190,6 +230,48 @@ func TestClientRecoversAfterTransientTransportDisconnect(t *testing.T) {
 		t.Fatalf("Receive().From = %v, want %v", got.From, a.PublicKey())
 	}
 	if string(got.Payload) != string(payload) {
+		t.Fatalf("Receive().Payload = %q, want %q", got.Payload, payload)
+	}
+}
+
+func TestClientRecvLoopRepliesToDERPPing(t *testing.T) {
+	fake := newFakeDERPClientConn()
+	c := &Client{
+		dc:          fake,
+		packetCh:    make(chan Packet, 16),
+		stopCh:      make(chan struct{}),
+		doneCh:      make(chan struct{}),
+		subscribers: make(map[uint64]*packetSubscriber),
+	}
+	go c.recvLoop()
+	t.Cleanup(func() { _ = c.Close() })
+
+	ping := derp.PingMessage{1, 2, 3, 4, 5, 6, 7, 8}
+	fake.messages <- ping
+
+	select {
+	case got := <-fake.pongs:
+		if got != [8]byte(ping) {
+			t.Fatalf("SendPong payload = %v, want %v", got, [8]byte(ping))
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("recvLoop did not reply to DERP ping")
+	}
+
+	src := key.NewNode().Public()
+	payload := []byte("after-ping")
+	fake.messages <- derp.ReceivedPacket{Source: src, Data: payload}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := c.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Receive() after ping error = %v", err)
+	}
+	if got.From != src {
+		t.Fatalf("Receive().From = %v, want %v", got.From, src)
+	}
+	if !bytes.Equal(got.Payload, payload) {
 		t.Fatalf("Receive().Payload = %q, want %q", got.Payload, payload)
 	}
 }
