@@ -137,10 +137,33 @@ jobs:
           path: dist/${{ matrix.asset }}
           if-no-files-found: error
 
+  build-web:
+    name: Build derphole web
+    runs-on: ubuntu-latest
+    needs: [meta]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+        with:
+          install: true
+          cache: true
+      - name: Build web artifact
+        run: mise run build-web
+      - name: Upload web artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: derphole-web-release
+          path: |
+            dist/release/derphole-web.zip
+            dist/release/derphole-web.zip.sha256
+          if-no-files-found: error
+
   release-prod:
     name: Publish release
     runs-on: ubuntu-latest
-    needs: [meta, check, build-binaries, publish-npm-prod]
+    needs: [meta, check, build-binaries, build-web, publish-npm-prod]
     if: needs.meta.outputs.is_tag == 'true'
     permissions:
       actions: read
@@ -164,7 +187,8 @@ jobs:
             -n derphole-linux-amd64 \
             -n derphole-linux-arm64 \
             -n derphole-darwin-amd64 \
-            -n derphole-darwin-arm64
+            -n derphole-darwin-arm64 \
+            -n derphole-web-release
           for asset in derpcat-linux-amd64 derpcat-linux-arm64 derpcat-darwin-amd64 derpcat-darwin-arm64 derphole-linux-amd64 derphole-linux-arm64 derphole-darwin-amd64 derphole-darwin-arm64; do
             cp "dist/downloads/$asset/$asset" "dist/raw/$asset"
           done
@@ -175,7 +199,10 @@ jobs:
             test "$("$asset" version)" = "${{ needs.meta.outputs.version }}"
           done
       - name: Package tarballs + checksums
-        run: bash ./tools/packaging/build-release-assets.sh
+        run: |
+          bash ./tools/packaging/build-release-assets.sh
+          cp dist/downloads/derphole-web-release/derphole-web.zip dist/release/
+          cp dist/downloads/derphole-web-release/derphole-web.zip.sha256 dist/release/
       - name: Publish release
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -198,6 +225,8 @@ jobs:
             dist/release/derphole-darwin-amd64.tar.gz.sha256
             dist/release/derphole-darwin-arm64.tar.gz
             dist/release/derphole-darwin-arm64.tar.gz.sha256
+            dist/release/derphole-web.zip
+            dist/release/derphole-web.zip.sha256
           )
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" -R "$GITHUB_REPOSITORY" "${files[@]}" --clobber
@@ -208,7 +237,7 @@ jobs:
   release-dev:
     name: Publish dev release
     runs-on: ubuntu-latest
-    needs: [meta, check, build-binaries, publish-npm-dev]
+    needs: [meta, check, build-binaries, build-web, publish-npm-dev]
     if: needs.meta.outputs.is_main == 'true'
     permissions:
       actions: read
@@ -234,7 +263,8 @@ jobs:
             -n derphole-linux-amd64 \
             -n derphole-linux-arm64 \
             -n derphole-darwin-amd64 \
-            -n derphole-darwin-arm64
+            -n derphole-darwin-arm64 \
+            -n derphole-web-release
           for asset in derpcat-linux-amd64 derpcat-linux-arm64 derpcat-darwin-amd64 derpcat-darwin-arm64 derphole-linux-amd64 derphole-linux-arm64 derphole-darwin-amd64 derphole-darwin-arm64; do
             cp "dist/downloads/$asset/$asset" "dist/raw/$asset"
           done
@@ -245,7 +275,10 @@ jobs:
             test "$("$asset" version)" = "${{ needs.meta.outputs.version }}"
           done
       - name: Package tarballs + checksums
-        run: bash ./tools/packaging/build-release-assets.sh
+        run: |
+          bash ./tools/packaging/build-release-assets.sh
+          cp dist/downloads/derphole-web-release/derphole-web.zip dist/release/
+          cp dist/downloads/derphole-web-release/derphole-web.zip.sha256 dist/release/
       - name: Update dev tag
         run: |
           git config user.name "github-actions[bot]"
@@ -273,6 +306,8 @@ jobs:
             dist/release/derphole-darwin-amd64.tar.gz.sha256
             dist/release/derphole-darwin-arm64.tar.gz
             dist/release/derphole-darwin-arm64.tar.gz.sha256
+            dist/release/derphole-web.zip
+            dist/release/derphole-web.zip.sha256
           )
           if gh release view dev -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release edit dev -R "$GITHUB_REPOSITORY" --title Dev --prerelease

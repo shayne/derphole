@@ -55,6 +55,9 @@ run = "bash ./tools/packaging/build-vendor.sh"
 [tasks."release:build-npm"]
 run = "bash ./tools/packaging/build-npm.sh"
 
+[tasks."build-web"]
+run = "bash ./tools/packaging/build-web.sh"
+
 [tasks."release:package-assets"]
 run = "bash ./tools/packaging/build-release-assets.sh"
 
@@ -91,6 +94,7 @@ for product in derpcat derphole; do
 done
 bash ./tools/packaging/build-release-assets.sh
 bash ./tools/packaging/build-npm.sh
+bash ./tools/packaging/build-web.sh
 """
 
 [tasks.smoke-local]

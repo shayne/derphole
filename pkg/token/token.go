@@ -15,6 +15,7 @@ const (
 	CapabilityShare
 	CapabilityAttach
 	CapabilityStdioOffer
+	CapabilityWebFile
 )
 
 type Token struct {

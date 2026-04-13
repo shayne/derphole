@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>derphole web</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">DERP relay proof of concept</p>
+        <h1>derphole web</h1>
+        <p class="lede">
+          Send one file through the same DERP rendezvous infrastructure as derphole,
+          directly from a browser tab.
+        </p>
+      </section>
+
+      <section class="grid">
+        <article class="panel">
+          <h2>Send</h2>
+          <p class="muted">Select a file, create a token, and paste it on the receiving browser.</p>
+          <button id="select-send-file" type="button">Select File</button>
+          <p id="send-file" class="file-label">No file selected.</p>
+          <button id="start-send" type="button" disabled>Create Token And Send</button>
+          <label class="token-label" for="send-token">Token</label>
+          <textarea id="send-token" readonly placeholder="Token appears here after the file offer starts."></textarea>
+          <button id="copy-token" type="button" disabled>Copy Token</button>
+          <pre id="send-progress" class="progress">idle</pre>
+          <p id="send-status" class="status">idle</p>
+        </article>
+
+        <article class="panel">
+          <h2>Receive</h2>
+          <p class="muted">Paste a token, choose where to save, then receive the file.</p>
+          <label class="token-label" for="receive-token">Token</label>
+          <textarea id="receive-token" placeholder="Paste sender token here."></textarea>
+          <button id="start-receive" type="button">Receive File</button>
+          <pre id="receive-progress" class="progress">idle</pre>
+          <p id="receive-status" class="status">idle</p>
+        </article>
+      </section>
+
+      <section class="notes">
+        <h2>Current POC Limits</h2>
+        <p>
+          This browser build is relay-only and sends one file at a time. Native derpcat
+          and derphole still own the direct UDP upgrade path and high-throughput transfer
+          engine.
+        </p>
+      </section>
+    </main>
+
+    <script src="wasm_exec.js"></script>
+    <script src="wasm_payload.js"></script>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
