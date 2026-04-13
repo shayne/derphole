@@ -38,7 +38,8 @@ els.startSend.addEventListener("click", async () => {
     els.sendToken.value = token;
     els.copyToken.disabled = false;
     progress.status("waiting-for-claim");
-    await window.derpholeWASM.sendFile(selectedFile, progress.callbacks);
+    const direct = makeDirectTransport(progress);
+    await window.derpholeWASM.sendFile(selectedFile, progress.callbacks, direct);
   } catch (err) {
     progress.status(`error: ${err.message || err}`);
   } finally {
@@ -62,7 +63,8 @@ els.startReceive.addEventListener("click", async () => {
   try {
     const sink = await makeSink(progress);
     progress.status("claiming");
-    await window.derpholeWASM.receiveFile(token, sink, progress.callbacks);
+    const direct = makeDirectTransport(progress);
+    await window.derpholeWASM.receiveFile(token, sink, progress.callbacks, direct);
   } catch (err) {
     progress.status(`error: ${err.message || err}`);
   } finally {
@@ -181,6 +183,22 @@ function makeProgress(output, statusEl) {
       statusEl.textContent = value;
     },
   };
+}
+
+function makeDirectTransport(progress) {
+  if (typeof window.createDerpholeWebRTCTransport !== "function") {
+    progress.status("relay-only: WebRTC unavailable");
+    return null;
+  }
+  const direct = window.createDerpholeWebRTCTransport({
+    status(value) {
+      progress.status(value);
+    },
+  });
+  if (!direct) {
+    progress.status("relay-only: WebRTC unavailable");
+  }
+  return direct;
 }
 
 function recordSample(state, bytes) {

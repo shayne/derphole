@@ -12,6 +12,7 @@ GOOS=js GOARCH=wasm go build -trimpath -o "${OUT_DIR}/derphole-web.wasm" "${ROOT
 cp "$(go env GOROOT)/lib/wasm/wasm_exec.js" "${OUT_DIR}/wasm_exec.js"
 cp "${ROOT_DIR}/web/derphole/index.html" "${OUT_DIR}/index.html"
 cp "${ROOT_DIR}/web/derphole/styles.css" "${OUT_DIR}/styles.css"
+cp "${ROOT_DIR}/web/derphole/webrtc.js" "${OUT_DIR}/webrtc.js"
 cp "${ROOT_DIR}/web/derphole/app.js" "${OUT_DIR}/app.js"
 
 {

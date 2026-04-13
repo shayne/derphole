@@ -9,11 +9,11 @@
   <body>
     <main class="shell">
       <section class="hero">
-        <p class="eyebrow">DERP relay proof of concept</p>
+        <p class="eyebrow">DERP relay-first proof of concept</p>
         <h1>derphole web</h1>
         <p class="lede">
           Send one file through the same DERP rendezvous infrastructure as derphole,
-          directly from a browser tab.
+          directly from a browser tab with WebRTC upgrade when available.
         </p>
       </section>
 
@@ -45,15 +45,17 @@
       <section class="notes">
         <h2>Current POC Limits</h2>
         <p>
-          This browser build is relay-only and sends one file at a time. Native derpcat
-          and derphole still own the direct UDP upgrade path and high-throughput transfer
-          engine.
+          This browser build starts on DERP relay immediately, then upgrades to a
+          WebRTC DataChannel when the browser and network allow it. Native derpcat
+          and derphole still own the direct UDP upgrade path and highest-throughput
+          transfer engine.
         </p>
       </section>
     </main>
 
     <script src="wasm_exec.js"></script>
     <script src="wasm_payload.js"></script>
+    <script src="webrtc.js"></script>
     <script type="module" src="app.js"></script>
   </body>
 </html>

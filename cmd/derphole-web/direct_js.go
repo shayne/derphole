@@ -76,6 +76,7 @@ func (d *jsDirectTransport) Start(ctx context.Context, role webrelay.DirectRole,
 
 	go d.forwardRemoteSignals(ctx, peer)
 	go d.waitReady(ctx)
+	go d.watchFailed(ctx)
 
 	if _, err := await(ctx, d.api.Call("start", string(role), signalSink)); err != nil {
 		d.fail(err)
@@ -139,6 +140,23 @@ func (d *jsDirectTransport) waitReady(ctx context.Context) {
 	}
 	d.ready = true
 	close(d.readyCh)
+}
+
+func (d *jsDirectTransport) watchFailed(ctx context.Context) {
+	failedFn := d.api.Get("failed")
+	if !isFunction(failedFn) {
+		return
+	}
+	value, err := await(ctx, failedFn.Invoke())
+	if err != nil {
+		d.fail(err)
+		return
+	}
+	if value.IsUndefined() || value.IsNull() {
+		d.fail(errors.New("direct path failed"))
+		return
+	}
+	d.fail(jsValueError(value))
 }
 
 func (d *jsDirectTransport) fail(err error) {
