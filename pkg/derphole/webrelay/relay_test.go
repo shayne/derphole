@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -524,7 +525,7 @@ func TestSendWithOptionsPipelinesRelayDataBeforeAck(t *testing.T) {
 	source := newFakeSource("file.txt", []byte("abc"), []byte("def"), []byte("ghi"))
 	metaAcked := make(chan struct{})
 	releaseDataAcks := make(chan struct{})
-	var dataSent int
+	var dataSent atomic.Int32
 
 	client.sendHook = func(_ key.NodePublic, payload []byte) {
 		frame, err := webproto.Parse(payload)
@@ -536,8 +537,7 @@ func TestSendWithOptionsPipelinesRelayDataBeforeAck(t *testing.T) {
 			client.emit(peerDERP, mustMarshalFrame(t, webproto.FrameAck, 0, webproto.Ack{BytesReceived: 0}))
 			close(metaAcked)
 		case webproto.FrameData:
-			dataSent++
-			if dataSent == 3 {
+			if dataSent.Add(1) == 3 {
 				go func() {
 					<-releaseDataAcks
 					client.emit(peerDERP, mustMarshalFrame(t, webproto.FrameAck, 0, webproto.Ack{BytesReceived: 3}))
@@ -570,11 +570,11 @@ func TestSendWithOptionsPipelinesRelayDataBeforeAck(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) && dataSent < 3 {
+	for time.Now().Before(deadline) && dataSent.Load() < 3 {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if dataSent < 3 {
-		t.Fatalf("data frames sent before ack = %d, want 3", dataSent)
+	if got := dataSent.Load(); got < 3 {
+		t.Fatalf("data frames sent before ack = %d, want 3", got)
 	}
 	close(releaseDataAcks)
 
