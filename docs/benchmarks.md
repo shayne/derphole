@@ -85,6 +85,27 @@ Keep the raw probe comparison separate from the derpcat baseline runs. The basel
 
 The reverse probe harness is only valid when the remote host can actually SSH to the peer host and user you supply. Do not rely on the local hostname unless that name is resolvable and reachable from the remote side.
 
+### Browser to CLI WebRTC
+
+Use this after changing `pkg/derphole/webrelay`, `pkg/derphole/webrtcdirect`, `cmd/derphole-web`, or `web/derphole`.
+
+1. Build and serve the browser demo locally:
+
+```bash
+./scripts/smoke-web-cli.sh
+python3 -m http.server --directory "${TMPDIR:-/tmp}/derphole-web-cli-smoke" 8765
+```
+
+2. Open `http://127.0.0.1:8765/`, select a file, and copy the receive command.
+
+3. Receive with native CLI:
+
+```bash
+DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 go run ./cmd/derpcat derphole receive '<token>'
+```
+
+Record time to first byte, path-switch time, average throughput, final path, and whether relay fallback was used.
+
 ## Cleanup Guardrails
 
 Never start the next benchmark iteration until the previous one has fully exited and both hosts are clean.
