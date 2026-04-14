@@ -30,8 +30,8 @@ func TestRelayWindowAckRetiresOnlyCommittedFrames(t *testing.T) {
 	if got := w.ackedOffset(); got != 5 {
 		t.Fatalf("ackedOffset = %d, want 5", got)
 	}
-	if got := w.inFlightBytes(); got != 6 {
-		t.Fatalf("inFlightBytes = %d, want 6", got)
+	if got := w.inFlightBytes(); got != 4 {
+		t.Fatalf("inFlightBytes = %d, want 4", got)
 	}
 	w.ack(6)
 	if got := w.inFlightBytes(); got != 3 {
@@ -95,5 +95,25 @@ func TestRelayWindowTracksUnsentFramesAndEmpty(t *testing.T) {
 	w.ack(6)
 	if !w.empty() {
 		t.Fatal("window should be empty after all frames are acked")
+	}
+}
+
+func TestRelayWindowPartialAckTrimsHeadFrame(t *testing.T) {
+	w := newRelayWindow(relayWindowConfig{MaxBytes: 64, MaxFrames: 8})
+	w.push(relayFrame{Seq: 1, Offset: 0, NextOffset: 6, Payload: []byte("abcdef")})
+	w.push(relayFrame{Seq: 2, Offset: 6, NextOffset: 9, Payload: []byte("ghi")})
+	w.ack(3)
+	if got := w.inFlightBytes(); got != 6 {
+		t.Fatalf("inFlightBytes = %d, want 6", got)
+	}
+	replay := w.replayFrom(3)
+	if len(replay) != 2 {
+		t.Fatalf("replay frame count = %d, want 2", len(replay))
+	}
+	if replay[0].Seq != 1 || replay[0].Offset != 3 || replay[0].NextOffset != 6 || string(replay[0].Payload) != "def" {
+		t.Fatalf("first replay frame = %+v", replay[0])
+	}
+	if replay[1].Seq != 2 || replay[1].Offset != 6 || replay[1].NextOffset != 9 || string(replay[1].Payload) != "ghi" {
+		t.Fatalf("second replay frame = %+v", replay[1])
 	}
 }

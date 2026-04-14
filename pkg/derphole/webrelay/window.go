@@ -79,6 +79,9 @@ func (w *relayWindow) ack(bytesReceived int64) {
 		if frame.NextOffset <= bytesReceived {
 			continue
 		}
+		if frame.Offset < bytesReceived {
+			frame = trimRelayFramePrefix(frame, bytesReceived-frame.Offset)
+		}
 		kept = append(kept, frame)
 		inFlight += int64(len(frame.Payload))
 		buffered += int64(len(frame.Payload))
@@ -110,6 +113,9 @@ func (w *relayWindow) replayFrom(offset int64) []relayFrame {
 		if frame.NextOffset <= offset {
 			continue
 		}
+		if frame.Offset < offset {
+			frame = trimRelayFramePrefix(frame, offset-frame.Offset)
+		}
 		out = append(out, cloneRelayFrame(frame))
 	}
 	return out
@@ -117,5 +123,19 @@ func (w *relayWindow) replayFrom(offset int64) []relayFrame {
 
 func cloneRelayFrame(frame relayFrame) relayFrame {
 	frame.Payload = append([]byte(nil), frame.Payload...)
+	return frame
+}
+
+func trimRelayFramePrefix(frame relayFrame, trimBytes int64) relayFrame {
+	if trimBytes <= 0 {
+		return cloneRelayFrame(frame)
+	}
+	if trimBytes >= int64(len(frame.Payload)) {
+		frame.Payload = nil
+		frame.Offset = frame.NextOffset
+		return frame
+	}
+	frame.Offset += trimBytes
+	frame.Payload = append([]byte(nil), frame.Payload[int(trimBytes):]...)
 	return frame
 }
