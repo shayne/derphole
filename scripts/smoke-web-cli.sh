@@ -10,8 +10,16 @@ mkdir -p "$TMP"
 dd if=/dev/urandom of="$TMP/input.bin" bs="$SIZE" count=1 status=none
 
 GOOS=js GOARCH=wasm go build -o "$TMP/derphole-web.wasm" "$ROOT/cmd/derphole-web"
-cp "$ROOT/web/derphole/"*.js "$TMP/"
-cp "$ROOT/web/derphole/"*.html "$TMP/" 2>/dev/null || true
+cp "$(go env GOROOT)/lib/wasm/wasm_exec.js" "$TMP/wasm_exec.js"
+cp "$ROOT/web/derphole/index.html" "$TMP/index.html"
+cp "$ROOT/web/derphole/styles.css" "$TMP/styles.css"
+cp "$ROOT/web/derphole/webrtc.js" "$TMP/webrtc.js"
+cp "$ROOT/web/derphole/app.js" "$TMP/app.js"
+{
+  printf 'window.derpholeWasmBase64 = "'
+  base64 < "$TMP/derphole-web.wasm" | tr -d '\n'
+  printf '";\n'
+} > "$TMP/wasm_payload.js"
 
 echo "Built browser assets in $TMP"
 echo "Manual smoke:"
