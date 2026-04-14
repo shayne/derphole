@@ -1,6 +1,6 @@
 (function () {
-  const bufferHighWater = 16 * 1024 * 1024;
-  const bufferLowWater = 4 * 1024 * 1024;
+  const bufferHighWater = 8 * 1024 * 1024;
+  const bufferLowWater = 2 * 1024 * 1024;
 
   window.createDerpholeWebRTCTransport = function createDerpholeWebRTCTransport(callbacks = {}) {
     const PeerConnection = window.RTCPeerConnection || window.webkitRTCPeerConnection;
@@ -189,16 +189,54 @@
 
     async function send(bytes) {
       await readyPromise;
+      for (;;) {
+        assertChannelOpen();
+        await waitForSendCapacity(bytes);
+        assertChannelOpen();
+        try {
+          channel.send(bytes);
+          return;
+        } catch (err) {
+          if (!isSendQueueFullError(err)) {
+            throw err;
+          }
+          await Promise.race([waitForBufferedAmountLow(), failedPromise]);
+        }
+      }
+    }
+
+    async function waitForSendCapacity(bytes) {
+      const size = byteLength(bytes);
+      while (channel && channel.bufferedAmount + size > bufferHighWater) {
+        await Promise.race([waitForBufferedAmountLow(), failedPromise]);
+        assertChannelOpen();
+      }
+    }
+
+    function assertChannelOpen() {
       if (!channel || channel.readyState !== "open") {
         throw new Error("webrtc datachannel is not open");
       }
-      while (channel.bufferedAmount > bufferHighWater) {
-        await Promise.race([waitForBufferedAmountLow(), failedPromise]);
-        if (!channel || channel.readyState !== "open") {
-          throw new Error("webrtc datachannel closed");
-        }
+    }
+
+    function byteLength(bytes) {
+      if (!bytes) {
+        return 0;
       }
-      channel.send(bytes);
+      if (typeof bytes === "string") {
+        return new TextEncoder().encode(bytes).byteLength;
+      }
+      if (typeof bytes.byteLength === "number") {
+        return bytes.byteLength;
+      }
+      if (typeof bytes.length === "number") {
+        return bytes.length;
+      }
+      return 0;
+    }
+
+    function isSendQueueFullError(err) {
+      return String(err?.message || err).includes("send queue is full");
     }
 
     function waitForBufferedAmountLow() {
