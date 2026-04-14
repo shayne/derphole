@@ -174,6 +174,9 @@ func newCallbacks(v js.Value) webrelay.Callbacks {
 		Progress: func(progress webrelay.Progress) {
 			call(v, "progress", float64(progress.Bytes), float64(progress.Total))
 		},
+		Trace: func(trace string) {
+			call(v, "trace", trace)
+		},
 	}
 }
 

@@ -240,6 +240,11 @@ func receiveViaWebRelay(ctx context.Context, cfg ReceiveConfig, receiveToken str
 			}
 		},
 		Progress: func(webrelay.Progress) {},
+		Trace: func(trace string) {
+			if cfg.Emitter != nil {
+				cfg.Emitter.Debug("webrelay-" + trace)
+			}
+		},
 	}
 	opts := webrelay.TransferOptions{}
 	if !cfg.ForceRelay && derpholeNewWebDirect != nil {

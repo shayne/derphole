@@ -276,6 +276,52 @@ func TestClientRecvLoopRepliesToDERPPing(t *testing.T) {
 	}
 }
 
+func TestClientRecvLoopFullFallbackQueueDoesNotBlockSubscribers(t *testing.T) {
+	fake := newFakeDERPClientConn()
+	c := &Client{
+		dc:          fake,
+		packetCh:    make(chan Packet, 1),
+		stopCh:      make(chan struct{}),
+		doneCh:      make(chan struct{}),
+		subscribers: make(map[uint64]*packetSubscriber),
+	}
+	go c.recvLoop()
+	t.Cleanup(func() { _ = c.Close() })
+
+	unmatchedSrc := key.NewNode().Public()
+	fake.messages <- derp.ReceivedPacket{Source: unmatchedSrc, Data: []byte("stale-1")}
+	deadline := time.Now().Add(time.Second)
+	for len(c.packetCh) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(c.packetCh) == 0 {
+		t.Fatal("fallback packet queue did not fill")
+	}
+
+	fake.messages <- derp.ReceivedPacket{Source: unmatchedSrc, Data: []byte("stale-2")}
+
+	wantPayload := []byte("claim-after-stale")
+	subCh, unsubscribe := c.SubscribeLossless(func(pkt Packet) bool {
+		return bytes.Equal(pkt.Payload, wantPayload)
+	})
+	defer unsubscribe()
+
+	matchSrc := key.NewNode().Public()
+	fake.messages <- derp.ReceivedPacket{Source: matchSrc, Data: wantPayload}
+
+	select {
+	case pkt := <-subCh:
+		if pkt.From != matchSrc {
+			t.Fatalf("subscriber From = %v, want %v", pkt.From, matchSrc)
+		}
+		if !bytes.Equal(pkt.Payload, wantPayload) {
+			t.Fatalf("subscriber payload = %q, want %q", pkt.Payload, wantPayload)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("subscriber did not receive matching packet after fallback queue filled")
+	}
+}
+
 func TestClientSubscribeInterceptsMatchingPackets(t *testing.T) {
 	c := &Client{
 		stopCh:      make(chan struct{}),

@@ -353,11 +353,28 @@ func (c *Client) recvLoop() {
 		if c.dispatchSubscriber(out) {
 			continue
 		}
-		select {
-		case c.packetCh <- out:
-		case <-c.stopCh:
-			return
-		}
+		c.enqueueFallback(out)
+	}
+}
+
+func (c *Client) enqueueFallback(pkt Packet) {
+	select {
+	case c.packetCh <- pkt:
+		return
+	case <-c.stopCh:
+		return
+	default:
+	}
+
+	select {
+	case <-c.packetCh:
+	default:
+	}
+
+	select {
+	case c.packetCh <- pkt:
+	case <-c.stopCh:
+	default:
 	}
 }
 

@@ -178,6 +178,9 @@ function makeProgress(output, statusEl) {
         recordSample(state, bytes);
         render();
       },
+      trace(value) {
+        console.debug(`[derphole] ${value}`);
+      },
     },
     status(value) {
       statusEl.textContent = value;

@@ -26,6 +26,7 @@ const (
 	chunkBytes         = webproto.MaxPayloadBytes
 	relayWindowBytes   = 8 << 20
 	relayWindowFrames  = relayWindowBytes / chunkBytes
+	maxPendingFrames   = relayWindowFrames * 2
 	claimRetryDelay    = 250 * time.Millisecond
 	frameRetryDelay    = 2 * time.Second
 	offerTokenTTL      = time.Hour
@@ -47,6 +48,7 @@ type Progress struct {
 type Callbacks struct {
 	Status   func(string)
 	Progress func(Progress)
+	Trace    func(string)
 }
 
 type DirectRole string
@@ -295,7 +297,8 @@ func (o *Offer) send(ctx context.Context, src FileSource, cb Callbacks, opts Tra
 		return errors.New("nil source")
 	}
 	cb.status(statusWaitingClaim)
-	peerDERP, err := o.waitClaim(ctx)
+	cb.trace("offer-wait-claim")
+	peerDERP, err := o.waitClaim(ctx, cb)
 	if err != nil {
 		return err
 	}
@@ -341,7 +344,7 @@ func (o *Offer) send(ctx context.Context, src FileSource, cb Callbacks, opts Tra
 	path := chooseSendPath(TransferOptions{Direct: directTransport}, direct != nil && direct.active)
 	if path == sendPathDirect {
 		if err := sendDirectFrame(ctx, directTransport, webproto.FrameDone, seq, nil); err == nil {
-			if err := awaitAckOrDirectFailure(ctx, peerCh, offset, 5*time.Minute, directTransport.Failed()); err != nil {
+			if err := awaitAck(ctx, peerCh, offset, 5*time.Minute); err != nil {
 				return notifyAbort(ctx, o.client, peerDERP, err)
 			}
 		} else {
@@ -444,7 +447,7 @@ func (o *Offer) sendDataWindowed(ctx context.Context, src FileSource, cb Callbac
 		}
 
 		if direct != nil && directTransport != nil && direct.ready && !direct.active && offset > 0 {
-			switched, err := trySwitchDirectWithReplay(ctx, o.client, peerDERP, peerCh, directTransport, seq, window)
+			switched, err := trySwitchDirectWithReplay(ctx, o.client, peerDERP, peerCh, directTransport, seq, window, cb)
 			if err != nil {
 				if err := abortIfContextDone(ctx, o.client, peerDERP); err != nil {
 					return offset, seq, directTransport, direct, err
@@ -508,6 +511,7 @@ func receive(ctx context.Context, encodedToken string, sink FileSink, cb Callbac
 	defer client.Close()
 
 	peerDERP := keyNodePublicFromRaw32(tok.DERPPublic)
+	cb.trace("claim-peer=" + peerDERP.ShortString())
 	frames, unsubscribe := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == peerDERP && webproto.IsWebFrame(pkt.Payload)
 	})
@@ -517,7 +521,7 @@ func receive(ctx context.Context, encodedToken string, sink FileSink, cb Callbac
 	if err != nil {
 		return err
 	}
-	if err := sendClaimUntilDecision(ctx, client, peerDERP, frames, claim); err != nil {
+	if err := sendClaimUntilDecision(ctx, client, peerDERP, frames, claim, cb); err != nil {
 		return err
 	}
 
@@ -546,6 +550,50 @@ func receiveFrames(ctx context.Context, client derpClient, peerDERP key.NodePubl
 	var received int64
 	var opened bool
 	var directActive bool
+	pendingFrames := make(map[uint64][]byte)
+	var doneSeen bool
+	var doneSeq uint64
+
+	writeFrame := func(frame webproto.Frame) error {
+		if err := sink.WriteChunk(ctx, frame.Payload); err != nil {
+			return abortAndReturn(ctx, client, peerDERP, err.Error())
+		}
+		received += int64(len(frame.Payload))
+		expectedSeq++
+		cb.progress(Progress{Bytes: received, Total: meta.Size})
+		return nil
+	}
+	drainPending := func() error {
+		for {
+			payload, ok := pendingFrames[expectedSeq]
+			if !ok {
+				return nil
+			}
+			delete(pendingFrames, expectedSeq)
+			if err := writeFrame(webproto.Frame{Kind: webproto.FrameData, Seq: expectedSeq, Payload: payload}); err != nil {
+				return err
+			}
+		}
+	}
+	completeIfDone := func() (bool, error) {
+		if !doneSeen || doneSeq > expectedSeq {
+			return false, nil
+		}
+		if meta.Size >= 0 && received != meta.Size {
+			return false, abortAndReturn(ctx, client, peerDERP, "received byte count does not match metadata")
+		}
+		if err := sendAck(ctx, client, peerDERP, received); err != nil {
+			return false, err
+		}
+		if opened {
+			if err := sink.Close(ctx); err != nil {
+				return false, err
+			}
+		}
+		cb.progress(Progress{Bytes: received, Total: meta.Size})
+		cb.status(statusComplete)
+		return true, nil
+	}
 
 	for {
 		raw, err := nextRawFrame(ctx, frames, direct, directActive)
@@ -588,15 +636,28 @@ func receiveFrames(ctx context.Context, client derpClient, peerDERP key.NodePubl
 				continue
 			}
 			if frame.Seq > expectedSeq {
-				return abortAndReturn(ctx, client, peerDERP, "missing data frame")
+				if _, ok := pendingFrames[frame.Seq]; !ok {
+					if len(pendingFrames) >= maxPendingFrames {
+						return abortAndReturn(ctx, client, peerDERP, "too many out-of-order data frames")
+					}
+					pendingFrames[frame.Seq] = append([]byte(nil), frame.Payload...)
+					if len(pendingFrames) == 1 || len(pendingFrames)%64 == 0 {
+						cb.trace(fmt.Sprintf("receive-buffered seq=%d expected=%d pending=%d", frame.Seq, expectedSeq, len(pendingFrames)))
+					}
+				}
+				_ = sendAck(ctx, client, peerDERP, received)
+				continue
 			}
-			if err := sink.WriteChunk(ctx, frame.Payload); err != nil {
-				return abortAndReturn(ctx, client, peerDERP, err.Error())
+			if err := writeFrame(frame); err != nil {
+				return err
 			}
-			received += int64(len(frame.Payload))
-			expectedSeq++
-			cb.progress(Progress{Bytes: received, Total: meta.Size})
+			if err := drainPending(); err != nil {
+				return err
+			}
 			if err := sendAck(ctx, client, peerDERP, received); err != nil {
+				return err
+			}
+			if complete, err := completeIfDone(); err != nil || complete {
 				return err
 			}
 		case webproto.FrameDirectReady:
@@ -604,43 +665,37 @@ func receiveFrames(ctx context.Context, client derpClient, peerDERP key.NodePubl
 			if err := json.Unmarshal(frame.Payload, &ready); err != nil {
 				return abortAndReturn(ctx, client, peerDERP, "invalid direct ready")
 			}
-			if ready.BytesReceived == received && ready.NextSeq == expectedSeq {
+			cb.trace(fmt.Sprintf("receive-direct-ready bytes=%d next_seq=%d received=%d expected=%d", ready.BytesReceived, ready.NextSeq, received, expectedSeq))
+			if ready.BytesReceived <= received && ready.NextSeq <= expectedSeq {
 				payload, err := json.Marshal(webproto.PathSwitch{
 					Path:          "webrtc",
-					BytesReceived: received,
-					NextSeq:       expectedSeq,
+					BytesReceived: ready.BytesReceived,
+					NextSeq:       ready.NextSeq,
 				})
 				if err != nil {
 					return err
 				}
-				if err := sendFrame(ctx, client, peerDERP, webproto.FramePathSwitch, expectedSeq, payload); err != nil {
+				if err := sendFrame(ctx, client, peerDERP, webproto.FramePathSwitch, ready.NextSeq, payload); err != nil {
 					return err
 				}
 				directActive = true
+				cb.trace(fmt.Sprintf("receive-path-switch bytes=%d next_seq=%d received=%d expected=%d", ready.BytesReceived, ready.NextSeq, received, expectedSeq))
 				cb.status(statusDirect)
 			}
 		case webproto.FrameDone:
-			if meta.Size >= 0 && received != meta.Size {
-				return abortAndReturn(ctx, client, peerDERP, "received byte count does not match metadata")
-			}
-			if err := sendAck(ctx, client, peerDERP, received); err != nil {
+			doneSeen = true
+			doneSeq = frame.Seq
+			if complete, err := completeIfDone(); err != nil || complete {
 				return err
 			}
-			if opened {
-				if err := sink.Close(ctx); err != nil {
-					return err
-				}
-			}
-			cb.progress(Progress{Bytes: received, Total: meta.Size})
-			cb.status(statusComplete)
-			return nil
+			_ = sendAck(ctx, client, peerDERP, received)
 		case webproto.FrameAbort:
 			return decodeAbort(frame.Payload)
 		}
 	}
 }
 
-func (o *Offer) waitClaim(ctx context.Context) (key.NodePublic, error) {
+func (o *Offer) waitClaim(ctx context.Context, cb Callbacks) (key.NodePublic, error) {
 	claimCh, unsubscribe := o.client.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return webproto.IsWebFrame(pkt.Payload)
 	})
@@ -653,20 +708,31 @@ func (o *Offer) waitClaim(ctx context.Context) (key.NodePublic, error) {
 		}
 		frame, err := webproto.Parse(pkt.Payload)
 		if err != nil || frame.Kind != webproto.FrameClaim {
+			if err == nil {
+				cb.trace("offer-frame-ignored=" + frameKindName(frame.Kind))
+			}
 			continue
 		}
+		cb.trace("offer-claim-received")
 		var claim rendezvous.Claim
 		if err := json.Unmarshal(frame.Payload, &claim); err != nil {
+			cb.trace("offer-claim-malformed")
 			continue
 		}
 		decision, _ := o.gate.Accept(time.Now(), claim)
 		peerDERP := keyNodePublicFromRaw32(claim.DERPPublic)
+		cb.trace("offer-claim-peer=" + peerDERP.ShortString())
 		payload, err := json.Marshal(decision)
 		if err != nil {
 			return key.NodePublic{}, err
 		}
 		if err := sendFrame(ctx, o.client, peerDERP, webproto.FrameDecision, 0, payload); err != nil {
 			return key.NodePublic{}, err
+		}
+		if decision.Accepted {
+			cb.trace("offer-decision=accepted")
+		} else {
+			cb.trace("offer-decision=rejected")
 		}
 		if !decision.Accepted {
 			continue
@@ -712,7 +778,7 @@ func pollSendDirectState(cb Callbacks, direct *directState, transport DirectTran
 	return transport, nil
 }
 
-func trySwitchDirectWithReplay(ctx context.Context, client derpClient, peerDERP key.NodePublic, frames <-chan derpbind.Packet, direct DirectTransport, nextSeq uint64, window *relayWindow) (bool, error) {
+func trySwitchDirectWithReplay(ctx context.Context, client derpClient, peerDERP key.NodePublic, frames <-chan derpbind.Packet, direct DirectTransport, nextSeq uint64, window *relayWindow, cb Callbacks) (bool, error) {
 	if direct == nil || window == nil {
 		return false, nil
 	}
@@ -722,6 +788,7 @@ func trySwitchDirectWithReplay(ctx context.Context, client derpClient, peerDERP 
 	if len(replay) > 0 {
 		switchSeq = replay[0].Seq
 	}
+	cb.trace(fmt.Sprintf("send-direct-ready bytes=%d next_seq=%d replay_frames=%d", switchOffset, switchSeq, len(replay)))
 	ready, err := marshalDirectReadyFrame(switchSeq, switchOffset)
 	if err != nil {
 		return false, err
@@ -750,12 +817,14 @@ func trySwitchDirectWithReplay(ctx context.Context, client derpClient, peerDERP 
 				if sw.Path != "webrtc" || sw.BytesReceived != switchOffset || sw.NextSeq != switchSeq {
 					return false, nil
 				}
+				cb.trace(fmt.Sprintf("send-path-switch bytes=%d next_seq=%d replay_frames=%d", sw.BytesReceived, sw.NextSeq, len(replay)))
 				for _, replayFrame := range replay {
 					if err := sendDirectFrame(ctx, direct, webproto.FrameData, replayFrame.Seq, replayFrame.Payload); err != nil {
 						return false, err
 					}
 					window.ack(replayFrame.NextOffset)
 				}
+				cb.trace(fmt.Sprintf("send-direct-replay-complete frames=%d", len(replay)))
 				return true, nil
 			case webproto.FrameAbort:
 				return false, decodeAbort(frame.Payload)
@@ -778,12 +847,15 @@ func trySwitchDirectWithReplay(ctx context.Context, client derpClient, peerDERP 
 	}
 }
 
-func sendClaimUntilDecision(ctx context.Context, client derpClient, peerDERP key.NodePublic, frames <-chan derpbind.Packet, claim rendezvous.Claim) error {
+func sendClaimUntilDecision(ctx context.Context, client derpClient, peerDERP key.NodePublic, frames <-chan derpbind.Packet, claim rendezvous.Claim, cb Callbacks) error {
 	payload, err := json.Marshal(claim)
 	if err != nil {
 		return err
 	}
+	attempt := 0
 	send := func() error {
+		attempt++
+		cb.trace("claim-send-attempt=" + strconv.Itoa(attempt))
 		return sendFrame(ctx, client, peerDERP, webproto.FrameClaim, 0, payload)
 	}
 	if err := send(); err != nil {
@@ -799,18 +871,25 @@ func sendClaimUntilDecision(ctx context.Context, client derpClient, peerDERP key
 			}
 			frame, err := webproto.Parse(pkt.Payload)
 			if err != nil || frame.Kind != webproto.FrameDecision {
+				if err == nil {
+					cb.trace("claim-frame-ignored=" + frameKindName(frame.Kind))
+				}
 				continue
 			}
+			cb.trace("claim-frame-received=decision")
 			var decision rendezvous.Decision
 			if err := json.Unmarshal(frame.Payload, &decision); err != nil {
+				cb.trace("claim-decision-malformed")
 				continue
 			}
 			if !decision.Accepted {
+				cb.trace("claim-decision=rejected")
 				if decision.Reject != nil && decision.Reject.Reason != "" {
 					return errors.New(decision.Reject.Reason)
 				}
 				return errors.New("claim rejected")
 			}
+			cb.trace("claim-decision=accepted")
 			return nil
 		case <-retry.C:
 			if err := send(); err != nil {
@@ -1178,6 +1257,47 @@ func (cb Callbacks) status(status string) {
 func (cb Callbacks) progress(progress Progress) {
 	if cb.Progress != nil {
 		cb.Progress(progress)
+	}
+}
+
+func (cb Callbacks) trace(trace string) {
+	if cb.Trace != nil {
+		cb.Trace(trace)
+	}
+}
+
+func frameKindName(kind webproto.FrameKind) string {
+	switch kind {
+	case webproto.FrameClaim:
+		return "claim"
+	case webproto.FrameDecision:
+		return "decision"
+	case webproto.FrameMeta:
+		return "meta"
+	case webproto.FrameData:
+		return "data"
+	case webproto.FrameDone:
+		return "done"
+	case webproto.FrameAck:
+		return "ack"
+	case webproto.FrameAbort:
+		return "abort"
+	case webproto.FrameWebRTCOffer:
+		return "webrtc-offer"
+	case webproto.FrameWebRTCAnswer:
+		return "webrtc-answer"
+	case webproto.FrameWebRTCIceCandidate:
+		return "webrtc-candidate"
+	case webproto.FrameWebRTCIceComplete:
+		return "webrtc-ice-complete"
+	case webproto.FrameDirectReady:
+		return "direct-ready"
+	case webproto.FramePathSwitch:
+		return "path-switch"
+	case webproto.FrameDirectFailed:
+		return "direct-failed"
+	default:
+		return "unknown"
 	}
 }
 
