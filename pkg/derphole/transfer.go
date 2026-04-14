@@ -16,6 +16,7 @@ import (
 	"github.com/shayne/derpcat/pkg/derphole/protocol"
 	"github.com/shayne/derpcat/pkg/derphole/webproto"
 	"github.com/shayne/derpcat/pkg/derphole/webrelay"
+	"github.com/shayne/derpcat/pkg/derphole/webrtcdirect"
 	"github.com/shayne/derpcat/pkg/session"
 	"github.com/shayne/derpcat/pkg/telemetry"
 	"github.com/shayne/derpcat/pkg/token"
@@ -66,12 +67,13 @@ type sendTransfer struct {
 const verificationPlaceholder = "0000-0000-0000"
 
 var (
-	derpholeSessionDialAttach = session.DialAttach
-	derpholeSessionListen     = session.Listen
-	derpholeSessionOffer      = session.Offer
-	derpholeSessionReceive    = session.Receive
-	derpholeSessionSend       = session.Send
-	derpholeWebRelayReceive   = webrelay.Receive
+	derpholeSessionDialAttach          = session.DialAttach
+	derpholeSessionListen              = session.Listen
+	derpholeSessionOffer               = session.Offer
+	derpholeSessionReceive             = session.Receive
+	derpholeSessionSend                = session.Send
+	derpholeWebRelayReceiveWithOptions = webrelay.ReceiveWithOptions
+	derpholeNewWebDirect               = func() webrelay.DirectTransport { return webrtcdirect.New() }
 )
 
 func normalizeParallelPolicy(policy session.ParallelPolicy) session.ParallelPolicy {
@@ -239,7 +241,11 @@ func receiveViaWebRelay(ctx context.Context, cfg ReceiveConfig, receiveToken str
 		},
 		Progress: func(webrelay.Progress) {},
 	}
-	return derpholeWebRelayReceive(ctx, receiveToken, sink, cb)
+	opts := webrelay.TransferOptions{}
+	if !cfg.ForceRelay && derpholeNewWebDirect != nil {
+		opts.Direct = derpholeNewWebDirect()
+	}
+	return derpholeWebRelayReceiveWithOptions(ctx, receiveToken, sink, cb, opts)
 }
 
 func prepareSendTransfer(cfg SendConfig) (sendTransfer, error) {

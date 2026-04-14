@@ -314,10 +314,13 @@ func TestReceiveDefaultsParallelPolicyForAttachDial(t *testing.T) {
 }
 
 func TestReceiveWebFileTokenUsesWebRelayReceiver(t *testing.T) {
-	prev := derpholeWebRelayReceive
+	prev := derpholeWebRelayReceiveWithOptions
+	prevDirect := derpholeNewWebDirect
 	t.Cleanup(func() {
-		derpholeWebRelayReceive = prev
+		derpholeWebRelayReceiveWithOptions = prev
+		derpholeNewWebDirect = prevDirect
 	})
+	derpholeNewWebDirect = nil
 
 	tok, err := token.Encode(token.Token{
 		Version:      token.SupportedVersion,
@@ -331,7 +334,7 @@ func TestReceiveWebFileTokenUsesWebRelayReceiver(t *testing.T) {
 	var gotToken string
 	var gotSink webrelay.FileSink
 	var gotProgressOutput bool
-	derpholeWebRelayReceive = func(_ context.Context, encodedToken string, sink webrelay.FileSink, cb webrelay.Callbacks) error {
+	derpholeWebRelayReceiveWithOptions = func(_ context.Context, encodedToken string, sink webrelay.FileSink, cb webrelay.Callbacks, _ webrelay.TransferOptions) error {
 		gotToken = encodedToken
 		gotSink = sink
 		gotProgressOutput = cb.Progress != nil
@@ -358,6 +361,73 @@ func TestReceiveWebFileTokenUsesWebRelayReceiver(t *testing.T) {
 		t.Fatal("web relay progress callback not configured")
 	}
 }
+
+func TestReceiveViaWebRelayUsesNativeDirectByDefault(t *testing.T) {
+	oldReceive := derpholeWebRelayReceiveWithOptions
+	oldDirect := derpholeNewWebDirect
+	defer func() {
+		derpholeWebRelayReceiveWithOptions = oldReceive
+		derpholeNewWebDirect = oldDirect
+	}()
+
+	var gotDirect bool
+	derpholeNewWebDirect = func() webrelay.DirectTransport {
+		return newFakeDirect()
+	}
+	derpholeWebRelayReceiveWithOptions = func(_ context.Context, _ string, _ webrelay.FileSink, _ webrelay.Callbacks, opts webrelay.TransferOptions) error {
+		gotDirect = opts.Direct != nil
+		return nil
+	}
+
+	err := receiveViaWebRelay(context.Background(), ReceiveConfig{}, "token")
+	if err != nil {
+		t.Fatalf("receiveViaWebRelay() error = %v", err)
+	}
+	if !gotDirect {
+		t.Fatal("receiveViaWebRelay did not pass native direct transport")
+	}
+}
+
+func TestReceiveViaWebRelaySkipsNativeDirectWhenForcedRelay(t *testing.T) {
+	oldReceive := derpholeWebRelayReceiveWithOptions
+	oldDirect := derpholeNewWebDirect
+	defer func() {
+		derpholeWebRelayReceiveWithOptions = oldReceive
+		derpholeNewWebDirect = oldDirect
+	}()
+
+	var gotDirect bool
+	derpholeNewWebDirect = func() webrelay.DirectTransport {
+		return newFakeDirect()
+	}
+	derpholeWebRelayReceiveWithOptions = func(_ context.Context, _ string, _ webrelay.FileSink, _ webrelay.Callbacks, opts webrelay.TransferOptions) error {
+		gotDirect = opts.Direct != nil
+		return nil
+	}
+
+	err := receiveViaWebRelay(context.Background(), ReceiveConfig{ForceRelay: true}, "token")
+	if err != nil {
+		t.Fatalf("receiveViaWebRelay() error = %v", err)
+	}
+	if gotDirect {
+		t.Fatal("receiveViaWebRelay passed direct transport despite ForceRelay")
+	}
+}
+
+type fakeWebDirect struct{}
+
+func newFakeDirect() webrelay.DirectTransport { return fakeWebDirect{} }
+
+func (fakeWebDirect) Start(context.Context, webrelay.DirectRole, webrelay.DirectSignalPeer) error {
+	return nil
+}
+func (fakeWebDirect) Ready() <-chan struct{} { return make(chan struct{}) }
+func (fakeWebDirect) Failed() <-chan error   { return make(chan error) }
+func (fakeWebDirect) SendFrame(context.Context, []byte) error {
+	return nil
+}
+func (fakeWebDirect) ReceiveFrames() <-chan []byte { return make(chan []byte) }
+func (fakeWebDirect) Close() error                 { return nil }
 
 func TestNativeWebFileSinkWritesFileAndProgress(t *testing.T) {
 	dir := t.TempDir()
