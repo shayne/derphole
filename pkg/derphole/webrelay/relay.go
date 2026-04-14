@@ -386,6 +386,9 @@ func (o *Offer) sendDataWindowed(ctx context.Context, src FileSource, cb Callbac
 
 			chunk, err := src.ReadChunk(ctx, offset, chunkBytes)
 			if err != nil {
+				if err := abortIfContextDone(ctx, o.client, peerDERP); err != nil {
+					return offset, seq, directTransport, direct, err
+				}
 				return offset, seq, directTransport, direct, notifyAbort(ctx, o.client, peerDERP, err)
 			}
 			if len(chunk) == 0 {
@@ -398,10 +401,16 @@ func (o *Offer) sendDataWindowed(ctx context.Context, src FileSource, cb Callbac
 			window.push(frame)
 			if direct != nil && direct.active && directTransport != nil {
 				if err := sendDirectFrame(ctx, directTransport, webproto.FrameData, seq, chunk); err != nil {
+					if err := abortIfContextDone(ctx, o.client, peerDERP); err != nil {
+						return offset, seq, directTransport, direct, err
+					}
 					return offset, seq, directTransport, direct, notifyAbort(ctx, o.client, peerDERP, err)
 				}
 				window.ack(nextOffset)
 			} else if err := sendRelayDataFrame(ctx, o.client, peerDERP, frame); err != nil {
+				if err := abortIfContextDone(ctx, o.client, peerDERP); err != nil {
+					return offset, seq, directTransport, direct, err
+				}
 				return offset, seq, directTransport, direct, err
 			} else {
 				window.markSent(seq)
@@ -423,6 +432,9 @@ func (o *Offer) sendDataWindowed(ctx context.Context, src FileSource, cb Callbac
 
 		if direct != nil && direct.ready && !direct.active && !window.empty() {
 			if err := awaitRelayWindowAck(ctx, peerCh, window); err != nil {
+				if err := abortIfContextDone(ctx, o.client, peerDERP); err != nil {
+					return offset, seq, directTransport, direct, err
+				}
 				return offset, seq, directTransport, direct, err
 			}
 			directTransport, directErr = pollSendDirectState(cb, direct, directTransport)
@@ -434,6 +446,9 @@ func (o *Offer) sendDataWindowed(ctx context.Context, src FileSource, cb Callbac
 		if direct != nil && directTransport != nil && direct.ready && !direct.active && offset > 0 {
 			switched, err := trySwitchDirectWithReplay(ctx, o.client, peerDERP, peerCh, directTransport, seq, window)
 			if err != nil {
+				if err := abortIfContextDone(ctx, o.client, peerDERP); err != nil {
+					return offset, seq, directTransport, direct, err
+				}
 				return offset, seq, directTransport, direct, err
 			}
 			if switched {
@@ -451,6 +466,9 @@ func (o *Offer) sendDataWindowed(ctx context.Context, src FileSource, cb Callbac
 		}
 
 		if err := awaitRelayWindowAck(ctx, peerCh, window); err != nil {
+			if err := abortIfContextDone(ctx, o.client, peerDERP); err != nil {
+				return offset, seq, directTransport, direct, err
+			}
 			return offset, seq, directTransport, direct, err
 		}
 	}
@@ -532,8 +550,11 @@ func receiveFrames(ctx context.Context, client derpClient, peerDERP key.NodePubl
 	for {
 		raw, err := nextRawFrame(ctx, frames, direct, directActive)
 		if err != nil {
+			if err := abortIfContextDone(ctx, client, peerDERP); err != nil {
+				return err
+			}
 			if directActive {
-				_ = sendAbort(ctx, client, peerDERP, err.Error())
+				_ = sendAbortBestEffort(ctx, client, peerDERP, err.Error())
 			}
 			return err
 		}
@@ -894,6 +915,9 @@ func sendFrameAwaitAck(ctx context.Context, client derpClient, peerDERP key.Node
 			if errors.Is(err, errAckTimeout) {
 				continue
 			}
+			if err := abortIfContextDone(ctx, client, peerDERP); err != nil {
+				return err
+			}
 			return err
 		}
 		return nil
@@ -923,15 +947,32 @@ func decodeAck(payload []byte) (webproto.Ack, error) {
 }
 
 func abortAndReturn(ctx context.Context, client derpClient, peerDERP key.NodePublic, reason string) error {
-	_ = sendAbort(ctx, client, peerDERP, reason)
+	_ = sendAbortBestEffort(ctx, client, peerDERP, reason)
 	return errors.New(reason)
 }
 
 func notifyAbort(ctx context.Context, client derpClient, peerDERP key.NodePublic, err error) error {
 	if err != nil {
-		_ = sendAbort(ctx, client, peerDERP, err.Error())
+		_ = sendAbortBestEffort(ctx, client, peerDERP, err.Error())
 	}
 	return err
+}
+
+func abortIfContextDone(ctx context.Context, client derpClient, peerDERP key.NodePublic) error {
+	if err := ctx.Err(); err != nil {
+		_ = sendAbortBestEffort(ctx, client, peerDERP, err.Error())
+		return err
+	}
+	return nil
+}
+
+func sendAbortBestEffort(ctx context.Context, client derpClient, peerDERP key.NodePublic, reason string) error {
+	if ctx.Err() == nil {
+		return sendAbort(ctx, client, peerDERP, reason)
+	}
+	abortCtx, cancel := context.WithTimeout(context.Background(), claimRetryDelay)
+	defer cancel()
+	return sendAbort(abortCtx, client, peerDERP, reason)
 }
 
 func sendAbort(ctx context.Context, client derpClient, peerDERP key.NodePublic, reason string) error {

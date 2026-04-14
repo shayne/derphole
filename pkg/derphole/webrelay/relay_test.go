@@ -961,6 +961,92 @@ func TestReceiveFramesDiscardsRelayDuplicateAfterDirectSwitch(t *testing.T) {
 	}
 }
 
+func TestSendContextCancelNotifiesReceiverAbort(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	client := newFakeDERPClient()
+	peerDERP := key.NewNode().Public()
+	tok, err := newToken(client.PublicKey(), 1)
+	if err != nil {
+		t.Fatalf("newToken() error = %v", err)
+	}
+	source := newFakeSource("file.txt", []byte("abc"), []byte("def"))
+
+	client.sendHook = func(_ key.NodePublic, payload []byte) {
+		frame, err := webproto.Parse(payload)
+		if err != nil {
+			t.Fatalf("Parse(sent frame) error = %v", err)
+		}
+		switch frame.Kind {
+		case webproto.FrameMeta:
+			client.emit(peerDERP, mustMarshalFrame(t, webproto.FrameAck, 0, webproto.Ack{BytesReceived: 0}))
+		case webproto.FrameData:
+			cancel()
+		}
+	}
+
+	offer := &Offer{client: client, token: tok, gate: rendezvous.NewGate(tok)}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- offer.Send(ctx, source, Callbacks{})
+	}()
+
+	client.waitForSubscribers(t, 1)
+	claim, err := newClaim(tok, peerDERP)
+	if err != nil {
+		t.Fatalf("newClaim() error = %v", err)
+	}
+	client.emit(peerDERP, mustMarshalFrame(t, webproto.FrameClaim, 0, claim))
+
+	err = <-errCh
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Send() error = %v, want context.Canceled", err)
+	}
+	if indexOfFrameKind(client.sentFrames(t), webproto.FrameAbort) == -1 {
+		t.Fatal("sender did not notify receiver with FrameAbort")
+	}
+}
+
+func TestReceiveFramesRejectsShortKnownSizeOnDone(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	client := newFakeDERPClient()
+	peerDERP := key.NewNode().Public()
+	sink := &fakeSink{}
+	frames := make(chan []byte, 4)
+	frames <- mustMarshalFrame(t, webproto.FrameMeta, 0, webproto.Meta{Name: "file.txt", Size: 6})
+	frames <- mustMarshalFrame(t, webproto.FrameData, 1, []byte("abc"))
+	frames <- mustMarshalFrame(t, webproto.FrameDone, 2, nil)
+	close(frames)
+
+	err := receiveFrames(ctx, client, peerDERP, frames, nil, sink, Callbacks{})
+	if err == nil || err.Error() != "received byte count does not match metadata" {
+		t.Fatalf("receiveFrames() error = %v, want byte count mismatch", err)
+	}
+}
+
+func TestReceiveContextCancelNotifiesSenderAbort(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	client := newFakeDERPClient()
+	peerDERP := key.NewNode().Public()
+	sink := &fakeSink{}
+	frames := make(chan []byte)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- receiveFrames(ctx, client, peerDERP, frames, nil, sink, Callbacks{})
+	}()
+
+	cancel()
+	err := <-errCh
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("receiveFrames() error = %v, want context.Canceled", err)
+	}
+	if indexOfFrameKind(client.sentFrames(t), webproto.FrameAbort) == -1 {
+		t.Fatal("receiver did not notify sender with FrameAbort")
+	}
+}
+
 func TestReceiveFramesActiveDirectFailureReturnsImmediately(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
