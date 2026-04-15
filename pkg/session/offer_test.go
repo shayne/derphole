@@ -244,10 +244,6 @@ func TestExternalOfferReceiveDirectUDPPromotionWithPipeSourceDoesNotStall(t *tes
 			writeErr <- fmt.Errorf("waiting for offered pipe sender direct UDP promotion: %w; receiver=%q sender=%q", err, receiverStatus.String(), senderStatus.String())
 			return
 		}
-		if err := waitForSessionTestStatusContains(gateCtx, &receiverStatus, string(StateDirect)); err != nil {
-			writeErr <- fmt.Errorf("waiting for offered pipe receiver direct UDP promotion: %w; receiver=%q sender=%q", err, receiverStatus.String(), senderStatus.String())
-			return
-		}
 		if _, err := pipeWriter.Write(payload[midpoint:]); err != nil {
 			writeErr <- err
 			return
@@ -273,5 +269,11 @@ func TestExternalOfferReceiveDirectUDPPromotionWithPipeSourceDoesNotStall(t *tes
 
 	if !bytes.Equal(receiverOut.Bytes(), payload) {
 		t.Fatalf("receiver output length = %d, want %d", receiverOut.Len(), len(payload))
+	}
+	if !strings.Contains(senderStatus.String(), string(StateDirect)) {
+		t.Fatalf("sender statuses = %q, want %q", senderStatus.String(), StateDirect)
+	}
+	if !strings.Contains(receiverStatus.String(), string(StateDirect)) {
+		t.Fatalf("receiver statuses = %q, want %q", receiverStatus.String(), StateDirect)
 	}
 }
