@@ -8,8 +8,8 @@ import (
 	"net"
 	"net/netip"
 
-	"github.com/shayne/derpcat/pkg/derpbind"
-	localnetstack "github.com/shayne/derpcat/pkg/wg/netstack"
+	"github.com/shayne/derphole/pkg/derpbind"
+	localnetstack "github.com/shayne/derphole/pkg/wg/netstack"
 	"github.com/tailscale/wireguard-go/device"
 	"golang.org/x/crypto/curve25519"
 	"tailscale.com/types/key"
@@ -73,7 +73,7 @@ func NewNode(cfg Config) (*Node, error) {
 		DirectEndpoint: cfg.DirectEndpoint,
 	})
 
-	dev := device.NewDevice(tunDev, bind, device.NewLogger(device.LogLevelSilent, "derpcat: "))
+	dev := device.NewDevice(tunDev, bind, device.NewLogger(device.LogLevelSilent, "derphole: "))
 	if err := dev.IpcSet(uapiConfig(cfg)); err != nil {
 		dev.Close()
 		return nil, err

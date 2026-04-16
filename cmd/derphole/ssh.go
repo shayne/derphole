@@ -8,9 +8,9 @@ import (
 	"io"
 	"strings"
 
-	pkgssh "github.com/shayne/derpcat/pkg/derphole/ssh"
-	"github.com/shayne/derpcat/pkg/session"
-	"github.com/shayne/derpcat/pkg/telemetry"
+	pkgssh "github.com/shayne/derphole/pkg/derphole/ssh"
+	"github.com/shayne/derphole/pkg/session"
+	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/yargs"
 )
 

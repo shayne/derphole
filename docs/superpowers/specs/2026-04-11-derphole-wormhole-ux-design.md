@@ -6,20 +6,20 @@ Date: 2026-04-11
 
 Add a second first-class CLI, `derphole`, to this repository.
 
-`derphole` should feel familiar to users of `magic-wormhole`, but it must stay on the existing `derpcat` architecture:
+`derphole` should feel familiar to users of `magic-wormhole`, but it must stay on the existing `derphole` architecture:
 
 - same DERP rendezvous/bootstrap model
 - same direct-path promotion and fallback behavior
 - same self-contained bearer-token session model
 - same no-extra-service deployment story
 
-The repo should support `derpcat` and `derphole` long-term without forking the transport stack or maintaining two unrelated release systems.
+The repo should support `derphole` and `derphole` long-term without forking the transport stack or maintaining two unrelated release systems.
 
 ## Product split
 
 Keep the two CLIs intentionally different.
 
-`derpcat` remains the lower-level transport-oriented tool:
+`derphole` remains the lower-level transport-oriented tool:
 
 - raw byte-stream transfer with `listen` / `send`
 - service sharing with `share` / `open`
@@ -30,16 +30,16 @@ Keep the two CLIs intentionally different.
 - wormhole-shaped command set
 - transfer semantics for text, files, directories, and SSH key exchange
 - friendlier prompts and instructional output
-- the same technically honest wording as `derpcat` where the underlying model matters
+- the same technically honest wording as `derphole` where the underlying model matters
 
-This is not a compatibility layer for the `magic-wormhole` protocol. It is a familiar UX built on `derpcat` transport.
+This is not a compatibility layer for the `magic-wormhole` protocol. It is a familiar UX built on `derphole` transport.
 
 ## Non-goals
 
 - Do not add a mailbox service or any short human-code rendezvous system.
 - Do not become protocol-compatible with `magic-wormhole`.
 - Do not move `share` / `open` into `derphole` in v1.
-- Do not replace `derpcat` with `derphole`.
+- Do not replace `derphole` with `derphole`.
 - Do not duplicate DERP, traversal, or direct-transfer logic under a second implementation.
 - Do not keep wormhole options that only make sense with wormhole's mailbox/code model, such as `--code-length`.
 
@@ -113,7 +113,7 @@ Verification and UX:
 
 ### Terminology
 
-The command shape should feel like wormhole. The wording should stay honest to `derpcat`.
+The command shape should feel like wormhole. The wording should stay honest to `derphole`.
 
 Use:
 
@@ -137,7 +137,7 @@ The following remain the source of truth:
 - `pkg/rendezvous`
 - `pkg/traversal`
 - `pkg/transport`
-- direct UDP / QUIC / relay behavior already implemented for `derpcat`
+- direct UDP / QUIC / relay behavior already implemented for `derphole`
 
 `derphole` must call into these existing layers rather than reimplement transport decisions.
 
@@ -174,7 +174,7 @@ This layer does not own:
 
 ### 3. Use a small application protocol over the existing byte stream
 
-`derpcat`'s current `send` / `listen` is a raw byte pipe. `derphole` needs structured payloads.
+`derphole`'s current `send` / `listen` is a raw byte pipe. `derphole` needs structured payloads.
 
 Define a compact application header at the start of each `derphole` transfer. The header should describe:
 
@@ -191,13 +191,13 @@ After the header, the payload remains a stream:
 - tar stream bytes for directories
 - structured SSH payload for invite/accept exchanges
 
-The protocol should be versioned so `derphole` can evolve without entangling raw `derpcat` transfers.
+The protocol should be versioned so `derphole` can evolve without entangling raw `derphole` transfers.
 
 The raw transport stays streaming. `derphole` must not require buffering the whole file or directory in RAM.
 
 ### 4. Refactor only the shared pieces that benefit both CLIs
 
-Do not force all of `derpcat` onto the new `derphole` product protocol.
+Do not force all of `derphole` onto the new `derphole` product protocol.
 
 Do extract shared pieces where permanent dual-CLI support would otherwise cause drift:
 
@@ -211,7 +211,7 @@ The boundary should be:
 
 - transport core shared by both products
 - app protocol owned by `derphole`
-- raw pipe UX remains valid in `derpcat`
+- raw pipe UX remains valid in `derphole`
 
 ## Feature design details
 
@@ -296,7 +296,7 @@ Normal mode:
 
 Verbose mode:
 
-- expose the same transport truth that `derpcat` uses
+- expose the same transport truth that `derphole` uses
 - do not invent wormhole-style terminology for transport internals
 
 The user should be able to trust that `derphole` is a friendlier frontend, not a different network stack.
@@ -309,28 +309,28 @@ The repo should publish two products from one release workflow.
 
 GitHub releases should include tarballs for both binaries:
 
-- `derpcat-<os>-<arch>.tar.gz`
+- `derphole-<os>-<arch>.tar.gz`
 - `derphole-<os>-<arch>.tar.gz`
 
 ### npm packages
 
 Publish two npm packages:
 
-- `derpcat`
+- `derphole`
 - `derphole`
 
-Both should be built from one workflow, with production releases on `v*` tags and `dev` publishes from `main`, matching the current `derpcat` behavior.
+Both should be built from one workflow, with production releases on `v*` tags and `dev` publishes from `main`, matching the current `derphole` behavior.
 
 ### Packaging structure
 
-Refactor the npm build process so it becomes package-aware instead of hard-coded for `derpcat`.
+Refactor the npm build process so it becomes package-aware instead of hard-coded for `derphole`.
 
 Expected direction:
 
 - package template inputs per product under `packaging/npm/`
 - a shared build script that can stage one named package at a time
 - distinct output directories such as:
-  - `dist/npm-derpcat`
+  - `dist/npm-derphole`
   - `dist/npm-derphole`
 - launcher scripts that vend the correct binary for each package
 
@@ -350,13 +350,13 @@ The repo now has two user-facing CLIs, so docs must stop assuming there is only 
 
 Update:
 
-- top-level `README.md` to describe the repo as containing both `derpcat` and `derphole`
+- top-level `README.md` to describe the repo as containing both `derphole` and `derphole`
 - command examples so users can tell which CLI they should reach for
 - release docs so both binary and npm outputs are documented
 
 Keep the distinction crisp:
 
-- use `derpcat` examples for raw transport and service sharing
+- use `derphole` examples for raw transport and service sharing
 - use `derphole` examples for human-driven transfer and SSH exchange
 
 ## Testing strategy
@@ -395,8 +395,8 @@ Release automation should verify:
 This design is successful when:
 
 - `derphole` feels like a wormhole-style CLI for the main user workflows
-- it still uses the current `derpcat` transport architecture
-- the repo can release `derpcat` and `derphole` together from one workflow
+- it still uses the current `derphole` transport architecture
+- the repo can release `derphole` and `derphole` together from one workflow
 - the long-term maintenance burden is one transport stack plus two product layers, not two transport stacks
 
 ## Explicit decisions

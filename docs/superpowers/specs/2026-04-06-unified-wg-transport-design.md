@@ -2,23 +2,23 @@
 
 ## Summary
 
-Replace derpcat's split public transport stack with one transport substrate:
+Replace derphole's split public transport stack with one transport substrate:
 
 - DERP for rendezvous, control, and relay fallback
 - direct UDP for NAT traversal and fast-path data transfer
 - the in-repo WireGuard packet engine in `pkg/wg` as the only direct and relay data plane
 
-The proof work already established the important fact: derpcat can reach the WAN ceiling when it uses the faster packet path. This refactor promotes that winning path into the product and removes the older QUIC and public-native-TCP branches.
+The proof work already established the important fact: derphole can reach the WAN ceiling when it uses the faster packet path. This refactor promotes that winning path into the product and removes the older QUIC and public-native-TCP branches.
 
 ## Goals
 
-- Make the fast path the default public derpcat transport.
+- Make the fast path the default public derphole transport.
 - Remove the public-native-TCP bootstrap path entirely.
 - Remove the direct QUIC path entirely.
 - Keep DERP as the rendezvous and relay fallback mechanism.
 - Preserve no-open-ports behavior as the default operating model.
 - Achieve direct no-Tailscale transfers that stay near the proven WAN ceiling on the best host pair, especially this Mac and `ktzlxc`.
-- Keep derpcat semantics intact for:
+- Keep derphole semantics intact for:
   - `send` / `listen`
   - `share` / `open`
 - Use live-host testing, not only unit tests, as the completion gate.
@@ -29,11 +29,11 @@ The proof work already established the important fact: derpcat can reach the WAN
 - Preserving the public-native-TCP bootstrap path behind feature flags.
 - Keeping QUIC as an alternate direct path.
 - Requiring manual port forwarding or any OS-level system modifications.
-- Turning derpcat into a general mesh VPN product.
+- Turning derphole into a general mesh VPN product.
 
 ## Context
 
-Today derpcat's public path is fragmented:
+Today derphole's public path is fragmented:
 
 - DERP handles rendezvous and relay.
 - direct QUIC over UDP handles the normal direct fast path.
@@ -42,7 +42,7 @@ Today derpcat's public path is fragmented:
 That structure creates three problems:
 
 1. More than one transport state machine is active in the public session flow.
-2. The path that proved the highest throughput is not the same path derpcat leads with by default.
+2. The path that proved the highest throughput is not the same path derphole leads with by default.
 3. The code is harder to reason about because direct promotion, relay fallback, and transfer semantics are spread across multiple transport implementations.
 
 The repo already contains the better substrate:
@@ -98,7 +98,7 @@ Cons:
 
 Use approach 2.
 
-The direct and relay data plane should be the existing in-repo WireGuard substrate. DERP remains for coordination and relay fallback. `pkg/session` should stop selecting between transport families and instead create one tunnel-backed session, then run derpcat behavior over that tunnel.
+The direct and relay data plane should be the existing in-repo WireGuard substrate. DERP remains for coordination and relay fallback. `pkg/session` should stop selecting between transport families and instead create one tunnel-backed session, then run derphole behavior over that tunnel.
 
 ## Architecture
 
@@ -132,7 +132,7 @@ That means there is no transport handoff from DERP to QUIC or from QUIC to publi
 
 ### Session Adapters
 
-Derpcat behaviors run above the overlay:
+Derphole behaviors run above the overlay:
 
 - `send/listen`
   - open one or more TCP streams inside the per-session netstack
@@ -173,7 +173,7 @@ This preserves the CLI model while replacing the underlying transport.
    - the overlay session stays the same; only the packet path changes
 
 7. Data transfer:
-   - derpcat opens overlay TCP streams inside the session netstack
+   - derphole opens overlay TCP streams inside the session netstack
    - all user payloads ride those overlay streams
 
 8. Path recovery:
@@ -257,7 +257,7 @@ Required live checks:
 1. This Mac <-> `ktzlxc`
    - both directions
    - no dedicated port forward
-   - `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1`
+   - `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1`
    - automatic direct promotion
    - throughput near the proven WAN ceiling
 

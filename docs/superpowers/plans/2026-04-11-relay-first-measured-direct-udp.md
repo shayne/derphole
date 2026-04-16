@@ -6,7 +6,7 @@
 
 **Architecture:** Keep DERP as the always-available control and initial payload path. Introduce a bounded replayable payload stream above the carrier so relay can start immediately, then switch the same byte stream onto direct UDP once the direct path proves it can carry data. Replace optimistic direct-start geometry with a measured ramp that derives initial sender rate, lane count, and replay window from observed delivery and live transfer feedback.
 
-**Tech Stack:** Go, `pkg/session` transport/session code, current direct-UDP probe heuristics, existing `pkg/probe` reporting, promotion scripts, `derpcat-probe matrix`, live SSH verification against `ktzlxc`, `uklxc`, `canlxc`, and `orange-india.exe.xyz`.
+**Tech Stack:** Go, `pkg/session` transport/session code, current direct-UDP probe heuristics, existing `pkg/probe` reporting, promotion scripts, `derphole-probe matrix`, live SSH verification against `ktzlxc`, `uklxc`, `canlxc`, and `orange-india.exe.xyz`.
 
 ---
 
@@ -25,9 +25,9 @@
   - spool boundedness, watermark trim, seek/replay coverage
 - Modify: `pkg/session/session_test.go`
   - end-to-end relay-first then direct-promotion tests
-- Modify: `cmd/derpcat/listen_test.go`
+- Modify: `cmd/derphole/listen_test.go`
   - CLI-visible startup and completion behavior tests
-- Modify: `cmd/derpcat-probe/matrix.go`
+- Modify: `cmd/derphole-probe/matrix.go`
   - preserve per-run peak/average/first-byte summaries and baseline comparison output
 - Modify: `docs/benchmarks.md`
   - benchmark procedure for relay-first promotion and iperf3 baseline comparison
@@ -37,7 +37,7 @@
 **Files:**
 - Modify: `pkg/session/external.go`
 - Test: `pkg/session/session_test.go`
-- Test: `cmd/derpcat/listen_test.go`
+- Test: `cmd/derphole/listen_test.go`
 
 - [ ] **Step 1: Write the failing session test for relay-first startup**
 
@@ -103,7 +103,7 @@ The important behavior change is that `runRelay` owns time-to-first-byte, while 
 
 - [ ] **Step 4: Add the CLI-visible regression test**
 
-In `cmd/derpcat/listen_test.go`, add a case that asserts non-verbose `listen` stays quiet except for the token/status lines and that data still appears before direct promotion completes:
+In `cmd/derphole/listen_test.go`, add a case that asserts non-verbose `listen` stays quiet except for the token/status lines and that data still appears before direct promotion completes:
 
 ```go
 func TestListenRelayFirstPromotionDoesNotDelayStdout(t *testing.T) {
@@ -119,7 +119,7 @@ Run:
 
 ```sh
 go test ./pkg/session -run TestSendListenStartsPayloadOnRelayBeforeDirectPromotion -count=1
-go test ./cmd/derpcat -run TestListenRelayFirstPromotionDoesNotDelayStdout -count=1
+go test ./cmd/derphole -run TestListenRelayFirstPromotionDoesNotDelayStdout -count=1
 ```
 
 Expected: both pass.
@@ -127,7 +127,7 @@ Expected: both pass.
 - [ ] **Step 6: Commit**
 
 ```sh
-git add pkg/session/external.go pkg/session/session_test.go cmd/derpcat/listen_test.go
+git add pkg/session/external.go pkg/session/session_test.go cmd/derphole/listen_test.go
 git commit -m "session: start send listen payload on relay immediately"
 ```
 
@@ -368,12 +368,12 @@ git commit -m "session: derive direct udp starts from measured path budget"
 ### Task 4: Preserve Benchmark Evidence And Regressions
 
 **Files:**
-- Modify: `cmd/derpcat-probe/matrix.go`
+- Modify: `cmd/derphole-probe/matrix.go`
 - Modify: `docs/benchmarks.md`
 
 - [ ] **Step 1: Write the failing matrix command test**
 
-In `cmd/derpcat-probe/matrix_test.go`, add:
+In `cmd/derphole-probe/matrix_test.go`, add:
 
 ```go
 func TestRunMatrixCmdIncludesPeakAndWallTimeInSummaries(t *testing.T) {
@@ -407,7 +407,7 @@ func TestRunMatrixCmdIncludesPeakAndWallTimeInSummaries(t *testing.T) {
 Run:
 
 ```sh
-go test ./cmd/derpcat-probe -run TestRunMatrixCmdIncludesPeakAndWallTimeInSummaries -count=1
+go test ./cmd/derphole-probe -run TestRunMatrixCmdIncludesPeakAndWallTimeInSummaries -count=1
 ```
 
 - [ ] **Step 3: Keep the benchmark docs aligned**
@@ -429,7 +429,7 @@ Update `docs/benchmarks.md` so the required evidence for this phase explicitly i
 Run:
 
 ```sh
-go test ./cmd/derpcat-probe -count=1
+go test ./cmd/derphole-probe -count=1
 ```
 
 Expected: pass.
@@ -437,7 +437,7 @@ Expected: pass.
 - [ ] **Step 5: Commit**
 
 ```sh
-git add cmd/derpcat-probe/matrix.go cmd/derpcat-probe/matrix_test.go docs/benchmarks.md
+git add cmd/derphole-probe/matrix.go cmd/derphole-probe/matrix_test.go docs/benchmarks.md
 git commit -m "probe: preserve promotion baseline evidence"
 ```
 
@@ -451,7 +451,7 @@ git commit -m "probe: preserve promotion baseline evidence"
 Run:
 
 ```sh
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./dist/derpcat-probe matrix --hosts ktzlxc,uklxc,canlxc,orange-india.exe.xyz --iterations 1 --size-mib 1024 --out /tmp/derpcat-matrix/four-host-baseline.json
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./dist/derphole-probe matrix --hosts ktzlxc,uklxc,canlxc,orange-india.exe.xyz --iterations 1 --size-mib 1024 --out /tmp/derphole-matrix/four-host-baseline.json
 ```
 
 Expected: JSON report with one forward and one reverse run per host.
@@ -461,8 +461,8 @@ Expected: JSON report with one forward and one reverse run per host.
 Run:
 
 ```sh
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh ktzlxc 1024
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh ktzlxc 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh ktzlxc 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh ktzlxc 1024
 ```
 
 Expected: both succeed and remain in the current ~2 Gbps class where WAN allows.
@@ -472,10 +472,10 @@ Expected: both succeed and remain in the current ~2 Gbps class where WAN allows.
 Run:
 
 ```sh
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh uklxc 1024
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh uklxc 1024
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh canlxc 1024
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh canlxc 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh uklxc 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh uklxc 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh canlxc 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh canlxc 1024
 ```
 
 Expected: all complete successfully; reverse `uklxc` must not tail-stall and `canlxc` should no longer run far below its WAN ceiling without an explainable network limit.
@@ -489,7 +489,7 @@ nix run nixpkgs#iperf3 -- -c <mac-public-endpoint> -p 8321 -P 4
 nix run nixpkgs#iperf3 -- -c <ktzlxc-peer> -p 8321 -P 4 -R
 ```
 
-Expected: derpcat remains below raw iperf3, but the gap is explainable and the session does not fail on lower-ceiling paths.
+Expected: derphole remains below raw iperf3, but the gap is explainable and the session does not fail on lower-ceiling paths.
 
 - [ ] **Step 5: Record the evidence**
 

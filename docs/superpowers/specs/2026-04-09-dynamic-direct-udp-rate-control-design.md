@@ -4,7 +4,7 @@ Date: 2026-04-09
 
 ## Goal
 
-Make derpcat's default DERP-coordinated direct UDP stream dynamically scale to each WAN path. It should work without user configuration from sub-1 MB/s links through multi-gigabit links, keep relay-first time-to-first-byte behavior, and avoid transfer failures caused by excessive retransmit or replay pressure.
+Make derphole's default DERP-coordinated direct UDP stream dynamically scale to each WAN path. It should work without user configuration from sub-1 MB/s links through multi-gigabit links, keep relay-first time-to-first-byte behavior, and avoid transfer failures caused by excessive retransmit or replay pressure.
 
 Target behavior:
 
@@ -20,13 +20,13 @@ Target behavior:
 
 - Do not add host-specific settings for `uklxc`, `ktzlxc`, or this Mac.
 - Do not require the user to provide a rate, payload size, lane count, replay window, or NAT setting.
-- Do not route derpcat tests over Tailscale candidates. Use `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1` for regression tests.
-- Do not use the forwarded Mac port 8321 in derpcat itself. It remains a test-only iperf3 baseline.
+- Do not route derphole tests over Tailscale candidates. Use `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1` for regression tests.
+- Do not use the forwarded Mac port 8321 in derphole itself. It remains a test-only iperf3 baseline.
 - Do not promise throughput above the current WAN ceiling measured at test time.
 
 ## Evidence and current failure mode
 
-The `uklxc` reverse run, from `uklxc` to this Mac, failed before completing 1 GiB. The sender reached `connected-direct`, then the remote shell reported the derpcat sender was killed with exit 137 after about 55 seconds. The Mac listener received only about 3.4 MiB. On `uklxc`, swap was full and cgroup `memory.events` showed `oom_kill=2`.
+The `uklxc` reverse run, from `uklxc` to this Mac, failed before completing 1 GiB. The sender reached `connected-direct`, then the remote shell reported the derphole sender was killed with exit 137 after about 55 seconds. The Mac listener received only about 3.4 MiB. On `uklxc`, swap was full and cgroup `memory.events` showed `oom_kill=2`.
 
 The `uklxc` forward run, from this Mac to `uklxc`, completed 10 out of 10, but only around 400 Mbps p50 and with very high replay and retransmit pressure. Replay nearly pegged the 256 MiB window. This proves the path can transfer, but the current default direct UDP behavior is too aggressive for that path.
 
@@ -154,13 +154,13 @@ Unit and integration tests should cover:
 Live validation should use:
 
 ```sh
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh uklxc 1024
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh uklxc 1024
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh ktzlxc 1024
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh ktzlxc 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh uklxc 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh uklxc 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh ktzlxc 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh ktzlxc 1024
 ```
 
-Run 10 iterations in each direction for `uklxc` and `ktzlxc`. Before interpreting throughput, measure the WAN ceiling with iperf3 over the dedicated forwarded test port where available, using `nix run` for iperf3. derpcat passes if it completes 10 out of 10 runs without OOM kills, timeouts, leaked derpcat UDP sockets, or replay pressure pegged at the hard budget, and if its goodput approaches the measured WAN ceiling within a few seconds of direct UDP handoff.
+Run 10 iterations in each direction for `uklxc` and `ktzlxc`. Before interpreting throughput, measure the WAN ceiling with iperf3 over the dedicated forwarded test port where available, using `nix run` for iperf3. derphole passes if it completes 10 out of 10 runs without OOM kills, timeouts, leaked derphole UDP sockets, or replay pressure pegged at the hard budget, and if its goodput approaches the measured WAN ceiling within a few seconds of direct UDP handoff.
 
 Release validation remains:
 

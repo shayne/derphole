@@ -2,18 +2,18 @@
 
 ## Summary
 
-Extend the standalone `derpcat-probe` experiment with the core UDP transport techniques Tailscale uses for throughput: batched send/receive, Linux UDP offload support, larger effective socket buffers, and queue-overflow visibility. The goal is not to copy Tailscale wholesale. The goal is to prove whether those specific techniques let a simpler direct UDP probe materially outperform current no-Tailscale derpcat on the same host pairs.
+Extend the standalone `derphole-probe` experiment with the core UDP transport techniques Tailscale uses for throughput: batched send/receive, Linux UDP offload support, larger effective socket buffers, and queue-overflow visibility. The goal is not to copy Tailscale wholesale. The goal is to prove whether those specific techniques let a simpler direct UDP probe materially outperform current no-Tailscale derphole on the same host pairs.
 
 ## Goal
 
-Produce a probe variant that clearly beats the current tuned derpcat baseline on large transfers to `ktzlxc`, then validate the result against `canlxc`, `uklxc`, and `orange-india.exe.xyz` to separate transport wins from path-quality limits.
+Produce a probe variant that clearly beats the current tuned derphole baseline on large transfers to `ktzlxc`, then validate the result against `canlxc`, `uklxc`, and `orange-india.exe.xyz` to separate transport wins from path-quality limits.
 
 ## Non-Goals
 
-- Replacing derpcat's production transport in this phase
+- Replacing derphole's production transport in this phase
 - Reimplementing WireGuard
 - Porting Tailscale's full magicsock stack
-- Making the probe feature-complete with derpcat
+- Making the probe feature-complete with derphole
 
 ## What Tailscale Is Doing That Matters
 
@@ -43,7 +43,7 @@ Cons:
 - still not a production transport
 - some Linux-only gains will not appear on macOS
 
-### Approach 2: Jump straight to a production derpcat refactor
+### Approach 2: Jump straight to a production derphole refactor
 
 Pros:
 
@@ -87,8 +87,8 @@ This is necessary because host/container socket caps were already a suspect in e
 
 The experiment only justifies a future refactor if all of the following are true:
 
-1. On `ktzlxc`, the new probe materially beats current tuned derpcat for `1 GiB`.
+1. On `ktzlxc`, the new probe materially beats current tuned derphole for `1 GiB`.
 2. The win remains after adding basic encryption back into the probe, or the raw result is large enough to justify that follow-up.
 3. Results on `canlxc`, `uklxc`, and `orange-india.exe.xyz` show where path quality, not transport overhead, becomes the limiter.
 
-If the probe still cannot beat tuned derpcat on `ktzlxc`, stop the refactor path and redirect effort into improving derpcat's current transport.
+If the probe still cannot beat tuned derphole on `ktzlxc`, stop the refactor path and redirect effort into improving derphole's current transport.

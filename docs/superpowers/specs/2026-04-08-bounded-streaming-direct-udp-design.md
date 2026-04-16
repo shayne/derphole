@@ -11,10 +11,10 @@ Target behavior:
 - Time to first byte is driven by direct path setup plus the first stdin read, not by total input length.
 - Sender memory is bounded by a replay/in-flight byte budget.
 - Receiver memory is bounded by a reorder byte budget.
-- Receiver writes contiguous bytes to `stdout` as soon as they are available, so `derpcat listen | pv > file` shows real network delivery.
-- Sender-side `pv | derpcat send` is accepted, but it measures producer-to-derpcat ingest. Network progress belongs in derpcat stats or listener-side `pv`.
+- Receiver writes contiguous bytes to `stdout` as soon as they are available, so `derphole listen | pv > file` shows real network delivery.
+- Sender-side `pv | derphole send` is accepted, but it measures producer-to-derphole ingest. Network progress belongs in derphole stats or listener-side `pv`.
 - No Tailscale endpoints are required or used in regression tests. DERP coordinates the UDP candidate exchange.
-- No forwarded port is required for derpcat. Mac port 8321 is a test-only iperf3 baseline.
+- No forwarded port is required for derphole. Mac port 8321 is a test-only iperf3 baseline.
 
 ## Non-goals
 
@@ -33,7 +33,7 @@ From `~/code/iperf`:
 - UDP receivers should account for highest sequence seen, loss/gaps, out-of-order packets, interval bytes, and first-packet timing.
 - Socket send/receive buffers are part of the test surface. Set/check them once and report transport capability.
 
-From the current derpcat code:
+From the current derphole code:
 
 - `probe.Send` already has a bounded reliable packet sender with cumulative ACK, ACK mask, extended ACK payload, in-flight map, and receiver reorder map.
 - `sendBlast`/`SendBlastParallel` have the syscall batching and adaptive rate-control machinery needed for high throughput.
@@ -137,7 +137,7 @@ Keep the benchmark functions pprof-compatible:
 
 ```sh
 go test ./pkg/probe -run '^$' -bench 'Benchmark.*Stream' -benchmem
-go test ./pkg/probe -run '^$' -bench 'Benchmark.*StreamUDP' -cpuprofile /tmp/derpcat.cpu.pprof -memprofile /tmp/derpcat.mem.pprof
+go test ./pkg/probe -run '^$' -bench 'Benchmark.*StreamUDP' -cpuprofile /tmp/derphole.cpu.pprof -memprofile /tmp/derphole.mem.pprof
 ```
 
 ## Acceptance
@@ -154,7 +154,7 @@ Live verification:
 
 - start with local loopback transfer
 - test canlxc for stability before optimizing ktzlxc
-- test ktzlxc both directions with `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1`
+- test ktzlxc both directions with `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1`
 - run iperf3 through forwarded Mac port 8321 as the independent WAN baseline
 - verify listener-side `pv` advances during the transfer
 - run 10x ktzlxc back-and-forth once single runs are stable

@@ -4,7 +4,7 @@ Date: 2026-04-05
 
 ## Summary
 
-Add a user-facing parallelism control for derpcat direct fast paths:
+Add a user-facing parallelism control for derphole direct fast paths:
 
 - default with no flag: fixed `4`
 - fixed override: `-P N` / `--parallel=N`
@@ -26,12 +26,12 @@ This design is intended to make `auto` a candidate for the eventual default, but
 
 Recent live benchmarks showed that `4` is not the steady-state optimum on the public-Internet native-QUIC path.
 
-From [CANLXC_BENCHMARKS.md](/Users/shayne/code/derpcat/CANLXC_BENCHMARKS.md):
+From [CANLXC_BENCHMARKS.md](/Users/shayne/code/derphole/CANLXC_BENCHMARKS.md):
 
 - `1024 MiB`, fixed `4 -> 8`, Mac -> host: `408 -> 486 Mbps` avg
 - `1024 MiB`, fixed `4 -> 8`, host -> Mac: `489 -> 588 Mbps` avg
 
-From [KTZLXC_BENCHMARKS.md](/Users/shayne/code/derpcat/KTZLXC_BENCHMARKS.md):
+From [KTZLXC_BENCHMARKS.md](/Users/shayne/code/derphole/KTZLXC_BENCHMARKS.md):
 
 - `1024 MiB`, fixed `4 -> 8`, Mac -> host: `741 -> 994 Mbps` avg
 - `1024 MiB`, fixed `4 -> 8`, host -> Mac: `573 -> 807 Mbps` avg
@@ -77,8 +77,8 @@ Accepted range:
 
 Examples:
 
-- `derpcat send -P 8 <token>`
-- `derpcat open --parallel=6 <token>`
+- `derphole send -P 8 <token>`
+- `derphole open --parallel=6 <token>`
 
 Meaning:
 
@@ -308,9 +308,9 @@ Use all three hosts because they expose different network conditions and help pr
 - `canlxc`: slower and more variable WAN path
 - `uklxc`: third independent WAN path to verify the controller generalizes beyond the first two hosts
 
-All derpcat live-transfer validation in this matrix must run with:
+All derphole live-transfer validation in this matrix must run with:
 
-- `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1`
+- `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1`
 
 That keeps the benchmark focused on public-Internet direct behavior rather than Tailscale-route candidate shortcuts.
 

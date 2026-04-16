@@ -1,15 +1,15 @@
-# derpcat
+# derphole
 
 This repository ships two standalone CLIs:
 
-- `derpcat` for raw byte streams and temporary local TCP service sharing
+- `derphole` for raw byte streams and temporary local TCP service sharing
 - `derphole` for wormhole-shaped text, file, directory, and SSH invite flows on the same transport stack
 
 Both use the public Tailscale [DERP](#what-is-derp) relay network for rendezvous and relay fallback, but they are **not** affiliated with Tailscale, do **not** require a Tailscale account or tailnet, and do **not** use `tailscaled` for transport.
 
-`derpcat` and `derphole` are **not** WireGuard overlays and **not** VPNs. Tailscale builds a general-purpose secure network on WireGuard. These tools are optimized for a different job: one session, one token, one transfer or shared service, on the shortest secure path they can find for that session. See [Transport Model](#transport-model), [Why It Is Fast](#why-it-is-fast), and [Security Model](#security-model).
+`derphole` and `derphole` are **not** WireGuard overlays and **not** VPNs. Tailscale builds a general-purpose secure network on WireGuard. These tools are optimized for a different job: one session, one token, one transfer or shared service, on the shortest secure path they can find for that session. See [Transport Model](#transport-model), [Why It Is Fast](#why-it-is-fast), and [Security Model](#security-model).
 
-For one-shot transfers and temporary service sharing, `derpcat` can beat sending the same traffic through a WireGuard-based overlay because it does not first build a general-purpose encrypted network path and then send application traffic through it. `derphole` uses the same session and transport machinery, but wraps it in a more human-oriented CLI. Both use DERP for rendezvous and fallback, then move the live session onto the best direct path they can establish for that workload. Details are in [Transport Model](#transport-model) and [How This Differs From Tailscale / WireGuard](#how-this-differs-from-tailscale--wireguard).
+For one-shot transfers and temporary service sharing, `derphole` can beat sending the same traffic through a WireGuard-based overlay because it does not first build a general-purpose encrypted network path and then send application traffic through it. `derphole` uses the same session and transport machinery, but wraps it in a more human-oriented CLI. Both use DERP for rendezvous and fallback, then move the live session onto the best direct path they can establish for that workload. Details are in [Transport Model](#transport-model) and [How This Differs From Tailscale / WireGuard](#how-this-differs-from-tailscale--wireguard).
 
 It does **not** require:
 
@@ -22,7 +22,7 @@ The token printed by `listen` or `share` carries session authorization. Public s
 
 ## Pick the CLI
 
-Use `derpcat` when you want transport primitives:
+Use `derphole` when you want transport primitives:
 
 - one-shot byte-stream transfer with `listen` and `send`
 - long-lived local service sharing with `share` and `open`
@@ -43,7 +43,7 @@ Use `derphole` when you want wormhole-shaped workflows:
 On the receiving machine:
 
 ```bash
-npx -y derpcat@latest listen > received.img
+npx -y derphole@latest listen > received.img
 ```
 
 `listen` prints a token to stderr. Copy that token to the sending machine.
@@ -51,13 +51,13 @@ npx -y derpcat@latest listen > received.img
 On the sending machine:
 
 ```bash
-cat ./disk.img | npx -y derpcat@latest send <token>
+cat ./disk.img | npx -y derphole@latest send <token>
 ```
 
 For a quick text example:
 
 ```bash
-printf 'hello\n' | npx -y derpcat@latest send <token>
+printf 'hello\n' | npx -y derphole@latest send <token>
 ```
 
 ### Send a File with `derphole`
@@ -102,7 +102,7 @@ npx -y derphole@latest ssh accept <token>
 
 ### Watch Progress with `pv`
 
-`derpcat` is plain stdin/stdout, so `pv` fits naturally in the pipe.
+`derphole` is plain stdin/stdout, so `pv` fits naturally in the pipe.
 
 Install `pv` if needed:
 
@@ -114,13 +114,13 @@ sudo apt install -y pv
 On the receiving machine:
 
 ```bash
-npx -y derpcat@latest listen | pv -brt > received.img
+npx -y derphole@latest listen | pv -brt > received.img
 ```
 
 On the sending machine:
 
 ```bash
-cat ./disk.img | pv -brt | npx -y derpcat@latest send <token>
+cat ./disk.img | pv -brt | npx -y derphole@latest send <token>
 ```
 
 Want a concrete Internet/NAT version of the same idea? See [Real-World Example: Tar Pipe Over Internet](#real-world-example-tar-pipe-over-internet).
@@ -130,7 +130,7 @@ Want a concrete Internet/NAT version of the same idea? See [Real-World Example: 
 On the machine running the local web app or API:
 
 ```bash
-npx -y derpcat@latest share 127.0.0.1:3000
+npx -y derphole@latest share 127.0.0.1:3000
 ```
 
 `share` prints a token to stderr. Copy that token to the machine that will open the shared service.
@@ -138,7 +138,7 @@ npx -y derpcat@latest share 127.0.0.1:3000
 On another machine, expose that shared service locally:
 
 ```bash
-npx -y derpcat@latest open <token>
+npx -y derphole@latest open <token>
 ```
 
 `open` prints the local listening address to stderr.
@@ -146,7 +146,7 @@ npx -y derpcat@latest open <token>
 Bind `open` to a specific local port if you want:
 
 ```bash
-npx -y derpcat@latest open <token> 127.0.0.1:8080
+npx -y derphole@latest open <token> 127.0.0.1:8080
 ```
 
 ### Useful Extras
@@ -154,14 +154,14 @@ npx -y derpcat@latest open <token> 127.0.0.1:8080
 Use the development channel for the latest commit published from `main`:
 
 ```bash
-npx -y derpcat@dev version
+npx -y derphole@dev version
 npx -y derphole@dev version
 ```
 
 By default, `listen`, `send`, `share`, and `open` keep transport status quiet. `listen` and `share` still print the token you need, and `open` still prints the local listening address. `derphole` also keeps transport status quiet by default, but it still prints the user-facing instruction or token needed to complete the transfer, plus wormhole-shaped transfer summaries and known-size progress on stderr. Use `--hide-progress` to suppress the progress bar. Use `--verbose` to see state transitions like `connected-relay` and `connected-direct`:
 
 ```bash
-npx -y derpcat@latest --verbose listen
+npx -y derphole@latest --verbose listen
 npx -y derphole@latest --verbose send ./photo.jpg
 ```
 
@@ -187,8 +187,8 @@ DERP is used for **rendezvous** and **relay fallback**. If the term is new, see 
 
 The data plane is selected per session:
 
-- `share/open` uses multiplexed QUIC streams over `derpcat`'s relay/direct UDP transport, so one claimed session can carry many independent TCP connections to the shared service.
-- `listen/send` uses a one-shot byte stream. By default, `derpcat` coordinates through DERP, promotes to a rate-adaptive direct UDP blast when traversal succeeds, and stays on encrypted relay fallback when no direct path is available.
+- `share/open` uses multiplexed QUIC streams over `derphole`'s relay/direct UDP transport, so one claimed session can carry many independent TCP connections to the shared service.
+- `listen/send` uses a one-shot byte stream. By default, `derphole` coordinates through DERP, promotes to a rate-adaptive direct UDP blast when traversal succeeds, and stays on encrypted relay fallback when no direct path is available.
 
 Candidate discovery splits into two phases:
 
@@ -201,20 +201,20 @@ That keeps startup latency low while still allowing relay-to-direct promotion.
 
 Tailscale uses WireGuard to build a secure general-purpose network between peers. That is the right abstraction when you want durable machine-to-machine connectivity, stable private addressing, ACLs, subnet routing, exit nodes, and a long-lived encrypted overlay.
 
-`derpcat` does something narrower and faster for its target workload. It creates session-scoped transport for a single transfer or a single shared service:
+`derphole` does something narrower and faster for its target workload. It creates session-scoped transport for a single transfer or a single shared service:
 
 - no WireGuard tunnel device
 - no overlay network interface
 - no persistent mesh control plane
 - no need to route arbitrary traffic through a general encrypted network
 
-Instead, `derpcat` uses a bearer token to authorize exactly one session, uses DERP to get both peers talking immediately, and then promotes the session onto the best direct path it can establish for that workload. Supporting details are in [Transport Model](#transport-model) and [Security Model](#security-model).
+Instead, `derphole` uses a bearer token to authorize exactly one session, uses DERP to get both peers talking immediately, and then promotes the session onto the best direct path it can establish for that workload. Supporting details are in [Transport Model](#transport-model) and [Security Model](#security-model).
 
-For `send/listen` and `share/open`, that can beat routing the same traffic through a WireGuard-based overlay because `derpcat` is purpose-built for the active session, not for a general secure network abstraction. See [Why It Is Fast](#why-it-is-fast) for the concrete transport reasons.
+For `send/listen` and `share/open`, that can beat routing the same traffic through a WireGuard-based overlay because `derphole` is purpose-built for the active session, not for a general secure network abstraction. See [Why It Is Fast](#why-it-is-fast) for the concrete transport reasons.
 
 ## Why It Is Fast
 
-`derpcat` gets its performance from the transport design:
+`derphole` gets its performance from the transport design:
 
 - DERP is for rendezvous and relay fallback, not the preferred steady-state data plane.
 - Sessions can start relayed immediately, then promote in place to direct without restarting the transfer.
@@ -235,7 +235,7 @@ DERP relays do **not** get the secret material needed to read or impersonate the
 - On `share/open`, stream traffic is carried over authenticated QUIC streams for the claimed session.
 - If packets are relayed through DERP, DERP only forwards encrypted session bytes.
 
-Important security property: `derpcat` does not trade speed for plaintext shortcuts:
+Important security property: `derphole` does not trade speed for plaintext shortcuts:
 
 - the token authorizes the session, but does not turn DERP into a trusted decrypting proxy
 - direct UDP data packets are encrypted and authenticated per session
@@ -261,12 +261,12 @@ Classic tar pipe is fast because it streams bytes directly from `tar` on one hos
 
 Problem: classic `tar | nc` assumes receiver can expose a listening port and sender can reach it. That breaks down fast when both hosts are on the public Internet, both sit behind NAT, and neither side should expose an inbound port.
 
-`derpcat` keeps the same streaming shape, but removes the open-port requirement.
+`derphole` keeps the same streaming shape, but removes the open-port requirement.
 
 Receiver:
 
 ```bash
-npx -y derpcat@latest listen | tar -xpf - -C /restore/path
+npx -y derphole@latest listen | tar -xpf - -C /restore/path
 ```
 
 `listen` prints a token on stderr. Copy that token to the sender over a channel you trust.
@@ -274,10 +274,10 @@ npx -y derpcat@latest listen | tar -xpf - -C /restore/path
 Sender:
 
 ```bash
-tar -cpf - /srv/data | npx -y derpcat@latest send <token>
+tar -cpf - /srv/data | npx -y derphole@latest send <token>
 ```
 
-This is still tar pipe. Difference: no public listener to expose, no SSH daemon required for data path, no VPN to join, and no permanent mesh to set up. `derpcat` starts with DERP if needed, then promotes the live transfer onto direct UDP when a faster direct path becomes available.
+This is still tar pipe. Difference: no public listener to expose, no SSH daemon required for data path, no VPN to join, and no permanent mesh to set up. `derphole` starts with DERP if needed, then promotes the live transfer onto direct UDP when a faster direct path becomes available.
 
 ## Development
 
@@ -288,7 +288,7 @@ mise run check
 mise run build
 ```
 
-`mise run build` writes both `dist/derpcat` and `dist/derphole`.
+`mise run build` writes both `dist/derphole` and `dist/derphole`.
 
 ## Verification
 
@@ -308,7 +308,7 @@ REMOTE_HOST=my-server.example.com mise run promotion-1g
 
 ## Releases
 
-- npm packages: `derpcat`, `derphole`
+- npm packages: `derphole`, `derphole`
 - production channel: `@latest` on each package
 - development channel: `@dev` on each package
 - bootstrap runbook: [docs/releases/npm-bootstrap.md](docs/releases/npm-bootstrap.md)
@@ -319,9 +319,9 @@ DERP stands for **Designated Encrypted Relay for Packets**. In plain terms, it i
 
 DERP was built by Tailscale for the Tailscale networking stack, and the public Tailscale-operated DERP network is reachable without running your own relays. The same DERP model is also used by Headscale, the open-source Tailscale control server implementation, which can serve its own DERP map and DERP servers.
 
-In `derpcat`, DERP has two jobs:
+In `derphole`, DERP has two jobs:
 
 - rendezvous: carry the initial claim, decision, and direct-path coordination messages so the two peers can find each other without a separate account-backed control plane
 - fallback relay: carry encrypted session traffic when NAT traversal has not succeeded yet or when direct connectivity is unavailable
 
-DERP is not the preferred steady-state path. It is the safety net that gets the session started and keeps it working. If a direct UDP path becomes available, `derpcat` promotes the live session onto that direct path. DERP only forwards bytes; it does not get the session keys needed to decrypt the traffic.
+DERP is not the preferred steady-state path. It is the safety net that gets the session started and keeps it working. If a direct UDP path becomes available, `derphole` promotes the live session onto that direct path. DERP only forwards bytes; it does not get the session keys needed to decrypt the traffic.

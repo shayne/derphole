@@ -2,11 +2,11 @@
 
 ## Goal
 
-Improve `derpcat`'s direct-connection success rate on residential and other consumer NATs by integrating Tailscale's port mapping support (UPnP, NAT-PMP, PCP) into the core direct transport. The feature should be enabled by default, require no CLI changes for normal use, and preserve the existing relay-first/direct-upgrade behavior.
+Improve `derphole`'s direct-connection success rate on residential and other consumer NATs by integrating Tailscale's port mapping support (UPnP, NAT-PMP, PCP) into the core direct transport. The feature should be enabled by default, require no CLI changes for normal use, and preserve the existing relay-first/direct-upgrade behavior.
 
 ## Current State
 
-`derpcat` currently relies on:
+`derphole` currently relies on:
 - public DERP bootstrap
 - bearer-token session claim over DERP
 - candidate exchange over DERP control messages
@@ -22,7 +22,7 @@ Attach a long-lived `tailscale.com/net/portmapper` client to each live direct UD
 Pros:
 - Best practical improvement for double-NAT and residential networks
 - Faithful to how Tailscale improves direct connectivity
-- Keeps the current `derpcat` session and transport architecture intact
+- Keeps the current `derphole` session and transport architecture intact
 
 Cons:
 - Requires deeper transport-manager integration
@@ -40,7 +40,7 @@ Cons:
 - Long-lived `share/open` sessions benefit less
 
 ### 3. Broader magicsock reuse
-Pull more of Tailscale's portmap and endpoint-refresh machinery into `derpcat`.
+Pull more of Tailscale's portmap and endpoint-refresh machinery into `derphole`.
 
 Pros:
 - Potentially closest to Tailscale parity
@@ -85,7 +85,7 @@ Use:
 
 Optionally pass the same portmapper client into `netcheck.Client` so discovery and port mapping share a consistent view of the network.
 
-Do not import more of `magicsock` than necessary. `derpcat` still owns:
+Do not import more of `magicsock` than necessary. `derphole` still owns:
 - session claim and token logic
 - candidate exchange over DERP
 - path selection and state transitions

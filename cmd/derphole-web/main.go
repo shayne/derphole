@@ -8,8 +8,8 @@ import (
 	"sync"
 	"syscall/js"
 
-	"github.com/shayne/derpcat/pkg/derphole/webproto"
-	"github.com/shayne/derpcat/pkg/derphole/webrelay"
+	"github.com/shayne/derphole/pkg/derphole/webproto"
+	"github.com/shayne/derphole/pkg/derphole/webrelay"
 )
 
 var (

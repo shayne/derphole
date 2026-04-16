@@ -123,7 +123,7 @@ func establishReceiveSession(t *testing.T, conn net.PacketConn, dst net.Addr, ru
 }
 
 func TestTransferCompletesAcrossLoopback(t *testing.T) {
-	src := bytes.Repeat([]byte("derpcat"), 1<<17)
+	src := bytes.Repeat([]byte("derphole"), 1<<17)
 	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -301,7 +301,7 @@ func TestReceiveBlastStreamParallelToWriterRejectsShortStripedFinalTotal(t *test
 }
 
 func TestTransferStatsCaptureFirstByte(t *testing.T) {
-	src := bytes.Repeat([]byte("derpcat"), 1<<12)
+	src := bytes.Repeat([]byte("derphole"), 1<<12)
 	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -4747,7 +4747,7 @@ func (c *capturePacketConn) Packets() [][]byte {
 
 func testPacketAEAD(t *testing.T) cipher.AEAD {
 	t.Helper()
-	block, err := aes.NewCipher([]byte("derpcat-test-key"))
+	block, err := aes.NewCipher([]byte("derphole-test-key"))
 	if err != nil {
 		t.Fatalf("aes.NewCipher() error = %v", err)
 	}

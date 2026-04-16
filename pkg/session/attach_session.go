@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/token"
+	"github.com/shayne/derphole/pkg/token"
 )
 
 var (

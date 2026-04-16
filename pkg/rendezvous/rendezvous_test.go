@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/token"
+	"github.com/shayne/derphole/pkg/token"
 )
 
 func testToken(now time.Time) token.Token {

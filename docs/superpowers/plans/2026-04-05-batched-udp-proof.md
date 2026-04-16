@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Prove whether Tailscale-style UDP batching and offload support can make `derpcat-probe` materially outperform current no-Tailscale derpcat on the live host matrix.
+**Goal:** Prove whether Tailscale-style UDP batching and offload support can make `derphole-probe` materially outperform current no-Tailscale derphole on the live host matrix.
 
 **Architecture:** Keep the existing probe protocol and orchestration, but add a focused UDP fast path: pooled buffers, batch send/receive, Linux offload enablement, effective socket-buffer reporting, and benchmark-mode controls so the current probe and the new fast path can be compared directly.
 
-**Tech Stack:** Go, `net`, `golang.org/x/net/ipv4`, `golang.org/x/net/ipv6`, Linux UDP socket options, existing `cmd/derpcat-probe`, existing benchmark shell scripts, SSH orchestration.
+**Tech Stack:** Go, `net`, `golang.org/x/net/ipv4`, `golang.org/x/net/ipv6`, Linux UDP socket options, existing `cmd/derphole-probe`, existing benchmark shell scripts, SSH orchestration.
 
 ---
 
@@ -25,7 +25,7 @@
 - `pkg/probe/session_test.go` — cover batch send/receive behavior and reporting.
 - `pkg/probe/report.go` — include batching/offload/socket-buffer facts in reports.
 - `pkg/probe/report_test.go` — lock the new report fields.
-- `cmd/derpcat-probe/orchestrate.go` — add CLI flags for transport mode selection if needed.
+- `cmd/derphole-probe/orchestrate.go` — add CLI flags for transport mode selection if needed.
 - `pkg/probe/orchestrator.go` — collect and aggregate new report fields.
 - `pkg/probe/orchestrator_test.go` — verify result parsing/aggregation.
 - `scripts/probe-benchmark.sh` — add fast-path mode selection.
@@ -76,7 +76,7 @@ go test ./pkg/probe -run 'Test(Session|Blast)' -count=1
 
 ```bash
 go test ./pkg/probe -run 'TestReport' -count=1
-go test ./cmd/derpcat-probe -count=1
+go test ./cmd/derphole-probe -count=1
 ```
 
 ### Task 4: Add benchmark mode controls and baseline comparison
@@ -84,7 +84,7 @@ go test ./cmd/derpcat-probe -count=1
 - [ ] Extend benchmark scripts so they can run:
   - legacy probe mode
   - batched probe mode
-  - current derpcat baseline
+  - current derphole baseline
 - [ ] Make the matrix runner emit enough detail to compare:
   - goodput
   - time to first byte
@@ -101,10 +101,10 @@ pre-commit run --files scripts/probe-benchmark.sh scripts/probe-benchmark-revers
 
 - [ ] Run the baseline on `ktzlxc`:
   - Tailscale `iperf3`
-  - tuned derpcat no-Tailscale
+  - tuned derphole no-Tailscale
   - legacy probe
   - batched probe
-- [ ] If batched probe does not beat tuned derpcat on `ktzlxc`, stop and write down the evidence.
+- [ ] If batched probe does not beat tuned derphole on `ktzlxc`, stop and write down the evidence.
 - [ ] If batched probe wins on `ktzlxc`, widen to:
   - `canlxc`
   - `uklxc`
@@ -116,9 +116,9 @@ pre-commit run --files scripts/probe-benchmark.sh scripts/probe-benchmark-revers
 - [ ] Run:
 
 ```bash
-go test ./cmd/derpcat-probe ./pkg/probe -count=1
-go test -race ./cmd/derpcat-probe ./pkg/probe
-go vet ./cmd/derpcat-probe ./pkg/probe
+go test ./cmd/derphole-probe ./pkg/probe -count=1
+go test -race ./cmd/derphole-probe ./pkg/probe
+go vet ./cmd/derphole-probe ./pkg/probe
 mise run check
 ```
 
@@ -130,4 +130,4 @@ mise run check
 
 - The probe has a measurable legacy mode and a measurable batched mode.
 - The batched mode is live-tested against the host matrix.
-- We either prove a real throughput win over tuned derpcat on `ktzlxc`, or we produce hard evidence that batching/offload alone is not enough.
+- We either prove a real throughput win over tuned derphole on `ktzlxc`, or we produce hard evidence that batching/offload alone is not enough.

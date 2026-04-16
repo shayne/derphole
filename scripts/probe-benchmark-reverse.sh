@@ -3,10 +3,10 @@ set -euo pipefail
 
 target="${1:?usage: $0 <target> [size-bytes]}"
 size_bytes="${2:-1073741824}"
-remote_user="${DERPCAT_REMOTE_USER:-root}"
-probe_mode="${DERPCAT_PROBE_MODE:-raw}"
-probe_transport="${DERPCAT_PROBE_TRANSPORT:-}"
-probe_parallel="${DERPCAT_PROBE_PARALLEL:-1}"
+remote_user="${DERPHOLE_REMOTE_USER:-root}"
+probe_mode="${DERPHOLE_PROBE_MODE:-raw}"
+probe_transport="${DERPHOLE_PROBE_TRANSPORT:-}"
+probe_parallel="${DERPHOLE_PROBE_PARALLEL:-1}"
 if [[ -z "${probe_transport}" ]]; then
 	if [[ "${probe_mode}" == "raw" || "${probe_mode}" == "blast" || "${probe_mode}" == "wg" || "${probe_mode}" == "wgos" || "${probe_mode}" == "wgiperf" ]]; then
 		probe_transport="batched"

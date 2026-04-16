@@ -23,14 +23,14 @@ const defaultExternalNativeTCPConns = 2
 const externalNativeTCPBearerAuthSize = 32 + sha256.Size
 const externalNativeTCPBootstrapHelloSize = 1
 
-var externalNativeTCPBearerAuthDomain = []byte("derpcat-native-tcp-v1")
+var externalNativeTCPBearerAuthDomain = []byte("derphole-native-tcp-v1")
 
 var externalNativeTCPAddrAllowed = externalNativeTCPAddrAllowedDefault
 var externalNativeTCPListen = listenExternalNativeTCP
 
-const externalNativeTCPBindAddrEnv = "DERPCAT_NATIVE_TCP_BIND_ADDR"
-const externalNativeTCPAdvertiseAddrEnv = "DERPCAT_NATIVE_TCP_ADVERTISE_ADDR"
-const externalNativeTCPChunkSizeEnv = "DERPCAT_NATIVE_TCP_CHUNK_SIZE"
+const externalNativeTCPBindAddrEnv = "DERPHOLE_NATIVE_TCP_BIND_ADDR"
+const externalNativeTCPAdvertiseAddrEnv = "DERPHOLE_NATIVE_TCP_ADVERTISE_ADDR"
+const externalNativeTCPChunkSizeEnv = "DERPHOLE_NATIVE_TCP_CHUNK_SIZE"
 
 type externalNativeTCPAuth struct {
 	Enabled      bool
@@ -52,7 +52,7 @@ func externalNativeTCPAddrAllowedDefault(addr net.Addr) bool {
 }
 
 func externalNativeTCPConnCount() int {
-	if raw := os.Getenv("DERPCAT_NATIVE_TCP_CONNS"); raw != "" {
+	if raw := os.Getenv("DERPHOLE_NATIVE_TCP_CONNS"); raw != "" {
 		count, err := strconv.Atoi(raw)
 		if err == nil && count > 0 {
 			return count
@@ -94,7 +94,7 @@ func externalNativeTCPPassiveConnCount(peerCount int) int {
 
 func externalNativeTCPConnCap() int {
 	localCap := MaxParallelStripes
-	if raw := os.Getenv("DERPCAT_NATIVE_TCP_CONNS"); raw != "" {
+	if raw := os.Getenv("DERPHOLE_NATIVE_TCP_CONNS"); raw != "" {
 		count, err := strconv.Atoi(raw)
 		if err == nil && count > 0 && count < localCap {
 			localCap = count

@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/probe"
-	"github.com/shayne/derpcat/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/probe"
+	"github.com/shayne/derphole/pkg/telemetry"
 )
 
 func TestExternalTransferMetricsTrackRelayAndDirectBytes(t *testing.T) {

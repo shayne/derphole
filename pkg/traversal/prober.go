@@ -8,8 +8,8 @@ import (
 )
 
 const (
-	probePayload = "derpcat-probe"
-	ackPayload   = "derpcat-ack"
+	probePayload = "derphole-probe"
+	ackPayload   = "derphole-ack"
 	probeWindow  = 100 * time.Millisecond
 )
 

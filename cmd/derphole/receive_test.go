@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	pkgderphole "github.com/shayne/derpcat/pkg/derphole"
-	"github.com/shayne/derpcat/pkg/session"
+	pkgderphole "github.com/shayne/derphole/pkg/derphole"
+	"github.com/shayne/derphole/pkg/session"
 )
 
 func TestRunHelpReceiveAliasesShowReceiveHelp(t *testing.T) {

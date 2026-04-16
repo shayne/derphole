@@ -23,7 +23,7 @@
       <nav aria-label="Primary">
         <a href="#demo">Demo</a>
         <a href="#cli">CLI</a>
-        <a href="https://github.com/shayne/derpcat">GitHub</a>
+        <a href="https://github.com/shayne/derphole">GitHub</a>
       </nav>
     </header>
 
@@ -39,7 +39,7 @@
           </p>
           <div class="actions" aria-label="Project links">
             <a class="button primary" href="#demo">Try the web demo</a>
-            <a class="button secondary" href="https://github.com/shayne/derpcat">View on GitHub</a>
+            <a class="button secondary" href="https://github.com/shayne/derphole">View on GitHub</a>
           </div>
         </div>
         <aside class="terminal-card" aria-label="CLI install commands">
@@ -47,7 +47,7 @@
           <pre><code>npx -y derphole@latest send ./file
 npx -y derphole@latest receive &lt;token&gt;
 
-cat image.img | npx -y derpcat@latest send &lt;token&gt;</code></pre>
+cat image.img | npx -y derphole@latest send &lt;token&gt;</code></pre>
         </aside>
       </section>
 
@@ -129,10 +129,10 @@ npx -y derphole@latest receive &lt;token&gt;
 npx -y derphole@latest ssh invite --user deploy</code></pre>
           </article>
           <article>
-            <h3>derpcat</h3>
-            <pre><code>npx -y derpcat@latest listen &gt; disk.img
-cat ./disk.img | npx -y derpcat@latest send &lt;token&gt;
-npx -y derpcat@latest share 127.0.0.1:3000</code></pre>
+            <h3>derphole</h3>
+            <pre><code>npx -y derphole@latest listen &gt; disk.img
+cat ./disk.img | npx -y derphole@latest send &lt;token&gt;
+npx -y derphole@latest share 127.0.0.1:3000</code></pre>
           </article>
         </div>
       </section>
@@ -142,7 +142,7 @@ npx -y derpcat@latest share 127.0.0.1:3000</code></pre>
         <p>
           Browser JavaScript cannot open raw UDP sockets, so this build uses DERP
           WebSockets for rendezvous and relay fallback, plus WebRTC DataChannel
-          for browser direct paths. The native derpcat and derphole binaries use
+          for browser direct paths. The native derphole and derphole binaries use
           the same DERP coordination model, but they can also use the optimized
           direct UDP transport that browsers do not expose.
         </p>
@@ -150,8 +150,8 @@ npx -y derpcat@latest share 127.0.0.1:3000</code></pre>
     </main>
 
     <footer class="footer">
-      <span>derpcat and derphole are session-scoped transfer tools.</span>
-      <a href="https://github.com/shayne/derpcat">github.com/shayne/derpcat</a>
+      <span>derphole and derphole are session-scoped transfer tools.</span>
+      <a href="https://github.com/shayne/derphole">github.com/shayne/derphole</a>
     </footer>
 
     <script src="wasm_exec.js"></script>

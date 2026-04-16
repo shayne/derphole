@@ -58,7 +58,7 @@ function runSSH(token) {
   const verboseFlag = verbose ? " --verbose" : "";
   const command = [
     `rm -f ${shellQuote(remoteOut)} ${shellQuote(remoteLog)}`,
-    `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 timeout ${shellQuote(timeout)} ${shellQuote(remoteBin)}${verboseFlag} receive${forceRelay}${progress} -o ${shellQuote(remoteOut)} ${shellQuote(token)} >/tmp/derphole-web-harness.out 2>${shellQuote(remoteLog)}`,
+    `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 timeout ${shellQuote(timeout)} ${shellQuote(remoteBin)}${verboseFlag} receive${forceRelay}${progress} -o ${shellQuote(remoteOut)} ${shellQuote(token)} >/tmp/derphole-web-harness.out 2>${shellQuote(remoteLog)}`,
     "rc=$?",
     `bytes=0; [ -f ${shellQuote(remoteOut)} ] && bytes=$(wc -c < ${shellQuote(remoteOut)})`,
     `echo rc=$rc bytes=$bytes`,

@@ -80,7 +80,7 @@ small proof of concept but is not suitable for very large files.
 ## Browser Direct Path
 
 The WebRTC direct path uses browser ICE with public STUN servers. It is not the
-native derpcat UDP engine and does not reuse Tailscale magicsock sockets, because
+native derphole UDP engine and does not reuse Tailscale magicsock sockets, because
 browser JavaScript cannot open raw UDP sockets. WebRTC is still the practical
 browser primitive for NAT traversal and direct browser-to-browser data.
 

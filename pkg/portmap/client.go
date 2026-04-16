@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/telemetry"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/portmapper"
 	"tailscale.com/net/portmapper/portmappertype"
@@ -79,7 +79,7 @@ func New(emitter *telemetry.Emitter) *Client {
 	}
 
 	if c.emitter != nil && c.emitter.DebugEnabled() {
-		c.subClient = bus.Client("derpcat-portmap")
+		c.subClient = bus.Client("derphole-portmap")
 		sub := eventbus.Subscribe[portmappertype.Mapping](c.subClient)
 		go c.consumeMappings(sub)
 	}

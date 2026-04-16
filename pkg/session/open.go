@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/stream"
-	"github.com/shayne/derpcat/pkg/token"
+	"github.com/shayne/derphole/pkg/stream"
+	"github.com/shayne/derphole/pkg/token"
 )
 
 func Open(ctx context.Context, cfg OpenConfig) error {

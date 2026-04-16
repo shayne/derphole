@@ -1255,7 +1255,7 @@ func TestManagerIgnoresAckWithoutOutstandingProbe(t *testing.T) {
 		t.Fatalf("PathState() before unsolicited ack = %v, want %v", mgr.PathState(), PathUnknown)
 	}
 
-	direct.enqueueRead([]byte("derpcat-ack"), peerCandidate)
+	direct.enqueueRead([]byte("derphole-ack"), peerCandidate)
 
 	if !waitForPath(t, mgr, PathUnknown, 100*time.Millisecond) {
 		t.Fatalf("PathState() after unsolicited ack = %v, want %v", mgr.PathState(), PathUnknown)
@@ -1292,7 +1292,7 @@ func TestManagerRespondsToInboundProbeWithAck(t *testing.T) {
 
 	direct.enqueueRead(discoProbePayload, peerCandidate)
 	if !direct.waitForWritePayloadTo(peerCandidate, discoAckPayload, 200*time.Millisecond) {
-		t.Fatal("manager did not reply to inbound probe with derpcat-ack")
+		t.Fatal("manager did not reply to inbound probe with derphole-ack")
 	}
 }
 
@@ -1400,7 +1400,7 @@ func TestManagerIgnoresUnexpectedDirectNoise(t *testing.T) {
 	}
 	waitForManagerTimers(t, clock, baseTimers, 2)
 
-	direct.enqueueRead([]byte("derpcat-ack"), &net.UDPAddr{IP: net.IPv4(100, 64, 0, 99), Port: 9999})
+	direct.enqueueRead([]byte("derphole-ack"), &net.UDPAddr{IP: net.IPv4(100, 64, 0, 99), Port: 9999})
 	direct.enqueueRead([]byte("udp-noise"), &net.UDPAddr{IP: net.IPv4(100, 64, 0, 100), Port: 10000})
 	direct.enqueueRead(append(append([]byte(nil), discoAckPayload...), []byte("-extra")...), &net.UDPAddr{IP: net.IPv4(100, 64, 0, 101), Port: 10001})
 	clock.Advance(1 * time.Second)

@@ -9,7 +9,7 @@ import (
 	"time"
 
 	quic "github.com/quic-go/quic-go"
-	"github.com/shayne/derpcat/pkg/transport"
+	"github.com/shayne/derphole/pkg/transport"
 )
 
 type relayPipe struct {

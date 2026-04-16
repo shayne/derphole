@@ -205,7 +205,7 @@ func testWireGuardTransfer(t *testing.T, transport string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	payload := bytes.Repeat([]byte("derpcat"), 16<<10)
+	payload := bytes.Repeat([]byte("derphole"), 16<<10)
 	var dst bytes.Buffer
 	serverDone := make(chan error, 1)
 	serverReady := make(chan struct{})

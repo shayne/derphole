@@ -22,8 +22,8 @@ const (
 )
 
 var (
-	discoProbePayload = []byte("derpcat-probe")
-	discoAckPayload   = []byte("derpcat-ack")
+	discoProbePayload = []byte("derphole-probe")
+	discoAckPayload   = []byte("derphole-ack")
 )
 
 func (m *Manager) discoveryLoop(ctx context.Context) {

@@ -14,7 +14,7 @@ import (
 	"time"
 
 	quic "github.com/quic-go/quic-go"
-	"github.com/shayne/derpcat/pkg/quicpath"
+	"github.com/shayne/derphole/pkg/quicpath"
 )
 
 const listenUsage = "usage: quicbench listen [addr]"

@@ -22,8 +22,8 @@ if (!triple) {
   process.exit(1);
 }
 
-const binaryName = process.platform === "win32" ? "derpcat.exe" : "derpcat";
-const binaryPath = path.join(__dirname, "..", "vendor", triple, "derpcat", binaryName);
+const binaryName = process.platform === "win32" ? "derphole.exe" : "derphole";
+const binaryPath = path.join(__dirname, "..", "vendor", triple, "derphole", binaryName);
 if (!existsSync(binaryPath)) {
   console.error(`Missing vendored binary: ${binaryPath}`);
   process.exit(1);
@@ -31,7 +31,7 @@ if (!existsSync(binaryPath)) {
 
 const child = spawn(binaryPath, process.argv.slice(2), {
   stdio: "inherit",
-  env: { ...process.env, DERPCAT_MANAGED_BY_NPM: "1" }
+  env: { ...process.env, DERPHOLE_MANAGED_BY_NPM: "1" }
 });
 
 child.on("error", (err) => {

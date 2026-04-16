@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Prove, with repeatable benchmarks, whether a standalone direct UDP probe can materially outperform current no-Tailscale derpcat on `ktzlxc`, `canlxc`, `uklxc`, and `orange-india.exe.xyz`, while staying isolated from derpcat's production transport.
+**Goal:** Prove, with repeatable benchmarks, whether a standalone direct UDP probe can materially outperform current no-Tailscale derphole on `ktzlxc`, `canlxc`, `uklxc`, and `orange-india.exe.xyz`, while staying isolated from derphole's production transport.
 
-**Architecture:** Build a separate `derpcat-probe` binary plus a focused `pkg/probe` package. The probe uses SSH for orchestration, `pkg/traversal` for public endpoint discovery, a minimal fixed-header UDP transport with ACK/SACK-based recovery, and optional AEAD mode only after the raw-mode benchmark gate passes on `ktzlxc`.
+**Architecture:** Build a separate `derphole-probe` binary plus a focused `pkg/probe` package. The probe uses SSH for orchestration, `pkg/traversal` for public endpoint discovery, a minimal fixed-header UDP transport with ACK/SACK-based recovery, and optional AEAD mode only after the raw-mode benchmark gate passes on `ktzlxc`.
 
 **Tech Stack:** Go, `github.com/shayne/yargs`, standard `net` UDP sockets, `os/exec` for `ssh`/`scp`, existing `pkg/traversal` STUN helpers, existing benchmark shell harnesses, markdown + JSON result logs.
 
@@ -14,12 +14,12 @@
 
 **Create:**
 
-- `cmd/derpcat-probe/main.go` — entrypoint for the experimental probe binary.
-- `cmd/derpcat-probe/root.go` — CLI registry and subcommand dispatch.
-- `cmd/derpcat-probe/server.go` — `server` subcommand wiring.
-- `cmd/derpcat-probe/client.go` — `client` subcommand wiring.
-- `cmd/derpcat-probe/orchestrate.go` — `orchestrate` subcommand wiring.
-- `cmd/derpcat-probe/root_test.go` — CLI routing and help coverage.
+- `cmd/derphole-probe/main.go` — entrypoint for the experimental probe binary.
+- `cmd/derphole-probe/root.go` — CLI registry and subcommand dispatch.
+- `cmd/derphole-probe/server.go` — `server` subcommand wiring.
+- `cmd/derphole-probe/client.go` — `client` subcommand wiring.
+- `cmd/derphole-probe/orchestrate.go` — `orchestrate` subcommand wiring.
+- `cmd/derphole-probe/root_test.go` — CLI routing and help coverage.
 - `pkg/probe/protocol.go` — packet types, header encode/decode, shared constants.
 - `pkg/probe/protocol_test.go` — protocol round-trip and validation tests.
 - `pkg/probe/session.go` — sender/receiver session loop, ACK handling, retransmit window.
@@ -47,19 +47,19 @@
 
 ## Scope Note
 
-This plan covers **phase 1 only**. It intentionally stops at the proof gate. If the raw or encrypted probe does not beat current derpcat on `ktzlxc`, do not start a production refactor. Write down the benchmark evidence and stop.
+This plan covers **phase 1 only**. It intentionally stops at the proof gate. If the raw or encrypted probe does not beat current derphole on `ktzlxc`, do not start a production refactor. Write down the benchmark evidence and stop.
 
 ### Task 1: Scaffold the probe protocol and CLI shell
 
 **Files:**
 - Create: `pkg/probe/protocol.go`
 - Create: `pkg/probe/protocol_test.go`
-- Create: `cmd/derpcat-probe/main.go`
-- Create: `cmd/derpcat-probe/root.go`
-- Create: `cmd/derpcat-probe/server.go`
-- Create: `cmd/derpcat-probe/client.go`
-- Create: `cmd/derpcat-probe/orchestrate.go`
-- Create: `cmd/derpcat-probe/root_test.go`
+- Create: `cmd/derphole-probe/main.go`
+- Create: `cmd/derphole-probe/root.go`
+- Create: `cmd/derphole-probe/server.go`
+- Create: `cmd/derphole-probe/client.go`
+- Create: `cmd/derphole-probe/orchestrate.go`
+- Create: `cmd/derphole-probe/root_test.go`
 
 - [ ] **Step 1: Write the failing protocol and CLI tests**
 
@@ -126,7 +126,7 @@ func TestPacketRejectsAEAD(t *testing.T) {
 ```
 
 ```go
-// cmd/derpcat-probe/root_test.go
+// cmd/derphole-probe/root_test.go
 package main
 
 import (
@@ -256,13 +256,13 @@ Run:
 
 ```bash
 go test ./pkg/probe -run 'TestPacketRoundTrip|TestUnmarshalPacketRejectsShortHeader|TestPacketRejectsAEAD' -count=1
-go test ./cmd/derpcat-probe -run 'TestRunShowsHelpForNoArgs|TestRunShowsHelpForHelpFlag|TestRunHelpCommandShowsSubcommandHelp|TestRunHelpCommandRejectsExtraArgs|TestRunHelpCommandRejectsUnknownSubcommand|TestRunRejectsUnknownCommand|TestRunServerRejectsPositionalArgs|TestRunClientRejectsPositionalArgs|TestRunOrchestrateRejectsPositionalArgs|TestRunServerShowsHelpForHelpFlag' -count=1
+go test ./cmd/derphole-probe -run 'TestRunShowsHelpForNoArgs|TestRunShowsHelpForHelpFlag|TestRunHelpCommandShowsSubcommandHelp|TestRunHelpCommandRejectsExtraArgs|TestRunHelpCommandRejectsUnknownSubcommand|TestRunRejectsUnknownCommand|TestRunServerRejectsPositionalArgs|TestRunClientRejectsPositionalArgs|TestRunOrchestrateRejectsPositionalArgs|TestRunServerShowsHelpForHelpFlag' -count=1
 ```
 
 Expected:
 
 - first command fails because `pkg/probe` does not exist
-- second command fails because `cmd/derpcat-probe` does not exist
+- second command fails because `cmd/derphole-probe` does not exist
 
 - [ ] **Step 3: Write the minimal protocol and CLI shell**
 
@@ -337,7 +337,7 @@ func UnmarshalPacket(buf []byte, aead cipher.AEAD) (Packet, error) {
 ```
 
 ```go
-// cmd/derpcat-probe/main.go
+// cmd/derphole-probe/main.go
 package main
 
 import "os"
@@ -348,7 +348,7 @@ func main() {
 ```
 
 ```go
-// cmd/derpcat-probe/root.go
+// cmd/derphole-probe/root.go
 package main
 
 import (
@@ -360,7 +360,7 @@ import (
 
 var registry = yargs.Registry{
 	Command: yargs.CommandInfo{
-		Name:        "derpcat-probe",
+		Name:        "derphole-probe",
 		Description: "Experimental direct UDP benchmark probe.",
 	},
 	SubCommands: map[string]yargs.CommandSpec{
@@ -408,21 +408,21 @@ func runHelp(args []string, stderr io.Writer) int {
 			fmt.Fprint(stderr, subcommandUsageLine("server"))
 			return 2
 		}
-		fmt.Fprint(stderr, "usage: derpcat-probe server\n")
+		fmt.Fprint(stderr, "usage: derphole-probe server\n")
 		return 0
 	case "client":
 		if len(args) != 1 {
 			fmt.Fprint(stderr, subcommandUsageLine("client"))
 			return 2
 		}
-		fmt.Fprint(stderr, "usage: derpcat-probe client\n")
+		fmt.Fprint(stderr, "usage: derphole-probe client\n")
 		return 0
 	case "orchestrate":
 		if len(args) != 1 {
 			fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
 			return 2
 		}
-		fmt.Fprint(stderr, "usage: derpcat-probe orchestrate\n")
+		fmt.Fprint(stderr, "usage: derphole-probe orchestrate\n")
 		return 0
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n", args[0])
@@ -432,7 +432,7 @@ func runHelp(args []string, stderr io.Writer) int {
 ```
 
 ```go
-// cmd/derpcat-probe/server.go
+// cmd/derphole-probe/server.go
 package main
 
 import (
@@ -442,11 +442,11 @@ import (
 
 func runServer(args []string, stdout, stderr io.Writer) int {
 	if isRootHelpRequest(args) {
-		fmt.Fprint(stderr, "usage: derpcat-probe server\n")
+		fmt.Fprint(stderr, "usage: derphole-probe server\n")
 		return 0
 	}
 	if len(args) != 0 {
-		fmt.Fprint(stderr, "usage: derpcat-probe server\n")
+		fmt.Fprint(stderr, "usage: derphole-probe server\n")
 		return 2
 	}
 	return 0
@@ -454,7 +454,7 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 ```
 
 ```go
-// cmd/derpcat-probe/client.go
+// cmd/derphole-probe/client.go
 package main
 
 import (
@@ -464,11 +464,11 @@ import (
 
 func runClient(args []string, stdout, stderr io.Writer) int {
 	if isRootHelpRequest(args) {
-		fmt.Fprint(stderr, "usage: derpcat-probe client\n")
+		fmt.Fprint(stderr, "usage: derphole-probe client\n")
 		return 0
 	}
 	if len(args) != 0 {
-		fmt.Fprint(stderr, "usage: derpcat-probe client\n")
+		fmt.Fprint(stderr, "usage: derphole-probe client\n")
 		return 2
 	}
 	return 0
@@ -476,7 +476,7 @@ func runClient(args []string, stdout, stderr io.Writer) int {
 ```
 
 ```go
-// cmd/derpcat-probe/orchestrate.go
+// cmd/derphole-probe/orchestrate.go
 package main
 
 import (
@@ -486,11 +486,11 @@ import (
 
 func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 	if isRootHelpRequest(args) {
-		fmt.Fprint(stderr, "usage: derpcat-probe orchestrate\n")
+		fmt.Fprint(stderr, "usage: derphole-probe orchestrate\n")
 		return 0
 	}
 	if len(args) != 0 {
-		fmt.Fprint(stderr, "usage: derpcat-probe orchestrate\n")
+		fmt.Fprint(stderr, "usage: derphole-probe orchestrate\n")
 		return 2
 	}
 	return 0
@@ -503,7 +503,7 @@ Run:
 
 ```bash
 go test ./pkg/probe -run 'TestPacketRoundTrip|TestUnmarshalPacketRejectsShortHeader|TestPacketRejectsAEAD' -count=1
-go test ./cmd/derpcat-probe -run 'TestRunShowsHelpForNoArgs|TestRunShowsHelpForHelpFlag|TestRunHelpCommandShowsSubcommandHelp|TestRunHelpCommandRejectsExtraArgs|TestRunHelpCommandRejectsUnknownSubcommand|TestRunRejectsUnknownCommand|TestRunServerRejectsPositionalArgs|TestRunClientRejectsPositionalArgs|TestRunOrchestrateRejectsPositionalArgs|TestRunServerShowsHelpForHelpFlag' -count=1
+go test ./cmd/derphole-probe -run 'TestRunShowsHelpForNoArgs|TestRunShowsHelpForHelpFlag|TestRunHelpCommandShowsSubcommandHelp|TestRunHelpCommandRejectsExtraArgs|TestRunHelpCommandRejectsUnknownSubcommand|TestRunRejectsUnknownCommand|TestRunServerRejectsPositionalArgs|TestRunClientRejectsPositionalArgs|TestRunOrchestrateRejectsPositionalArgs|TestRunServerShowsHelpForHelpFlag' -count=1
 ```
 
 Expected:
@@ -513,7 +513,7 @@ Expected:
 - [ ] **Step 5: Commit**
 
 ```bash
-git add pkg/probe/protocol.go pkg/probe/protocol_test.go cmd/derpcat-probe/main.go cmd/derpcat-probe/root.go cmd/derpcat-probe/server.go cmd/derpcat-probe/client.go cmd/derpcat-probe/orchestrate.go cmd/derpcat-probe/root_test.go
+git add pkg/probe/protocol.go pkg/probe/protocol_test.go cmd/derphole-probe/main.go cmd/derphole-probe/root.go cmd/derphole-probe/server.go cmd/derphole-probe/client.go cmd/derphole-probe/orchestrate.go cmd/derphole-probe/root_test.go
 git commit -m "probe: scaffold udp proof cli"
 ```
 
@@ -578,7 +578,7 @@ import (
 )
 
 func TestTransferCompletesAcrossLoopback(t *testing.T) {
-	src := bytes.Repeat([]byte("derpcat"), 1<<17)
+	src := bytes.Repeat([]byte("derphole"), 1<<17)
 	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -635,7 +635,7 @@ import (
 	"context"
 	"net"
 
-	"github.com/shayne/derpcat/pkg/traversal"
+	"github.com/shayne/derphole/pkg/traversal"
 )
 
 type DirectResult struct {
@@ -857,9 +857,9 @@ git commit -m "probe: add raw udp transfer path"
 - Create: `pkg/probe/report_test.go`
 - Create: `pkg/probe/orchestrator.go`
 - Create: `pkg/probe/orchestrator_test.go`
-- Modify: `cmd/derpcat-probe/server.go`
-- Modify: `cmd/derpcat-probe/client.go`
-- Modify: `cmd/derpcat-probe/orchestrate.go`
+- Modify: `cmd/derphole-probe/server.go`
+- Modify: `cmd/derphole-probe/client.go`
+- Modify: `cmd/derphole-probe/orchestrate.go`
 
 - [ ] **Step 1: Write the failing orchestration and report tests**
 
@@ -902,14 +902,14 @@ import (
 )
 
 func TestRemoteCommandIncludesProbeBinaryAndServerMode(t *testing.T) {
-	runner := SSHRunner{User: "root", Host: "ktzlxc", RemotePath: "/tmp/derpcat-probe"}
+	runner := SSHRunner{User: "root", Host: "ktzlxc", RemotePath: "/tmp/derphole-probe"}
 	cmd := runner.ServerCommand(ServerConfig{ListenAddr: ":0", Raw: true})
 	if got, want := cmd[0], "ssh"; got != want {
 		t.Fatalf("cmd[0] = %q, want %q", got, want)
 	}
 	found := false
 	for _, part := range cmd {
-		if part == "/tmp/derpcat-probe server --listen :0 --mode raw" {
+		if part == "/tmp/derphole-probe server --listen :0 --mode raw" {
 			found = true
 		}
 	}
@@ -1021,7 +1021,7 @@ func RunOrchestrate(ctx context.Context, cfg OrchestrateConfig) (RunReport, erro
 		return RunReport{}, errors.New("host is required")
 	}
 	if cfg.RemotePath == "" {
-		cfg.RemotePath = "/tmp/derpcat-probe"
+		cfg.RemotePath = "/tmp/derphole-probe"
 	}
 	if cfg.Mode == "" {
 		cfg.Mode = "raw"
@@ -1050,7 +1050,7 @@ func runCommand(ctx context.Context, argv []string) ([]byte, error) {
 ```
 
 ```go
-// cmd/derpcat-probe/orchestrate.go
+// cmd/derphole-probe/orchestrate.go
 package main
 
 import (
@@ -1062,7 +1062,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/shayne/derpcat/pkg/probe"
+	"github.com/shayne/derphole/pkg/probe"
 	"github.com/shayne/yargs"
 )
 
@@ -1105,7 +1105,7 @@ Run:
 
 ```bash
 go test ./pkg/probe -run 'TestMarkdownReportIncludesCoreMetrics|TestRemoteCommandIncludesProbeBinaryAndServerMode|TestOrchestratorRejectsMissingHost' -count=1
-go test ./cmd/derpcat-probe -count=1
+go test ./cmd/derphole-probe -count=1
 ```
 
 Expected:
@@ -1115,7 +1115,7 @@ Expected:
 - [ ] **Step 6: Commit**
 
 ```bash
-git add pkg/probe/report.go pkg/probe/report_test.go pkg/probe/orchestrator.go pkg/probe/orchestrator_test.go cmd/derpcat-probe/server.go cmd/derpcat-probe/client.go cmd/derpcat-probe/orchestrate.go
+git add pkg/probe/report.go pkg/probe/report_test.go pkg/probe/orchestrator.go pkg/probe/orchestrator_test.go cmd/derphole-probe/server.go cmd/derphole-probe/client.go cmd/derphole-probe/orchestrate.go
 git commit -m "probe: add orchestration and reporting"
 ```
 
@@ -1148,14 +1148,14 @@ set -euo pipefail
 
 target="${1:?usage: $0 <target> [size-bytes]}"
 size_bytes="${2:-1073741824}"
-remote_user="${DERPCAT_REMOTE_USER:-root}"
+remote_user="${DERPHOLE_REMOTE_USER:-root}"
 
 mise run build
-GOOS=linux GOARCH=amd64 go build -o dist/derpcat-probe-linux-amd64 ./cmd/derpcat-probe
-scp dist/derpcat-probe-linux-amd64 "${remote_user}@${target}:/tmp/derpcat-probe" >/dev/null
-ssh "${remote_user}@${target}" "chmod +x /tmp/derpcat-probe"
+GOOS=linux GOARCH=amd64 go build -o dist/derphole-probe-linux-amd64 ./cmd/derphole-probe
+scp dist/derphole-probe-linux-amd64 "${remote_user}@${target}:/tmp/derphole-probe" >/dev/null
+ssh "${remote_user}@${target}" "chmod +x /tmp/derphole-probe"
 
-./dist/derpcat-probe orchestrate --host "${target}" --user "${remote_user}" --size-bytes "${size_bytes}" --mode raw
+./dist/derphole-probe orchestrate --host "${target}" --user "${remote_user}" --size-bytes "${size_bytes}" --mode raw
 ```
 
 ```bash
@@ -1165,14 +1165,14 @@ set -euo pipefail
 
 target="${1:?usage: $0 <target> [size-bytes]}"
 size_bytes="${2:-1073741824}"
-remote_user="${DERPCAT_REMOTE_USER:-root}"
+remote_user="${DERPHOLE_REMOTE_USER:-root}"
 
 mise run build
-GOOS=linux GOARCH=amd64 go build -o dist/derpcat-probe-linux-amd64 ./cmd/derpcat-probe
-scp dist/derpcat-probe-linux-amd64 "${remote_user}@${target}:/tmp/derpcat-probe" >/dev/null
-ssh "${remote_user}@${target}" "chmod +x /tmp/derpcat-probe"
+GOOS=linux GOARCH=amd64 go build -o dist/derphole-probe-linux-amd64 ./cmd/derphole-probe
+scp dist/derphole-probe-linux-amd64 "${remote_user}@${target}:/tmp/derphole-probe" >/dev/null
+ssh "${remote_user}@${target}" "chmod +x /tmp/derphole-probe"
 
-ssh "${remote_user}@${target}" "/tmp/derpcat-probe orchestrate --host '$(hostname -s)' --user '${USER}' --size-bytes '${size_bytes}' --mode raw"
+ssh "${remote_user}@${target}" "/tmp/derphole-probe orchestrate --host '$(hostname -s)' --user '${USER}' --size-bytes '${size_bytes}' --mode raw"
 ```
 
 ```bash
@@ -1202,23 +1202,23 @@ done
 Run:
 
 ```bash
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh ktzlxc 1024 | tee /tmp/derpcat-ktzlxc-current.log
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPCAT_PARALLEL_ARGS='--parallel=auto' ./scripts/promotion-test.sh ktzlxc 1024 | tee /tmp/derpcat-ktzlxc-auto.log
-./scripts/probe-benchmark.sh ktzlxc 1073741824 | tee /tmp/derpcat-probe-ktzlxc-raw.json
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh ktzlxc 1024 | tee /tmp/derphole-ktzlxc-current.log
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_PARALLEL_ARGS='--parallel=auto' ./scripts/promotion-test.sh ktzlxc 1024 | tee /tmp/derphole-ktzlxc-auto.log
+./scripts/probe-benchmark.sh ktzlxc 1073741824 | tee /tmp/derphole-probe-ktzlxc-raw.json
 ```
 
 Expected:
 
 - all three commands complete successfully
 - the probe report includes `direct=true`
-- the probe report shows `goodput_mbps` materially above the current derpcat raw baseline
+- the probe report shows `goodput_mbps` materially above the current derphole raw baseline
 
 - [ ] **Step 4: Write down the raw gate result before continuing**
 
 Run:
 
 ```bash
-jq '{host,mode,direction,goodput_mbps,first_byte_ms,direct}' /tmp/derpcat-probe-ktzlxc-raw.json
+jq '{host,mode,direction,goodput_mbps,first_byte_ms,direct}' /tmp/derphole-probe-ktzlxc-raw.json
 ```
 
 Expected:
@@ -1227,7 +1227,7 @@ Expected:
 
 Decision rule:
 
-- If raw probe goodput does **not** beat current derpcat on `ktzlxc`, stop here, write the benchmark summary into `KTZLXC_BENCHMARKS.md`, commit the probe as evidence tooling, and do not implement Task 5.
+- If raw probe goodput does **not** beat current derphole on `ktzlxc`, stop here, write the benchmark summary into `KTZLXC_BENCHMARKS.md`, commit the probe as evidence tooling, and do not implement Task 5.
 
 - [ ] **Step 5: Commit**
 
@@ -1242,7 +1242,7 @@ git commit -m "probe: add benchmark harnesses"
 - Modify: `pkg/probe/protocol.go`
 - Modify: `pkg/probe/session.go`
 - Modify: `pkg/probe/session_test.go`
-- Modify: `cmd/derpcat-probe/orchestrate.go`
+- Modify: `cmd/derphole-probe/orchestrate.go`
 - Modify: `pkg/probe/orchestrator.go`
 
 - [ ] **Step 1: Write the failing encrypted-mode tests**
@@ -1342,8 +1342,8 @@ Update `MarshalPacket` / `UnmarshalPacket` to encrypt and decrypt payload-bearin
 Run:
 
 ```bash
-./scripts/probe-benchmark.sh ktzlxc 1073741824 | tee /tmp/derpcat-probe-ktzlxc-raw.json
-./dist/derpcat-probe orchestrate --host ktzlxc --user root --size-bytes 1073741824 --mode aead | tee /tmp/derpcat-probe-ktzlxc-aead.json
+./scripts/probe-benchmark.sh ktzlxc 1073741824 | tee /tmp/derphole-probe-ktzlxc-raw.json
+./dist/derphole-probe orchestrate --host ktzlxc --user root --size-bytes 1073741824 --mode aead | tee /tmp/derphole-probe-ktzlxc-aead.json
 ```
 
 Expected:
@@ -1355,7 +1355,7 @@ Expected:
 - [ ] **Step 5: Commit**
 
 ```bash
-git add pkg/probe/protocol.go pkg/probe/session.go pkg/probe/session_test.go cmd/derpcat-probe/orchestrate.go pkg/probe/orchestrator.go
+git add pkg/probe/protocol.go pkg/probe/session.go pkg/probe/session_test.go cmd/derphole-probe/orchestrate.go pkg/probe/orchestrator.go
 git commit -m "probe: add encrypted udp mode"
 ```
 
@@ -1367,33 +1367,33 @@ git commit -m "probe: add encrypted udp mode"
 - Modify locally only: `UKLXC_BENCHMARKS.md`
 - Modify locally only: `ORANGE_INDIA_BENCHMARKS.md`
 
-- [ ] **Step 1: Capture Tailscale and derpcat baselines**
+- [ ] **Step 1: Capture Tailscale and derphole baselines**
 
 Run:
 
 ```bash
 # Tailscale iperf3 baseline, 3x each direction, each host
-# Current derpcat baseline, no Tailscale candidates:
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh ktzlxc 1024
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh canlxc 1024
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh uklxc 1024
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh orange-india.exe.xyz 1024
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPCAT_PARALLEL_ARGS='--parallel=auto' ./scripts/promotion-test.sh ktzlxc 1024
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPCAT_PARALLEL_ARGS='--parallel=auto' ./scripts/promotion-test.sh canlxc 1024
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPCAT_PARALLEL_ARGS='--parallel=auto' ./scripts/promotion-test.sh uklxc 1024
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPCAT_PARALLEL_ARGS='--parallel=auto' ./scripts/promotion-test.sh orange-india.exe.xyz 1024
+# Current derphole baseline, no Tailscale candidates:
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh ktzlxc 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh canlxc 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh uklxc 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh orange-india.exe.xyz 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_PARALLEL_ARGS='--parallel=auto' ./scripts/promotion-test.sh ktzlxc 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_PARALLEL_ARGS='--parallel=auto' ./scripts/promotion-test.sh canlxc 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_PARALLEL_ARGS='--parallel=auto' ./scripts/promotion-test.sh uklxc 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_PARALLEL_ARGS='--parallel=auto' ./scripts/promotion-test.sh orange-india.exe.xyz 1024
 ```
 
 Expected:
 
-- every derpcat run shows direct evidence in sender and listener traces
+- every derphole run shows direct evidence in sender and listener traces
 
 - [ ] **Step 2: Run the new probe matrix**
 
 Run:
 
 ```bash
-./scripts/probe-matrix.sh | tee /tmp/derpcat-probe-matrix.log
+./scripts/probe-matrix.sh | tee /tmp/derphole-probe-matrix.log
 ```
 
 Expected:
@@ -1406,7 +1406,7 @@ Record in the local benchmark markdown files:
 
 - host WAN ceiling
 - Tailscale `iperf3` averages
-- current derpcat no-Tailscale averages
+- current derphole no-Tailscale averages
 - probe raw averages
 - probe AEAD averages if Task 5 ran
 - notes on whether the path appears QUIC-limited, path-limited, or host-limited
@@ -1414,7 +1414,7 @@ Record in the local benchmark markdown files:
 Decision rule:
 
 - If the probe wins on `ktzlxc` and stays competitive in AEAD mode, write a short recommendation that phase 2 should replace the direct QUIC data plane experimentally.
-- If the probe does not win, write a short recommendation that derpcat should keep QUIC and focus on other bottlenecks.
+- If the probe does not win, write a short recommendation that derphole should keep QUIC and focus on other bottlenecks.
 
 - [ ] **Step 4: Final verification**
 
@@ -1422,7 +1422,7 @@ Run:
 
 ```bash
 go test ./pkg/probe -count=1
-go test ./cmd/derpcat-probe -count=1
+go test ./cmd/derphole-probe -count=1
 pre-commit run --files docs/benchmarks.md
 ```
 
@@ -1433,7 +1433,7 @@ Expected:
 - [ ] **Step 5: Commit the code, not the local benchmark logs**
 
 ```bash
-git add cmd/derpcat-probe pkg/probe scripts/probe-benchmark.sh scripts/probe-benchmark-reverse.sh scripts/probe-matrix.sh docs/benchmarks.md
+git add cmd/derphole-probe pkg/probe scripts/probe-benchmark.sh scripts/probe-benchmark-reverse.sh scripts/probe-matrix.sh docs/benchmarks.md
 git commit -m "probe: add direct udp proof harness"
 ```
 

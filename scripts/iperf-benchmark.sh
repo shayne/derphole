@@ -9,11 +9,11 @@ start_ms=0
 duration_ms=0
 remote_target="${target}"
 if [[ "${target}" != *"@"* ]]; then
-  remote_user="${DERPCAT_REMOTE_USER:-root}"
+  remote_user="${DERPHOLE_REMOTE_USER:-root}"
   remote_target="${remote_user}@${target}"
 fi
-iperf_port="${DERPCAT_IPERF_PORT:-8321}"
-iperf_parallel="${DERPCAT_IPERF_PARALLEL:-4}"
+iperf_port="${DERPHOLE_IPERF_PORT:-8321}"
+iperf_parallel="${DERPHOLE_IPERF_PARALLEL:-4}"
 
 remote() {
   ssh "${remote_target}" 'bash -se' <<<"$1"
@@ -28,7 +28,7 @@ now_ms() {
 }
 
 preserve_logs() {
-  local log_dir="${DERPCAT_BENCH_LOG_DIR:-}"
+  local log_dir="${DERPHOLE_BENCH_LOG_DIR:-}"
   if [[ -z "${log_dir}" ]]; then
     return 0
   fi
@@ -41,8 +41,8 @@ preserve_logs() {
 }
 
 discover_public_ip() {
-  if [[ -n "${DERPCAT_IPERF_SERVER_HOST:-}" ]]; then
-    printf '%s\n' "${DERPCAT_IPERF_SERVER_HOST}"
+  if [[ -n "${DERPHOLE_IPERF_SERVER_HOST:-}" ]]; then
+    printf '%s\n' "${DERPHOLE_IPERF_SERVER_HOST}"
     return 0
   fi
   curl -4fsSL https://api.ipify.org

@@ -12,11 +12,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/derphole/protocol"
-	"github.com/shayne/derpcat/pkg/derphole/webproto"
-	"github.com/shayne/derpcat/pkg/derphole/webrelay"
-	"github.com/shayne/derpcat/pkg/session"
-	"github.com/shayne/derpcat/pkg/token"
+	"github.com/shayne/derphole/pkg/derphole/protocol"
+	"github.com/shayne/derphole/pkg/derphole/webproto"
+	"github.com/shayne/derphole/pkg/derphole/webrelay"
+	"github.com/shayne/derphole/pkg/session"
+	"github.com/shayne/derphole/pkg/token"
 )
 
 func TestSendTextIssuesTokenAndTransfersPayload(t *testing.T) {

@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`cmd/derpcat/` and `cmd/derphole/` contain the CLI entrypoints and subcommand wiring. Core transport and session logic lives under `pkg/` (`pkg/session`, `pkg/wg`, `pkg/traversal`, `pkg/derpbind`, `pkg/derphole`, etc.). Packaging assets live in `packaging/npm/` and `tools/packaging/`. Verification scripts are in `scripts/`. Public documentation lives in `docs/derp/` and `docs/releases/`.
+`cmd/derphole/` and `cmd/derphole/` contain the CLI entrypoints and subcommand wiring. Core transport and session logic lives under `pkg/` (`pkg/session`, `pkg/wg`, `pkg/traversal`, `pkg/derpbind`, `pkg/derphole`, etc.). Packaging assets live in `packaging/npm/` and `tools/packaging/`. Verification scripts are in `scripts/`. Public documentation lives in `docs/derp/` and `docs/releases/`.
 
 `dist/` is generated output for local builds, release packaging, and npm assembly. Treat it as ephemeral.
 
@@ -10,14 +10,14 @@
 
 Use `mise` for toolchain consistency.
 
-- `mise run build` builds `dist/derpcat` and `dist/derphole`
+- `mise run build` builds `dist/derphole` and `dist/derphole`
 - `mise run test` runs `go test ./...`
 - `mise run vet` runs `go vet ./...`
 - `mise run install-githooks` installs the local `pre-commit` and `prepare-commit-msg` hooks
 - `mise run check:hooks` runs the repository's `pre-commit` checks across all files
 - `mise run check` runs the same hook, build, and test sequence as the dedicated checks workflow
 - `mise run smoke-local` runs the local end-to-end smoke test
-- `mise run release:build-all` builds vendored binaries, release tarballs, and `dist/npm-derpcat` plus `dist/npm-derphole`
+- `mise run release:build-all` builds vendored binaries, release tarballs, and `dist/npm-derphole` plus `dist/npm-derphole`
 - `mise run release:npm-dry-run` validates both npm packages without publishing
 
 For remote verification, set `REMOTE_HOST` and use `mise run smoke-remote`, `mise run smoke-remote-share`, or `mise run promotion-1g`.

@@ -20,8 +20,8 @@ import (
 	"github.com/quic-go/quic-go/qlogwriter"
 )
 
-const ALPN = "derpcat-quic/1"
-const ServerName = "derpcat"
+const ALPN = "derphole-quic/1"
+const ServerName = "derphole"
 const MaxIncomingStreams = 64
 
 var ErrPeerIdentityMismatch = errors.New("quic peer identity mismatch")
@@ -162,7 +162,7 @@ func verifyPinnedPeer(expected [32]byte) func([][]byte, [][]*x509.Certificate) e
 }
 
 func qlogTracerFromEnv() func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace {
-	dir := os.Getenv("DERPCAT_QLOG_DIR")
+	dir := os.Getenv("DERPHOLE_QLOG_DIR")
 	if dir == "" {
 		return nil
 	}
@@ -171,7 +171,7 @@ func qlogTracerFromEnv() func(context.Context, bool, quic.ConnectionID) qlogwrit
 		if isClient {
 			perspective = "client"
 		}
-		path := filepath.Join(dir, fmt.Sprintf("derpcat-%s-%s.qlog", connID, perspective))
+		path := filepath.Join(dir, fmt.Sprintf("derphole-%s-%s.qlog", connID, perspective))
 		f, err := os.Create(path)
 		if err != nil {
 			return nil

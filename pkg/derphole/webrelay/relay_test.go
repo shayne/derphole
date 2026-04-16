@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/derpbind"
-	"github.com/shayne/derpcat/pkg/derphole/webproto"
-	"github.com/shayne/derpcat/pkg/rendezvous"
+	"github.com/shayne/derphole/pkg/derpbind"
+	"github.com/shayne/derphole/pkg/derphole/webproto"
+	"github.com/shayne/derphole/pkg/rendezvous"
 	"tailscale.com/types/key"
 )
 

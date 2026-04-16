@@ -44,7 +44,7 @@ type quicMetricsRecorder struct {
 }
 
 func metricsTracerFromEnv() func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace {
-	dir := os.Getenv("DERPCAT_QUIC_METRICS_DIR")
+	dir := os.Getenv("DERPHOLE_QUIC_METRICS_DIR")
 	if dir == "" {
 		return nil
 	}
@@ -54,7 +54,7 @@ func metricsTracerFromEnv() func(context.Context, bool, quic.ConnectionID) qlogw
 			perspective = "client"
 		}
 		return &quicMetricsTrace{
-			path: filepath.Join(dir, fmt.Sprintf("derpcat-%s-%s.metrics.json", connID, perspective)),
+			path: filepath.Join(dir, fmt.Sprintf("derphole-%s-%s.metrics.json", connID, perspective)),
 		}
 	}
 }

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/shayne/derpcat/pkg/probe"
+	"github.com/shayne/derphole/pkg/probe"
 )
 
 func TestParsePromotionSummaryReadsBenchmarkFooter(t *testing.T) {
@@ -131,14 +131,14 @@ func TestRunMatrixIteratesRequestedTools(t *testing.T) {
 
 	_, err := runMatrix(context.Background(), matrixConfig{
 		Hosts:      []string{"ktzlxc"},
-		Tools:      []string{"derpcat", "derphole", "iperf"},
+		Tools:      []string{"derphole", "iperf"},
 		Iterations: 1,
 		SizeMiB:    1024,
 	})
 	if err != nil {
 		t.Fatalf("runMatrix() error = %v", err)
 	}
-	if got, want := len(calls), 6; got != want {
+	if got, want := len(calls), 4; got != want {
 		t.Fatalf("len(calls) = %d, want %d", got, want)
 	}
 }
@@ -229,8 +229,8 @@ func TestRunMatrixCmdWritesOutFile(t *testing.T) {
 
 func TestSummarizeMatrixRunsSeparatesTools(t *testing.T) {
 	runs := []probe.RunReport{
-		{Host: "ktzlxc", Mode: "derpcat", Direction: "forward", DurationMS: 1000, GoodputMbps: 100, Success: boolPtr(true)},
-		{Host: "ktzlxc", Mode: "derphole", Direction: "forward", DurationMS: 1000, GoodputMbps: 90, Success: boolPtr(true)},
+		{Host: "ktzlxc", Mode: "derphole", Direction: "forward", DurationMS: 1000, GoodputMbps: 100, Success: boolPtr(true)},
+		{Host: "ktzlxc", Mode: "iperf", Direction: "forward", DurationMS: 1000, GoodputMbps: 90, Success: boolPtr(true)},
 	}
 
 	got := summarizeMatrixRuns(runs)

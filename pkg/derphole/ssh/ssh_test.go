@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/session"
+	"github.com/shayne/derphole/pkg/session"
 )
 
 func TestInviteAcceptAppendsAuthorizedKey(t *testing.T) {

@@ -371,7 +371,7 @@ git commit -m "feat: stream external payloads relay-first with direct handoff"
 
 - [ ] **Step 1: Write a failing script-level check for no-Tailscale candidate mode**
 
-Create `scripts/promotion-matrix-no-tailscale.sh` that runs both directions for `hetz`, `ktzlxc`, and `pve1` with `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1`, and prints a failure if any sender or listener log contains `100.64.` or `fd7a:115c:a1e0::`.
+Create `scripts/promotion-matrix-no-tailscale.sh` that runs both directions for `hetz`, `ktzlxc`, and `pve1` with `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1`, and prints a failure if any sender or listener log contains `100.64.` or `fd7a:115c:a1e0::`.
 
 Use this structure:
 
@@ -381,8 +381,8 @@ set -euo pipefail
 
 hosts=(hetz ktzlxc pve1)
 for host in "${hosts[@]}"; do
-  DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh "$host" 1024
-  DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh "$host" 1024
+  DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh "$host" 1024
+  DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh "$host" 1024
 done
 ```
 
@@ -393,7 +393,7 @@ Then extend the promotion scripts so they emit enough verbose logs for this chec
 Run:
 
 ```bash
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-matrix-no-tailscale.sh
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-matrix-no-tailscale.sh
 ```
 
 Expected: FAIL until the scripts and sender/listener flow emit and preserve the expected no-Tailscale route evidence in a machine-checkable way.
@@ -417,7 +417,7 @@ Run:
 
 ```bash
 mise run check
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-matrix-no-tailscale.sh
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-matrix-no-tailscale.sh
 ./scripts/promotion-test.sh ktzlxc 1024
 ./scripts/promotion-test-reverse.sh ktzlxc 1024
 ./scripts/promotion-test.sh hetz 1024

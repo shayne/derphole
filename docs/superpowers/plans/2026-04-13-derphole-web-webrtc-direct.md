@@ -204,7 +204,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/shayne/derpcat/pkg/derphole/webproto"
+	"github.com/shayne/derphole/pkg/derphole/webproto"
 )
 
 type fakeDirect struct {
@@ -957,8 +957,8 @@ import (
 	"errors"
 	"syscall/js"
 
-	"github.com/shayne/derpcat/pkg/derphole/webproto"
-	"github.com/shayne/derpcat/pkg/derphole/webrelay"
+	"github.com/shayne/derphole/pkg/derphole/webproto"
+	"github.com/shayne/derphole/pkg/derphole/webrelay"
 )
 
 type jsDirectTransport struct {
@@ -1335,7 +1335,7 @@ mise run build
 mise run build-web
 ```
 
-Expected: `dist/derpcat` and `dist/release/derphole-web.zip` exist.
+Expected: `dist/derphole` and `dist/release/derphole-web.zip` exist.
 
 - [ ] **Step 4: Run repository checks**
 

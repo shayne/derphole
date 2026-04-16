@@ -18,15 +18,15 @@ import (
 	"time"
 
 	quic "github.com/quic-go/quic-go"
-	"github.com/shayne/derpcat/pkg/derpbind"
-	"github.com/shayne/derpcat/pkg/portmap"
-	"github.com/shayne/derpcat/pkg/quicpath"
-	"github.com/shayne/derpcat/pkg/rendezvous"
-	"github.com/shayne/derpcat/pkg/telemetry"
-	"github.com/shayne/derpcat/pkg/token"
-	"github.com/shayne/derpcat/pkg/transport"
-	"github.com/shayne/derpcat/pkg/traversal"
-	wgtransport "github.com/shayne/derpcat/pkg/wg"
+	"github.com/shayne/derphole/pkg/derpbind"
+	"github.com/shayne/derphole/pkg/portmap"
+	"github.com/shayne/derphole/pkg/quicpath"
+	"github.com/shayne/derphole/pkg/rendezvous"
+	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/token"
+	"github.com/shayne/derphole/pkg/transport"
+	"github.com/shayne/derphole/pkg/traversal"
+	wgtransport "github.com/shayne/derphole/pkg/wg"
 	"tailscale.com/net/batching"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -2282,14 +2282,14 @@ func derpServerURL(node *tailcfg.DERPNode) string {
 }
 
 func publicDERPMapURL() string {
-	if override := os.Getenv("DERPCAT_TEST_DERP_MAP_URL"); override != "" {
+	if override := os.Getenv("DERPHOLE_TEST_DERP_MAP_URL"); override != "" {
 		return override
 	}
 	return derpbind.PublicDERPMapURL
 }
 
 func publicDERPServerURL(node *tailcfg.DERPNode) string {
-	if override := os.Getenv("DERPCAT_TEST_DERP_SERVER_URL"); override != "" {
+	if override := os.Getenv("DERPHOLE_TEST_DERP_SERVER_URL"); override != "" {
 		return override
 	}
 	return derpServerURL(node)
@@ -2420,7 +2420,7 @@ func waitInitialExternalNativeDirectMode(
 	ch <-chan externalNativeDirectModeResult,
 	wait time.Duration,
 ) (externalNativeDirectModeResult, bool) {
-	if os.Getenv("DERPCAT_NATIVE_TCP_DIRECT_START") != "1" {
+	if os.Getenv("DERPHOLE_NATIVE_TCP_DIRECT_START") != "1" {
 		return externalNativeDirectModeResult{}, false
 	}
 	if wait <= 0 {
@@ -2600,10 +2600,10 @@ func publicProbeCandidateAllowed(ip netip.Addr) bool {
 	if !publicProbeTailscaleCGNATPrefix.Contains(ip) && !publicProbeTailscaleULAPrefix.Contains(ip) {
 		return true
 	}
-	if os.Getenv("DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES") == "1" {
+	if os.Getenv("DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES") == "1" {
 		return false
 	}
-	return os.Getenv("DERPCAT_ENABLE_TAILSCALE_CANDIDATES") == "1"
+	return os.Getenv("DERPHOLE_ENABLE_TAILSCALE_CANDIDATES") == "1"
 }
 
 func publicProbeAddrs(ctx context.Context, conn net.PacketConn, dm *tailcfg.DERPMap, pm publicPortmap) []net.Addr {
@@ -2917,7 +2917,7 @@ func fakeTransportCandidatesBlocked() bool {
 	if !fakeTransportEnabled() {
 		return false
 	}
-	raw := os.Getenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT")
+	raw := os.Getenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT")
 	if raw == "" {
 		return false
 	}
@@ -2929,14 +2929,14 @@ func fakeTransportCandidatesBlocked() bool {
 }
 
 func fakeTransportEnabled() bool {
-	return os.Getenv("DERPCAT_FAKE_TRANSPORT") == "1"
+	return os.Getenv("DERPHOLE_FAKE_TRANSPORT") == "1"
 }
 
 func externalNativeQUICConnCount() int {
 	if fakeTransportEnabled() {
 		return 1
 	}
-	if raw := os.Getenv("DERPCAT_NATIVE_QUIC_CONNS"); raw != "" {
+	if raw := os.Getenv("DERPHOLE_NATIVE_QUIC_CONNS"); raw != "" {
 		count, err := strconv.Atoi(raw)
 		if err == nil && count > 0 {
 			return count

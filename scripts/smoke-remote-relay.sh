@@ -3,14 +3,14 @@ set -euo pipefail
 
 target="${1:?usage: $0 <host>}"
 tmp="$(mktemp -d)"
-remote_base="/tmp/derpcat-relay-smoke-$$"
-remote_upload="/tmp/derpcat-relay-bin-$$"
+remote_base="/tmp/derphole-relay-smoke-$$"
+remote_upload="/tmp/derphole-relay-bin-$$"
 local_listener_pid=""
-remote_user="${DERPCAT_REMOTE_USER:-root}"
+remote_user="${DERPHOLE_REMOTE_USER:-root}"
 remote_env=()
 
-if [[ "${DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES:-}" == "1" ]]; then
-  remote_env+=(DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1)
+if [[ "${DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES:-}" == "1" ]]; then
+  remote_env+=(DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1)
 fi
 
 remote() {
@@ -81,17 +81,17 @@ dump_remote_logs() {
 
 mise run build
 mise run build-linux-amd64
-scp dist/derpcat-linux-amd64 "${remote_user}@${target}:${remote_upload}" >/dev/null
-remote "install -m 0755 '${remote_upload}' /usr/local/bin/derpcat && rm -f '${remote_upload}' && /usr/local/bin/derpcat --help >/dev/null 2>&1"
+scp dist/derphole-linux-amd64 "${remote_user}@${target}:${remote_upload}" >/dev/null
+remote "install -m 0755 '${remote_upload}' /usr/local/bin/derphole && rm -f '${remote_upload}' && /usr/local/bin/derphole --help >/dev/null 2>&1"
 
 payload_local_to_remote="hello relay local-to-${target}-$(date +%s)"
-remote "rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err'; nohup /usr/local/bin/derpcat listen --force-relay >'${remote_base}.out' 2>'${remote_base}.err' </dev/null & echo \$! > '${remote_base}.pid'"
+remote "rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err'; nohup /usr/local/bin/derphole listen --force-relay >'${remote_base}.out' 2>'${remote_base}.err' </dev/null & echo \$! > '${remote_base}.pid'"
 remote_token="$(wait_for_remote_token)" || {
   echo "failed to capture remote listener token" >&2
   dump_remote_logs >&2
   exit 1
 }
-printf '%s' "${payload_local_to_remote}" | dist/derpcat send "${remote_token}" --force-relay >"${tmp}/local-sender.out" 2>"${tmp}/local-sender.err"
+printf '%s' "${payload_local_to_remote}" | dist/derphole send "${remote_token}" --force-relay >"${tmp}/local-sender.out" 2>"${tmp}/local-sender.err"
 wait_for_remote_exit || {
   echo "remote relay listener did not exit" >&2
   dump_remote_logs >&2
@@ -111,14 +111,14 @@ remote "grep -q 'connected-relay' '${remote_base}.err'"
 payload_remote_to_local="hello relay ${target}-to-local-$(date +%s)"
 local_listener_log="${tmp}/local-listener.err"
 local_listener_out="${tmp}/local-listener.out"
-dist/derpcat listen --force-relay >"${local_listener_out}" 2>"${local_listener_log}" &
+dist/derphole listen --force-relay >"${local_listener_out}" 2>"${local_listener_log}" &
 local_listener_pid=$!
 local_token="$(wait_for_local_token "${local_listener_log}")" || {
   echo "failed to capture local relay listener token" >&2
   sed -n '1,160p' "${local_listener_log}" >&2 || true
   exit 1
 }
-remote "printf '%s' '${payload_remote_to_local}' | /usr/local/bin/derpcat send '${local_token}' --force-relay >'${remote_base}.sender.out' 2>'${remote_base}.sender.err'"
+remote "printf '%s' '${payload_remote_to_local}' | /usr/local/bin/derphole send '${local_token}' --force-relay >'${remote_base}.sender.out' 2>'${remote_base}.sender.err'"
 wait_for_local_exit "${local_listener_pid}" || {
   echo "local relay listener did not exit" >&2
   sed -n '1,160p' "${local_listener_log}" >&2 || true

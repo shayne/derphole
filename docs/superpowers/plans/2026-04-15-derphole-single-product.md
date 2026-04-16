@@ -26,19 +26,19 @@
   - TCP service open wrapper.
 - Modify: `cmd/derphole/*_test.go`
   - Add CLI tests for migrated commands.
-- Delete: `cmd/derpcat/`
+- Delete: `cmd/derphole/`
   - Remove retired CLI after behavior is covered in `cmd/derphole`.
-- Move: `cmd/derpcat-probe/` to `cmd/derphole-probe/`
+- Move: `cmd/derphole-probe/` to `cmd/derphole-probe/`
   - Rename probe command and tests.
 - Modify: `go.mod`
   - Change module path to `github.com/shayne/derphole`.
 - Modify: all `.go` files
   - Rewrite internal imports to `github.com/shayne/derphole/...`.
 - Modify: `pkg/session`, `pkg/quicpath`, `pkg/transport`, `pkg/portmap`, `pkg/probe`, scripts, and tests
-  - Rename `DERPCAT_` variables and internal branded string constants to `DERPHOLE_` / `derphole`.
+  - Rename `DERPHOLE_` variables and internal branded string constants to `DERPHOLE_` / `derphole`.
 - Modify: `.mise.toml`, `.github/workflows/release.yml`, `tools/packaging/*.sh`, `packaging/npm/`, `scripts/release-package-smoke.sh`
   - Build and publish only `derphole`.
-- Delete: `packaging/npm/derpcat/`
+- Delete: `packaging/npm/derphole/`
   - Retire npm package template.
 - Modify: `README.md`, `AGENTS.md`, `docs/**/*.md`, `scripts/**/*.sh`, `web/derphole/*`
   - Remove retired product references and document the single-product command surface.
@@ -116,14 +116,14 @@ git commit -m "feat: move raw and share commands into derphole"
 ## Task 3: Remove retired CLI and rename the probe command
 
 **Files:**
-- Delete: `cmd/derpcat/`
-- Move: `cmd/derpcat-probe/` to `cmd/derphole-probe/`
+- Delete: `cmd/derphole/`
+- Move: `cmd/derphole-probe/` to `cmd/derphole-probe/`
 - Modify: `.mise.toml`
 - Modify: scripts that build or call the probe command
 
 - [ ] **Step 1: Remove retired CLI directory**
 
-Delete `cmd/derpcat` after `cmd/derphole` covers its features.
+Delete `cmd/derphole` after `cmd/derphole` covers its features.
 
 - [ ] **Step 2: Rename probe command directory and executable names**
 
@@ -151,7 +151,7 @@ git commit -m "refactor: remove retired cli entrypoints"
 **Files:**
 - Modify: `go.mod`
 - Modify: all Go source files
-- Modify: scripts and docs that reference `DERPCAT_`
+- Modify: scripts and docs that reference `DERPHOLE_`
 
 - [ ] **Step 1: Rewrite module path**
 
@@ -159,15 +159,15 @@ Change `go.mod` to `module github.com/shayne/derphole`.
 
 - [ ] **Step 2: Rewrite internal imports**
 
-Replace `github.com/shayne/derpcat` with `github.com/shayne/derphole` in Go files.
+Replace `github.com/shayne/derphole` with `github.com/shayne/derphole` in Go files.
 
 - [ ] **Step 3: Rename environment variables**
 
-Replace `DERPCAT_` with `DERPHOLE_` in Go code, tests, scripts, and docs.
+Replace `DERPHOLE_` with `DERPHOLE_` in Go code, tests, scripts, and docs.
 
 - [ ] **Step 4: Rename internal branded string constants**
 
-Replace internal `derpcat-` string constants with `derphole-` where used for filenames, probes, ALPN, temp files, and bus client names.
+Replace internal `derphole-` string constants with `derphole-` where used for filenames, probes, ALPN, temp files, and bus client names.
 
 - [ ] **Step 5: Verify core packages**
 
@@ -197,7 +197,7 @@ git commit -m "refactor: rename module and environment prefix"
 - Modify: `tools/packaging/build-release-assets.sh`
 - Modify: `tools/packaging/publish-npm-if-missing.sh`
 - Modify: `scripts/release-package-smoke.sh`
-- Delete: `packaging/npm/derpcat/`
+- Delete: `packaging/npm/derphole/`
 - Modify: `packaging/npm/derphole/package.json`
 - Modify: `packaging/npm/README.md`
 
@@ -221,7 +221,7 @@ Run:
 VERSION=v0.0.1 COMMIT=$(git rev-parse HEAD) BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) mise run release:build-all
 test -x dist/derphole
 test -f dist/npm-derphole/package.json
-test ! -e dist/npm-derpcat
+test ! -e dist/npm-derphole
 ```
 
 Expected: PASS.
@@ -259,7 +259,7 @@ Edit historical specs and plans so the retired product literal no longer appears
 Run:
 
 ```bash
-rg -i 'derpcat' -g '!dist'
+rg -i 'derphole' -g '!dist'
 ```
 
 Expected: no matches.
@@ -332,7 +332,7 @@ Expected: PASS.
 - [ ] **Step 4: Run scrub check**
 
 ```bash
-rg -i 'derpcat' -g '!dist'
+rg -i 'derphole' -g '!dist'
 ```
 
 Expected: no matches.

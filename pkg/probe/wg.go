@@ -16,7 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	wgtransport "github.com/shayne/derpcat/pkg/wg"
+	wgtransport "github.com/shayne/derphole/pkg/wg"
 )
 
 const defaultWireGuardProbePort = 7000
@@ -293,7 +293,7 @@ type zeroReader struct {
 }
 
 func probeWGTraceEnabled() bool {
-	return strings.TrimSpace(os.Getenv("DERPCAT_PROBE_WG_TRACE")) != ""
+	return strings.TrimSpace(os.Getenv("DERPHOLE_PROBE_WG_TRACE")) != ""
 }
 
 func probeWGTracef(format string, args ...any) {

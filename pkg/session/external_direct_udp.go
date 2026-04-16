@@ -20,13 +20,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/derpbind"
-	"github.com/shayne/derpcat/pkg/probe"
-	"github.com/shayne/derpcat/pkg/quicpath"
-	"github.com/shayne/derpcat/pkg/rendezvous"
-	"github.com/shayne/derpcat/pkg/telemetry"
-	"github.com/shayne/derpcat/pkg/token"
-	"github.com/shayne/derpcat/pkg/transport"
+	"github.com/shayne/derphole/pkg/derpbind"
+	"github.com/shayne/derphole/pkg/probe"
+	"github.com/shayne/derphole/pkg/quicpath"
+	"github.com/shayne/derphole/pkg/rendezvous"
+	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/token"
+	"github.com/shayne/derphole/pkg/transport"
 	"go4.org/mem"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -128,7 +128,7 @@ var externalDirectUDPReceiveRateProbesFn = externalDirectUDPReceiveRateProbes
 var externalDirectUDPConnsFn = externalDirectUDPConns
 var externalSendExternalHandoffDERPFn = sendExternalHandoffDERP
 var externalReceiveExternalHandoffDERPFn = receiveExternalHandoffDERP
-var externalDirectUDPPacketAEADDomain = []byte("derpcat-direct-udp-packet-aead-v1")
+var externalDirectUDPPacketAEADDomain = []byte("derphole-direct-udp-packet-aead-v1")
 var externalDirectUDPObservePunchAddrsByConn = probe.ObservePunchAddrsByConn
 
 type externalDirectUDPSendPlan struct {
@@ -4000,7 +4000,7 @@ func externalDirectUDPSpoolDiscardLanes(ctx context.Context, src io.Reader, lane
 	if chunkSize <= 0 {
 		chunkSize = externalDirectUDPChunkSize
 	}
-	file, err := os.CreateTemp("", "derpcat-discard-spool-*")
+	file, err := os.CreateTemp("", "derphole-discard-spool-*")
 	if err != nil {
 		return nil, err
 	}
@@ -4213,7 +4213,7 @@ func externalDirectUDPReceiveSectionTarget(dst io.Writer, totalBytes int64) (*os
 		}
 		return file, false, func() {}, nil
 	}
-	file, err := os.CreateTemp("", "derpcat-receive-spool-*")
+	file, err := os.CreateTemp("", "derphole-receive-spool-*")
 	if err != nil {
 		return nil, false, nil, err
 	}

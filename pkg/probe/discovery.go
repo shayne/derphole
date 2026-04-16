@@ -10,14 +10,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/derpbind"
-	"github.com/shayne/derpcat/pkg/traversal"
+	"github.com/shayne/derphole/pkg/derpbind"
+	"github.com/shayne/derphole/pkg/traversal"
 )
 
 const (
 	defaultDiscoveryTimeout = 750 * time.Millisecond
 	defaultPunchInterval    = 25 * time.Millisecond
-	defaultPunchPayload     = "derpcat-punch"
+	defaultPunchPayload     = "derphole-punch"
 	tailscaleV4Prefix       = "100.64.0.0/10"
 	tailscaleV6Prefix       = "fd7a:115c:a1e0::/48"
 )

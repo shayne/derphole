@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/probe"
-	"github.com/shayne/derpcat/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/probe"
+	"github.com/shayne/derphole/pkg/telemetry"
 )
 
 type externalTransferMetrics struct {

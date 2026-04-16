@@ -9,10 +9,10 @@ import (
 	"time"
 
 	quic "github.com/quic-go/quic-go"
-	"github.com/shayne/derpcat/pkg/derpbind"
-	"github.com/shayne/derpcat/pkg/quicpath"
-	"github.com/shayne/derpcat/pkg/rendezvous"
-	"github.com/shayne/derpcat/pkg/token"
+	"github.com/shayne/derphole/pkg/derpbind"
+	"github.com/shayne/derphole/pkg/quicpath"
+	"github.com/shayne/derphole/pkg/rendezvous"
+	"github.com/shayne/derphole/pkg/token"
 	"go4.org/mem"
 	"tailscale.com/types/key"
 )

@@ -35,7 +35,7 @@ Neither project provides a ready-made CLI WebRTC implementation for this reposit
 
 ## Non-Goals
 
-- Matching native derpcat UDP throughput from browser WebRTC. Browser DataChannel and SCTP overhead may cap below native UDP on multi-gigabit links.
+- Matching native derphole UDP throughput from browser WebRTC. Browser DataChannel and SCTP overhead may cap below native UDP on multi-gigabit links.
 - Replacing the native CLI-to-CLI direct UDP engine.
 - Implementing custom browser UDP, raw sockets, or non-standard browser APIs.
 - Adding user-required configuration for STUN, ICE, relay windows, or path selection.
@@ -165,5 +165,5 @@ Implementation should land in small commits:
 - Direct upgrade does not create a visible stall in the first five seconds.
 - Unknown-size streams remain bounded in memory.
 - Interrupting either side causes the other side to exit promptly with the correct success or failure status.
-- Existing CLI-to-CLI derpcat performance is not regressed.
+- Existing CLI-to-CLI derphole performance is not regressed.
 - CI passes, release packaging includes the browser demo assets, and GitHub Pages continues to deploy.

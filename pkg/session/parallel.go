@@ -33,7 +33,7 @@ type ParallelPolicy struct {
 }
 
 func DefaultParallelPolicy() ParallelPolicy {
-	if raw := os.Getenv("DERPCAT_NATIVE_QUIC_CONNS"); raw != "" {
+	if raw := os.Getenv("DERPHOLE_NATIVE_QUIC_CONNS"); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n >= 1 && n <= MaxParallelStripes {
 			return FixedParallelPolicy(n)
 		}

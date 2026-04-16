@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/probe"
+	"github.com/shayne/derphole/pkg/probe"
 	"github.com/shayne/yargs"
 )
 
@@ -210,7 +210,7 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 			waitStats, waitErr := probe.ReceiveBlastParallelToWriter(ctx, conns, io.Discard, probe.ReceiveConfig{
 				Blast:           true,
 				Transport:       transport,
-				RequireComplete: probeEnvBool("DERPCAT_PROBE_REQUIRE_COMPLETE"),
+				RequireComplete: probeEnvBool("DERPHOLE_PROBE_REQUIRE_COMPLETE"),
 			}, parsed.Flags.SizeBytes)
 			if waitErr != nil {
 				fmt.Fprintln(stderr, waitErr)

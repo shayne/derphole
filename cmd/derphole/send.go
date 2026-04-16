@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"io"
 
-	pkgderphole "github.com/shayne/derpcat/pkg/derphole"
-	"github.com/shayne/derpcat/pkg/session"
-	"github.com/shayne/derpcat/pkg/telemetry"
+	pkgderphole "github.com/shayne/derphole/pkg/derphole"
+	"github.com/shayne/derphole/pkg/session"
+	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/yargs"
 )
 
@@ -23,7 +23,7 @@ type sendArgs struct {
 var sendHelpConfig = yargs.HelpConfig{
 	Command: yargs.CommandInfo{
 		Name:        "derphole",
-		Description: "Send text, files, or directories with wormhole-shaped UX on top of derpcat transport.",
+		Description: "Send text, files, or directories with wormhole-shaped UX on top of derphole transport.",
 		Examples: []string{
 			"derphole send hello",
 			"derphole send ./photo.jpg",

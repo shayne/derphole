@@ -9,13 +9,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/token"
+	"github.com/shayne/derphole/pkg/token"
 )
 
 func TestListenAttachAndDialAttachExternalRoundTrip(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -95,8 +95,8 @@ func TestListenAttachAndDialAttachExternalRoundTrip(t *testing.T) {
 
 func TestListenAttachAndDialAttachExternalReverseRoundTrip(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -147,8 +147,8 @@ func TestListenAttachAndDialAttachExternalReverseRoundTrip(t *testing.T) {
 
 func TestListenAttachAndDialAttachExternalIsOneShot(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

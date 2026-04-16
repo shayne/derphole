@@ -17,15 +17,15 @@ func TestPromotionWrappersUseSharedDriver(t *testing.T) {
 		direction string
 	}{
 		{
-			name:      "derpcat forward",
+			name:      "derphole forward",
 			file:      "promotion-test.sh",
-			tool:      "derpcat",
+			tool:      "derphole",
 			direction: "forward",
 		},
 		{
-			name:      "derpcat reverse",
+			name:      "derphole reverse",
 			file:      "promotion-test-reverse.sh",
-			tool:      "derpcat",
+			tool:      "derphole",
 			direction: "reverse",
 		},
 		{
@@ -57,11 +57,11 @@ func TestPromotionWrappersUseSharedDriver(t *testing.T) {
 			if !strings.Contains(body, `promotion-benchmark-driver.sh`) {
 				t.Fatalf("%s does not invoke the shared benchmark driver", tc.file)
 			}
-			if !strings.Contains(body, `DERPCAT_BENCH_TOOL=`+tc.tool) {
-				t.Fatalf("%s does not declare DERPCAT_BENCH_TOOL=%s", tc.file, tc.tool)
+			if !strings.Contains(body, `DERPHOLE_BENCH_TOOL=`+tc.tool) {
+				t.Fatalf("%s does not declare DERPHOLE_BENCH_TOOL=%s", tc.file, tc.tool)
 			}
-			if !strings.Contains(body, `DERPCAT_BENCH_DIRECTION=`+tc.direction) {
-				t.Fatalf("%s does not declare DERPCAT_BENCH_DIRECTION=%s", tc.file, tc.direction)
+			if !strings.Contains(body, `DERPHOLE_BENCH_DIRECTION=`+tc.direction) {
+				t.Fatalf("%s does not declare DERPHOLE_BENCH_DIRECTION=%s", tc.file, tc.direction)
 			}
 		})
 	}

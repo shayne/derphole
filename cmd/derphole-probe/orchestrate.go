@@ -9,7 +9,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/shayne/derpcat/pkg/probe"
+	"github.com/shayne/derphole/pkg/probe"
 	"github.com/shayne/yargs"
 )
 

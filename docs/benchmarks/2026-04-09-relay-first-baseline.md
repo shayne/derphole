@@ -6,7 +6,7 @@ Baseline revision: `7138654 transport: stream direct UDP with bounded replay`
 
 Host pair: this Mac -> `ktzlxc`
 
-Guardrail: `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1`
+Guardrail: `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1`
 
 ## Baseline Finding
 
@@ -18,7 +18,7 @@ Command shape:
 
 ```sh
 dd if=/dev/zero bs="$size" count=1 |
-  DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./dist/derpcat --verbose send "$token"
+  DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./dist/derphole --verbose send "$token"
 ```
 
 Listener stdout was written to a remote temp file and byte-counted after the listener process exited.
@@ -40,7 +40,7 @@ Control measurement:
 Command:
 
 ```sh
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh ktzlxc 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh ktzlxc 1024
 ```
 
 Result:

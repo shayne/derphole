@@ -13,10 +13,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/derpbind"
-	"github.com/shayne/derpcat/pkg/derphole/webproto"
-	"github.com/shayne/derpcat/pkg/rendezvous"
-	"github.com/shayne/derpcat/pkg/token"
+	"github.com/shayne/derphole/pkg/derpbind"
+	"github.com/shayne/derphole/pkg/derphole/webproto"
+	"github.com/shayne/derphole/pkg/rendezvous"
+	"github.com/shayne/derphole/pkg/token"
 	"go4.org/mem"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -1318,14 +1318,14 @@ func firstDERPNode(dm *tailcfg.DERPMap, regionID int) *tailcfg.DERPNode {
 }
 
 func publicDERPMapURL() string {
-	if override := os.Getenv("DERPCAT_TEST_DERP_MAP_URL"); override != "" {
+	if override := os.Getenv("DERPHOLE_TEST_DERP_MAP_URL"); override != "" {
 		return override
 	}
 	return derpbind.PublicDERPMapURL
 }
 
 func publicDERPServerURL(node *tailcfg.DERPNode) string {
-	if override := os.Getenv("DERPCAT_TEST_DERP_SERVER_URL"); override != "" {
+	if override := os.Getenv("DERPHOLE_TEST_DERP_SERVER_URL"); override != "" {
 		return override
 	}
 	if node == nil {

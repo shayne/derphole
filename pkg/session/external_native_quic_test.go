@@ -13,8 +13,8 @@ import (
 	"time"
 
 	quic "github.com/quic-go/quic-go"
-	"github.com/shayne/derpcat/pkg/derpbind"
-	"github.com/shayne/derpcat/pkg/quicpath"
+	"github.com/shayne/derphole/pkg/derpbind"
+	"github.com/shayne/derphole/pkg/quicpath"
 	"tailscale.com/tailcfg"
 )
 

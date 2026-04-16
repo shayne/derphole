@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a second CLI, `derphole`, that delivers wormhole-shaped text/file/directory/SSH workflows on top of the existing derpcat transport stack, and ship both `derpcat` and `derphole` from the same release pipeline.
+**Goal:** Add a second CLI, `derphole`, that delivers wormhole-shaped text/file/directory/SSH workflows on top of the existing derphole transport stack, and ship both `derphole` and `derphole` from the same release pipeline.
 
-**Architecture:** Introduce a shared one-shot bidirectional attach primitive in `pkg/session`, then build a new `pkg/derphole` application layer and `cmd/derphole` CLI on top of it. Keep `derpcat` raw `listen` / `send` and `share` / `open` semantics intact, while refactoring packaging and release scripts so both products reuse the same vendored binaries, build metadata, and npm/release workflow.
+**Architecture:** Introduce a shared one-shot bidirectional attach primitive in `pkg/session`, then build a new `pkg/derphole` application layer and `cmd/derphole` CLI on top of it. Keep `derphole` raw `listen` / `send` and `share` / `open` semantics intact, while refactoring packaging and release scripts so both products reuse the same vendored binaries, build metadata, and npm/release workflow.
 
 **Tech Stack:** Go, `github.com/shayne/yargs`, existing `pkg/session` / `pkg/token` / `pkg/transport`, QUIC/DERP path code already in the repo, Go `archive/tar`, GitHub Actions, npm launcher packages, `mise`.
 
@@ -64,10 +64,10 @@
   - receive CLI tests
 - `cmd/derphole/ssh_test.go`
   - ssh CLI tests
-- `packaging/npm/derpcat/package.json`
-  - derpcat npm manifest
-- `packaging/npm/derpcat/bin/derpcat.js`
-  - derpcat launcher
+- `packaging/npm/derphole/package.json`
+  - derphole npm manifest
+- `packaging/npm/derphole/bin/derphole.js`
+  - derphole launcher
 - `packaging/npm/derphole/package.json`
   - derphole npm manifest
 - `packaging/npm/derphole/bin/derphole.js`
@@ -96,7 +96,7 @@
 - `.github/workflows/release.yml`
   - build, stage, and publish both products from one workflow
 - `README.md`
-  - explain `derpcat` vs `derphole`
+  - explain `derphole` vs `derphole`
 - `docs/releases/npm-bootstrap.md`
   - bootstrap both npm packages
 - `AGENTS.md`
@@ -325,8 +325,8 @@ git commit -m "feat: add local attach session primitive"
 // pkg/session/external_attach_test.go
 func TestListenAttachAndDialAttachExternalRoundTrip(t *testing.T) {
 	srv := newCommandTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -1501,8 +1501,8 @@ git commit -m "feat: add derphole ssh invite and accept"
 - Modify: `tools/packaging/build-release-assets.sh`
 - Modify: `scripts/release-package-smoke.sh`
 - Modify: `.github/workflows/release.yml`
-- Create: `packaging/npm/derpcat/package.json`
-- Create: `packaging/npm/derpcat/bin/derpcat.js`
+- Create: `packaging/npm/derphole/package.json`
+- Create: `packaging/npm/derphole/bin/derphole.js`
 - Create: `packaging/npm/derphole/package.json`
 - Create: `packaging/npm/derphole/bin/derphole.js`
 - Test: `.github/workflows/release.yml`
@@ -1539,14 +1539,14 @@ Expected: FAIL on missing `dist/raw/derphole-*` and `dist/npm-derphole`.
   "files": ["bin", "vendor", "README.md", "LICENSE"],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/shayne/derpcat.git"
+    "url": "git+https://github.com/shayne/derphole.git"
   }
 }
 ```
 
 ```bash
 # tools/packaging/build-npm.sh
-for product in derpcat derphole; do
+for product in derphole derphole; do
   src_dir="${ROOT_DIR}/packaging/npm/${product}"
   out_dir="${ROOT_DIR}/dist/npm-${product}"
   rm -rf "${out_dir}"
@@ -1565,7 +1565,7 @@ done
 [tasks.build]
 run = """
 mkdir -p dist
-go build -o dist/derpcat ./cmd/derpcat
+go build -o dist/derphole ./cmd/derphole
 go build -o dist/derphole ./cmd/derphole
 """
 ```
@@ -1578,14 +1578,14 @@ go build -o dist/derphole ./cmd/derphole
     strategy:
       matrix:
         include:
-          - product: derpcat
-            cmd: ./cmd/derpcat
           - product: derphole
             cmd: ./cmd/derphole
-          - product: derpcat
+          - product: derphole
+            cmd: ./cmd/derphole
+          - product: derphole
             goos: linux
             goarch: amd64
-            asset: derpcat-linux-amd64
+            asset: derphole-linux-amd64
           - product: derphole
             goos: linux
             goarch: amd64
@@ -1594,9 +1594,9 @@ go build -o dist/derphole ./cmd/derphole
   publish-packages-prod:
     steps:
       - run: bash ./tools/packaging/build-npm.sh
-      - run: node ./dist/npm-derpcat/bin/derpcat.js version
       - run: node ./dist/npm-derphole/bin/derphole.js version
-      - run: npm publish ./dist/npm-derpcat --access public --dry-run
+      - run: node ./dist/npm-derphole/bin/derphole.js version
+      - run: npm publish ./dist/npm-derphole --access public --dry-run
       - run: npm publish ./dist/npm-derphole --access public --dry-run
 ```
 
@@ -1606,9 +1606,9 @@ Run: `VERSION=v0.0.1 COMMIT=$(git rev-parse HEAD) BUILD_DATE=$(date -u +%Y-%m-%d
 
 Expected: PASS and creates:
 
-- `dist/raw/derpcat-linux-amd64`
 - `dist/raw/derphole-linux-amd64`
-- `dist/npm-derpcat`
+- `dist/raw/derphole-linux-amd64`
+- `dist/npm-derphole`
 - `dist/npm-derphole`
 
 Then run: `VERSION=v0.0.1 mise run release:npm-dry-run`
@@ -1618,8 +1618,8 @@ Expected: PASS with dry-run publish output for both packages.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add .mise.toml tools/packaging/build-vendor.sh tools/packaging/build-npm.sh tools/packaging/build-release-assets.sh scripts/release-package-smoke.sh .github/workflows/release.yml packaging/npm/derpcat packaging/npm/derphole
-git commit -m "build: release derpcat and derphole together"
+git add .mise.toml tools/packaging/build-vendor.sh tools/packaging/build-npm.sh tools/packaging/build-release-assets.sh scripts/release-package-smoke.sh .github/workflows/release.yml packaging/npm/derphole packaging/npm/derphole
+git commit -m "build: release derphole and derphole together"
 ```
 
 ## Task 10: Update docs and run final verification
@@ -1635,14 +1635,14 @@ git commit -m "build: release derpcat and derphole together"
 
 ```md
 <!-- README.md -->
-# derpcat
+# derphole
 
 This repository ships two CLIs:
 
-- `derpcat`: raw byte streams and temporary TCP service sharing
+- `derphole`: raw byte streams and temporary TCP service sharing
 - `derphole`: wormhole-shaped text/file/directory/SSH workflows on the same transport
 
-Use `derpcat` when you want low-level transport primitives.
+Use `derphole` when you want low-level transport primitives.
 Use `derphole` when you want a friendlier send/receive flow.
 ```
 
@@ -1653,14 +1653,14 @@ Use `derphole` when you want a friendlier send/receive flow.
 ```bash
 VERSION=v0.0.1 COMMIT=$(git rev-parse HEAD) BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) mise run release:build-all
 VERSION=v0.0.1 mise run release:npm-dry-run
-node ./dist/npm-derpcat/bin/derpcat.js version
+node ./dist/npm-derphole/bin/derphole.js version
 node ./dist/npm-derphole/bin/derphole.js version
 ```
 
 ## Publish
 
 ```bash
-npm publish ./dist/npm-derpcat --access public
+npm publish ./dist/npm-derphole --access public
 npm publish ./dist/npm-derphole --access public
 ```
 ```
@@ -1677,7 +1677,7 @@ Expected: PASS
 
 Run: `mise run build`
 
-Expected: PASS and produces `dist/derpcat` and `dist/derphole`
+Expected: PASS and produces `dist/derphole` and `dist/derphole`
 
 Run: `VERSION=v0.0.1 mise run release:npm-dry-run`
 

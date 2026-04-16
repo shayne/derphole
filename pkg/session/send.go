@@ -6,7 +6,7 @@ import (
 	"io"
 	"net"
 
-	"github.com/shayne/derpcat/pkg/traversal"
+	"github.com/shayne/derphole/pkg/traversal"
 )
 
 var ErrUnknownSession = errors.New("unknown session")

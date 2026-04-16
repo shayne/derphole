@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-tool="${DERPCAT_BENCH_TOOL:?DERPCAT_BENCH_TOOL is required}"
-direction="${DERPCAT_BENCH_DIRECTION:?DERPCAT_BENCH_DIRECTION is required}"
+tool="${DERPHOLE_BENCH_TOOL:?DERPHOLE_BENCH_TOOL is required}"
+direction="${DERPHOLE_BENCH_DIRECTION:?DERPHOLE_BENCH_DIRECTION is required}"
 
 target="${1:?usage: $0 <target> [size-mib]}"
 size_mib="${2:-1024}"
@@ -18,10 +18,10 @@ remote_base="/tmp/${tool}-promotion${remote_suffix}-$$"
 remote_upload="/tmp/${tool}-promotion${remote_suffix}-bin-$$"
 remote_target="${target}"
 if [[ "${target}" != *"@"* ]]; then
-  remote_user="${DERPCAT_REMOTE_USER:-root}"
+  remote_user="${DERPHOLE_REMOTE_USER:-root}"
   remote_target="${remote_user}@${target}"
 fi
-requested_remote_bin_dir="${DERPCAT_REMOTE_BIN_DIR:-/usr/local/bin}"
+requested_remote_bin_dir="${DERPHOLE_REMOTE_BIN_DIR:-/usr/local/bin}"
 remote_bin_dir="${requested_remote_bin_dir}"
 remote_bin="${remote_bin_dir%/}/${tool}"
 local_bin="./dist/${tool}"
@@ -36,26 +36,26 @@ remote_env=()
 parallel_args=()
 parallel_args_remote=""
 
-if [[ "${DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES:-}" == "1" ]]; then
-  remote_env+=(DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1)
+if [[ "${DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES:-}" == "1" ]]; then
+  remote_env+=(DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1)
 fi
-if [[ "${DERPCAT_ENABLE_TAILSCALE_CANDIDATES:-}" == "1" ]]; then
-  remote_env+=(DERPCAT_ENABLE_TAILSCALE_CANDIDATES=1)
+if [[ "${DERPHOLE_ENABLE_TAILSCALE_CANDIDATES:-}" == "1" ]]; then
+  remote_env+=(DERPHOLE_ENABLE_TAILSCALE_CANDIDATES=1)
 fi
-if [[ -n "${DERPCAT_NATIVE_QUIC_CONNS:-}" ]]; then
-  remote_env+=(DERPCAT_NATIVE_QUIC_CONNS="${DERPCAT_NATIVE_QUIC_CONNS}")
+if [[ -n "${DERPHOLE_NATIVE_QUIC_CONNS:-}" ]]; then
+  remote_env+=(DERPHOLE_NATIVE_QUIC_CONNS="${DERPHOLE_NATIVE_QUIC_CONNS}")
 fi
-if [[ -n "${DERPCAT_NATIVE_TCP_CONNS:-}" ]]; then
-  remote_env+=(DERPCAT_NATIVE_TCP_CONNS="${DERPCAT_NATIVE_TCP_CONNS}")
+if [[ -n "${DERPHOLE_NATIVE_TCP_CONNS:-}" ]]; then
+  remote_env+=(DERPHOLE_NATIVE_TCP_CONNS="${DERPHOLE_NATIVE_TCP_CONNS}")
 fi
-if [[ "${DERPCAT_TRACE_HANDOFF:-}" == "1" ]]; then
-  remote_env+=(DERPCAT_TRACE_HANDOFF=1)
+if [[ "${DERPHOLE_TRACE_HANDOFF:-}" == "1" ]]; then
+  remote_env+=(DERPHOLE_TRACE_HANDOFF=1)
 fi
-if [[ "${DERPCAT_PROBE_TRACE:-}" == "1" ]]; then
-  remote_env+=(DERPCAT_PROBE_TRACE=1)
+if [[ "${DERPHOLE_PROBE_TRACE:-}" == "1" ]]; then
+  remote_env+=(DERPHOLE_PROBE_TRACE=1)
 fi
-if [[ "${tool}" == "derpcat" && -n "${DERPCAT_PARALLEL_ARGS:-}" ]]; then
-  read -r -a parallel_args <<<"${DERPCAT_PARALLEL_ARGS}"
+if [[ "${tool}" == "derphole" && -n "${DERPHOLE_PARALLEL_ARGS:-}" ]]; then
+  read -r -a parallel_args <<<"${DERPHOLE_PARALLEL_ARGS}"
   parallel_args_remote="${parallel_args[*]-}"
 fi
 
@@ -182,7 +182,7 @@ require_direct_blast_log() {
 }
 
 preserve_logs() {
-  local log_dir="${DERPCAT_BENCH_LOG_DIR:-}"
+  local log_dir="${DERPHOLE_BENCH_LOG_DIR:-}"
   if [[ -z "${log_dir}" ]]; then
     return 0
   fi
@@ -281,7 +281,7 @@ build_and_install_remote_binary() {
   if install_remote_bin "${remote_bin_dir}"; then
     return 0
   fi
-  if [[ -n "${DERPCAT_REMOTE_BIN_DIR:-}" ]]; then
+  if [[ -n "${DERPHOLE_REMOTE_BIN_DIR:-}" ]]; then
     exit 1
   fi
   local installed_fallback=0
@@ -300,7 +300,7 @@ build_and_install_remote_binary() {
   fi
 }
 
-run_forward_derpcat() {
+run_forward_derphole() {
   echo "generating ${size_mib} MiB random payload"
   dd if=/dev/urandom of="${payload}" bs=1048576 count="${size_mib}" 2>/dev/null
   source_sha="$(shasum -a 256 "${payload}" | awk '{print $1}')"
@@ -333,7 +333,7 @@ run_forward_derpcat() {
   sink_size="$(remote "wc -c < '${remote_base}.out'")"
 }
 
-run_reverse_derpcat() {
+run_reverse_derphole() {
   echo "generating ${size_mib} MiB random payload on ${target}"
   remote "dd if=/dev/urandom of='${remote_base}.payload' bs=1048576 count='${size_mib}' 2>/dev/null"
   source_sha="$(remote "sha256sum '${remote_base}.payload' | awk '{print \$1}'")"
@@ -509,11 +509,11 @@ finalize_run() {
 build_and_install_remote_binary
 
 case "${tool}:${direction}" in
-  derpcat:forward)
-    run_forward_derpcat
+  derphole:forward)
+    run_forward_derphole
     ;;
-  derpcat:reverse)
-    run_reverse_derpcat
+  derphole:reverse)
+    run_reverse_derphole
     ;;
   derphole:forward)
     run_forward_derphole

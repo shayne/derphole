@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	wgtransport "github.com/shayne/derpcat/pkg/wg"
+	wgtransport "github.com/shayne/derphole/pkg/wg"
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun"
 )
@@ -203,7 +203,7 @@ func newWireGuardOSNode(conn net.PacketConn, cfg WireGuardConfig) (*wireGuardOSN
 		Transport:      cfg.Transport,
 		DirectEndpoint: strings.TrimSpace(cfg.DirectEndpoint),
 	})
-	dev := device.NewDevice(tunDev, bind, device.NewLogger(device.LogLevelSilent, "derpcat-probe: "))
+	dev := device.NewDevice(tunDev, bind, device.NewLogger(device.LogLevelSilent, "derphole-probe: "))
 	if err := dev.IpcSet(wireGuardUAPI(resolved, strings.TrimSpace(cfg.DirectEndpoint))); err != nil {
 		dev.Close()
 		tunDev.Close()

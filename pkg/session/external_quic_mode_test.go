@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/derpbind"
-	"github.com/shayne/derpcat/pkg/transport"
+	"github.com/shayne/derphole/pkg/derpbind"
+	"github.com/shayne/derphole/pkg/transport"
 )
 
 func TestRequestExternalQUICModeSendsRequestBeforeLocalDirectIsReady(t *testing.T) {
@@ -68,7 +68,7 @@ func TestRequestExternalQUICModeSendsRequestBeforeLocalDirectIsReady(t *testing.
 				}
 				continue
 			}
-			_, _ = peerPacketConn.WriteTo([]byte("derpcat-ack"), addr)
+			_, _ = peerPacketConn.WriteTo([]byte("derphole-ack"), addr)
 		}
 	}()
 
@@ -584,7 +584,7 @@ func TestExternalQUICModeNegotiationUsesListenerResponseAddrWithoutSplitBrain(t 
 				}
 				continue
 			}
-			_, _ = peerPacketConn.WriteTo([]byte("derpcat-ack"), addr)
+			_, _ = peerPacketConn.WriteTo([]byte("derphole-ack"), addr)
 		}
 	}()
 
@@ -654,7 +654,7 @@ func TestExternalQUICModeNegotiationUsesListenerResponseAddrWithoutSplitBrain(t 
 }
 
 func TestExternalQUICModeNegotiationUsesRouteLocalNativeTCPBeforeUDPDirectPromotion(t *testing.T) {
-	t.Setenv("DERPCAT_NATIVE_TCP_CONNS", "1")
+	t.Setenv("DERPHOLE_NATIVE_TCP_CONNS", "1")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

@@ -17,7 +17,7 @@ import (
 )
 
 func TestRemoteCommandIncludesProbeBinaryAndServerMode(t *testing.T) {
-	runner := SSHRunner{User: "root", Host: "ktzlxc", RemotePath: "/tmp/derpcat-probe"}
+	runner := SSHRunner{User: "root", Host: "ktzlxc", RemotePath: "/tmp/derphole-probe"}
 	cmd := runner.ServerCommand(ServerConfig{ListenAddr: ":0", Mode: "raw", Transport: "batched"})
 
 	if got, want := cmd[0], "ssh"; got != want {
@@ -26,7 +26,7 @@ func TestRemoteCommandIncludesProbeBinaryAndServerMode(t *testing.T) {
 
 	found := false
 	for _, part := range cmd {
-		if part == "/tmp/derpcat-probe" {
+		if part == "/tmp/derphole-probe" {
 			found = true
 			break
 		}
@@ -40,7 +40,7 @@ func TestRemoteCommandIncludesProbeBinaryAndServerMode(t *testing.T) {
 }
 
 func TestRemoteClientCommandIncludesProbeBinaryAndPeerCandidates(t *testing.T) {
-	runner := SSHRunner{User: "root", Host: "ktzlxc", RemotePath: "/tmp/derpcat-probe"}
+	runner := SSHRunner{User: "root", Host: "ktzlxc", RemotePath: "/tmp/derphole-probe"}
 	cmd := runner.ClientCommand(ClientConfig{
 		Mode:              "blast",
 		Transport:         "batched",
@@ -52,13 +52,13 @@ func TestRemoteClientCommandIncludesProbeBinaryAndPeerCandidates(t *testing.T) {
 		t.Fatalf("cmd[0] = %q, want %q", got, want)
 	}
 	joined := strings.Join(cmd, " ")
-	if !strings.Contains(joined, "/tmp/derpcat-probe client --mode blast --transport batched --size-bytes 1024 --peer-candidates 198.51.100.10:40000,203.0.113.10:50000") {
+	if !strings.Contains(joined, "/tmp/derphole-probe client --mode blast --transport batched --size-bytes 1024 --peer-candidates 198.51.100.10:40000,203.0.113.10:50000") {
 		t.Fatalf("client command missing expected remote invocation: %#v", cmd)
 	}
 }
 
 func TestRemoteClientCommandIncludesRawParallel(t *testing.T) {
-	runner := SSHRunner{User: "root", Host: "ktzlxc", RemotePath: "/tmp/derpcat-probe"}
+	runner := SSHRunner{User: "root", Host: "ktzlxc", RemotePath: "/tmp/derphole-probe"}
 	cmd := runner.ClientCommand(ClientConfig{
 		Mode:      "raw",
 		Transport: "batched",
@@ -68,13 +68,13 @@ func TestRemoteClientCommandIncludesRawParallel(t *testing.T) {
 	})
 
 	joined := strings.Join(cmd, " ")
-	if !strings.Contains(joined, "/tmp/derpcat-probe client --mode raw --transport batched --size-bytes 1024 --host 198.51.100.10:40000 --parallel 4") {
+	if !strings.Contains(joined, "/tmp/derphole-probe client --mode raw --transport batched --size-bytes 1024 --host 198.51.100.10:40000 --parallel 4") {
 		t.Fatalf("client command missing raw parallel: %#v", cmd)
 	}
 }
 
 func TestRemoteCommandsIncludeBlastParallel(t *testing.T) {
-	runner := SSHRunner{User: "root", Host: "ktzlxc", RemotePath: "/tmp/derpcat-probe"}
+	runner := SSHRunner{User: "root", Host: "ktzlxc", RemotePath: "/tmp/derphole-probe"}
 
 	serverCmd := strings.Join(runner.ServerCommand(ServerConfig{
 		ListenAddr: ":0",
@@ -83,7 +83,7 @@ func TestRemoteCommandsIncludeBlastParallel(t *testing.T) {
 		SizeBytes:  1024,
 		Parallel:   4,
 	}), " ")
-	if !strings.Contains(serverCmd, "/tmp/derpcat-probe server --listen :0 --mode blast --transport batched --size-bytes 1024 --parallel 4") {
+	if !strings.Contains(serverCmd, "/tmp/derphole-probe server --listen :0 --mode blast --transport batched --size-bytes 1024 --parallel 4") {
 		t.Fatalf("server command missing blast parallel: %s", serverCmd)
 	}
 
@@ -94,13 +94,13 @@ func TestRemoteCommandsIncludeBlastParallel(t *testing.T) {
 		PeerCandidatesCSV: "198.51.100.10:40000,203.0.113.10:50000",
 		Parallel:          4,
 	}), " ")
-	if !strings.Contains(clientCmd, "/tmp/derpcat-probe client --mode blast --transport batched --size-bytes 1024 --peer-candidates 198.51.100.10:40000,203.0.113.10:50000 --parallel 4") {
+	if !strings.Contains(clientCmd, "/tmp/derphole-probe client --mode blast --transport batched --size-bytes 1024 --peer-candidates 198.51.100.10:40000,203.0.113.10:50000 --parallel 4") {
 		t.Fatalf("client command missing blast parallel: %s", clientCmd)
 	}
 }
 
 func TestRemoteServerCommandIncludesWireGuardArgs(t *testing.T) {
-	runner := SSHRunner{User: "root", Host: "ktzlxc", RemotePath: "/tmp/derpcat-probe"}
+	runner := SSHRunner{User: "root", Host: "ktzlxc", RemotePath: "/tmp/derphole-probe"}
 	cmd := runner.ServerCommand(ServerConfig{
 		ListenAddr:        ":0",
 		Mode:              "wg",
@@ -116,7 +116,7 @@ func TestRemoteServerCommandIncludesWireGuardArgs(t *testing.T) {
 
 	joined := strings.Join(cmd, " ")
 	for _, want := range []string{
-		"/tmp/derpcat-probe",
+		"/tmp/derphole-probe",
 		"server",
 		"--listen :0",
 		"--mode wg",
@@ -136,7 +136,7 @@ func TestRemoteServerCommandIncludesWireGuardArgs(t *testing.T) {
 }
 
 func TestRemoteClientCommandIncludesWireGuardArgs(t *testing.T) {
-	runner := SSHRunner{User: "root", Host: "ktzlxc", RemotePath: "/tmp/derpcat-probe"}
+	runner := SSHRunner{User: "root", Host: "ktzlxc", RemotePath: "/tmp/derphole-probe"}
 	cmd := runner.ClientCommand(ClientConfig{
 		Mode:              "wg",
 		Transport:         "legacy",
@@ -152,7 +152,7 @@ func TestRemoteClientCommandIncludesWireGuardArgs(t *testing.T) {
 
 	joined := strings.Join(cmd, " ")
 	for _, want := range []string{
-		"/tmp/derpcat-probe",
+		"/tmp/derphole-probe",
 		"client",
 		"--mode wg",
 		"--transport legacy",
@@ -268,7 +268,7 @@ func TestRunOrchestrateForwardTransfersAndReportsDirect(t *testing.T) {
 	if report.Local.Kind != "legacy" || report.Remote.Kind != "batched" {
 		t.Fatalf("transport report = %#v", report)
 	}
-	if len(gotArgv) < 7 || gotArgv[0] != "ssh" || !strings.Contains(strings.Join(gotArgv, " "), "BatchMode=yes") || !strings.Contains(strings.Join(gotArgv, " "), "ConnectTimeout=5") || !strings.Contains(strings.Join(gotArgv, " "), "/tmp/derpcat-probe server --listen :0 --mode raw --transport batched") || !strings.Contains(strings.Join(gotArgv, " "), "--peer-candidates 198.51.100.10:40000") {
+	if len(gotArgv) < 7 || gotArgv[0] != "ssh" || !strings.Contains(strings.Join(gotArgv, " "), "BatchMode=yes") || !strings.Contains(strings.Join(gotArgv, " "), "ConnectTimeout=5") || !strings.Contains(strings.Join(gotArgv, " "), "/tmp/derphole-probe server --listen :0 --mode raw --transport batched") || !strings.Contains(strings.Join(gotArgv, " "), "--peer-candidates 198.51.100.10:40000") {
 		t.Fatalf("RunOrchestrate() argv = %#v", gotArgv)
 	}
 }
@@ -464,8 +464,8 @@ func TestRunOrchestrateWgiperfReportsSuccessWithoutMeasuredFirstByte(t *testing.
 }
 
 func TestRunOrchestrateForwardBlastPassesRateToSingleSession(t *testing.T) {
-	t.Setenv("DERPCAT_PROBE_RATE_MBPS", "1200")
-	t.Setenv("DERPCAT_PROBE_REPAIR_PAYLOADS", "1")
+	t.Setenv("DERPHOLE_PROBE_RATE_MBPS", "1200")
+	t.Setenv("DERPHOLE_PROBE_REPAIR_PAYLOADS", "1")
 
 	oldListenPacket := listenPacket
 	oldDiscoverCandidates := orchestrateDiscoverCandidates
@@ -530,7 +530,7 @@ func TestRunOrchestrateForwardBlastPassesRateToSingleSession(t *testing.T) {
 }
 
 func TestRunOrchestrateForwardBlastParallelPrefersRemoteDoneFirstByte(t *testing.T) {
-	t.Setenv("DERPCAT_PROBE_RATE_MBPS", "1200")
+	t.Setenv("DERPHOLE_PROBE_RATE_MBPS", "1200")
 
 	cases := []struct {
 		name         string
@@ -768,7 +768,7 @@ func TestRunOrchestrateReverseTransfersAndReportsDirect(t *testing.T) {
 		t.Fatalf("transport report = %#v", report)
 	}
 	joined := strings.Join(gotArgv, " ")
-	if !strings.Contains(joined, "/tmp/derpcat-probe client --mode raw --transport batched --size-bytes 1024 --peer-candidates 198.51.100.10:40000") {
+	if !strings.Contains(joined, "/tmp/derphole-probe client --mode raw --transport batched --size-bytes 1024 --peer-candidates 198.51.100.10:40000") {
 		t.Fatalf("RunOrchestrate() argv = %#v", gotArgv)
 	}
 	if strings.Contains(joined, "--parallel") {
@@ -829,7 +829,7 @@ func TestRunOrchestrateReverseFailsOnShortReceive(t *testing.T) {
 }
 
 func TestRunOrchestrateReverseBlastSingleUsesExpectedReceiver(t *testing.T) {
-	t.Setenv("DERPCAT_PROBE_REQUIRE_COMPLETE", "1")
+	t.Setenv("DERPHOLE_PROBE_REQUIRE_COMPLETE", "1")
 
 	oldListenPacket := listenPacket
 	oldDiscoverCandidates := orchestrateDiscoverCandidates
@@ -1172,7 +1172,7 @@ func TestRunCommandIncludesCombinedOutputOnFailure(t *testing.T) {
 }
 
 func TestProbeSendTuningDefaultsAndOverrides(t *testing.T) {
-	for _, key := range []string{"DERPCAT_PROBE_WINDOW", "DERPCAT_PROBE_WINDOW_SIZE", "DERPCAT_PROBE_CHUNK_SIZE"} {
+	for _, key := range []string{"DERPHOLE_PROBE_WINDOW", "DERPHOLE_PROBE_WINDOW_SIZE", "DERPHOLE_PROBE_CHUNK_SIZE"} {
 		old := os.Getenv(key)
 		defer func(k, v string) {
 			if v == "" {
@@ -1197,14 +1197,14 @@ func TestProbeSendTuningDefaultsAndOverrides(t *testing.T) {
 		t.Fatalf("probeChunkSize() = %d, want %d", got, defaultChunkSize)
 	}
 
-	_ = os.Setenv("DERPCAT_PROBE_WINDOW_SIZE", strconv.Itoa(256))
-	_ = os.Setenv("DERPCAT_PROBE_CHUNK_SIZE", strconv.Itoa(1300))
+	_ = os.Setenv("DERPHOLE_PROBE_WINDOW_SIZE", strconv.Itoa(256))
+	_ = os.Setenv("DERPHOLE_PROBE_CHUNK_SIZE", strconv.Itoa(1300))
 
 	if got := probeWindowSize("raw", probeTransportBatched); got != 256 {
 		t.Fatalf("probeWindowSize(raw, batched) override = %d, want 256", got)
 	}
-	_ = os.Unsetenv("DERPCAT_PROBE_WINDOW_SIZE")
-	_ = os.Setenv("DERPCAT_PROBE_WINDOW", strconv.Itoa(320))
+	_ = os.Unsetenv("DERPHOLE_PROBE_WINDOW_SIZE")
+	_ = os.Setenv("DERPHOLE_PROBE_WINDOW", strconv.Itoa(320))
 	if got := probeWindowSize("raw", probeTransportBatched); got != 320 {
 		t.Fatalf("probeWindowSize(raw, batched) legacy override = %d, want 320", got)
 	}
@@ -1371,7 +1371,7 @@ func TestRunOrchestratePassesRawParallelToSingleSession(t *testing.T) {
 }
 
 func TestRunOrchestratePassesBlastParallelToSingleSession(t *testing.T) {
-	t.Setenv("DERPCAT_PROBE_RATE_MBPS", "2000")
+	t.Setenv("DERPHOLE_PROBE_RATE_MBPS", "2000")
 
 	oldChild := orchestrateChildRun
 	oldLaunchRemoteServer := launchRemoteServer

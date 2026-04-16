@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/telemetry"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/portmapper"
 	"tailscale.com/net/portmapper/portmappertype"

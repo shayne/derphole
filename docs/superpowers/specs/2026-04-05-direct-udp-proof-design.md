@@ -2,19 +2,19 @@
 
 ## Summary
 
-Build a standalone experimental probe that tests whether a simpler direct UDP data plane can materially outperform derpcat's current no-Tailscale QUIC path on the public Internet. The probe is not a production transport. Its job is to establish evidence. If the probe wins, it becomes the basis for a later derpcat refactor. If it does not, we stop before spending time on the wrong transport rewrite.
+Build a standalone experimental probe that tests whether a simpler direct UDP data plane can materially outperform derphole's current no-Tailscale QUIC path on the public Internet. The probe is not a production transport. Its job is to establish evidence. If the probe wins, it becomes the basis for a later derphole refactor. If it does not, we stop before spending time on the wrong transport rewrite.
 
 This work is intentionally split into two phases:
 
 1. Phase 1: prove the path and the technique with a standalone experimental probe.
-2. Phase 2: only if phase 1 wins, integrate the winning technique into derpcat while keeping derpcat's session model, control plane, and security guarantees.
+2. Phase 2: only if phase 1 wins, integrate the winning technique into derphole while keeping derphole's session model, control plane, and security guarantees.
 
 ## Goals
 
-- Prove whether a simpler direct UDP transport can beat derpcat's current direct QUIC path.
+- Prove whether a simpler direct UDP transport can beat derphole's current direct QUIC path.
 - Keep the proof apples-to-apples against existing baselines:
   - Tailscale `iperf3`
-  - derpcat with `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1`
+  - derphole with `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1`
   - new probe, also not over Tailscale
 - Benchmark all required hosts:
   - `ktzlxc`
@@ -30,14 +30,14 @@ This work is intentionally split into two phases:
 
 ## Non-Goals
 
-- Replacing derpcat's production transport in this phase.
+- Replacing derphole's production transport in this phase.
 - Building a full WireGuard replacement or a generic magicsock clone.
 - Solving reliable public-Internet direct TCP traversal. TCP probing may exist for diagnostics, but it is not the main plan.
-- Matching every derpcat feature in the probe. The probe only needs enough machinery to answer the throughput question.
+- Matching every derphole feature in the probe. The probe only needs enough machinery to answer the throughput question.
 
 ## Context
 
-derpcat's current public direct fast path is QUIC over UDP, with DERP used for rendezvous, relay fallback, and control. Native TCP exists as a fast path when both sides already have a mutually usable TCP route, but it is not a general TCP NAT traversal system.
+derphole's current public direct fast path is QUIC over UDP, with DERP used for rendezvous, relay fallback, and control. Native TCP exists as a fast path when both sides already have a mutually usable TCP route, but it is not a general TCP NAT traversal system.
 
 The current benchmark picture is mixed:
 
@@ -56,17 +56,17 @@ Use a separate binary that coordinates both sides over SSH, exchanges public end
 Pros:
 
 - Fastest path to evidence.
-- Minimal coupling to existing derpcat code.
-- Easy to compare raw path ceiling versus derpcat and Tailscale.
+- Minimal coupling to existing derphole code.
+- Easy to compare raw path ceiling versus derphole and Tailscale.
 
 Cons:
 
-- Lower fidelity to derpcat's production control plane.
+- Lower fidelity to derphole's production control plane.
 - Some code may be discarded if the experiment fails.
 
-### Approach 2: Experimental derpcat data plane behind existing rendezvous/control
+### Approach 2: Experimental derphole data plane behind existing rendezvous/control
 
-Reuse derpcat token flow, DERP control, and candidate exchange, but replace only the direct data plane with an experimental UDP transport.
+Reuse derphole token flow, DERP control, and candidate exchange, but replace only the direct data plane with an experimental UDP transport.
 
 Pros:
 
@@ -80,7 +80,7 @@ Cons:
 
 ### Approach 3: Full production refactor immediately
 
-Refactor derpcat's direct transport now and test as we go.
+Refactor derphole's direct transport now and test as we go.
 
 Pros:
 
@@ -96,13 +96,13 @@ Cons:
 
 Use approach 1 first, then approach 2 only if the results justify it.
 
-The standalone probe should be intentionally small and brutally empirical. Its purpose is to answer one question: does a simpler direct UDP data plane materially outperform derpcat's current direct QUIC path on the same host pairs and payload sizes? If the answer is yes, phase 2 ports the winning ideas into derpcat. If the answer is no, the refactor stops there.
+The standalone probe should be intentionally small and brutally empirical. Its purpose is to answer one question: does a simpler direct UDP data plane materially outperform derphole's current direct QUIC path on the same host pairs and payload sizes? If the answer is yes, phase 2 ports the winning ideas into derphole. If the answer is no, the refactor stops there.
 
 ## Phase 1 Architecture
 
 ### Binary Layout
 
-Add a standalone debug binary under `cmd/derpcat-probe/` with three modes:
+Add a standalone debug binary under `cmd/derphole-probe/` with three modes:
 
 - `server`
 - `client`
@@ -110,7 +110,7 @@ Add a standalone debug binary under `cmd/derpcat-probe/` with three modes:
 
 `orchestrate` runs on the Mac and drives the entire proof workflow. It may SSH into the remote host to deploy or invoke the same binary, start the remote side, exchange endpoint information, trigger simultaneous punching, run benchmark iterations, and collect results.
 
-This is intentionally separate from the main `cmd/derpcat/` CLI so the experiment can change rapidly without destabilizing user-facing behavior.
+This is intentionally separate from the main `cmd/derphole/` CLI so the experiment can change rapidly without destabilizing user-facing behavior.
 
 ### Control Path
 
@@ -124,7 +124,7 @@ The orchestrator will:
 4. Trigger a simultaneous punch loop on both sides.
 5. Once direct packets are flowing, start a unidirectional or bidirectional throughput test.
 
-This phase does not need to reuse derpcat tokens or DERP control messages yet.
+This phase does not need to reuse derphole tokens or DERP control messages yet.
 
 ### Data Plane
 
@@ -177,7 +177,7 @@ Reasoning:
 - encrypted mode shows whether a minimal secure transport stays near the raw result
 - if encrypted mode collapses performance, that matters for phase 2
 
-The probe does not need derpcat-grade session semantics in phase 1, but it must still reject unrelated traffic and avoid accepting arbitrary packets from the Internet.
+The probe does not need derphole-grade session semantics in phase 1, but it must still reject unrelated traffic and avoid accepting arbitrary packets from the Internet.
 
 ### Optional TCP Diagnostic
 
@@ -209,8 +209,8 @@ For each host pair, collect:
    - both directions
    - 3 runs per direction
 
-2. Current derpcat baseline
-   - `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1`
+2. Current derphole baseline
+   - `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1`
    - current default settings
    - `--parallel=auto`
    - optional fixed `--parallel=8` where useful for context
@@ -221,7 +221,7 @@ For each host pair, collect:
 
 ### Size Matrix
 
-For derpcat and the new probe:
+For derphole and the new probe:
 
 - `10KB`
 - `1MB`
@@ -253,9 +253,9 @@ Store results in:
 
 ## Decision Gates
 
-### Gate A: Does the raw probe beat current derpcat on `ktzlxc`?
+### Gate A: Does the raw probe beat current derphole on `ktzlxc`?
 
-If the raw direct UDP probe does not materially beat current derpcat on `ktzlxc`, stop. That means QUIC is probably not the main bottleneck, and a production refactor is not justified yet.
+If the raw direct UDP probe does not materially beat current derphole on `ktzlxc`, stop. That means QUIC is probably not the main bottleneck, and a production refactor is not justified yet.
 
 ### Gate B: Do the slower hosts show the same effect?
 
@@ -275,11 +275,11 @@ Only after these gates pass should phase 2 begin.
 
 If phase 1 succeeds, phase 2 should not be a blind rewrite. It should:
 
-- keep derpcat's session model
+- keep derphole's session model
 - keep DERP rendezvous and relay fallback
 - keep the current no-Tailscale validation discipline
 - replace only the direct data plane for the relevant session types
-- preserve derpcat's security model with proper session authentication and peer binding
+- preserve derphole's security model with proper session authentication and peer binding
 
 The expected shape is:
 
@@ -299,13 +299,13 @@ The expected shape is:
 Before phase 2 begins, the proof must show:
 
 - a direct path is consistently established without Tailscale candidates
-- the new probe beats current derpcat on `ktzlxc` for large transfers
+- the new probe beats current derphole on `ktzlxc` for large transfers
 - the performance picture on `canlxc` and `uklxc` is explained by evidence, not guesswork
 - encrypted mode remains close enough to raw mode to be worth productizing
 
 ## Open Questions Resolved
 
-- The proof tool will be separate from the current derpcat CLI.
+- The proof tool will be separate from the current derphole CLI.
 - Phase 1 may use SSH control because it is faster to build and sufficient to answer the question.
 - The first target is evidence, not production completeness.
-- The benchmark comparison must include all three hosts and must not use Tailscale candidates for derpcat or the new probe.
+- The benchmark comparison must include all three hosts and must not use Tailscale candidates for derphole or the new probe.

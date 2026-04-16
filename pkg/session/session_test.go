@@ -21,14 +21,14 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/shayne/derpcat/pkg/derpbind"
-	"github.com/shayne/derpcat/pkg/portmap"
-	"github.com/shayne/derpcat/pkg/quicpath"
-	"github.com/shayne/derpcat/pkg/rendezvous"
-	"github.com/shayne/derpcat/pkg/telemetry"
-	"github.com/shayne/derpcat/pkg/token"
-	"github.com/shayne/derpcat/pkg/transport"
-	"github.com/shayne/derpcat/pkg/traversal"
+	"github.com/shayne/derphole/pkg/derpbind"
+	"github.com/shayne/derphole/pkg/portmap"
+	"github.com/shayne/derphole/pkg/quicpath"
+	"github.com/shayne/derphole/pkg/rendezvous"
+	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/token"
+	"github.com/shayne/derphole/pkg/transport"
+	"github.com/shayne/derphole/pkg/traversal"
 	"go4.org/mem"
 	"tailscale.com/derp/derpserver"
 	"tailscale.com/net/portmapper/portmappertype"
@@ -118,8 +118,8 @@ func TestRelayOnlyStdioRoundTrip(t *testing.T) {
 
 func TestPublicRelayOnlyStdioRoundTrip(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -161,8 +161,8 @@ func TestPublicRelayOnlyStdioRoundTrip(t *testing.T) {
 
 func TestPublicRelayOnlyStdioRoundTripSingleStripe(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -203,8 +203,8 @@ func TestPublicRelayOnlyStdioRoundTripSingleStripe(t *testing.T) {
 
 func TestPublicRelayOnlyListenerExitsWhenSenderCancels(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -312,12 +312,12 @@ func TestSessionPromotesDirectStateWhenProbeSucceeds(t *testing.T) {
 }
 
 func TestSendListenExternalStartsRelayPayloadBeforeNativeModeTimeout(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
 
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -407,7 +407,7 @@ func TestDecodeEnvelopeRejectsOversizedPayload(t *testing.T) {
 }
 
 func TestWaitInitialExternalNativeDirectModeAllowsDirectStart(t *testing.T) {
-	t.Setenv("DERPCAT_NATIVE_TCP_DIRECT_START", "1")
+	t.Setenv("DERPHOLE_NATIVE_TCP_DIRECT_START", "1")
 
 	ch := make(chan externalNativeDirectModeResult, 1)
 	want := externalNativeDirectModeResult{nativeTCPConns: []net.Conn{&net.TCPConn{}}}
@@ -527,11 +527,11 @@ func TestShareTokenAllowsOneClaimer(t *testing.T) {
 }
 
 func TestShareOpenExternalAllowsOneClaimerUnderContention(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
 
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -608,11 +608,11 @@ func TestShareOpenExternalAllowsOneClaimerUnderContention(t *testing.T) {
 }
 
 func TestShareOpenExternalClaimPressureDoesNotStallAcceptedRelaySession(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
 
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -700,7 +700,7 @@ func TestShareOpenExternalClaimPressureDoesNotStallAcceptedRelaySession(t *testi
 }
 
 func TestShareOpenExternalCanUpgradeAfterRelayStartAndServeConnections(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
 
 	result := runExternalShareOpenSession(t, shareOpenRoundTripConfig{
 		relayPayload:    "relay-first",
@@ -724,8 +724,8 @@ func TestShareOpenExternalCanUpgradeAfterRelayStartAndServeConnections(t *testin
 }
 
 func TestExternalListenSendUsesRelayUDPWhenDirectNeverBecomesReady(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
 
 	prevTCPAddrAllowed := externalNativeTCPAddrAllowed
 	externalNativeTCPAddrAllowed = func(net.Addr) bool { return false }
@@ -743,8 +743,8 @@ func TestExternalListenSendUsesRelayUDPWhenDirectNeverBecomesReady(t *testing.T)
 	t.Cleanup(func() { publicInterfaceAddrs = prevInterfaceAddrs })
 
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -795,16 +795,16 @@ func TestExternalListenSendUsesRelayUDPWhenDirectNeverBecomesReady(t *testing.T)
 }
 
 func TestExternalListenSendSmallRelayPayloadDoesNotWaitForDelayedNativeMode(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
 
 	prevTCPAddrAllowed := externalNativeTCPAddrAllowed
 	externalNativeTCPAddrAllowed = func(net.Addr) bool { return false }
 	t.Cleanup(func() { externalNativeTCPAddrAllowed = prevTCPAddrAllowed })
 
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -847,8 +847,8 @@ func TestExternalListenSendSmallRelayPayloadDoesNotWaitForDelayedNativeMode(t *t
 }
 
 func TestExternalListenSendSmallPayloadFinishesOverRelayBeforeDelayedDirectUDP(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
 
 	prevInterfaceAddrs := publicInterfaceAddrs
 	publicInterfaceAddrs = func() ([]net.Addr, error) {
@@ -873,8 +873,8 @@ func TestExternalListenSendSmallPayloadFinishesOverRelayBeforeDelayedDirectUDP(t
 	t.Cleanup(func() { waitExternalDirectUDPAddr = prevWaitDirectUDPAddr })
 
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -921,8 +921,8 @@ func TestExternalListenSendSmallPayloadFinishesOverRelayBeforeDelayedDirectUDP(t
 }
 
 func TestExternalListenSendSmallPayloadFinishesOverRelayWhileDirectReadyAckIsDelayed(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
 
 	prevTCPAddrAllowed := externalNativeTCPAddrAllowed
 	externalNativeTCPAddrAllowed = func(net.Addr) bool { return false }
@@ -951,8 +951,8 @@ func TestExternalListenSendSmallPayloadFinishesOverRelayWhileDirectReadyAckIsDel
 	t.Cleanup(func() { externalDirectUDPWaitReadyAckFn = prevWaitReadyAck })
 
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -1002,9 +1002,9 @@ func TestExternalListenSendSmallPayloadFinishesOverRelayWhileDirectReadyAckIsDel
 }
 
 func TestExternalListenSendSmallRelayPayloadDoesNotStallWhenSenderSkipsNativeQUICSetup(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(250*time.Millisecond).UnixNano(), 10))
-	t.Setenv("DERPCAT_NATIVE_QUIC_CONNS", "4")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(250*time.Millisecond).UnixNano(), 10))
+	t.Setenv("DERPHOLE_NATIVE_QUIC_CONNS", "4")
 	const nativeQUICCandidateDelay = 10 * time.Second
 
 	prevTCPAddrAllowed := externalNativeTCPAddrAllowed
@@ -1024,8 +1024,8 @@ func TestExternalListenSendSmallRelayPayloadDoesNotStallWhenSenderSkipsNativeQUI
 	t.Cleanup(func() { externalNativeQUICStripeProbeCandidates = prevStripeCandidates })
 
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -1072,8 +1072,8 @@ func TestExternalListenSendSmallRelayPayloadDoesNotStallWhenSenderSkipsNativeQUI
 }
 
 func TestExternalListenSendPromotesToDirectUDPWhenBothSidesAreDirectReady(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
 
 	prevTCPAddrAllowed := externalNativeTCPAddrAllowed
 	externalNativeTCPAddrAllowed = func(net.Addr) bool { return false }
@@ -1091,8 +1091,8 @@ func TestExternalListenSendPromotesToDirectUDPWhenBothSidesAreDirectReady(t *tes
 	t.Cleanup(func() { publicInterfaceAddrs = prevInterfaceAddrs })
 
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -1176,8 +1176,8 @@ func TestExternalListenSendPromotesToDirectUDPWhenBothSidesAreDirectReady(t *tes
 }
 
 func TestExternalListenSendDirectUDPPromotionDoesNotEmitRelayRegression(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
 
 	prevTCPAddrAllowed := externalNativeTCPAddrAllowed
 	externalNativeTCPAddrAllowed = func(net.Addr) bool { return false }
@@ -1195,8 +1195,8 @@ func TestExternalListenSendDirectUDPPromotionDoesNotEmitRelayRegression(t *testi
 	t.Cleanup(func() { publicInterfaceAddrs = prevInterfaceAddrs })
 
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -1262,8 +1262,8 @@ func TestExternalListenSendDirectUDPPromotionDoesNotEmitRelayRegression(t *testi
 }
 
 func TestExternalListenSendIgnoresLegacyParallelPolicyForDirectUDP(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
 
 	prevTCPAddrAllowed := externalNativeTCPAddrAllowed
 	externalNativeTCPAddrAllowed = func(net.Addr) bool { return false }
@@ -1281,8 +1281,8 @@ func TestExternalListenSendIgnoresLegacyParallelPolicyForDirectUDP(t *testing.T)
 	t.Cleanup(func() { publicInterfaceAddrs = prevInterfaceAddrs })
 
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -1351,9 +1351,9 @@ func TestExternalListenSendIgnoresLegacyParallelPolicyForDirectUDP(t *testing.T)
 }
 
 func TestExternalListenSendCompletesWhenDirectUDPSetupOverlapsTransfer(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
-	t.Setenv("DERPCAT_NATIVE_QUIC_CONNS", "4")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+	t.Setenv("DERPHOLE_NATIVE_QUIC_CONNS", "4")
 
 	prevTCPAddrAllowed := externalNativeTCPAddrAllowed
 	externalNativeTCPAddrAllowed = func(net.Addr) bool { return false }
@@ -1378,8 +1378,8 @@ func TestExternalListenSendCompletesWhenDirectUDPSetupOverlapsTransfer(t *testin
 	t.Cleanup(func() { externalNativeQUICStripeCanUseLocalAddrCandidate = prevLocalAddrCandidate })
 
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
@@ -1483,8 +1483,8 @@ func (r *sessionTestGatedReader) Read(p []byte) (int, error) {
 }
 
 func TestExternalListenSendUsesDirectUDPEvenWhenNativeTCPWouldBeAllowed(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
 
 	prevTCPAddrAllowed := externalNativeTCPAddrAllowed
 	externalNativeTCPAddrAllowed = func(net.Addr) bool { return true }
@@ -1502,8 +1502,8 @@ func TestExternalListenSendUsesDirectUDPEvenWhenNativeTCPWouldBeAllowed(t *testi
 	t.Cleanup(func() { publicInterfaceAddrs = prevInterfaceAddrs })
 
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -1584,8 +1584,8 @@ func TestExternalListenSendUsesDirectUDPEvenWhenNativeTCPWouldBeAllowed(t *testi
 }
 
 func TestExternalListenSendIgnoresRequestedParallelPolicyForDirectUDP(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
 	prevTCPAddrAllowed := externalNativeTCPAddrAllowed
 	externalNativeTCPAddrAllowed = func(net.Addr) bool { return true }
 	t.Cleanup(func() { externalNativeTCPAddrAllowed = prevTCPAddrAllowed })
@@ -1602,8 +1602,8 @@ func TestExternalListenSendIgnoresRequestedParallelPolicyForDirectUDP(t *testing
 	t.Cleanup(func() { publicInterfaceAddrs = prevInterfaceAddrs })
 
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -1685,16 +1685,16 @@ func TestExternalListenSendIgnoresRequestedParallelPolicyForDirectUDP(t *testing
 }
 
 func TestExternalListenSendUsesRelayUDPWhenDirectPromotionIsTooLate(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(externalDirectUDPWait+time.Second).UnixNano(), 10))
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(externalDirectUDPWait+time.Second).UnixNano(), 10))
 
 	prevTCPAddrAllowed := externalNativeTCPAddrAllowed
 	externalNativeTCPAddrAllowed = func(net.Addr) bool { return false }
 	t.Cleanup(func() { externalNativeTCPAddrAllowed = prevTCPAddrAllowed })
 
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -1745,16 +1745,16 @@ func TestExternalListenSendUsesRelayUDPWhenDirectPromotionIsTooLate(t *testing.T
 }
 
 func TestExternalListenSendLargeRelayPayloadDoesNotStallWhenDirectPromotionTimesOut(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(externalDirectUDPWait+time.Second).UnixNano(), 10))
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(externalDirectUDPWait+time.Second).UnixNano(), 10))
 
 	prevTCPAddrAllowed := externalNativeTCPAddrAllowed
 	externalNativeTCPAddrAllowed = func(net.Addr) bool { return false }
 	t.Cleanup(func() { externalNativeTCPAddrAllowed = prevTCPAddrAllowed })
 
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -2001,8 +2001,8 @@ func TestPublicInitialProbeCandidatesKeepsPrivateInterfaceCandidates(t *testing.
 }
 
 func TestPublicInitialProbeCandidatesKeepsLoopbackForFakeTransport(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
 
 	conn := &stubPacketConn{localAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242}}
 
@@ -2198,7 +2198,7 @@ func TestPublicCandidateSourceReturnsQuicklyWhenSTUNGatherBlocks(t *testing.T) {
 }
 
 func TestPublicProbeCandidatesSkipsTailscaleCGNATInInternetOnlyTestMode(t *testing.T) {
-	t.Setenv("DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES", "1")
+	t.Setenv("DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES", "1")
 
 	ctx := context.Background()
 	conn := &stubPacketConn{localAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242}}
@@ -2237,20 +2237,20 @@ func TestPublicProbeCandidateAllowedSkipsTailscaleByDefault(t *testing.T) {
 }
 
 func TestPublicProbeCandidateAllowedCanEnableTailscaleExplicitly(t *testing.T) {
-	t.Setenv("DERPCAT_ENABLE_TAILSCALE_CANDIDATES", "1")
+	t.Setenv("DERPHOLE_ENABLE_TAILSCALE_CANDIDATES", "1")
 
 	if !publicProbeCandidateAllowed(netip.MustParseAddr("100.125.235.82")) {
-		t.Fatal("publicProbeCandidateAllowed(100.125.235.82) = false, want true when DERPCAT_ENABLE_TAILSCALE_CANDIDATES=1")
+		t.Fatal("publicProbeCandidateAllowed(100.125.235.82) = false, want true when DERPHOLE_ENABLE_TAILSCALE_CANDIDATES=1")
 	}
 	if !publicProbeCandidateAllowed(netip.MustParseAddr("fd7a:115c:a1e0::1")) {
-		t.Fatal("publicProbeCandidateAllowed(fd7a:115c:a1e0::1) = false, want true when DERPCAT_ENABLE_TAILSCALE_CANDIDATES=1")
+		t.Fatal("publicProbeCandidateAllowed(fd7a:115c:a1e0::1) = false, want true when DERPHOLE_ENABLE_TAILSCALE_CANDIDATES=1")
 	}
 }
 
 func TestIssuePublicSessionAttachesAndClosesPortmap(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	prevCtor := newPublicPortmap
 	fake := &sessionLifecyclePortmap{
@@ -2295,8 +2295,8 @@ func TestIssuePublicSessionAttachesAndClosesPortmap(t *testing.T) {
 
 func TestIssuePublicShareSessionUsesQUICIdentityInToken(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -2339,7 +2339,7 @@ func TestNewBoundPublicPortmapDoesNotSynchronouslyRefresh(t *testing.T) {
 }
 
 func TestExternalNativeQUICConnCountUsesEnvOverride(t *testing.T) {
-	t.Setenv("DERPCAT_NATIVE_QUIC_CONNS", "8")
+	t.Setenv("DERPHOLE_NATIVE_QUIC_CONNS", "8")
 
 	if got := externalNativeQUICConnCount(); got != 8 {
 		t.Fatalf("externalNativeQUICConnCount() = %d, want 8", got)
@@ -2347,7 +2347,7 @@ func TestExternalNativeQUICConnCountUsesEnvOverride(t *testing.T) {
 }
 
 func TestExternalNativeQUICConnCountIgnoresInvalidEnvOverride(t *testing.T) {
-	t.Setenv("DERPCAT_NATIVE_QUIC_CONNS", "0")
+	t.Setenv("DERPHOLE_NATIVE_QUIC_CONNS", "0")
 
 	if got := externalNativeQUICConnCount(); got != defaultExternalNativeQUICConns {
 		t.Fatalf("externalNativeQUICConnCount() = %d, want %d", got, defaultExternalNativeQUICConns)
@@ -2355,8 +2355,8 @@ func TestExternalNativeQUICConnCountIgnoresInvalidEnvOverride(t *testing.T) {
 }
 
 func TestExternalNativeQUICConnCountKeepsFakeTransportSingleConn(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
-	t.Setenv("DERPCAT_NATIVE_QUIC_CONNS", "8")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_NATIVE_QUIC_CONNS", "8")
 
 	if got := externalNativeQUICConnCount(); got != 1 {
 		t.Fatalf("externalNativeQUICConnCount() = %d, want 1", got)
@@ -2380,7 +2380,7 @@ func TestExternalNativeQUICConnCountForPeerKeepsStripingForRouteLocalPeer(t *tes
 }
 
 func TestExternalNativeTCPConnCountUsesEnvOverride(t *testing.T) {
-	t.Setenv("DERPCAT_NATIVE_TCP_CONNS", "4")
+	t.Setenv("DERPHOLE_NATIVE_TCP_CONNS", "4")
 
 	if got := externalNativeTCPConnCount(); got != 4 {
 		t.Fatalf("externalNativeTCPConnCount() = %d, want 4", got)
@@ -2388,7 +2388,7 @@ func TestExternalNativeTCPConnCountUsesEnvOverride(t *testing.T) {
 }
 
 func TestExternalNativeTCPConnCountDefaultsToTwo(t *testing.T) {
-	t.Setenv("DERPCAT_NATIVE_TCP_CONNS", "")
+	t.Setenv("DERPHOLE_NATIVE_TCP_CONNS", "")
 
 	if got := externalNativeTCPConnCount(); got != 2 {
 		t.Fatalf("externalNativeTCPConnCount() = %d, want 2", got)
@@ -2396,7 +2396,7 @@ func TestExternalNativeTCPConnCountDefaultsToTwo(t *testing.T) {
 }
 
 func TestExternalNativeTCPConnCountIgnoresInvalidEnvOverride(t *testing.T) {
-	t.Setenv("DERPCAT_NATIVE_TCP_CONNS", "0")
+	t.Setenv("DERPHOLE_NATIVE_TCP_CONNS", "0")
 
 	if got := externalNativeTCPConnCount(); got != defaultExternalNativeTCPConns {
 		t.Fatalf("externalNativeTCPConnCount() = %d, want %d", got, defaultExternalNativeTCPConns)
@@ -2424,7 +2424,7 @@ func TestExternalNativeTCPHandshakeConnCountNegotiatesMinimumPositive(t *testing
 }
 
 func TestExternalNativeTCPPassiveConnCountFollowsPeerRequestByDefault(t *testing.T) {
-	t.Setenv("DERPCAT_NATIVE_TCP_CONNS", "")
+	t.Setenv("DERPHOLE_NATIVE_TCP_CONNS", "")
 
 	if got := externalNativeTCPPassiveConnCount(8); got != 8 {
 		t.Fatalf("externalNativeTCPPassiveConnCount(8) = %d, want 8", got)
@@ -2435,7 +2435,7 @@ func TestExternalNativeTCPPassiveConnCountFollowsPeerRequestByDefault(t *testing
 }
 
 func TestExternalNativeTCPPassiveConnCountCapsAtLocalOverride(t *testing.T) {
-	t.Setenv("DERPCAT_NATIVE_TCP_CONNS", "6")
+	t.Setenv("DERPHOLE_NATIVE_TCP_CONNS", "6")
 
 	if got := externalNativeTCPPassiveConnCount(8); got != 6 {
 		t.Fatalf("externalNativeTCPPassiveConnCount(8) = %d, want 6", got)
@@ -2443,7 +2443,7 @@ func TestExternalNativeTCPPassiveConnCountCapsAtLocalOverride(t *testing.T) {
 }
 
 func TestExternalNativeTCPPassiveConnCountCapsAtMaxParallelStripes(t *testing.T) {
-	t.Setenv("DERPCAT_NATIVE_TCP_CONNS", "")
+	t.Setenv("DERPHOLE_NATIVE_TCP_CONNS", "")
 
 	if got := externalNativeTCPPassiveConnCount(MaxParallelStripes + 4); got != MaxParallelStripes {
 		t.Fatalf("externalNativeTCPPassiveConnCount(%d) = %d, want %d", MaxParallelStripes+4, got, MaxParallelStripes)
@@ -2451,7 +2451,7 @@ func TestExternalNativeTCPPassiveConnCountCapsAtMaxParallelStripes(t *testing.T)
 }
 
 func TestExternalNativeTCPPassiveConnCountDefaultsForLegacyPeer(t *testing.T) {
-	t.Setenv("DERPCAT_NATIVE_TCP_CONNS", "")
+	t.Setenv("DERPHOLE_NATIVE_TCP_CONNS", "")
 
 	if got := externalNativeTCPPassiveConnCount(0); got != defaultExternalNativeTCPConns {
 		t.Fatalf("externalNativeTCPPassiveConnCount(0) = %d, want %d", got, defaultExternalNativeTCPConns)
@@ -2726,7 +2726,7 @@ func TestExternalNativeTCPAdvertiseAddrFallsBackToBoundAddr(t *testing.T) {
 }
 
 func TestExternalNativeTCPCopyChunkSizeUsesEnvOverride(t *testing.T) {
-	t.Setenv("DERPCAT_NATIVE_TCP_CHUNK_SIZE", "262144")
+	t.Setenv("DERPHOLE_NATIVE_TCP_CHUNK_SIZE", "262144")
 
 	if got := externalNativeTCPCopyChunkSize(); got != 262144 {
 		t.Fatalf("externalNativeTCPCopyChunkSize() = %d, want 262144", got)
@@ -2734,7 +2734,7 @@ func TestExternalNativeTCPCopyChunkSizeUsesEnvOverride(t *testing.T) {
 }
 
 func TestExternalNativeTCPCopyChunkSizeFallsBackOnInvalidOverride(t *testing.T) {
-	t.Setenv("DERPCAT_NATIVE_TCP_CHUNK_SIZE", "nope")
+	t.Setenv("DERPHOLE_NATIVE_TCP_CHUNK_SIZE", "nope")
 
 	if got := externalNativeTCPCopyChunkSize(); got != externalNativeTCPCopyBufferSizeDefault {
 		t.Fatalf("externalNativeTCPCopyChunkSize() = %d, want %d", got, externalNativeTCPCopyBufferSizeDefault)
@@ -2938,11 +2938,11 @@ func TestExternalNativeTCPBootstrapConnsNegotiateRequestedCount(t *testing.T) {
 }
 
 func TestExternalSendIgnoresTokenNativeTCPBootstrapHint(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
 
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -2991,11 +2991,11 @@ func TestExternalSendIgnoresTokenNativeTCPBootstrapHint(t *testing.T) {
 }
 
 func TestExternalRoundTripUsesSessionPortmapLifecycle(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
 
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	fakes := []*sessionLifecyclePortmap{
 		{have: true, snapshot: netip.MustParseAddrPort("198.51.100.10:54321")},
@@ -3333,9 +3333,9 @@ func runExternalShareOpenSession(t *testing.T, cfg shareOpenRoundTripConfig) sha
 	t.Helper()
 
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
-	t.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -3378,7 +3378,7 @@ func runExternalShareOpenSession(t *testing.T, cfg shareOpenRoundTripConfig) sha
 
 	waitForStatusPrefixBuffer(t, &shareStatus, 20*time.Second, string(StateWaiting), string(StateClaimed), string(StateRelay))
 	waitForStatusPrefixBuffer(t, &openStatus, 20*time.Second, string(StateProbing), string(StateRelay))
-	if err := os.Setenv("DERPCAT_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0"); err != nil {
+	if err := os.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0"); err != nil {
 		t.Fatalf("Setenv(enable direct) error = %v", err)
 	}
 	waitForStatusPrefixBuffer(t, &shareStatus, 20*time.Second, string(StateWaiting), string(StateClaimed), string(StateRelay), string(StateDirect))

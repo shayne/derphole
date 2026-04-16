@@ -1,28 +1,28 @@
 repos:
   - repo: local
     hooks:
-      - id: derpcat-gofmt-check
-        name: derpcat gofmt check
+      - id: derphole-gofmt-check
+        name: derphole gofmt check
         entry: tools/hooks/gofmt-check
         language: script
         files: \.go$
-      - id: derpcat-go-vet
-        name: derpcat go vet
+      - id: derphole-go-vet
+        name: derphole go vet
         entry: tools/hooks/go-vet
         language: script
         pass_filenames: false
-      - id: derpcat-go-mod-tidy
-        name: derpcat go mod tidy
+      - id: derphole-go-mod-tidy
+        name: derphole go mod tidy
         entry: tools/hooks/go-mod-tidy-check
         language: script
         pass_filenames: false
-      - id: derpcat-staticcheck
-        name: derpcat staticcheck
+      - id: derphole-staticcheck
+        name: derphole staticcheck
         entry: tools/hooks/staticcheck
         language: script
         pass_filenames: false
-      - id: derpcat-prepare-commit-msg
-        name: derpcat prepare commit message
+      - id: derphole-prepare-commit-msg
+        name: derphole prepare commit message
         entry: tools/hooks/prepare-commit-msg
         language: script
         stages: [prepare-commit-msg]

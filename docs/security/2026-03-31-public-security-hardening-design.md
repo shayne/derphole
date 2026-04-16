@@ -2,7 +2,7 @@
 
 ## Goal
 
-Harden `derpcat` before wider open source distribution without changing its core product model:
+Harden `derphole` before wider open source distribution without changing its core product model:
 
 - no Tailscale account
 - no `tailscaled`
@@ -89,11 +89,11 @@ No extra mandatory user step is added. An optional passphrase layer can be consi
 The command surface remains:
 
 ```bash
-npx -y derpcat@latest listen
-printf 'hello\n' | npx -y derpcat@latest send <token>
+npx -y derphole@latest listen
+printf 'hello\n' | npx -y derphole@latest send <token>
 
-npx -y derpcat@latest share 127.0.0.1:3000
-npx -y derpcat@latest open <token>
+npx -y derphole@latest share 127.0.0.1:3000
+npx -y derphole@latest open <token>
 ```
 
 Status output remains similar, including relay-to-direct promotion messages under `--verbose`.

@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/derpbind"
-	"github.com/shayne/derpcat/pkg/rendezvous"
-	"github.com/shayne/derpcat/pkg/telemetry"
-	"github.com/shayne/derpcat/pkg/token"
-	wgtransport "github.com/shayne/derpcat/pkg/wg"
+	"github.com/shayne/derphole/pkg/derpbind"
+	"github.com/shayne/derphole/pkg/rendezvous"
+	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/token"
+	wgtransport "github.com/shayne/derphole/pkg/wg"
 	"go4.org/mem"
 	"tailscale.com/types/key"
 )
@@ -715,8 +715,8 @@ func TestExternalWGTunnelIssuedPublicSessionPiecesWithSenderPortmapVerboseEmitte
 
 func TestSendExternalViaWGTunnelAgainstManualListener(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -840,8 +840,8 @@ func TestSendExternalViaWGTunnelAgainstManualListener(t *testing.T) {
 
 func TestListenExternalViaWGTunnelAgainstManualSender(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -955,8 +955,8 @@ func TestListenExternalViaWGTunnelAgainstManualSender(t *testing.T) {
 
 func runExternalWGTunnelIssuedPublicSessionPiecesWithTransportManager(t *testing.T, senderPortmap bool, senderEmitter *telemetry.Emitter) {
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

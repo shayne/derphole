@@ -1,4 +1,4 @@
-module github.com/shayne/derpcat
+module github.com/shayne/derphole
 
 go 1.26.1
 

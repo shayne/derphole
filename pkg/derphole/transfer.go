@@ -12,14 +12,14 @@ import (
 	"strings"
 	"time"
 
-	dharchive "github.com/shayne/derpcat/pkg/derphole/archive"
-	"github.com/shayne/derpcat/pkg/derphole/protocol"
-	"github.com/shayne/derpcat/pkg/derphole/webproto"
-	"github.com/shayne/derpcat/pkg/derphole/webrelay"
-	"github.com/shayne/derpcat/pkg/derphole/webrtcdirect"
-	"github.com/shayne/derpcat/pkg/session"
-	"github.com/shayne/derpcat/pkg/telemetry"
-	"github.com/shayne/derpcat/pkg/token"
+	dharchive "github.com/shayne/derphole/pkg/derphole/archive"
+	"github.com/shayne/derphole/pkg/derphole/protocol"
+	"github.com/shayne/derphole/pkg/derphole/webproto"
+	"github.com/shayne/derphole/pkg/derphole/webrelay"
+	"github.com/shayne/derphole/pkg/derphole/webrtcdirect"
+	"github.com/shayne/derphole/pkg/session"
+	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/token"
 )
 
 type SendConfig struct {

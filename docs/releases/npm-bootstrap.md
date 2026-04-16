@@ -1,10 +1,10 @@
 # Manual npm Bootstrap Publish
 
-This runbook covers the first npm publish before GitHub trusted publishing is configured. The repository now ships two npm packages: `derpcat` and `derphole`.
+This runbook covers the first npm publish before GitHub trusted publishing is configured. The repository now ships two npm packages: `derphole` and `derphole`.
 
 ## Prerequisites
 
-- npm account that can claim and publish the `derpcat` and `derphole` package names
+- npm account that can claim and publish the `derphole` and `derphole` package names
 - local `npm whoami` succeeds
 - run from the repository root
 - `mise` and the release toolchain are available locally
@@ -22,15 +22,15 @@ Validate the npm payloads with an unpublished prerelease version. This avoids dr
 
 ```bash
 VERSION=v0.0.1-dev.$(date -u +%Y%m%d%H%M%S) mise run release:npm-dry-run
-node ./dist/npm-derpcat/bin/derpcat.js version
+node ./dist/npm-derphole/bin/derphole.js version
 node ./dist/npm-derphole/bin/derphole.js version
 ```
 
 Expected output:
 
-- `npm publish --dry-run` succeeds for `dist/npm-derpcat`
 - `npm publish --dry-run` succeeds for `dist/npm-derphole`
-- `node ./dist/npm-derpcat/bin/derpcat.js version` prints `v0.0.1`
+- `npm publish --dry-run` succeeds for `dist/npm-derphole`
+- `node ./dist/npm-derphole/bin/derphole.js version` prints `v0.0.1`
 - `node ./dist/npm-derphole/bin/derphole.js version` prints `v0.0.1`
 
 ## Publish
@@ -38,7 +38,7 @@ Expected output:
 Publish both packages if both are being bootstrapped:
 
 ```bash
-npm publish ./dist/npm-derpcat --access public
+npm publish ./dist/npm-derphole --access public
 npm publish ./dist/npm-derphole --access public
 ```
 
@@ -46,7 +46,7 @@ If only one package still needs manual bootstrap, publish only that package dire
 
 ## After trusted publisher setup
 
-Once npm trusted publishing is configured for `shayne/derpcat`:
+Once npm trusted publishing is configured for `shayne/derphole`:
 
 ```bash
 git push origin main

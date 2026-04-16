@@ -6,8 +6,8 @@ import (
 	"net"
 	"net/netip"
 
-	"github.com/shayne/derpcat/pkg/quicpath"
-	"github.com/shayne/derpcat/pkg/token"
+	"github.com/shayne/derphole/pkg/quicpath"
+	"github.com/shayne/derphole/pkg/token"
 )
 
 type externalNativeTCPBootstrapResult struct {

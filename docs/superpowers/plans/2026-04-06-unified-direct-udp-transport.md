@@ -4,7 +4,7 @@
 
 ## Goal
 
-Replace derpcat's current public WireGuard-over-TCP default with one direct UDP data plane that:
+Replace derphole's current public WireGuard-over-TCP default with one direct UDP data plane that:
 
 - uses DERP for rendezvous, coordination, and relay fallback
 - uses direct UDP between peers whenever possible, without requiring forwarded ports
@@ -125,7 +125,7 @@ Exit criterion:
 
 Exit criterion:
 
-- `ktzlxc` no-forwarded-port direct transfer clearly beats the current WG-tunnel implementation and reaches or exceeds the old ~`955 Mbps` derpcat baseline
+- `ktzlxc` no-forwarded-port direct transfer clearly beats the current WG-tunnel implementation and reaches or exceeds the old ~`955 Mbps` derphole baseline
 
 ### Task 5: Migrate `share/open`
 
@@ -157,8 +157,8 @@ Local correctness:
 
 Live correctness:
 
-- `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh ktzlxc 1024`
-- `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh ktzlxc 1024`
+- `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh ktzlxc 1024`
+- `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh ktzlxc 1024`
 - same pair for `canlxc`
 - same pair for `uklxc`
 - at least one manual public-path verification against `orange-india.exe.xyz`

@@ -4432,7 +4432,7 @@ func (s *blastReceiveRunState) ensureStripedPayloadSpool() (*os.File, error) {
 	if s.pendingOutputSpool != nil {
 		return s.pendingOutputSpool, nil
 	}
-	spool, err := os.CreateTemp("", "derpcat-striped-pending-*")
+	spool, err := os.CreateTemp("", "derphole-striped-pending-*")
 	if err != nil {
 		return nil, err
 	}
@@ -5539,7 +5539,7 @@ func writeSpoolParallelBlastPayload(dst io.Writer, state *blastReceiveRunState, 
 		return len(payload), nil
 	}
 	if dst != io.Discard && state.spool == nil {
-		spool, err := os.CreateTemp("", "derpcat-blast-spool-*")
+		spool, err := os.CreateTemp("", "derphole-blast-spool-*")
 		if err != nil {
 			return 0, err
 		}
@@ -5692,11 +5692,11 @@ func sessionTracef(format string, args ...any) {
 }
 
 func sessionTraceEnabled() bool {
-	return strings.TrimSpace(os.Getenv("DERPCAT_PROBE_TRACE")) != ""
+	return strings.TrimSpace(os.Getenv("DERPHOLE_PROBE_TRACE")) != ""
 }
 
 func sessionPacketTraceEnabled() bool {
-	return strings.TrimSpace(os.Getenv("DERPCAT_PROBE_TRACE_PACKETS")) != ""
+	return strings.TrimSpace(os.Getenv("DERPHOLE_PROBE_TRACE_PACKETS")) != ""
 }
 
 func decodeBlastPacketFull(buf []byte) (PacketType, []byte, [16]byte, uint64, uint64, bool) {

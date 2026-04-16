@@ -28,7 +28,7 @@ const externalHandoffTransferIDHandoff = ^uint64(0)
 var externalTransferTraceStart = time.Now()
 
 func externalTransferTracef(format string, args ...any) {
-	if os.Getenv("DERPCAT_TRACE_HANDOFF") != "1" {
+	if os.Getenv("DERPHOLE_TRACE_HANDOFF") != "1" {
 		return
 	}
 	allArgs := append([]any{time.Since(externalTransferTraceStart).Truncate(time.Microsecond)}, args...)
@@ -154,7 +154,7 @@ func newExternalHandoffSpool(src io.Reader, chunkSize int, maxUnackedBytes int64
 	if maxUnackedBytes <= 0 {
 		return nil, fmt.Errorf("external handoff unacked window %d must be positive", maxUnackedBytes)
 	}
-	file, err := os.CreateTemp("", "derpcat-external-handoff-*.spool")
+	file, err := os.CreateTemp("", "derphole-external-handoff-*.spool")
 	if err != nil {
 		return nil, err
 	}

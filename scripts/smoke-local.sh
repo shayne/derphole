@@ -33,7 +33,7 @@ open_log="$tmp/open.log"
 http_dir="$tmp/http"
 mkdir -p "$http_dir"
 
-dist/derpcat listen >"$output_file" 2>"$listener_log" &
+dist/derphole listen >"$output_file" 2>"$listener_log" &
 listener_pid=$!
 
 token=""
@@ -50,7 +50,7 @@ if [[ -z "$token" ]]; then
   exit 1
 fi
 
-printf 'hello smoke' | dist/derpcat send "$token" >"$tmp/sender.out" 2>"$sender_log"
+printf 'hello smoke' | dist/derphole send "$token" >"$tmp/sender.out" 2>"$sender_log"
 wait "$listener_pid"
 
 test "$(cat "$output_file")" = "hello smoke"
@@ -67,7 +67,7 @@ printf 'hello shared smoke\n' >"$http_dir/index.html"
 python3 -m http.server "$http_port" --bind 127.0.0.1 --directory "$http_dir" >"$tmp/http.log" 2>&1 &
 http_pid=$!
 
-dist/derpcat share "127.0.0.1:${http_port}" >"$tmp/share.out" 2>"$share_log" &
+dist/derphole share "127.0.0.1:${http_port}" >"$tmp/share.out" 2>"$share_log" &
 share_pid=$!
 
 share_token=""
@@ -84,7 +84,7 @@ if [[ -z "$share_token" ]]; then
   exit 1
 fi
 
-dist/derpcat open "$share_token" >"$tmp/open.out" 2>"$open_log" &
+dist/derphole open "$share_token" >"$tmp/open.out" 2>"$open_log" &
 open_pid=$!
 
 bind_addr=""

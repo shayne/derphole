@@ -5,7 +5,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/shayne/derpcat/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/yargs"
 )
 
@@ -18,7 +18,7 @@ type rootGlobalFlags struct {
 var rootRegistry = yargs.Registry{
 	Command: yargs.CommandInfo{
 		Name:        "derphole",
-		Description: "Move text, files, directories, and SSH invites over derpcat transport with wormhole-shaped commands.",
+		Description: "Move text, files, directories, and SSH invites over derphole transport with wormhole-shaped commands.",
 		Examples: []string{
 			"derphole send ./photo.jpg",
 			"derphole receive",

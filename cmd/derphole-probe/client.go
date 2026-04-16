@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/probe"
+	"github.com/shayne/derphole/pkg/probe"
 	"github.com/shayne/yargs"
 )
 
@@ -167,7 +167,7 @@ func runClient(args []string, stdout, stderr io.Writer) int {
 			ChunkSize:      parsed.Flags.ChunkSize,
 			WindowSize:     parsed.Flags.WindowSize,
 			RateMbps:       parsed.Flags.RateMbps,
-			RepairPayloads: probeEnvBool("DERPCAT_PROBE_REPAIR_PAYLOADS"),
+			RepairPayloads: probeEnvBool("DERPHOLE_PROBE_REPAIR_PAYLOADS"),
 		})
 	} else {
 		stats, err = probeSend(ctx, conn, remoteAddr, &src, probe.SendConfig{
@@ -178,7 +178,7 @@ func runClient(args []string, stdout, stderr io.Writer) int {
 			WindowSize:     parsed.Flags.WindowSize,
 			Parallel:       parsed.Flags.Parallel,
 			RateMbps:       parsed.Flags.RateMbps,
-			RepairPayloads: probeEnvBool("DERPCAT_PROBE_REPAIR_PAYLOADS"),
+			RepairPayloads: probeEnvBool("DERPHOLE_PROBE_REPAIR_PAYLOADS"),
 		})
 	}
 	punchCancel()
@@ -400,7 +400,7 @@ func perClientShareRateMbps(totalRateMbps int, shares int) int {
 }
 
 func probeTracef(format string, args ...any) {
-	if strings.TrimSpace(os.Getenv("DERPCAT_PROBE_TRACE")) == "" {
+	if strings.TrimSpace(os.Getenv("DERPHOLE_PROBE_TRACE")) == "" {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "probe-trace: "+format+"\n", args...)

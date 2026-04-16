@@ -12,12 +12,12 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/shayne/derpcat/pkg/probe"
+	"github.com/shayne/derphole/pkg/probe"
 	"github.com/shayne/yargs"
 )
 
 const defaultMatrixHosts = "ktzlxc,canlxc,uklxc,november-oscar.exe.xyz,eric@eric-nuc"
-const defaultMatrixTools = "derpcat"
+const defaultMatrixTools = "derphole"
 
 type matrixConfig struct {
 	Hosts      []string `json:"hosts"`
@@ -29,7 +29,7 @@ type matrixConfig struct {
 
 type matrixFlags struct {
 	Hosts      string `flag:"hosts" help:"Comma-separated remote hosts" default:"ktzlxc,canlxc,uklxc,november-oscar.exe.xyz,eric@eric-nuc"`
-	Tools      string `flag:"tools" help:"Comma-separated benchmark tools: derpcat, derphole, iperf" default:"derpcat"`
+	Tools      string `flag:"tools" help:"Comma-separated benchmark tools: derphole, iperf" default:"derphole"`
 	Iterations int    `flag:"iterations" help:"Runs per host per direction" default:"10"`
 	SizeMiB    int    `flag:"size-mib" help:"Payload size in MiB" default:"1024"`
 	Out        string `flag:"out" help:"Write the JSON report to this path"`
@@ -312,15 +312,10 @@ func matrixCases(tools []string) ([]matrixCase, error) {
 	var cases []matrixCase
 	for _, tool := range tools {
 		switch tool {
-		case "derpcat":
+		case "derphole":
 			cases = append(cases,
 				matrixCase{tool: tool, script: "./scripts/promotion-test.sh", direction: "forward"},
 				matrixCase{tool: tool, script: "./scripts/promotion-test-reverse.sh", direction: "reverse"},
-			)
-		case "derphole":
-			cases = append(cases,
-				matrixCase{tool: tool, script: "./scripts/derphole-promotion-test.sh", direction: "forward"},
-				matrixCase{tool: tool, script: "./scripts/derphole-promotion-test-reverse.sh", direction: "reverse"},
 			)
 		case "iperf":
 			cases = append(cases,

@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	defaultProbeRemotePath      = "/tmp/derpcat-probe"
+	defaultProbeRemotePath      = "/tmp/derphole-probe"
 	defaultSSHConnectTimeoutSec = 5
 	defaultProbeWindowSize      = 1024
 )
@@ -129,20 +129,20 @@ func (r SSHRunner) binaryPath() string {
 
 func sshProbeEnvVars() []string {
 	var env []string
-	if trace := strings.TrimSpace(os.Getenv("DERPCAT_PROBE_WG_TRACE")); trace != "" {
-		env = append(env, "DERPCAT_PROBE_WG_TRACE="+trace)
+	if trace := strings.TrimSpace(os.Getenv("DERPHOLE_PROBE_WG_TRACE")); trace != "" {
+		env = append(env, "DERPHOLE_PROBE_WG_TRACE="+trace)
 	}
-	if trace := strings.TrimSpace(os.Getenv("DERPCAT_PROBE_TRACE")); trace != "" {
-		env = append(env, "DERPCAT_PROBE_TRACE="+trace)
+	if trace := strings.TrimSpace(os.Getenv("DERPHOLE_PROBE_TRACE")); trace != "" {
+		env = append(env, "DERPHOLE_PROBE_TRACE="+trace)
 	}
-	if rate := strings.TrimSpace(os.Getenv("DERPCAT_PROBE_RATE_MBPS")); rate != "" {
-		env = append(env, "DERPCAT_PROBE_RATE_MBPS="+rate)
+	if rate := strings.TrimSpace(os.Getenv("DERPHOLE_PROBE_RATE_MBPS")); rate != "" {
+		env = append(env, "DERPHOLE_PROBE_RATE_MBPS="+rate)
 	}
-	if requireComplete := strings.TrimSpace(os.Getenv("DERPCAT_PROBE_REQUIRE_COMPLETE")); requireComplete != "" {
-		env = append(env, "DERPCAT_PROBE_REQUIRE_COMPLETE="+requireComplete)
+	if requireComplete := strings.TrimSpace(os.Getenv("DERPHOLE_PROBE_REQUIRE_COMPLETE")); requireComplete != "" {
+		env = append(env, "DERPHOLE_PROBE_REQUIRE_COMPLETE="+requireComplete)
 	}
-	if repairPayloads := strings.TrimSpace(os.Getenv("DERPCAT_PROBE_REPAIR_PAYLOADS")); repairPayloads != "" {
-		env = append(env, "DERPCAT_PROBE_REPAIR_PAYLOADS="+repairPayloads)
+	if repairPayloads := strings.TrimSpace(os.Getenv("DERPHOLE_PROBE_REPAIR_PAYLOADS")); repairPayloads != "" {
+		env = append(env, "DERPHOLE_PROBE_REPAIR_PAYLOADS="+repairPayloads)
 	}
 	return env
 }
@@ -267,7 +267,7 @@ func (r SSHRunner) ClientCommand(cfg ClientConfig) []string {
 		argv = append(argv, "--parallel", strconv.Itoa(cfg.Parallel))
 	}
 	if mode == "blast" {
-		if rate := strings.TrimSpace(os.Getenv("DERPCAT_PROBE_RATE_MBPS")); rate != "" {
+		if rate := strings.TrimSpace(os.Getenv("DERPHOLE_PROBE_RATE_MBPS")); rate != "" {
 			argv = append(argv, "--rate-mbps", rate)
 		}
 	}
@@ -1743,11 +1743,11 @@ func requireExpectedBytes(received, expected int64) error {
 }
 
 func probeWindowSize(mode, transport string) int {
-	if raw := strings.TrimSpace(os.Getenv("DERPCAT_PROBE_WINDOW")); raw != "" {
-		return envPositiveInt("DERPCAT_PROBE_WINDOW", defaultProbeWindowSize)
+	if raw := strings.TrimSpace(os.Getenv("DERPHOLE_PROBE_WINDOW")); raw != "" {
+		return envPositiveInt("DERPHOLE_PROBE_WINDOW", defaultProbeWindowSize)
 	}
-	if raw := strings.TrimSpace(os.Getenv("DERPCAT_PROBE_WINDOW_SIZE")); raw != "" {
-		return envPositiveInt("DERPCAT_PROBE_WINDOW_SIZE", defaultProbeWindowSize)
+	if raw := strings.TrimSpace(os.Getenv("DERPHOLE_PROBE_WINDOW_SIZE")); raw != "" {
+		return envPositiveInt("DERPHOLE_PROBE_WINDOW_SIZE", defaultProbeWindowSize)
 	}
 	if mode == "raw" {
 		if normalized, err := normalizeTransport(transport); err == nil && normalized == probeTransportBatched {
@@ -1759,19 +1759,19 @@ func probeWindowSize(mode, transport string) int {
 }
 
 func probeChunkSize() int {
-	return envPositiveInt("DERPCAT_PROBE_CHUNK_SIZE", defaultChunkSize)
+	return envPositiveInt("DERPHOLE_PROBE_CHUNK_SIZE", defaultChunkSize)
 }
 
 func probeRateMbps() int {
-	return envPositiveInt("DERPCAT_PROBE_RATE_MBPS", 0)
+	return envPositiveInt("DERPHOLE_PROBE_RATE_MBPS", 0)
 }
 
 func probeRequireComplete() bool {
-	return envBool("DERPCAT_PROBE_REQUIRE_COMPLETE")
+	return envBool("DERPHOLE_PROBE_REQUIRE_COMPLETE")
 }
 
 func probeRepairPayloads() bool {
-	return envBool("DERPCAT_PROBE_REPAIR_PAYLOADS")
+	return envBool("DERPHOLE_PROBE_REPAIR_PAYLOADS")
 }
 
 func envBool(key string) bool {
@@ -1792,14 +1792,14 @@ func envPositiveInt(key string, fallback int) int {
 }
 
 func probeTracef(format string, args ...any) {
-	if strings.TrimSpace(os.Getenv("DERPCAT_PROBE_TRACE")) == "" {
+	if strings.TrimSpace(os.Getenv("DERPHOLE_PROBE_TRACE")) == "" {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "probe-trace: "+format+"\n", args...)
 }
 
 func traceStderrWriter(buf *bytes.Buffer) io.Writer {
-	if strings.TrimSpace(os.Getenv("DERPCAT_PROBE_TRACE")) == "" {
+	if strings.TrimSpace(os.Getenv("DERPHOLE_PROBE_TRACE")) == "" {
 		return buf
 	}
 	return io.MultiWriter(buf, os.Stderr)

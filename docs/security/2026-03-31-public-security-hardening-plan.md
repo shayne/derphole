@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Harden public `derpcat` sessions by adding real peer authentication, tightening token contents, and enforcing practical abuse limits without changing the user-facing CLI flows.
+**Goal:** Harden public `derphole` sessions by adding real peer authentication, tightening token contents, and enforcing practical abuse limits without changing the user-facing CLI flows.
 
 **Architecture:** Keep the bearer-token workflow and public Tailscale DERP bootstrap model, but bind QUIC to ephemeral session identity instead of trusting any self-signed peer. Minimize token contents to current transport needs, move unsafe local defaults out of the token, and add runtime validation and bounded resource usage around claims, control messages, and multiplexed streams.
 
@@ -12,44 +12,44 @@
 
 ## File Map
 
-- Modify: `/Users/shayne/code/derpcat/pkg/token/token.go`
+- Modify: `/Users/shayne/code/derphole/pkg/token/token.go`
   - shrink token schema to fields required by the current public transport
-- Modify: `/Users/shayne/code/derpcat/pkg/token/token_test.go`
+- Modify: `/Users/shayne/code/derphole/pkg/token/token_test.go`
   - lock down new token encoding, expiry, and compatibility behavior
-- Modify: `/Users/shayne/code/derpcat/pkg/rendezvous/messages.go`
+- Modify: `/Users/shayne/code/derphole/pkg/rendezvous/messages.go`
   - carry explicit QUIC client identity and validate bounded claim payloads
-- Modify: `/Users/shayne/code/derpcat/pkg/rendezvous/state.go`
+- Modify: `/Users/shayne/code/derphole/pkg/rendezvous/state.go`
   - enforce stricter claim validation and reject malformed capability or size abuse
-- Modify: `/Users/shayne/code/derpcat/pkg/quicpath/config.go`
+- Modify: `/Users/shayne/code/derphole/pkg/quicpath/config.go`
   - replace blind QUIC verification with pinned session identity checks
-- Create: `/Users/shayne/code/derpcat/pkg/quicpath/identity.go`
+- Create: `/Users/shayne/code/derphole/pkg/quicpath/identity.go`
   - derive and verify session-bound QUIC certificates and peer identity pins
-- Create: `/Users/shayne/code/derpcat/pkg/quicpath/identity_test.go`
+- Create: `/Users/shayne/code/derphole/pkg/quicpath/identity_test.go`
   - prove valid peers connect and mismatched peers fail closed
-- Modify: `/Users/shayne/code/derpcat/pkg/session/external.go`
+- Modify: `/Users/shayne/code/derphole/pkg/session/external.go`
   - issue pinned QUIC server identity for `listen`, send pinned client identity for `send`
-- Modify: `/Users/shayne/code/derpcat/pkg/session/external_share.go`
+- Modify: `/Users/shayne/code/derphole/pkg/session/external_share.go`
   - issue pinned QUIC server identity for `share`, validate claimant QUIC identity for `open`
-- Modify: `/Users/shayne/code/derpcat/pkg/session/open.go`
+- Modify: `/Users/shayne/code/derphole/pkg/session/open.go`
   - ensure local bind defaults remain local policy, not token-driven policy
-- Modify: `/Users/shayne/code/derpcat/pkg/session/share.go`
+- Modify: `/Users/shayne/code/derphole/pkg/session/share.go`
   - add bounded concurrent stream policy around shared backend handling
-- Modify: `/Users/shayne/code/derpcat/pkg/transport/control.go`
+- Modify: `/Users/shayne/code/derphole/pkg/transport/control.go`
   - bound control payload size and candidate counts
-- Modify: `/Users/shayne/code/derpcat/pkg/session/session_test.go`
+- Modify: `/Users/shayne/code/derphole/pkg/session/session_test.go`
   - add public-session security regressions
-- Modify: `/Users/shayne/code/derpcat/pkg/quicpath/integration_test.go`
+- Modify: `/Users/shayne/code/derphole/pkg/quicpath/integration_test.go`
   - verify handshake succeeds only for pinned peers
-- Modify: `/Users/shayne/code/derpcat/cmd/derpcat/open.go`
+- Modify: `/Users/shayne/code/derphole/cmd/derphole/open.go`
   - keep `open` bind defaults ergonomic while detached from token fields
-- Modify: `/Users/shayne/code/derpcat/README.md`
+- Modify: `/Users/shayne/code/derphole/README.md`
   - document 1-hour tokens and optional passphrase note only if implemented
 
 ### Task 1: Tighten the Token Schema
 
 **Files:**
-- Modify: `/Users/shayne/code/derpcat/pkg/token/token.go`
-- Modify: `/Users/shayne/code/derpcat/pkg/token/token_test.go`
+- Modify: `/Users/shayne/code/derphole/pkg/token/token.go`
+- Modify: `/Users/shayne/code/derphole/pkg/token/token_test.go`
 
 - [ ] **Step 1: Write the failing token-shape tests**
 
@@ -137,16 +137,16 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add /Users/shayne/code/derpcat/pkg/token/token.go /Users/shayne/code/derpcat/pkg/token/token_test.go
+git add /Users/shayne/code/derphole/pkg/token/token.go /Users/shayne/code/derphole/pkg/token/token_test.go
 git commit -m "security: tighten public token schema"
 ```
 
 ### Task 2: Add Pinned QUIC Session Identity
 
 **Files:**
-- Create: `/Users/shayne/code/derpcat/pkg/quicpath/identity.go`
-- Create: `/Users/shayne/code/derpcat/pkg/quicpath/identity_test.go`
-- Modify: `/Users/shayne/code/derpcat/pkg/quicpath/config.go`
+- Create: `/Users/shayne/code/derphole/pkg/quicpath/identity.go`
+- Create: `/Users/shayne/code/derphole/pkg/quicpath/identity_test.go`
+- Modify: `/Users/shayne/code/derphole/pkg/quicpath/config.go`
 
 - [ ] **Step 1: Write failing QUIC identity tests**
 
@@ -253,24 +253,24 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add /Users/shayne/code/derpcat/pkg/quicpath/config.go /Users/shayne/code/derpcat/pkg/quicpath/identity.go /Users/shayne/code/derpcat/pkg/quicpath/identity_test.go
+git add /Users/shayne/code/derphole/pkg/quicpath/config.go /Users/shayne/code/derphole/pkg/quicpath/identity.go /Users/shayne/code/derphole/pkg/quicpath/identity_test.go
 git commit -m "security: pin quic peer identity"
 ```
 
 ### Task 3: Bind Public Sessions to QUIC Identity
 
 **Files:**
-- Modify: `/Users/shayne/code/derpcat/pkg/session/external.go`
-- Modify: `/Users/shayne/code/derpcat/pkg/session/external_share.go`
-- Modify: `/Users/shayne/code/derpcat/pkg/session/session_test.go`
+- Modify: `/Users/shayne/code/derphole/pkg/session/external.go`
+- Modify: `/Users/shayne/code/derphole/pkg/session/external_share.go`
+- Modify: `/Users/shayne/code/derphole/pkg/session/session_test.go`
 
 - [ ] **Step 1: Write failing public-session tests for mismatched peer identity**
 
 ```go
 func TestPublicListenSendRejectsQUICPeerIdentityMismatch(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPCAT_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPCAT_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -365,18 +365,18 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add /Users/shayne/code/derpcat/pkg/session/external.go /Users/shayne/code/derpcat/pkg/session/external_share.go /Users/shayne/code/derpcat/pkg/session/session_test.go
+git add /Users/shayne/code/derphole/pkg/session/external.go /Users/shayne/code/derphole/pkg/session/external_share.go /Users/shayne/code/derphole/pkg/session/session_test.go
 git commit -m "security: bind public sessions to quic identity"
 ```
 
 ### Task 4: Validate Claim Payloads and Bound Control Data
 
 **Files:**
-- Modify: `/Users/shayne/code/derpcat/pkg/rendezvous/messages.go`
-- Modify: `/Users/shayne/code/derpcat/pkg/rendezvous/state.go`
-- Modify: `/Users/shayne/code/derpcat/pkg/transport/control.go`
-- Modify: `/Users/shayne/code/derpcat/pkg/rendezvous/rendezvous_test.go`
-- Modify: `/Users/shayne/code/derpcat/pkg/transport/manager_test.go`
+- Modify: `/Users/shayne/code/derphole/pkg/rendezvous/messages.go`
+- Modify: `/Users/shayne/code/derphole/pkg/rendezvous/state.go`
+- Modify: `/Users/shayne/code/derphole/pkg/transport/control.go`
+- Modify: `/Users/shayne/code/derphole/pkg/rendezvous/rendezvous_test.go`
+- Modify: `/Users/shayne/code/derphole/pkg/transport/manager_test.go`
 
 - [ ] **Step 1: Write failing tests for malformed candidate abuse**
 
@@ -454,16 +454,16 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add /Users/shayne/code/derpcat/pkg/rendezvous/messages.go /Users/shayne/code/derpcat/pkg/rendezvous/state.go /Users/shayne/code/derpcat/pkg/transport/control.go /Users/shayne/code/derpcat/pkg/rendezvous/rendezvous_test.go /Users/shayne/code/derpcat/pkg/transport/manager_test.go
+git add /Users/shayne/code/derphole/pkg/rendezvous/messages.go /Users/shayne/code/derphole/pkg/rendezvous/state.go /Users/shayne/code/derphole/pkg/transport/control.go /Users/shayne/code/derphole/pkg/rendezvous/rendezvous_test.go /Users/shayne/code/derphole/pkg/transport/manager_test.go
 git commit -m "security: bound claim and control data"
 ```
 
 ### Task 5: Bound Shared-Service Stream Fan-Out
 
 **Files:**
-- Modify: `/Users/shayne/code/derpcat/pkg/session/share.go`
-- Modify: `/Users/shayne/code/derpcat/pkg/session/external_share.go`
-- Modify: `/Users/shayne/code/derpcat/pkg/session/session_test.go`
+- Modify: `/Users/shayne/code/derphole/pkg/session/share.go`
+- Modify: `/Users/shayne/code/derphole/pkg/session/external_share.go`
+- Modify: `/Users/shayne/code/derphole/pkg/session/session_test.go`
 
 - [ ] **Step 1: Write the failing concurrent-stream limit test**
 
@@ -528,15 +528,15 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add /Users/shayne/code/derpcat/pkg/session/share.go /Users/shayne/code/derpcat/pkg/session/external_share.go /Users/shayne/code/derpcat/pkg/session/session_test.go
+git add /Users/shayne/code/derphole/pkg/session/share.go /Users/shayne/code/derphole/pkg/session/external_share.go /Users/shayne/code/derphole/pkg/session/session_test.go
 git commit -m "security: bound shared session fan-out"
 ```
 
 ### Task 6: Keep `open` Defaults Local and Safe
 
 **Files:**
-- Modify: `/Users/shayne/code/derpcat/pkg/session/open.go`
-- Modify: `/Users/shayne/code/derpcat/cmd/derpcat/open_test.go`
+- Modify: `/Users/shayne/code/derphole/pkg/session/open.go`
+- Modify: `/Users/shayne/code/derphole/cmd/derphole/open_test.go`
 
 - [ ] **Step 1: Write the failing bind-default test**
 
@@ -562,7 +562,7 @@ func TestOpenDefaultsToLocalEphemeralBind(t *testing.T) {
 
 - [ ] **Step 2: Run the targeted test to verify it fails if token defaults still matter**
 
-Run: `go test ./pkg/session ./cmd/derpcat -run TestOpenDefaultsToLocalEphemeralBind -count=1`
+Run: `go test ./pkg/session ./cmd/derphole -run TestOpenDefaultsToLocalEphemeralBind -count=1`
 Expected: FAIL or require adjustment because old token fields still influenced bind policy.
 
 - [ ] **Step 3: Implement fixed local policy**
@@ -579,20 +579,20 @@ func openLocalListener(cfg OpenConfig, tok token.Token) (net.Listener, error) {
 
 - [ ] **Step 4: Run the targeted test to verify it passes**
 
-Run: `go test ./pkg/session ./cmd/derpcat -run TestOpenDefaultsToLocalEphemeralBind -count=1`
+Run: `go test ./pkg/session ./cmd/derphole -run TestOpenDefaultsToLocalEphemeralBind -count=1`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add /Users/shayne/code/derpcat/pkg/session/open.go /Users/shayne/code/derpcat/cmd/derpcat/open_test.go
+git add /Users/shayne/code/derphole/pkg/session/open.go /Users/shayne/code/derphole/cmd/derphole/open_test.go
 git commit -m "security: keep open defaults local"
 ```
 
 ### Task 7: Full Suite and Live Security Verification
 
 **Files:**
-- Modify: `/Users/shayne/code/derpcat/README.md`
+- Modify: `/Users/shayne/code/derphole/README.md`
   - mention one-hour token lifetime if user-facing docs need it
 
 - [ ] **Step 1: Run the full local verification suite**
@@ -660,7 +660,7 @@ Expected: PASS with direct evidence on at least one side, no new security valida
 - [ ] **Step 7: Commit**
 
 ```bash
-git add /Users/shayne/code/derpcat/README.md
+git add /Users/shayne/code/derphole/README.md
 git commit -m "security: document hardened public sessions"
 ```
 

@@ -49,5 +49,5 @@
 
 - [ ] Run focused `go test` for `pkg/probe` and `pkg/session`.
 - [ ] Run `mise run build`.
-- [ ] Run no-Tailscale derpcat 1 GiB forward and reverse against `ktzlxc`.
+- [ ] Run no-Tailscale derphole 1 GiB forward and reverse against `ktzlxc`.
 - [ ] Compare against iperf TCP/UDP `-P 4` baselines over forwarded port `8321` only as a baseline, not as an implementation dependency.

@@ -6,7 +6,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/shayne/derpcat/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/telemetry"
 )
 
 var commandContext = func() (context.Context, context.CancelFunc) {
@@ -14,7 +14,7 @@ var commandContext = func() (context.Context, context.CancelFunc) {
 }
 
 func usePublicDERPTransport() bool {
-	return os.Getenv("DERPCAT_TEST_LOCAL_RELAY") != "1"
+	return os.Getenv("DERPHOLE_TEST_LOCAL_RELAY") != "1"
 }
 
 func commandSessionTelemetryLevel(level telemetry.Level) telemetry.Level {

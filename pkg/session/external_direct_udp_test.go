@@ -17,12 +17,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/derpbind"
-	"github.com/shayne/derpcat/pkg/probe"
-	"github.com/shayne/derpcat/pkg/rendezvous"
-	"github.com/shayne/derpcat/pkg/telemetry"
-	"github.com/shayne/derpcat/pkg/token"
-	"github.com/shayne/derpcat/pkg/transport"
+	"github.com/shayne/derphole/pkg/derpbind"
+	"github.com/shayne/derphole/pkg/probe"
+	"github.com/shayne/derphole/pkg/rendezvous"
+	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/token"
+	"github.com/shayne/derphole/pkg/transport"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -2067,7 +2067,7 @@ func TestExternalDirectUDPConnsUseProbeCompatibleDualStackSockets(t *testing.T) 
 }
 
 func TestExternalDirectUDPConnsUseLoopbackIPv4SocketsForFakeTransport(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
 
 	conns, _, cleanup, err := externalDirectUDPConns(nil, nil, 1, nil)
 	if err != nil {
@@ -2332,7 +2332,7 @@ func TestExternalDirectUDPReceiveSectionLayoutUsesSenderSizes(t *testing.T) {
 }
 
 func TestExternalDirectUDPReceiveSectionTargetUsesRegularFileDirectly(t *testing.T) {
-	file, err := os.CreateTemp(t.TempDir(), "derpcat-section-target-*")
+	file, err := os.CreateTemp(t.TempDir(), "derphole-section-target-*")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2359,7 +2359,7 @@ func TestExternalDirectUDPReceiveSectionTargetUsesRegularFileDirectly(t *testing
 }
 
 func TestExternalDirectUDPReceiveSectionTargetUsesWrappedRegularFileDirectly(t *testing.T) {
-	file, err := os.CreateTemp(t.TempDir(), "derpcat-section-target-*")
+	file, err := os.CreateTemp(t.TempDir(), "derphole-section-target-*")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2386,7 +2386,7 @@ func TestExternalDirectUDPReceiveSectionTargetUsesWrappedRegularFileDirectly(t *
 }
 
 func TestExternalDirectUDPSectionWriterForTargetBypassesBufferForRegularFiles(t *testing.T) {
-	file, err := os.CreateTemp(t.TempDir(), "derpcat-section-target-*")
+	file, err := os.CreateTemp(t.TempDir(), "derphole-section-target-*")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2403,7 +2403,7 @@ func TestExternalDirectUDPSectionWriterForTargetBypassesBufferForRegularFiles(t 
 }
 
 func TestExternalDirectUDPSectionWriterForTargetBypassesBufferForWrappedRegularFiles(t *testing.T) {
-	file, err := os.CreateTemp(t.TempDir(), "derpcat-section-target-*")
+	file, err := os.CreateTemp(t.TempDir(), "derphole-section-target-*")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2436,7 +2436,7 @@ func TestExternalDirectUDPReceiveSectionTargetSpoolsNonFiles(t *testing.T) {
 }
 
 func TestExternalDirectUDPFinishSectionTargetSeeksDirectFileToEnd(t *testing.T) {
-	file, err := os.CreateTemp(t.TempDir(), "derpcat-section-target-*")
+	file, err := os.CreateTemp(t.TempDir(), "derphole-section-target-*")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2479,7 +2479,7 @@ func TestExternalDirectUDPParallelCandidateStringsPreferEstablishedPeerAddr(t *t
 }
 
 func TestExternalDirectUDPParallelCandidateStringsPreferLoopbackForFakeTransport(t *testing.T) {
-	t.Setenv("DERPCAT_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
 	peer, err := net.ResolveUDPAddr("udp", "10.0.1.254:44321")
 	if err != nil {
 		t.Fatal(err)

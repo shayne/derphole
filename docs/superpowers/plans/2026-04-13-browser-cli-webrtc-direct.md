@@ -893,8 +893,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/derphole/webproto"
-	"github.com/shayne/derpcat/pkg/derphole/webrelay"
+	"github.com/shayne/derphole/pkg/derphole/webproto"
+	"github.com/shayne/derphole/pkg/derphole/webrelay"
 )
 
 type memoryPeer struct {
@@ -996,8 +996,8 @@ import (
 	"sync"
 
 	"github.com/pion/webrtc/v4"
-	"github.com/shayne/derpcat/pkg/derphole/webproto"
-	"github.com/shayne/derpcat/pkg/derphole/webrelay"
+	"github.com/shayne/derphole/pkg/derphole/webproto"
+	"github.com/shayne/derphole/pkg/derphole/webrelay"
 )
 
 const receiveQueueFrames = 512
@@ -1374,7 +1374,7 @@ Expected: FAIL with undefined `derpholeWebRelayReceiveWithOptions` and `derphole
 Modify imports in `pkg/derphole/transfer.go`:
 
 ```go
-	"github.com/shayne/derpcat/pkg/derphole/webrtcdirect"
+	"github.com/shayne/derphole/pkg/derphole/webrtcdirect"
 ```
 
 Modify package variables:
@@ -1556,7 +1556,7 @@ echo "Built browser assets in $TMP"
 echo "Manual smoke:"
 echo "1. Serve $TMP with: python3 -m http.server --directory \"$TMP\" 8765"
 echo "2. Open http://127.0.0.1:8765/"
-echo "3. Send from browser, receive with: go run ./cmd/derpcat derphole receive <token>"
+echo "3. Send from browser, receive with: go run ./cmd/derphole derphole receive <token>"
 ```
 
 Make it executable:
@@ -1596,7 +1596,7 @@ python3 -m http.server --directory "${TMPDIR:-/tmp}/derphole-web-cli-smoke" 8765
 3. Receive with native CLI:
 
 ```bash
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 go run ./cmd/derpcat derphole receive '<token>'
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 go run ./cmd/derphole derphole receive '<token>'
 ```
 
 Record time to first byte, path-switch time, average throughput, final path, and whether relay fallback was used.
@@ -1682,7 +1682,7 @@ ssh root@ktzlxc 'rm -f ~/derphole-web-cli-recv.log ~/1GBFile.browser'
 Use the browser page to generate a token, then on `ktzlxc` run:
 
 ```bash
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 npx -y derphole@dev --verbose receive '<token>' > ~/1GBFile.browser 2> ~/derphole-web-cli-recv.log
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 npx -y derphole@dev --verbose receive '<token>' > ~/1GBFile.browser 2> ~/derphole-web-cli-recv.log
 ```
 
 Expected: payload starts immediately over relay, WebRTC direct is attempted, final logs show `connected-direct` when direct succeeds, and no early freeze around the first five seconds.
@@ -1698,7 +1698,7 @@ ssh eric@eric-nuc 'rm -f ~/derphole-web-cli-recv.log ~/128MBFile.browser'
 Use the browser page to generate a token, then on `eric-nuc` run:
 
 ```bash
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 npx -y derphole@dev --verbose receive '<token>' > ~/128MBFile.browser 2> ~/derphole-web-cli-recv.log
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 npx -y derphole@dev --verbose receive '<token>' > ~/128MBFile.browser 2> ~/derphole-web-cli-recv.log
 ```
 
 Expected: transfer does not hang; throughput is judged against current residential upload ceiling rather than ktzlxc expectations.

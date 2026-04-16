@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a reproducible benchmark gate for this Mac plus `ktzlxc`, `canlxc`, `uklxc`, and `orange-india.exe.xyz`, then harden derpcat's relay-first/direct-UDP path so total wall time improves, peak throughput stays near WAN ceiling, and slower WAN links stop failing under default settings.
+**Goal:** Add a reproducible benchmark gate for this Mac plus `ktzlxc`, `canlxc`, `uklxc`, and `orange-india.exe.xyz`, then harden derphole's relay-first/direct-UDP path so total wall time improves, peak throughput stays near WAN ceiling, and slower WAN links stop failing under default settings.
 
-**Architecture:** Keep derpcat's current DERP-coordinated relay-first startup and direct-UDP fast path. Borrow from magic-wormhole only the disciplined parts: explicit contender/winner reasoning, delayed fallback, bounded backpressure, and durable telemetry. Extend the existing probe/session stats with interval-based metrics, feed those metrics into the current adaptive blast controller, and add a Go-driven benchmark matrix that compares baseline vs candidate across all four remotes in both directions.
+**Architecture:** Keep derphole's current DERP-coordinated relay-first startup and direct-UDP fast path. Borrow from magic-wormhole only the disciplined parts: explicit contender/winner reasoning, delayed fallback, bounded backpressure, and durable telemetry. Extend the existing probe/session stats with interval-based metrics, feed those metrics into the current adaptive blast controller, and add a Go-driven benchmark matrix that compares baseline vs candidate across all four remotes in both directions.
 
-**Tech Stack:** Go, bash, existing `cmd/derpcat-probe`, `pkg/probe`, `pkg/session`, `mise`, `nix run nixpkgs#iperf3`, Ookla `speedtest`
+**Tech Stack:** Go, bash, existing `cmd/derphole-probe`, `pkg/probe`, `pkg/session`, `mise`, `nix run nixpkgs#iperf3`, Ookla `speedtest`
 
 ---
 
@@ -40,11 +40,11 @@
   Purpose: emit session-wide summary metrics and tighten dynamic start/rate/window decisions.
 - Modify: `pkg/session/external_direct_udp_test.go`
   Purpose: verify ktzlxc-style high-ceiling behavior is preserved while slower links scale down cleanly.
-- Create: `cmd/derpcat-probe/matrix.go`
+- Create: `cmd/derphole-probe/matrix.go`
   Purpose: run the 10x both-direction benchmark matrix over the production `promotion-test` harnesses and write JSON/markdown artifacts.
-- Create: `cmd/derpcat-probe/matrix_test.go`
+- Create: `cmd/derphole-probe/matrix_test.go`
   Purpose: test host iteration, output parsing, and baseline-vs-candidate verdicts with fake command runners.
-- Modify: `cmd/derpcat-probe/root.go`
+- Modify: `cmd/derphole-probe/root.go`
   Purpose: register the new `matrix` subcommand.
 - Modify: `scripts/promotion-test.sh`
   Purpose: append a stable `benchmark-*` key/value footer after SHA and cleanup verification.
@@ -405,8 +405,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/probe"
-	"github.com/shayne/derpcat/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/probe"
+	"github.com/shayne/derphole/pkg/telemetry"
 )
 
 func TestExternalTransferMetricsTrackRelayAndDirectBytes(t *testing.T) {
@@ -468,8 +468,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/probe"
-	"github.com/shayne/derpcat/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/probe"
+	"github.com/shayne/derphole/pkg/telemetry"
 )
 
 type externalTransferMetrics struct {
@@ -555,9 +555,9 @@ git commit -m "session: emit wall clock direct udp metrics"
 ### Task 4: Add A Go-Driven 10x Matrix Runner For The Production Harness
 
 **Files:**
-- Create: `cmd/derpcat-probe/matrix.go`
-- Create: `cmd/derpcat-probe/matrix_test.go`
-- Modify: `cmd/derpcat-probe/root.go`
+- Create: `cmd/derphole-probe/matrix.go`
+- Create: `cmd/derphole-probe/matrix_test.go`
+- Modify: `cmd/derphole-probe/root.go`
 - Modify: `scripts/promotion-test.sh`
 - Modify: `scripts/promotion-test-reverse.sh`
 - Modify: `scripts/promotion-matrix-no-tailscale.sh`
@@ -627,7 +627,7 @@ func TestRunMatrixIteratesAllHostsDirectionsAndIterations(t *testing.T) {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `go test ./cmd/derpcat-probe -run 'TestParsePromotionSummaryReadsBenchmarkFooter|TestRunMatrixIteratesAllHostsDirectionsAndIterations' -count=1`
+Run: `go test ./cmd/derphole-probe -run 'TestParsePromotionSummaryReadsBenchmarkFooter|TestRunMatrixIteratesAllHostsDirectionsAndIterations' -count=1`
 
 Expected: FAIL with undefined `parsePromotionSummary`, `runMatrix`, `matrixConfig`, and `runMatrixCommand`.
 
@@ -644,7 +644,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/shayne/derpcat/pkg/probe"
+	"github.com/shayne/derphole/pkg/probe"
 )
 
 type matrixConfig struct {
@@ -734,7 +734,7 @@ echo "benchmark-first-byte-ms=${sender_first_byte_ms}"
 echo "benchmark-success=true"
 ```
 
-Run: `go test ./cmd/derpcat-probe -run 'TestParsePromotionSummaryReadsBenchmarkFooter|TestRunMatrixIteratesAllHostsDirectionsAndIterations' -count=1`
+Run: `go test ./cmd/derphole-probe -run 'TestParsePromotionSummaryReadsBenchmarkFooter|TestRunMatrixIteratesAllHostsDirectionsAndIterations' -count=1`
 
 Expected: PASS
 
@@ -745,7 +745,7 @@ Expected: PASS with no shell syntax errors.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add cmd/derpcat-probe/matrix.go cmd/derpcat-probe/matrix_test.go cmd/derpcat-probe/root.go scripts/promotion-test.sh scripts/promotion-test-reverse.sh scripts/promotion-matrix-no-tailscale.sh
+git add cmd/derphole-probe/matrix.go cmd/derphole-probe/matrix_test.go cmd/derphole-probe/root.go scripts/promotion-test.sh scripts/promotion-test-reverse.sh scripts/promotion-matrix-no-tailscale.sh
 git commit -m "probe: add production benchmark matrix runner"
 ```
 
@@ -767,7 +767,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/probe"
+	"github.com/shayne/derphole/pkg/probe"
 )
 
 func TestExternalDirectUDPStartBudgetScalesDownForSlowCeilings(t *testing.T) {
@@ -873,7 +873,7 @@ Run: `go test ./pkg/probe ./pkg/session -run 'TestExternalDirectUDPStartBudgetSc
 
 Expected: PASS
 
-Run: `DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh ktzlxc 1024`
+Run: `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh ktzlxc 1024`
 
 Expected: PASS with `connected-relay` then `connected-direct`, no SHA mismatch, no leaked sockets, and `benchmark-success=true`.
 
@@ -907,7 +907,7 @@ Commands:
 
 ```sh
 nix run nixpkgs#iperf3 -- -s -p 8321 -1
-./dist/derpcat-probe matrix --hosts ktzlxc,canlxc,uklxc,orange-india.exe.xyz --iterations 10 --size-mib 1024 --out docs/benchmarks/2026-04-11-baseline.json
+./dist/derphole-probe matrix --hosts ktzlxc,canlxc,uklxc,orange-india.exe.xyz --iterations 10 --size-mib 1024 --out docs/benchmarks/2026-04-11-baseline.json
 speedtest
 ssh root@ktzlxc '~/speedtest --accept-license --accept-gdpr'
 ssh root@canlxc '~/speedtest --accept-license --accept-gdpr'
@@ -918,7 +918,7 @@ ssh root@orange-india.exe.xyz '~/speedtest --accept-license --accept-gdpr'
 
 - [ ] **Step 2: Run the matrix and save the output**
 
-Run: `./dist/derpcat-probe matrix --hosts ktzlxc,canlxc,uklxc,orange-india.exe.xyz --iterations 10 --size-mib 1024 --out docs/benchmarks/2026-04-11-baseline.json`
+Run: `./dist/derphole-probe matrix --hosts ktzlxc,canlxc,uklxc,orange-india.exe.xyz --iterations 10 --size-mib 1024 --out docs/benchmarks/2026-04-11-baseline.json`
 
 Expected: PASS, with one JSON artifact and one markdown summary that include:
 - total wall time per host/direction
@@ -935,7 +935,7 @@ Expected: PASS, with one JSON artifact and one markdown summary that include:
 Use the Go matrix runner for repeatable 10x both-direction validation:
 
 ```sh
-./dist/derpcat-probe matrix \
+./dist/derphole-probe matrix \
   --hosts ktzlxc,canlxc,uklxc,orange-india.exe.xyz \
   --iterations 10 \
   --size-mib 1024 \
@@ -959,7 +959,7 @@ Run: `mise run check`
 
 Expected: PASS
 
-Run: `./dist/derpcat-probe matrix --hosts ktzlxc,canlxc,uklxc,orange-india.exe.xyz --iterations 10 --size-mib 1024 --baseline docs/benchmarks/2026-04-11-baseline.json --out docs/benchmarks/2026-04-11-candidate.json`
+Run: `./dist/derphole-probe matrix --hosts ktzlxc,canlxc,uklxc,orange-india.exe.xyz --iterations 10 --size-mib 1024 --baseline docs/benchmarks/2026-04-11-baseline.json --out docs/benchmarks/2026-04-11-candidate.json`
 
 Expected: PASS, with no regression verdicts and ktzlxc staying near the forwarded-port iperf ceiling.
 

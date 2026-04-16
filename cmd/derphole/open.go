@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/shayne/derpcat/pkg/session"
-	"github.com/shayne/derpcat/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/session"
+	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/yargs"
 )
 

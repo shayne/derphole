@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/shayne/derpcat/pkg/derpbind"
+	"github.com/shayne/derphole/pkg/derpbind"
 	"github.com/tailscale/wireguard-go/conn"
 	"golang.org/x/net/ipv6"
 	"tailscale.com/net/batching"

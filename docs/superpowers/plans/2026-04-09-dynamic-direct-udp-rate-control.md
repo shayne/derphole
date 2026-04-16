@@ -849,7 +849,7 @@ Expected: pass.
 - No tracked source files.
 - Logs should go under ignored `notes/`.
 
-- [ ] **Step 1: Build current derpcat**
+- [ ] **Step 1: Build current derphole**
 
 Run:
 
@@ -857,11 +857,11 @@ Run:
 mise run build
 ```
 
-Expected: pass and produce `dist/derpcat`.
+Expected: pass and produce `dist/derphole`.
 
 - [ ] **Step 2: Measure WAN ceiling with iperf3 using nix**
 
-Use the existing forwarded test port only as baseline validation, not as derpcat transport design input.
+Use the existing forwarded test port only as baseline validation, not as derphole transport design input.
 
 Example Mac-side command shape:
 
@@ -877,10 +877,10 @@ Record the exact host and results in `notes/YYYY-MM-DD-dynamic-rate-validation.m
 Run:
 
 ```sh
-DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh uklxc 1024 2>&1 | tee notes/$(date +%Y-%m-%d)-uklxc-reverse-dynamic-single.log
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh uklxc 1024 2>&1 | tee notes/$(date +%Y-%m-%d)-uklxc-reverse-dynamic-single.log
 ```
 
-Expected: completes without exit 137, timeout, or leaked remote derpcat UDP sockets. Verbose output should include `udp-rate-ceiling-mbps=10000`, probe rates, probe samples, selected rate, replay pressure stats, and `stream-complete`.
+Expected: completes without exit 137, timeout, or leaked remote derphole UDP sockets. Verbose output should include `udp-rate-ceiling-mbps=10000`, probe rates, probe samples, selected rate, replay pressure stats, and `stream-complete`.
 
 - [ ] **Step 4: Run 10x uklxc reverse**
 
@@ -888,11 +888,11 @@ Run:
 
 ```sh
 for i in $(seq -w 1 10); do
-  DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh uklxc 1024 2>&1 | tee "notes/$(date +%Y-%m-%d)-uklxc-reverse-dynamic-${i}.log"
+  DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh uklxc 1024 2>&1 | tee "notes/$(date +%Y-%m-%d)-uklxc-reverse-dynamic-${i}.log"
 done
 ```
 
-Expected: 10/10 complete, no OOM kill increment on `uklxc`, no leaked remote derpcat UDP sockets, no replay window pegged at the hard budget across the run set.
+Expected: 10/10 complete, no OOM kill increment on `uklxc`, no leaked remote derphole UDP sockets, no replay window pegged at the hard budget across the run set.
 
 - [ ] **Step 5: Run 10x uklxc forward**
 
@@ -900,7 +900,7 @@ Run:
 
 ```sh
 for i in $(seq -w 1 10); do
-  DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh uklxc 1024 2>&1 | tee "notes/$(date +%Y-%m-%d)-uklxc-forward-dynamic-${i}.log"
+  DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh uklxc 1024 2>&1 | tee "notes/$(date +%Y-%m-%d)-uklxc-forward-dynamic-${i}.log"
 done
 ```
 
@@ -914,9 +914,9 @@ Run:
 for dir in forward reverse; do
   for i in $(seq -w 1 10); do
     if [ "$dir" = forward ]; then
-      DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh ktzlxc 1024 2>&1 | tee "notes/$(date +%Y-%m-%d)-ktzlxc-forward-dynamic-${i}.log"
+      DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh ktzlxc 1024 2>&1 | tee "notes/$(date +%Y-%m-%d)-ktzlxc-forward-dynamic-${i}.log"
     else
-      DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh ktzlxc 1024 2>&1 | tee "notes/$(date +%Y-%m-%d)-ktzlxc-reverse-dynamic-${i}.log"
+      DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh ktzlxc 1024 2>&1 | tee "notes/$(date +%Y-%m-%d)-ktzlxc-reverse-dynamic-${i}.log"
     fi
   done
 done
@@ -942,7 +942,7 @@ Include:
 - iperf3 forward:
 - iperf3 reverse:
 
-## derpcat
+## derphole
 
 - uklxc reverse 10x:
 - uklxc forward 10x:

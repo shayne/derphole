@@ -3,15 +3,15 @@ set -euo pipefail
 
 target="${1:?usage: $0 <host>}"
 tmp="$(mktemp -d)"
-remote_base="/tmp/derpcat-share-smoke-$$"
-remote_upload="/tmp/derpcat-share-bin-$$"
+remote_base="/tmp/derphole-share-smoke-$$"
+remote_upload="/tmp/derphole-share-bin-$$"
 local_share_pid=""
 local_http_pid=""
-remote_user="${DERPCAT_REMOTE_USER:-root}"
+remote_user="${DERPHOLE_REMOTE_USER:-root}"
 remote_env=()
 
-if [[ "${DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES:-}" == "1" ]]; then
-  remote_env+=(DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1)
+if [[ "${DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES:-}" == "1" ]]; then
+  remote_env+=(DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1)
 fi
 
 remote() {
@@ -27,7 +27,7 @@ cleanup() {
     kill "${local_http_pid}" 2>/dev/null || true
     wait "${local_http_pid}" 2>/dev/null || true
   fi
-  remote "if [[ -f '${remote_base}.pid' ]]; then kill \$(cat '${remote_base}.pid') 2>/dev/null || true; fi; rm -f '${remote_base}'.* '/tmp/derpcat-share-'* >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+  remote "if [[ -f '${remote_base}.pid' ]]; then kill \$(cat '${remote_base}.pid') 2>/dev/null || true; fi; rm -f '${remote_base}'.* '/tmp/derphole-share-'* >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
   rm -rf "${tmp}"
 }
 trap cleanup EXIT
@@ -138,8 +138,8 @@ wait_for_direct_evidence() {
 
 mise run build
 mise run build-linux-amd64
-scp dist/derpcat-linux-amd64 "${remote_user}@${target}:${remote_upload}" >/dev/null
-remote "install -m 0755 '${remote_upload}' /usr/local/bin/derpcat && rm -f '${remote_upload}' && /usr/local/bin/derpcat help open >/dev/null 2>&1"
+scp dist/derphole-linux-amd64 "${remote_user}@${target}:${remote_upload}" >/dev/null
+remote "install -m 0755 '${remote_upload}' /usr/local/bin/derphole && rm -f '${remote_upload}' && /usr/local/bin/derphole help open >/dev/null 2>&1"
 
 shared_content="hello shared service ${target} $(date +%s)"
 printf '%s\n' "${shared_content}" >"${tmp}/index.html"
@@ -148,7 +148,7 @@ python3 -m http.server "${local_http_port}" --bind 127.0.0.1 --directory "${tmp}
 local_http_pid=$!
 
 local_share_log="${tmp}/share.err"
-dist/derpcat --verbose share "127.0.0.1:${local_http_port}" >"${tmp}/share.out" 2>"${local_share_log}" &
+dist/derphole --verbose share "127.0.0.1:${local_http_port}" >"${tmp}/share.out" 2>"${local_share_log}" &
 local_share_pid=$!
 
 token="$(wait_for_local_token "${local_share_log}")" || {
@@ -158,7 +158,7 @@ token="$(wait_for_local_token "${local_share_log}")" || {
 }
 
 remote_open_err="${remote_base}.open.err"
-remote "rm -f '${remote_base}.pid' '${remote_open_err}'; nohup /usr/local/bin/derpcat --verbose open '${token}' >/dev/null 2>'${remote_open_err}' </dev/null & echo \$! > '${remote_base}.pid'"
+remote "rm -f '${remote_base}.pid' '${remote_open_err}'; nohup /usr/local/bin/derphole --verbose open '${token}' >/dev/null 2>'${remote_open_err}' </dev/null & echo \$! > '${remote_base}.pid'"
 bind_addr="$(wait_for_remote_bind "${remote_open_err}")" || {
   echo "failed to capture remote bind address" >&2
   remote "sed -n '1,200p' '${remote_open_err}'" >&2 || true
