@@ -909,14 +909,17 @@ func TestExternalListenSendSmallPayloadFinishesOverRelayBeforeDelayedDirectUDP(t
 	if err := <-listenErr; err != nil {
 		t.Fatalf("Listen() error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
 	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("small payload took %v, want relay completion before delayed direct UDP; listener=%q sender=%q", elapsed, listenerStatus.String(), senderStatus.String())
+	if elapsed := time.Since(start); elapsed > externalDirectUDPWait+2*time.Second {
+		t.Fatalf("small payload took %v, want relay completion without long direct UDP wait; listener=%q sender=%q", elapsed, listenerStatus.String(), senderStatus.String())
 	}
 	if !bytes.Equal(listenerOut.Bytes(), payload) {
 		t.Fatalf("listener output length = %d, want %d", listenerOut.Len(), len(payload))
 	}
-	if got := senderStatus.String(); strings.Contains(got, "udp-stream=true") {
-		t.Fatalf("sender status = %q, want payload completion before direct UDP stream starts", got)
+	if got := senderStatus.String(); !strings.Contains(got, "udp-handoff-finished-on-relay=true") || strings.Contains(got, "udp-stream=true") {
+		t.Fatalf("sender status = %q, want relay completion before direct UDP stream starts", got)
+	}
+	if got := listenerStatus.String(); !strings.Contains(got, "udp-handoff-finished-on-relay=true") || strings.Contains(got, "udp-stream=true") {
+		t.Fatalf("listener status = %q, want relay completion before direct UDP stream starts", got)
 	}
 }
 
@@ -990,14 +993,17 @@ func TestExternalListenSendSmallPayloadFinishesOverRelayWhileDirectReadyAckIsDel
 	if err := <-listenErr; err != nil {
 		t.Fatalf("Listen() error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
 	}
-	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
-		t.Fatalf("small payload took %v, want relay completion while direct ready ack is delayed; listener=%q sender=%q", elapsed, listenerStatus.String(), senderStatus.String())
+	if elapsed := time.Since(start); elapsed > externalDirectUDPWait+2*time.Second {
+		t.Fatalf("small payload took %v, want relay completion without long direct UDP wait; listener=%q sender=%q", elapsed, listenerStatus.String(), senderStatus.String())
 	}
 	if !bytes.Equal(listenerOut.Bytes(), payload) {
 		t.Fatalf("listener output length = %d, want %d", listenerOut.Len(), len(payload))
 	}
-	if got := senderStatus.String(); strings.Contains(got, "udp-stream=true") {
+	if got := senderStatus.String(); !strings.Contains(got, "udp-handoff-finished-on-relay=true") || strings.Contains(got, "udp-stream=true") {
 		t.Fatalf("sender status = %q, want relay completion before direct UDP stream starts", got)
+	}
+	if got := listenerStatus.String(); !strings.Contains(got, "udp-handoff-finished-on-relay=true") || strings.Contains(got, "udp-stream=true") {
+		t.Fatalf("listener status = %q, want relay completion before direct UDP stream starts", got)
 	}
 }
 
