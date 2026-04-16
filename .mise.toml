@@ -65,7 +65,7 @@ run = """
 set -euo pipefail
 bash ./tools/packaging/build-vendor.sh
 bash ./tools/packaging/build-npm.sh
-for product in derphole derphole; do
+for product in derphole; do
   pkg_version="$(node -e "process.stdout.write(require('./dist/npm-${product}/package.json').version)")"
   if [[ "$pkg_version" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+-.+ ]]; then
     npm publish "./dist/npm-${product}" --access public --dry-run --tag dev
@@ -82,9 +82,10 @@ run = "bash ./scripts/release-package-smoke.sh"
 shell = "bash -c"
 run = """
 set -euo pipefail
+rm -rf dist/raw
 mkdir -p dist/raw
 bash ./tools/packaging/build-vendor.sh
-for product in derphole derphole; do
+for product in derphole; do
   cp "dist/vendor/x86_64-unknown-linux-musl/${product}/${product}" "dist/raw/${product}-linux-amd64"
   cp "dist/vendor/aarch64-unknown-linux-musl/${product}/${product}" "dist/raw/${product}-linux-arm64"
   cp "dist/vendor/x86_64-apple-darwin/${product}/${product}" "dist/raw/${product}-darwin-amd64"

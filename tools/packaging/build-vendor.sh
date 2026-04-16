@@ -20,7 +20,7 @@ targets=(
 
 for target in "${targets[@]}"; do
   read -r goos goarch triple <<<"${target}"
-  for product in derphole derphole; do
+  for product in derphole; do
     dest_dir="${OUT_DIR}/${triple}/${product}"
     mkdir -p "${dest_dir}"
     CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \

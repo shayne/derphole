@@ -50,7 +50,7 @@ if [[ -z "$token" ]]; then
   exit 1
 fi
 
-printf 'hello smoke' | dist/derphole send "$token" >"$tmp/sender.out" 2>"$sender_log"
+printf 'hello smoke' | dist/derphole pipe "$token" >"$tmp/sender.out" 2>"$sender_log"
 wait "$listener_pid"
 
 test "$(cat "$output_file")" = "hello smoke"

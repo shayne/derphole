@@ -147,7 +147,7 @@ remote_token="$(wait_for_remote_token)" || {
   dump_remote_logs >&2
   exit 1
 }
-send_staged_payload "${payload_local_to_remote}" | dist/derphole --verbose send "${remote_token}" >"${tmp}/local-sender.out" 2>"${tmp}/local-sender.err"
+send_staged_payload "${payload_local_to_remote}" | dist/derphole --verbose pipe "${remote_token}" >"${tmp}/local-sender.out" 2>"${tmp}/local-sender.err"
 wait_for_remote_exit || {
   echo "remote listener did not exit" >&2
   dump_remote_logs >&2
@@ -178,7 +178,7 @@ local_token="$(wait_for_local_token "${local_listener_log}")" || {
   sed -n '1,160p' "${local_listener_log}" >&2 || true
   exit 1
 }
-remote "payload='${payload_remote_to_local}'; split_at=\$(( \${#payload} / 2 )); { printf '%s' \"\${payload:0:split_at}\"; sleep '${transfer_pause}'; printf '%s' \"\${payload:split_at}\"; } | /usr/local/bin/derphole --verbose send '${local_token}' >'${remote_base}.sender.out' 2>'${remote_base}.sender.err'"
+remote "payload='${payload_remote_to_local}'; split_at=\$(( \${#payload} / 2 )); { printf '%s' \"\${payload:0:split_at}\"; sleep '${transfer_pause}'; printf '%s' \"\${payload:split_at}\"; } | /usr/local/bin/derphole --verbose pipe '${local_token}' >'${remote_base}.sender.out' 2>'${remote_base}.sender.err'"
 wait_for_local_exit "${local_listener_pid}" || {
   echo "local listener did not exit" >&2
   sed -n '1,160p' "${local_listener_log}" >&2 || true

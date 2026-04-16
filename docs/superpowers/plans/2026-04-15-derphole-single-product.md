@@ -26,10 +26,10 @@
   - TCP service open wrapper.
 - Modify: `cmd/derphole/*_test.go`
   - Add CLI tests for migrated commands.
-- Delete: `cmd/derphole/`
-  - Remove retired CLI after behavior is covered in `cmd/derphole`.
-- Move: `cmd/derphole-probe/` to `cmd/derphole-probe/`
-  - Rename probe command and tests.
+- Delete: retired raw CLI directory
+  - Remove the retired CLI after behavior is covered in `cmd/derphole`.
+- Move: legacy probe command to `cmd/derphole-probe/`
+  - Rename the probe command and tests.
 - Modify: `go.mod`
   - Change module path to `github.com/shayne/derphole`.
 - Modify: all `.go` files
@@ -38,8 +38,8 @@
   - Rename `DERPHOLE_` variables and internal branded string constants to `DERPHOLE_` / `derphole`.
 - Modify: `.mise.toml`, `.github/workflows/release.yml`, `tools/packaging/*.sh`, `packaging/npm/`, `scripts/release-package-smoke.sh`
   - Build and publish only `derphole`.
-- Delete: `packaging/npm/derphole/`
-  - Retire npm package template.
+- Delete: retired npm package template
+  - Stop staging the retired package.
 - Modify: `README.md`, `AGENTS.md`, `docs/**/*.md`, `scripts/**/*.sh`, `web/derphole/*`
   - Remove retired product references and document the single-product command surface.
 
@@ -116,14 +116,14 @@ git commit -m "feat: move raw and share commands into derphole"
 ## Task 3: Remove retired CLI and rename the probe command
 
 **Files:**
-- Delete: `cmd/derphole/`
-- Move: `cmd/derphole-probe/` to `cmd/derphole-probe/`
+- Delete: retired raw CLI directory
+- Move: legacy probe command to `cmd/derphole-probe/`
 - Modify: `.mise.toml`
 - Modify: scripts that build or call the probe command
 
 - [ ] **Step 1: Remove retired CLI directory**
 
-Delete `cmd/derphole` after `cmd/derphole` covers its features.
+Delete the retired CLI directory after `cmd/derphole` covers its features.
 
 - [ ] **Step 2: Rename probe command directory and executable names**
 
@@ -159,15 +159,15 @@ Change `go.mod` to `module github.com/shayne/derphole`.
 
 - [ ] **Step 2: Rewrite internal imports**
 
-Replace `github.com/shayne/derphole` with `github.com/shayne/derphole` in Go files.
+Change internal imports to `github.com/shayne/derphole/...` in Go files.
 
 - [ ] **Step 3: Rename environment variables**
 
-Replace `DERPHOLE_` with `DERPHOLE_` in Go code, tests, scripts, and docs.
+Replace the retired environment prefix with `DERPHOLE_` in Go code, tests, scripts, and docs.
 
 - [ ] **Step 4: Rename internal branded string constants**
 
-Replace internal `derphole-` string constants with `derphole-` where used for filenames, probes, ALPN, temp files, and bus client names.
+Replace retired branded string constants with `derphole-` where used for filenames, probes, ALPN, temp files, and bus client names.
 
 - [ ] **Step 5: Verify core packages**
 

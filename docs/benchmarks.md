@@ -13,9 +13,9 @@ Use the checked-in harnesses first:
 - `./scripts/smoke-remote.sh my-server.example.com`
 - `./scripts/smoke-remote-share.sh my-server.example.com`
 
-`promotion-test.sh` is the main throughput benchmark for one-shot `listen/send`. It verifies byte count, SHA-256, path transition logs, and now fails if any `derphole` process or UDP socket survives after cleanup.
+`promotion-test.sh` is the main throughput benchmark for one-shot `listen/pipe`. It verifies byte count, SHA-256, path transition logs, and now fails if any `derphole` process or UDP socket survives after cleanup.
 
-When comparing direct-path striping, forward the same CLI flag family used by `send` and `open` through the harness with `DERPHOLE_PARALLEL_ARGS`. The harness passes those args to the active side only: local `send/open` in forward runs and remote `send/open` in reverse runs. The passive side follows the active side's negotiated request.
+When comparing direct-path striping, forward the same CLI flag family used by `pipe` and `open` through the harness with `DERPHOLE_PARALLEL_ARGS`. The harness passes those args to the active side only: local `pipe/open` in forward runs and remote `pipe/open` in reverse runs. The passive side follows the active side's negotiated request.
 
 ## Baseline Comparisons
 
@@ -23,7 +23,7 @@ Measure raw network capacity separately before blaming tunnel overhead.
 
 - `iperf3` between the same two hosts for a TCP baseline
 - `nc` plus `pv` for a simple streaming baseline
-- then the matching `derphole listen/send` or `share/open` path
+- then the matching `derphole listen/pipe` or `share/open` path
 
 Keep source payload size, host pair, and direction fixed when comparing variants. Record duration, throughput, final path state, and whether the session upgraded from `connected-relay` to `connected-direct`.
 
@@ -46,7 +46,7 @@ Examples:
 
 ## Direct UDP Probe Harness
 
-The raw-mode direct UDP probe harness is a microbenchmark for packet-engine experiments. Production `listen/send` now uses DERP-coordinated direct UDP by default, so treat this harness as a lower-level comparison tool rather than the proof of the default transport.
+The raw-mode direct UDP probe harness is a microbenchmark for packet-engine experiments. Production `listen/pipe` now uses DERP-coordinated direct UDP by default, so treat this harness as a lower-level comparison tool rather than the proof of the default transport.
 
 Every derphole baseline command in this validation path must set `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1`.
 
@@ -111,7 +111,7 @@ python3 -m http.server --directory "${TMPDIR:-/tmp}/derphole-web-cli-smoke" 8765
 3. Receive with native CLI:
 
 ```bash
-DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 go run ./cmd/derphole derphole receive '<token>'
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 go run ./cmd/derphole receive '<token>'
 ```
 
 Record time to first byte, path-switch time, average throughput, final path, and whether relay fallback was used. Do not compare manual verbose runs against quiet harness throughput.

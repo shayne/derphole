@@ -91,7 +91,7 @@ remote_token="$(wait_for_remote_token)" || {
   dump_remote_logs >&2
   exit 1
 }
-printf '%s' "${payload_local_to_remote}" | dist/derphole send "${remote_token}" --force-relay >"${tmp}/local-sender.out" 2>"${tmp}/local-sender.err"
+printf '%s' "${payload_local_to_remote}" | dist/derphole pipe "${remote_token}" --force-relay >"${tmp}/local-sender.out" 2>"${tmp}/local-sender.err"
 wait_for_remote_exit || {
   echo "remote relay listener did not exit" >&2
   dump_remote_logs >&2
@@ -118,7 +118,7 @@ local_token="$(wait_for_local_token "${local_listener_log}")" || {
   sed -n '1,160p' "${local_listener_log}" >&2 || true
   exit 1
 }
-remote "printf '%s' '${payload_remote_to_local}' | /usr/local/bin/derphole send '${local_token}' --force-relay >'${remote_base}.sender.out' 2>'${remote_base}.sender.err'"
+remote "printf '%s' '${payload_remote_to_local}' | /usr/local/bin/derphole pipe '${local_token}' --force-relay >'${remote_base}.sender.out' 2>'${remote_base}.sender.err'"
 wait_for_local_exit "${local_listener_pid}" || {
   echo "local relay listener did not exit" >&2
   sed -n '1,160p' "${local_listener_log}" >&2 || true

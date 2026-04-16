@@ -1556,7 +1556,7 @@ echo "Built browser assets in $TMP"
 echo "Manual smoke:"
 echo "1. Serve $TMP with: python3 -m http.server --directory \"$TMP\" 8765"
 echo "2. Open http://127.0.0.1:8765/"
-echo "3. Send from browser, receive with: go run ./cmd/derphole derphole receive <token>"
+echo "3. Send from browser, receive with: go run ./cmd/derphole receive <token>"
 ```
 
 Make it executable:
@@ -1596,7 +1596,7 @@ python3 -m http.server --directory "${TMPDIR:-/tmp}/derphole-web-cli-smoke" 8765
 3. Receive with native CLI:
 
 ```bash
-DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 go run ./cmd/derphole derphole receive '<token>'
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 go run ./cmd/derphole receive '<token>'
 ```
 
 Record time to first byte, path-switch time, average throughput, final path, and whether relay fallback was used.

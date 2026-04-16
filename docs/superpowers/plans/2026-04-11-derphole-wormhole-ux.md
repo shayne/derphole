@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a second CLI, `derphole`, that delivers wormhole-shaped text/file/directory/SSH workflows on top of the existing derphole transport stack, and ship both `derphole` and `derphole` from the same release pipeline.
+**Goal:** Add wormhole-shaped text/file/directory/SSH workflows on top of the existing derphole transport stack, and ship them from the release pipeline.
 
 **Architecture:** Introduce a shared one-shot bidirectional attach primitive in `pkg/session`, then build a new `pkg/derphole` application layer and `cmd/derphole` CLI on top of it. Keep `derphole` raw `listen` / `send` and `share` / `open` semantics intact, while refactoring packaging and release scripts so both products reuse the same vendored binaries, build metadata, and npm/release workflow.
 
@@ -92,13 +92,13 @@
 - `tools/packaging/build-vendor.sh`
   - vendor both commands per target triple
 - `scripts/release-package-smoke.sh`
-  - smoke both npm packages
+  - smoke the npm package
 - `.github/workflows/release.yml`
   - build, stage, and publish both products from one workflow
 - `README.md`
   - explain `derphole` vs `derphole`
 - `docs/releases/npm-bootstrap.md`
-  - bootstrap both npm packages
+  - bootstrap the npm package
 - `AGENTS.md`
   - keep build/release guidance accurate for two products
 
@@ -1546,7 +1546,7 @@ Expected: FAIL on missing `dist/raw/derphole-*` and `dist/npm-derphole`.
 
 ```bash
 # tools/packaging/build-npm.sh
-for product in derphole derphole; do
+for product in derphole; do
   src_dir="${ROOT_DIR}/packaging/npm/${product}"
   out_dir="${ROOT_DIR}/dist/npm-${product}"
   rm -rf "${out_dir}"
@@ -1613,13 +1613,13 @@ Expected: PASS and creates:
 
 Then run: `VERSION=v0.0.1 mise run release:npm-dry-run`
 
-Expected: PASS with dry-run publish output for both packages.
+Expected: PASS with dry-run publish output for the package.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add .mise.toml tools/packaging/build-vendor.sh tools/packaging/build-npm.sh tools/packaging/build-release-assets.sh scripts/release-package-smoke.sh .github/workflows/release.yml packaging/npm/derphole packaging/npm/derphole
-git commit -m "build: release derphole and derphole together"
+git commit -m "build: release derphole package"
 ```
 
 ## Task 10: Update docs and run final verification
@@ -1677,11 +1677,11 @@ Expected: PASS
 
 Run: `mise run build`
 
-Expected: PASS and produces `dist/derphole` and `dist/derphole`
+Expected: PASS and produces `dist/derphole`
 
 Run: `VERSION=v0.0.1 mise run release:npm-dry-run`
 
-Expected: PASS for both packages
+Expected: PASS for the package
 
 - [ ] **Step 3: Run focused CLI smoke tests for the new product**
 

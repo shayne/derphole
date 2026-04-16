@@ -14,7 +14,7 @@ else
   checksum_cmd=(shasum -a 256)
 fi
 
-for product in derphole derphole; do
+for product in derphole; do
   for asset in \
     "${product}-linux-amd64" \
     "${product}-linux-arm64" \

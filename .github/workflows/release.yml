@@ -64,50 +64,26 @@ jobs:
         run: mise run vet
 
   build-binaries:
-    name: Build ${{ matrix.product }} (${{ matrix.goos }}/${{ matrix.goarch }})
+    name: Build derphole (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ${{ matrix.runner }}
     needs: [meta]
     strategy:
       fail-fast: false
       matrix:
         include:
-          - product: derphole
-            runner: ubuntu-latest
+          - runner: ubuntu-latest
             goos: linux
             goarch: amd64
             asset: derphole-linux-amd64
-          - product: derphole
-            runner: ubuntu-latest
+          - runner: ubuntu-latest
             goos: linux
             goarch: arm64
             asset: derphole-linux-arm64
-          - product: derphole
-            runner: macos-latest
+          - runner: macos-latest
             goos: darwin
             goarch: amd64
             asset: derphole-darwin-amd64
-          - product: derphole
-            runner: macos-latest
-            goos: darwin
-            goarch: arm64
-            asset: derphole-darwin-arm64
-          - product: derphole
-            runner: ubuntu-latest
-            goos: linux
-            goarch: amd64
-            asset: derphole-linux-amd64
-          - product: derphole
-            runner: ubuntu-latest
-            goos: linux
-            goarch: arm64
-            asset: derphole-linux-arm64
-          - product: derphole
-            runner: macos-latest
-            goos: darwin
-            goarch: amd64
-            asset: derphole-darwin-amd64
-          - product: derphole
-            runner: macos-latest
+          - runner: macos-latest
             goos: darwin
             goarch: arm64
             asset: derphole-darwin-arm64
@@ -129,7 +105,7 @@ jobs:
             go build -trimpath \
               -ldflags "-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}" \
               -o dist/${{ matrix.asset }} \
-              ./cmd/${{ matrix.product }}
+              ./cmd/derphole
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
@@ -184,20 +160,14 @@ jobs:
             -n derphole-linux-arm64 \
             -n derphole-darwin-amd64 \
             -n derphole-darwin-arm64 \
-            -n derphole-linux-amd64 \
-            -n derphole-linux-arm64 \
-            -n derphole-darwin-amd64 \
-            -n derphole-darwin-arm64 \
             -n derphole-web-release
-          for asset in derphole-linux-amd64 derphole-linux-arm64 derphole-darwin-amd64 derphole-darwin-arm64 derphole-linux-amd64 derphole-linux-arm64 derphole-darwin-amd64 derphole-darwin-arm64; do
+          for asset in derphole-linux-amd64 derphole-linux-arm64 derphole-darwin-amd64 derphole-darwin-arm64; do
             cp "dist/downloads/$asset/$asset" "dist/raw/$asset"
           done
       - name: Verify binary version
         run: |
-          for asset in dist/raw/derphole-linux-amd64 dist/raw/derphole-linux-amd64; do
-            chmod +x "$asset"
-            test "$("$asset" version)" = "${{ needs.meta.outputs.version }}"
-          done
+          chmod +x dist/raw/derphole-linux-amd64
+          test "$(dist/raw/derphole-linux-amd64 version)" = "${{ needs.meta.outputs.version }}"
       - name: Package tarballs + checksums
         run: |
           bash ./tools/packaging/build-release-assets.sh
@@ -209,14 +179,6 @@ jobs:
           TAG: ${{ needs.meta.outputs.version }}
         run: |
           files=(
-            dist/release/derphole-linux-amd64.tar.gz
-            dist/release/derphole-linux-amd64.tar.gz.sha256
-            dist/release/derphole-linux-arm64.tar.gz
-            dist/release/derphole-linux-arm64.tar.gz.sha256
-            dist/release/derphole-darwin-amd64.tar.gz
-            dist/release/derphole-darwin-amd64.tar.gz.sha256
-            dist/release/derphole-darwin-arm64.tar.gz
-            dist/release/derphole-darwin-arm64.tar.gz.sha256
             dist/release/derphole-linux-amd64.tar.gz
             dist/release/derphole-linux-amd64.tar.gz.sha256
             dist/release/derphole-linux-arm64.tar.gz
@@ -260,20 +222,14 @@ jobs:
             -n derphole-linux-arm64 \
             -n derphole-darwin-amd64 \
             -n derphole-darwin-arm64 \
-            -n derphole-linux-amd64 \
-            -n derphole-linux-arm64 \
-            -n derphole-darwin-amd64 \
-            -n derphole-darwin-arm64 \
             -n derphole-web-release
-          for asset in derphole-linux-amd64 derphole-linux-arm64 derphole-darwin-amd64 derphole-darwin-arm64 derphole-linux-amd64 derphole-linux-arm64 derphole-darwin-amd64 derphole-darwin-arm64; do
+          for asset in derphole-linux-amd64 derphole-linux-arm64 derphole-darwin-amd64 derphole-darwin-arm64; do
             cp "dist/downloads/$asset/$asset" "dist/raw/$asset"
           done
       - name: Verify binary version
         run: |
-          for asset in dist/raw/derphole-linux-amd64 dist/raw/derphole-linux-amd64; do
-            chmod +x "$asset"
-            test "$("$asset" version)" = "${{ needs.meta.outputs.version }}"
-          done
+          chmod +x dist/raw/derphole-linux-amd64
+          test "$(dist/raw/derphole-linux-amd64 version)" = "${{ needs.meta.outputs.version }}"
       - name: Package tarballs + checksums
         run: |
           bash ./tools/packaging/build-release-assets.sh
@@ -298,14 +254,6 @@ jobs:
             dist/release/derphole-darwin-amd64.tar.gz.sha256
             dist/release/derphole-darwin-arm64.tar.gz
             dist/release/derphole-darwin-arm64.tar.gz.sha256
-            dist/release/derphole-linux-amd64.tar.gz
-            dist/release/derphole-linux-amd64.tar.gz.sha256
-            dist/release/derphole-linux-arm64.tar.gz
-            dist/release/derphole-linux-arm64.tar.gz.sha256
-            dist/release/derphole-darwin-amd64.tar.gz
-            dist/release/derphole-darwin-amd64.tar.gz.sha256
-            dist/release/derphole-darwin-arm64.tar.gz
-            dist/release/derphole-darwin-arm64.tar.gz.sha256
             dist/release/derphole-web.zip
             dist/release/derphole-web.zip.sha256
           )
@@ -317,7 +265,7 @@ jobs:
           fi
 
   publish-packages-prod:
-    name: Build npm artifacts (prod)
+    name: Build npm artifact (prod)
     runs-on: ubuntu-latest
     needs: [meta, check, build-binaries]
     if: needs.meta.outputs.is_tag == 'true'
@@ -341,47 +289,34 @@ jobs:
             -n derphole-linux-amd64 \
             -n derphole-linux-arm64 \
             -n derphole-darwin-amd64 \
-            -n derphole-darwin-arm64 \
-            -n derphole-linux-amd64 \
-            -n derphole-linux-arm64 \
-            -n derphole-darwin-amd64 \
             -n derphole-darwin-arm64
-          for asset in derphole-linux-amd64 derphole-linux-arm64 derphole-darwin-amd64 derphole-darwin-arm64 derphole-linux-amd64 derphole-linux-arm64 derphole-darwin-amd64 derphole-darwin-arm64; do
+          for asset in derphole-linux-amd64 derphole-linux-arm64 derphole-darwin-amd64 derphole-darwin-arm64; do
             cp "dist/downloads/$asset/$asset" "dist/raw/$asset"
           done
       - name: Stage vendored binaries
         run: |
           rm -rf dist/vendor
           stage() {
-            local product="$1" asset="$2" triple="$3"
-            mkdir -p "dist/vendor/${triple}/${product}"
-            cp "dist/raw/${asset}" "dist/vendor/${triple}/${product}/${product}"
-            chmod +x "dist/vendor/${triple}/${product}/${product}"
+            local asset="$1" triple="$2"
+            mkdir -p "dist/vendor/${triple}/derphole"
+            cp "dist/raw/${asset}" "dist/vendor/${triple}/derphole/derphole"
+            chmod +x "dist/vendor/${triple}/derphole/derphole"
           }
-          stage derphole derphole-linux-amd64 x86_64-unknown-linux-musl
-          stage derphole derphole-linux-arm64 aarch64-unknown-linux-musl
-          stage derphole derphole-darwin-amd64 x86_64-apple-darwin
-          stage derphole derphole-darwin-arm64 aarch64-apple-darwin
-          stage derphole derphole-linux-amd64 x86_64-unknown-linux-musl
-          stage derphole derphole-linux-arm64 aarch64-unknown-linux-musl
-          stage derphole derphole-darwin-amd64 x86_64-apple-darwin
-          stage derphole derphole-darwin-arm64 aarch64-apple-darwin
+          stage derphole-linux-amd64 x86_64-unknown-linux-musl
+          stage derphole-linux-arm64 aarch64-unknown-linux-musl
+          stage derphole-darwin-amd64 x86_64-apple-darwin
+          stage derphole-darwin-arm64 aarch64-apple-darwin
       - name: Build npm artifact
         run: |
           VERSION=${{ needs.meta.outputs.version }}
           export VERSION
           bash ./tools/packaging/build-npm.sh
-      - name: Smoke test packaged launchers
-        run: |
-          node ./dist/npm-derphole/bin/derphole.js version
-          node ./dist/npm-derphole/bin/derphole.js version
+      - name: Smoke test packaged launcher
+        run: node ./dist/npm-derphole/bin/derphole.js version
       - name: Validate npm publish (dry-run)
-        run: |
-          npm publish ./dist/npm-derphole --access public --dry-run
-          npm publish ./dist/npm-derphole --access public --dry-run
+        run: npm publish ./dist/npm-derphole --access public --dry-run
       - name: Package npm artifact
-        run: |
-          tar -czf dist/npm-packages.tgz -C dist npm-derphole npm-derphole
+        run: tar -czf dist/npm-packages.tgz -C dist npm-derphole
       - name: Upload package artifact
         uses: actions/upload-artifact@v6
         with:
@@ -390,7 +325,7 @@ jobs:
           if-no-files-found: error
 
   publish-packages-dev:
-    name: Build npm artifacts (dev)
+    name: Build npm artifact (dev)
     runs-on: ubuntu-latest
     needs: [meta, check, build-binaries]
     if: needs.meta.outputs.is_main == 'true'
@@ -414,47 +349,34 @@ jobs:
             -n derphole-linux-amd64 \
             -n derphole-linux-arm64 \
             -n derphole-darwin-amd64 \
-            -n derphole-darwin-arm64 \
-            -n derphole-linux-amd64 \
-            -n derphole-linux-arm64 \
-            -n derphole-darwin-amd64 \
             -n derphole-darwin-arm64
-          for asset in derphole-linux-amd64 derphole-linux-arm64 derphole-darwin-amd64 derphole-darwin-arm64 derphole-linux-amd64 derphole-linux-arm64 derphole-darwin-amd64 derphole-darwin-arm64; do
+          for asset in derphole-linux-amd64 derphole-linux-arm64 derphole-darwin-amd64 derphole-darwin-arm64; do
             cp "dist/downloads/$asset/$asset" "dist/raw/$asset"
           done
       - name: Stage vendored binaries
         run: |
           rm -rf dist/vendor
           stage() {
-            local product="$1" asset="$2" triple="$3"
-            mkdir -p "dist/vendor/${triple}/${product}"
-            cp "dist/raw/${asset}" "dist/vendor/${triple}/${product}/${product}"
-            chmod +x "dist/vendor/${triple}/${product}/${product}"
+            local asset="$1" triple="$2"
+            mkdir -p "dist/vendor/${triple}/derphole"
+            cp "dist/raw/${asset}" "dist/vendor/${triple}/derphole/derphole"
+            chmod +x "dist/vendor/${triple}/derphole/derphole"
           }
-          stage derphole derphole-linux-amd64 x86_64-unknown-linux-musl
-          stage derphole derphole-linux-arm64 aarch64-unknown-linux-musl
-          stage derphole derphole-darwin-amd64 x86_64-apple-darwin
-          stage derphole derphole-darwin-arm64 aarch64-apple-darwin
-          stage derphole derphole-linux-amd64 x86_64-unknown-linux-musl
-          stage derphole derphole-linux-arm64 aarch64-unknown-linux-musl
-          stage derphole derphole-darwin-amd64 x86_64-apple-darwin
-          stage derphole derphole-darwin-arm64 aarch64-apple-darwin
+          stage derphole-linux-amd64 x86_64-unknown-linux-musl
+          stage derphole-linux-arm64 aarch64-unknown-linux-musl
+          stage derphole-darwin-amd64 x86_64-apple-darwin
+          stage derphole-darwin-arm64 aarch64-apple-darwin
       - name: Build npm artifact
         run: |
           VERSION=${{ needs.meta.outputs.version }}
           export VERSION
           bash ./tools/packaging/build-npm.sh
-      - name: Smoke test packaged launchers
-        run: |
-          node ./dist/npm-derphole/bin/derphole.js version
-          node ./dist/npm-derphole/bin/derphole.js version
+      - name: Smoke test packaged launcher
+        run: node ./dist/npm-derphole/bin/derphole.js version
       - name: Validate npm publish (dry-run)
-        run: |
-          npm publish ./dist/npm-derphole --access public --dry-run --tag dev
-          npm publish ./dist/npm-derphole --access public --dry-run --tag dev
+        run: npm publish ./dist/npm-derphole --access public --dry-run --tag dev
       - name: Package npm artifact
-        run: |
-          tar -czf dist/npm-packages.tgz -C dist npm-derphole npm-derphole
+        run: tar -czf dist/npm-packages.tgz -C dist npm-derphole
       - name: Upload package artifact
         uses: actions/upload-artifact@v6
         with:
@@ -494,10 +416,8 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      - name: Publish npm packages
-        run: |
-          bash ./tools/packaging/publish-npm-if-missing.sh ./dist/npm-derphole
-          bash ./tools/packaging/publish-npm-if-missing.sh ./dist/npm-derphole
+      - name: Publish npm package
+        run: bash ./tools/packaging/publish-npm-if-missing.sh ./dist/npm-derphole
 
   publish-npm-dev:
     name: Publish npm package (dev tag)
@@ -531,7 +451,5 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      - name: Publish npm packages (dev tag)
-        run: |
-          bash ./tools/packaging/publish-npm-if-missing.sh --tag dev ./dist/npm-derphole
-          bash ./tools/packaging/publish-npm-if-missing.sh --tag dev ./dist/npm-derphole
+      - name: Publish npm package (dev tag)
+        run: bash ./tools/packaging/publish-npm-if-missing.sh --tag dev ./dist/npm-derphole

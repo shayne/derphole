@@ -18,7 +18,7 @@ Command shape:
 
 ```sh
 dd if=/dev/zero bs="$size" count=1 |
-  DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./dist/derphole --verbose send "$token"
+  DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./dist/derphole --verbose pipe "$token"
 ```
 
 Listener stdout was written to a remote temp file and byte-counted after the listener process exited.

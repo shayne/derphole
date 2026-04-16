@@ -322,9 +322,9 @@ run_forward_derphole() {
 
   start_ms="$(now_ms)"
   if ((${#parallel_args[@]})); then
-    "${local_bin}" --verbose send "${parallel_args[@]}" "${token}" < "${payload}" >/dev/null 2>"${sender_log}"
+    "${local_bin}" --verbose pipe "${parallel_args[@]}" "${token}" < "${payload}" >/dev/null 2>"${sender_log}"
   else
-    "${local_bin}" --verbose send "${token}" < "${payload}" >/dev/null 2>"${sender_log}"
+    "${local_bin}" --verbose pipe "${token}" < "${payload}" >/dev/null 2>"${sender_log}"
   fi
 
   wait_remote_pid_exit
@@ -355,7 +355,7 @@ run_reverse_derphole() {
   fi
 
   local remote_send_cmd
-  remote_send_cmd="'${remote_bin}' --verbose send"
+  remote_send_cmd="'${remote_bin}' --verbose pipe"
   if [[ -n "${parallel_args_remote}" ]]; then
     remote_send_cmd+=" ${parallel_args_remote}"
   fi
@@ -366,73 +366,6 @@ run_reverse_derphole() {
 
   wait "${listener_pid}"
   listener_pid=""
-  remote "cat '${remote_base}.err'" >"${sender_log}"
-  sink_sha="$(shasum -a 256 "${receiver_out}" | awk '{print $1}')"
-  sink_size="$(wc -c < "${receiver_out}" | tr -d '[:space:]')"
-}
-
-run_forward_derphole() {
-  echo "generating ${size_mib} MiB random payload"
-  dd if=/dev/urandom of="${payload}" bs=1048576 count="${size_mib}" 2>/dev/null
-  source_sha="$(shasum -a 256 "${payload}" | awk '{print $1}')"
-
-  "${local_bin}" --verbose send --hide-progress "${payload}" >/dev/null 2>"${sender_log}" &
-  send_pid="$!"
-
-  token=""
-  for _ in $(seq 1 200); do
-    token="$(sed -n 's#^npx -y derphole@latest receive ##p' "${sender_log}" | head -n 1 || true)"
-    if [[ -n "${token}" ]]; then
-      break
-    fi
-    if ! kill -0 "${send_pid}" 2>/dev/null; then
-      break
-    fi
-    sleep 0.1
-  done
-  if [[ -z "${token}" ]]; then
-    echo "failed to capture sender token" >&2
-    exit 1
-  fi
-
-  start_ms="$(now_ms)"
-  remote "rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err'; nohup '${remote_bin}' --verbose receive --hide-progress --output '${remote_base}.out' '${token}' >/dev/null 2>'${remote_base}.err' </dev/null & echo \$! > '${remote_base}.pid'"
-
-  wait "${send_pid}"
-  send_pid=""
-  wait_remote_pid_exit
-  remote "cat '${remote_base}.err'" >"${receiver_log}"
-  sink_sha="$(remote "sha256sum '${remote_base}.out' | awk '{print \$1}'")"
-  sink_size="$(remote "wc -c < '${remote_base}.out'")"
-}
-
-run_reverse_derphole() {
-  echo "generating ${size_mib} MiB random payload on ${target}"
-  remote "dd if=/dev/urandom of='${remote_base}.payload' bs=1048576 count='${size_mib}' 2>/dev/null"
-  source_sha="$(remote "sha256sum '${remote_base}.payload' | awk '{print \$1}'")"
-
-  remote "rm -f '${remote_base}.pid' '${remote_base}.err'; nohup '${remote_bin}' --verbose send --hide-progress '${remote_base}.payload' >/dev/null 2>'${remote_base}.err' </dev/null & echo \$! > '${remote_base}.pid'"
-
-  token=""
-  for _ in $(seq 1 200); do
-    token="$(remote "sed -n 's#^npx -y derphole@latest receive ##p' '${remote_base}.err' | head -n 1 || true")"
-    if [[ -n "${token}" ]]; then
-      break
-    fi
-    if ! remote "if [[ -f '${remote_base}.pid' ]]; then kill -0 \$(cat '${remote_base}.pid') 2>/dev/null; else false; fi" >/dev/null 2>&1; then
-      break
-    fi
-    sleep 0.1
-  done
-  if [[ -z "${token}" ]]; then
-    echo "failed to capture sender token" >&2
-    exit 1
-  fi
-
-  start_ms="$(now_ms)"
-  "${local_bin}" --verbose receive --hide-progress --output "${receiver_out}" "${token}" >/dev/null 2>"${receiver_log}"
-
-  wait_remote_pid_exit
   remote "cat '${remote_base}.err'" >"${sender_log}"
   sink_sha="$(shasum -a 256 "${receiver_out}" | awk '{print $1}')"
   sink_size="$(wc -c < "${receiver_out}" | tr -d '[:space:]')"
@@ -509,12 +442,6 @@ finalize_run() {
 build_and_install_remote_binary
 
 case "${tool}:${direction}" in
-  derphole:forward)
-    run_forward_derphole
-    ;;
-  derphole:reverse)
-    run_reverse_derphole
-    ;;
   derphole:forward)
     run_forward_derphole
     ;;

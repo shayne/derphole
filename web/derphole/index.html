@@ -118,20 +118,20 @@ cat image.img | npx -y derphole@latest send &lt;token&gt;</code></pre>
           <p>
             The web demo proves the static browser flow. For multi-gigabit paths,
             long streams, directories, service sharing, and SSH invites, use the
-            native npm packages.
+            native npm package.
           </p>
         </div>
         <div class="command-grid">
           <article>
-            <h3>derphole</h3>
+            <h3>Transfers</h3>
             <pre><code>npx -y derphole@latest send ./photo.jpg
 npx -y derphole@latest receive &lt;token&gt;
 npx -y derphole@latest ssh invite --user deploy</code></pre>
           </article>
           <article>
-            <h3>derphole</h3>
+            <h3>Streams and services</h3>
             <pre><code>npx -y derphole@latest listen &gt; disk.img
-cat ./disk.img | npx -y derphole@latest send &lt;token&gt;
+cat ./disk.img | npx -y derphole@latest pipe &lt;token&gt;
 npx -y derphole@latest share 127.0.0.1:3000</code></pre>
           </article>
         </div>
@@ -142,7 +142,7 @@ npx -y derphole@latest share 127.0.0.1:3000</code></pre>
         <p>
           Browser JavaScript cannot open raw UDP sockets, so this build uses DERP
           WebSockets for rendezvous and relay fallback, plus WebRTC DataChannel
-          for browser direct paths. The native derphole and derphole binaries use
+          for browser direct paths. The native derphole binary uses
           the same DERP coordination model, but they can also use the optimized
           direct UDP transport that browsers do not expose.
         </p>
@@ -150,7 +150,7 @@ npx -y derphole@latest share 127.0.0.1:3000</code></pre>
     </main>
 
     <footer class="footer">
-      <span>derphole and derphole are session-scoped transfer tools.</span>
+      <span>derphole is a session-scoped transfer tool.</span>
       <a href="https://github.com/shayne/derphole">github.com/shayne/derphole</a>
     </footer>
 

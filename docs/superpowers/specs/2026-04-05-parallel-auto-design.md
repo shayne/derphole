@@ -103,7 +103,7 @@ Meaning:
 
 The active side is authoritative:
 
-- `send` controls the session for `listen/send`
+- `pipe` controls the session for `listen/pipe`
 - `open` controls the session for `share/open`
 
 The passive side mirrors the session policy and participates in setup and growth, but does not choose a competing user policy.

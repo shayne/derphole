@@ -13,7 +13,7 @@ Add a second first-class CLI, `derphole`, to this repository.
 - same self-contained bearer-token session model
 - same no-extra-service deployment story
 
-The repo should support `derphole` and `derphole` long-term without forking the transport stack or maintaining two unrelated release systems.
+The repo should support the wormhole-shaped `derphole` workflow without forking the transport stack or maintaining unrelated release systems.
 
 ## Product split
 
@@ -314,7 +314,7 @@ GitHub releases should include tarballs for both binaries:
 
 ### npm packages
 
-Publish two npm packages:
+Publish one npm package:
 
 - `derphole`
 - `derphole`
@@ -332,7 +332,7 @@ Expected direction:
 - distinct output directories such as:
   - `dist/npm-derphole`
   - `dist/npm-derphole`
-- launcher scripts that vend the correct binary for each package
+- launcher scripts that vend the correct binary for the package
 
 ### Bootstrap publish
 
@@ -341,8 +341,8 @@ Update the bootstrap runbook to include first publish steps for `derphole`.
 The runbook should explicitly cover:
 
 - first manual npm publish for `derphole`
-- dry-run validation for both packages
-- post-bootstrap trusted publishing behavior for both packages
+- dry-run validation for the package
+- post-bootstrap trusted publishing behavior for the package
 
 ## Documentation design
 
@@ -350,7 +350,7 @@ The repo now has two user-facing CLIs, so docs must stop assuming there is only 
 
 Update:
 
-- top-level `README.md` to describe the repo as containing both `derphole` and `derphole`
+- top-level `README.md` to describe `derphole` as the single CLI surface
 - command examples so users can tell which CLI they should reach for
 - release docs so both binary and npm outputs are documented
 
@@ -387,7 +387,7 @@ Add local CLI tests for:
 Release automation should verify:
 
 - both binaries report the workflow version string
-- both npm packages dry-run publish successfully
+- the npm package dry-run publishes successfully
 - both vendored launchers run `version`
 
 ## Acceptance
@@ -396,7 +396,7 @@ This design is successful when:
 
 - `derphole` feels like a wormhole-style CLI for the main user workflows
 - it still uses the current `derphole` transport architecture
-- the repo can release `derphole` and `derphole` together from one workflow
+- the repo can release `derphole` from one workflow
 - the long-term maintenance burden is one transport stack plus two product layers, not two transport stacks
 
 ## Explicit decisions

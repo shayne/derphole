@@ -14,7 +14,9 @@ if [ ! -d "${VENDOR_DIR}" ]; then
   exit 1
 fi
 
-products=(derphole derphole)
+rm -rf "${ROOT_DIR}"/dist/npm-*
+
+products=(derphole)
 triples=(
   x86_64-unknown-linux-musl
   aarch64-unknown-linux-musl

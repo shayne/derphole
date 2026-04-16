@@ -1,15 +1,14 @@
 # derphole
 
-This repository ships two standalone CLIs:
+This repository ships one standalone CLI, `derphole`, for session-scoped transfers and temporary local TCP service sharing.
 
-- `derphole` for raw byte streams and temporary local TCP service sharing
-- `derphole` for wormhole-shaped text, file, directory, and SSH invite flows on the same transport stack
+It includes raw byte streams with `listen` and `pipe`, wormhole-shaped text/file/directory transfer with `send` and `receive`, service sharing with `share` and `open`, and SSH invite flows with `ssh invite` and `ssh accept`.
 
-Both use the public Tailscale [DERP](#what-is-derp) relay network for rendezvous and relay fallback, but they are **not** affiliated with Tailscale, do **not** require a Tailscale account or tailnet, and do **not** use `tailscaled` for transport.
+`derphole` uses the public Tailscale [DERP](#what-is-derp) relay network for rendezvous and relay fallback, but it is **not** affiliated with Tailscale, does **not** require a Tailscale account or tailnet, and does **not** use `tailscaled` for transport.
 
-`derphole` and `derphole` are **not** WireGuard overlays and **not** VPNs. Tailscale builds a general-purpose secure network on WireGuard. These tools are optimized for a different job: one session, one token, one transfer or shared service, on the shortest secure path they can find for that session. See [Transport Model](#transport-model), [Why It Is Fast](#why-it-is-fast), and [Security Model](#security-model).
+`derphole` is **not** a WireGuard overlay and **not** a VPN. Tailscale builds a general-purpose secure network on WireGuard. `derphole` is optimized for a different job: one session, one token, one transfer or shared service, on the shortest secure path it can find for that session. See [Transport Model](#transport-model), [Why It Is Fast](#why-it-is-fast), and [Security Model](#security-model).
 
-For one-shot transfers and temporary service sharing, `derphole` can beat sending the same traffic through a WireGuard-based overlay because it does not first build a general-purpose encrypted network path and then send application traffic through it. `derphole` uses the same session and transport machinery, but wraps it in a more human-oriented CLI. Both use DERP for rendezvous and fallback, then move the live session onto the best direct path they can establish for that workload. Details are in [Transport Model](#transport-model) and [How This Differs From Tailscale / WireGuard](#how-this-differs-from-tailscale--wireguard).
+For one-shot transfers and temporary service sharing, `derphole` can beat sending the same traffic through a WireGuard-based overlay because it does not first build a general-purpose encrypted network path and then send application traffic through it. It uses DERP for rendezvous and fallback, then moves the live session onto the best direct path it can establish for that workload. Details are in [Transport Model](#transport-model) and [How This Differs From Tailscale / WireGuard](#how-this-differs-from-tailscale--wireguard).
 
 It does **not** require:
 
@@ -20,23 +19,16 @@ It does **not** require:
 
 The token printed by `listen` or `share` carries session authorization. Public sessions still fetch the DERP map at runtime so both sides can find relay/bootstrap nodes. See [Security Model](#security-model) for what the token authorizes and what intermediaries can and cannot see.
 
-## Pick the CLI
+## Pick the Workflow
 
-Use `derphole` when you want transport primitives:
-
-- one-shot byte-stream transfer with `listen` and `send`
+- raw byte-stream transfer with `listen` and `pipe`
+- text, file, and directory transfer with `send` and `receive`
 - long-lived local service sharing with `share` and `open`
-
-Use `derphole` when you want wormhole-shaped workflows:
-
-- text transfer
-- file transfer
-- directory transfer
-- SSH public key exchange for `authorized_keys`
+- SSH public key exchange with `ssh invite` and `ssh accept`
 
 ## Quick Start
 
-`listen` receives bytes and prints a token. `send` pipes bytes into that token. `share` and `open` do the same thing for a local TCP service instead of a byte stream.
+`listen` receives bytes and prints a token. `pipe` sends stdin into that token. `share` and `open` do the same thing for a local TCP service instead of a byte stream.
 
 ### Transfer a File
 
@@ -51,16 +43,16 @@ npx -y derphole@latest listen > received.img
 On the sending machine:
 
 ```bash
-cat ./disk.img | npx -y derphole@latest send <token>
+cat ./disk.img | npx -y derphole@latest pipe <token>
 ```
 
 For a quick text example:
 
 ```bash
-printf 'hello\n' | npx -y derphole@latest send <token>
+printf 'hello\n' | npx -y derphole@latest pipe <token>
 ```
 
-### Send a File with `derphole`
+### Send a File with a Receive Code
 
 On the sending machine:
 
@@ -120,7 +112,7 @@ npx -y derphole@latest listen | pv -brt > received.img
 On the sending machine:
 
 ```bash
-cat ./disk.img | pv -brt | npx -y derphole@latest send <token>
+cat ./disk.img | pv -brt | npx -y derphole@latest pipe <token>
 ```
 
 Want a concrete Internet/NAT version of the same idea? See [Real-World Example: Tar Pipe Over Internet](#real-world-example-tar-pipe-over-internet).
@@ -155,13 +147,13 @@ Use the development channel for the latest commit published from `main`:
 
 ```bash
 npx -y derphole@dev version
-npx -y derphole@dev version
 ```
 
-By default, `listen`, `send`, `share`, and `open` keep transport status quiet. `listen` and `share` still print the token you need, and `open` still prints the local listening address. `derphole` also keeps transport status quiet by default, but it still prints the user-facing instruction or token needed to complete the transfer, plus wormhole-shaped transfer summaries and known-size progress on stderr. Use `--hide-progress` to suppress the progress bar. Use `--verbose` to see state transitions like `connected-relay` and `connected-direct`:
+By default, `listen`, `pipe`, `send`, `receive`, `share`, and `open` keep transport status quiet. `listen` and `share` print the token you need, `open` prints the local listening address, and `send` / `receive` print the instruction or token needed to complete the transfer. Known-size transfers show wormhole-shaped progress on stderr. Use `--hide-progress` to suppress the progress bar. Use `--verbose` to see state transitions like `connected-relay` and `connected-direct`:
 
 ```bash
 npx -y derphole@latest --verbose listen
+npx -y derphole@latest --verbose pipe <token>
 npx -y derphole@latest --verbose send ./photo.jpg
 ```
 
@@ -171,9 +163,9 @@ Want transport details after the examples? Jump to [Transport Model](#transport-
 
 High level:
 
-1. `listen` or `share` creates an ephemeral session and prints an opaque bearer token.
+1. `listen`, `share`, or `receive` creates an ephemeral session and prints an opaque bearer token.
 2. That token contains the session ID, expiry, DERP bootstrap hints, the listener's public peer identity, a bearer secret, and the allowed session capability.
-3. `send` or `open` uses the token to contact the listener through DERP and claim the session.
+3. `pipe`, `send`, or `open` uses the token to contact the listener through DERP and claim the session.
 4. The listener validates the claim, checks the requested capability, and returns its current direct-path candidates.
 5. Both sides start on the first working path immediately, including DERP relay if direct connectivity is not ready yet.
 6. In parallel, both sides continue NAT traversal and direct-path probing. If a direct path succeeds, the live session upgrades in place without restarting the transfer.
@@ -188,7 +180,8 @@ DERP is used for **rendezvous** and **relay fallback**. If the term is new, see 
 The data plane is selected per session:
 
 - `share/open` uses multiplexed QUIC streams over `derphole`'s relay/direct UDP transport, so one claimed session can carry many independent TCP connections to the shared service.
-- `listen/send` uses a one-shot byte stream. By default, `derphole` coordinates through DERP, promotes to a rate-adaptive direct UDP blast when traversal succeeds, and stays on encrypted relay fallback when no direct path is available.
+- `listen/pipe` uses a one-shot byte stream. By default, `derphole` coordinates through DERP, promotes to a rate-adaptive direct UDP blast when traversal succeeds, and stays on encrypted relay fallback when no direct path is available.
+- `send/receive` wraps the same one-shot stream with text, file, directory, and progress metadata.
 
 Candidate discovery splits into two phases:
 
@@ -210,7 +203,7 @@ Tailscale uses WireGuard to build a secure general-purpose network between peers
 
 Instead, `derphole` uses a bearer token to authorize exactly one session, uses DERP to get both peers talking immediately, and then promotes the session onto the best direct path it can establish for that workload. Supporting details are in [Transport Model](#transport-model) and [Security Model](#security-model).
 
-For `send/listen` and `share/open`, that can beat routing the same traffic through a WireGuard-based overlay because `derphole` is purpose-built for the active session, not for a general secure network abstraction. See [Why It Is Fast](#why-it-is-fast) for the concrete transport reasons.
+For `listen/pipe`, `send/receive`, and `share/open`, that can beat routing the same traffic through a WireGuard-based overlay because `derphole` is purpose-built for the active session, not for a general secure network abstraction. See [Why It Is Fast](#why-it-is-fast) for the concrete transport reasons.
 
 ## Why It Is Fast
 
@@ -218,7 +211,7 @@ For `send/listen` and `share/open`, that can beat routing the same traffic throu
 
 - DERP is for rendezvous and relay fallback, not the preferred steady-state data plane.
 - Sessions can start relayed immediately, then promote in place to direct without restarting the transfer.
-- `listen/send` can scale from one to multiple direct UDP lanes, runs a short path-rate probe, then uses paced sending, adaptive rate control, and targeted replay/repair. That lets fast links run near their WAN ceiling without forcing slower links into the same send rate.
+- `listen/pipe` and `send/receive` can scale from one to multiple direct UDP lanes, run a short path-rate probe, then use paced sending, adaptive rate control, and targeted replay/repair. That lets fast links run near their WAN ceiling without forcing slower links into the same send rate.
 - Direct UDP payload packets are AEAD-protected with a per-session key derived from the bearer secret. The packet header stays visible for sequencing and repair, while user bytes stay encrypted and authenticated.
 - `share/open` keeps QUIC stream multiplexing for service sharing, where many independent TCP streams need one claimed session.
 - Candidate discovery is front-loaded with local interface candidates and cached mappings, then refined in the background with STUN and port mapping refresh. That keeps the first byte moving quickly instead of stalling the session until every traversal probe finishes.
@@ -231,7 +224,7 @@ The session token is a **bearer capability**. Anyone who has the token can claim
 
 DERP relays do **not** get the secret material needed to read or impersonate the session:
 
-- On the default `listen/send` direct UDP path, payload packets are encrypted and authenticated with session AEAD derived from the bearer secret in the token.
+- On the default `listen/pipe` and `send/receive` direct UDP path, payload packets are encrypted and authenticated with session AEAD derived from the bearer secret in the token.
 - On `share/open`, stream traffic is carried over authenticated QUIC streams for the claimed session.
 - If packets are relayed through DERP, DERP only forwards encrypted session bytes.
 
@@ -274,7 +267,7 @@ npx -y derphole@latest listen | tar -xpf - -C /restore/path
 Sender:
 
 ```bash
-tar -cpf - /srv/data | npx -y derphole@latest send <token>
+tar -cpf - /srv/data | npx -y derphole@latest pipe <token>
 ```
 
 This is still tar pipe. Difference: no public listener to expose, no SSH daemon required for data path, no VPN to join, and no permanent mesh to set up. `derphole` starts with DERP if needed, then promotes the live transfer onto direct UDP when a faster direct path becomes available.
@@ -288,7 +281,7 @@ mise run check
 mise run build
 ```
 
-`mise run build` writes both `dist/derphole` and `dist/derphole`.
+`mise run build` writes `dist/derphole`.
 
 ## Verification
 
@@ -308,9 +301,9 @@ REMOTE_HOST=my-server.example.com mise run promotion-1g
 
 ## Releases
 
-- npm packages: `derphole`, `derphole`
-- production channel: `@latest` on each package
-- development channel: `@dev` on each package
+- npm package: `derphole`
+- production channel: `derphole@latest`
+- development channel: `derphole@dev`
 - bootstrap runbook: [docs/releases/npm-bootstrap.md](docs/releases/npm-bootstrap.md)
 
 ## What Is DERP?
