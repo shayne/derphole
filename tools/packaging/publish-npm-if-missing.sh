@@ -3,13 +3,14 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: publish-npm-if-missing.sh [--tag TAG] [--dry-run] <package-dir>
+usage: publish-npm-if-missing.sh [--tag TAG] [--dry-run] [--skip-unclaimed] <package-dir>
 EOF
   exit 2
 }
 
 tag=""
 dry_run=false
+skip_unclaimed=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -20,6 +21,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dry-run)
       dry_run=true
+      shift
+      ;;
+    --skip-unclaimed)
+      skip_unclaimed=true
       shift
       ;;
     -*)
@@ -43,9 +48,30 @@ package_json="${package_dir}/package.json"
 package_name="$(node -e "const fs=require('fs'); const pkg=JSON.parse(fs.readFileSync(process.argv[1],'utf8')); process.stdout.write(pkg.name);" "${package_json}")"
 package_version="$(node -e "const fs=require('fs'); const pkg=JSON.parse(fs.readFileSync(process.argv[1],'utf8')); process.stdout.write(pkg.version);" "${package_json}")"
 
-if npm view "${package_name}@${package_version}" version >/dev/null 2>&1; then
-  echo "already published ${package_name}@${package_version}; skipping"
-  exit 0
+package_exists=true
+if ! package_view_output="$(npm view "${package_name}" name 2>&1)"; then
+  if grep -q "E404" <<<"${package_view_output}"; then
+    package_exists=false
+    if [[ "${skip_unclaimed}" == true ]]; then
+      echo "${package_name} is not published yet; skipping npm publish"
+      echo "run docs/releases/npm-bootstrap.md before enabling automated dev publishes"
+      exit 0
+    fi
+  else
+    printf '%s\n' "${package_view_output}" >&2
+    exit 1
+  fi
+fi
+
+if [[ "${package_exists}" == true ]]; then
+  if package_version_output="$(npm view "${package_name}@${package_version}" version 2>&1)"; then
+    echo "already published ${package_name}@${package_version}; skipping"
+    exit 0
+  fi
+  if ! grep -q "E404" <<<"${package_version_output}"; then
+    printf '%s\n' "${package_version_output}" >&2
+    exit 1
+  fi
 fi
 
 publish_args=("${package_dir}" --access public)

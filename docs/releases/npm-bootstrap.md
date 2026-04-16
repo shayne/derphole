@@ -48,4 +48,4 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-After that, pushes to `main` update the npm `dev` dist-tag, and pushes of `v*` tags publish production releases through GitHub Actions. The manual `0.0.1` bootstrap path is no longer needed once trusted publishing is configured.
+Before the package is bootstrapped, pushes to `main` still build and dry-run the npm artifact, but the dev publish job skips the unclaimed package instead of failing CI. After bootstrap and trusted publisher setup, pushes to `main` update the npm `dev` dist-tag, and pushes of `v*` tags publish production releases through GitHub Actions. The manual `0.0.1` bootstrap path is no longer needed once trusted publishing is configured.
