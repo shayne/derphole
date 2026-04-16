@@ -4747,7 +4747,7 @@ func (c *capturePacketConn) Packets() [][]byte {
 
 func testPacketAEAD(t *testing.T) cipher.AEAD {
 	t.Helper()
-	block, err := aes.NewCipher([]byte("derphole-test-key"))
+	block, err := aes.NewCipher([]byte("derphole-testkey"))
 	if err != nil {
 		t.Fatalf("aes.NewCipher() error = %v", err)
 	}
