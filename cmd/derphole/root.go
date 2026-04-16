@@ -22,6 +22,10 @@ var rootRegistry = yargs.Registry{
 		Examples: []string{
 			"derphole send ./photo.jpg",
 			"derphole receive",
+			"derphole listen",
+			"cat file | derphole pipe <token>",
+			"derphole share 127.0.0.1:3000",
+			"derphole open <token>",
 			"derphole ssh invite ~/.ssh/id_ed25519.pub",
 			"derphole version",
 		},
@@ -37,6 +41,30 @@ var rootRegistry = yargs.Registry{
 			Info: yargs.SubCommandInfo{
 				Name:        "receive",
 				Description: "Receive text, a file, or a directory.",
+			},
+		},
+		"listen": {
+			Info: yargs.SubCommandInfo{
+				Name:        "listen",
+				Description: "Listen for one incoming raw byte stream.",
+			},
+		},
+		"pipe": {
+			Info: yargs.SubCommandInfo{
+				Name:        "pipe",
+				Description: "Send stdin as one raw byte stream.",
+			},
+		},
+		"share": {
+			Info: yargs.SubCommandInfo{
+				Name:        "share",
+				Description: "Share a local TCP service until Ctrl-C.",
+			},
+		},
+		"open": {
+			Info: yargs.SubCommandInfo{
+				Name:        "open",
+				Description: "Open a shared service locally until Ctrl-C.",
 			},
 		},
 		"ssh": {
@@ -93,6 +121,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runSend(remaining[1:], level, stdin, stdout, stderr)
 	case "receive":
 		return runReceive(remaining[1:], level, stdin, stdout, stderr)
+	case "listen":
+		return runListen(remaining[1:], level, stdout, stderr)
+	case "pipe":
+		return runPipe(remaining[1:], level, stdin, stdout, stderr)
+	case "share":
+		return runShare(remaining[1:], level, stdout, stderr)
+	case "open":
+		return runOpen(remaining[1:], level, stdout, stderr)
 	case "ssh":
 		return runSSH(remaining[1:], level, stdin, stdout, stderr)
 	case "version":
@@ -134,6 +170,18 @@ func runHelpCommand(args []string, stderr io.Writer) int {
 		return 0
 	case "receive":
 		fmt.Fprint(stderr, receiveHelpText())
+		return 0
+	case "listen":
+		fmt.Fprint(stderr, listenHelpText())
+		return 0
+	case "pipe":
+		fmt.Fprint(stderr, pipeHelpText())
+		return 0
+	case "share":
+		fmt.Fprint(stderr, shareHelpText())
+		return 0
+	case "open":
+		fmt.Fprint(stderr, openHelpText())
 		return 0
 	case "ssh":
 		fmt.Fprint(stderr, sshHelpText())
