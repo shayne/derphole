@@ -82,4 +82,17 @@ if [[ "${dry_run}" == true ]]; then
   publish_args+=(--dry-run)
 fi
 
-npm publish "${publish_args[@]}"
+if publish_output="$(npm publish "${publish_args[@]}" 2>&1)"; then
+  printf '%s\n' "${publish_output}"
+  exit 0
+fi
+
+if [[ "${skip_unclaimed}" == true ]] && grep -Eq "E404|E403" <<<"${publish_output}"; then
+  printf '%s\n' "${publish_output}"
+  echo "${package_name}@${package_version} is not publishable by this workflow yet; skipping npm publish"
+  echo "claim the package and configure npm trusted publishing before enabling automated dev publishes"
+  exit 0
+fi
+
+printf '%s\n' "${publish_output}" >&2
+exit 1
