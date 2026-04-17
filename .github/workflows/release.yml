@@ -417,7 +417,7 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
       - name: Publish npm package
-        run: bash ./tools/packaging/publish-npm-if-missing.sh ./dist/npm-derphole
+        run: bash ./tools/packaging/publish-npm-if-missing.sh --skip-unclaimed ./dist/npm-derphole
 
   publish-npm-dev:
     name: Publish npm package (dev tag)

@@ -54,7 +54,7 @@ if ! package_view_output="$(npm view "${package_name}" name 2>&1)"; then
     package_exists=false
     if [[ "${skip_unclaimed}" == true ]]; then
       echo "${package_name} is not published yet; skipping npm publish"
-      echo "run docs/releases/npm-bootstrap.md before enabling automated dev publishes"
+      echo "run docs/releases/npm-bootstrap.md before enabling automated npm publishes"
       exit 0
     fi
   else
@@ -90,7 +90,7 @@ fi
 if [[ "${skip_unclaimed}" == true ]] && grep -Eq "E404|E403" <<<"${publish_output}"; then
   printf '%s\n' "${publish_output}"
   echo "${package_name}@${package_version} is not publishable by this workflow yet; skipping npm publish"
-  echo "claim the package and configure npm trusted publishing before enabling automated dev publishes"
+  echo "claim the package and configure npm trusted publishing before enabling automated npm publishes"
   exit 0
 fi
 
