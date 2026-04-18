@@ -10,7 +10,7 @@ import (
 	sessiontoken "github.com/shayne/derphole/pkg/token"
 )
 
-func TestGenerateServerTokenDefaultsToSevenDays(t *testing.T) {
+func TestGenerateServerTokenDefaultsToSixMonths(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	encoded, err := GenerateServerToken(ServerTokenOptions{Now: now})
 	if err != nil {
@@ -23,8 +23,30 @@ func TestGenerateServerTokenDefaultsToSevenDays(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeServerToken() error = %v", err)
 	}
-	if got, want := time.Unix(cred.ExpiresUnix, 0).UTC(), now.Add(7*24*time.Hour); !got.Equal(want) {
+	if got, want := time.Unix(cred.ExpiresUnix, 0).UTC(), now.Add(180*24*time.Hour); !got.Equal(want) {
 		t.Fatalf("expiry = %s, want %s", got, want)
+	}
+}
+
+func TestGenerateClientTokenDefaultsToNinetyDays(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	serverToken, err := GenerateServerToken(ServerTokenOptions{Now: now})
+	if err != nil {
+		t.Fatalf("GenerateServerToken() error = %v", err)
+	}
+	clientToken, err := GenerateClientToken(ClientTokenOptions{
+		Now:         now,
+		ServerToken: serverToken,
+	})
+	if err != nil {
+		t.Fatalf("GenerateClientToken() error = %v", err)
+	}
+	clientCred, err := DecodeClientToken(clientToken, now)
+	if err != nil {
+		t.Fatalf("DecodeClientToken() error = %v", err)
+	}
+	if got, want := time.Unix(clientCred.ExpiresUnix, 0).UTC(), now.Add(90*24*time.Hour); !got.Equal(want) {
+		t.Fatalf("client expiry = %s, want %s", got, want)
 	}
 }
 

@@ -20,7 +20,8 @@ const (
 	ServerTokenPrefix = "dts1_"
 	ClientTokenPrefix = "dtc1_"
 	TokenVersion      = 1
-	DefaultDays       = 7
+	DefaultServerDays = 180
+	DefaultClientDays = 90
 	ProtocolTCP       = "tcp"
 	ProtocolUDP       = "udp"
 )
@@ -75,7 +76,7 @@ type ClientCredential struct {
 
 func GenerateServerToken(opts ServerTokenOptions) (string, error) {
 	now := normalizedNow(opts.Now)
-	expires, err := resolveExpiry(now, opts.Days, opts.Expires)
+	expires, err := resolveExpiry(now, opts.Days, opts.Expires, DefaultServerDays)
 	if err != nil {
 		return "", err
 	}
@@ -109,7 +110,7 @@ func GenerateClientToken(opts ClientTokenOptions) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	expires, err := resolveExpiry(now, opts.Days, opts.Expires)
+	expires, err := resolveExpiry(now, opts.Days, opts.Expires, DefaultClientDays)
 	if err != nil {
 		return "", err
 	}
@@ -257,10 +258,10 @@ func normalizedNow(now time.Time) time.Time {
 	return now
 }
 
-func resolveExpiry(now time.Time, days int, expires time.Time) (time.Time, error) {
+func resolveExpiry(now time.Time, days int, expires time.Time, defaultDays int) (time.Time, error) {
 	if expires.IsZero() {
 		if days == 0 {
-			days = DefaultDays
+			days = defaultDays
 		}
 		if days < 1 {
 			return time.Time{}, fmt.Errorf("days must be at least 1")

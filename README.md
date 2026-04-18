@@ -157,8 +157,8 @@ npx -y derphole@latest open <token> 127.0.0.1:8080
 On `serverhost`:
 
 ```bash
-npx -y derptun@latest token server --days 365 > server.dts
-npx -y derptun@latest token client --token "$(cat server.dts)" --days 7 > client.dtc
+npx -y derptun@latest token server > server.dts
+npx -y derptun@latest token client --token "$(cat server.dts)" > client.dtc
 npx -y derptun@latest serve --token "$(cat server.dts)" --tcp 127.0.0.1:22
 ```
 
@@ -182,7 +182,7 @@ Host serverhost-derptun
 
 The server token is secret serving authority. Keep it on the serving machine or in its secret manager. The client token can connect until it expires, but it cannot serve or mint more tokens.
 
-Server and client tokens default to seven days. Set a relative lifetime with `--days`, or use an absolute expiry:
+Server tokens default to 180 days. Client tokens default to 90 days and cannot outlive their server token. Set a relative lifetime with `--days`, or use an absolute expiry:
 
 ```bash
 npx -y derptun@latest token server --expires 2026-05-01T00:00:00Z > server.dts
@@ -272,7 +272,7 @@ In practice: move bytes early, keep them moving through relay if needed, then sh
 
 ## Security Model
 
-Tokens are **bearer capabilities**. Anyone with a token can claim the matching session or tunnel until it expires, so share tokens over a trusted channel. `derphole` session tokens expire after one hour. `derptun` server tokens default to seven days and can mint shorter-lived client tokens; only server tokens can serve.
+Tokens are **bearer capabilities**. Anyone with a token can claim the matching session or tunnel until it expires, so share tokens over a trusted channel. `derphole` session tokens expire after one hour. `derptun` server tokens default to 180 days and can mint shorter-lived client tokens; client tokens default to 90 days and cannot serve.
 
 DERP relays do **not** get the secret material needed to read or impersonate the session:
 

@@ -20,8 +20,8 @@ var rootRegistry = yargs.Registry{
 		Name:        "derptun",
 		Description: "Open durable TCP tunnels through DERP rendezvous and direct UDP promotion.",
 		Examples: []string{
-			"derptun token server --days 365 > server.dts",
-			"derptun token client --token \"$(cat server.dts)\" --days 7 > client.dtc",
+			"derptun token server > server.dts",
+			"derptun token client --token \"$(cat server.dts)\" > client.dtc",
 			"derptun serve --token \"$(cat server.dts)\" --tcp 127.0.0.1:22",
 			"derptun open --token \"$(cat client.dtc)\" --listen 127.0.0.1:2222",
 			"ssh -o ProxyCommand='derptun connect --token ~/.config/derptun/client.dtc --stdio' foo@serverhost",

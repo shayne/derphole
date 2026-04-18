@@ -11,13 +11,13 @@ import (
 )
 
 type tokenCommonFlags struct {
-	Days    int    `flag:"days" help:"Token lifetime in days"`
+	Days    int    `flag:"days" help:"Token lifetime in days; server default is 180 days"`
 	Expires string `flag:"expires" help:"Absolute expiry as RFC3339 or YYYY-MM-DD"`
 }
 
 type tokenClientFlags struct {
 	Token   string `flag:"token" help:"Server token used to mint a client token"`
-	Days    int    `flag:"days" help:"Token lifetime in days"`
+	Days    int    `flag:"days" help:"Token lifetime in days; client default is 90 days"`
 	Expires string `flag:"expires" help:"Absolute expiry as RFC3339 or YYYY-MM-DD"`
 }
 
@@ -26,8 +26,8 @@ var tokenHelpConfig = yargs.HelpConfig{
 		Name:        "derptun",
 		Description: "Generate derptun server and client tokens.",
 		Examples: []string{
-			"derptun token server --days 365",
-			"derptun token client --token <dts1_token> --days 7",
+			"derptun token server",
+			"derptun token client --token <dts1_token>",
 		},
 	},
 	SubCommands: map[string]yargs.SubCommandInfo{
@@ -36,8 +36,8 @@ var tokenHelpConfig = yargs.HelpConfig{
 			Description: "Generate a server credential or client access token.",
 			Usage:       "server [--days N|--expires DATE] | client --token TOKEN [--days N|--expires DATE]",
 			Examples: []string{
-				"derptun token server --days 365",
-				"derptun token client --token <dts1_token> --days 7",
+				"derptun token server",
+				"derptun token client --token <dts1_token>",
 			},
 		},
 	},
