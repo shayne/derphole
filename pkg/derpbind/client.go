@@ -67,11 +67,22 @@ const (
 const losslessSubscriberQueueSize = 64
 
 func NewClient(ctx context.Context, node *tailcfg.DERPNode, serverURL string) (*Client, error) {
+	priv := key.NewNode()
+	return newClientWithPrivateKey(ctx, node, serverURL, priv)
+}
+
+func NewClientWithPrivateKey(ctx context.Context, node *tailcfg.DERPNode, serverURL string, priv key.NodePrivate) (*Client, error) {
+	if priv.IsZero() {
+		return nil, errors.New("zero DERP private key")
+	}
+	return newClientWithPrivateKey(ctx, node, serverURL, priv)
+}
+
+func newClientWithPrivateKey(ctx context.Context, node *tailcfg.DERPNode, serverURL string, priv key.NodePrivate) (*Client, error) {
 	if node == nil {
 		return nil, errors.New("nil DERP node")
 	}
 
-	priv := key.NewNode()
 	logf := logger.Logf(func(string, ...any) {})
 	netMon := netmon.NewStatic()
 	dc, err := derphttp.NewClient(priv, serverURL, logf, netMon)

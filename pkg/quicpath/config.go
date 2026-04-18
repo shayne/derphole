@@ -97,23 +97,37 @@ func generateSelfSignedCertificate() (tls.Certificate, [32]byte, error) {
 	if err != nil {
 		return tls.Certificate{}, [32]byte{}, err
 	}
+	identity, err := SessionIdentityFromEd25519PrivateKey(priv, time.Now())
+	if err != nil {
+		return tls.Certificate{}, [32]byte{}, err
+	}
+	return identity.Certificate, identity.Public, nil
+}
+
+func SessionIdentityFromEd25519PrivateKey(priv ed25519.PrivateKey, now time.Time) (SessionIdentity, error) {
+	if len(priv) != ed25519.PrivateKeySize {
+		return SessionIdentity{}, fmt.Errorf("ed25519 private key length = %d, want %d", len(priv), ed25519.PrivateKeySize)
+	}
+	pub, ok := priv.Public().(ed25519.PublicKey)
+	if !ok || len(pub) != ed25519.PublicKeySize {
+		return SessionIdentity{}, ErrPeerIdentityMismatch
+	}
 	var public [32]byte
-	copy(public[:], priv.Public().(ed25519.PublicKey))
+	copy(public[:], pub)
 
 	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serial, err := rand.Int(rand.Reader, serialLimit)
 	if err != nil {
-		return tls.Certificate{}, [32]byte{}, err
+		return SessionIdentity{}, err
 	}
 
-	now := time.Now()
 	template := &x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
 			CommonName: ServerName,
 		},
 		NotBefore:             now.Add(-1 * time.Minute),
-		NotAfter:              now.Add(1 * time.Hour),
+		NotAfter:              now.Add(24 * time.Hour),
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
@@ -122,21 +136,21 @@ func generateSelfSignedCertificate() (tls.Certificate, [32]byte, error) {
 
 	der, err := x509.CreateCertificate(rand.Reader, template, template, priv.Public(), priv)
 	if err != nil {
-		return tls.Certificate{}, [32]byte{}, err
+		return SessionIdentity{}, err
 	}
 
 	keyDER, err := x509.MarshalPKCS8PrivateKey(priv)
 	if err != nil {
-		return tls.Certificate{}, [32]byte{}, err
+		return SessionIdentity{}, err
 	}
 
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
-		return tls.Certificate{}, [32]byte{}, err
+		return SessionIdentity{}, err
 	}
-	return cert, public, nil
+	return SessionIdentity{Certificate: cert, Public: public}, nil
 }
 
 func verifyPinnedPeer(expected [32]byte) func([][]byte, [][]*x509.Certificate) error {
