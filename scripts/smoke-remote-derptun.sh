@@ -7,7 +7,8 @@ remote_user="${DERPHOLE_REMOTE_USER:-root}"
 remote_base="/tmp/derptun-smoke-$$"
 remote_upload="/tmp/derptun-bin-$$"
 tmp="$(mktemp -d)"
-token_file="${tmp}/token"
+server_token_file="${tmp}/server.dts"
+client_token_file="${tmp}/client.dtc"
 open_log="${tmp}/open.log"
 serve_log="${tmp}/serve.log"
 connect_first_log="${tmp}/connect-first.log"
@@ -91,7 +92,7 @@ connect_request_pongs() {
   local log_file="$3"
   local connect_pid=""
 
-  python3 - <<'PY' | DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 "${root_dir}/dist/derptun" --verbose connect --token "$(cat "${token_file}")" --stdio >"${out_file}" 2>"${log_file}" &
+  python3 - <<'PY' | DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 "${root_dir}/dist/derptun" --verbose connect --token "$(cat "${client_token_file}")" --stdio >"${out_file}" 2>"${log_file}" &
 import sys
 import time
 
@@ -139,7 +140,7 @@ PY
 
 start_holding_connect() {
   mkfifo "${active_in}"
-  DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 "${root_dir}/dist/derptun" --verbose connect --token "$(cat "${token_file}")" --stdio <"${active_in}" >"${active_out}" 2>"${active_log}" &
+  DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 "${root_dir}/dist/derptun" --verbose connect --token "$(cat "${client_token_file}")" --stdio <"${active_in}" >"${active_out}" 2>"${active_log}" &
   active_connect_pid=$!
   exec 9>"${active_in}"
   printf 'ping\n' >&9
@@ -199,7 +200,7 @@ expect_claimed_contender() {
     sed -n '1,200p' "${active_log}" >&2 || true
     exit 1
   fi
-  (printf 'ping\n' | DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 "${root_dir}/dist/derptun" --verbose connect --token "$(cat "${token_file}")" --stdio >"${contender_out}" 2>"${contender_log}") &
+  (printf 'ping\n' | DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 "${root_dir}/dist/derptun" --verbose connect --token "$(cat "${client_token_file}")" --stdio >"${contender_out}" 2>"${contender_log}") &
   contender_pid=$!
 
   for _ in $(seq 1 40); do
@@ -282,12 +283,13 @@ require_direct_evidence() {
 mkdir -p "${root_dir}/dist"
 go build -o "${root_dir}/dist/derptun" "${root_dir}/cmd/derptun"
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o "${root_dir}/dist/derptun-linux-amd64" "${root_dir}/cmd/derptun"
-"${root_dir}/dist/derptun" token --days 1 >"${token_file}"
+"${root_dir}/dist/derptun" token server --days 1 >"${server_token_file}"
+"${root_dir}/dist/derptun" token client --token "$(cat "${server_token_file}")" --days 1 >"${client_token_file}"
 
 remote "mkdir -p '${remote_base}'"
 scp "${root_dir}/dist/derptun-linux-amd64" "${remote_user}@${target}:${remote_upload}" >/dev/null
 remote "install -m 0755 '${remote_upload}' '${remote_base}/derptun'; rm -f '${remote_upload}'"
-scp "${token_file}" "${remote_user}@${target}:${remote_base}/token" >/dev/null
+scp "${server_token_file}" "${remote_user}@${target}:${remote_base}/server.dts" >/dev/null
 
 remote "nohup python3 -u - <<'PY' >'${remote_base}/echo.log' 2>&1 & echo \$! >'${remote_base}/echo.pid'
 import socket
@@ -308,12 +310,12 @@ while True:
                 break
 PY"
 
-remote "DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 nohup '${remote_base}/derptun' --verbose serve --token \"\$(cat '${remote_base}/token')\" --tcp 127.0.0.1:22345 >'${remote_base}/serve.out' 2>'${remote_base}/serve.err' </dev/null & echo \$! >'${remote_base}/serve.pid'"
+remote "DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 nohup '${remote_base}/derptun' --verbose serve --token \"\$(cat '${remote_base}/server.dts')\" --tcp 127.0.0.1:22345 >'${remote_base}/serve.out' 2>'${remote_base}/serve.err' </dev/null & echo \$! >'${remote_base}/serve.pid'"
 
 connect_request_pongs "first" "${connect_first_out}" "${connect_first_log}"
 fetch_remote_serve_log
 require_direct_evidence "remote derptun serve after first connect" "${serve_log}"
-remote "kill \$(cat '${remote_base}/serve.pid') 2>/dev/null || true; DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 nohup '${remote_base}/derptun' --verbose serve --token \"\$(cat '${remote_base}/token')\" --tcp 127.0.0.1:22345 >'${remote_base}/serve.out' 2>'${remote_base}/serve.err' </dev/null & echo \$! >'${remote_base}/serve.pid'"
+remote "kill \$(cat '${remote_base}/serve.pid') 2>/dev/null || true; DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 nohup '${remote_base}/derptun' --verbose serve --token \"\$(cat '${remote_base}/server.dts')\" --tcp 127.0.0.1:22345 >'${remote_base}/serve.out' 2>'${remote_base}/serve.err' </dev/null & echo \$! >'${remote_base}/serve.pid'"
 
 start_holding_connect
 refresh_active_connect
@@ -335,7 +337,7 @@ fetch_remote_serve_log
 require_direct_evidence "remote derptun serve after second connect" "${serve_log}"
 
 local_port="$(free_local_port | tr -d '\n')"
-DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 "${root_dir}/dist/derptun" --verbose open --token "$(cat "${token_file}")" --listen "127.0.0.1:${local_port}" >"${open_log}" 2>&1 &
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 "${root_dir}/dist/derptun" --verbose open --token "$(cat "${client_token_file}")" --listen "127.0.0.1:${local_port}" >"${open_log}" 2>&1 &
 local_open_pid=$!
 
 wait_for_file_pattern "${open_log}" "listening on 127\\.0\\.0\\.1:${local_port}" || {

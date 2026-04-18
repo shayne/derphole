@@ -152,37 +152,41 @@ npx -y derphole@latest open <token> 127.0.0.1:8080
 
 ### Durable SSH Tunnels with `derptun`
 
-`derptun` is the durable TCP tunnel companion to `derphole`. Use it when a host is behind NAT and you want a stable token you can reuse for days instead of a one-hour, session-scoped share token.
+`derptun` is the durable TCP tunnel companion to `derphole`. Use it when `serverhost` is behind NAT and you want a stable server credential that can survive process restarts.
 
-On the target host:
+On `serverhost`:
 
 ```bash
-npx -y derptun@latest token --days 7 > host1.token
-npx -y derptun@latest serve --token "$(cat host1.token)" --tcp 127.0.0.1:22
+npx -y derptun@latest token server --days 365 > server.dts
+npx -y derptun@latest token client --token "$(cat server.dts)" --days 7 > client.dtc
+npx -y derptun@latest serve --token "$(cat server.dts)" --tcp 127.0.0.1:22
 ```
 
-On the client:
+Copy only `client.dtc` to `clienthost`.
+
+On `clienthost`:
 
 ```bash
-npx -y derptun@latest open --token "$(cat host1.token)" --listen 127.0.0.1:2222
-ssh -p 2222 foo@127.0.0.1
+npx -y derptun@latest open --token "$(cat client.dtc)" --listen 127.0.0.1:2222
+ssh -p 2222 user@127.0.0.1
 ```
 
 For SSH without a separate local listener, use `ProxyCommand`:
 
 ```sshconfig
-Host host1-derptun
-  HostName host1
+Host serverhost-derptun
+  HostName serverhost
   User foo
-  ProxyCommand derptun connect --token ~/.config/derptun/host1.token --stdio
+  ProxyCommand derptun connect --token ~/.config/derptun/client.dtc --stdio
 ```
 
-`derptun` keeps trying when the network path drops, and it can reconnect while both `derptun` processes stay alive. If either process exits, the token can bring the tunnel back, but an already-open TCP session is gone. Use `tmux` or `screen` on the remote host when shell continuity matters.
+The server token is secret serving authority. Keep it on the serving machine or in its secret manager. The client token can connect until it expires, but it cannot serve or mint more tokens.
 
-Tokens default to seven days. Set a relative lifetime with `--days`, or use an absolute expiry:
+Server and client tokens default to seven days. Set a relative lifetime with `--days`, or use an absolute expiry:
 
 ```bash
-npx -y derptun@latest token --expires 2026-05-01T00:00:00Z
+npx -y derptun@latest token server --expires 2026-05-01T00:00:00Z > server.dts
+npx -y derptun@latest token client --token "$(cat server.dts)" --expires 2026-04-25T00:00:00Z > client.dtc
 ```
 
 The first `derptun` release is TCP-only. UDP forwarding is planned for use cases like Minecraft Bedrock servers, but it is not part of this release.
@@ -268,7 +272,7 @@ In practice: move bytes early, keep them moving through relay if needed, then sh
 
 ## Security Model
 
-Tokens are **bearer capabilities**. Anyone with a token can claim the matching session or tunnel until it expires, so share tokens over a trusted channel. `derphole` session tokens expire after one hour. `derptun` tokens default to seven days and can be shortened or extended with `--days` or `--expires`.
+Tokens are **bearer capabilities**. Anyone with a token can claim the matching session or tunnel until it expires, so share tokens over a trusted channel. `derphole` session tokens expire after one hour. `derptun` server tokens default to seven days and can mint shorter-lived client tokens; only server tokens can serve.
 
 DERP relays do **not** get the secret material needed to read or impersonate the session:
 
