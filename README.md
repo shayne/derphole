@@ -8,6 +8,7 @@ It supports:
 - text, file, and directory transfer with `send` and `receive`
 - local TCP service sharing with `share` and `open`
 - SSH access exchange with `ssh invite` and `ssh accept`
+- durable TCP tunnels with the companion `derptun` package
 
 `derphole` uses the public Tailscale [DERP](#what-is-derp) relay network for rendezvous and relay fallback. It is **not** affiliated with Tailscale, does **not** require a Tailscale account or tailnet, and does **not** use `tailscaled` for transport.
 
@@ -34,7 +35,7 @@ Session tokens carry authorization, and receive-code flows resolve into the same
 
 ## Quick Start
 
-`listen` receives bytes and prints a token. `pipe` sends stdin into that token. `share` and `open` use the same token shape for local TCP services.
+`listen` receives bytes and prints a token. `pipe` sends stdin into that token. `share` and `open` use the same token shape for local TCP services. Use `derptun` when the service needs a reusable token and longer-lived tunnel.
 
 ### Stream a Raw File
 
@@ -178,6 +179,12 @@ Host alpha-derptun
 
 `derptun` keeps trying when the network path drops, and it can reconnect while both `derptun` processes stay alive. If either process exits, the token can bring the tunnel back, but an already-open TCP session is gone. Use `tmux` or `screen` on the remote host when shell continuity matters.
 
+Tokens default to seven days. Set a relative lifetime with `--days`, or use an absolute expiry:
+
+```bash
+npx -y derptun@latest token --expires 2026-05-01T00:00:00Z
+```
+
 The first `derptun` release is TCP-only. UDP forwarding is planned for use cases like Minecraft Bedrock servers, but it is not part of this release.
 
 ### Useful Extras
@@ -186,6 +193,7 @@ Use the development channel for the latest commit from `main`:
 
 ```bash
 npx -y derphole@dev version
+npx -y derptun@dev version
 ```
 
 By default, `listen`, `pipe`, `send`, `receive`, `share`, and `open` keep transport status quiet. `listen` and `share` print tokens, `open` prints the local listening address, and `send` / `receive` print the receiver command or code needed to complete the transfer. Known-size transfers show wormhole-shaped progress on stderr. Use `--hide-progress` to suppress the progress bar. Use `--verbose` to see state transitions like `connected-relay` and `connected-direct`:
@@ -219,6 +227,7 @@ DERP provides **rendezvous** and **relay fallback**. If the term is new, see [Wh
 The data plane is selected per session:
 
 - `share/open` uses multiplexed QUIC streams over `derphole`'s relay/direct UDP transport, so one claimed session can carry many independent TCP connections to the shared service.
+- `derptun` uses a stable tunnel token and the same relay/direct UDP transport to carry reconnectable TCP streams. It is built for longer-lived access, such as SSH to a host behind NAT.
 - `listen/pipe` uses a one-shot byte stream. By default, `derphole` coordinates through DERP, promotes to rate-adaptive direct UDP when traversal succeeds, and stays on encrypted relay fallback when no direct path is available.
 - `send/receive` wraps the same one-shot stream with text, file, directory, and progress metadata.
 
@@ -259,12 +268,13 @@ In practice: move bytes early, keep them moving through relay if needed, then sh
 
 ## Security Model
 
-The session token is a **bearer capability**. Anyone with the token can claim the session until it expires, so share it over a trusted channel. Tokens expire after one hour.
+Tokens are **bearer capabilities**. Anyone with a token can claim the matching session or tunnel until it expires, so share tokens over a trusted channel. `derphole` session tokens expire after one hour. `derptun` tokens default to seven days and can be shortened or extended with `--days` or `--expires`.
 
 DERP relays do **not** get the secret material needed to read or impersonate the session:
 
 - On the default `listen/pipe` and `send/receive` direct UDP path, payload packets are encrypted and authenticated with session AEAD derived from the token bearer secret.
 - On `share/open`, stream traffic uses authenticated QUIC streams for the claimed session.
+- On `derptun`, stream traffic uses authenticated QUIC streams pinned to the stable tunnel identity in the token.
 - If packets are relayed through DERP, DERP only forwards encrypted session bytes.
 
 Important security property: `derphole` does not trade speed for plaintext shortcuts:
