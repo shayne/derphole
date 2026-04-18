@@ -14,13 +14,28 @@ connect_first_log="${tmp}/connect-first.log"
 connect_first_out="${tmp}/connect-first.out"
 connect_second_log="${tmp}/connect-second.log"
 connect_second_out="${tmp}/connect-second.out"
+connect_after_dead_log="${tmp}/connect-after-dead.log"
+connect_after_dead_out="${tmp}/connect-after-dead.out"
+active_in="${tmp}/connect-active.in"
+active_log="${tmp}/connect-active.log"
+active_out="${tmp}/connect-active.out"
+contender_log="${tmp}/connect-contender.log"
+contender_out="${tmp}/connect-contender.out"
 local_open_pid=""
+active_connect_pid=""
 
 remote() {
   ssh "${remote_user}@${target}" 'bash -se' <<<"$1"
 }
 
 cleanup() {
+  set +e
+  exec 9>&- 2>/dev/null
+  set -e
+  if [[ -n "${active_connect_pid}" ]]; then
+    kill "${active_connect_pid}" 2>/dev/null || true
+    wait "${active_connect_pid}" 2>/dev/null || true
+  fi
   if [[ -n "${local_open_pid}" ]]; then
     kill "${local_open_pid}" 2>/dev/null || true
     wait "${local_open_pid}" 2>/dev/null || true
@@ -108,8 +123,79 @@ PY
     exit 1
   fi
   require_direct_evidence "local derptun connect ${label}" "${log_file}"
+  for _ in $(seq 1 8); do
+    if ! kill -0 "${connect_pid}" 2>/dev/null; then
+      wait "${connect_pid}" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.25
+  done
   kill "${connect_pid}" 2>/dev/null || true
   wait "${connect_pid}" 2>/dev/null || true
+  sleep 12
+}
+
+start_holding_connect() {
+  mkfifo "${active_in}"
+  DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 "${root_dir}/dist/derptun" --verbose connect --token "$(cat "${token_file}")" --stdio <"${active_in}" >"${active_out}" 2>"${active_log}" &
+  active_connect_pid=$!
+  exec 9>"${active_in}"
+  printf 'ping\n' >&9
+
+  for _ in $(seq 1 120); do
+    if grep -q '^pong$' "${active_out}" 2>/dev/null && grep -q 'connected-direct' "${active_log}" 2>/dev/null; then
+      return 0
+    fi
+    if ! kill -0 "${active_connect_pid}" 2>/dev/null; then
+      echo "active derptun connect exited before becoming direct" >&2
+      sed -n '1,120p' "${active_out}" >&2 || true
+      sed -n '1,200p' "${active_log}" >&2 || true
+      exit 1
+    fi
+    sleep 0.25
+  done
+
+  echo "active derptun connect did not become direct" >&2
+  sed -n '1,120p' "${active_out}" >&2 || true
+  sed -n '1,200p' "${active_log}" >&2 || true
+  exit 1
+}
+
+expect_claimed_contender() {
+  (printf 'ping\n' | DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 "${root_dir}/dist/derptun" --verbose connect --token "$(cat "${token_file}")" --stdio >"${contender_out}" 2>"${contender_log}") &
+  contender_pid=$!
+
+  for _ in $(seq 1 40); do
+    if ! kill -0 "${contender_pid}" 2>/dev/null; then
+      break
+    fi
+    sleep 0.25
+  done
+  if kill -0 "${contender_pid}" 2>/dev/null; then
+    kill "${contender_pid}" 2>/dev/null || true
+    wait "${contender_pid}" 2>/dev/null || true
+    echo "contending derptun connect timed out instead of receiving claimed rejection" >&2
+    sed -n '1,120p' "${contender_out}" >&2 || true
+    sed -n '1,200p' "${contender_log}" >&2 || true
+    exit 1
+  fi
+
+  set +e
+  wait "${contender_pid}"
+  contender_status=$?
+  set -e
+  if [[ "${contender_status}" == "0" ]]; then
+    echo "contending derptun connect succeeded while active client was connected" >&2
+    sed -n '1,120p' "${contender_out}" >&2 || true
+    sed -n '1,200p' "${contender_log}" >&2 || true
+    exit 1
+  fi
+  if ! grep -q 'session already claimed' "${contender_log}" "${contender_out}" 2>/dev/null; then
+    echo "contending derptun connect did not report claimed rejection" >&2
+    sed -n '1,120p' "${contender_out}" >&2 || true
+    sed -n '1,200p' "${contender_log}" >&2 || true
+    exit 1
+  fi
 }
 
 require_direct_evidence() {
@@ -156,6 +242,21 @@ remote "DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 nohup '${remote_base}/derpt
 connect_request_pongs "first" "${connect_first_out}" "${connect_first_log}"
 fetch_remote_serve_log
 require_direct_evidence "remote derptun serve after first connect" "${serve_log}"
+
+start_holding_connect
+expect_claimed_contender
+require_direct_evidence "active derptun connect" "${active_log}"
+kill "${active_connect_pid}" 2>/dev/null || true
+wait "${active_connect_pid}" 2>/dev/null || true
+active_connect_pid=""
+set +e
+exec 9>&- 2>/dev/null
+set -e
+sleep 12
+
+connect_request_pongs "after dead client" "${connect_after_dead_out}" "${connect_after_dead_log}"
+fetch_remote_serve_log
+require_direct_evidence "remote derptun serve after dead client reconnect" "${serve_log}"
 
 connect_request_pongs "second" "${connect_second_out}" "${connect_second_log}"
 fetch_remote_serve_log

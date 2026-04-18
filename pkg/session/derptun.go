@@ -49,6 +49,13 @@ func decodeDerptunCredential(raw string) (derptun.Credential, error) {
 	return derptun.DecodeToken(raw, time.Now())
 }
 
+func derptunQUICConfig() *quic.Config {
+	cfg := quicpath.DefaultQUICConfig()
+	cfg.KeepAlivePeriod = 2 * time.Second
+	cfg.MaxIdleTimeout = 10 * time.Second
+	return cfg
+}
+
 func DerptunServe(ctx context.Context, cfg DerptunServeConfig) error {
 	cred, err := decodeDerptunCredential(cfg.Token)
 	if err != nil {
@@ -216,13 +223,7 @@ func handleDerptunServeClaim(
 	}
 	claim := *env.Claim
 	peerDERP := key.NodePublicFromRaw32(mem.B(claim.DERPPublic[:]))
-	decision, err := gate.Accept(time.Now(), claim)
-	if errors.Is(err, rendezvous.ErrClaimed) && active != nil && !active.sameClaim(claim) {
-		active.cancel()
-		gate.Release(active.claim.DERPPublic)
-		active = nil
-		decision, _ = gate.Accept(time.Now(), claim)
-	}
+	decision, _ := gate.Accept(time.Now(), claim)
 	if !decision.Accepted {
 		if err := sendEnvelope(ctx, derpClient, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
 			return active, err
@@ -266,7 +267,7 @@ func handleDerptunServeClaim(
 	seedAcceptedClaimCandidates(transportCtx, transportManager, claim)
 
 	adapter := quicpath.NewAdapter(transportManager.PeerDatagramConn(transportCtx))
-	quicListener, err := quic.Listen(adapter, quicpath.ServerTLSConfig(identity, claim.QUICPublic), quicpath.DefaultQUICConfig())
+	quicListener, err := quic.Listen(adapter, quicpath.ServerTLSConfig(identity, claim.QUICPublic), derptunQUICConfig())
 	if err != nil {
 		_ = adapter.Close()
 		transportCleanup()
@@ -329,7 +330,7 @@ func handleDerptunServeClaim(
 }
 
 func serveDerptunMuxTarget(ctx context.Context, mux *derptun.Mux, targetAddr string, emitter *telemetry.Emitter) error {
-	slots := make(chan struct{}, quicpath.MaxIncomingStreams)
+	slots := make(chan struct{}, 1)
 	for {
 		overlayConn, err := mux.Accept(ctx)
 		if err != nil {
@@ -557,7 +558,7 @@ func dialDerptunMux(ctx context.Context, tokenValue string, emitter *telemetry.E
 
 	peerConn := transportManager.PeerDatagramConn(transportCtx)
 	adapter := quicpath.NewAdapter(peerConn)
-	quicConn, err := quic.Dial(ctx, adapter, peerConn.RemoteAddr(), quicpath.ClientTLSConfig(clientIdentity, tok.QUICPublic), quicpath.DefaultQUICConfig())
+	quicConn, err := quic.Dial(ctx, adapter, peerConn.RemoteAddr(), quicpath.ClientTLSConfig(clientIdentity, tok.QUICPublic), derptunQUICConfig())
 	if err != nil {
 		_ = adapter.Close()
 		transportCleanup()
