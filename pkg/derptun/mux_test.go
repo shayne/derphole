@@ -115,6 +115,10 @@ func TestMuxResendsUnackedDataAfterCarrierReplacement(t *testing.T) {
 	if !bytes.Equal(before, []byte("before")) {
 		t.Fatalf("initial payload = %q, want %q", before, "before")
 	}
+	time.Sleep(50 * time.Millisecond)
+
+	clientA, serverA := net.Pipe()
+	clientMux.ReplaceCarrier(clientA)
 
 	writeDone := make(chan error, 1)
 	go func() {
@@ -122,7 +126,15 @@ func TestMuxResendsUnackedDataAfterCarrierReplacement(t *testing.T) {
 		writeDone <- err
 	}()
 
-	time.Sleep(20 * time.Millisecond)
+	header, payload, err := readFrame(serverA)
+	if err != nil {
+		t.Fatalf("read old carrier frame error = %v", err)
+	}
+	if header.Type != frameTypeData || string(payload) != "after reconnect" {
+		t.Fatalf("old carrier frame = (%#v, %q), want data after reconnect", header, payload)
+	}
+
+	_ = serverA.Close()
 	closeBoth(t, clientMux.ReplaceCarrier, serverMux.ReplaceCarrier)
 
 	select {
@@ -201,7 +213,14 @@ func TestMuxReplaysOpenAfterCarrierReplacement(t *testing.T) {
 		openCh <- openResult{conn: conn, err: err}
 	}()
 
-	time.Sleep(20 * time.Millisecond)
+	header, _, err := readFrame(serverA)
+	if err != nil {
+		t.Fatalf("read old carrier frame error = %v", err)
+	}
+	if header.Type != frameTypeOpen {
+		t.Fatalf("old carrier frame type = %q, want %q", header.Type, frameTypeOpen)
+	}
+
 	_ = serverA.Close()
 	clientB, serverB := net.Pipe()
 	clientMux.ReplaceCarrier(clientB)
@@ -234,6 +253,23 @@ func TestMuxReplaysOpenAfterCarrierReplacement(t *testing.T) {
 	}
 	if string(got) != "open replay" {
 		t.Fatalf("server got %q, want open replay", got)
+	}
+}
+
+func TestMuxOpenStreamTimesOutWithoutCarrier(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	mux := NewMux(MuxConfig{Role: MuxRoleClient, ReconnectTimeout: 50 * time.Millisecond})
+	defer mux.Close()
+
+	conn, err := mux.OpenStream(ctx)
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("OpenStream() error = nil, want reconnect timeout")
+	}
+	if err != context.DeadlineExceeded {
+		t.Fatalf("OpenStream() error = %v, want %v", err, context.DeadlineExceeded)
 	}
 }
 

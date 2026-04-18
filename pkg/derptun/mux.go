@@ -442,11 +442,11 @@ func (s *muxStream) sendOpen(ctx context.Context) error {
 	header := frameHeader{Type: frameTypeOpen, StreamID: s.id}
 	deadline := s.mux.deadline()
 	for {
+		carrierChanged := s.mux.currentCarrierChange()
 		if err := s.mux.writeFrameUntil(header, nil, deadline); err != nil {
 			return err
 		}
 
-		carrierChanged := s.mux.currentCarrierChange()
 		wait := time.Until(deadline)
 		if wait <= 0 {
 			return context.DeadlineExceeded
@@ -501,11 +501,11 @@ func (s *muxStream) sendChunk(payload []byte) error {
 	deadline := s.mux.deadline()
 
 	for {
+		carrierChanged := s.mux.currentCarrierChange()
 		if err := s.mux.writeFrameUntil(header, payload, deadline); err != nil {
 			return err
 		}
 
-		carrierChanged := s.mux.currentCarrierChange()
 		wait := time.Until(deadline)
 		if wait <= 0 {
 			return context.DeadlineExceeded
