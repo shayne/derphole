@@ -125,6 +125,14 @@ set -euo pipefail
 ./scripts/smoke-remote-share.sh "${REMOTE_HOST}"
 """
 
+[tasks.smoke-remote-derptun]
+shell = "bash -c"
+run = """
+set -euo pipefail
+: "${REMOTE_HOST:?set REMOTE_HOST to a reachable SSH host}"
+./scripts/smoke-remote-derptun.sh "${REMOTE_HOST}"
+"""
+
 [tasks.promotion-1g]
 shell = "bash -c"
 run = """

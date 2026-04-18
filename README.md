@@ -30,6 +30,7 @@ Session tokens carry authorization, and receive-code flows resolve into the same
 - Use `send` and `receive` for text, files, directories, progress, and receive-code UX.
 - Use `share` and `open` for temporary access to a local TCP service.
 - Use `ssh invite` and `ssh accept` for SSH public key exchange.
+- Use `derptun` for durable TCP tunnels with reusable, longer-lived tokens.
 
 ## Quick Start
 
@@ -147,6 +148,37 @@ Bind `open` to a specific local port:
 ```bash
 npx -y derphole@latest open <token> 127.0.0.1:8080
 ```
+
+### Durable SSH Tunnels with `derptun`
+
+`derptun` is the durable TCP tunnel companion to `derphole`. Use it when a host is behind NAT and you want a stable token you can reuse for days instead of a one-hour, session-scoped share token.
+
+On the target host:
+
+```bash
+npx -y derptun@latest token --days 7 > alpha.token
+npx -y derptun@latest serve --token "$(cat alpha.token)" --tcp 127.0.0.1:22
+```
+
+On the client:
+
+```bash
+npx -y derptun@latest open --token "$(cat alpha.token)" --listen 127.0.0.1:2222
+ssh -p 2222 foo@127.0.0.1
+```
+
+For SSH without a separate local listener, use `ProxyCommand`:
+
+```sshconfig
+Host alpha-derptun
+  HostName alpha
+  User foo
+  ProxyCommand derptun connect --token ~/.config/derptun/alpha.token --stdio
+```
+
+`derptun` keeps trying when the network path drops, and it can reconnect while both `derptun` processes stay alive. If either process exits, the token can bring the tunnel back, but an already-open TCP session is gone. Use `tmux` or `screen` on the remote host when shell continuity matters.
+
+The first `derptun` release is TCP-only. UDP forwarding is planned for use cases like Minecraft Bedrock servers, but it is not part of this release.
 
 ### Useful Extras
 
@@ -288,7 +320,7 @@ mise run check
 mise run build
 ```
 
-`mise run build` writes `dist/derphole`.
+`mise run build` writes `dist/derphole` and `dist/derptun`.
 
 ## Verification
 
@@ -303,14 +335,15 @@ Remote smoke tests against a host you control:
 ```bash
 REMOTE_HOST=my-server.example.com mise run smoke-remote
 REMOTE_HOST=my-server.example.com mise run smoke-remote-share
+REMOTE_HOST=my-server.example.com mise run smoke-remote-derptun
 REMOTE_HOST=my-server.example.com mise run promotion-1g
 ```
 
 ## Releases
 
-- npm package: `derphole`
-- production channel: `derphole@latest`
-- development channel: `derphole@dev`
+- npm packages: `derphole`, `derptun`
+- production channels: `derphole@latest`, `derptun@latest`
+- development channels: `derphole@dev`, `derptun@dev`
 - bootstrap runbook: [docs/releases/npm-bootstrap.md](docs/releases/npm-bootstrap.md)
 
 ## What Is DERP?
