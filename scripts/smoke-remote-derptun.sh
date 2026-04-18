@@ -10,6 +10,10 @@ tmp="$(mktemp -d)"
 token_file="${tmp}/token"
 open_log="${tmp}/open.log"
 serve_log="${tmp}/serve.log"
+connect_first_log="${tmp}/connect-first.log"
+connect_first_out="${tmp}/connect-first.out"
+connect_second_log="${tmp}/connect-second.log"
+connect_second_out="${tmp}/connect-second.out"
 local_open_pid=""
 
 remote() {
@@ -66,6 +70,48 @@ print(data.decode("utf-8", "replace").strip())
 PY
 }
 
+connect_request_pongs() {
+  local label="$1"
+  local out_file="$2"
+  local log_file="$3"
+  local connect_pid=""
+
+  python3 - <<'PY' | DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 "${root_dir}/dist/derptun" --verbose connect --token "$(cat "${token_file}")" --stdio >"${out_file}" 2>"${log_file}" &
+import sys
+import time
+
+for _ in range(80):
+    sys.stdout.write("ping\n")
+    sys.stdout.flush()
+    time.sleep(0.05)
+PY
+  connect_pid=$!
+
+  for _ in $(seq 1 120); do
+    got_count="$(grep -c '^pong$' "${out_file}" 2>/dev/null || true)"
+    if [[ "${got_count}" == "80" ]] && grep -q 'connected-direct' "${log_file}" 2>/dev/null; then
+      break
+    fi
+    if ! kill -0 "${connect_pid}" 2>/dev/null; then
+      break
+    fi
+    sleep 0.25
+  done
+
+  got_count="$(grep -c '^pong$' "${out_file}" || true)"
+  if [[ "${got_count}" != "80" ]]; then
+    echo "derptun connect ${label} payload mismatch" >&2
+    printf 'want pong lines=%q\n' "80" >&2
+    printf ' got pong lines=%q\n' "${got_count}" >&2
+    sed -n '1,120p' "${out_file}" >&2 || true
+    sed -n '1,200p' "${log_file}" >&2 || true
+    exit 1
+  fi
+  require_direct_evidence "local derptun connect ${label}" "${log_file}"
+  kill "${connect_pid}" 2>/dev/null || true
+  wait "${connect_pid}" 2>/dev/null || true
+}
+
 require_direct_evidence() {
   local label="$1"
   local file="$2"
@@ -96,11 +142,24 @@ server.listen()
 while True:
     conn, _ = server.accept()
     with conn:
-        conn.recv(1024)
-        conn.sendall(b'pong\n')
+        stream = conn.makefile('rwb', buffering=0)
+        for index, line in enumerate(stream, start=1):
+            if not line:
+                break
+            conn.sendall(b'pong\n')
+            if index >= 80:
+                break
 PY"
 
 remote "DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 nohup '${remote_base}/derptun' --verbose serve --token \"\$(cat '${remote_base}/token')\" --tcp 127.0.0.1:22345 >'${remote_base}/serve.out' 2>'${remote_base}/serve.err' </dev/null & echo \$! >'${remote_base}/serve.pid'"
+
+connect_request_pongs "first" "${connect_first_out}" "${connect_first_log}"
+fetch_remote_serve_log
+require_direct_evidence "remote derptun serve after first connect" "${serve_log}"
+
+connect_request_pongs "second" "${connect_second_out}" "${connect_second_log}"
+fetch_remote_serve_log
+require_direct_evidence "remote derptun serve after second connect" "${serve_log}"
 
 local_port="$(free_local_port | tr -d '\n')"
 DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 "${root_dir}/dist/derptun" --verbose open --token "$(cat "${token_file}")" --listen "127.0.0.1:${local_port}" >"${open_log}" 2>&1 &
@@ -108,6 +167,14 @@ local_open_pid=$!
 
 wait_for_file_pattern "${open_log}" "listening on 127\\.0\\.0\\.1:${local_port}" || {
   echo "derptun open did not bind local listener" >&2
+  fetch_remote_serve_log
+  echo "first connect log:" >&2
+  sed -n '1,200p' "${connect_first_log}" >&2 || true
+  echo "second connect log:" >&2
+  sed -n '1,200p' "${connect_second_log}" >&2 || true
+  echo "serve log:" >&2
+  sed -n '1,240p' "${serve_log}" >&2 || true
+  echo "open log:" >&2
   sed -n '1,200p' "${open_log}" >&2 || true
   exit 1
 }

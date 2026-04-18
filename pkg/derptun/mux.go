@@ -155,13 +155,28 @@ func (m *Mux) OpenStream(ctx context.Context) (net.Conn, error) {
 }
 
 func (m *Mux) Accept(ctx context.Context) (net.Conn, error) {
-	select {
-	case conn := <-m.acceptCh:
-		return conn, nil
-	case <-m.closeCh:
-		return nil, net.ErrClosed
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	for {
+		select {
+		case conn := <-m.acceptCh:
+			return conn, nil
+		default:
+		}
+
+		carrier, _, changed, closed := m.carrierSnapshot()
+		if closed || carrier == nil {
+			return nil, net.ErrClosed
+		}
+
+		select {
+		case conn := <-m.acceptCh:
+			return conn, nil
+		case <-changed:
+			continue
+		case <-m.closeCh:
+			return nil, net.ErrClosed
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 }
 

@@ -89,6 +89,46 @@ func TestDerptunConnectBridgesStdio(t *testing.T) {
 	<-serveErr
 }
 
+func TestDerptunServeAcceptsRepeatedConnectRestarts(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	backend := startLineEchoServer(t)
+	tokenValue, err := derptun.GenerateToken(derptun.TokenOptions{Now: time.Now()})
+	if err != nil {
+		t.Fatalf("GenerateToken() error = %v", err)
+	}
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- DerptunServe(ctx, DerptunServeConfig{Token: tokenValue, TargetAddr: backend, ForceRelay: true})
+	}()
+
+	for _, line := range []string{"first\n", "second\n"} {
+		var out strings.Builder
+		connectCtx, connectCancel := context.WithTimeout(ctx, 10*time.Second)
+		err := DerptunConnect(connectCtx, DerptunConnectConfig{
+			Token:      tokenValue,
+			StdioIn:    strings.NewReader(line),
+			StdioOut:   &out,
+			ForceRelay: true,
+		})
+		connectCancel()
+		if err != nil {
+			t.Fatalf("DerptunConnect(%q) error = %v", strings.TrimSpace(line), err)
+		}
+		if got, want := out.String(), "echo: "+line; got != want {
+			t.Fatalf("DerptunConnect(%q) stdout = %q, want %q", strings.TrimSpace(line), got, want)
+		}
+	}
+
+	cancel()
+	<-serveErr
+}
+
 func TestBridgeDerptunStdioClosesInputWhenRemoteEnds(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

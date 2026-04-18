@@ -14,7 +14,6 @@ import (
 	"github.com/shayne/derphole/pkg/rendezvous"
 	"github.com/shayne/derphole/pkg/stream"
 	"github.com/shayne/derphole/pkg/telemetry"
-	sessiontoken "github.com/shayne/derphole/pkg/token"
 	"go4.org/mem"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -94,20 +93,51 @@ func DerptunServe(ctx context.Context, cfg DerptunServeConfig) error {
 
 	emitStatus(cfg.Emitter, StateWaiting)
 	gate := rendezvous.NewDurableGate(tok)
-	for {
-		if err := serveDerptunOnce(ctx, cfg, tok, identity, dm, derpClient, probeConn, pm, gate); err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			return err
+	if err := serveDerptunClaims(ctx, cfg, identity, dm, derpClient, probeConn, pm, gate); err != nil {
+		if ctx.Err() != nil {
+			return nil
 		}
+		return err
+	}
+	return nil
+}
+
+type derptunServeActive struct {
+	claim  rendezvous.Claim
+	cancel context.CancelFunc
+	done   chan error
+}
+
+func (a *derptunServeActive) sameClaim(claim rendezvous.Claim) bool {
+	if a == nil {
+		return false
+	}
+	return a.claim.DERPPublic == claim.DERPPublic && a.claim.QUICPublic == claim.QUICPublic
+}
+
+func (a *derptunServeActive) stop(ctx context.Context) error {
+	if a == nil {
+		return nil
+	}
+	a.cancel()
+	select {
+	case err := <-a.done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
-func serveDerptunOnce(
+func derptunServeTunnelErr(err error) error {
+	if err == nil || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
+
+func serveDerptunClaims(
 	ctx context.Context,
 	cfg DerptunServeConfig,
-	tok sessiontoken.Token,
 	identity quicpath.SessionIdentity,
 	dm *tailcfg.DERPMap,
 	derpClient *derpbind.Client,
@@ -120,90 +150,172 @@ func serveDerptunOnce(
 	})
 	defer unsubscribeClaims()
 
+	var active *derptunServeActive
+	defer func() {
+		if active != nil {
+			_ = active.stop(context.Background())
+			gate.Release(active.claim.DERPPublic)
+		}
+	}()
+
 	for {
-		pkt, err := receiveSubscribedPacket(ctx, claimCh)
-		if err != nil {
-			return err
+		var activeDone <-chan error
+		if active != nil {
+			activeDone = active.done
 		}
-		env, err := decodeEnvelope(pkt.Payload)
-		if err != nil || env.Type != envelopeClaim || env.Claim == nil {
-			continue
-		}
-		peerDERP := key.NodePublicFromRaw32(mem.B(env.Claim.DERPPublic[:]))
-		decision, _ := gate.Accept(time.Now(), *env.Claim)
-		if !decision.Accepted {
-			if err := sendEnvelope(ctx, derpClient, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
+
+		select {
+		case err := <-activeDone:
+			gate.Release(active.claim.DERPPublic)
+			active = nil
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if err := derptunServeTunnelErr(err); err != nil {
 				return err
 			}
 			continue
+		case pkt, ok := <-claimCh:
+			if !ok {
+				return net.ErrClosed
+			}
+			nextActive, err := handleDerptunServeClaim(ctx, cfg, identity, dm, derpClient, probeConn, pm, gate, active, pkt)
+			if err != nil {
+				return err
+			}
+			active = nextActive
+		case <-ctx.Done():
+			if active != nil {
+				err := active.stop(context.Background())
+				gate.Release(active.claim.DERPPublic)
+				active = nil
+				if err := derptunServeTunnelErr(err); err != nil {
+					return err
+				}
+			}
+			return ctx.Err()
 		}
+	}
+}
+
+func handleDerptunServeClaim(
+	ctx context.Context,
+	cfg DerptunServeConfig,
+	identity quicpath.SessionIdentity,
+	dm *tailcfg.DERPMap,
+	derpClient *derpbind.Client,
+	probeConn net.PacketConn,
+	pm publicPortmap,
+	gate *rendezvous.DurableGate,
+	active *derptunServeActive,
+	pkt derpbind.Packet,
+) (*derptunServeActive, error) {
+	env, err := decodeEnvelope(pkt.Payload)
+	if err != nil || env.Type != envelopeClaim || env.Claim == nil {
+		return active, nil
+	}
+	claim := *env.Claim
+	peerDERP := key.NodePublicFromRaw32(mem.B(claim.DERPPublic[:]))
+	decision, err := gate.Accept(time.Now(), claim)
+	if errors.Is(err, rendezvous.ErrClaimed) && active != nil && !active.sameClaim(claim) {
+		active.cancel()
+		gate.Release(active.claim.DERPPublic)
+		active = nil
+		decision, _ = gate.Accept(time.Now(), claim)
+	}
+	if !decision.Accepted {
+		if err := sendEnvelope(ctx, derpClient, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
+			return active, err
+		}
+		return active, nil
+	}
+	if active != nil && active.sameClaim(claim) {
 		if decision.Accept != nil && !cfg.ForceRelay {
 			decision.Accept.Candidates = publicProbeCandidates(ctx, probeConn, dm, pm)
 		}
-
-		emitStatus(cfg.Emitter, StateClaimed)
-		pathEmitter := newTransportPathEmitter(cfg.Emitter)
-		pathEmitter.Emit(StateProbing)
-		transportCtx, transportCancel := context.WithCancel(ctx)
-		transportManager, transportCleanup, err := startExternalTransportManager(
-			transportCtx,
-			probeConn,
-			dm,
-			derpClient,
-			peerDERP,
-			parseCandidateStrings(decision.Accept.Candidates),
-			pm,
-			cfg.ForceRelay,
-		)
-		if err != nil {
-			transportCancel()
-			gate.Release(env.Claim.DERPPublic)
-			return err
-		}
-		pathEmitter.Watch(transportCtx, transportManager)
-		pathEmitter.Flush(transportManager)
-		seedAcceptedClaimCandidates(transportCtx, transportManager, *env.Claim)
-
-		adapter := quicpath.NewAdapter(transportManager.PeerDatagramConn(transportCtx))
-		quicListener, err := quic.Listen(adapter, quicpath.ServerTLSConfig(identity, env.Claim.QUICPublic), quicpath.DefaultQUICConfig())
-		if err != nil {
-			_ = adapter.Close()
-			transportCleanup()
-			transportCancel()
-			gate.Release(env.Claim.DERPPublic)
-			return err
-		}
 		if err := sendEnvelope(ctx, derpClient, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
-			_ = quicListener.Close()
-			_ = adapter.Close()
-			transportCleanup()
-			transportCancel()
-			gate.Release(env.Claim.DERPPublic)
-			return err
+			return active, err
 		}
-		quicConn, err := quicListener.Accept(ctx)
-		if err != nil {
-			_ = quicListener.Close()
-			_ = adapter.Close()
-			transportCleanup()
-			transportCancel()
-			gate.Release(env.Claim.DERPPublic)
-			return err
-		}
-		carrier, err := quicConn.AcceptStream(ctx)
-		if err != nil {
-			_ = quicConn.CloseWithError(1, "accept derptun carrier failed")
-			_ = quicListener.Close()
-			_ = adapter.Close()
-			transportCleanup()
-			transportCancel()
-			gate.Release(env.Claim.DERPPublic)
-			return err
-		}
+		return active, nil
+	}
+	if decision.Accept != nil && !cfg.ForceRelay {
+		decision.Accept.Candidates = publicProbeCandidates(ctx, probeConn, dm, pm)
+	}
 
-		mux := derptun.NewMux(derptun.MuxConfig{Role: derptun.MuxRoleServer, ReconnectTimeout: 30 * time.Second})
-		mux.ReplaceCarrier(quicpath.WrapStream(quicConn, carrier))
-		err = serveDerptunMuxTarget(ctx, mux, cfg.TargetAddr, cfg.Emitter)
+	emitStatus(cfg.Emitter, StateClaimed)
+	pathEmitter := newTransportPathEmitter(cfg.Emitter)
+	pathEmitter.Emit(StateProbing)
+	transportCtx, transportCancel := context.WithCancel(ctx)
+	transportManager, transportCleanup, err := startExternalTransportManager(
+		transportCtx,
+		probeConn,
+		dm,
+		derpClient,
+		peerDERP,
+		parseCandidateStrings(decision.Accept.Candidates),
+		pm,
+		cfg.ForceRelay,
+	)
+	if err != nil {
+		transportCancel()
+		gate.Release(claim.DERPPublic)
+		return active, err
+	}
+	pathEmitter.Watch(transportCtx, transportManager)
+	pathEmitter.Flush(transportManager)
+	seedAcceptedClaimCandidates(transportCtx, transportManager, claim)
+
+	adapter := quicpath.NewAdapter(transportManager.PeerDatagramConn(transportCtx))
+	quicListener, err := quic.Listen(adapter, quicpath.ServerTLSConfig(identity, claim.QUICPublic), quicpath.DefaultQUICConfig())
+	if err != nil {
+		_ = adapter.Close()
+		transportCleanup()
+		transportCancel()
+		gate.Release(claim.DERPPublic)
+		return active, err
+	}
+	if err := sendEnvelope(ctx, derpClient, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
+		_ = quicListener.Close()
+		_ = adapter.Close()
+		transportCleanup()
+		transportCancel()
+		gate.Release(claim.DERPPublic)
+		return active, err
+	}
+	quicConn, err := quicListener.Accept(ctx)
+	if err != nil {
+		_ = quicListener.Close()
+		_ = adapter.Close()
+		transportCleanup()
+		transportCancel()
+		gate.Release(claim.DERPPublic)
+		return active, err
+	}
+	carrier, err := quicConn.AcceptStream(ctx)
+	if err != nil {
+		_ = quicConn.CloseWithError(1, "accept derptun carrier failed")
+		_ = quicListener.Close()
+		_ = adapter.Close()
+		transportCleanup()
+		transportCancel()
+		gate.Release(claim.DERPPublic)
+		return active, err
+	}
+
+	mux := derptun.NewMux(derptun.MuxConfig{Role: derptun.MuxRoleServer, ReconnectTimeout: 30 * time.Second})
+	mux.ReplaceCarrier(quicpath.WrapStream(quicConn, carrier))
+	tunnelCtx, tunnelCancel := context.WithCancel(ctx)
+	next := &derptunServeActive{claim: claim, cancel: tunnelCancel, done: make(chan error, 1)}
+	go func() {
+		go func() {
+			select {
+			case <-quicConn.Context().Done():
+				tunnelCancel()
+			case <-tunnelCtx.Done():
+			}
+		}()
+		err := serveDerptunMuxTarget(tunnelCtx, mux, cfg.TargetAddr, cfg.Emitter)
+		tunnelCancel()
 		_ = mux.Close()
 		_ = quicConn.CloseWithError(0, "")
 		_ = quicListener.Close()
@@ -211,14 +323,9 @@ func serveDerptunOnce(
 		pathEmitter.Complete(transportManager)
 		transportCleanup()
 		transportCancel()
-		gate.Release(env.Claim.DERPPublic)
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if err != nil && !errors.Is(err, net.ErrClosed) {
-			return err
-		}
-	}
+		next.done <- err
+	}()
+	return next, nil
 }
 
 func serveDerptunMuxTarget(ctx context.Context, mux *derptun.Mux, targetAddr string, emitter *telemetry.Emitter) error {

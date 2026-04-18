@@ -196,6 +196,40 @@ func TestMuxCloseFramePropagatesEOF(t *testing.T) {
 	}
 }
 
+func TestMuxAcceptReturnsWhenCarrierCloses(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	clientCarrier, serverCarrier := net.Pipe()
+	defer clientCarrier.Close()
+
+	mux := NewMux(MuxConfig{Role: MuxRoleServer, ReconnectTimeout: time.Second})
+	defer mux.Close()
+	mux.ReplaceCarrier(serverCarrier)
+
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := mux.Accept(ctx)
+		if conn != nil {
+			_ = conn.Close()
+		}
+		errCh <- err
+	}()
+
+	if err := clientCarrier.Close(); err != nil {
+		t.Fatalf("client carrier Close() error = %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Accept() error = %v, want net.ErrClosed", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Accept() did not return after carrier close")
+	}
+}
+
 func TestMuxReplaysOpenAfterCarrierReplacement(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
