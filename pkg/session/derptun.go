@@ -15,12 +15,14 @@ import (
 	"github.com/shayne/derphole/pkg/rendezvous"
 	"github.com/shayne/derphole/pkg/stream"
 	"github.com/shayne/derphole/pkg/telemetry"
+	sessiontoken "github.com/shayne/derphole/pkg/token"
 	"go4.org/mem"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
 
 type DerptunServeConfig struct {
+	ServerToken   string
 	Token         string
 	TargetAddr    string
 	Emitter       *telemetry.Emitter
@@ -29,6 +31,7 @@ type DerptunServeConfig struct {
 }
 
 type DerptunOpenConfig struct {
+	ClientToken   string
 	Token         string
 	ListenAddr    string
 	BindAddrSink  chan<- string
@@ -38,6 +41,7 @@ type DerptunOpenConfig struct {
 }
 
 type DerptunConnectConfig struct {
+	ClientToken   string
 	Token         string
 	StdioIn       io.Reader
 	StdioOut      io.Writer
@@ -46,8 +50,12 @@ type DerptunConnectConfig struct {
 	UsePublicDERP bool
 }
 
-func decodeDerptunCredential(raw string) (derptun.Credential, error) {
-	return derptun.DecodeToken(raw, time.Now())
+func decodeDerptunServer(raw string) (derptun.ServerCredential, error) {
+	return derptun.DecodeServerToken(raw, time.Now())
+}
+
+func decodeDerptunClient(raw string) (derptun.ClientCredential, error) {
+	return derptun.DecodeClientToken(raw, time.Now())
 }
 
 func derptunQUICConfig() *quic.Config {
@@ -63,7 +71,11 @@ var (
 )
 
 func DerptunServe(ctx context.Context, cfg DerptunServeConfig) error {
-	cred, err := decodeDerptunCredential(cfg.Token)
+	serverToken := cfg.ServerToken
+	if serverToken == "" {
+		serverToken = cfg.Token
+	}
+	cred, err := decodeDerptunServer(serverToken)
 	if err != nil {
 		return err
 	}
@@ -105,8 +117,8 @@ func DerptunServe(ctx context.Context, cfg DerptunServeConfig) error {
 	defer pm.Close()
 
 	emitStatus(cfg.Emitter, StateWaiting)
-	gate := rendezvous.NewDurableGate(tok)
-	if err := serveDerptunClaims(ctx, cfg, identity, dm, derpClient, probeConn, pm, gate); err != nil {
+	gate := &derptunClientGate{}
+	if err := serveDerptunClaims(ctx, cfg, cred, identity, dm, derpClient, probeConn, pm, gate); err != nil {
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -170,7 +182,7 @@ func (a *derptunServeActive) lastPeerActivity() time.Time {
 	return time.Time{}
 }
 
-func recoverStaleDerptunActive(ctx context.Context, emitter *telemetry.Emitter, gate *rendezvous.DurableGate, active *derptunServeActive, probeTimeout, stopTimeout time.Duration) (bool, error) {
+func recoverStaleDerptunActive(ctx context.Context, emitter *telemetry.Emitter, gate *derptunClientGate, active *derptunServeActive, probeTimeout, stopTimeout time.Duration) (bool, error) {
 	if active == nil {
 		return false, nil
 	}
@@ -209,7 +221,7 @@ func recoverStaleDerptunActive(ctx context.Context, emitter *telemetry.Emitter, 
 	return true, nil
 }
 
-func releaseDerptunActive(emitter *telemetry.Emitter, gate *rendezvous.DurableGate, active *derptunServeActive, stopTimeout time.Duration) {
+func releaseDerptunActive(emitter *telemetry.Emitter, gate *derptunClientGate, active *derptunServeActive, stopTimeout time.Duration) {
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), stopTimeout)
 	stopErr := active.stop(stopCtx)
 	stopCancel()
@@ -241,6 +253,74 @@ func startDerptunDecisionResender(ctx context.Context, client *derpbind.Client, 
 	return cancel
 }
 
+func derptunServerTokenForClaim(server derptun.ServerCredential, claim rendezvous.Claim, now time.Time) (sessiontoken.Token, rendezvous.Decision, error) {
+	if claim.Client == nil {
+		return sessiontoken.Token{}, rendezvous.Decision{Accepted: false, Reject: &rendezvous.RejectInfo{Code: rendezvous.RejectClaimMalformed, Reason: "client proof missing"}}, rendezvous.ErrDenied
+	}
+	client := derptun.ClientCredential{
+		Version:     derptun.TokenVersion,
+		SessionID:   claim.SessionID,
+		ClientID:    claim.Client.ClientID,
+		TokenID:     claim.Client.TokenID,
+		ClientName:  claim.Client.ClientName,
+		ExpiresUnix: claim.Client.ExpiresUnix,
+		ProofMAC:    claim.Client.ProofMAC,
+	}
+	serverTok, err := server.SessionToken()
+	if err != nil {
+		return sessiontoken.Token{}, rendezvous.Decision{}, err
+	}
+	client.DERPPublic = serverTok.DERPPublic
+	client.QUICPublic = serverTok.QUICPublic
+	client.BearerSecret = derptun.DeriveClientBearerSecretForClaim(server.SigningSecret, client.ClientID)
+	if err := derptun.VerifyClientCredential(server.SigningSecret, client, now); err != nil {
+		reason := "client proof invalid"
+		code := rendezvous.RejectBadMAC
+		if errors.Is(err, derptun.ErrExpired) {
+			reason = "client token expired"
+			code = rendezvous.RejectExpired
+		}
+		return sessiontoken.Token{}, rendezvous.Decision{Accepted: false, Reject: &rendezvous.RejectInfo{Code: code, Reason: reason}}, err
+	}
+	serverTok.BearerSecret = client.BearerSecret
+	serverTok.ExpiresUnix = client.ExpiresUnix
+	return serverTok, rendezvous.Decision{}, nil
+}
+
+type derptunClientGate struct {
+	active *rendezvous.Claim
+}
+
+func (g *derptunClientGate) Accept(now time.Time, tok sessiontoken.Token, claim rendezvous.Claim) (rendezvous.Decision, error) {
+	// V1 intentionally allows one active client. Multi-client support should replace
+	// this single active claim with a map keyed by client ID and independent tunnel state.
+	if g.active != nil {
+		if sameDerptunConnector(*g.active, claim) {
+			return rendezvous.NewGate(tok).Accept(now, claim)
+		}
+		return rendezvous.Decision{Accepted: false, Reject: &rendezvous.RejectInfo{Code: rendezvous.RejectClaimed, Reason: "session already claimed"}}, rendezvous.ErrClaimed
+	}
+	decision, err := rendezvous.NewGate(tok).Accept(now, claim)
+	if err != nil {
+		return decision, err
+	}
+	stored := claim
+	stored.Candidates = append([]string(nil), claim.Candidates...)
+	g.active = &stored
+	return decision, nil
+}
+
+func (g *derptunClientGate) Release(derpPublic [32]byte) {
+	if g.active == nil || g.active.DERPPublic != derpPublic {
+		return
+	}
+	g.active = nil
+}
+
+func sameDerptunConnector(a, b rendezvous.Claim) bool {
+	return a.DERPPublic == b.DERPPublic && a.QUICPublic == b.QUICPublic
+}
+
 func derptunServeTunnelErr(err error) error {
 	if err == nil || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
 		return nil
@@ -251,12 +331,13 @@ func derptunServeTunnelErr(err error) error {
 func serveDerptunClaims(
 	ctx context.Context,
 	cfg DerptunServeConfig,
+	server derptun.ServerCredential,
 	identity quicpath.SessionIdentity,
 	dm *tailcfg.DERPMap,
 	derpClient *derpbind.Client,
 	probeConn net.PacketConn,
 	pm publicPortmap,
-	gate *rendezvous.DurableGate,
+	gate *derptunClientGate,
 ) error {
 	claimCh, unsubscribeClaims := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return isClaimPayload(pkt.Payload)
@@ -292,7 +373,7 @@ func serveDerptunClaims(
 			if !ok {
 				return net.ErrClosed
 			}
-			nextActive, err := handleDerptunServeClaim(ctx, cfg, identity, dm, derpClient, probeConn, pm, gate, active, pkt)
+			nextActive, err := handleDerptunServeClaim(ctx, cfg, server, identity, dm, derpClient, probeConn, pm, gate, active, pkt)
 			if err != nil {
 				return err
 			}
@@ -314,12 +395,13 @@ func serveDerptunClaims(
 func handleDerptunServeClaim(
 	ctx context.Context,
 	cfg DerptunServeConfig,
+	server derptun.ServerCredential,
 	identity quicpath.SessionIdentity,
 	dm *tailcfg.DERPMap,
 	derpClient *derpbind.Client,
 	probeConn net.PacketConn,
 	pm publicPortmap,
-	gate *rendezvous.DurableGate,
+	gate *derptunClientGate,
 	active *derptunServeActive,
 	pkt derpbind.Packet,
 ) (*derptunServeActive, error) {
@@ -329,7 +411,18 @@ func handleDerptunServeClaim(
 	}
 	claim := *env.Claim
 	peerDERP := key.NodePublicFromRaw32(mem.B(claim.DERPPublic[:]))
-	decision, _ := gate.Accept(time.Now(), claim)
+	now := time.Now()
+	claimToken, rejectDecision, err := derptunServerTokenForClaim(server, claim, now)
+	if err != nil {
+		if rejectDecision.Reject == nil {
+			return active, err
+		}
+		if sendErr := sendEnvelope(ctx, derpClient, peerDERP, envelope{Type: envelopeDecision, Decision: &rejectDecision}); sendErr != nil {
+			return active, sendErr
+		}
+		return active, nil
+	}
+	decision, _ := gate.Accept(now, claimToken, claim)
 	if !decision.Accepted {
 		if decision.Reject != nil && decision.Reject.Code == rendezvous.RejectClaimed && active != nil && !active.sameClaim(claim) {
 			recovered, err := recoverStaleDerptunActive(ctx, cfg.Emitter, gate, active, derptunActiveProbeTimeout, derptunActiveStopTimeout)
@@ -338,7 +431,7 @@ func handleDerptunServeClaim(
 			}
 			if recovered {
 				active = nil
-				decision, _ = gate.Accept(time.Now(), claim)
+				decision, _ = gate.Accept(time.Now(), claimToken, claim)
 			}
 		}
 	}
@@ -486,7 +579,11 @@ func serveDerptunMuxTarget(ctx context.Context, mux *derptun.Mux, targetAddr str
 }
 
 func DerptunOpen(ctx context.Context, cfg DerptunOpenConfig) error {
-	mux, cleanup, err := dialDerptunMux(ctx, cfg.Token, cfg.Emitter, cfg.ForceRelay)
+	clientToken := cfg.ClientToken
+	if clientToken == "" {
+		clientToken = cfg.Token
+	}
+	mux, cleanup, err := dialDerptunMux(ctx, clientToken, cfg.Emitter, cfg.ForceRelay)
 	if err != nil {
 		return err
 	}
@@ -510,7 +607,11 @@ func DerptunOpen(ctx context.Context, cfg DerptunOpenConfig) error {
 }
 
 func DerptunConnect(ctx context.Context, cfg DerptunConnectConfig) error {
-	conn, cleanup, err := dialDerptunMuxStream(ctx, cfg.Token, cfg.Emitter, cfg.ForceRelay)
+	clientToken := cfg.ClientToken
+	if clientToken == "" {
+		clientToken = cfg.Token
+	}
+	conn, cleanup, err := dialDerptunMuxStream(ctx, clientToken, cfg.Emitter, cfg.ForceRelay)
 	if err != nil {
 		return err
 	}
@@ -568,8 +669,8 @@ type emptyReader struct{}
 
 func (*emptyReader) Read([]byte) (int, error) { return 0, io.EOF }
 
-func dialDerptunMuxStream(ctx context.Context, tokenValue string, emitter *telemetry.Emitter, forceRelay bool) (net.Conn, func(), error) {
-	mux, cleanup, err := dialDerptunMux(ctx, tokenValue, emitter, forceRelay)
+func dialDerptunMuxStream(ctx context.Context, clientToken string, emitter *telemetry.Emitter, forceRelay bool) (net.Conn, func(), error) {
+	mux, cleanup, err := dialDerptunMux(ctx, clientToken, emitter, forceRelay)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -585,8 +686,8 @@ func dialDerptunMuxStream(ctx context.Context, tokenValue string, emitter *telem
 	}, nil
 }
 
-func dialDerptunMux(ctx context.Context, tokenValue string, emitter *telemetry.Emitter, forceRelay bool) (*derptun.Mux, func(), error) {
-	cred, err := decodeDerptunCredential(tokenValue)
+func dialDerptunMux(ctx context.Context, clientToken string, emitter *telemetry.Emitter, forceRelay bool) (*derptun.Mux, func(), error) {
+	cred, err := decodeDerptunClient(clientToken)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -635,6 +736,13 @@ func dialDerptunMux(ctx context.Context, tokenValue string, emitter *telemetry.E
 		QUICPublic:   clientIdentity.Public,
 		Candidates:   localCandidates,
 		Capabilities: tok.Capabilities,
+		Client: &rendezvous.ClientProof{
+			ClientID:    cred.ClientID,
+			TokenID:     cred.TokenID,
+			ClientName:  cred.ClientName,
+			ExpiresUnix: cred.ExpiresUnix,
+			ProofMAC:    cred.ProofMAC,
+		},
 	}
 	claim.BearerMAC = rendezvous.ComputeBearerMAC(tok.BearerSecret, claim)
 	decision, err := sendClaimAndReceiveDecision(ctx, derpClient, listenerDERP, claim)

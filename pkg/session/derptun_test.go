@@ -18,6 +18,24 @@ import (
 	"github.com/shayne/derphole/pkg/token"
 )
 
+func derptunServerAndClientTokens(t *testing.T) (string, string) {
+	t.Helper()
+	now := time.Now()
+	server, err := derptun.GenerateServerToken(derptun.ServerTokenOptions{Now: now, Days: 1})
+	if err != nil {
+		t.Fatalf("GenerateServerToken() error = %v", err)
+	}
+	client, err := derptun.GenerateClientToken(derptun.ClientTokenOptions{
+		Now:         now,
+		ServerToken: server,
+		Days:        1,
+	})
+	if err != nil {
+		t.Fatalf("GenerateClientToken() error = %v", err)
+	}
+	return server, client
+}
+
 func TestDerptunOpenForwardsTCPToServedTarget(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
@@ -27,19 +45,16 @@ func TestDerptunOpenForwardsTCPToServedTarget(t *testing.T) {
 	defer cancel()
 
 	backend := startLineEchoServer(t)
-	tokenValue, err := derptun.GenerateToken(derptun.TokenOptions{Now: time.Now()})
-	if err != nil {
-		t.Fatalf("GenerateToken() error = %v", err)
-	}
+	serverToken, clientToken := derptunServerAndClientTokens(t)
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- DerptunServe(ctx, DerptunServeConfig{Token: tokenValue, TargetAddr: backend})
+		serveErr <- DerptunServe(ctx, DerptunServeConfig{ServerToken: serverToken, TargetAddr: backend})
 	}()
 
 	bindCh := make(chan string, 1)
 	openErr := make(chan error, 1)
 	go func() {
-		openErr <- DerptunOpen(ctx, DerptunOpenConfig{Token: tokenValue, ListenAddr: "127.0.0.1:0", BindAddrSink: bindCh})
+		openErr <- DerptunOpen(ctx, DerptunOpenConfig{ClientToken: clientToken, ListenAddr: "127.0.0.1:0", BindAddrSink: bindCh})
 	}()
 	bindAddr := <-bindCh
 	conn, err := net.Dial("tcp", bindAddr)
@@ -71,19 +86,16 @@ func TestDerptunConnectBridgesStdio(t *testing.T) {
 	defer cancel()
 
 	backend := startLineEchoServer(t)
-	tokenValue, err := derptun.GenerateToken(derptun.TokenOptions{Now: time.Now()})
-	if err != nil {
-		t.Fatalf("GenerateToken() error = %v", err)
-	}
+	serverToken, clientToken := derptunServerAndClientTokens(t)
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- DerptunServe(ctx, DerptunServeConfig{Token: tokenValue, TargetAddr: backend})
+		serveErr <- DerptunServe(ctx, DerptunServeConfig{ServerToken: serverToken, TargetAddr: backend})
 	}()
 	var out strings.Builder
-	err = DerptunConnect(ctx, DerptunConnectConfig{
-		Token:    tokenValue,
-		StdioIn:  strings.NewReader("hello\n"),
-		StdioOut: &out,
+	err := DerptunConnect(ctx, DerptunConnectConfig{
+		ClientToken: clientToken,
+		StdioIn:     strings.NewReader("hello\n"),
+		StdioOut:    &out,
 	})
 	if err != nil {
 		t.Fatalf("DerptunConnect() error = %v", err)
@@ -104,23 +116,20 @@ func TestDerptunServeAcceptsRepeatedConnectRestarts(t *testing.T) {
 	defer cancel()
 
 	backend := startLineEchoServer(t)
-	tokenValue, err := derptun.GenerateToken(derptun.TokenOptions{Now: time.Now()})
-	if err != nil {
-		t.Fatalf("GenerateToken() error = %v", err)
-	}
+	serverToken, clientToken := derptunServerAndClientTokens(t)
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- DerptunServe(ctx, DerptunServeConfig{Token: tokenValue, TargetAddr: backend, ForceRelay: true})
+		serveErr <- DerptunServe(ctx, DerptunServeConfig{ServerToken: serverToken, TargetAddr: backend, ForceRelay: true})
 	}()
 
 	for _, line := range []string{"first\n", "second\n"} {
 		var out strings.Builder
 		connectCtx, connectCancel := context.WithTimeout(ctx, 10*time.Second)
 		err := DerptunConnect(connectCtx, DerptunConnectConfig{
-			Token:      tokenValue,
-			StdioIn:    strings.NewReader(line),
-			StdioOut:   &out,
-			ForceRelay: true,
+			ClientToken: clientToken,
+			StdioIn:     strings.NewReader(line),
+			StdioOut:    &out,
+			ForceRelay:  true,
 		})
 		connectCancel()
 		if err != nil {
@@ -144,23 +153,20 @@ func TestDerptunServeRejectsConcurrentConnector(t *testing.T) {
 	defer cancel()
 
 	backend, accepted := startHoldingTCPServer(t)
-	tokenValue, err := derptun.GenerateToken(derptun.TokenOptions{Now: time.Now()})
-	if err != nil {
-		t.Fatalf("GenerateToken() error = %v", err)
-	}
+	serverToken, clientToken := derptunServerAndClientTokens(t)
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- DerptunServe(ctx, DerptunServeConfig{Token: tokenValue, TargetAddr: backend, ForceRelay: true})
+		serveErr <- DerptunServe(ctx, DerptunServeConfig{ServerToken: serverToken, TargetAddr: backend, ForceRelay: true})
 	}()
 
 	firstInput, firstInputWriter := io.Pipe()
 	firstErr := make(chan error, 1)
 	go func() {
 		firstErr <- DerptunConnect(ctx, DerptunConnectConfig{
-			Token:      tokenValue,
-			StdioIn:    firstInput,
-			StdioOut:   io.Discard,
-			ForceRelay: true,
+			ClientToken: clientToken,
+			StdioIn:     firstInput,
+			StdioOut:    io.Discard,
+			ForceRelay:  true,
 		})
 	}()
 	select {
@@ -171,11 +177,11 @@ func TestDerptunServeRejectsConcurrentConnector(t *testing.T) {
 
 	secondCtx, secondCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer secondCancel()
-	err = DerptunConnect(secondCtx, DerptunConnectConfig{
-		Token:      tokenValue,
-		StdioIn:    strings.NewReader("second\n"),
-		StdioOut:   io.Discard,
-		ForceRelay: true,
+	err := DerptunConnect(secondCtx, DerptunConnectConfig{
+		ClientToken: clientToken,
+		StdioIn:     strings.NewReader("second\n"),
+		StdioOut:    io.Discard,
+		ForceRelay:  true,
 	})
 	if err == nil {
 		t.Fatal("second DerptunConnect() error = nil, want claimed rejection")
@@ -193,15 +199,28 @@ func TestDerptunServeRejectsConcurrentConnector(t *testing.T) {
 	<-serveErr
 }
 
+func TestDerptunRejectsWrongTokenRoles(t *testing.T) {
+	serverToken, clientToken := derptunServerAndClientTokens(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := DerptunServe(ctx, DerptunServeConfig{ServerToken: clientToken, TargetAddr: "127.0.0.1:22"}); !errors.Is(err, derptun.ErrInvalidToken) {
+		t.Fatalf("DerptunServe(client) error = %v, want ErrInvalidToken", err)
+	}
+	if err := DerptunConnect(ctx, DerptunConnectConfig{ClientToken: serverToken, StdioIn: strings.NewReader("x"), StdioOut: io.Discard}); !errors.Is(err, derptun.ErrInvalidToken) {
+		t.Fatalf("DerptunConnect(server) error = %v, want ErrInvalidToken", err)
+	}
+}
+
 func TestRecoverStaleDerptunActiveReleasesUnresponsiveClaim(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
 	now := time.Now()
 	tok := derptunTestToken(now.Add(time.Minute))
-	gate := rendezvous.NewDurableGate(tok)
+	gate := &derptunClientGate{}
 	first := derptunTestClaim(tok, 11)
-	if _, err := gate.Accept(now, first); err != nil {
+	if _, err := gate.Accept(now, tok, first); err != nil {
 		t.Fatalf("first Accept() error = %v", err)
 	}
 
@@ -222,7 +241,7 @@ func TestRecoverStaleDerptunActiveReleasesUnresponsiveClaim(t *testing.T) {
 	}()
 
 	second := derptunTestClaim(tok, 22)
-	if _, err := gate.Accept(now, second); !errors.Is(err, rendezvous.ErrClaimed) {
+	if _, err := gate.Accept(now, tok, second); !errors.Is(err, rendezvous.ErrClaimed) {
 		t.Fatalf("second Accept() error = %v, want %v", err, rendezvous.ErrClaimed)
 	}
 
@@ -234,7 +253,7 @@ func TestRecoverStaleDerptunActiveReleasesUnresponsiveClaim(t *testing.T) {
 		t.Fatal("recoverStaleDerptunActive() recovered = false, want true")
 	}
 
-	decision, err := gate.Accept(now, second)
+	decision, err := gate.Accept(now, tok, second)
 	if err != nil {
 		t.Fatalf("second Accept() after recovery error = %v", err)
 	}
@@ -249,9 +268,9 @@ func TestRecoverStaleDerptunActiveKeepsResponsiveClaim(t *testing.T) {
 
 	now := time.Now()
 	tok := derptunTestToken(now.Add(time.Minute))
-	gate := rendezvous.NewDurableGate(tok)
+	gate := &derptunClientGate{}
 	first := derptunTestClaim(tok, 33)
-	if _, err := gate.Accept(now, first); err != nil {
+	if _, err := gate.Accept(now, tok, first); err != nil {
 		t.Fatalf("first Accept() error = %v", err)
 	}
 
@@ -274,7 +293,7 @@ func TestRecoverStaleDerptunActiveKeepsResponsiveClaim(t *testing.T) {
 	}
 
 	second := derptunTestClaim(tok, 44)
-	if _, err := gate.Accept(now, second); !errors.Is(err, rendezvous.ErrClaimed) {
+	if _, err := gate.Accept(now, tok, second); !errors.Is(err, rendezvous.ErrClaimed) {
 		t.Fatalf("second Accept() error = %v, want %v", err, rendezvous.ErrClaimed)
 	}
 }
@@ -285,9 +304,9 @@ func TestRecoverStaleDerptunActiveReleasesClosedTransport(t *testing.T) {
 
 	now := time.Now()
 	tok := derptunTestToken(now.Add(time.Minute))
-	gate := rendezvous.NewDurableGate(tok)
+	gate := &derptunClientGate{}
 	first := derptunTestClaim(tok, 77)
-	if _, err := gate.Accept(now, first); err != nil {
+	if _, err := gate.Accept(now, tok, first); err != nil {
 		t.Fatalf("first Accept() error = %v", err)
 	}
 
@@ -310,7 +329,7 @@ func TestRecoverStaleDerptunActiveReleasesClosedTransport(t *testing.T) {
 	}
 
 	second := derptunTestClaim(tok, 88)
-	decision, err := gate.Accept(now, second)
+	decision, err := gate.Accept(now, tok, second)
 	if err != nil {
 		t.Fatalf("second Accept() error = %v", err)
 	}
