@@ -23,7 +23,7 @@ var rootRegistry = yargs.Registry{
 			"derptun token --days 7",
 			"derptun serve --token <token> --tcp 127.0.0.1:22",
 			"derptun open --token <token> --listen 127.0.0.1:2222",
-			"ssh -o ProxyCommand='derptun connect --token <token> --stdio' foo@alpha",
+			"ssh -o ProxyCommand='derptun connect --token <token> --stdio' foo@host1",
 		},
 	},
 	SubCommands: map[string]yargs.CommandSpec{

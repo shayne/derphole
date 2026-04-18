@@ -157,24 +157,24 @@ npx -y derphole@latest open <token> 127.0.0.1:8080
 On the target host:
 
 ```bash
-npx -y derptun@latest token --days 7 > alpha.token
-npx -y derptun@latest serve --token "$(cat alpha.token)" --tcp 127.0.0.1:22
+npx -y derptun@latest token --days 7 > host1.token
+npx -y derptun@latest serve --token "$(cat host1.token)" --tcp 127.0.0.1:22
 ```
 
 On the client:
 
 ```bash
-npx -y derptun@latest open --token "$(cat alpha.token)" --listen 127.0.0.1:2222
+npx -y derptun@latest open --token "$(cat host1.token)" --listen 127.0.0.1:2222
 ssh -p 2222 foo@127.0.0.1
 ```
 
 For SSH without a separate local listener, use `ProxyCommand`:
 
 ```sshconfig
-Host alpha-derptun
-  HostName alpha
+Host host1-derptun
+  HostName host1
   User foo
-  ProxyCommand derptun connect --token ~/.config/derptun/alpha.token --stdio
+  ProxyCommand derptun connect --token ~/.config/derptun/host1.token --stdio
 ```
 
 `derptun` keeps trying when the network path drops, and it can reconnect while both `derptun` processes stay alive. If either process exits, the token can bring the tunnel back, but an already-open TCP session is gone. Use `tmux` or `screen` on the remote host when shell continuity matters.

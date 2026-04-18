@@ -22,7 +22,7 @@ var connectHelpConfig = yargs.HelpConfig{
 		Name:        "derptun",
 		Description: "Connect a single TCP stream through a durable derptun token.",
 		Examples: []string{
-			"ssh -o ProxyCommand='derptun connect --token <token> --stdio' foo@alpha",
+			"ssh -o ProxyCommand='derptun connect --token <token> --stdio' foo@host1",
 			"derptun connect --token <token> --stdio",
 		},
 	},
@@ -32,7 +32,7 @@ var connectHelpConfig = yargs.HelpConfig{
 			Description: "Bridge one tunnel stream over stdin/stdout.",
 			Usage:       "--token TOKEN --stdio [--force-relay]",
 			Examples: []string{
-				"ssh -o ProxyCommand='derptun connect --token <token> --stdio' foo@alpha",
+				"ssh -o ProxyCommand='derptun connect --token <token> --stdio' foo@host1",
 				"derptun connect --token <token> --stdio",
 			},
 		},
