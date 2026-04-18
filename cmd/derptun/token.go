@@ -16,9 +16,11 @@ type tokenCommonFlags struct {
 }
 
 type tokenClientFlags struct {
-	Token   string `flag:"token" help:"Server token used to mint a client token"`
-	Days    int    `flag:"days" help:"Token lifetime in days; client default is 90 days"`
-	Expires string `flag:"expires" help:"Absolute expiry as RFC3339 or YYYY-MM-DD"`
+	Token      string `flag:"token" help:"Server token used to mint a client token"`
+	TokenFile  string `flag:"token-file" help:"Read the server token from a file"`
+	TokenStdin bool   `flag:"token-stdin" help:"Read the server token from the first stdin line"`
+	Days       int    `flag:"days" help:"Token lifetime in days; client default is 90 days"`
+	Expires    string `flag:"expires" help:"Absolute expiry as RFC3339 or YYYY-MM-DD"`
 }
 
 var tokenHelpConfig = yargs.HelpConfig{
@@ -27,23 +29,24 @@ var tokenHelpConfig = yargs.HelpConfig{
 		Description: "Generate derptun server and client tokens.",
 		Examples: []string{
 			"derptun token server",
-			"derptun token client --token <dts1_token>",
+			"derptun token client --token-file server.dts",
 		},
 	},
 	SubCommands: map[string]yargs.SubCommandInfo{
 		"token": {
 			Name:        "token",
 			Description: "Generate a server credential or client access token.",
-			Usage:       "server [--days N|--expires DATE] | client --token TOKEN [--days N|--expires DATE]",
+			Usage:       "server [--days N|--expires DATE] | client (--token TOKEN|--token-file PATH|--token-stdin) [--days N|--expires DATE]",
 			Examples: []string{
 				"derptun token server",
-				"derptun token client --token <dts1_token>",
+				"derptun token client --token-file server.dts",
+				"printf '%s\\n' \"$DERPTUN_SERVER_TOKEN\" | derptun token client --token-stdin",
 			},
 		},
 	},
 }
 
-func runToken(args []string, stdout, stderr io.Writer) int {
+func runToken(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
 		fmt.Fprint(stderr, tokenHelpText())
 		if len(args) == 0 {
@@ -55,7 +58,7 @@ func runToken(args []string, stdout, stderr io.Writer) int {
 	case "server":
 		return runTokenServer(args[1:], stdout, stderr)
 	case "client":
-		return runTokenClient(args[1:], stdout, stderr)
+		return runTokenClient(args[1:], stdin, stdout, stderr)
 	default:
 		fmt.Fprint(stderr, tokenHelpText())
 		return 2
@@ -85,12 +88,22 @@ func runTokenServer(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func runTokenClient(args []string, stdout, stderr io.Writer) int {
+func runTokenClient(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	parsed, err := yargs.ParseWithCommandAndHelp[struct{}, tokenClientFlags, struct{}](append([]string{"client"}, args...), tokenHelpConfig)
 	if err != nil {
 		return handleTokenParseError(parsed, err, stderr)
 	}
-	if parsed.SubCommandFlags.Token == "" || len(parsed.Parser.Args) != 0 || len(parsed.RemainingArgs) != 0 {
+	if len(parsed.Parser.Args) != 0 || len(parsed.RemainingArgs) != 0 {
+		fmt.Fprint(stderr, tokenHelpText())
+		return 2
+	}
+	serverToken, _, err := resolveTokenSource(stdin, tokenSource{
+		Token:      parsed.SubCommandFlags.Token,
+		TokenFile:  parsed.SubCommandFlags.TokenFile,
+		TokenStdin: parsed.SubCommandFlags.TokenStdin,
+	})
+	if err != nil {
+		fmt.Fprintln(stderr, err)
 		fmt.Fprint(stderr, tokenHelpText())
 		return 2
 	}
@@ -100,7 +113,7 @@ func runTokenClient(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	tokenValue, err := derptun.GenerateClientToken(derptun.ClientTokenOptions{
-		ServerToken: parsed.SubCommandFlags.Token,
+		ServerToken: serverToken,
 		Days:        parsed.SubCommandFlags.Days,
 		Expires:     expires,
 	})

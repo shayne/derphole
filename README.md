@@ -158,8 +158,8 @@ On `serverhost`:
 
 ```bash
 npx -y derptun@latest token server > server.dts
-npx -y derptun@latest token client --token "$(cat server.dts)" > client.dtc
-npx -y derptun@latest serve --token "$(cat server.dts)" --tcp 127.0.0.1:22
+npx -y derptun@latest token client --token-file server.dts > client.dtc
+npx -y derptun@latest serve --token-file server.dts --tcp 127.0.0.1:22
 ```
 
 Copy only `client.dtc` to `clienthost`.
@@ -167,7 +167,7 @@ Copy only `client.dtc` to `clienthost`.
 On `clienthost`:
 
 ```bash
-npx -y derptun@latest open --token "$(cat client.dtc)" --listen 127.0.0.1:2222
+npx -y derptun@latest open --token-file client.dtc --listen 127.0.0.1:2222
 ssh -p 2222 user@127.0.0.1
 ```
 
@@ -177,7 +177,7 @@ For SSH without a separate local listener, use `ProxyCommand`:
 Host serverhost-derptun
   HostName serverhost
   User foo
-  ProxyCommand derptun connect --token ~/.config/derptun/client.dtc --stdio
+  ProxyCommand derptun connect --token-file ~/.config/derptun/client.dtc --stdio
 ```
 
 The server token is secret serving authority. Keep it on the serving machine or in its secret manager. The client token can connect until it expires, but it cannot serve or mint more tokens.
@@ -186,8 +186,10 @@ Server tokens default to 180 days. Client tokens default to 90 days and cannot o
 
 ```bash
 npx -y derptun@latest token server --expires 2026-05-01T00:00:00Z > server.dts
-npx -y derptun@latest token client --token "$(cat server.dts)" --expires 2026-04-25T00:00:00Z > client.dtc
+npx -y derptun@latest token client --token-file server.dts --expires 2026-04-25T00:00:00Z > client.dtc
 ```
+
+`--token TOKEN` still works for quick one-off commands. Prefer `--token-file PATH` for durable tokens. `--token-stdin` reads the token from the first stdin line when a pipe is more convenient.
 
 The first `derptun` release is TCP-only. UDP forwarding is planned for use cases like Minecraft Bedrock servers, but it is not part of this release.
 

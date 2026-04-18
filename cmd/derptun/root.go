@@ -21,10 +21,10 @@ var rootRegistry = yargs.Registry{
 		Description: "Open durable TCP tunnels through DERP rendezvous and direct UDP promotion.",
 		Examples: []string{
 			"derptun token server > server.dts",
-			"derptun token client --token \"$(cat server.dts)\" > client.dtc",
-			"derptun serve --token \"$(cat server.dts)\" --tcp 127.0.0.1:22",
-			"derptun open --token \"$(cat client.dtc)\" --listen 127.0.0.1:2222",
-			"ssh -o ProxyCommand='derptun connect --token ~/.config/derptun/client.dtc --stdio' foo@serverhost",
+			"derptun token client --token-file server.dts > client.dtc",
+			"derptun serve --token-file server.dts --tcp 127.0.0.1:22",
+			"derptun open --token-file client.dtc --listen 127.0.0.1:2222",
+			"ssh -o ProxyCommand='derptun connect --token-file ~/.config/derptun/client.dtc --stdio' foo@serverhost",
 		},
 	},
 	SubCommands: map[string]yargs.CommandSpec{
@@ -62,11 +62,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	switch remaining[0] {
 	case "token":
-		return runToken(remaining[1:], stdout, stderr)
+		return runToken(remaining[1:], stdin, stdout, stderr)
 	case "serve":
-		return runServe(remaining[1:], level, stderr)
+		return runServe(remaining[1:], level, stdin, stderr)
 	case "open":
-		return runOpen(remaining[1:], level, stderr)
+		return runOpen(remaining[1:], level, stdin, stderr)
 	case "connect":
 		return runConnect(remaining[1:], level, stdin, stdout, stderr)
 	case "version":

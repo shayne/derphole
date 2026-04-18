@@ -13,6 +13,8 @@ import (
 
 type openFlags struct {
 	Token      string `flag:"token" help:"Client token for tunnel access"`
+	TokenFile  string `flag:"token-file" help:"Read the client token from a file"`
+	TokenStdin bool   `flag:"token-stdin" help:"Read the client token from the first stdin line"`
 	Listen     string `flag:"listen" help:"Local TCP bind address, for example 127.0.0.1:2222"`
 	ForceRelay bool   `flag:"force-relay" help:"Disable direct probing"`
 }
@@ -22,7 +24,7 @@ var openHelpConfig = yargs.HelpConfig{
 		Name:        "derptun",
 		Description: "Open a local TCP listener that forwards through a derptun client token.",
 		Examples: []string{
-			"derptun open --token \"$(cat client.dtc)\" --listen 127.0.0.1:2222",
+			"derptun open --token-file client.dtc --listen 127.0.0.1:2222",
 			"ssh -p 2222 foo@127.0.0.1",
 		},
 	},
@@ -30,10 +32,10 @@ var openHelpConfig = yargs.HelpConfig{
 		"open": {
 			Name:        "open",
 			Description: "Listen locally and forward each TCP connection through the tunnel.",
-			Usage:       "--token TOKEN [--listen HOST:PORT] [--force-relay]",
+			Usage:       "(--token TOKEN|--token-file PATH|--token-stdin) [--listen HOST:PORT] [--force-relay]",
 			Examples: []string{
-				"derptun open --token \"$(cat client.dtc)\"",
-				"derptun open --token \"$(cat client.dtc)\" --listen 127.0.0.1:2222",
+				"derptun open --token-file client.dtc",
+				"printf '%s\\n' \"$DERPTUN_CLIENT_TOKEN\" | derptun open --token-stdin --listen 127.0.0.1:2222",
 			},
 		},
 	},
@@ -41,7 +43,7 @@ var openHelpConfig = yargs.HelpConfig{
 
 var derptunOpen = session.DerptunOpen
 
-func runOpen(args []string, level telemetry.Level, stderr io.Writer) int {
+func runOpen(args []string, level telemetry.Level, stdin io.Reader, stderr io.Writer) int {
 	parsed, err := yargs.ParseWithCommandAndHelp[struct{}, openFlags, struct{}](append([]string{"open"}, args...), openHelpConfig)
 	if err != nil {
 		switch {
@@ -58,7 +60,17 @@ func runOpen(args []string, level telemetry.Level, stderr io.Writer) int {
 			return 2
 		}
 	}
-	if parsed.SubCommandFlags.Token == "" || len(parsed.Parser.Args) != 0 || len(parsed.RemainingArgs) != 0 {
+	if len(parsed.Parser.Args) != 0 || len(parsed.RemainingArgs) != 0 {
+		fmt.Fprint(stderr, openHelpText())
+		return 2
+	}
+	token, _, err := resolveTokenSource(stdin, tokenSource{
+		Token:      parsed.SubCommandFlags.Token,
+		TokenFile:  parsed.SubCommandFlags.TokenFile,
+		TokenStdin: parsed.SubCommandFlags.TokenStdin,
+	})
+	if err != nil {
+		fmt.Fprintln(stderr, err)
 		fmt.Fprint(stderr, openHelpText())
 		return 2
 	}
@@ -69,7 +81,7 @@ func runOpen(args []string, level telemetry.Level, stderr io.Writer) int {
 	done := make(chan error, 1)
 	go func() {
 		done <- derptunOpen(ctx, session.DerptunOpenConfig{
-			ClientToken:   parsed.SubCommandFlags.Token,
+			ClientToken:   token,
 			ListenAddr:    parsed.SubCommandFlags.Listen,
 			BindAddrSink:  bindSink,
 			Emitter:       telemetry.New(stderr, commandSessionTelemetryLevel(level)),

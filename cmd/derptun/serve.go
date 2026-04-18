@@ -13,6 +13,8 @@ import (
 
 type serveFlags struct {
 	Token      string `flag:"token" help:"Server token for serving a local target"`
+	TokenFile  string `flag:"token-file" help:"Read the server token from a file"`
+	TokenStdin bool   `flag:"token-stdin" help:"Read the server token from the first stdin line"`
 	TCP        string `flag:"tcp" help:"Local TCP target to expose, for example 127.0.0.1:22"`
 	ForceRelay bool   `flag:"force-relay" help:"Disable direct probing"`
 }
@@ -23,16 +25,17 @@ var serveHelpConfig = yargs.HelpConfig{
 		Description: "Serve a local TCP service through a derptun server token.",
 		Examples: []string{
 			"derptun token server --days 365 > server.dts",
-			"derptun serve --token \"$(cat server.dts)\" --tcp 127.0.0.1:22",
+			"derptun serve --token-file server.dts --tcp 127.0.0.1:22",
 		},
 	},
 	SubCommands: map[string]yargs.SubCommandInfo{
 		"serve": {
 			Name:        "serve",
 			Description: "Expose a local TCP target until Ctrl-C.",
-			Usage:       "--token TOKEN --tcp HOST:PORT [--force-relay]",
+			Usage:       "(--token TOKEN|--token-file PATH|--token-stdin) --tcp HOST:PORT [--force-relay]",
 			Examples: []string{
-				"derptun serve --token \"$(cat server.dts)\" --tcp 127.0.0.1:22",
+				"derptun serve --token-file server.dts --tcp 127.0.0.1:22",
+				"printf '%s\\n' \"$DERPTUN_SERVER_TOKEN\" | derptun serve --token-stdin --tcp 127.0.0.1:22",
 			},
 		},
 	},
@@ -40,7 +43,7 @@ var serveHelpConfig = yargs.HelpConfig{
 
 var derptunServe = session.DerptunServe
 
-func runServe(args []string, level telemetry.Level, stderr io.Writer) int {
+func runServe(args []string, level telemetry.Level, stdin io.Reader, stderr io.Writer) int {
 	parsed, err := yargs.ParseWithCommandAndHelp[struct{}, serveFlags, struct{}](append([]string{"serve"}, args...), serveHelpConfig)
 	if err != nil {
 		switch {
@@ -57,7 +60,17 @@ func runServe(args []string, level telemetry.Level, stderr io.Writer) int {
 			return 2
 		}
 	}
-	if parsed.SubCommandFlags.Token == "" || parsed.SubCommandFlags.TCP == "" || len(parsed.Parser.Args) != 0 || len(parsed.RemainingArgs) != 0 {
+	if parsed.SubCommandFlags.TCP == "" || len(parsed.Parser.Args) != 0 || len(parsed.RemainingArgs) != 0 {
+		fmt.Fprint(stderr, serveHelpText())
+		return 2
+	}
+	token, _, err := resolveTokenSource(stdin, tokenSource{
+		Token:      parsed.SubCommandFlags.Token,
+		TokenFile:  parsed.SubCommandFlags.TokenFile,
+		TokenStdin: parsed.SubCommandFlags.TokenStdin,
+	})
+	if err != nil {
+		fmt.Fprintln(stderr, err)
 		fmt.Fprint(stderr, serveHelpText())
 		return 2
 	}
@@ -65,7 +78,7 @@ func runServe(args []string, level telemetry.Level, stderr io.Writer) int {
 	ctx, stop := commandContext()
 	defer stop()
 	if err := derptunServe(ctx, session.DerptunServeConfig{
-		ServerToken:   parsed.SubCommandFlags.Token,
+		ServerToken:   token,
 		TargetAddr:    parsed.SubCommandFlags.TCP,
 		Emitter:       telemetry.New(stderr, commandSessionTelemetryLevel(level)),
 		ForceRelay:    parsed.SubCommandFlags.ForceRelay,
