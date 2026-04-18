@@ -174,7 +174,7 @@ func DecodeClientToken(encoded string, now time.Time) (ClientCredential, error) 
 		cred.DERPPublic == ([32]byte{}) ||
 		cred.QUICPublic == ([32]byte{}) ||
 		cred.BearerSecret == ([32]byte{}) ||
-		cred.ProofMAC == "" {
+		!validProofMACHex(cred.ProofMAC) {
 		return ClientCredential{}, ErrInvalidToken
 	}
 	if expired(now, cred.ExpiresUnix) {
@@ -245,7 +245,7 @@ func VerifyClientCredential(secret [32]byte, client ClientCredential, now time.T
 	if client.BearerSecret != deriveClientBearerSecret(secret, client.ClientID) {
 		return ErrInvalidToken
 	}
-	if !hmac.Equal([]byte(client.ProofMAC), []byte(computeClientProofMAC(secret, client))) {
+	if !validClientProofMAC(secret, client) {
 		return ErrInvalidToken
 	}
 	return nil
@@ -279,6 +279,23 @@ func expired(now time.Time, expiresUnix int64) bool {
 		now = time.Now()
 	}
 	return now.Unix() >= expiresUnix
+}
+
+func validProofMACHex(value string) bool {
+	raw, err := hex.DecodeString(value)
+	return err == nil && len(raw) == sha256.Size
+}
+
+func validClientProofMAC(secret [32]byte, client ClientCredential) bool {
+	got, err := hex.DecodeString(client.ProofMAC)
+	if err != nil {
+		return false
+	}
+	want, err := hex.DecodeString(computeClientProofMAC(secret, client))
+	if err != nil {
+		return false
+	}
+	return hmac.Equal(got, want)
 }
 
 func encodeJSONToken(prefix string, value any) (string, error) {

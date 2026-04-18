@@ -120,10 +120,11 @@ jobs:
           install: true
           cache: true
       - name: Build
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          COMMIT: ${{ github.sha }}
         run: |
           mkdir -p dist
-          VERSION=${{ needs.meta.outputs.version }}
-          COMMIT=${{ github.sha }}
           BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
             go build -trimpath \
@@ -193,10 +194,12 @@ jobs:
             cp "dist/downloads/$asset/$asset" "dist/raw/$asset"
           done
       - name: Verify binary version
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
           for asset in dist/raw/derphole-linux-amd64 dist/raw/derptun-linux-amd64; do
             chmod +x "$asset"
-            test "$("$asset" version)" = "${{ needs.meta.outputs.version }}"
+            test "$("$asset" version)" = "$VERSION"
           done
       - name: Package tarballs + checksums
         run: |
@@ -269,10 +272,12 @@ jobs:
             cp "dist/downloads/$asset/$asset" "dist/raw/$asset"
           done
       - name: Verify binary version
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
           for asset in dist/raw/derphole-linux-amd64 dist/raw/derptun-linux-amd64; do
             chmod +x "$asset"
-            test "$("$asset" version)" = "${{ needs.meta.outputs.version }}"
+            test "$("$asset" version)" = "$VERSION"
           done
       - name: Package tarballs + checksums
         run: |
@@ -367,9 +372,9 @@ jobs:
           stage derptun derptun-darwin-amd64 x86_64-apple-darwin
           stage derptun derptun-darwin-arm64 aarch64-apple-darwin
       - name: Build npm artifact
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
-          VERSION=${{ needs.meta.outputs.version }}
-          export VERSION
           bash ./tools/packaging/build-npm.sh
       - name: Smoke test packaged launchers
         run: |
@@ -439,9 +444,9 @@ jobs:
           stage derptun derptun-darwin-amd64 x86_64-apple-darwin
           stage derptun derptun-darwin-arm64 aarch64-apple-darwin
       - name: Build npm artifact
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
-          VERSION=${{ needs.meta.outputs.version }}
-          export VERSION
           bash ./tools/packaging/build-npm.sh
       - name: Smoke test packaged launchers
         run: |

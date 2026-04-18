@@ -29,3 +29,26 @@ func TestReleaseWorkflowNpmPublishesSkipUnclaimedUntilBootstrap(t *testing.T) {
 		}
 	}
 }
+
+func TestReleaseWorkflowDoesNotInterpolateVersionInShell(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join("..", ".github", "workflows", "release.yml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read release workflow: %v", err)
+	}
+
+	body := string(data)
+	for _, unsafe := range []string{
+		"VERSION=${{ needs.meta.outputs.version }}",
+		"\"${{ needs.meta.outputs.version }}\"",
+	} {
+		if strings.Contains(body, unsafe) {
+			t.Fatalf("release workflow interpolates version into shell with %q", unsafe)
+		}
+	}
+	if !strings.Contains(body, "VERSION: ${{ needs.meta.outputs.version }}") {
+		t.Fatal("release workflow does not pass version through step environment")
+	}
+}

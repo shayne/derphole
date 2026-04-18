@@ -247,6 +247,12 @@ func startDerptunDecisionResender(ctx context.Context, client *derpbind.Client, 
 }
 
 func derptunServerTokenForClaim(server derptun.ServerCredential, claim rendezvous.Claim, now time.Time) (sessiontoken.Token, rendezvous.Decision, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if now.Unix() >= server.ExpiresUnix {
+		return sessiontoken.Token{}, rendezvous.Decision{Accepted: false, Reject: &rendezvous.RejectInfo{Code: rendezvous.RejectExpired, Reason: "server token expired"}}, derptun.ErrExpired
+	}
 	if claim.Client == nil {
 		return sessiontoken.Token{}, rendezvous.Decision{Accepted: false, Reject: &rendezvous.RejectInfo{Code: rendezvous.RejectClaimMalformed, Reason: "client proof missing"}}, rendezvous.ErrDenied
 	}
@@ -258,6 +264,9 @@ func derptunServerTokenForClaim(server derptun.ServerCredential, claim rendezvou
 		ClientName:  claim.Client.ClientName,
 		ExpiresUnix: claim.Client.ExpiresUnix,
 		ProofMAC:    claim.Client.ProofMAC,
+	}
+	if client.ExpiresUnix > server.ExpiresUnix {
+		return sessiontoken.Token{}, rendezvous.Decision{Accepted: false, Reject: &rendezvous.RejectInfo{Code: rendezvous.RejectExpired, Reason: "client expiry exceeds server expiry"}}, derptun.ErrExpired
 	}
 	serverTok, err := server.SessionToken()
 	if err != nil {
@@ -278,6 +287,10 @@ func derptunServerTokenForClaim(server derptun.ServerCredential, claim rendezvou
 	serverTok.BearerSecret = client.BearerSecret
 	serverTok.ExpiresUnix = client.ExpiresUnix
 	return serverTok, rendezvous.Decision{}, nil
+}
+
+func derptunClaimSourceMatches(from key.NodePublic, claim rendezvous.Claim) bool {
+	return from == key.NodePublicFromRaw32(mem.B(claim.DERPPublic[:]))
 }
 
 type derptunClientGate struct {
@@ -403,6 +416,12 @@ func handleDerptunServeClaim(
 		return active, nil
 	}
 	claim := *env.Claim
+	if !derptunClaimSourceMatches(pkt.From, claim) {
+		if cfg.Emitter != nil {
+			cfg.Emitter.Debug("derptun-claim-source-mismatch")
+		}
+		return active, nil
+	}
 	peerDERP := key.NodePublicFromRaw32(mem.B(claim.DERPPublic[:]))
 	now := time.Now()
 	claimToken, rejectDecision, err := derptunServerTokenForClaim(server, claim, now)

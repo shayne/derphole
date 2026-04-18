@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -12,10 +13,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shayne/derphole/pkg/derpbind"
 	"github.com/shayne/derphole/pkg/derptun"
+	"github.com/shayne/derphole/pkg/quicpath"
 	"github.com/shayne/derphole/pkg/rendezvous"
 	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/token"
+	"tailscale.com/types/key"
 )
 
 func derptunServerAndClientTokens(t *testing.T) (string, string) {
@@ -209,6 +213,207 @@ func TestDerptunRejectsWrongTokenRoles(t *testing.T) {
 	}
 	if err := DerptunConnect(ctx, DerptunConnectConfig{ClientToken: serverToken, StdioIn: strings.NewReader("x"), StdioOut: io.Discard}); !errors.Is(err, derptun.ErrInvalidToken) {
 		t.Fatalf("DerptunConnect(server) error = %v, want ErrInvalidToken", err)
+	}
+}
+
+func TestDerptunServerTokenForClaimRejectsTamperedClientProof(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	serverToken, err := derptun.GenerateServerToken(derptun.ServerTokenOptions{Now: now, Days: 30})
+	if err != nil {
+		t.Fatalf("GenerateServerToken() error = %v", err)
+	}
+	clientToken, err := derptun.GenerateClientToken(derptun.ClientTokenOptions{
+		Now:         now,
+		ServerToken: serverToken,
+		Days:        7,
+	})
+	if err != nil {
+		t.Fatalf("GenerateClientToken() error = %v", err)
+	}
+	serverCred, err := derptun.DecodeServerToken(serverToken, now)
+	if err != nil {
+		t.Fatalf("DecodeServerToken() error = %v", err)
+	}
+	clientCred, err := derptun.DecodeClientToken(clientToken, now)
+	if err != nil {
+		t.Fatalf("DecodeClientToken() error = %v", err)
+	}
+	validClaim := derptunClaimForClient(t, clientCred, 91)
+	if _, reject, err := derptunServerTokenForClaim(serverCred, validClaim, now); err != nil {
+		t.Fatalf("valid derptunServerTokenForClaim() error = %v reject=%+v", err, reject)
+	}
+
+	for _, tt := range []struct {
+		name   string
+		mutate func(*rendezvous.Claim)
+	}{
+		{
+			name: "extended expiry",
+			mutate: func(claim *rendezvous.Claim) {
+				claim.Client.ExpiresUnix += int64(24 * time.Hour / time.Second)
+			},
+		},
+		{
+			name: "moved session",
+			mutate: func(claim *rendezvous.Claim) {
+				claim.SessionID[0]++
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			claim := derptunClaimForClient(t, clientCred, 92)
+			tt.mutate(&claim)
+			clientTok, err := clientCred.SessionToken()
+			if err != nil {
+				t.Fatalf("SessionToken() error = %v", err)
+			}
+			claim.BearerMAC = rendezvous.ComputeBearerMAC(clientTok.BearerSecret, claim)
+
+			_, reject, err := derptunServerTokenForClaim(serverCred, claim, now)
+			if err == nil {
+				t.Fatal("derptunServerTokenForClaim(tampered) error = nil, want rejection")
+			}
+			if reject.Reject == nil || reject.Reject.Code != rendezvous.RejectBadMAC {
+				t.Fatalf("Reject = %+v, want %q", reject.Reject, rendezvous.RejectBadMAC)
+			}
+		})
+	}
+}
+
+func TestDerptunServerTokenForClaimRejectsMissingClientProof(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	serverToken, clientToken := derptunServerAndClientTokens(t)
+	serverCred, err := derptun.DecodeServerToken(serverToken, now)
+	if err != nil {
+		t.Fatalf("DecodeServerToken() error = %v", err)
+	}
+	clientCred, err := derptun.DecodeClientToken(clientToken, now)
+	if err != nil {
+		t.Fatalf("DecodeClientToken() error = %v", err)
+	}
+	claim := derptunClaimForClient(t, clientCred, 93)
+	claim.Client = nil
+	clientTok, err := clientCred.SessionToken()
+	if err != nil {
+		t.Fatalf("SessionToken() error = %v", err)
+	}
+	claim.BearerMAC = rendezvous.ComputeBearerMAC(clientTok.BearerSecret, claim)
+
+	_, reject, err := derptunServerTokenForClaim(serverCred, claim, now)
+	if !errors.Is(err, rendezvous.ErrDenied) {
+		t.Fatalf("derptunServerTokenForClaim() error = %v, want ErrDenied", err)
+	}
+	if reject.Reject == nil || reject.Reject.Code != rendezvous.RejectClaimMalformed {
+		t.Fatalf("Reject = %+v, want %q", reject.Reject, rendezvous.RejectClaimMalformed)
+	}
+}
+
+func TestDerptunServerTokenForClaimRejectsExpiredServerCredential(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	serverToken, clientToken := derptunServerAndClientTokens(t)
+	serverCred, err := derptun.DecodeServerToken(serverToken, now)
+	if err != nil {
+		t.Fatalf("DecodeServerToken() error = %v", err)
+	}
+	serverCred.ExpiresUnix = now.Add(-time.Second).Unix()
+	clientCred, err := derptun.DecodeClientToken(clientToken, now)
+	if err != nil {
+		t.Fatalf("DecodeClientToken() error = %v", err)
+	}
+	claim := derptunClaimForClient(t, clientCred, 94)
+
+	_, reject, err := derptunServerTokenForClaim(serverCred, claim, now)
+	if !errors.Is(err, derptun.ErrExpired) {
+		t.Fatalf("derptunServerTokenForClaim() error = %v, want derptun.ErrExpired", err)
+	}
+	if reject.Reject == nil || reject.Reject.Code != rendezvous.RejectExpired {
+		t.Fatalf("Reject = %+v, want %q", reject.Reject, rendezvous.RejectExpired)
+	}
+}
+
+func TestDerptunServerTokenForClaimRejectsClientExpiryPastServerExpiry(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	serverToken, err := derptun.GenerateServerToken(derptun.ServerTokenOptions{Now: now, Days: 30})
+	if err != nil {
+		t.Fatalf("GenerateServerToken() error = %v", err)
+	}
+	clientToken, err := derptun.GenerateClientToken(derptun.ClientTokenOptions{
+		Now:         now,
+		ServerToken: serverToken,
+		Days:        7,
+	})
+	if err != nil {
+		t.Fatalf("GenerateClientToken() error = %v", err)
+	}
+	serverCred, err := derptun.DecodeServerToken(serverToken, now)
+	if err != nil {
+		t.Fatalf("DecodeServerToken() error = %v", err)
+	}
+	serverCred.ExpiresUnix = now.Add(time.Hour).Unix()
+	clientCred, err := derptun.DecodeClientToken(clientToken, now)
+	if err != nil {
+		t.Fatalf("DecodeClientToken() error = %v", err)
+	}
+	claim := derptunClaimForClient(t, clientCred, 95)
+
+	_, reject, err := derptunServerTokenForClaim(serverCred, claim, now)
+	if !errors.Is(err, derptun.ErrExpired) {
+		t.Fatalf("derptunServerTokenForClaim() error = %v, want derptun.ErrExpired", err)
+	}
+	if reject.Reject == nil || reject.Reject.Code != rendezvous.RejectExpired {
+		t.Fatalf("Reject = %+v, want %q", reject.Reject, rendezvous.RejectExpired)
+	}
+}
+
+func TestHandleDerptunServeClaimRejectsSourceMismatch(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	serverToken, err := derptun.GenerateServerToken(derptun.ServerTokenOptions{Now: now, Days: 30})
+	if err != nil {
+		t.Fatalf("GenerateServerToken() error = %v", err)
+	}
+	clientToken, err := derptun.GenerateClientToken(derptun.ClientTokenOptions{
+		Now:         now,
+		ServerToken: serverToken,
+		Days:        7,
+	})
+	if err != nil {
+		t.Fatalf("GenerateClientToken() error = %v", err)
+	}
+	serverCred, err := derptun.DecodeServerToken(serverToken, now)
+	if err != nil {
+		t.Fatalf("DecodeServerToken() error = %v", err)
+	}
+	clientCred, err := derptun.DecodeClientToken(clientToken, now)
+	if err != nil {
+		t.Fatalf("DecodeClientToken() error = %v", err)
+	}
+	claim := derptunClaimForClient(t, clientCred, 96)
+	payload, err := json.Marshal(envelope{Type: envelopeClaim, Claim: &claim})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	gate := &derptunClientGate{}
+	active, err := handleDerptunServeClaim(
+		context.Background(),
+		DerptunServeConfig{ForceRelay: true},
+		serverCred,
+		quicpath.SessionIdentity{},
+		nil,
+		nil,
+		nil,
+		nil,
+		gate,
+		nil,
+		derpbind.Packet{From: key.NewNode().Public(), Payload: payload},
+	)
+	if err != nil {
+		t.Fatalf("handleDerptunServeClaim() error = %v, want nil for ignored source mismatch", err)
+	}
+	if active != nil {
+		t.Fatalf("active = %+v, want nil", active)
+	}
+	if gate.active != nil {
+		t.Fatalf("gate active = %+v, want nil", gate.active)
 	}
 }
 
@@ -624,6 +829,31 @@ func derptunTestClaim(tok token.Token, marker byte) rendezvous.Claim {
 		QUICPublic:   [32]byte{marker + 1},
 		Candidates:   []string{"udp4:203.0.113.10:12345"},
 		Capabilities: tok.Capabilities,
+	}
+	claim.BearerMAC = rendezvous.ComputeBearerMAC(tok.BearerSecret, claim)
+	return claim
+}
+
+func derptunClaimForClient(t *testing.T, cred derptun.ClientCredential, marker byte) rendezvous.Claim {
+	t.Helper()
+	tok, err := cred.SessionToken()
+	if err != nil {
+		t.Fatalf("SessionToken() error = %v", err)
+	}
+	claim := rendezvous.Claim{
+		Version:      tok.Version,
+		SessionID:    tok.SessionID,
+		DERPPublic:   [32]byte{marker},
+		QUICPublic:   [32]byte{marker + 1},
+		Candidates:   []string{"udp4:203.0.113.10:12345"},
+		Capabilities: tok.Capabilities,
+		Client: &rendezvous.ClientProof{
+			ClientID:    cred.ClientID,
+			TokenID:     cred.TokenID,
+			ClientName:  cred.ClientName,
+			ExpiresUnix: cred.ExpiresUnix,
+			ProofMAC:    cred.ProofMAC,
+		},
 	}
 	claim.BearerMAC = rendezvous.ComputeBearerMAC(tok.BearerSecret, claim)
 	return claim

@@ -85,6 +85,29 @@ func TestGenerateClientTokenFromServerToken(t *testing.T) {
 	}
 }
 
+func TestDecodeClientTokenRejectsMalformedProofMAC(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	serverToken, err := GenerateServerToken(ServerTokenOptions{Now: now, Days: 30})
+	if err != nil {
+		t.Fatalf("GenerateServerToken() error = %v", err)
+	}
+	clientToken, err := GenerateClientToken(ClientTokenOptions{
+		Now:         now,
+		ServerToken: serverToken,
+		Days:        7,
+	})
+	if err != nil {
+		t.Fatalf("GenerateClientToken() error = %v", err)
+	}
+	payload := decodeTokenPayload(t, ClientTokenPrefix, clientToken)
+	payload["proof_mac"] = "not-hex"
+	tampered := encodeTokenPayload(t, ClientTokenPrefix, payload)
+
+	if _, err := DecodeClientToken(tampered, now); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("DecodeClientToken(tampered) error = %v, want ErrInvalidToken", err)
+	}
+}
+
 func TestClientTokenCannotOutliveServerToken(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	server, err := GenerateServerToken(ServerTokenOptions{Now: now, Days: 1})
@@ -173,4 +196,13 @@ func decodeTokenPayload(t *testing.T, prefix, encoded string) map[string]any {
 		t.Fatalf("Unmarshal() error = %v", err)
 	}
 	return payload
+}
+
+func encodeTokenPayload(t *testing.T, prefix string, payload map[string]any) string {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	return prefix + base64.RawURLEncoding.EncodeToString(raw)
 }

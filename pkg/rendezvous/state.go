@@ -38,68 +38,24 @@ func (g *Gate) Accept(now time.Time, claim Claim) (Decision, error) {
 			Reject:   &RejectInfo{Code: RejectExpired, Reason: "token expired"},
 		}, token.ErrExpired
 	}
+	decision, err := validateClaimForToken(g.token, claim)
+	if err != nil {
+		return decision, err
+	}
 	if g.claim != nil {
 		if sameClaim(*g.claim, claim) {
-			return Decision{
-				Accepted: true,
-				Accept: &AcceptInfo{
-					Version:      g.token.Version,
-					SessionID:    g.token.SessionID,
-					Parallel:     claim.Parallel,
-					Candidates:   append([]string(nil), claim.Candidates...),
-					Capabilities: claim.Capabilities,
-				},
-			}, nil
+			return decision, nil
 		}
 		return Decision{
 			Accepted: false,
 			Reject:   &RejectInfo{Code: RejectClaimed, Reason: "session already claimed"},
 		}, ErrClaimed
 	}
-	if claim.Version != g.token.Version {
-		return Decision{
-			Accepted: false,
-			Reject:   &RejectInfo{Code: RejectVersionMismatch, Reason: "version mismatch"},
-		}, ErrDenied
-	}
-	if claim.SessionID != g.token.SessionID {
-		return Decision{
-			Accepted: false,
-			Reject:   &RejectInfo{Code: RejectSessionMismatch, Reason: "session mismatch"},
-		}, ErrDenied
-	}
-	if !validBearerMAC(g.token.BearerSecret, claim) {
-		return Decision{
-			Accepted: false,
-			Reject:   &RejectInfo{Code: RejectBadMAC, Reason: "bad bearer mac"},
-		}, ErrDenied
-	}
-	if claim.Capabilities != g.token.Capabilities {
-		return Decision{
-			Accepted: false,
-			Reject:   &RejectInfo{Code: RejectCapabilities, Reason: "capabilities mismatch"},
-		}, ErrDenied
-	}
-	if claim.DERPPublic == [32]byte{} || claim.QUICPublic == [32]byte{} || !validCandidates(claim.Candidates) {
-		return Decision{
-			Accepted: false,
-			Reject:   &RejectInfo{Code: RejectClaimMalformed, Reason: "claim malformed"},
-		}, ErrDenied
-	}
 
 	stored := claim
 	stored.Candidates = append([]string(nil), claim.Candidates...)
 	g.claim = &stored
-	return Decision{
-		Accepted: true,
-		Accept: &AcceptInfo{
-			Version:      g.token.Version,
-			SessionID:    g.token.SessionID,
-			Parallel:     claim.Parallel,
-			Candidates:   append([]string(nil), claim.Candidates...),
-			Capabilities: claim.Capabilities,
-		},
-	}, nil
+	return decision, nil
 }
 
 func sameClaim(a, b Claim) bool {

@@ -147,6 +147,28 @@ func TestGateRejectsSecondClaimFromDifferentPeer(t *testing.T) {
 	}
 }
 
+func TestGateAuthenticatesSecondClaimBeforeClaimedRejection(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	tok := testToken(now)
+	gate := NewGate(tok)
+
+	first := testClaim(tok)
+	if _, err := gate.Accept(now, first); err != nil {
+		t.Fatalf("first Accept() error = %v", err)
+	}
+	second := testClaim(tok)
+	second.DERPPublic[0]++
+	second.BearerMAC = "bad-mac"
+
+	decision, err := gate.Accept(now, second)
+	if !errors.Is(err, ErrDenied) {
+		t.Fatalf("second Accept() error = %v, want ErrDenied", err)
+	}
+	if decision.Reject == nil || decision.Reject.Code != RejectBadMAC {
+		t.Fatalf("Reject = %+v, want %q", decision.Reject, RejectBadMAC)
+	}
+}
+
 func TestGateRejectsMismatchedVersion(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	tok := testToken(now)
