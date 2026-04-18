@@ -1,0 +1,30 @@
+{
+  "name": "derptun",
+  "version": "0.0.0",
+  "license": "BSD-3-Clause",
+  "bin": {
+    "derptun": "bin/derptun.js"
+  },
+  "type": "module",
+  "os": [
+    "linux",
+    "darwin"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "files": [
+    "bin",
+    "vendor",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shayne/derphole.git"
+  }
+}
