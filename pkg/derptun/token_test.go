@@ -1,120 +1,154 @@
 package derptun
 
 import (
-	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
 	sessiontoken "github.com/shayne/derphole/pkg/token"
 )
 
-func TestGenerateTokenDefaultsToSevenDays(t *testing.T) {
-	now := time.Unix(1000, 0).UTC()
-	encoded, err := GenerateToken(TokenOptions{Now: now})
+func TestGenerateServerTokenDefaultsToSevenDays(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	encoded, err := GenerateServerToken(ServerTokenOptions{Now: now})
 	if err != nil {
-		t.Fatalf("GenerateToken() error = %v", err)
+		t.Fatalf("GenerateServerToken() error = %v", err)
 	}
-	cred, err := DecodeToken(encoded, now)
+	if got := encoded[:len(ServerTokenPrefix)]; got != ServerTokenPrefix {
+		t.Fatalf("prefix = %q, want %q", got, ServerTokenPrefix)
+	}
+	cred, err := DecodeServerToken(encoded, now)
 	if err != nil {
-		t.Fatalf("DecodeToken() error = %v", err)
+		t.Fatalf("DecodeServerToken() error = %v", err)
 	}
 	if got, want := time.Unix(cred.ExpiresUnix, 0).UTC(), now.Add(7*24*time.Hour); !got.Equal(want) {
 		t.Fatalf("expiry = %s, want %s", got, want)
 	}
 }
 
-func TestGenerateTokenUsesAbsoluteExpiry(t *testing.T) {
-	now := time.Unix(1000, 0).UTC()
-	expires := now.Add(36 * time.Hour)
-	encoded, err := GenerateToken(TokenOptions{Now: now, Expires: expires})
+func TestGenerateClientTokenFromServerToken(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	serverToken, err := GenerateServerToken(ServerTokenOptions{Now: now, Days: 30})
 	if err != nil {
-		t.Fatalf("GenerateToken() error = %v", err)
+		t.Fatalf("GenerateServerToken() error = %v", err)
 	}
-	cred, err := DecodeToken(encoded, now)
+	clientToken, err := GenerateClientToken(ClientTokenOptions{
+		Now:         now,
+		ServerToken: serverToken,
+		Days:        7,
+	})
 	if err != nil {
-		t.Fatalf("DecodeToken() error = %v", err)
+		t.Fatalf("GenerateClientToken() error = %v", err)
 	}
-	if got := time.Unix(cred.ExpiresUnix, 0).UTC(); !got.Equal(expires) {
-		t.Fatalf("expiry = %s, want %s", got, expires)
+	if got := clientToken[:len(ClientTokenPrefix)]; got != ClientTokenPrefix {
+		t.Fatalf("prefix = %q, want %q", got, ClientTokenPrefix)
+	}
+	clientCred, err := DecodeClientToken(clientToken, now)
+	if err != nil {
+		t.Fatalf("DecodeClientToken() error = %v", err)
+	}
+	if clientCred.ClientName == "" {
+		t.Fatalf("ClientName = empty, want generated name")
+	}
+	payload := decodeTokenPayload(t, ClientTokenPrefix, clientToken)
+	for _, field := range []string{"derp_private", "quic_private", "signing_secret"} {
+		if _, ok := payload[field]; ok {
+			t.Fatalf("client token exposed private field %q", field)
+		}
+	}
+	if got, want := time.Unix(clientCred.ExpiresUnix, 0).UTC(), now.Add(7*24*time.Hour); !got.Equal(want) {
+		t.Fatalf("client expiry = %s, want %s", got, want)
 	}
 }
 
-func TestDecodeTokenRejectsExpired(t *testing.T) {
-	now := time.Unix(1000, 0).UTC()
-	encoded, err := GenerateToken(TokenOptions{Now: now, Days: 1})
+func TestClientTokenCannotOutliveServerToken(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	server, err := GenerateServerToken(ServerTokenOptions{Now: now, Days: 1})
 	if err != nil {
-		t.Fatalf("GenerateToken() error = %v", err)
+		t.Fatalf("GenerateServerToken() error = %v", err)
 	}
-	_, err = DecodeToken(encoded, now.Add(25*time.Hour))
-	if err != ErrExpired {
-		t.Fatalf("DecodeToken() error = %v, want %v", err, ErrExpired)
+	_, err = GenerateClientToken(ClientTokenOptions{
+		Now:         now,
+		ServerToken: server,
+		Days:        2,
+	})
+	if err == nil || err.Error() != "client expiry exceeds server expiry" {
+		t.Fatalf("GenerateClientToken() error = %v, want client expiry exceeds server expiry", err)
 	}
 }
 
-func TestTokenSessionTokenUsesDerptunCapability(t *testing.T) {
-	now := time.Unix(1000, 0).UTC()
-	encoded, err := GenerateToken(TokenOptions{Now: now})
+func TestDecodeRejectsWrongTokenRole(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	server, err := GenerateServerToken(ServerTokenOptions{Now: now})
 	if err != nil {
-		t.Fatalf("GenerateToken() error = %v", err)
+		t.Fatalf("GenerateServerToken() error = %v", err)
 	}
-	cred, err := DecodeToken(encoded, now)
+	client, err := GenerateClientToken(ClientTokenOptions{Now: now, ServerToken: server})
 	if err != nil {
-		t.Fatalf("DecodeToken() error = %v", err)
+		t.Fatalf("GenerateClientToken() error = %v", err)
 	}
-	tok, err := cred.SessionToken()
-	if err != nil {
-		t.Fatalf("SessionToken() error = %v", err)
+	if _, err := DecodeClientToken(server, now); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("DecodeClientToken(server) error = %v, want ErrInvalidToken", err)
 	}
-	if tok.Capabilities&sessiontoken.CapabilityDerptunTCP == 0 {
-		t.Fatalf("capabilities = %b, want derptun tcp bit", tok.Capabilities)
+	if _, err := DecodeServerToken(client, now); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("DecodeServerToken(client) error = %v, want ErrInvalidToken", err)
 	}
-	if tok.Capabilities&sessiontoken.CapabilityShare != 0 {
-		t.Fatalf("capabilities = %b, must not include share bit", tok.Capabilities)
+	if _, err := DecodeServerToken("dt1_legacy", now); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("DecodeServerToken(legacy) error = %v, want ErrInvalidToken", err)
 	}
 }
 
-func TestTokenStableIdentityMaterialRoundTrips(t *testing.T) {
-	now := time.Unix(1000, 0).UTC()
-	encoded, err := GenerateToken(TokenOptions{Now: now})
+func TestServerAndClientSessionTokensShareServerIdentity(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	server, err := GenerateServerToken(ServerTokenOptions{Now: now})
 	if err != nil {
-		t.Fatalf("GenerateToken() error = %v", err)
+		t.Fatalf("GenerateServerToken() error = %v", err)
 	}
-	first, err := DecodeToken(encoded, now)
+	serverCred, err := DecodeServerToken(server, now)
 	if err != nil {
-		t.Fatalf("DecodeToken(first) error = %v", err)
+		t.Fatalf("DecodeServerToken() error = %v", err)
 	}
-	second, err := DecodeToken(encoded, now.Add(time.Hour))
+	client, err := GenerateClientToken(ClientTokenOptions{Now: now, ServerToken: server})
 	if err != nil {
-		t.Fatalf("DecodeToken(second) error = %v", err)
+		t.Fatalf("GenerateClientToken() error = %v", err)
 	}
-	if first.DERPPrivate != second.DERPPrivate {
-		t.Fatal("DERP private key changed across decode")
+	clientCred, err := DecodeClientToken(client, now)
+	if err != nil {
+		t.Fatalf("DecodeClientToken() error = %v", err)
 	}
-	if string(first.QUICPrivate) != string(second.QUICPrivate) {
-		t.Fatal("QUIC private key changed across decode")
+	serverTok, err := serverCred.SessionToken()
+	if err != nil {
+		t.Fatalf("server SessionToken() error = %v", err)
 	}
-	if len(first.QUICPrivate) != ed25519.PrivateKeySize {
-		t.Fatalf("QUIC private key length = %d, want %d", len(first.QUICPrivate), ed25519.PrivateKeySize)
+	clientTok, err := clientCred.SessionToken()
+	if err != nil {
+		t.Fatalf("client SessionToken() error = %v", err)
+	}
+	if serverTok.SessionID != clientTok.SessionID {
+		t.Fatalf("session mismatch")
+	}
+	if serverTok.DERPPublic != clientTok.DERPPublic {
+		t.Fatalf("DERP public mismatch")
+	}
+	if serverTok.QUICPublic != clientTok.QUICPublic {
+		t.Fatalf("QUIC public mismatch")
+	}
+	if clientTok.Capabilities&sessiontoken.CapabilityDerptunTCP == 0 {
+		t.Fatalf("client capabilities = %b, want derptun tcp bit", clientTok.Capabilities)
 	}
 }
 
-func TestDecodeTokenRejectsInvalidDERPPrivateKey(t *testing.T) {
-	now := time.Unix(1000, 0).UTC()
-	encoded, err := GenerateToken(TokenOptions{Now: now})
+func decodeTokenPayload(t *testing.T, prefix, encoded string) map[string]any {
+	t.Helper()
+	raw, err := base64.RawURLEncoding.DecodeString(encoded[len(prefix):])
 	if err != nil {
-		t.Fatalf("GenerateToken() error = %v", err)
+		t.Fatalf("DecodeString() error = %v", err)
 	}
-	cred, err := DecodeToken(encoded, now)
-	if err != nil {
-		t.Fatalf("DecodeToken(valid) error = %v", err)
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
 	}
-	cred.DERPPrivate = "not-a-node-private-key"
-	encoded, err = EncodeCredential(cred)
-	if err != nil {
-		t.Fatalf("EncodeCredential() error = %v", err)
-	}
-	_, err = DecodeToken(encoded, now)
-	if err != ErrInvalidToken {
-		t.Fatalf("DecodeToken() error = %v, want %v", err, ErrInvalidToken)
-	}
+	return payload
 }
