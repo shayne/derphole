@@ -128,6 +128,9 @@ func DecodeToken(encoded string, now time.Time) (Credential, error) {
 		len(cred.QUICPrivate) != ed25519.PrivateKeySize {
 		return Credential{}, ErrInvalidToken
 	}
+	if _, err := cred.DERPKey(); err != nil {
+		return Credential{}, ErrInvalidToken
+	}
 	if now.IsZero() {
 		now = time.Now()
 	}

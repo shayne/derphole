@@ -97,3 +97,24 @@ func TestTokenStableIdentityMaterialRoundTrips(t *testing.T) {
 		t.Fatalf("QUIC private key length = %d, want %d", len(first.QUICPrivate), ed25519.PrivateKeySize)
 	}
 }
+
+func TestDecodeTokenRejectsInvalidDERPPrivateKey(t *testing.T) {
+	now := time.Unix(1000, 0).UTC()
+	encoded, err := GenerateToken(TokenOptions{Now: now})
+	if err != nil {
+		t.Fatalf("GenerateToken() error = %v", err)
+	}
+	cred, err := DecodeToken(encoded, now)
+	if err != nil {
+		t.Fatalf("DecodeToken(valid) error = %v", err)
+	}
+	cred.DERPPrivate = "not-a-node-private-key"
+	encoded, err = EncodeCredential(cred)
+	if err != nil {
+		t.Fatalf("EncodeCredential() error = %v", err)
+	}
+	_, err = DecodeToken(encoded, now)
+	if err != ErrInvalidToken {
+		t.Fatalf("DecodeToken() error = %v, want %v", err, ErrInvalidToken)
+	}
+}
