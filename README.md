@@ -8,7 +8,7 @@ It supports:
 - text, file, and directory transfer with `send` and `receive`
 - local TCP service sharing with `share` and `open`
 - SSH access exchange with `ssh invite` and `ssh accept`
-- durable TCP tunnels with the companion `derptun` package
+- durable TCP tunnels with the companion [`derptun`](#long-lived-tcp-tunnels) package
 
 `derphole` uses the public Tailscale [DERP](#what-is-derp) relay network for rendezvous and relay fallback. It is **not** affiliated with Tailscale, does **not** require a Tailscale account or tailnet, and does **not** use `tailscaled` for transport.
 
@@ -31,11 +31,11 @@ Session tokens carry authorization, and receive-code flows resolve into the same
 - Use `send` and `receive` for text, files, directories, progress, and receive-code UX.
 - Use `share` and `open` for temporary access to a local TCP service.
 - Use `ssh invite` and `ssh accept` for SSH public key exchange.
-- Use `derptun` for durable TCP tunnels with reusable, longer-lived tokens.
+- Use [`derptun`](#long-lived-tcp-tunnels) for durable TCP tunnels with reusable, longer-lived tokens.
 
 ## Quick Start
 
-`listen` receives bytes and prints a token. `pipe` sends stdin into that token. `share` and `open` use the same token shape for local TCP services. Use `derptun` when the service needs a reusable token and longer-lived tunnel.
+`listen` receives bytes and prints a token. `pipe` sends stdin into that token. `share` and `open` use the same token shape for local TCP services. Use [`derptun`](#long-lived-tcp-tunnels) when the service needs a reusable token and longer-lived tunnel.
 
 ### Stream a Raw File
 
@@ -150,11 +150,11 @@ Bind `open` to a specific local port:
 npx -y derphole@latest open <token> 127.0.0.1:8080
 ```
 
-### Durable SSH Tunnels with `derptun`
+### Long-Lived TCP Tunnels
 
-`derptun` is the durable TCP tunnel companion to `derphole`. Use it when `serverhost` is behind NAT and you want a stable server credential that can survive process restarts.
+`derptun` is the long-lived TCP tunnel companion to `derphole`. A tunnel uses stable tokens, can be restarted on either side, and lets one client reconnect many times without opening ports on `vps-server`. That makes it durable enough for workflows like SSH.
 
-On `serverhost`:
+On `vps-server`:
 
 ```bash
 npx -y derptun@latest token server > server.dts
@@ -162,9 +162,9 @@ npx -y derptun@latest token client --token-file server.dts > client.dtc
 npx -y derptun@latest serve --token-file server.dts --tcp 127.0.0.1:22
 ```
 
-Copy only `client.dtc` to `clienthost`.
+Copy only `client.dtc` to `alice-laptop`.
 
-On `clienthost`:
+On `alice-laptop`:
 
 ```bash
 npx -y derptun@latest open --token-file client.dtc --listen 127.0.0.1:2222
@@ -173,11 +173,8 @@ ssh -p 2222 user@127.0.0.1
 
 For SSH without a separate local listener, use `ProxyCommand`:
 
-```sshconfig
-Host serverhost-derptun
-  HostName serverhost
-  User foo
-  ProxyCommand derptun connect --token-file ~/.config/derptun/client.dtc --stdio
+```bash
+ssh -o ProxyCommand='npx -y derptun@latest connect --token-file ~/.config/derptun/client.dtc --stdio' foo@vps-server
 ```
 
 The server token is secret serving authority. Keep it on the serving machine or in its secret manager. The client token can connect until it expires, but it cannot serve or mint more tokens.
