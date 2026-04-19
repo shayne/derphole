@@ -174,7 +174,7 @@ ssh -p 2222 user@127.0.0.1
 For SSH without a separate local listener, use `ProxyCommand`:
 
 ```bash
-ssh -o ProxyCommand='npx -y derptun@latest connect --token-file ./client.dtc --stdio' foo@vps-server
+ssh -o ProxyCommand='npx -y derptun@latest connect --token-file ./client.dtc --stdio' foo@localhost
 ```
 
 The server token is secret serving authority. Keep it on the serving machine or in its secret manager. The client token can connect until it expires, but it cannot serve or mint more tokens.
