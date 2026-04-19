@@ -6255,6 +6255,9 @@ func TestSendExternalRelayUDPConfiguresPacketAEAD(t *testing.T) {
 	if captured.RunID != tok.SessionID {
 		t.Fatalf("RunID = %x, want %x", captured.RunID, tok.SessionID)
 	}
+	if !captured.Blast {
+		t.Fatal("Blast = false, want force-relay AEAD-capable blast mode")
+	}
 	if captured.PacketAEAD == nil {
 		t.Fatal("PacketAEAD = nil, want token-derived AEAD")
 	}
@@ -6296,8 +6299,92 @@ func TestReceiveExternalRelayUDPConfiguresPacketAEAD(t *testing.T) {
 	if captured.ExpectedRunID != tok.SessionID {
 		t.Fatalf("ExpectedRunID = %x, want %x", captured.ExpectedRunID, tok.SessionID)
 	}
+	if !captured.Blast {
+		t.Fatal("Blast = false, want force-relay AEAD-capable blast mode")
+	}
 	if captured.PacketAEAD == nil {
 		t.Fatal("PacketAEAD = nil, want token-derived AEAD")
+	}
+}
+
+func TestExternalRelayUDPEncryptsWirePayloadAndRoundTrips(t *testing.T) {
+	tok := testExternalSessionToken(0x73)
+	marker := []byte("force-relay-real-wire-secret-marker")
+	relay := newCapturedExternalRelayDatagrams()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	senderManager := transport.NewManager(transport.ManagerConfig{
+		RelayAddr:    relay.receiverAddr,
+		RelaySend:    relay.sendFromSender,
+		ReceiveRelay: relay.receiveForSender,
+	})
+	receiverManager := transport.NewManager(transport.ManagerConfig{
+		RelayAddr:    relay.senderAddr,
+		RelaySend:    relay.sendFromReceiver,
+		ReceiveRelay: relay.receiveForReceiver,
+	})
+	for _, manager := range []*transport.Manager{senderManager, receiverManager} {
+		if err := manager.Start(ctx); err != nil {
+			t.Fatalf("manager.Start() error = %v", err)
+		}
+	}
+	t.Cleanup(func() {
+		cancel()
+		senderManager.Wait()
+		receiverManager.Wait()
+	})
+
+	var out bytes.Buffer
+	receiveErr := make(chan error, 1)
+	go func() {
+		receiveErr <- receiveExternalRelayUDP(ctx, &out, receiverManager, tok, nil)
+	}()
+
+	if err := sendExternalRelayUDP(ctx, bytes.NewReader(marker), senderManager, tok, nil); err != nil {
+		t.Fatalf("sendExternalRelayUDP() error = %v", err)
+	}
+	select {
+	case err := <-receiveErr:
+		if err != nil {
+			t.Fatalf("receiveExternalRelayUDP() error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for receiveExternalRelayUDP(): %v", ctx.Err())
+	}
+	if !bytes.Equal(out.Bytes(), marker) {
+		t.Fatalf("received payload = %q, want %q", out.Bytes(), marker)
+	}
+
+	datagrams := relay.senderDatagrams()
+	dataWire := firstProbeDataDatagram(t, datagrams)
+	for _, datagram := range datagrams {
+		if bytes.Contains(datagram, marker) {
+			t.Fatalf("relay datagram contains plaintext marker: %x", datagram)
+		}
+	}
+
+	packetAEAD, err := externalSessionPacketAEAD(tok)
+	if err != nil {
+		t.Fatalf("externalSessionPacketAEAD() error = %v", err)
+	}
+	packet, err := probe.UnmarshalPacket(dataWire, packetAEAD)
+	if err != nil {
+		t.Fatalf("UnmarshalPacket(dataWire, token AEAD) error = %v", err)
+	}
+	if packet.Type != probe.PacketTypeData {
+		t.Fatalf("data packet type = %v, want %v", packet.Type, probe.PacketTypeData)
+	}
+	if !bytes.Equal(packet.Payload, marker) {
+		t.Fatalf("decrypted payload = %q, want %q", packet.Payload, marker)
+	}
+
+	wrongAEAD, err := externalSessionPacketAEAD(testExternalSessionToken(0x74))
+	if err != nil {
+		t.Fatalf("externalSessionPacketAEAD(wrong token) error = %v", err)
+	}
+	if _, err := probe.UnmarshalPacket(dataWire, wrongAEAD); err == nil {
+		t.Fatal("UnmarshalPacket(dataWire, wrong AEAD) succeeded")
 	}
 }
 
@@ -6769,6 +6856,104 @@ func TestExternalDirectUDPDistributeDiscardStreamDoesNotBlockOtherLanesBehindSlo
 	}
 	_ = writerA.Close()
 	<-drainA
+}
+
+type capturedExternalRelayDatagrams struct {
+	senderToReceiver chan []byte
+	receiverToSender chan []byte
+	senderAddr       net.Addr
+	receiverAddr     net.Addr
+
+	mu           sync.Mutex
+	senderWire   [][]byte
+	receiverWire [][]byte
+}
+
+func newCapturedExternalRelayDatagrams() *capturedExternalRelayDatagrams {
+	return &capturedExternalRelayDatagrams{
+		senderToReceiver: make(chan []byte, 4096),
+		receiverToSender: make(chan []byte, 4096),
+		senderAddr:       &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 21001},
+		receiverAddr:     &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 21002},
+	}
+}
+
+func (r *capturedExternalRelayDatagrams) sendFromSender(ctx context.Context, payload []byte) error {
+	r.captureSender(payload)
+	return sendCapturedExternalRelayDatagram(ctx, r.senderToReceiver, payload)
+}
+
+func (r *capturedExternalRelayDatagrams) receiveForReceiver(ctx context.Context) ([]byte, error) {
+	return receiveCapturedExternalRelayDatagram(ctx, r.senderToReceiver)
+}
+
+func (r *capturedExternalRelayDatagrams) sendFromReceiver(ctx context.Context, payload []byte) error {
+	r.captureReceiver(payload)
+	return sendCapturedExternalRelayDatagram(ctx, r.receiverToSender, payload)
+}
+
+func (r *capturedExternalRelayDatagrams) receiveForSender(ctx context.Context) ([]byte, error) {
+	return receiveCapturedExternalRelayDatagram(ctx, r.receiverToSender)
+}
+
+func (r *capturedExternalRelayDatagrams) senderDatagrams() [][]byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return cloneDatagramSlice(r.senderWire)
+}
+
+func (r *capturedExternalRelayDatagrams) captureSender(payload []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.senderWire = append(r.senderWire, append([]byte(nil), payload...))
+}
+
+func (r *capturedExternalRelayDatagrams) captureReceiver(payload []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.receiverWire = append(r.receiverWire, append([]byte(nil), payload...))
+}
+
+func sendCapturedExternalRelayDatagram(ctx context.Context, ch chan<- []byte, payload []byte) error {
+	clone := append([]byte(nil), payload...)
+	select {
+	case ch <- clone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func receiveCapturedExternalRelayDatagram(ctx context.Context, ch <-chan []byte) ([]byte, error) {
+	select {
+	case payload := <-ch:
+		return append([]byte(nil), payload...), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func cloneDatagramSlice(src [][]byte) [][]byte {
+	dst := make([][]byte, len(src))
+	for i := range src {
+		dst[i] = append([]byte(nil), src[i]...)
+	}
+	return dst
+}
+
+func firstProbeDataDatagram(t *testing.T, datagrams [][]byte) []byte {
+	t.Helper()
+	for _, datagram := range datagrams {
+		packet, err := probe.UnmarshalPacket(datagram, nil)
+		if err != nil {
+			continue
+		}
+		if packet.Type == probe.PacketTypeData {
+			return datagram
+		}
+	}
+	t.Fatalf("captured %d sender relay datagrams, found no probe data packet", len(datagrams))
+	return nil
 }
 
 func testExternalSessionToken(seed byte) token.Token {

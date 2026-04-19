@@ -5287,6 +5287,7 @@ func sendExternalRelayUDP(ctx context.Context, src io.Reader, manager *transport
 	defer packetConn.Close()
 	_, err = externalDirectUDPProbeSendFn(ctx, packetConn, packetConn.remoteAddr.String(), externalDirectUDPBufferedReader(src), probe.SendConfig{
 		Raw:        true,
+		Blast:      true,
 		Transport:  "legacy",
 		ChunkSize:  externalDirectUDPChunkSize,
 		WindowSize: 4096,
@@ -5310,6 +5311,7 @@ func receiveExternalRelayUDP(ctx context.Context, dst io.Writer, manager *transp
 	receiveDst, flushDst := externalDirectUDPBufferedWriter(dst)
 	_, err = externalDirectUDPProbeReceiveToWriterFn(ctx, packetConn, "", receiveDst, probe.ReceiveConfig{
 		Raw:           true,
+		Blast:         true,
 		ExpectedRunID: tok.SessionID,
 		PacketAEAD:    packetAEAD,
 	})
