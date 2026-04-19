@@ -6,37 +6,105 @@ import (
 	"testing"
 )
 
-func TestEncodeReceiveToken(t *testing.T) {
-	got, err := EncodeReceiveToken("abc-123_DEF")
+func TestEncodeFileToken(t *testing.T) {
+	got, err := EncodeFileToken("abc-123_DEF")
 	if err != nil {
-		t.Fatalf("EncodeReceiveToken() error = %v", err)
+		t.Fatalf("EncodeFileToken() error = %v", err)
 	}
-	const want = "derphole://receive?v=1&token=abc-123_DEF"
+	const want = "derphole://file?token=abc-123_DEF&v=1"
 	if got != want {
-		t.Fatalf("EncodeReceiveToken() = %q, want %q", got, want)
+		t.Fatalf("EncodeFileToken() = %q, want %q", got, want)
 	}
 }
 
-func TestEncodeReceiveTokenTrimsAndEscapesToken(t *testing.T) {
-	got, err := EncodeReceiveToken(" token with spaces ")
+func TestEncodeFileTokenTrimsAndEscapesToken(t *testing.T) {
+	got, err := EncodeFileToken(" token with spaces ")
 	if err != nil {
-		t.Fatalf("EncodeReceiveToken() error = %v", err)
+		t.Fatalf("EncodeFileToken() error = %v", err)
 	}
-	const want = "derphole://receive?v=1&token=token+with+spaces"
+	const want = "derphole://file?token=token+with+spaces&v=1"
 	if got != want {
-		t.Fatalf("EncodeReceiveToken() = %q, want %q", got, want)
+		t.Fatalf("EncodeFileToken() = %q, want %q", got, want)
 	}
 }
 
-func TestEncodeReceiveTokenRejectsEmpty(t *testing.T) {
-	_, err := EncodeReceiveToken(" ")
+func TestEncodeFileTokenRejectsEmpty(t *testing.T) {
+	_, err := EncodeFileToken(" ")
 	if !errors.Is(err, ErrMissingToken) {
-		t.Fatalf("EncodeReceiveToken() error = %v, want %v", err, ErrMissingToken)
+		t.Fatalf("EncodeFileToken() error = %v, want %v", err, ErrMissingToken)
 	}
 }
 
-func TestParseReceivePayload(t *testing.T) {
-	got, err := ParseReceivePayload("derphole://receive?v=1&token=abc-123_DEF")
+func TestParseFilePayload(t *testing.T) {
+	got, err := Parse("derphole://file?token=abc-123_DEF&v=1")
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if got.Kind != KindFile || got.Token != "abc-123_DEF" {
+		t.Fatalf("Parse() = %#v, want file token", got)
+	}
+}
+
+func TestEncodeAndParseWebPayload(t *testing.T) {
+	encoded, err := EncodeWebToken("dtc1_test", "http", "/admin")
+	if err != nil {
+		t.Fatalf("EncodeWebToken() error = %v", err)
+	}
+	const want = "derphole://web?path=%2Fadmin&scheme=http&token=dtc1_test&v=1"
+	if encoded != want {
+		t.Fatalf("EncodeWebToken() = %q, want %q", encoded, want)
+	}
+
+	got, err := Parse(encoded)
+	if err != nil {
+		t.Fatalf("Parse(web) error = %v", err)
+	}
+	if got.Kind != KindWeb || got.Token != "dtc1_test" || got.Scheme != "http" || got.Path != "/admin" {
+		t.Fatalf("Parse(web) = %#v, want web payload", got)
+	}
+}
+
+func TestEncodeAndParseTCPPayload(t *testing.T) {
+	encoded, err := EncodeTCPToken("dtc1_test")
+	if err != nil {
+		t.Fatalf("EncodeTCPToken() error = %v", err)
+	}
+	const want = "derphole://tcp?token=dtc1_test&v=1"
+	if encoded != want {
+		t.Fatalf("EncodeTCPToken() = %q, want %q", encoded, want)
+	}
+
+	got, err := Parse(encoded)
+	if err != nil {
+		t.Fatalf("Parse(tcp) error = %v", err)
+	}
+	if got.Kind != KindTCP || got.Token != "dtc1_test" {
+		t.Fatalf("Parse(tcp) = %#v, want tcp payload", got)
+	}
+}
+
+func TestParseAcceptsLegacyReceivePayloadAsFile(t *testing.T) {
+	got, err := Parse("derphole://receive?v=1&token=legacy-token")
+	if err != nil {
+		t.Fatalf("Parse(legacy receive) error = %v", err)
+	}
+	if got.Kind != KindFile || got.Token != "legacy-token" {
+		t.Fatalf("Parse(legacy receive) = %#v, want file token", got)
+	}
+}
+
+func TestParseAcceptsRawTokenAsFile(t *testing.T) {
+	got, err := Parse("  raw-token-123  ")
+	if err != nil {
+		t.Fatalf("Parse(raw token) error = %v", err)
+	}
+	if got.Kind != KindFile || got.Token != "raw-token-123" {
+		t.Fatalf("Parse(raw token) = %#v, want file token", got)
+	}
+}
+
+func TestParseReceivePayloadReturnsFileToken(t *testing.T) {
+	got, err := ParseReceivePayload("derphole://file?token=abc-123_DEF&v=1")
 	if err != nil {
 		t.Fatalf("ParseReceivePayload() error = %v", err)
 	}
@@ -68,10 +136,11 @@ func TestParseReceivePayloadRejectsInvalidURLPayloads(t *testing.T) {
 		wantErr error
 	}{
 		{input: "", wantErr: ErrMissingToken},
-		{input: "derphole://receive?v=1", wantErr: ErrMissingToken},
+		{input: "derphole://file?v=1", wantErr: ErrMissingToken},
 		{input: "derphole://send?v=1&token=abc", wantErr: ErrUnsupportedPayload},
 		{input: "https://example.com/receive?v=1&token=abc", wantErr: ErrUnsupportedPayload},
-		{input: "derphole://receive?token=abc", wantErr: ErrUnsupportedVersion},
+		{input: "derphole://file?token=abc", wantErr: ErrUnsupportedVersion},
+		{input: "derphole://web?token=abc&v=1", wantErr: ErrUnsupportedPayload},
 	} {
 		t.Run(strings.ReplaceAll(tc.input, "/", "_"), func(t *testing.T) {
 			_, err := ParseReceivePayload(tc.input)

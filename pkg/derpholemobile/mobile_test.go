@@ -24,9 +24,9 @@ func (c *testCallbacks) Progress(current int64, total int64) {
 }
 
 func TestParsePayloadReturnsToken(t *testing.T) {
-	payload, err := qrpayload.EncodeReceiveToken("token-123")
+	payload, err := qrpayload.EncodeFileToken("token-123")
 	if err != nil {
-		t.Fatalf("EncodeReceiveToken() error = %v", err)
+		t.Fatalf("EncodeFileToken() error = %v", err)
 	}
 	got, err := ParsePayload(payload)
 	if err != nil {

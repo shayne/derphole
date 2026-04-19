@@ -97,7 +97,7 @@ final class DerpholeTests: XCTestCase {
         XCTAssertEqual(state.validatedToken, "")
         XCTAssertNotNil(state.errorText)
 
-        state.pastedPayload = "derphole://receive?v=1&token=token-123"
+        state.pastedPayload = "derphole://file?token=token-123&v=1"
         state.notePastedPayloadEdited()
 
         XCTAssertEqual(state.phase, .idle)

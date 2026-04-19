@@ -29,7 +29,7 @@ func WriteSendQRInstruction(stderr io.Writer, token string) {
 	if stderr == nil {
 		return
 	}
-	payload, err := qrpayload.EncodeReceiveToken(token)
+	payload, err := qrpayload.EncodeFileToken(token)
 	if err != nil {
 		fmt.Fprintf(stderr, "Could not render QR payload: %v\n", err)
 		return
