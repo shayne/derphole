@@ -691,6 +691,108 @@ func TestExternalAssertNoPlaintextRelayMarker(t *testing.T) {
 	}
 }
 
+func TestExternalHandoffDERPRoundTripEncryptsRelayFrames(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	node := srv.Map.Regions[1].Nodes[0]
+	listenerDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(listener) error = %v", err)
+	}
+	defer listenerDERP.Close()
+	senderDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(sender) error = %v", err)
+	}
+	defer senderDERP.Close()
+	warmExternalQUICModeTestDERPRoute(t, ctx, senderDERP, listenerDERP)
+	warmExternalQUICModeTestDERPRoute(t, ctx, listenerDERP, senderDERP)
+
+	relayFrames, unsubscribe := listenerDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == senderDERP.PublicKey() && externalRelayPrefixDERPFrameKindOf(pkt.Payload) != 0
+	})
+	defer unsubscribe()
+
+	receiverPackets := make(chan derpbind.Packet, 32)
+	captured := make(chan derpbind.Packet, 32)
+	go func() {
+		defer close(receiverPackets)
+		for {
+			select {
+			case pkt, ok := <-relayFrames:
+				if !ok {
+					return
+				}
+				select {
+				case captured <- pkt:
+				default:
+				}
+				select {
+				case receiverPackets <- pkt:
+				case <-ctx.Done():
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	marker := []byte("relay-prefix-live-secret-marker")
+	payload := append([]byte{}, marker...)
+	payload = append(payload, bytes.Repeat([]byte("-payload"), 64)...)
+	aead := testExternalSessionAEAD(t, 0x81)
+
+	spool, err := newExternalHandoffSpool(bytes.NewReader(payload), len(payload), int64(len(payload))*2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spool.Close()
+
+	var out bytes.Buffer
+	rx := newExternalHandoffReceiver(&out, int64(len(payload))*2)
+	receiveErr := make(chan error, 1)
+	go func() {
+		receiveErr <- receiveExternalHandoffDERP(ctx, listenerDERP, senderDERP.PublicKey(), rx, receiverPackets, nil, aead)
+	}()
+
+	if err := sendExternalHandoffDERP(ctx, senderDERP, listenerDERP.PublicKey(), spool, nil, nil, aead); err != nil {
+		t.Fatalf("sendExternalHandoffDERP() error = %v", err)
+	}
+	select {
+	case err := <-receiveErr:
+		if err != nil {
+			t.Fatalf("receiveExternalHandoffDERP() error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for receiveExternalHandoffDERP(): %v", ctx.Err())
+	}
+	if !bytes.Equal(out.Bytes(), payload) {
+		t.Fatalf("receiver payload = %q, want %q", out.Bytes(), payload)
+	}
+
+	sawData := false
+	for {
+		select {
+		case pkt := <-captured:
+			if externalRelayPrefixDERPFrameKindOf(pkt.Payload) != externalRelayPrefixDERPFrameData {
+				continue
+			}
+			sawData = true
+			if bytes.Contains(pkt.Payload, marker) {
+				t.Fatalf("captured relay-prefix data frame contains plaintext marker: %x", pkt.Payload)
+			}
+		default:
+			if !sawData {
+				t.Fatal("captured no relay-prefix data frames")
+			}
+			return
+		}
+	}
+}
+
 func TestSendExternalHandoffDERPStopUsesReceiverHandoffAckBelowReadBoundary(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
