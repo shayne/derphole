@@ -100,31 +100,6 @@ Client:
 npx -y derphole@latest ssh accept <token>
 ```
 
-### Watch Progress with `pv`
-
-`derphole` is plain stdin/stdout, so `pv` fits in the pipeline.
-
-Install `pv` if needed:
-
-```bash
-brew install pv
-sudo apt install -y pv
-```
-
-Receiver:
-
-```bash
-npx -y derphole@latest listen | pv -brt > received.img
-```
-
-Sender:
-
-```bash
-cat ./disk.img | pv -brt | npx -y derphole@latest pipe <token>
-```
-
-For an Internet/NAT version, see [Real-World Example: Tar Pipe Over Internet](#real-world-example-tar-pipe-over-internet).
-
 ### Share a Local TCP Service
 
 Service host:
@@ -292,30 +267,6 @@ Sessions can start on DERP relay and later promote to direct paths without resta
 - quick sharing of local web apps, APIs, and admin interfaces
 - `npx` use without manual install
 
-## Real-World Example: Tar Pipe Over Internet
-
-Classic tar pipe is fast because it streams bytes from `tar` on one host into `tar` on another. Reference: [Using netcat and tar to quickly transfer files between machines, aka tar pipe](https://toast.djw.org.uk/tarpipe.html).
-
-Problem: classic `tar | nc` needs a reachable listening port. That breaks when both hosts sit behind NAT or should not expose inbound ports.
-
-`derphole` keeps the streaming shape and removes the open-port requirement.
-
-Receiver:
-
-```bash
-npx -y derphole@latest listen | tar -xpf - -C /restore/path
-```
-
-`listen` prints a token on stderr. Copy it to the sender over a trusted channel.
-
-Sender:
-
-```bash
-tar -cpf - /srv/data | npx -y derphole@latest pipe <token>
-```
-
-This is still tar pipe. Difference: no public listener, no SSH daemon for the data path, no VPN, no permanent mesh. `derphole` starts with DERP if needed, then promotes the live transfer to direct UDP when available.
-
 ## Development
 
 ```bash
@@ -349,7 +300,6 @@ REMOTE_HOST=my-server.example.com mise run promotion-1g
 - npm packages: `derphole`, `derptun`
 - production channels: `derphole@latest`, `derptun@latest`
 - development channels: `derphole@dev`, `derptun@dev`
-- bootstrap runbook: [docs/releases/npm-bootstrap.md](docs/releases/npm-bootstrap.md)
 
 ## What Is DERP?
 
