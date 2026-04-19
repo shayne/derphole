@@ -77,6 +77,7 @@ function buffersEqual(a, b) {
 
 async function installSavePickerHarness(page) {
   await page.addInitScript(() => {
+    window.__derpholeReceiveMode = "save-picker";
     window.__derpholeSavedOptions = null;
     window.__derpholeReceivedChunks = [];
     window.__derpholeClosed = false;
@@ -111,19 +112,62 @@ async function installSavePickerHarness(page) {
   });
 }
 
-(async () => {
-  const launchOptions = { headless: true };
-  const chromePath = process.env.PLAYWRIGHT_CHROME_EXECUTABLE || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-  if (existsSync(chromePath)) {
-    launchOptions.executablePath = chromePath;
-  } else if (process.env.PLAYWRIGHT_CHROME_CHANNEL) {
-    launchOptions.channel = process.env.PLAYWRIGHT_CHROME_CHANNEL;
-  }
-  const browser = await chromium.launch(launchOptions);
+async function installMemoryFallbackHarness(page) {
+  await page.addInitScript(() => {
+    window.__derpholeReceiveMode = "memory-fallback";
+    window.__derpholeFallbackBlob = null;
+    window.__derpholeFallbackDownload = "";
+    window.__derpholeClosed = false;
+    window.showSaveFilePicker = undefined;
+    window.showDirectoryPicker = async () => {
+      throw new Error("browser receive must not request directory access");
+    };
+
+    URL.createObjectURL = (blob) => {
+      window.__derpholeFallbackBlob = blob;
+      return "blob:derphole-fallback";
+    };
+    URL.revokeObjectURL = () => {};
+
+    const createElement = Document.prototype.createElement;
+    Document.prototype.createElement = function(tagName, ...args) {
+      const element = createElement.call(this, tagName, ...args);
+      if (String(tagName).toLowerCase() === "a") {
+        element.click = function() {
+          window.__derpholeFallbackDownload = this.download;
+          window.__derpholeClosed = true;
+        };
+      }
+      return element;
+    };
+  });
+}
+
+async function collectReceiveResult(receiver) {
+  return await receiver.evaluate(async () => {
+    let bytes = [];
+    if (window.__derpholeReceivedChunks) {
+      bytes = window.__derpholeReceivedChunks.flat();
+    } else if (window.__derpholeFallbackBlob) {
+      bytes = Array.from(new Uint8Array(await window.__derpholeFallbackBlob.arrayBuffer()));
+    }
+    return {
+      mode: window.__derpholeReceiveMode,
+      savedOptions: window.__derpholeSavedOptions || null,
+      fallbackDownload: window.__derpholeFallbackDownload || "",
+      closed: Boolean(window.__derpholeClosed),
+      bytes,
+      status: document.querySelector("#receive-status")?.textContent || "",
+      progress: document.querySelector("#receive-progress")?.textContent || "",
+    };
+  });
+}
+
+async function runReceiveScenario(browser, name, installReceiverHarness) {
+  const sender = await browser.newPage();
+  const receiver = await browser.newPage();
   try {
-    const sender = await browser.newPage();
-    const receiver = await browser.newPage();
-    await installSavePickerHarness(receiver);
+    await installReceiverHarness(receiver);
 
     await Promise.all([
       sender.goto(`http://127.0.0.1:${port}/`, { waitUntil: "networkidle" }),
@@ -137,7 +181,7 @@ async function installSavePickerHarness(page) {
       window.createDerpholeWebRTCTransport = undefined;
     });
 
-    console.error("browser receive smoke: creating web offer");
+    console.error(`browser receive smoke (${name}): creating web offer`);
     const token = await sender.evaluate(async (bytes) => {
       const raw = Uint8Array.from(bytes);
       const file = new File([raw], "browser-input.bin", { type: "application/octet-stream" });
@@ -155,47 +199,75 @@ async function installSavePickerHarness(page) {
       return token;
     }, Array.from(expected));
 
-    console.error("browser receive smoke: claiming web offer");
+    console.error(`browser receive smoke (${name}): claiming web offer`);
     await receiver.fill("#receive-token", token);
     await receiver.click("#start-receive");
     await withTimeout(receiver.waitForFunction(() => {
       const status = document.querySelector("#receive-status")?.textContent || "";
       return window.__derpholeClosed || status.startsWith("error:");
-    }, { timeout: timeoutMs }), "browser receive");
+    }, { timeout: timeoutMs }), `browser receive (${name})`);
 
-    const result = await receiver.evaluate(() => ({
-      savedOptions: window.__derpholeSavedOptions,
-      closed: window.__derpholeClosed,
-      chunks: window.__derpholeReceivedChunks,
-      status: document.querySelector("#receive-status")?.textContent || "",
-      progress: document.querySelector("#receive-progress")?.textContent || "",
-    }));
+    const result = await collectReceiveResult(receiver);
     if (result.status.startsWith("error:")) {
-      throw new Error("browser receive failed: " + result.status);
-    }
-    if (!result.savedOptions || result.savedOptions.startIn !== "downloads") {
-      throw new Error("browser receive did not use save picker with downloads start directory");
+      throw new Error(`browser receive (${name}) failed: ${result.status}`);
     }
     if (!result.closed) {
-      throw new Error("browser receive did not close writable stream");
+      throw new Error(`browser receive (${name}) did not close output`);
     }
-    const actual = Buffer.from(result.chunks.flat());
+    if (name === "save-picker") {
+      if (!result.savedOptions || result.savedOptions.startIn !== "downloads") {
+        throw new Error("browser receive did not use save picker with downloads start directory");
+      }
+      if (result.savedOptions.suggestedName !== "browser-input.bin") {
+        throw new Error("browser receive save picker did not preserve filename");
+      }
+    } else {
+      if (result.savedOptions) {
+        throw new Error("browser receive fallback unexpectedly used save picker");
+      }
+      if (result.fallbackDownload !== "browser-input.bin") {
+        throw new Error("browser receive fallback did not preserve filename");
+      }
+    }
+    const actual = Buffer.from(result.bytes);
     if (!buffersEqual(actual, expected)) {
-      throw new Error(`received bytes mismatch: got ${actual.length}, want ${expected.length}`);
+      throw new Error(`received bytes mismatch (${name}): got ${actual.length}, want ${expected.length}`);
     }
 
-    await withTimeout(sender.evaluate(() => window.__derpholeSendPromise), "browser send");
+    await withTimeout(sender.evaluate(() => window.__derpholeSendPromise), `browser send (${name})`);
     const sendState = await sender.evaluate(() => window.__derpholeSendState);
     if (sendState.error || !sendState.done) {
-      throw new Error("browser send failed: " + (sendState.error || "not done"));
+      throw new Error(`browser send (${name}) failed: ${sendState.error || "not done"}`);
     }
-    console.error(JSON.stringify({
+    return {
+      name,
       receivedBytes: actual.length,
       savedOptions: result.savedOptions,
+      fallbackDownload: result.fallbackDownload,
       receiveStatus: result.status,
       receiveProgress: result.progress,
       sendEvents: sendState.logs.filter((entry) => entry.kind !== "progress").slice(-20),
-    }, null, 2));
+    };
+  } finally {
+    await sender.close().catch(() => {});
+    await receiver.close().catch(() => {});
+  }
+}
+
+(async () => {
+  const launchOptions = { headless: true };
+  const chromePath = process.env.PLAYWRIGHT_CHROME_EXECUTABLE || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+  if (existsSync(chromePath)) {
+    launchOptions.executablePath = chromePath;
+  } else if (process.env.PLAYWRIGHT_CHROME_CHANNEL) {
+    launchOptions.channel = process.env.PLAYWRIGHT_CHROME_CHANNEL;
+  }
+  const browser = await chromium.launch(launchOptions);
+  try {
+    const scenarios = [];
+    scenarios.push(await runReceiveScenario(browser, "save-picker", installSavePickerHarness));
+    scenarios.push(await runReceiveScenario(browser, "memory-fallback", installMemoryFallbackHarness));
+    console.error(JSON.stringify({ scenarios }, null, 2));
   } finally {
     await browser.close();
   }

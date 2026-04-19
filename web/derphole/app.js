@@ -138,20 +138,19 @@ async function makeSink(progress) {
   }
   progress.status("warning: save picker unavailable; buffering receive in browser memory");
   return {
-    chunks: [],
-    filename: "derphole-download",
     async open(name) {
-      this.filename = name || this.filename;
+      const chunks = [];
+      const filename = name || "derphole-download";
       return {
         write: async (chunk) => {
-          this.chunks.push(chunk.slice());
+          chunks.push(chunk.slice());
         },
         close: async () => {
-          const blob = new Blob(this.chunks);
+          const blob = new Blob(chunks);
           const url = URL.createObjectURL(blob);
           const link = document.createElement("a");
           link.href = url;
-          link.download = this.filename;
+          link.download = filename;
           link.click();
           URL.revokeObjectURL(url);
         },
