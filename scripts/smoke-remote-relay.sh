@@ -9,7 +9,8 @@ remote_upload=""
 local_listener_pid=""
 remote_user="${DERPHOLE_REMOTE_USER:-root}"
 remote_env=()
-relay_plaintext_marker="relay-plaintext-marker-${target}-$(date +%s)-$$"
+relay_marker_nonce="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+relay_plaintext_marker="relay-plaintext-marker-${target}-$(date +%s)-${relay_marker_nonce}"
 export DERPHOLE_TEST_RELAY_PLAINTEXT_MARKER="${relay_plaintext_marker}"
 remote_env+=(DERPHOLE_TEST_RELAY_PLAINTEXT_MARKER="${relay_plaintext_marker}")
 
