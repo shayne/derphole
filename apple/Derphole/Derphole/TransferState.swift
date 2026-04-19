@@ -12,6 +12,7 @@ import DerpholeMobile
 final class TransferState: ObservableObject {
     enum Phase: Equatable {
         case idle
+        case scanning
         case receiving
         case received
         case failed
@@ -56,12 +57,20 @@ final class TransferState: ObservableObject {
         phase == .receiving
     }
 
+    var isScanning: Bool {
+        phase == .scanning
+    }
+
     var canValidatePayload: Bool {
-        !pastedPayload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isReceiving
+        !pastedPayload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isReceiving && !canExport
     }
 
     var canStartReceive: Bool {
-        canValidatePayload
+        canValidatePayload && !canExport
+    }
+
+    var canStartScan: Bool {
+        !isReceiving && !canExport
     }
 
     var canExport: Bool {
@@ -77,6 +86,8 @@ final class TransferState: ObservableObject {
         switch phase {
         case .idle:
             return "Ready to receive"
+        case .scanning:
+            return "Scanning"
         case .receiving:
             return "Receiving"
         case .received:
@@ -102,13 +113,28 @@ final class TransferState: ObservableObject {
         }
     }
 
+    func scanStarted() {
+        guard canStartScan else { return }
+        phase = .scanning
+        route = .unknown
+        progressCurrent = 0
+        progressTotal = 0
+        validatedToken = ""
+        completedFileURL = nil
+        traceText = ""
+        statusText = "Scanning for QR code."
+        errorText = nil
+        cancelRequested = false
+        lastScannedPayload = ""
+    }
+
     func receivePastedPayload() {
         startReceive(from: pastedPayload, source: .manual)
     }
 
     func receiveScannedPayload(_ payload: String) {
         let trimmed = payload.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !isReceiving, trimmed != lastScannedPayload else {
+        guard !trimmed.isEmpty, canStartScan, trimmed != lastScannedPayload else {
             return
         }
         pastedPayload = trimmed
@@ -127,7 +153,16 @@ final class TransferState: ObservableObject {
     }
 
     func cancelReceive() {
-        guard isReceiving else { return }
+        cancel()
+    }
+
+    func cancel() {
+        guard isReceiving else {
+            phase = .canceled
+            statusText = "Receive canceled."
+            errorText = nil
+            return
+        }
         cancelRequested = true
         statusText = "Canceling receive..."
         activeReceiver?.cancel()
@@ -138,8 +173,16 @@ final class TransferState: ObservableObject {
         isExporterPresented = true
     }
 
-    func exporterFinished() {
+    func exporterFinished(exported: Bool) {
         isExporterPresented = false
+        guard exported else { return }
+        phase = .idle
+        route = .unknown
+        progressCurrent = 0
+        progressTotal = 0
+        completedFileURL = nil
+        traceText = ""
+        statusText = "Ready."
     }
 
     private enum ReceiveSource {
@@ -148,7 +191,7 @@ final class TransferState: ObservableObject {
     }
 
     private func startReceive(from payload: String, source: ReceiveSource) {
-        guard !isReceiving else { return }
+        guard !isReceiving, !canExport else { return }
 
         let token: String
         do {

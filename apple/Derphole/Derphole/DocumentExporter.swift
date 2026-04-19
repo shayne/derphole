@@ -10,7 +10,7 @@ import UIKit
 
 struct DocumentExporter: UIViewControllerRepresentable {
     let fileURL: URL
-    let onComplete: () -> Void
+    let onComplete: (Bool) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(onComplete: onComplete)
@@ -26,18 +26,18 @@ struct DocumentExporter: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
 
     final class Coordinator: NSObject, UIDocumentPickerDelegate {
-        private let onComplete: () -> Void
+        private let onComplete: (Bool) -> Void
 
-        init(onComplete: @escaping () -> Void) {
+        init(onComplete: @escaping (Bool) -> Void) {
             self.onComplete = onComplete
         }
 
         func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-            onComplete()
+            onComplete(false)
         }
 
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            onComplete()
+            onComplete(true)
         }
     }
 }

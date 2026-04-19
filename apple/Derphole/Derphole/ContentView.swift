@@ -25,7 +25,7 @@ struct ContentView: View {
             .sheet(isPresented: $transferState.isExporterPresented) {
                 if let fileURL = transferState.completedFileURL {
                     DocumentExporter(fileURL: fileURL) {
-                        transferState.exporterFinished()
+                        transferState.exporterFinished(exported: $0)
                     }
                 }
             }
@@ -34,10 +34,16 @@ struct ContentView: View {
 
     private var scannerSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Scan QR Code")
-                .font(.headline)
+            Button {
+                transferState.scanStarted()
+            } label: {
+                Label("Scan QR Code", systemImage: "qrcode.viewfinder")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!transferState.canStartScan)
+            .accessibilityIdentifier("scanQRCodeButton")
 
-            QRScannerView(isScanning: !transferState.isReceiving) { payload in
+            QRScannerView(isScanning: transferState.isScanning && !transferState.isReceiving) { payload in
                 transferState.receiveScannedPayload(payload)
             }
             .frame(minHeight: 260)
@@ -82,6 +88,7 @@ struct ContentView: View {
                 .disabled(!transferState.canStartReceive)
                 .accessibilityIdentifier("receivePayloadButton")
             }
+            .accessibilityElement(children: .contain)
             .accessibilityIdentifier("pastedPayloadSection")
         }
     }

@@ -198,7 +198,7 @@ final class ScannerViewController: UIViewController {
         if scanningEnabled {
             hideMessage()
         } else {
-            showMessage("Receive in progress.")
+            showMessage("Scanner paused.")
         }
 
         sessionQueue.async { [session, scanningEnabled] in
