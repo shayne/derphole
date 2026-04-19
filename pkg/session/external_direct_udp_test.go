@@ -247,6 +247,118 @@ func TestWaitForPeerAckReturnsPeerAborted(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedEnvelopeRejectsTamperedFields(t *testing.T) {
+	auth := externalPeerControlAuthForToken(token.Token{
+		SessionID:    [16]byte{1, 2, 3},
+		BearerSecret: [32]byte{4, 5, 6},
+	})
+	env := signEnvelopeMAC(envelope{Type: envelopeAck, Ack: newPeerAck(11)}, auth)
+	if !verifyEnvelopeMAC(env, auth) {
+		t.Fatal("signed envelope was rejected")
+	}
+
+	env.Ack = newPeerAck(12)
+	if verifyEnvelopeMAC(env, auth) {
+		t.Fatal("tampered signed envelope was accepted")
+	}
+}
+
+func TestWaitForPeerAckIgnoresUnsignedAckWhenAuthConfigured(t *testing.T) {
+	auth := externalPeerControlAuthForToken(token.Token{
+		SessionID:    [16]byte{1, 2, 3},
+		BearerSecret: [32]byte{4, 5, 6},
+	})
+	unsignedPayload, err := json.Marshal(envelope{Type: envelopeAck, Ack: newPeerAck(11)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedPayload, err := marshalAuthenticatedEnvelope(envelope{Type: envelopeAck, Ack: newPeerAck(11)}, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ackCh := make(chan derpbind.Packet, 2)
+	ackCh <- derpbind.Packet{Payload: unsignedPayload}
+	ackCh <- derpbind.Packet{Payload: signedPayload}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := waitForPeerAck(ctx, ackCh, 11, auth); err != nil {
+		t.Fatalf("waitForPeerAck() error = %v", err)
+	}
+}
+
+func TestWaitForDirectUDPStartIgnoresUnsignedStartWhenAuthConfigured(t *testing.T) {
+	auth := externalPeerControlAuthForToken(token.Token{
+		SessionID:    [16]byte{1, 2, 3},
+		BearerSecret: [32]byte{4, 5, 6},
+	})
+	unsignedPayload, err := json.Marshal(envelope{
+		Type:           envelopeDirectUDPStart,
+		DirectUDPStart: &directUDPStart{ExpectedBytes: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedPayload, err := marshalAuthenticatedEnvelope(envelope{
+		Type:           envelopeDirectUDPStart,
+		DirectUDPStart: &directUDPStart{ExpectedBytes: 44},
+	}, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	startCh := make(chan derpbind.Packet, 2)
+	startCh <- derpbind.Packet{Payload: unsignedPayload}
+	startCh <- derpbind.Packet{Payload: signedPayload}
+
+	got, err := waitForDirectUDPStart(context.Background(), startCh, auth)
+	if err != nil {
+		t.Fatalf("waitForDirectUDPStart() error = %v", err)
+	}
+	if got.ExpectedBytes != 44 {
+		t.Fatalf("ExpectedBytes = %d, want 44", got.ExpectedBytes)
+	}
+}
+
+func TestReceiveTransportControlIgnoresUnsignedControlWhenAuthConfigured(t *testing.T) {
+	auth := externalPeerControlAuthForToken(token.Token{
+		SessionID:    [16]byte{1, 2, 3},
+		BearerSecret: [32]byte{4, 5, 6},
+	})
+	unsignedPayload, err := json.Marshal(envelope{
+		Type:    envelopeControl,
+		Control: &transport.ControlMessage{Type: transport.ControlCallMeMaybe},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedPayload, err := marshalAuthenticatedEnvelope(envelope{
+		Type: envelopeControl,
+		Control: &transport.ControlMessage{
+			Type:       transport.ControlCandidates,
+			Candidates: []string{"203.0.113.10:1234"},
+		},
+	}, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	controlCh := make(chan derpbind.Packet, 2)
+	controlCh <- derpbind.Packet{Payload: unsignedPayload}
+	controlCh <- derpbind.Packet{Payload: signedPayload}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := receiveTransportControl(ctx, controlCh, auth)
+	if err != nil {
+		t.Fatalf("receiveTransportControl() error = %v", err)
+	}
+	if got.Type != transport.ControlCandidates {
+		t.Fatalf("control type = %q, want %q", got.Type, transport.ControlCandidates)
+	}
+}
+
 func TestPeerControlContextCancelsOnPeerAbort(t *testing.T) {
 	payload := []byte(`{"type":"abort","abort":{"reason":"canceled","bytes_transferred":7}}`)
 	abortCh := make(chan derpbind.Packet, 1)
@@ -684,7 +796,7 @@ func TestReceiveExternalViaDirectUDPOnlyLetsPrepareConsumeReady(t *testing.T) {
 	waitReadyCalled := false
 	prepareCalled := false
 	executeCalled := false
-	externalDirectUDPWaitReadyFn = func(context.Context, <-chan derpbind.Packet) error {
+	externalDirectUDPWaitReadyFn = func(context.Context, <-chan derpbind.Packet, ...externalPeerControlAuth) error {
 		waitReadyCalled = true
 		return errors.New("unexpected direct UDP ready wait")
 	}
@@ -1492,7 +1604,7 @@ func TestExternalPrepareDirectUDPSendWaitsForHandoffProceedBeforeSendingStart(t 
 	t.Cleanup(func() { externalDirectUDPSendRateProbesParallelFn = prevSendRateProbes })
 
 	prevWaitRateProbe := externalDirectUDPWaitRateProbeFn
-	externalDirectUDPWaitRateProbeFn = func(context.Context, <-chan derpbind.Packet) (directUDPRateProbeResult, error) {
+	externalDirectUDPWaitRateProbeFn = func(context.Context, <-chan derpbind.Packet, ...externalPeerControlAuth) (directUDPRateProbeResult, error) {
 		return directUDPRateProbeResult{}, nil
 	}
 	t.Cleanup(func() { externalDirectUDPWaitRateProbeFn = prevWaitRateProbe })
@@ -1504,6 +1616,7 @@ func TestExternalPrepareDirectUDPSendWaitsForHandoffProceedBeforeSendingStart(t 
 		SessionID:    [16]byte{0x91},
 		BearerSecret: [32]byte{0x42},
 	}
+	auth := externalPeerControlAuthForToken(tok)
 	prepareErrCh := make(chan error, 1)
 	go func() {
 		_, err := externalPrepareDirectUDPSend(prepCtx, tok, senderDERP, listenerDERP.PublicKey(), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, []net.PacketConn{probeConn}, nil, readyAckCh, startAckCh, nil, SendConfig{})
@@ -1517,12 +1630,12 @@ func TestExternalPrepareDirectUDPSendWaitsForHandoffProceedBeforeSendingStart(t 
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for direct UDP ready before proceed gate")
 	}
-	if err := sendEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{
+	if err := sendAuthenticatedEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{
 		Type: envelopeDirectUDPReadyAck,
 		DirectUDPReadyAck: &directUDPReadyAck{
 			FastDiscard: true,
 		},
-	}); err != nil {
+	}, auth); err != nil {
 		t.Fatalf("sendEnvelope(ready-ack) error = %v", err)
 	}
 
@@ -1551,7 +1664,7 @@ func TestExternalPrepareDirectUDPSendWaitsForHandoffProceedBeforeSendingStart(t 
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for direct UDP start after proceed gate")
 	}
-	if err := sendEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{Type: envelopeDirectUDPStartAck}); err != nil {
+	if err := sendAuthenticatedEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{Type: envelopeDirectUDPStartAck}, auth); err != nil {
 		t.Fatalf("sendEnvelope(start-ack) error = %v", err)
 	}
 
@@ -1616,7 +1729,7 @@ func TestExternalPrepareDirectUDPSendSkipsRateProbesForSmallKnownTransfer(t *tes
 
 	var rateProbeWaitCalled bool
 	prevWaitRateProbe := externalDirectUDPWaitRateProbeFn
-	externalDirectUDPWaitRateProbeFn = func(context.Context, <-chan derpbind.Packet) (directUDPRateProbeResult, error) {
+	externalDirectUDPWaitRateProbeFn = func(context.Context, <-chan derpbind.Packet, ...externalPeerControlAuth) (directUDPRateProbeResult, error) {
 		rateProbeWaitCalled = true
 		return directUDPRateProbeResult{}, errors.New("unexpected rate probe wait for small known transfer")
 	}
@@ -1643,12 +1756,12 @@ func TestExternalPrepareDirectUDPSendSkipsRateProbesForSmallKnownTransfer(t *tes
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for direct UDP ready")
 	}
-	if err := sendEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{
+	if err := sendAuthenticatedEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{
 		Type: envelopeDirectUDPReadyAck,
 		DirectUDPReadyAck: &directUDPReadyAck{
 			FastDiscard: true,
 		},
-	}); err != nil {
+	}, externalPeerControlAuthForToken(tok)); err != nil {
 		t.Fatalf("sendEnvelope(ready-ack) error = %v", err)
 	}
 
@@ -1679,7 +1792,7 @@ func TestExternalPrepareDirectUDPSendSkipsRateProbesForSmallKnownTransfer(t *tes
 	if got := startEnv.DirectUDPStart.ProbeRates; len(got) != 0 {
 		t.Fatalf("direct UDP start ProbeRates = %v, want none for small known transfer", got)
 	}
-	if err := sendEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{Type: envelopeDirectUDPStartAck}); err != nil {
+	if err := sendAuthenticatedEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{Type: envelopeDirectUDPStartAck}, externalPeerControlAuthForToken(tok)); err != nil {
 		t.Fatalf("sendEnvelope(start-ack) error = %v", err)
 	}
 
@@ -1750,7 +1863,7 @@ func TestExternalPrepareDirectUDPSendSkipsBlockingRateProbesForRelayPrefixUpgrad
 
 	var rateProbeWaitCalled bool
 	prevWaitRateProbe := externalDirectUDPWaitRateProbeFn
-	externalDirectUDPWaitRateProbeFn = func(context.Context, <-chan derpbind.Packet) (directUDPRateProbeResult, error) {
+	externalDirectUDPWaitRateProbeFn = func(context.Context, <-chan derpbind.Packet, ...externalPeerControlAuth) (directUDPRateProbeResult, error) {
 		rateProbeWaitCalled = true
 		return directUDPRateProbeResult{}, errors.New("unexpected rate probe wait for relay-prefix upgrade")
 	}
@@ -1784,12 +1897,12 @@ func TestExternalPrepareDirectUDPSendSkipsBlockingRateProbesForRelayPrefixUpgrad
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for direct UDP ready")
 	}
-	if err := sendEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{
+	if err := sendAuthenticatedEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{
 		Type: envelopeDirectUDPReadyAck,
 		DirectUDPReadyAck: &directUDPReadyAck{
 			FastDiscard: true,
 		},
-	}); err != nil {
+	}, externalPeerControlAuthForToken(tok)); err != nil {
 		t.Fatalf("sendEnvelope(ready-ack) error = %v", err)
 	}
 
@@ -1820,7 +1933,7 @@ func TestExternalPrepareDirectUDPSendSkipsBlockingRateProbesForRelayPrefixUpgrad
 	if got := startEnv.DirectUDPStart.ProbeRates; len(got) != 0 {
 		t.Fatalf("direct UDP start ProbeRates = %v, want none for relay-prefix upgrade", got)
 	}
-	if err := sendEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{Type: envelopeDirectUDPStartAck}); err != nil {
+	if err := sendAuthenticatedEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{Type: envelopeDirectUDPStartAck}, externalPeerControlAuthForToken(tok)); err != nil {
 		t.Fatalf("sendEnvelope(start-ack) error = %v", err)
 	}
 

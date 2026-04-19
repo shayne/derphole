@@ -3,8 +3,9 @@ set -euo pipefail
 
 target="${1:?usage: $0 <host>}"
 tmp="$(mktemp -d)"
-remote_base="/tmp/derphole-share-smoke-$$"
-remote_upload="/tmp/derphole-share-bin-$$"
+remote_tmp=""
+remote_base=""
+remote_upload=""
 local_share_pid=""
 local_http_pid=""
 remote_user="${DERPHOLE_REMOTE_USER:-root}"
@@ -18,6 +19,10 @@ remote() {
   ssh "${remote_user}@${target}" "${remote_env[@]}" 'bash -se' <<<"$1"
 }
 
+remote_tmp="$(remote 'mktemp -d "${TMPDIR:-/tmp}/derphole-share-smoke.XXXXXXXXXX"')"
+remote_base="${remote_tmp}/derphole-share-smoke"
+remote_upload="${remote_tmp}/derphole-bin"
+
 cleanup() {
   if [[ -n "${local_share_pid}" ]]; then
     kill "${local_share_pid}" 2>/dev/null || true
@@ -27,7 +32,9 @@ cleanup() {
     kill "${local_http_pid}" 2>/dev/null || true
     wait "${local_http_pid}" 2>/dev/null || true
   fi
-  remote "if [[ -f '${remote_base}.pid' ]]; then kill \$(cat '${remote_base}.pid') 2>/dev/null || true; fi; rm -f '${remote_base}'.* '/tmp/derphole-share-'* >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+  if [[ -n "${remote_tmp}" ]]; then
+    remote "if [[ -f '${remote_base}.pid' ]]; then kill \$(cat '${remote_base}.pid') 2>/dev/null || true; fi; rm -rf -- '${remote_tmp}'" >/dev/null 2>&1 || true
+  fi
   rm -rf "${tmp}"
 }
 trap cleanup EXIT

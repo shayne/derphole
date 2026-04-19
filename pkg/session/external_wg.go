@@ -125,7 +125,9 @@ func startExternalWGTransportManager(
 	localCandidates []net.Addr,
 	pm publicPortmap,
 	forceRelay bool,
+	authOpt ...externalPeerControlAuth,
 ) (*transport.Manager, func(), error) {
+	auth := optionalPeerControlAuth(authOpt)
 	controlCh, unsubscribe := derpClient.Subscribe(func(pkt derpbind.Packet) bool {
 		return pkt.From == peerDERP && isTransportControlPayload(pkt.Payload)
 	})
@@ -139,10 +141,10 @@ func startExternalWGTransportManager(
 		EndpointRefreshInterval: 1 * time.Second,
 		DirectStaleTimeout:      10 * time.Second,
 		SendControl: func(ctx context.Context, msg transport.ControlMessage) error {
-			return sendTransportControl(ctx, derpClient, peerDERP, msg)
+			return sendTransportControl(ctx, derpClient, peerDERP, msg, auth)
 		},
 		ReceiveControl: func(ctx context.Context) (transport.ControlMessage, error) {
-			return receiveTransportControl(ctx, controlCh)
+			return receiveTransportControl(ctx, controlCh, auth)
 		},
 	}
 	if !forceRelay {
@@ -284,19 +286,20 @@ func sendExternalViaWGTunnel(ctx context.Context, cfg SendConfig) (retErr error)
 		return pkt.From == listenerDERP && isHeartbeatPayload(pkt.Payload)
 	})
 	defer unsubscribeHeartbeat()
+	auth := externalPeerControlAuthForToken(tok)
 	ctx, stopPeerAbort := withPeerControlContext(ctx, derpClient, listenerDERP, abortCh, heartbeatCh, func() int64 {
 		return countedSrc.Count()
-	}, externalPeerControlAuthForToken(tok))
+	}, auth)
 	defer stopPeerAbort()
 	defer notifyPeerAbortOnError(&retErr, ctx, derpClient, listenerDERP, func() int64 {
 		return countedSrc.Count()
-	})
+	}, auth)
 
 	pathEmitter := newTransportPathEmitter(cfg.Emitter)
 	pathEmitter.Emit(StateProbing)
 	transportCtx, transportCancel := context.WithCancel(ctx)
 	defer transportCancel()
-	transportManager, transportCleanup, err := startExternalWGTransportManager(transportCtx, probeConn, dm, derpClient, listenerDERP, parseCandidateStrings(localCandidates), pm, cfg.ForceRelay)
+	transportManager, transportCleanup, err := startExternalWGTransportManager(transportCtx, probeConn, dm, derpClient, listenerDERP, parseCandidateStrings(localCandidates), pm, cfg.ForceRelay, auth)
 	if err != nil {
 		return err
 	}
@@ -331,7 +334,7 @@ func sendExternalViaWGTunnel(ctx context.Context, cfg SendConfig) (retErr error)
 	if err := sendExternalNativeTCPDirect(ctx, countedSrc, conns); err != nil {
 		return err
 	}
-	if err := waitForPeerAck(ctx, ackCh, countedSrc.Count()); err != nil {
+	if err := waitForPeerAck(ctx, ackCh, countedSrc.Count(), auth); err != nil {
 		return err
 	}
 	return nil
@@ -418,7 +421,8 @@ func listenExternalViaWGTunnel(ctx context.Context, cfg ListenConfig) (retTok st
 
 		transportCtx, transportCancel := context.WithCancel(ctx)
 		defer transportCancel()
-		transportManager, transportCleanup, err := startExternalWGTransportManager(transportCtx, session.probeConn, session.derpMap, session.derp, peerDERP, localCandidates, publicSessionPortmap(session), cfg.ForceRelay)
+		auth := externalPeerControlAuthForToken(session.token)
+		transportManager, transportCleanup, err := startExternalWGTransportManager(transportCtx, session.probeConn, session.derpMap, session.derp, peerDERP, localCandidates, publicSessionPortmap(session), cfg.ForceRelay, auth)
 		if err != nil {
 			return tok, err
 		}
@@ -473,7 +477,7 @@ func listenExternalViaWGTunnel(ctx context.Context, cfg ListenConfig) (retTok st
 		if err := receiveExternalNativeTCPDirect(ctx, countedDst, conns); err != nil {
 			return tok, err
 		}
-		if err := sendPeerAck(ctx, session.derp, peerDERP, countedDst.Count()); err != nil {
+		if err := sendPeerAck(ctx, session.derp, peerDERP, countedDst.Count(), auth); err != nil {
 			return tok, err
 		}
 		return tok, nil

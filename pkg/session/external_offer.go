@@ -82,19 +82,20 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (retTok string, retErr 
 			return pkt.From == peerDERP && isHeartbeatPayload(pkt.Payload)
 		})
 		defer unsubscribeHeartbeat()
+		auth := externalPeerControlAuthForToken(session.token)
 		ctx, stopPeerAbort := withPeerControlContext(ctx, session.derp, peerDERP, abortCh, heartbeatCh, func() int64 {
 			if countedSrc == nil {
 				return 0
 			}
 			return countedSrc.Count()
-		}, externalPeerControlAuthForToken(session.token))
+		}, auth)
 		defer stopPeerAbort()
 		defer notifyPeerAbortOnError(&retErr, ctx, session.derp, peerDERP, func() int64 {
 			if countedSrc == nil {
 				return 0
 			}
 			return countedSrc.Count()
-		})
+		}, auth)
 
 		probeConn := session.probeConn
 		probeConns := []net.PacketConn{session.probeConn}
@@ -200,7 +201,7 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (retTok string, retErr 
 		if sendErr != nil {
 			return tok, sendErr
 		}
-		if err := waitForPeerAckWithTimeout(ctx, ackCh, countedSrc.Count(), externalDirectUDPAckWait); err != nil {
+		if err := waitForPeerAckWithTimeout(ctx, ackCh, countedSrc.Count(), externalDirectUDPAckWait, auth); err != nil {
 			return tok, err
 		}
 		pathEmitter.Complete(transportManager)
@@ -327,19 +328,20 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) (retErr error) {
 		return pkt.From == listenerDERP && isHeartbeatPayload(pkt.Payload)
 	})
 	defer unsubscribeHeartbeat()
+	auth := externalPeerControlAuthForToken(tok)
 	ctx, stopPeerAbort := withPeerControlContext(ctx, derpClient, listenerDERP, abortCh, heartbeatCh, func() int64 {
 		if countedDst == nil {
 			return 0
 		}
 		return countedDst.Count()
-	}, externalPeerControlAuthForToken(tok))
+	}, auth)
 	defer stopPeerAbort()
 	defer notifyPeerAbortOnError(&retErr, ctx, derpClient, listenerDERP, func() int64 {
 		if countedDst == nil {
 			return 0
 		}
 		return countedDst.Count()
-	})
+	}, auth)
 
 	pathEmitter := newTransportPathEmitter(cfg.Emitter)
 	pathEmitter.Emit(StateProbing)
@@ -400,7 +402,7 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) (retErr error) {
 	if receiveErr != nil {
 		return receiveErr
 	}
-	if err := sendPeerAck(ctx, derpClient, listenerDERP, countedDst.Count()); err != nil {
+	if err := sendPeerAck(ctx, derpClient, listenerDERP, countedDst.Count(), auth); err != nil {
 		return err
 	}
 	pathEmitter.Complete(transportManager)

@@ -95,6 +95,7 @@ type publicPortmap interface {
 
 type envelope struct {
 	Type               string                    `json:"type"`
+	MAC                string                    `json:"mac,omitempty"`
 	Claim              *rendezvous.Claim         `json:"claim,omitempty"`
 	Decision           *rendezvous.Decision      `json:"decision,omitempty"`
 	Control            *transport.ControlMessage `json:"control,omitempty"`
@@ -1262,6 +1263,7 @@ func startExternalTransportManager(
 	pm publicPortmap,
 	forceRelay bool,
 ) (*transport.Manager, func(), error) {
+	auth := externalPeerControlAuthForToken(tok)
 	controlCh, unsubscribe := derpClient.Subscribe(func(pkt derpbind.Packet) bool {
 		return pkt.From == peerDERP && isTransportControlPayload(pkt.Payload)
 	})
@@ -1294,10 +1296,10 @@ func startExternalTransportManager(
 		DirectStaleTimeout:      10 * time.Second,
 		DiscoveryKey:            externalTransportDiscoveryKey(tok, derpClient.PublicKey(), peerDERP),
 		SendControl: func(ctx context.Context, msg transport.ControlMessage) error {
-			return sendTransportControl(ctx, derpClient, peerDERP, msg)
+			return sendTransportControl(ctx, derpClient, peerDERP, msg, auth)
 		},
 		ReceiveControl: func(ctx context.Context) (transport.ControlMessage, error) {
-			return receiveTransportControl(ctx, controlCh)
+			return receiveTransportControl(ctx, controlCh, auth)
 		},
 	}
 	if !forceRelay {
@@ -1354,10 +1356,12 @@ func requestExternalQUICMode(
 	nativeTCPAuth externalNativeTCPAuth,
 	parallelPolicy ParallelPolicy,
 	forceRelay bool,
+	authOpt ...externalPeerControlAuth,
 ) (bool, []net.Conn, net.Addr, ParallelPolicy, error) {
 	if forceRelay || manager == nil {
 		return false, nil, nil, ParallelPolicy{}, nil
 	}
+	auth := optionalPeerControlAuth(authOpt)
 	parallelPolicy = parallelPolicy.normalized()
 
 	var localTCPListener net.Listener
@@ -1386,7 +1390,7 @@ func requestExternalQUICMode(
 	})
 	defer unsubscribeReady()
 
-	if err := sendEnvelope(ctx, client, peerDERP, envelope{
+	if err := sendAuthenticatedEnvelope(ctx, client, peerDERP, envelope{
 		Type: envelopeQUICModeReq,
 		QUICModeReq: &quicModeRequest{
 			NativeDirect:    true,
@@ -1397,23 +1401,23 @@ func requestExternalQUICMode(
 			ParallelInitial: parallelPolicy.Initial,
 			ParallelCap:     parallelPolicy.Cap,
 		},
-	}); err != nil {
+	}, auth); err != nil {
 		return false, nil, nil, ParallelPolicy{}, err
 	}
 
 	modeCtx, cancel := context.WithTimeout(ctx, externalNativeQUICWait)
 	defer cancel()
-	resp, err := receiveQUICModeResponse(modeCtx, modeCh)
+	resp, err := receiveQUICModeResponse(modeCtx, modeCh, auth)
 	if err != nil || (!resp.NativeDirect && !resp.NativeTCP) {
 		if errors.Is(err, context.Canceled) {
 			nackCtx, nackCancel := context.WithTimeout(context.Background(), externalNativeQUICNackWait)
-			_ = sendEnvelope(nackCtx, client, peerDERP, envelope{
+			_ = sendAuthenticatedEnvelope(nackCtx, client, peerDERP, envelope{
 				Type: envelopeQUICModeAck,
 				QUICModeAck: &quicModeAck{
 					NativeDirect: false,
 					NativeTCP:    false,
 				},
-			})
+			}, auth)
 			nackCancel()
 		}
 		if emitter != nil {
@@ -1491,7 +1495,7 @@ func requestExternalQUICMode(
 			NativeTCP:    nativeTCP && len(nativeTCPConns) > 0,
 		},
 	}
-	if err := sendEnvelope(ctx, client, peerDERP, ackEnv); err != nil {
+	if err := sendAuthenticatedEnvelope(ctx, client, peerDERP, ackEnv, auth); err != nil {
 		closeExternalNativeTCPConns(nativeTCPConns)
 		return false, nil, nil, resolvedPolicy, err
 	}
@@ -1510,8 +1514,8 @@ func requestExternalQUICMode(
 	readyCtx, readyCancel := context.WithTimeout(ctx, externalNativeQUICWait)
 	defer readyCancel()
 	ready, err := receiveQUICModeReadyWithAckRetry(readyCtx, readyCh, func(ctx context.Context) error {
-		return sendEnvelope(ctx, client, peerDERP, ackEnv)
-	})
+		return sendAuthenticatedEnvelope(ctx, client, peerDERP, ackEnv, auth)
+	}, auth)
 	if err != nil || !ready.NativeDirect {
 		closeExternalNativeTCPConns(nativeTCPConns)
 		if errors.Is(err, context.Canceled) {
@@ -1534,9 +1538,11 @@ func acceptExternalQUICMode(
 	clientTLSConfig *tls.Config,
 	serverTLSConfig *tls.Config,
 	nativeTCPAuth externalNativeTCPAuth,
+	authOpt ...externalPeerControlAuth,
 ) (bool, []net.Conn, net.Addr, ParallelPolicy, error) {
 	modeCtx, cancel := context.WithTimeout(ctx, externalNativeQUICWait)
 	defer cancel()
+	auth := optionalPeerControlAuth(authOpt)
 
 	ackCh, unsubscribeAck := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == peerDERP && isQUICModeAckPayload(pkt.Payload)
@@ -1547,7 +1553,7 @@ func acceptExternalQUICMode(
 	})
 	defer unsubscribeModeAbort()
 
-	req, err := receiveQUICModeRequest(modeCtx, modeCh)
+	req, err := receiveQUICModeRequest(modeCtx, modeCh, auth)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, net.ErrClosed) {
 			return false, nil, nil, ParallelPolicy{}, nil
@@ -1613,7 +1619,7 @@ func acceptExternalQUICMode(
 		}
 	}
 	if req.NativeDirect && !forceRelay && nativeTCPListener == nil {
-		peerDirectAddr, ok, aborted := waitForExternalDirectAddrOrModeAbort(ctx, manager, modeAbortCh, externalNativeQUICWait)
+		peerDirectAddr, ok, aborted := waitForExternalDirectAddrOrModeAbort(ctx, manager, modeAbortCh, externalNativeQUICWait, auth)
 		if aborted {
 			return false, nil, nil, ParallelPolicy{}, nil
 		}
@@ -1660,7 +1666,7 @@ func acceptExternalQUICMode(
 		}
 	}
 	nativeTCPOffered := nativeTCPListener != nil
-	if err := sendEnvelope(ctx, client, peerDERP, envelope{
+	if err := sendAuthenticatedEnvelope(ctx, client, peerDERP, envelope{
 		Type: envelopeQUICModeResp,
 		QUICModeResp: &quicModeResponse{
 			NativeDirect:    nativeQUIC,
@@ -1671,7 +1677,7 @@ func acceptExternalQUICMode(
 			ParallelInitial: resolvedPolicy.Initial,
 			ParallelCap:     resolvedPolicy.Cap,
 		},
-	}); err != nil {
+	}, auth); err != nil {
 		if nativeTCPListener != nil {
 			_ = nativeTCPListener.Close()
 		}
@@ -1738,7 +1744,7 @@ func acceptExternalQUICMode(
 	}
 	ackCtx, ackCancel := context.WithTimeout(ctx, externalNativeQUICWait)
 	defer ackCancel()
-	ack, err := receiveQUICModeAck(ackCtx, ackCh)
+	ack, err := receiveQUICModeAck(ackCtx, ackCh, auth)
 	if err != nil || (!ack.NativeDirect && !ack.NativeTCP) {
 		if nativeTCPCancel != nil {
 			nativeTCPCancel()
@@ -1763,7 +1769,7 @@ func acceptExternalQUICMode(
 		if !nativeQUIC {
 			return false, nil, nil, resolvedPolicy, nil
 		}
-		if _, err := sendExternalQUICModeReady(ctx, client, peerDERP, manager, nativeQUICAddr); err != nil {
+		if _, err := sendExternalQUICModeReady(ctx, client, peerDERP, manager, nativeQUICAddr, auth); err != nil {
 			return false, nil, nil, resolvedPolicy, err
 		}
 		return nativeQUIC, nil, cloneSessionAddr(nativeQUICPeerAddr), resolvedPolicy, nil
@@ -1772,7 +1778,7 @@ func acceptExternalQUICMode(
 		if !nativeQUIC {
 			return false, nil, nil, resolvedPolicy, nil
 		}
-		if _, err := sendExternalQUICModeReady(ctx, client, peerDERP, manager, nativeQUICAddr); err != nil {
+		if _, err := sendExternalQUICModeReady(ctx, client, peerDERP, manager, nativeQUICAddr, auth); err != nil {
 			return false, nil, nil, resolvedPolicy, err
 		}
 		return nativeQUIC, nil, cloneSessionAddr(nativeQUICPeerAddr), resolvedPolicy, nil
@@ -1790,17 +1796,19 @@ func sendExternalQUICModeReady(
 	peerDERP key.NodePublic,
 	manager *transport.Manager,
 	nativeQUICAddr net.Addr,
+	authOpt ...externalPeerControlAuth,
 ) (net.Addr, error) {
+	auth := optionalPeerControlAuth(authOpt)
 	readyAddr := cloneSessionAddr(nativeQUICAddr)
 	if manager != nil {
 		if readyAddr == nil {
 			readyAddr, _ = manager.DirectAddr()
 		}
 	}
-	if err := sendEnvelope(ctx, client, peerDERP, envelope{
+	if err := sendAuthenticatedEnvelope(ctx, client, peerDERP, envelope{
 		Type:          envelopeQUICModeReady,
 		QUICModeReady: &quicModeReady{NativeDirect: true},
-	}); err != nil {
+	}, auth); err != nil {
 		return nil, err
 	}
 	externalTransferTracef("listener-native-quic-ready-sent addr=%v", readyAddr)
@@ -1917,51 +1925,69 @@ func quicModeDirectAddrString(addr net.Addr) string {
 	return addr.String()
 }
 
-func receiveQUICModeRequest(ctx context.Context, ch <-chan derpbind.Packet) (quicModeRequest, error) {
-	select {
-	case pkt, ok := <-ch:
-		if !ok {
-			return quicModeRequest{}, net.ErrClosed
+func receiveQUICModeRequest(ctx context.Context, ch <-chan derpbind.Packet, authOpt ...externalPeerControlAuth) (quicModeRequest, error) {
+	auth := optionalPeerControlAuth(authOpt)
+	for {
+		select {
+		case pkt, ok := <-ch:
+			if !ok {
+				return quicModeRequest{}, net.ErrClosed
+			}
+			env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+			if ignoreAuthenticatedEnvelopeError(err, auth) {
+				continue
+			}
+			if err != nil || env.Type != envelopeQUICModeReq || env.QUICModeReq == nil {
+				return quicModeRequest{}, errors.New("unexpected quic mode request")
+			}
+			return *env.QUICModeReq, nil
+		case <-ctx.Done():
+			return quicModeRequest{}, ctx.Err()
 		}
-		env, err := decodeEnvelope(pkt.Payload)
-		if err != nil || env.Type != envelopeQUICModeReq || env.QUICModeReq == nil {
-			return quicModeRequest{}, errors.New("unexpected quic mode request")
-		}
-		return *env.QUICModeReq, nil
-	case <-ctx.Done():
-		return quicModeRequest{}, ctx.Err()
 	}
 }
 
-func receiveQUICModeResponse(ctx context.Context, ch <-chan derpbind.Packet) (quicModeResponse, error) {
-	select {
-	case pkt, ok := <-ch:
-		if !ok {
-			return quicModeResponse{}, net.ErrClosed
+func receiveQUICModeResponse(ctx context.Context, ch <-chan derpbind.Packet, authOpt ...externalPeerControlAuth) (quicModeResponse, error) {
+	auth := optionalPeerControlAuth(authOpt)
+	for {
+		select {
+		case pkt, ok := <-ch:
+			if !ok {
+				return quicModeResponse{}, net.ErrClosed
+			}
+			env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+			if ignoreAuthenticatedEnvelopeError(err, auth) {
+				continue
+			}
+			if err != nil || env.Type != envelopeQUICModeResp || env.QUICModeResp == nil {
+				return quicModeResponse{}, errors.New("unexpected quic mode response")
+			}
+			return *env.QUICModeResp, nil
+		case <-ctx.Done():
+			return quicModeResponse{}, ctx.Err()
 		}
-		env, err := decodeEnvelope(pkt.Payload)
-		if err != nil || env.Type != envelopeQUICModeResp || env.QUICModeResp == nil {
-			return quicModeResponse{}, errors.New("unexpected quic mode response")
-		}
-		return *env.QUICModeResp, nil
-	case <-ctx.Done():
-		return quicModeResponse{}, ctx.Err()
 	}
 }
 
-func receiveQUICModeAck(ctx context.Context, ch <-chan derpbind.Packet) (quicModeAck, error) {
-	select {
-	case pkt, ok := <-ch:
-		if !ok {
-			return quicModeAck{}, net.ErrClosed
+func receiveQUICModeAck(ctx context.Context, ch <-chan derpbind.Packet, authOpt ...externalPeerControlAuth) (quicModeAck, error) {
+	auth := optionalPeerControlAuth(authOpt)
+	for {
+		select {
+		case pkt, ok := <-ch:
+			if !ok {
+				return quicModeAck{}, net.ErrClosed
+			}
+			env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+			if ignoreAuthenticatedEnvelopeError(err, auth) {
+				continue
+			}
+			if err != nil || env.Type != envelopeQUICModeAck || env.QUICModeAck == nil {
+				return quicModeAck{}, errors.New("unexpected quic mode ack")
+			}
+			return *env.QUICModeAck, nil
+		case <-ctx.Done():
+			return quicModeAck{}, ctx.Err()
 		}
-		env, err := decodeEnvelope(pkt.Payload)
-		if err != nil || env.Type != envelopeQUICModeAck || env.QUICModeAck == nil {
-			return quicModeAck{}, errors.New("unexpected quic mode ack")
-		}
-		return *env.QUICModeAck, nil
-	case <-ctx.Done():
-		return quicModeAck{}, ctx.Err()
 	}
 }
 
@@ -1969,7 +1995,9 @@ func receiveQUICModeReadyWithAckRetry(
 	ctx context.Context,
 	readyCh <-chan derpbind.Packet,
 	sendAck func(context.Context) error,
+	authOpt ...externalPeerControlAuth,
 ) (quicModeReady, error) {
+	auth := optionalPeerControlAuth(authOpt)
 	retry := time.NewTicker(externalNativeQUICAckRetryInterval)
 	defer retry.Stop()
 
@@ -1979,7 +2007,10 @@ func receiveQUICModeReadyWithAckRetry(
 			if !ok {
 				return quicModeReady{}, net.ErrClosed
 			}
-			env, err := decodeEnvelope(pkt.Payload)
+			env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+			if ignoreAuthenticatedEnvelopeError(err, auth) {
+				continue
+			}
 			if err != nil || env.Type != envelopeQUICModeReady || env.QUICModeReady == nil {
 				return quicModeReady{}, errors.New("unexpected quic mode ready")
 			}
@@ -2006,10 +2037,12 @@ func waitForExternalDirectAddrOrModeAbort(
 	manager *transport.Manager,
 	modeAckCh <-chan derpbind.Packet,
 	timeout time.Duration,
+	authOpt ...externalPeerControlAuth,
 ) (net.Addr, bool, bool) {
 	if manager == nil {
 		return nil, false, false
 	}
+	auth := optionalPeerControlAuth(authOpt)
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -2030,7 +2063,10 @@ func waitForExternalDirectAddrOrModeAbort(
 				externalTransferTracef("wait-direct-addr-mode-ack-closed")
 				return nil, false, true
 			}
-			ackEnv, err := decodeEnvelope(pkt.Payload)
+			ackEnv, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+			if ignoreAuthenticatedEnvelopeError(err, auth) {
+				continue
+			}
 			if err == nil &&
 				ackEnv.Type == envelopeQUICModeAck &&
 				ackEnv.QUICModeAck != nil &&
@@ -2047,11 +2083,12 @@ func waitForExternalDirectAddrOrModeAbort(
 	}
 }
 
-func sendPeerAck(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, bytesReceived int64) error {
-	return sendEnvelope(ctx, client, peerDERP, envelope{Type: envelopeAck, Ack: newPeerAck(bytesReceived)})
+func sendPeerAck(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, bytesReceived int64, authOpt ...externalPeerControlAuth) error {
+	auth := optionalPeerControlAuth(authOpt)
+	return sendAuthenticatedEnvelope(ctx, client, peerDERP, envelope{Type: envelopeAck, Ack: newPeerAck(bytesReceived)}, auth)
 }
 
-func sendPeerAbortBestEffort(client *derpbind.Client, peerDERP key.NodePublic, reason string, bytesTransferred int64) {
+func sendPeerAbortBestEffort(client *derpbind.Client, peerDERP key.NodePublic, reason string, bytesTransferred int64, authOpt ...externalPeerControlAuth) {
 	if client == nil || peerDERP.IsZero() {
 		return
 	}
@@ -2060,20 +2097,21 @@ func sendPeerAbortBestEffort(client *derpbind.Client, peerDERP key.NodePublic, r
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
 	defer cancel()
-	_ = sendEnvelope(ctx, client, peerDERP, envelope{
+	auth := optionalPeerControlAuth(authOpt)
+	_ = sendAuthenticatedEnvelope(ctx, client, peerDERP, envelope{
 		Type:  envelopeAbort,
 		Abort: newPeerAbort(reason, bytesTransferred),
-	})
+	}, auth)
 }
 
 func sendPeerHeartbeat(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, bytesTransferred int64, sequence uint64, auth externalPeerControlAuth) error {
 	if client == nil || peerDERP.IsZero() {
 		return nil
 	}
-	return sendEnvelope(ctx, client, peerDERP, envelope{
+	return sendAuthenticatedEnvelope(ctx, client, peerDERP, envelope{
 		Type:      envelopeHeartbeat,
 		Heartbeat: newAuthenticatedPeerHeartbeat(bytesTransferred, sequence, auth),
-	})
+	}, auth)
 }
 
 func withPeerControlContext(parent context.Context, client *derpbind.Client, peerDERP key.NodePublic, abortCh <-chan derpbind.Packet, heartbeatCh <-chan derpbind.Packet, bytesTransferred func() int64, auth externalPeerControlAuth) (context.Context, context.CancelFunc) {
@@ -2130,7 +2168,10 @@ func withPeerControlContext(parent context.Context, client *derpbind.Client, pee
 						abortCh = nil
 						continue
 					}
-					env, err := decodeEnvelope(pkt.Payload)
+					env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+					if ignoreAuthenticatedEnvelopeError(err, auth) {
+						continue
+					}
 					if err == nil && env.Type == envelopeAbort {
 						cancel(ErrPeerAborted)
 						return
@@ -2201,7 +2242,7 @@ func normalizePeerAbortError(ctx context.Context, err error) error {
 	return err
 }
 
-func notifyPeerAbortOnError(errp *error, ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, bytesTransferred func() int64) {
+func notifyPeerAbortOnError(errp *error, ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, bytesTransferred func() int64, authOpt ...externalPeerControlAuth) {
 	if errp == nil {
 		return
 	}
@@ -2213,7 +2254,7 @@ func notifyPeerAbortOnError(errp *error, ctx context.Context, client *derpbind.C
 	if bytesTransferred != nil {
 		bytes = bytesTransferred()
 	}
-	sendPeerAbortBestEffort(client, peerDERP, peerAbortReason(*errp), bytes)
+	sendPeerAbortBestEffort(client, peerDERP, peerAbortReason(*errp), bytes, optionalPeerControlAuth(authOpt))
 }
 
 func peerAbortReason(err error) string {
@@ -2229,38 +2270,44 @@ func peerAbortReason(err error) string {
 	}
 }
 
-func waitForPeerAck(ctx context.Context, ch <-chan derpbind.Packet, bytesSent int64) error {
-	select {
-	case pkt, ok := <-ch:
-		if !ok {
-			return net.ErrClosed
+func waitForPeerAck(ctx context.Context, ch <-chan derpbind.Packet, bytesSent int64, authOpt ...externalPeerControlAuth) error {
+	auth := optionalPeerControlAuth(authOpt)
+	for {
+		select {
+		case pkt, ok := <-ch:
+			if !ok {
+				return net.ErrClosed
+			}
+			env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+			if ignoreAuthenticatedEnvelopeError(err, auth) {
+				continue
+			}
+			if err == nil && env.Type == envelopeAbort {
+				return ErrPeerAborted
+			}
+			if err != nil || env.Type != envelopeAck {
+				return errors.New("unexpected peer ack payload")
+			}
+			if env.Ack == nil || env.Ack.BytesReceived == nil {
+				return errors.New("peer ack missing bytes_received")
+			}
+			if *env.Ack.BytesReceived != bytesSent {
+				return fmt.Errorf("peer received %d bytes, sent %d", *env.Ack.BytesReceived, bytesSent)
+			}
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
 		}
-		env, err := decodeEnvelope(pkt.Payload)
-		if err == nil && env.Type == envelopeAbort {
-			return ErrPeerAborted
-		}
-		if err != nil || env.Type != envelopeAck {
-			return errors.New("unexpected peer ack payload")
-		}
-		if env.Ack == nil || env.Ack.BytesReceived == nil {
-			return errors.New("peer ack missing bytes_received")
-		}
-		if *env.Ack.BytesReceived != bytesSent {
-			return fmt.Errorf("peer received %d bytes, sent %d", *env.Ack.BytesReceived, bytesSent)
-		}
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
 	}
 }
 
-func waitForPeerAckWithTimeout(ctx context.Context, ch <-chan derpbind.Packet, bytesSent int64, timeout time.Duration) error {
+func waitForPeerAckWithTimeout(ctx context.Context, ch <-chan derpbind.Packet, bytesSent int64, timeout time.Duration, authOpt ...externalPeerControlAuth) error {
 	if timeout <= 0 {
-		return waitForPeerAck(ctx, ch, bytesSent)
+		return waitForPeerAck(ctx, ch, bytesSent, authOpt...)
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return waitForPeerAck(waitCtx, ch, bytesSent)
+	return waitForPeerAck(waitCtx, ch, bytesSent, authOpt...)
 }
 
 func firstDERPNode(dm *tailcfg.DERPMap, regionID int) *tailcfg.DERPNode {
@@ -2380,8 +2427,8 @@ func sendClaimAndReceiveDecisionWithTelemetry(
 	}
 }
 
-func sendTransportControl(ctx context.Context, client *derpbind.Client, dst key.NodePublic, msg transport.ControlMessage) error {
-	return sendEnvelope(ctx, client, dst, envelope{Type: envelopeControl, Control: &msg})
+func sendTransportControl(ctx context.Context, client *derpbind.Client, dst key.NodePublic, msg transport.ControlMessage, authOpt ...externalPeerControlAuth) error {
+	return sendAuthenticatedEnvelope(ctx, client, dst, envelope{Type: envelopeControl, Control: &msg}, optionalPeerControlAuth(authOpt))
 }
 
 func quicModeParallelPolicy(msg interface {
@@ -2456,24 +2503,38 @@ func singleExternalNativeDirectModeResult(result externalNativeDirectModeResult)
 	return ch
 }
 
-func receiveTransportControl(ctx context.Context, ch <-chan derpbind.Packet) (transport.ControlMessage, error) {
-	select {
-	case pkt, ok := <-ch:
-		if !ok {
-			return transport.ControlMessage{}, net.ErrClosed
+func receiveTransportControl(ctx context.Context, ch <-chan derpbind.Packet, authOpt ...externalPeerControlAuth) (transport.ControlMessage, error) {
+	auth := optionalPeerControlAuth(authOpt)
+	for {
+		select {
+		case pkt, ok := <-ch:
+			if !ok {
+				return transport.ControlMessage{}, net.ErrClosed
+			}
+			env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+			if ignoreAuthenticatedEnvelopeError(err, auth) {
+				continue
+			}
+			if err != nil || env.Type != envelopeControl || env.Control == nil {
+				return transport.ControlMessage{}, errors.New("unexpected control payload")
+			}
+			return *env.Control, nil
+		case <-ctx.Done():
+			return transport.ControlMessage{}, ctx.Err()
 		}
-		env, err := decodeEnvelope(pkt.Payload)
-		if err != nil || env.Type != envelopeControl || env.Control == nil {
-			return transport.ControlMessage{}, errors.New("unexpected control payload")
-		}
-		return *env.Control, nil
-	case <-ctx.Done():
-		return transport.ControlMessage{}, ctx.Err()
 	}
 }
 
 func sendEnvelope(ctx context.Context, client *derpbind.Client, dst key.NodePublic, env envelope) error {
 	payload, err := json.Marshal(env)
+	if err != nil {
+		return err
+	}
+	return client.Send(ctx, dst, payload)
+}
+
+func sendAuthenticatedEnvelope(ctx context.Context, client *derpbind.Client, dst key.NodePublic, env envelope, auth externalPeerControlAuth) error {
+	payload, err := marshalAuthenticatedEnvelope(env, auth)
 	if err != nil {
 		return err
 	}

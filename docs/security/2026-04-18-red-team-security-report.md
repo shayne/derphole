@@ -138,16 +138,20 @@ Final repository verification:
 
 ## Residual Risks
 
-### Accepted development risk: Remote smoke harnesses use predictable remote paths
+### Addressed: Remote smoke harnesses use remote temp directories
 
-The remote shell harnesses use `/tmp/...-$$` names. This is acceptable for controlled hosts like `ktzlxc`, but not for untrusted multi-user systems. Use remote `mktemp -d` and quote host inputs through positional parameters before relying on these harnesses for adversarial shared-host testing.
+The remote smoke harnesses now allocate a remote `mktemp -d` directory and place remote binaries, logs, pid files, and tokens under that directory. Cleanup removes the temp directory instead of globbing predictable `/tmp` path prefixes.
 
-### Low: Not every DERP control envelope has its own MAC
+### Addressed: DERP control envelopes now have token-derived MACs
 
-Heartbeat envelopes now have a message MAC and replay check, and DERP sender identity filtering still gates abort, ack, mode, and rendezvous control traffic. If the threat model expands to include malicious relays or compromised peer identities, extend the same envelope-level MAC pattern to those remaining control message types.
+Peer heartbeat, ACK, abort, transport control, direct UDP control, QUIC mode control, and parallel growth control envelopes now carry token-derived HMACs when session auth is available. Receivers ignore unauthenticated or tampered control envelopes instead of acting on them.
+
+### Low: Claim and decision envelopes still rely on rendezvous bearer MACs
+
+Claim and decision envelopes remain covered by the existing rendezvous bearer MAC and DERP sender filtering rather than the generic control-envelope MAC. This keeps the bootstrap path compatible with the existing rendezvous protocol while protecting post-claim control traffic with per-session envelope authentication.
 
 ## Follow-Up Priority
 
 1. Keep ktzlxc smoke coverage in the release loop with `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1` so direct-path claims are not accidentally satisfied by Tailscale.
-2. Harden remote smoke scripts with `mktemp -d` before using them on untrusted multi-user hosts.
-3. Consider envelope-level MACs for abort, ack, and mode-control messages if the DERP relay threat model becomes stricter.
+2. Keep adversarial injected-packet tests in `pkg/session` close to the control-envelope code so future control messages are signed by default.
+3. If the bootstrap threat model tightens further, review whether claim and decision should be wrapped in the generic envelope MAC after the rendezvous bearer check.

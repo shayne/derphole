@@ -440,13 +440,14 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) (retErr error
 		return pkt.From == listenerDERP && isHeartbeatPayload(pkt.Payload)
 	})
 	defer unsubscribeHeartbeat()
+	auth := externalPeerControlAuthForToken(tok)
 	ctx, stopPeerAbort := withPeerControlContext(ctx, derpClient, listenerDERP, abortCh, heartbeatCh, func() int64 {
 		return countedSrc.Count()
-	}, externalPeerControlAuthForToken(tok))
+	}, auth)
 	defer stopPeerAbort()
 	defer notifyPeerAbortOnError(&retErr, ctx, derpClient, listenerDERP, func() int64 {
 		return countedSrc.Count()
-	})
+	}, auth)
 	readyAckCh, unsubscribeReadyAck := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == listenerDERP && isDirectUDPReadyAckPayload(pkt.Payload)
 	})
@@ -505,7 +506,7 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) (retErr error
 	if sendErr != nil {
 		return sendErr
 	}
-	if err := waitForPeerAckWithTimeout(ctx, ackCh, countedSrc.Count(), externalDirectUDPAckWait); err != nil {
+	if err := waitForPeerAckWithTimeout(ctx, ackCh, countedSrc.Count(), externalDirectUDPAckWait, auth); err != nil {
 		return err
 	}
 	pathEmitter.Complete(transportManager)
@@ -526,12 +527,13 @@ func externalDirectUDPActivateDirectPath(pathEmitter *transportPathEmitter, tran
 
 func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClient *derpbind.Client, listenerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, readyAckCh <-chan derpbind.Packet, startAckCh <-chan derpbind.Packet, rateProbeCh <-chan derpbind.Packet, cfg SendConfig) (externalDirectUDPSendPlan, error) {
 	plan := externalDirectUDPSendPlan{}
+	auth := externalPeerControlAuthForToken(tok)
 	externalTransferTracef("direct-udp-send-ready-send addr=%v", peerAddr)
-	if err := sendEnvelope(ctx, derpClient, listenerDERP, envelope{Type: envelopeDirectUDPReady}); err != nil {
+	if err := sendAuthenticatedEnvelope(ctx, derpClient, listenerDERP, envelope{Type: envelopeDirectUDPReady}, auth); err != nil {
 		return plan, err
 	}
 	externalTransferTracef("direct-udp-send-ready-wait-ack addr=%v", peerAddr)
-	readyAck, err := externalDirectUDPWaitReadyAckFn(ctx, readyAckCh)
+	readyAck, err := externalDirectUDPWaitReadyAckFn(ctx, readyAckCh, auth)
 	if err != nil {
 		return plan, err
 	}
@@ -611,14 +613,14 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 	}
 	start.StripedBlast = sendCfg.StripedBlast
 	externalTransferTracef("direct-udp-send-start-send addr=%v", peerAddr)
-	if err := sendEnvelope(ctx, derpClient, listenerDERP, envelope{
+	if err := sendAuthenticatedEnvelope(ctx, derpClient, listenerDERP, envelope{
 		Type:           envelopeDirectUDPStart,
 		DirectUDPStart: &start,
-	}); err != nil {
+	}, auth); err != nil {
 		return plan, err
 	}
 	externalTransferTracef("direct-udp-send-start-wait-ack addr=%v", peerAddr)
-	if err := externalDirectUDPWaitStartAckFn(ctx, startAckCh); err != nil {
+	if err := externalDirectUDPWaitStartAckFn(ctx, startAckCh, auth); err != nil {
 		return plan, err
 	}
 	externalTransferTracef("direct-udp-send-start-ack addr=%v", peerAddr)
@@ -634,7 +636,7 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 			externalTransferTracef("direct-udp-send-rate-probe-done err=%v", err)
 			return plan, err
 		}
-		probeResult, err = externalDirectUDPWaitRateProbeFn(ctx, rateProbeCh)
+		probeResult, err = externalDirectUDPWaitRateProbeFn(ctx, rateProbeCh, auth)
 		if err != nil {
 			externalTransferTracef("direct-udp-send-rate-probe-done err=%v", err)
 			return plan, err
@@ -744,8 +746,9 @@ func externalExecutePreparedDirectUDPSend(ctx context.Context, src io.Reader, pl
 
 func externalPrepareDirectUDPReceive(ctx context.Context, dst io.Writer, tok token.Token, derpClient *derpbind.Client, peerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, decision rendezvous.Decision, readyCh <-chan derpbind.Packet, startCh <-chan derpbind.Packet, cfg ListenConfig) (externalDirectUDPReceivePlan, error) {
 	plan := externalDirectUDPReceivePlan{decision: decision, peerAddr: peerAddr}
+	auth := externalPeerControlAuthForToken(tok)
 	externalTransferTracef("direct-udp-recv-ready-wait addr=%v", peerAddr)
-	if err := externalDirectUDPWaitReadyFn(ctx, readyCh); err != nil {
+	if err := externalDirectUDPWaitReadyFn(ctx, readyCh, auth); err != nil {
 		return plan, err
 	}
 	externalTransferTracef("direct-udp-recv-ready addr=%v", peerAddr)
@@ -762,12 +765,12 @@ func externalPrepareDirectUDPReceive(ctx context.Context, dst io.Writer, tok tok
 	if !fastDiscard {
 		receiveDst, flushDst = externalDirectUDPSectionWriterForTarget(dst, receiveDst, flushDst)
 	}
-	if err := sendEnvelope(ctx, derpClient, peerDERP, envelope{
+	if err := sendAuthenticatedEnvelope(ctx, derpClient, peerDERP, envelope{
 		Type: envelopeDirectUDPReadyAck,
 		DirectUDPReadyAck: &directUDPReadyAck{
 			FastDiscard: fastDiscard,
 		},
-	}); err != nil {
+	}, auth); err != nil {
 		return plan, err
 	}
 	externalTransferTracef("direct-udp-recv-ready-ack-send addr=%v fast-discard=%v", peerAddr, fastDiscard)
@@ -789,7 +792,7 @@ func externalPrepareDirectUDPReceive(ctx context.Context, dst io.Writer, tok tok
 	receiveCfg := externalDirectUDPFastDiscardReceiveConfig()
 	receiveCfg.PacketAEAD = packetAEAD
 	externalTransferTracef("direct-udp-recv-start-wait addr=%v", peerAddr)
-	start, err := externalDirectUDPWaitStartFn(ctx, startCh)
+	start, err := externalDirectUDPWaitStartFn(ctx, startCh, auth)
 	if err != nil {
 		return plan, err
 	}
@@ -803,7 +806,7 @@ func externalPrepareDirectUDPReceive(ctx context.Context, dst io.Writer, tok tok
 		cfg.Emitter.Debug("udp-striped-blast=" + strconv.FormatBool(start.StripedBlast))
 	}
 	emitExternalDirectUDPReceiveStartDebug(cfg.Emitter, start.ExpectedBytes)
-	if err := sendEnvelope(ctx, derpClient, peerDERP, envelope{Type: envelopeDirectUDPStartAck}); err != nil {
+	if err := sendAuthenticatedEnvelope(ctx, derpClient, peerDERP, envelope{Type: envelopeDirectUDPStartAck}, auth); err != nil {
 		return plan, err
 	}
 	externalTransferTracef("direct-udp-recv-start-ack-send addr=%v", peerAddr)
@@ -816,12 +819,12 @@ func externalPrepareDirectUDPReceive(ctx context.Context, dst io.Writer, tok tok
 		if cfg.Emitter != nil {
 			cfg.Emitter.Debug("udp-rate-probe-samples=" + externalDirectUDPFormatRateProbeSamples(nil, probeSamples))
 		}
-		if err := sendEnvelope(ctx, derpClient, peerDERP, envelope{
+		if err := sendAuthenticatedEnvelope(ctx, derpClient, peerDERP, envelope{
 			Type: envelopeDirectUDPRateProbe,
 			DirectUDPRateProbe: &directUDPRateProbeResult{
 				Samples: probeSamples,
 			},
-		}); err != nil {
+		}, auth); err != nil {
 			return plan, err
 		}
 	}
@@ -967,19 +970,20 @@ func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (retTok s
 			return pkt.From == peerDERP && isHeartbeatPayload(pkt.Payload)
 		})
 		defer unsubscribeHeartbeat()
+		auth := externalPeerControlAuthForToken(session.token)
 		ctx, stopPeerAbort := withPeerControlContext(ctx, session.derp, peerDERP, abortCh, heartbeatCh, func() int64 {
 			if countedDst == nil {
 				return 0
 			}
 			return countedDst.Count()
-		}, externalPeerControlAuthForToken(session.token))
+		}, auth)
 		defer stopPeerAbort()
 		defer notifyPeerAbortOnError(&retErr, ctx, session.derp, peerDERP, func() int64 {
 			if countedDst == nil {
 				return 0
 			}
 			return countedDst.Count()
-		})
+		}, auth)
 		probeConn := session.probeConn
 		probeConns := []net.PacketConn{session.probeConn}
 		portmaps := []publicPortmap{publicSessionPortmap(session)}
@@ -1076,7 +1080,7 @@ func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (retTok s
 		if receiveErr != nil {
 			return tok, receiveErr
 		}
-		if err := sendPeerAck(ctx, session.derp, peerDERP, countedDst.Count()); err != nil {
+		if err := sendPeerAck(ctx, session.derp, peerDERP, countedDst.Count(), auth); err != nil {
 			return tok, err
 		}
 		pathEmitter.Complete(transportManager)
@@ -3975,76 +3979,113 @@ func emitExternalDirectUDPReceiveResultDebug(emitter *telemetry.Emitter, stats p
 	}
 }
 
-func waitForDirectUDPReady(ctx context.Context, readyCh <-chan derpbind.Packet) error {
+func waitForDirectUDPReady(ctx context.Context, readyCh <-chan derpbind.Packet, authOpt ...externalPeerControlAuth) error {
 	waitCtx, cancel := context.WithTimeout(ctx, externalDirectUDPWait)
 	defer cancel()
-	_, err := receiveSubscribedPacket(waitCtx, readyCh)
-	return err
+	auth := optionalPeerControlAuth(authOpt)
+	for {
+		pkt, err := receiveSubscribedPacket(waitCtx, readyCh)
+		if err != nil {
+			return err
+		}
+		env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+		if ignoreAuthenticatedEnvelopeError(err, auth) {
+			continue
+		}
+		if err != nil || env.Type != envelopeDirectUDPReady {
+			return errors.New("unexpected direct UDP ready")
+		}
+		return nil
+	}
 }
 
-func waitForDirectUDPReadyAck(ctx context.Context, readyAckCh <-chan derpbind.Packet) (directUDPReadyAck, error) {
+func waitForDirectUDPReadyAck(ctx context.Context, readyAckCh <-chan derpbind.Packet, authOpt ...externalPeerControlAuth) (directUDPReadyAck, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, externalDirectUDPWait)
 	defer cancel()
-	pkt, err := receiveSubscribedPacket(waitCtx, readyAckCh)
-	if err != nil {
-		return directUDPReadyAck{}, err
+	auth := optionalPeerControlAuth(authOpt)
+	for {
+		pkt, err := receiveSubscribedPacket(waitCtx, readyAckCh)
+		if err != nil {
+			return directUDPReadyAck{}, err
+		}
+		env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+		if ignoreAuthenticatedEnvelopeError(err, auth) {
+			continue
+		}
+		if err != nil || env.Type != envelopeDirectUDPReadyAck {
+			return directUDPReadyAck{}, errors.New("unexpected direct UDP ready ack")
+		}
+		if env.DirectUDPReadyAck == nil {
+			return directUDPReadyAck{}, nil
+		}
+		return *env.DirectUDPReadyAck, nil
 	}
-	env, err := decodeEnvelope(pkt.Payload)
-	if err != nil || env.Type != envelopeDirectUDPReadyAck {
-		return directUDPReadyAck{}, errors.New("unexpected direct UDP ready ack")
-	}
-	if env.DirectUDPReadyAck == nil {
-		return directUDPReadyAck{}, nil
-	}
-	return *env.DirectUDPReadyAck, nil
 }
 
-func waitForDirectUDPStart(ctx context.Context, startCh <-chan derpbind.Packet) (directUDPStart, error) {
+func waitForDirectUDPStart(ctx context.Context, startCh <-chan derpbind.Packet, authOpt ...externalPeerControlAuth) (directUDPStart, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, externalDirectUDPStartWait)
 	defer cancel()
-	pkt, err := receiveSubscribedPacket(waitCtx, startCh)
-	if err != nil {
-		return directUDPStart{}, err
+	auth := optionalPeerControlAuth(authOpt)
+	for {
+		pkt, err := receiveSubscribedPacket(waitCtx, startCh)
+		if err != nil {
+			return directUDPStart{}, err
+		}
+		env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+		if ignoreAuthenticatedEnvelopeError(err, auth) {
+			continue
+		}
+		if err != nil || env.Type != envelopeDirectUDPStart {
+			return directUDPStart{}, errors.New("unexpected direct UDP start")
+		}
+		if env.DirectUDPStart == nil {
+			return directUDPStart{}, nil
+		}
+		return *env.DirectUDPStart, nil
 	}
-	env, err := decodeEnvelope(pkt.Payload)
-	if err != nil || env.Type != envelopeDirectUDPStart {
-		return directUDPStart{}, errors.New("unexpected direct UDP start")
-	}
-	if env.DirectUDPStart == nil {
-		return directUDPStart{}, nil
-	}
-	return *env.DirectUDPStart, nil
 }
 
-func waitForDirectUDPStartAck(ctx context.Context, startAckCh <-chan derpbind.Packet) error {
+func waitForDirectUDPStartAck(ctx context.Context, startAckCh <-chan derpbind.Packet, authOpt ...externalPeerControlAuth) error {
 	waitCtx, cancel := context.WithTimeout(ctx, externalDirectUDPStartWait)
 	defer cancel()
-	pkt, err := receiveSubscribedPacket(waitCtx, startAckCh)
-	if err != nil {
-		return err
+	auth := optionalPeerControlAuth(authOpt)
+	for {
+		pkt, err := receiveSubscribedPacket(waitCtx, startAckCh)
+		if err != nil {
+			return err
+		}
+		env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+		if ignoreAuthenticatedEnvelopeError(err, auth) {
+			continue
+		}
+		if err != nil || env.Type != envelopeDirectUDPStartAck {
+			return errors.New("unexpected direct UDP start ack")
+		}
+		return nil
 	}
-	env, err := decodeEnvelope(pkt.Payload)
-	if err != nil || env.Type != envelopeDirectUDPStartAck {
-		return errors.New("unexpected direct UDP start ack")
-	}
-	return nil
 }
 
-func waitForDirectUDPRateProbe(ctx context.Context, rateProbeCh <-chan derpbind.Packet) (directUDPRateProbeResult, error) {
+func waitForDirectUDPRateProbe(ctx context.Context, rateProbeCh <-chan derpbind.Packet, authOpt ...externalPeerControlAuth) (directUDPRateProbeResult, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, externalDirectUDPStartWait)
 	defer cancel()
-	pkt, err := receiveSubscribedPacket(waitCtx, rateProbeCh)
-	if err != nil {
-		return directUDPRateProbeResult{}, err
+	auth := optionalPeerControlAuth(authOpt)
+	for {
+		pkt, err := receiveSubscribedPacket(waitCtx, rateProbeCh)
+		if err != nil {
+			return directUDPRateProbeResult{}, err
+		}
+		env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+		if ignoreAuthenticatedEnvelopeError(err, auth) {
+			continue
+		}
+		if err != nil || env.Type != envelopeDirectUDPRateProbe {
+			return directUDPRateProbeResult{}, errors.New("unexpected direct UDP rate probe response")
+		}
+		if env.DirectUDPRateProbe == nil {
+			return directUDPRateProbeResult{}, errors.New("direct UDP rate probe response missing samples")
+		}
+		return *env.DirectUDPRateProbe, nil
 	}
-	env, err := decodeEnvelope(pkt.Payload)
-	if err != nil || env.Type != envelopeDirectUDPRateProbe {
-		return directUDPRateProbeResult{}, errors.New("unexpected direct UDP rate probe response")
-	}
-	if env.DirectUDPRateProbe == nil {
-		return directUDPRateProbeResult{}, errors.New("direct UDP rate probe response missing samples")
-	}
-	return *env.DirectUDPRateProbe, nil
 }
 
 func isDirectUDPReadyPayload(payload []byte) bool {

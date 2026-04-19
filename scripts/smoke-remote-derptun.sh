@@ -4,8 +4,8 @@ set -euo pipefail
 target="${1:?usage: smoke-remote-derptun.sh HOST}"
 root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 remote_user="${DERPHOLE_REMOTE_USER:-root}"
-remote_base="/tmp/derptun-smoke-$$"
-remote_upload="/tmp/derptun-bin-$$"
+remote_base=""
+remote_upload=""
 tmp="$(mktemp -d)"
 server_token_file="${tmp}/server.dts"
 client_token_file="${tmp}/client.dtc"
@@ -29,6 +29,9 @@ remote() {
   ssh "${remote_user}@${target}" 'bash -se' <<<"$1"
 }
 
+remote_base="$(remote 'mktemp -d "${TMPDIR:-/tmp}/derptun-smoke.XXXXXXXXXX"')"
+remote_upload="${remote_base}/derptun-bin"
+
 cleanup() {
   set +e
   { exec 9>&-; } 2>/dev/null || true
@@ -41,7 +44,9 @@ cleanup() {
     kill "${local_open_pid}" 2>/dev/null || true
     wait "${local_open_pid}" 2>/dev/null || true
   fi
-  remote "if [[ -f '${remote_base}/serve.pid' ]]; then kill \$(cat '${remote_base}/serve.pid') 2>/dev/null || true; fi; if [[ -f '${remote_base}/echo.pid' ]]; then kill \$(cat '${remote_base}/echo.pid') 2>/dev/null || true; fi; rm -rf '${remote_base}' '${remote_upload}'" >/dev/null 2>&1 || true
+  if [[ -n "${remote_base}" ]]; then
+    remote "if [[ -f '${remote_base}/serve.pid' ]]; then kill \$(cat '${remote_base}/serve.pid') 2>/dev/null || true; fi; if [[ -f '${remote_base}/echo.pid' ]]; then kill \$(cat '${remote_base}/echo.pid') 2>/dev/null || true; fi; rm -rf -- '${remote_base}'" >/dev/null 2>&1 || true
+  fi
   rm -rf "${tmp}"
 }
 trap cleanup EXIT

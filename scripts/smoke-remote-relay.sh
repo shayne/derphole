@@ -3,8 +3,9 @@ set -euo pipefail
 
 target="${1:?usage: $0 <host>}"
 tmp="$(mktemp -d)"
-remote_base="/tmp/derphole-relay-smoke-$$"
-remote_upload="/tmp/derphole-relay-bin-$$"
+remote_tmp=""
+remote_base=""
+remote_upload=""
 local_listener_pid=""
 remote_user="${DERPHOLE_REMOTE_USER:-root}"
 remote_env=()
@@ -17,12 +18,18 @@ remote() {
   ssh "${remote_user}@${target}" "${remote_env[@]}" 'bash -se' <<<"$1"
 }
 
+remote_tmp="$(remote 'mktemp -d "${TMPDIR:-/tmp}/derphole-relay-smoke.XXXXXXXXXX"')"
+remote_base="${remote_tmp}/derphole-relay-smoke"
+remote_upload="${remote_tmp}/derphole-bin"
+
 cleanup() {
   if [[ -n "${local_listener_pid}" ]]; then
     kill "${local_listener_pid}" 2>/dev/null || true
     wait "${local_listener_pid}" 2>/dev/null || true
   fi
-  remote "if [[ -f '${remote_base}.pid' ]]; then kill \$(cat '${remote_base}.pid') 2>/dev/null || true; fi; rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err' '${remote_base}.sender.out' '${remote_base}.sender.err'" >/dev/null 2>&1 || true
+  if [[ -n "${remote_tmp}" ]]; then
+    remote "if [[ -f '${remote_base}.pid' ]]; then kill \$(cat '${remote_base}.pid') 2>/dev/null || true; fi; rm -rf -- '${remote_tmp}'" >/dev/null 2>&1 || true
+  fi
   rm -rf "${tmp}"
 }
 trap cleanup EXIT

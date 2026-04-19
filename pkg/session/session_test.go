@@ -943,13 +943,13 @@ func TestExternalListenSendSmallPayloadFinishesOverRelayWhileDirectReadyAckIsDel
 	t.Cleanup(func() { publicInterfaceAddrs = prevInterfaceAddrs })
 
 	prevWaitReadyAck := externalDirectUDPWaitReadyAckFn
-	externalDirectUDPWaitReadyAckFn = func(ctx context.Context, readyAckCh <-chan derpbind.Packet) (directUDPReadyAck, error) {
+	externalDirectUDPWaitReadyAckFn = func(ctx context.Context, readyAckCh <-chan derpbind.Packet, authOpt ...externalPeerControlAuth) (directUDPReadyAck, error) {
 		select {
 		case <-time.After(1500 * time.Millisecond):
 		case <-ctx.Done():
 			return directUDPReadyAck{}, ctx.Err()
 		}
-		return prevWaitReadyAck(ctx, readyAckCh)
+		return prevWaitReadyAck(ctx, readyAckCh, authOpt...)
 	}
 	t.Cleanup(func() { externalDirectUDPWaitReadyAckFn = prevWaitReadyAck })
 

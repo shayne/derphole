@@ -32,7 +32,9 @@ func startParallelAutoGrowthLoop(
 	spool *externalHandoffSpool,
 	policy ParallelPolicy,
 	emitter *telemetry.Emitter,
+	authOpt ...externalPeerControlAuth,
 ) <-chan struct{} {
+	auth := optionalPeerControlAuth(authOpt)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -116,7 +118,7 @@ func startParallelAutoGrowthLoop(
 					}
 				}
 			}()
-			streams, applied, err := requestExternalNativeQUICGrowth(growCtx, client, peerDERP, session, decision.NextTarget, emitter)
+			streams, applied, err := requestExternalNativeQUICGrowth(growCtx, client, peerDERP, session, decision.NextTarget, emitter, auth)
 			<-growWatchDone
 			growCancel()
 			if err != nil {
@@ -156,7 +158,9 @@ func startParallelGrowthRequestHandler(
 	session *externalNativeQUICStripedSession,
 	runtime *externalHandoffCarrierRuntime,
 	emitter *telemetry.Emitter,
+	authOpt ...externalPeerControlAuth,
 ) <-chan struct{} {
+	auth := optionalPeerControlAuth(authOpt)
 	done := make(chan struct{})
 	reqCh, unsubscribe := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == peerDERP && isParallelGrowRequestPayload(pkt.Payload)
@@ -169,7 +173,7 @@ func startParallelGrowthRequestHandler(
 		defer unsubscribe()
 		defer unsubscribeResult()
 		for {
-			req, err := receiveParallelGrowRequest(ctx, reqCh)
+			req, err := receiveParallelGrowRequest(ctx, reqCh, auth)
 			if err != nil {
 				if ctx.Err() != nil || err == net.ErrClosed {
 					return
@@ -188,10 +192,10 @@ func startParallelGrowthRequestHandler(
 				ack.CandidateSets = plan.candidateSets
 			}
 			externalTransferTracef("parallel-grow-handler-ack-send target=%d ready=%v", ack.Target, ack.Ready)
-			if sendErr := sendEnvelope(growCtx, client, peerDERP, envelope{
+			if sendErr := sendAuthenticatedEnvelope(growCtx, client, peerDERP, envelope{
 				Type:            envelopeParallelGrowAck,
 				ParallelGrowAck: &ack,
-			}); sendErr != nil {
+			}, auth); sendErr != nil {
 				closeExternalNativeQUICGrowthPlan(plan)
 				cancel()
 				return
@@ -210,14 +214,14 @@ func startParallelGrowthRequestHandler(
 				applied = plan.target
 			}
 			externalTransferTracef("parallel-grow-handler-result-send target=%d ready=%v applied=%d", req.Target, ready, applied)
-			if sendErr := sendEnvelope(growCtx, client, peerDERP, envelope{
+			if sendErr := sendAuthenticatedEnvelope(growCtx, client, peerDERP, envelope{
 				Type: envelopeParallelGrowResult,
 				ParallelGrowResult: &parallelGrowResult{
 					Target:  req.Target,
 					Ready:   ready,
 					Applied: applied,
 				},
-			}); sendErr != nil {
+			}, auth); sendErr != nil {
 				if growth != nil {
 					closeExternalNativeQUICGrowthResult(growth)
 				} else {
@@ -226,7 +230,7 @@ func startParallelGrowthRequestHandler(
 				cancel()
 				return
 			}
-			peerResult, recvErr := receiveParallelGrowResult(growCtx, resultCh, req.Target)
+			peerResult, recvErr := receiveParallelGrowResult(growCtx, resultCh, req.Target, auth)
 			cancel()
 			if recvErr != nil || !ready || !peerResult.Ready {
 				if growth != nil {
@@ -258,7 +262,9 @@ func requestExternalNativeQUICGrowth(
 	session *externalNativeQUICStripedSession,
 	target int,
 	emitter *telemetry.Emitter,
+	authOpt ...externalPeerControlAuth,
 ) ([]io.ReadWriteCloser, int, error) {
+	auth := optionalPeerControlAuth(authOpt)
 	ackCh, unsubscribeAck := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == peerDERP && isParallelGrowAckPayload(pkt.Payload)
 	})
@@ -274,16 +280,16 @@ func requestExternalNativeQUICGrowth(
 		return nil, session.StripeCount(), err
 	}
 	externalTransferTracef("parallel-grow-request-send target=%d", target)
-	if err := sendEnvelope(ctx, client, peerDERP, envelope{
+	if err := sendAuthenticatedEnvelope(ctx, client, peerDERP, envelope{
 		Type: envelopeParallelGrowReq,
 		ParallelGrowReq: &parallelGrowRequest{
 			Target:        target,
 			CandidateSets: plan.candidateSets,
 		},
-	}); err != nil {
+	}, auth); err != nil {
 		return nil, session.StripeCount(), err
 	}
-	ack, err := receiveParallelGrowAck(ctx, ackCh, target)
+	ack, err := receiveParallelGrowAck(ctx, ackCh, target, auth)
 	if err != nil {
 		closeExternalNativeQUICGrowthPlan(plan)
 		return nil, session.StripeCount(), err
@@ -301,14 +307,14 @@ func requestExternalNativeQUICGrowth(
 		applied = target
 	}
 	externalTransferTracef("parallel-grow-result-send target=%d ready=%v applied=%d", target, ready, applied)
-	if sendErr := sendEnvelope(ctx, client, peerDERP, envelope{
+	if sendErr := sendAuthenticatedEnvelope(ctx, client, peerDERP, envelope{
 		Type: envelopeParallelGrowResult,
 		ParallelGrowResult: &parallelGrowResult{
 			Target:  target,
 			Ready:   ready,
 			Applied: applied,
 		},
-	}); sendErr != nil {
+	}, auth); sendErr != nil {
 		if growth != nil {
 			closeExternalNativeQUICGrowthResult(growth)
 		} else {
@@ -316,7 +322,7 @@ func requestExternalNativeQUICGrowth(
 		}
 		return nil, session.StripeCount(), sendErr
 	}
-	peerResult, err := receiveParallelGrowResult(ctx, resultCh, target)
+	peerResult, err := receiveParallelGrowResult(ctx, resultCh, target, auth)
 	if err != nil || !ready || !peerResult.Ready {
 		externalTransferTracef("parallel-grow-result-recv target=%d err=%v peerReady=%v peerApplied=%d", target, err, peerResult.Ready, peerResult.Applied)
 		if growth != nil {
@@ -334,14 +340,18 @@ func requestExternalNativeQUICGrowth(
 	return growth.streams, applied, nil
 }
 
-func receiveParallelGrowRequest(ctx context.Context, ch <-chan derpbind.Packet) (parallelGrowRequest, error) {
+func receiveParallelGrowRequest(ctx context.Context, ch <-chan derpbind.Packet, authOpt ...externalPeerControlAuth) (parallelGrowRequest, error) {
+	auth := optionalPeerControlAuth(authOpt)
 	for {
 		select {
 		case pkt, ok := <-ch:
 			if !ok {
 				return parallelGrowRequest{}, net.ErrClosed
 			}
-			env, err := decodeEnvelope(pkt.Payload)
+			env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+			if ignoreAuthenticatedEnvelopeError(err, auth) {
+				continue
+			}
 			if err != nil || env.Type != envelopeParallelGrowReq || env.ParallelGrowReq == nil {
 				continue
 			}
@@ -352,14 +362,18 @@ func receiveParallelGrowRequest(ctx context.Context, ch <-chan derpbind.Packet) 
 	}
 }
 
-func receiveParallelGrowAck(ctx context.Context, ch <-chan derpbind.Packet, target int) (parallelGrowAck, error) {
+func receiveParallelGrowAck(ctx context.Context, ch <-chan derpbind.Packet, target int, authOpt ...externalPeerControlAuth) (parallelGrowAck, error) {
+	auth := optionalPeerControlAuth(authOpt)
 	for {
 		select {
 		case pkt, ok := <-ch:
 			if !ok {
 				return parallelGrowAck{}, net.ErrClosed
 			}
-			env, err := decodeEnvelope(pkt.Payload)
+			env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+			if ignoreAuthenticatedEnvelopeError(err, auth) {
+				continue
+			}
 			if err != nil || env.Type != envelopeParallelGrowAck || env.ParallelGrowAck == nil {
 				continue
 			}
@@ -373,14 +387,18 @@ func receiveParallelGrowAck(ctx context.Context, ch <-chan derpbind.Packet, targ
 	}
 }
 
-func receiveParallelGrowResult(ctx context.Context, ch <-chan derpbind.Packet, target int) (parallelGrowResult, error) {
+func receiveParallelGrowResult(ctx context.Context, ch <-chan derpbind.Packet, target int, authOpt ...externalPeerControlAuth) (parallelGrowResult, error) {
+	auth := optionalPeerControlAuth(authOpt)
 	for {
 		select {
 		case pkt, ok := <-ch:
 			if !ok {
 				return parallelGrowResult{}, net.ErrClosed
 			}
-			env, err := decodeEnvelope(pkt.Payload)
+			env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+			if ignoreAuthenticatedEnvelopeError(err, auth) {
+				continue
+			}
 			if err != nil || env.Type != envelopeParallelGrowResult || env.ParallelGrowResult == nil {
 				continue
 			}
