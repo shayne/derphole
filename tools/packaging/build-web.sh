@@ -16,6 +16,16 @@ cp "${ROOT_DIR}/web/derphole/webrtc.js" "${OUT_DIR}/webrtc.js"
 cp "${ROOT_DIR}/web/derphole/app.js" "${OUT_DIR}/app.js"
 touch "${OUT_DIR}/.nojekyll"
 
+asset_version="${DERPHOLE_WEB_ASSET_VERSION:-}"
+if [[ -z "${asset_version}" ]]; then
+  asset_version="$(git -C "${ROOT_DIR}" rev-parse --short=12 HEAD 2>/dev/null || true)"
+fi
+if [[ -z "${asset_version}" ]]; then
+  asset_version="$(date -u +%Y%m%d%H%M%S)"
+fi
+asset_version="${asset_version//[^A-Za-z0-9._-]/-}"
+DERPHOLE_WEB_ASSET_VERSION="${asset_version}" perl -0pi -e 's/\?v=dev/\?v=$ENV{DERPHOLE_WEB_ASSET_VERSION}/g' "${OUT_DIR}/index.html"
+
 {
   printf 'window.derpholeWasmBase64 = "'
   base64 < "${OUT_DIR}/derphole-web.wasm" | tr -d '\n'

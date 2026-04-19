@@ -2,6 +2,7 @@ package scripts
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -23,6 +24,11 @@ func TestDerpholeWebLandingKeepsDemoInTechnicalFrontDoor(t *testing.T) {
 		`<section id="demo" class="demo-grid"`,
 		`href="https://github.com/shayne/derphole"`,
 		`npx -y derphole@latest`,
+		`href="styles.css?v=dev"`,
+		`src="wasm_exec.js?v=dev"`,
+		`src="wasm_payload.js?v=dev"`,
+		`src="webrtc.js?v=dev"`,
+		`src="app.js?v=dev"`,
 	}
 	for _, want := range required {
 		if !strings.Contains(html, want) {
@@ -43,6 +49,37 @@ func TestDerpholeWebLandingKeepsDemoInTechnicalFrontDoor(t *testing.T) {
 	for _, id := range demoIDs {
 		if !strings.Contains(html, id) {
 			t.Fatalf("web demo lost required element %s", id)
+		}
+	}
+}
+
+func TestBuildWebRewritesAssetCacheVersion(t *testing.T) {
+	version := "cache-test-123"
+	cmd := exec.Command("bash", filepath.Join("..", "tools", "packaging", "build-web.sh"))
+	cmd.Env = append(os.Environ(), "DERPHOLE_WEB_ASSET_VERSION="+version)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build web artifact: %v\n%s", err, out)
+	}
+
+	htmlPath := filepath.Join("..", "dist", "web", "derphole-web", "index.html")
+	data, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatalf("read built web landing page: %v", err)
+	}
+	html := string(data)
+	if strings.Contains(html, "?v=dev") {
+		t.Fatal("built web page still contains development asset cache token")
+	}
+	for _, want := range []string{
+		`href="styles.css?v=` + version + `"`,
+		`src="wasm_exec.js?v=` + version + `"`,
+		`src="wasm_payload.js?v=` + version + `"`,
+		`src="webrtc.js?v=` + version + `"`,
+		`src="app.js?v=` + version + `"`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("built web page missing cache-busted asset reference %q", want)
 		}
 	}
 }

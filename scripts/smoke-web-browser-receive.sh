@@ -7,6 +7,7 @@ SIZE="${SIZE:-65536}"
 PORT="${PORT:-0}"
 TIMEOUT_MS="${TIMEOUT_MS:-60000}"
 INPUT_FILE="$TMP/browser-input.bin"
+APP_JS_SOURCE="${APP_JS_SOURCE:-$ROOT/web/derphole/app.js}"
 
 rm -rf "$TMP"
 mkdir -p "$TMP"
@@ -17,7 +18,7 @@ cp "$(go env GOROOT)/lib/wasm/wasm_exec.js" "$TMP/wasm_exec.js"
 cp "$ROOT/web/derphole/index.html" "$TMP/index.html"
 cp "$ROOT/web/derphole/styles.css" "$TMP/styles.css"
 cp "$ROOT/web/derphole/webrtc.js" "$TMP/webrtc.js"
-cp "$ROOT/web/derphole/app.js" "$TMP/app.js"
+cp "$APP_JS_SOURCE" "$TMP/app.js"
 {
   printf 'window.derpholeWasmBase64 = "'
   base64 < "$TMP/derphole-web.wasm" | tr -d '\n'
@@ -112,6 +113,19 @@ async function installSavePickerHarness(page) {
   });
 }
 
+async function installSenderFilePickerHarness(page) {
+  await page.addInitScript((bytes) => {
+    window.showOpenFilePicker = async () => [
+      {
+        async getFile() {
+          const raw = Uint8Array.from(bytes);
+          return new File([raw], "browser-input.bin", { type: "application/octet-stream" });
+        },
+      },
+    ];
+  }, Array.from(expected));
+}
+
 async function installMemoryFallbackHarness(page) {
   await page.addInitScript(() => {
     window.__derpholeReceiveMode = "memory-fallback";
@@ -167,6 +181,7 @@ async function runReceiveScenario(browser, name, installReceiverHarness) {
   const sender = await browser.newPage();
   const receiver = await browser.newPage();
   try {
+    await installSenderFilePickerHarness(sender);
     await installReceiverHarness(receiver);
 
     await Promise.all([
@@ -181,23 +196,18 @@ async function runReceiveScenario(browser, name, installReceiverHarness) {
       window.createDerpholeWebRTCTransport = undefined;
     });
 
-    console.error(`browser receive smoke (${name}): creating web offer`);
-    const token = await sender.evaluate(async (bytes) => {
-      const raw = Uint8Array.from(bytes);
-      const file = new File([raw], "browser-input.bin", { type: "application/octet-stream" });
-      const logs = [];
-      window.__derpholeSendState = { done: false, error: null, logs };
-      const callbacks = {
-        status(value) { logs.push({ kind: "status", value }); },
-        progress(bytes, total) { logs.push({ kind: "progress", bytes, total }); },
-        trace(value) { logs.push({ kind: "trace", value }); },
-      };
-      const token = await window.derpholeWASM.createOffer();
-      window.__derpholeSendPromise = window.derpholeWASM.sendFile(file, callbacks, null)
-        .then(() => { window.__derpholeSendState.done = true; })
-        .catch((err) => { window.__derpholeSendState.error = String(err?.message || err); });
-      return token;
-    }, Array.from(expected));
+    console.error(`browser receive smoke (${name}): selecting file through UI`);
+    await sender.click("#select-send-file");
+    await withTimeout(sender.waitForFunction(() => {
+      return (document.querySelector("#send-file")?.textContent || "").includes("browser-input.bin");
+    }, { timeout: timeoutMs }), `browser sender file selection (${name})`);
+
+    console.error(`browser receive smoke (${name}): creating web offer through UI`);
+    await sender.click("#start-send");
+    await withTimeout(sender.waitForFunction(() => {
+      return Boolean((document.querySelector("#send-token")?.value || "").trim());
+    }, { timeout: timeoutMs }), `browser sender token creation (${name})`);
+    const token = await sender.inputValue("#send-token");
 
     console.error(`browser receive smoke (${name}): claiming web offer`);
     await receiver.fill("#receive-token", token);
@@ -234,10 +244,13 @@ async function runReceiveScenario(browser, name, installReceiverHarness) {
       throw new Error(`received bytes mismatch (${name}): got ${actual.length}, want ${expected.length}`);
     }
 
-    await withTimeout(sender.evaluate(() => window.__derpholeSendPromise), `browser send (${name})`);
-    const sendState = await sender.evaluate(() => window.__derpholeSendState);
-    if (sendState.error || !sendState.done) {
-      throw new Error(`browser send (${name}) failed: ${sendState.error || "not done"}`);
+    await withTimeout(sender.waitForFunction(() => {
+      const status = document.querySelector("#send-status")?.textContent || "";
+      return status === "complete" || status.startsWith("error:");
+    }, { timeout: timeoutMs }), `browser send (${name})`);
+    const sendStatus = await sender.textContent("#send-status");
+    if (sendStatus !== "complete") {
+      throw new Error(`browser send (${name}) failed: ${sendStatus}`);
     }
     return {
       name,
@@ -246,7 +259,8 @@ async function runReceiveScenario(browser, name, installReceiverHarness) {
       fallbackDownload: result.fallbackDownload,
       receiveStatus: result.status,
       receiveProgress: result.progress,
-      sendEvents: sendState.logs.filter((entry) => entry.kind !== "progress").slice(-20),
+      sendStatus,
+      sendProgress: await sender.textContent("#send-progress"),
     };
   } finally {
     await sender.close().catch(() => {});
