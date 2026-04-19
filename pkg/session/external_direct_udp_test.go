@@ -254,7 +254,7 @@ func TestPeerControlContextCancelsOnPeerAbort(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	transferCtx, stop := withPeerControlContext(ctx, nil, key.NodePublic{}, abortCh, nil, nil)
+	transferCtx, stop := withPeerControlContext(ctx, nil, key.NodePublic{}, abortCh, nil, nil, externalPeerControlAuth{})
 	defer stop()
 
 	select {
@@ -279,7 +279,7 @@ func TestPeerControlContextCancelsWhenHeartbeatsStop(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	transferCtx, stop := withPeerControlContext(ctx, nil, key.NodePublic{}, nil, make(chan derpbind.Packet), nil)
+	transferCtx, stop := withPeerControlContext(ctx, nil, key.NodePublic{}, nil, make(chan derpbind.Packet), nil, externalPeerControlAuth{})
 	defer stop()
 
 	select {
@@ -292,6 +292,48 @@ func TestPeerControlContextCancelsWhenHeartbeatsStop(t *testing.T) {
 	}
 }
 
+func TestPeerControlContextIgnoresUnauthenticatedHeartbeatWhenAuthConfigured(t *testing.T) {
+	prevTimeout := peerHeartbeatTimeout
+	peerHeartbeatTimeout = 25 * time.Millisecond
+	t.Cleanup(func() {
+		peerHeartbeatTimeout = prevTimeout
+	})
+
+	heartbeatCh := make(chan derpbind.Packet, 1)
+	payload, err := json.Marshal(envelope{Type: envelopeHeartbeat, Heartbeat: newPeerHeartbeat(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	heartbeatCh <- derpbind.Packet{Payload: payload}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	auth := externalPeerControlAuth{HeartbeatKey: [32]byte{1, 2, 3}}
+	transferCtx, stop := withPeerControlContext(ctx, nil, key.NodePublic{}, nil, heartbeatCh, nil, auth)
+	defer stop()
+
+	select {
+	case <-transferCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("unauthenticated heartbeat kept context alive")
+	}
+	if !errors.Is(context.Cause(transferCtx), ErrPeerDisconnected) {
+		t.Fatalf("context cause = %v, want %v", context.Cause(transferCtx), ErrPeerDisconnected)
+	}
+}
+
+func TestPeerHeartbeatRejectsReplay(t *testing.T) {
+	auth := externalPeerControlAuth{HeartbeatKey: [32]byte{1, 2, 3}}
+	hb := newAuthenticatedPeerHeartbeat(12, 1, auth)
+	var last uint64
+	if !verifyPeerHeartbeat(hb, auth, &last) {
+		t.Fatal("first authenticated heartbeat was rejected")
+	}
+	if verifyPeerHeartbeat(hb, auth, &last) {
+		t.Fatal("replayed heartbeat was accepted")
+	}
+}
+
 func TestPeerControlContextWithoutHeartbeatDoesNotTimeout(t *testing.T) {
 	prevTimeout := peerHeartbeatTimeout
 	peerHeartbeatTimeout = 25 * time.Millisecond
@@ -301,7 +343,7 @@ func TestPeerControlContextWithoutHeartbeatDoesNotTimeout(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	transferCtx, stop := withPeerControlContext(ctx, nil, key.NodePublic{}, make(chan derpbind.Packet), nil, nil)
+	transferCtx, stop := withPeerControlContext(ctx, nil, key.NodePublic{}, make(chan derpbind.Packet), nil, nil, externalPeerControlAuth{})
 	defer stop()
 
 	select {
@@ -1444,7 +1486,7 @@ func TestExternalPrepareDirectUDPSendWaitsForHandoffProceedBeforeSendingStart(t 
 	defer probeConn.Close()
 
 	prevSendRateProbes := externalDirectUDPSendRateProbesParallelFn
-	externalDirectUDPSendRateProbesParallelFn = func(context.Context, []net.PacketConn, []string, []int) ([]directUDPRateProbeSample, error) {
+	externalDirectUDPSendRateProbesParallelFn = func(context.Context, []net.PacketConn, []string, []int, externalDirectUDPRateProbeAuth) ([]directUDPRateProbeSample, error) {
 		return nil, nil
 	}
 	t.Cleanup(func() { externalDirectUDPSendRateProbesParallelFn = prevSendRateProbes })
@@ -1566,7 +1608,7 @@ func TestExternalPrepareDirectUDPSendSkipsRateProbesForSmallKnownTransfer(t *tes
 
 	var rateProbeSendCalled bool
 	prevSendRateProbes := externalDirectUDPSendRateProbesParallelFn
-	externalDirectUDPSendRateProbesParallelFn = func(context.Context, []net.PacketConn, []string, []int) ([]directUDPRateProbeSample, error) {
+	externalDirectUDPSendRateProbesParallelFn = func(context.Context, []net.PacketConn, []string, []int, externalDirectUDPRateProbeAuth) ([]directUDPRateProbeSample, error) {
 		rateProbeSendCalled = true
 		return nil, errors.New("unexpected rate probe send for small known transfer")
 	}
@@ -1700,7 +1742,7 @@ func TestExternalPrepareDirectUDPSendSkipsBlockingRateProbesForRelayPrefixUpgrad
 
 	var rateProbeSendCalled bool
 	prevSendRateProbes := externalDirectUDPSendRateProbesParallelFn
-	externalDirectUDPSendRateProbesParallelFn = func(context.Context, []net.PacketConn, []string, []int) ([]directUDPRateProbeSample, error) {
+	externalDirectUDPSendRateProbesParallelFn = func(context.Context, []net.PacketConn, []string, []int, externalDirectUDPRateProbeAuth) ([]directUDPRateProbeSample, error) {
 		rateProbeSendCalled = true
 		return nil, errors.New("unexpected blocking rate probe for relay-prefix upgrade")
 	}
@@ -4371,20 +4413,82 @@ func TestExternalDirectUDPMagicStringsUseDerpholeBrand(t *testing.T) {
 	}
 }
 
+func testExternalDirectUDPRateProbeAuth() externalDirectUDPRateProbeAuth {
+	return externalDirectUDPRateProbeAuth{
+		Key:   [32]byte{1, 2, 3},
+		Nonce: [16]byte{4, 5, 6},
+	}
+}
+
 func TestExternalDirectUDPRateProbePayloadEncodesIndex(t *testing.T) {
-	payload, err := externalDirectUDPRateProbePayload(3, 128)
+	auth := testExternalDirectUDPRateProbeAuth()
+	payload, err := externalDirectUDPRateProbePayload(3, 128, auth)
 	if err != nil {
 		t.Fatalf("externalDirectUDPRateProbePayload() error = %v", err)
 	}
 	if len(payload) != 128 {
 		t.Fatalf("payload len = %d, want 128", len(payload))
 	}
-	index, ok := externalDirectUDPRateProbeIndex(payload, 10)
+	index, ok := externalDirectUDPRateProbeIndex(payload, 10, auth)
 	if !ok {
 		t.Fatal("externalDirectUDPRateProbeIndex() did not recognize payload")
 	}
 	if index != 3 {
 		t.Fatalf("probe index = %d, want 3", index)
+	}
+}
+
+func TestExternalDirectUDPRateProbeIndexRejectsForgedMAC(t *testing.T) {
+	auth := testExternalDirectUDPRateProbeAuth()
+	payload, err := externalDirectUDPRateProbePayload(0, 128, auth)
+	if err != nil {
+		t.Fatalf("externalDirectUDPRateProbePayload() error = %v", err)
+	}
+	payload[len(payload)-1] ^= 0x01
+	if _, ok := externalDirectUDPRateProbeIndex(payload, 1, auth); ok {
+		t.Fatal("forged rate-probe packet was accepted")
+	}
+}
+
+func TestExternalDirectUDPReceiveRateProbesRejectsUnexpectedSource(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	receiver, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+	allowedSender, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer allowedSender.Close()
+	forgedSender, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forgedSender.Close()
+
+	auth := externalDirectUDPRateProbeAuth{Key: [32]byte{1}, Nonce: [16]byte{2}}
+	payload, err := externalDirectUDPRateProbePayload(0, 128, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiverAddr, err := net.ResolveUDPAddr("udp", receiver.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := forgedSender.WriteTo(payload, receiverAddr); err != nil {
+		t.Fatal(err)
+	}
+
+	samples, err := externalDirectUDPReceiveRateProbes(ctx, []net.PacketConn{receiver}, []string{allowedSender.LocalAddr().String()}, []int{8}, auth)
+	if err != nil {
+		t.Fatalf("externalDirectUDPReceiveRateProbes() error = %v", err)
+	}
+	if samples[0].BytesReceived != 0 {
+		t.Fatalf("forged source counted %d bytes, want 0", samples[0].BytesReceived)
 	}
 }
 
@@ -4447,6 +4551,7 @@ func TestExternalDirectUDPSendRateProbesWritesSyntheticPackets(t *testing.T) {
 	defer client.Close()
 
 	rates := []int{8, 25}
+	auth := testExternalDirectUDPRateProbeAuth()
 	readCh := make(chan int, 16)
 	go func() {
 		defer close(readCh)
@@ -4458,14 +4563,14 @@ func TestExternalDirectUDPSendRateProbesWritesSyntheticPackets(t *testing.T) {
 			if err != nil {
 				return
 			}
-			index, ok := externalDirectUDPRateProbeIndex(buf[:n], len(rates))
+			index, ok := externalDirectUDPRateProbeIndex(buf[:n], len(rates), auth)
 			if ok {
 				readCh <- index
 			}
 		}
 	}()
 
-	sent, err := externalDirectUDPSendRateProbes(ctx, client, server.LocalAddr().String(), rates)
+	sent, err := externalDirectUDPSendRateProbes(ctx, client, server.LocalAddr().String(), rates, auth)
 	if err != nil {
 		t.Fatalf("externalDirectUDPSendRateProbes() error = %v", err)
 	}
@@ -4518,6 +4623,7 @@ func TestExternalDirectUDPSendRateProbesParallelUsesActiveLaneSubset(t *testing.
 		t.Fatal(err)
 	}
 	defer clientB.Close()
+	auth := testExternalDirectUDPRateProbeAuth()
 
 	readOne := func(conn net.PacketConn, ch chan<- bool) {
 		defer close(ch)
@@ -4528,7 +4634,7 @@ func TestExternalDirectUDPSendRateProbesParallelUsesActiveLaneSubset(t *testing.
 			if err != nil {
 				return
 			}
-			if _, ok := externalDirectUDPRateProbeIndex(buf[:n], 1); ok {
+			if _, ok := externalDirectUDPRateProbeIndex(buf[:n], 1, auth); ok {
 				ch <- true
 				return
 			}
@@ -4540,7 +4646,7 @@ func TestExternalDirectUDPSendRateProbesParallelUsesActiveLaneSubset(t *testing.
 	go readOne(serverA, seenA)
 	go readOne(serverB, seenB)
 
-	sent, err := externalDirectUDPSendRateProbesParallel(ctx, []net.PacketConn{clientA, clientB}, []string{serverA.LocalAddr().String(), serverB.LocalAddr().String()}, []int{8})
+	sent, err := externalDirectUDPSendRateProbesParallel(ctx, []net.PacketConn{clientA, clientB}, []string{serverA.LocalAddr().String(), serverB.LocalAddr().String()}, []int{8}, auth)
 	if err != nil {
 		t.Fatalf("externalDirectUDPSendRateProbesParallel() error = %v", err)
 	}
@@ -4572,6 +4678,7 @@ func TestExternalDirectUDPSendRateProbesParallelRetriesTransientNoBufferSpace(t 
 	defer clientBase.Close()
 
 	clientConn := &transientNoBufferPacketConn{PacketConn: clientBase, remaining: 1}
+	auth := testExternalDirectUDPRateProbeAuth()
 
 	seen := make(chan bool, 1)
 	go func() {
@@ -4583,14 +4690,14 @@ func TestExternalDirectUDPSendRateProbesParallelRetriesTransientNoBufferSpace(t 
 			if err != nil {
 				return
 			}
-			if _, ok := externalDirectUDPRateProbeIndex(buf[:n], 1); ok {
+			if _, ok := externalDirectUDPRateProbeIndex(buf[:n], 1, auth); ok {
 				seen <- true
 				return
 			}
 		}
 	}()
 
-	sent, err := externalDirectUDPSendRateProbesParallel(ctx, []net.PacketConn{clientConn}, []string{serverConn.LocalAddr().String()}, []int{8})
+	sent, err := externalDirectUDPSendRateProbesParallel(ctx, []net.PacketConn{clientConn}, []string{serverConn.LocalAddr().String()}, []int{8}, auth)
 	if err != nil {
 		t.Fatalf("externalDirectUDPSendRateProbesParallel() error = %v", err)
 	}

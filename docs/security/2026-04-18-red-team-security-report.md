@@ -66,6 +66,56 @@ Evidence:
 - Added `TestReleaseWorkflowDoesNotInterpolateVersionInShell` in `scripts/release_workflow_test.go`.
 - Fixed phase: `go test ./scripts -run TestReleaseWorkflow -count=1` passed.
 
+## Post-Report Remediations
+
+### 6. Lossless DERP subscriber queues are bounded
+
+`SubscribeLossless` now enforces a bounded queue instead of appending without a hard cap. This removes the high-priority unbounded memory risk for critical DERP control subscribers.
+
+Evidence:
+
+- Added bounded-queue regression coverage for backed-up lossless subscribers.
+- Focused derpbind tests passed with `go test ./pkg/derpbind -run 'TestClientSubscribeLossless' -count=1`.
+
+### 7. Direct UDP promotion probes are MAC-bound
+
+Direct promotion now derives a transport discovery key from the bearer token and DERP identities. MAC-bound probe and ack payloads replace static probe acceptance for token-backed sessions, and legacy discovery payloads are rejected when a discovery key is configured.
+
+Evidence:
+
+- Added MAC-bound discovery tests in `pkg/transport` and token-derived discovery-key tests in `pkg/session`.
+- Focused transport/session tests passed for MAC-bound direct promotion and legacy-payload rejection.
+
+### 8. derptun tokens can avoid argv exposure
+
+The derptun CLI now supports file/stdin token inputs in addition to inline tokens. This lets operators keep long-lived server and client credentials out of process listings while preserving the simple inline-token path for low-risk local use.
+
+Evidence:
+
+- Added CLI coverage for token file/stdin inputs across derptun serve, open, connect, and client-token flows.
+- Focused derptun command tests passed with token-file and token-stdin paths.
+
+### 9. Candidate validation rejects policy-invalid claims
+
+Candidate handling now validates beyond raw string shape. Claim candidates are bounded and policy-checked before they can influence rendezvous or transport setup.
+
+Evidence:
+
+- Added adversarial candidate validation tests in `pkg/candidate`, `pkg/rendezvous`, `pkg/session`, and `pkg/transport`.
+- Focused candidate/rendezvous/session/transport tests passed for malformed, repeated, and policy-invalid candidate inputs.
+
+### 10. Direct UDP rate probes and heartbeats are authenticated
+
+Direct UDP rate-probe packets now include a per-transfer nonce and HMAC derived from the token bearer secret and session ID. The receiver accepts only MAC-valid probe packets from selected remote UDP addresses. Peer heartbeat envelopes now include a monotonic sequence and HMAC, and authenticated sessions ignore unauthenticated or replayed heartbeat envelopes.
+
+Evidence:
+
+- Added `TestExternalDirectUDPRateProbeIndexRejectsForgedMAC`.
+- Added `TestExternalDirectUDPReceiveRateProbesRejectsUnexpectedSource`.
+- Added `TestPeerControlContextIgnoresUnauthenticatedHeartbeatWhenAuthConfigured`.
+- Added `TestPeerHeartbeatRejectsReplay`.
+- Fixed phase: `go test ./pkg/session -run 'TestExternalDirectUDPRateProbeIndexRejectsForgedMAC|TestExternalDirectUDPReceiveRateProbesRejectsUnexpectedSource|TestPeerControlContextIgnoresUnauthenticatedHeartbeatWhenAuthConfigured|TestPeerHeartbeatRejectsReplay' -count=1` passed.
+
 ## Live Evidence
 
 Commands run:
@@ -88,38 +138,16 @@ Final repository verification:
 
 ## Residual Risks
 
-### High: Lossless DERP subscriber queues can grow without a hard cap
-
-`pkg/derpbind/client.go` has `losslessSubscriberQueueSize = 64`, but `packetSubscriber.enqueue` still appends without enforcing that bound. Existing tests currently expect more than 64 backed-up packets to be retained, so fixing this requires an explicit semantic decision: block the receive path, drop with telemetry, close the subscriber, or split critical control streams onto protocol-specific bounded queues.
-
-Recommended next test:
-
-- Add a red test that dispatches far more than `losslessSubscriberQueueSize` matching packets to an unread lossless subscriber and asserts memory is bounded or the subscriber is closed with an explicit error path.
-
-### Medium: Direct UDP promotion probes are not cryptographically bound
-
-Direct promotion uses simple probe and ack payloads. QUIC and session tokens still protect derptun data once the carrier is established, but the promotion probes themselves can be spoofed on-path or same-LAN. Future UDP serving, such as a Minecraft use case, should bind direct probes to the session token with a nonce/MAC and include source-address pinning once a probe is accepted.
-
-Recommended next test:
-
-- Inject forged direct probe, ack, and rate-probe packets from a non-peer source and assert they cannot advance transport state.
-
-### Medium: Remote smoke harnesses use predictable remote paths
+### Accepted development risk: Remote smoke harnesses use predictable remote paths
 
 The remote shell harnesses use `/tmp/...-$$` names. This is acceptable for controlled hosts like `ktzlxc`, but not for untrusted multi-user systems. Use remote `mktemp -d` and quote host inputs through positional parameters before relying on these harnesses for adversarial shared-host testing.
 
-### Medium: derptun long-lived tokens are commonly passed through argv
+### Low: Not every DERP control envelope has its own MAC
 
-Docs and smoke scripts still use `--token "$(cat file)"`. That is ergonomic but exposes long-lived tokens to process listings on some systems. Add `--token-file` or `--token-stdin` support for `serve`, `open`, `connect`, and `token client`.
-
-### Medium: Candidate validation is syntactic, not policy-aware
-
-Claim candidates are bounded by count and string length, but not by candidate class, address family policy, private/public address expectations, or repeated/unreachable endpoints. This should be tightened before UDP service exposure expands.
+Heartbeat envelopes now have a message MAC and replay check, and DERP sender identity filtering still gates abort, ack, mode, and rendezvous control traffic. If the threat model expands to include malicious relays or compromised peer identities, extend the same envelope-level MAC pattern to those remaining control message types.
 
 ## Follow-Up Priority
 
-1. Bound or redesign `SubscribeLossless` queues.
-2. MAC-bind direct UDP promotion, heartbeat, and rate-probe control packets.
-3. Add `--token-file` and update docs/scripts to avoid argv token exposure.
-4. Harden remote smoke scripts for untrusted shared hosts.
-5. Add adversarial candidate validation tests before enabling UDP tunnel mode.
+1. Keep ktzlxc smoke coverage in the release loop with `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1` so direct-path claims are not accidentally satisfied by Tailscale.
+2. Harden remote smoke scripts with `mktemp -d` before using them on untrusted multi-user hosts.
+3. Consider envelope-level MACs for abort, ack, and mode-control messages if the DERP relay threat model becomes stricter.

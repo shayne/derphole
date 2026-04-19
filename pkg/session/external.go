@@ -135,6 +135,8 @@ func newPeerAbort(reason string, bytesTransferred int64) *peerAbort {
 
 type peerHeartbeat struct {
 	BytesTransferred *int64 `json:"bytes_transferred,omitempty"`
+	Sequence         uint64 `json:"sequence,omitempty"`
+	MAC              string `json:"mac,omitempty"`
 }
 
 func newPeerHeartbeat(bytesTransferred int64) *peerHeartbeat {
@@ -150,6 +152,7 @@ type directUDPStart struct {
 	SectionSizes  []int64  `json:"section_sizes,omitempty"`
 	SectionAddrs  []string `json:"section_addrs,omitempty"`
 	ProbeRates    []int    `json:"probe_rates,omitempty"`
+	ProbeNonce    string   `json:"probe_nonce,omitempty"`
 	Stream        bool     `json:"stream,omitempty"`
 	StripedBlast  bool     `json:"striped_blast,omitempty"`
 }
@@ -2063,17 +2066,17 @@ func sendPeerAbortBestEffort(client *derpbind.Client, peerDERP key.NodePublic, r
 	})
 }
 
-func sendPeerHeartbeat(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, bytesTransferred int64) error {
+func sendPeerHeartbeat(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, bytesTransferred int64, sequence uint64, auth externalPeerControlAuth) error {
 	if client == nil || peerDERP.IsZero() {
 		return nil
 	}
 	return sendEnvelope(ctx, client, peerDERP, envelope{
 		Type:      envelopeHeartbeat,
-		Heartbeat: newPeerHeartbeat(bytesTransferred),
+		Heartbeat: newAuthenticatedPeerHeartbeat(bytesTransferred, sequence, auth),
 	})
 }
 
-func withPeerControlContext(parent context.Context, client *derpbind.Client, peerDERP key.NodePublic, abortCh <-chan derpbind.Packet, heartbeatCh <-chan derpbind.Packet, bytesTransferred func() int64) (context.Context, context.CancelFunc) {
+func withPeerControlContext(parent context.Context, client *derpbind.Client, peerDERP key.NodePublic, abortCh <-chan derpbind.Packet, heartbeatCh <-chan derpbind.Packet, bytesTransferred func() int64, auth externalPeerControlAuth) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancelCause(parent)
 	var stopOnce sync.Once
 	stopCh := make(chan struct{})
@@ -2119,6 +2122,7 @@ func withPeerControlContext(parent context.Context, client *derpbind.Client, pee
 				}
 				timer.Reset(timeout)
 			}
+			var lastHeartbeatSequence uint64
 			for {
 				select {
 				case pkt, ok := <-abortCh:
@@ -2139,6 +2143,9 @@ func withPeerControlContext(parent context.Context, client *derpbind.Client, pee
 					}
 					env, err := decodeEnvelope(pkt.Payload)
 					if err != nil || env.Type != envelopeHeartbeat {
+						continue
+					}
+					if !verifyPeerHeartbeat(env.Heartbeat, auth, &lastHeartbeatSequence) {
 						continue
 					}
 					resetHeartbeatTimer()
@@ -2165,8 +2172,10 @@ func withPeerControlContext(parent context.Context, client *derpbind.Client, pee
 			}
 			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
+			var heartbeatSequence uint64
 			for {
-				_ = sendPeerHeartbeat(ctx, client, peerDERP, currentBytes())
+				heartbeatSequence++
+				_ = sendPeerHeartbeat(ctx, client, peerDERP, currentBytes(), heartbeatSequence, auth)
 				select {
 				case <-ticker.C:
 				case <-ctx.Done():

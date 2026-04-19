@@ -5,7 +5,10 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -99,6 +102,22 @@ const (
 
 var externalDirectUDPRateProbeMagic = [16]byte{0, 'd', 'e', 'r', 'p', 'h', 'o', 'l', 'e', '-', 'r', 'a', 't', 'e', 'v', '1'}
 var externalRelayPrefixDERPMagic = [16]byte{0, 'd', 'e', 'r', 'p', 'h', 'o', 'l', 'e', '-', 'p', 'r', 'e', 'f', 'v', '1'}
+
+const (
+	externalDirectUDPRateProbeIndexOffset = len(externalDirectUDPRateProbeMagic)
+	externalDirectUDPRateProbeNonceOffset = externalDirectUDPRateProbeIndexOffset + 4
+	externalDirectUDPRateProbeMACOffset   = externalDirectUDPRateProbeNonceOffset + 16
+	externalDirectUDPRateProbeHeaderSize  = externalDirectUDPRateProbeMACOffset + sha256.Size
+)
+
+type externalDirectUDPRateProbeAuth struct {
+	Key   [32]byte
+	Nonce [16]byte
+}
+
+func (auth externalDirectUDPRateProbeAuth) enabled() bool {
+	return auth.Key != [32]byte{} && auth.Nonce != [16]byte{}
+}
 
 type externalRelayPrefixDERPFrameKind byte
 
@@ -423,7 +442,7 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) (retErr error
 	defer unsubscribeHeartbeat()
 	ctx, stopPeerAbort := withPeerControlContext(ctx, derpClient, listenerDERP, abortCh, heartbeatCh, func() int64 {
 		return countedSrc.Count()
-	})
+	}, externalPeerControlAuthForToken(tok))
 	defer stopPeerAbort()
 	defer notifyPeerAbortOnError(&retErr, ctx, derpClient, listenerDERP, func() int64 {
 		return countedSrc.Count()
@@ -583,6 +602,13 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 		probeRates = nil
 		externalTransferTracef("direct-udp-send-rate-probe-skipped reason=relay-prefix-upgrade")
 	}
+	var rateProbeAuth externalDirectUDPRateProbeAuth
+	if len(probeRates) > 0 {
+		rateProbeAuth, start.ProbeNonce, err = newExternalDirectUDPRateProbeAuth(tok)
+		if err != nil {
+			return plan, err
+		}
+	}
 	start.StripedBlast = sendCfg.StripedBlast
 	externalTransferTracef("direct-udp-send-start-send addr=%v", peerAddr)
 	if err := sendEnvelope(ctx, derpClient, listenerDERP, envelope{
@@ -603,7 +629,7 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 	var probeResult directUDPRateProbeResult
 	if len(probeRates) > 0 {
 		externalTransferTracef("direct-udp-send-rate-probe-start rates=%s", strings.Trim(strings.Join(strings.Fields(fmt.Sprint(probeRates)), ","), "[]"))
-		sentProbeSamples, err = externalDirectUDPSendRateProbesParallelFn(ctx, probeConns, remoteAddrs, probeRates)
+		sentProbeSamples, err = externalDirectUDPSendRateProbesParallelFn(ctx, probeConns, remoteAddrs, probeRates, rateProbeAuth)
 		if err != nil {
 			externalTransferTracef("direct-udp-send-rate-probe-done err=%v", err)
 			return plan, err
@@ -767,6 +793,10 @@ func externalPrepareDirectUDPReceive(ctx context.Context, dst io.Writer, tok tok
 	if err != nil {
 		return plan, err
 	}
+	rateProbeAuth, err := externalDirectUDPRateProbeAuthFromStart(tok, start)
+	if err != nil {
+		return plan, err
+	}
 	externalTransferTracef("direct-udp-recv-start addr=%v stream=%v", peerAddr, start.Stream)
 	if cfg.Emitter != nil {
 		cfg.Emitter.Debug("udp-stream=" + strconv.FormatBool(start.Stream))
@@ -779,7 +809,7 @@ func externalPrepareDirectUDPReceive(ctx context.Context, dst io.Writer, tok tok
 	externalTransferTracef("direct-udp-recv-start-ack-send addr=%v", peerAddr)
 	signalExternalDirectUDPDirectReady(ctx)
 	if len(start.ProbeRates) > 0 {
-		probeSamples, probeErr := externalDirectUDPReceiveRateProbesFn(ctx, probeConns, start.ProbeRates)
+		probeSamples, probeErr := externalDirectUDPReceiveRateProbesFn(ctx, probeConns, remoteAddrs, start.ProbeRates, rateProbeAuth)
 		if probeErr != nil {
 			return plan, probeErr
 		}
@@ -942,7 +972,7 @@ func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (retTok s
 				return 0
 			}
 			return countedDst.Count()
-		})
+		}, externalPeerControlAuthForToken(session.token))
 		defer stopPeerAbort()
 		defer notifyPeerAbortOnError(&retErr, ctx, session.derp, peerDERP, func() int64 {
 			if countedDst == nil {
@@ -2475,26 +2505,78 @@ func externalDirectUDPRemainingExpectedBytes(totalBytes int64, alreadyDelivered 
 	return totalBytes - alreadyDelivered
 }
 
-func externalDirectUDPRateProbePayload(index int, size int) ([]byte, error) {
+func newExternalDirectUDPRateProbeAuth(tok token.Token) (externalDirectUDPRateProbeAuth, string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return externalDirectUDPRateProbeAuth{}, "", err
+	}
+	auth := externalDirectUDPRateProbeAuthForToken(tok, nonce)
+	return auth, base64.RawURLEncoding.EncodeToString(nonce[:]), nil
+}
+
+func externalDirectUDPRateProbeAuthForToken(tok token.Token, nonce [16]byte) externalDirectUDPRateProbeAuth {
+	return externalDirectUDPRateProbeAuth{
+		Key:   externalSessionSubkey(tok, "derphole-direct-udp-rate-probe-v1"),
+		Nonce: nonce,
+	}
+}
+
+func externalDirectUDPRateProbeAuthFromStart(tok token.Token, start directUDPStart) (externalDirectUDPRateProbeAuth, error) {
+	if len(start.ProbeRates) == 0 {
+		return externalDirectUDPRateProbeAuth{}, nil
+	}
+	if start.ProbeNonce == "" {
+		return externalDirectUDPRateProbeAuth{}, errors.New("direct UDP rate probe nonce missing")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(start.ProbeNonce)
+	if err != nil {
+		return externalDirectUDPRateProbeAuth{}, err
+	}
+	if len(raw) != 16 {
+		return externalDirectUDPRateProbeAuth{}, fmt.Errorf("direct UDP rate probe nonce length %d", len(raw))
+	}
+	var nonce [16]byte
+	copy(nonce[:], raw)
+	return externalDirectUDPRateProbeAuthForToken(tok, nonce), nil
+}
+
+func externalDirectUDPRateProbePayload(index int, size int, auth externalDirectUDPRateProbeAuth) ([]byte, error) {
 	if index < 0 {
 		return nil, fmt.Errorf("negative rate probe index %d", index)
 	}
-	if size < 20 {
-		size = 20
+	if !auth.enabled() {
+		return nil, errors.New("rate probe auth missing")
+	}
+	if size < externalDirectUDPRateProbeHeaderSize {
+		size = externalDirectUDPRateProbeHeaderSize
 	}
 	payload := make([]byte, size)
-	copy(payload[:16], externalDirectUDPRateProbeMagic[:])
-	binary.BigEndian.PutUint32(payload[16:20], uint32(index))
+	copy(payload[:externalDirectUDPRateProbeIndexOffset], externalDirectUDPRateProbeMagic[:])
+	binary.BigEndian.PutUint32(payload[externalDirectUDPRateProbeIndexOffset:externalDirectUDPRateProbeNonceOffset], uint32(index))
+	copy(payload[externalDirectUDPRateProbeNonceOffset:externalDirectUDPRateProbeMACOffset], auth.Nonce[:])
+	copy(payload[externalDirectUDPRateProbeMACOffset:externalDirectUDPRateProbeHeaderSize], externalDirectUDPRateProbeMAC(auth, payload))
 	return payload, nil
 }
 
-func externalDirectUDPSendRateProbes(ctx context.Context, conn net.PacketConn, remoteAddr string, rates []int) ([]directUDPRateProbeSample, error) {
-	return externalDirectUDPSendRateProbesParallel(ctx, []net.PacketConn{conn}, []string{remoteAddr}, rates)
+func externalDirectUDPRateProbeMAC(auth externalDirectUDPRateProbeAuth, packet []byte) []byte {
+	mac := hmac.New(sha256.New, auth.Key[:])
+	mac.Write(packet[:externalDirectUDPRateProbeMACOffset])
+	if len(packet) > externalDirectUDPRateProbeHeaderSize {
+		mac.Write(packet[externalDirectUDPRateProbeHeaderSize:])
+	}
+	return mac.Sum(nil)
 }
 
-func externalDirectUDPSendRateProbesParallel(ctx context.Context, conns []net.PacketConn, remoteAddrs []string, rates []int) ([]directUDPRateProbeSample, error) {
+func externalDirectUDPSendRateProbes(ctx context.Context, conn net.PacketConn, remoteAddr string, rates []int, auth externalDirectUDPRateProbeAuth) ([]directUDPRateProbeSample, error) {
+	return externalDirectUDPSendRateProbesParallel(ctx, []net.PacketConn{conn}, []string{remoteAddr}, rates, auth)
+}
+
+func externalDirectUDPSendRateProbesParallel(ctx context.Context, conns []net.PacketConn, remoteAddrs []string, rates []int, auth externalDirectUDPRateProbeAuth) ([]directUDPRateProbeSample, error) {
 	if len(rates) == 0 {
 		return nil, nil
+	}
+	if !auth.enabled() {
+		return nil, errors.New("rate probe auth missing")
 	}
 	if len(conns) == 0 {
 		return nil, errors.New("no rate probe conns")
@@ -2521,7 +2603,7 @@ func externalDirectUDPSendRateProbesParallel(ctx context.Context, conns []net.Pa
 		if rate <= 0 {
 			return nil, fmt.Errorf("invalid rate probe rate %d", rate)
 		}
-		payload, err := externalDirectUDPRateProbePayload(i, externalDirectUDPChunkSize)
+		payload, err := externalDirectUDPRateProbePayload(i, externalDirectUDPChunkSize, auth)
 		if err != nil {
 			return samples, err
 		}
@@ -2670,9 +2752,12 @@ func sleepWithContext(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func externalDirectUDPReceiveRateProbes(ctx context.Context, conns []net.PacketConn, rates []int) ([]directUDPRateProbeSample, error) {
+func externalDirectUDPReceiveRateProbes(ctx context.Context, conns []net.PacketConn, remoteAddrs []string, rates []int, auth externalDirectUDPRateProbeAuth) ([]directUDPRateProbeSample, error) {
 	if len(rates) == 0 {
 		return nil, nil
+	}
+	if !auth.enabled() {
+		return nil, errors.New("rate probe auth missing")
 	}
 	samples := make([]directUDPRateProbeSample, len(rates))
 	for i, rate := range rates {
@@ -2683,6 +2768,10 @@ func externalDirectUDPReceiveRateProbes(ctx context.Context, conns []net.PacketC
 	}
 	if len(conns) == 0 {
 		return samples, errors.New("no packet conns")
+	}
+	allowedSources, err := externalDirectUDPRateProbeAllowedSources(remoteAddrs)
+	if err != nil {
+		return samples, err
 	}
 	deadline := time.Now().Add(externalDirectUDPRateProbeWindow(rates) + externalDirectUDPRateProbeGrace)
 	var mu sync.Mutex
@@ -2698,7 +2787,7 @@ func externalDirectUDPReceiveRateProbes(ctx context.Context, conns []net.PacketC
 			defer conn.SetReadDeadline(time.Time{})
 			buf := make([]byte, externalDirectUDPChunkSize)
 			for {
-				n, _, err := conn.ReadFrom(buf)
+				n, addr, err := conn.ReadFrom(buf)
 				if err != nil {
 					if externalDirectUDPIsNetTimeout(err) {
 						return
@@ -2710,7 +2799,10 @@ func externalDirectUDPReceiveRateProbes(ctx context.Context, conns []net.PacketC
 					errCh <- err
 					return
 				}
-				index, ok := externalDirectUDPRateProbeIndex(buf[:n], len(samples))
+				if !externalDirectUDPRateProbeSourceAllowed(addr, allowedSources) {
+					continue
+				}
+				index, ok := externalDirectUDPRateProbeIndex(buf[:n], len(samples), auth)
 				if !ok {
 					continue
 				}
@@ -2729,14 +2821,47 @@ func externalDirectUDPReceiveRateProbes(ctx context.Context, conns []net.PacketC
 	return samples, nil
 }
 
-func externalDirectUDPRateProbeIndex(packet []byte, samples int) (int, bool) {
-	if len(packet) < 20 || samples <= 0 {
+func externalDirectUDPRateProbeAllowedSources(remoteAddrs []string) (map[string]struct{}, error) {
+	allowed := make(map[string]struct{}, len(remoteAddrs))
+	for _, raw := range remoteAddrs {
+		if raw == "" {
+			continue
+		}
+		addr, err := net.ResolveUDPAddr("udp", raw)
+		if err != nil {
+			return nil, err
+		}
+		allowed[addr.String()] = struct{}{}
+	}
+	if len(allowed) == 0 {
+		return nil, errors.New("no rate probe remote addrs")
+	}
+	return allowed, nil
+}
+
+func externalDirectUDPRateProbeSourceAllowed(addr net.Addr, allowed map[string]struct{}) bool {
+	if addr == nil || len(allowed) == 0 {
+		return false
+	}
+	_, ok := allowed[addr.String()]
+	return ok
+}
+
+func externalDirectUDPRateProbeIndex(packet []byte, samples int, auth externalDirectUDPRateProbeAuth) (int, bool) {
+	if len(packet) < externalDirectUDPRateProbeHeaderSize || samples <= 0 || !auth.enabled() {
 		return 0, false
 	}
-	if string(packet[:16]) != string(externalDirectUDPRateProbeMagic[:]) {
+	if string(packet[:externalDirectUDPRateProbeIndexOffset]) != string(externalDirectUDPRateProbeMagic[:]) {
 		return 0, false
 	}
-	index := int(binary.BigEndian.Uint32(packet[16:20]))
+	if !hmac.Equal(packet[externalDirectUDPRateProbeNonceOffset:externalDirectUDPRateProbeMACOffset], auth.Nonce[:]) {
+		return 0, false
+	}
+	wantMAC := externalDirectUDPRateProbeMAC(auth, packet)
+	if !hmac.Equal(packet[externalDirectUDPRateProbeMACOffset:externalDirectUDPRateProbeHeaderSize], wantMAC) {
+		return 0, false
+	}
+	index := int(binary.BigEndian.Uint32(packet[externalDirectUDPRateProbeIndexOffset:externalDirectUDPRateProbeNonceOffset]))
 	if index < 0 || index >= samples {
 		return 0, false
 	}

@@ -286,7 +286,7 @@ func sendExternalViaWGTunnel(ctx context.Context, cfg SendConfig) (retErr error)
 	defer unsubscribeHeartbeat()
 	ctx, stopPeerAbort := withPeerControlContext(ctx, derpClient, listenerDERP, abortCh, heartbeatCh, func() int64 {
 		return countedSrc.Count()
-	})
+	}, externalPeerControlAuthForToken(tok))
 	defer stopPeerAbort()
 	defer notifyPeerAbortOnError(&retErr, ctx, derpClient, listenerDERP, func() int64 {
 		return countedSrc.Count()
@@ -400,7 +400,7 @@ func listenExternalViaWGTunnel(ctx context.Context, cfg ListenConfig) (retTok st
 				return 0
 			}
 			return countedDst.Count()
-		})
+		}, externalPeerControlAuthForToken(session.token))
 		defer stopPeerAbort()
 		defer notifyPeerAbortOnError(&retErr, ctx, session.derp, peerDERP, func() int64 {
 			if countedDst == nil {

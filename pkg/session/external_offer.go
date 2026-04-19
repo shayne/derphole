@@ -87,7 +87,7 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (retTok string, retErr 
 				return 0
 			}
 			return countedSrc.Count()
-		})
+		}, externalPeerControlAuthForToken(session.token))
 		defer stopPeerAbort()
 		defer notifyPeerAbortOnError(&retErr, ctx, session.derp, peerDERP, func() int64 {
 			if countedSrc == nil {
@@ -332,7 +332,7 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) (retErr error) {
 			return 0
 		}
 		return countedDst.Count()
-	})
+	}, externalPeerControlAuthForToken(tok))
 	defer stopPeerAbort()
 	defer notifyPeerAbortOnError(&retErr, ctx, derpClient, listenerDERP, func() int64 {
 		if countedDst == nil {
