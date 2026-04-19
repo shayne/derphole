@@ -49,9 +49,13 @@ final class TransferState: ObservableObject {
     @Published var isExporterPresented = false
 
     private var activeReceiver: DerpholemobileReceiver?
+    private var callbackPump: TransferUIUpdatePump?
     private var transferID = UUID()
     private var cancelRequested = false
     private var lastScannedPayload = ""
+    #if DEBUG
+    private var runtimeInjectedReceiveStarted = false
+    #endif
 
     var isReceiving: Bool {
         phase == .receiving
@@ -185,6 +189,20 @@ final class TransferState: ObservableObject {
         statusText = "Ready."
     }
 
+    #if DEBUG
+    func receiveRuntimeInjectedPayloadIfConfigured(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        arguments: [String] = ProcessInfo.processInfo.arguments
+    ) {
+        guard !runtimeInjectedReceiveStarted else { return }
+        guard let payload = LiveReceiveLaunchConfiguration.payload(from: environment, arguments: arguments) else { return }
+
+        runtimeInjectedReceiveStarted = true
+        pastedPayload = payload
+        startReceive(from: payload, source: .manual)
+    }
+    #endif
+
     private enum ReceiveSource {
         case manual
         case scanner
@@ -239,21 +257,29 @@ final class TransferState: ObservableObject {
         traceText = ""
         statusText = source == .scanner ? "QR code scanned. Starting receive..." : "Starting receive..."
 
+        let callbackPump = TransferUIUpdatePump { [weak self] snapshot in
+            guard let self else { return }
+            if let progress = snapshot.progress {
+                self.handleProgress(current: progress.current, total: progress.total, transferID: currentTransferID)
+            }
+            if let status = snapshot.status {
+                self.handleStatus(status, transferID: currentTransferID)
+            }
+            if let trace = snapshot.trace {
+                self.handleTrace(trace, transferID: currentTransferID)
+            }
+        }
+        self.callbackPump = callbackPump
+
         let callbacks = TransferCallbacks(
-            onProgress: { [weak self] current, total in
-                DispatchQueue.main.async {
-                    self?.handleProgress(current: current, total: total, transferID: currentTransferID)
-                }
+            onProgress: { current, total in
+                callbackPump.progress(current: current, total: total)
             },
-            onStatus: { [weak self] status in
-                DispatchQueue.main.async {
-                    self?.handleStatus(status, transferID: currentTransferID)
-                }
+            onStatus: { status in
+                callbackPump.status(status)
             },
-            onTrace: { [weak self] trace in
-                DispatchQueue.main.async {
-                    self?.handleTrace(trace, transferID: currentTransferID)
-                }
+            onTrace: { trace in
+                callbackPump.trace(trace)
             }
         )
 
@@ -318,6 +344,8 @@ final class TransferState: ObservableObject {
 
     private func completeReceive(at fileURL: URL, transferID: UUID) {
         guard self.transferID == transferID else { return }
+        callbackPump?.flushPending()
+        callbackPump = nil
         activeReceiver = nil
         phase = .received
         completedFileURL = fileURL
@@ -330,6 +358,8 @@ final class TransferState: ObservableObject {
 
     private func failReceive(_ error: Error, transferID: UUID) {
         guard self.transferID == transferID else { return }
+        callbackPump?.flushPending()
+        callbackPump = nil
         activeReceiver = nil
         completedFileURL = nil
         lastScannedPayload = ""

@@ -29,6 +29,11 @@ struct ContentView: View {
                     }
                 }
             }
+            .onAppear {
+                #if DEBUG
+                transferState.receiveRuntimeInjectedPayloadIfConfigured()
+                #endif
+            }
         }
     }
 

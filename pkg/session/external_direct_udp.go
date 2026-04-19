@@ -134,6 +134,9 @@ var externalDirectUDPPreviewTransportCaps = probe.PreviewTransportCaps
 var externalDirectUDPProbeCandidates = publicProbeCandidates
 var externalDirectUDPProbeSendFn = probe.Send
 var externalDirectUDPProbeReceiveToWriterFn = probe.ReceiveToWriter
+var externalRelayUDPProbeReceiveToWriterFn = func(ctx context.Context, conn net.PacketConn, dst io.Writer, cfg probe.ReceiveConfig) (probe.TransferStats, error) {
+	return probe.ReceiveBlastParallelToWriter(ctx, []net.PacketConn{conn}, dst, cfg, 0)
+}
 var externalSendDirectUDPOnlyFn = sendExternalViaDirectUDPOnly
 var externalPrepareDirectUDPSendFn = externalPrepareDirectUDPSend
 var externalExecutePreparedDirectUDPSendFn = externalExecutePreparedDirectUDPSend
@@ -411,12 +414,16 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) (retErr error
 	if !cfg.ForceRelay {
 		localCandidates = externalDirectUDPFlattenCandidateSets(externalDirectUDPCandidateSets(ctx, probeConns, dm, portmaps))
 	}
+	claimParallel := len(probeConns)
+	if cfg.ForceRelay {
+		claimParallel = 0
+	}
 	claim := rendezvous.Claim{
 		Version:      tok.Version,
 		SessionID:    tok.SessionID,
 		DERPPublic:   derpPublicKeyRaw32(derpClient.PublicKey()),
 		QUICPublic:   claimIdentity.Public,
-		Parallel:     len(probeConns),
+		Parallel:     claimParallel,
 		Candidates:   localCandidates,
 		Capabilities: tok.Capabilities,
 	}
@@ -431,6 +438,9 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) (retErr error
 			return errors.New(decision.Reject.Reason)
 		}
 		return errors.New("claim rejected")
+	}
+	if decision.Accept == nil {
+		return errors.New("accepted decision missing accept payload")
 	}
 	ackCh, unsubscribeAck := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == listenerDERP && isAckOrAbortPayload(pkt.Payload)
@@ -468,7 +478,9 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) (retErr error
 	pathEmitter.SuppressWatcherDirect()
 	transportCtx, transportCancel := context.WithCancel(ctx)
 	defer transportCancel()
-	transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, tok, probeConn, dm, derpClient, listenerDERP, parseCandidateStrings(localCandidates), pm, cfg.ForceRelay)
+	remoteRelayOnly := externalDecisionRelayOnly(decision)
+	relayOnly := cfg.ForceRelay || remoteRelayOnly
+	transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, tok, probeConn, dm, derpClient, listenerDERP, parseCandidateStrings(localCandidates), pm, relayOnly)
 	if err != nil {
 		return err
 	}
@@ -479,12 +491,12 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) (retErr error
 	remoteCandidates := parseRemoteCandidateStrings(decision.Accept.Candidates)
 	punchCtx, punchCancel := context.WithCancel(transportCtx)
 	defer punchCancel()
-	if !cfg.ForceRelay {
+	if !relayOnly {
 		externalDirectUDPStartPunching(punchCtx, probeConns, remoteCandidates)
 	}
 
 	var sendErr error
-	if cfg.ForceRelay {
+	if relayOnly {
 		sendErr = sendExternalRelayUDP(ctx, countedSrc, transportManager, tok, cfg.Emitter)
 	} else {
 		sendErr = sendExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixSendConfig{
@@ -994,7 +1006,9 @@ func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (retTok s
 		probeConns := []net.PacketConn{session.probeConn}
 		portmaps := []publicPortmap{publicSessionPortmap(session)}
 		cleanupProbeConns := func() {}
-		if !cfg.ForceRelay {
+		peerRelayOnly := externalClaimRelayOnly(*env.Claim)
+		relayOnly := cfg.ForceRelay || peerRelayOnly
+		if !relayOnly {
 			probeConn, probeConns, portmaps, cleanupProbeConns, err = externalAcceptedDirectUDPSet(session.probeConn, publicSessionPortmap(session), cfg.Emitter)
 			if err != nil {
 				return tok, err
@@ -1002,10 +1016,11 @@ func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (retTok s
 		}
 		defer cleanupProbeConns()
 		pm := portmaps[0]
-		decision.Accept.Parallel = len(probeConns)
-		if !cfg.ForceRelay {
+		if !relayOnly {
+			decision.Accept.Parallel = len(probeConns)
 			decision.Accept.Candidates = externalDirectUDPFlattenCandidateSets(externalDirectUDPCandidateSets(ctx, probeConns, session.derpMap, portmaps))
 		} else {
+			decision.Accept.Parallel = 0
 			decision.Accept.Candidates = nil
 		}
 		localCandidates := parseCandidateStrings(decision.Accept.Candidates)
@@ -1023,7 +1038,7 @@ func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (retTok s
 
 		transportCtx, transportCancel := context.WithCancel(ctx)
 		defer transportCancel()
-		transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, session.token, probeConn, session.derpMap, session.derp, peerDERP, localCandidates, pm, cfg.ForceRelay)
+		transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, session.token, probeConn, session.derpMap, session.derp, peerDERP, localCandidates, pm, relayOnly)
 		if err != nil {
 			return tok, err
 		}
@@ -1035,7 +1050,7 @@ func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (retTok s
 		remoteCandidates := parseRemoteCandidateStrings(env.Claim.Candidates)
 		punchCtx, punchCancel := context.WithCancel(transportCtx)
 		defer punchCancel()
-		if !cfg.ForceRelay {
+		if !relayOnly {
 			externalDirectUDPStartPunching(punchCtx, probeConns, remoteCandidates)
 		}
 
@@ -1046,7 +1061,7 @@ func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (retTok s
 		countedDst = newByteCountingWriteCloser(dst)
 		defer countedDst.Close()
 		var relayPrefixPackets <-chan derpbind.Packet
-		if !cfg.ForceRelay {
+		if !relayOnly {
 			var unsubscribeRelayPrefix func()
 			relayPrefixPackets, unsubscribeRelayPrefix = session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
 				return pkt.From == peerDERP && externalRelayPrefixDERPFrameKindOf(pkt.Payload) != 0
@@ -1062,7 +1077,7 @@ func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (retTok s
 		}
 
 		var receiveErr error
-		if cfg.ForceRelay {
+		if relayOnly {
 			receiveErr = receiveExternalRelayUDP(ctx, countedDst, transportManager, session.token, cfg.Emitter)
 		} else {
 			receiveErr = receiveExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixReceiveConfig{
@@ -5313,6 +5328,13 @@ func sendExternalRelayUDP(ctx context.Context, src io.Reader, manager *transport
 		WindowSize: 4096,
 		RunID:      tok.SessionID,
 		PacketAEAD: packetAEAD,
+		// DERP is reliable per connection, but relay datagrams can still be
+		// dropped by local queues during high-rate transfers. Keep the blast
+		// repair path enabled for force-relay file correctness.
+		RepairPayloads:          true,
+		TailReplayBytes:         externalDirectUDPTailReplayBytes,
+		FECGroupSize:            externalDirectUDPFECGroupSize,
+		StreamReplayWindowBytes: externalDirectUDPStreamReplayBytes,
 	})
 	return err
 }
@@ -5329,11 +5351,14 @@ func receiveExternalRelayUDP(ctx context.Context, dst io.Writer, manager *transp
 	packetConn := newExternalPeerDatagramPacketConn(ctx, peerConn)
 	defer packetConn.Close()
 	receiveDst, flushDst := externalDirectUDPBufferedWriter(dst)
-	_, err = externalDirectUDPProbeReceiveToWriterFn(ctx, packetConn, "", receiveDst, probe.ReceiveConfig{
-		Raw:           true,
-		Blast:         true,
-		ExpectedRunID: tok.SessionID,
-		PacketAEAD:    packetAEAD,
+	_, err = externalRelayUDPProbeReceiveToWriterFn(ctx, packetConn, receiveDst, probe.ReceiveConfig{
+		Raw:             true,
+		Blast:           true,
+		ExpectedRunID:   tok.SessionID,
+		PacketAEAD:      packetAEAD,
+		RequireComplete: true,
+		FECGroupSize:    externalDirectUDPFECGroupSize,
+		SpoolOutput:     true,
 	})
 	if err == nil {
 		err = flushDst()

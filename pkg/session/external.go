@@ -2800,6 +2800,18 @@ func parseRemoteCandidateStrings(raw []string) []net.Addr {
 	return candidate.ParsePeerAddrs(raw)
 }
 
+func externalRelayOnlyRequested(parallel int, candidates []string) bool {
+	return parallel == 0 && len(candidates) == 0
+}
+
+func externalClaimRelayOnly(claim rendezvous.Claim) bool {
+	return externalRelayOnlyRequested(claim.Parallel, claim.Candidates)
+}
+
+func externalDecisionRelayOnly(decision rendezvous.Decision) bool {
+	return decision.Accept != nil && externalRelayOnlyRequested(decision.Accept.Parallel, decision.Accept.Candidates)
+}
+
 func cloneSessionAddr(addr net.Addr) net.Addr {
 	switch v := addr.(type) {
 	case *net.UDPAddr:

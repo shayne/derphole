@@ -159,6 +159,124 @@ func TestPublicRelayOnlyStdioRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPublicRelayOnlyStdioRoundTripWhenOnlySenderForcesRelay(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	var listenerOut bytes.Buffer
+	var listenerStatus syncBuffer
+	var senderStatus syncBuffer
+	tokenSink := make(chan string, 1)
+	listenErr := make(chan error, 1)
+	go func() {
+		_, err := Listen(ctx, ListenConfig{
+			Emitter:       telemetry.New(&listenerStatus, telemetry.LevelVerbose),
+			TokenSink:     tokenSink,
+			StdioOut:      &listenerOut,
+			UsePublicDERP: true,
+		})
+		listenErr <- err
+	}()
+
+	var token string
+	select {
+	case token = <-tokenSink:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for listener token: %v; listener=%q sender=%q", ctx.Err(), listenerStatus.String(), senderStatus.String())
+	}
+
+	if err := Send(ctx, SendConfig{
+		Token:         token,
+		Emitter:       telemetry.New(&senderStatus, telemetry.LevelVerbose),
+		StdioIn:       strings.NewReader("sender-forced relay payload"),
+		ForceRelay:    true,
+		UsePublicDERP: true,
+	}); err != nil {
+		cancel()
+		select {
+		case <-listenErr:
+		case <-time.After(time.Second):
+		}
+		t.Fatalf("Send() error = %v; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+	}
+
+	if err := <-listenErr; err != nil {
+		t.Fatalf("Listen() error = %v; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+	}
+	if got := listenerOut.String(); got != "sender-forced relay payload" {
+		t.Fatalf("listener output = %q, want %q", got, "sender-forced relay payload")
+	}
+	if got := senderStatus.String(); !strings.Contains(got, "udp-relay=true") {
+		t.Fatalf("sender status = %q, want UDP relay path", got)
+	}
+	if got := listenerStatus.String(); !strings.Contains(got, "udp-relay=true") || strings.Contains(got, "udp-handoff-receive-prepare-error") {
+		t.Fatalf("listener status = %q, want UDP relay path without direct handoff prepare", got)
+	}
+}
+
+func TestPublicRelayOnlyStdioRoundTripWhenOnlyListenerForcesRelay(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	var listenerOut bytes.Buffer
+	var listenerStatus syncBuffer
+	var senderStatus syncBuffer
+	tokenSink := make(chan string, 1)
+	listenErr := make(chan error, 1)
+	go func() {
+		_, err := Listen(ctx, ListenConfig{
+			Emitter:       telemetry.New(&listenerStatus, telemetry.LevelVerbose),
+			TokenSink:     tokenSink,
+			StdioOut:      &listenerOut,
+			ForceRelay:    true,
+			UsePublicDERP: true,
+		})
+		listenErr <- err
+	}()
+
+	var token string
+	select {
+	case token = <-tokenSink:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for listener token: %v; listener=%q sender=%q", ctx.Err(), listenerStatus.String(), senderStatus.String())
+	}
+
+	if err := Send(ctx, SendConfig{
+		Token:         token,
+		Emitter:       telemetry.New(&senderStatus, telemetry.LevelVerbose),
+		StdioIn:       strings.NewReader("listener-forced relay payload"),
+		UsePublicDERP: true,
+	}); err != nil {
+		cancel()
+		select {
+		case <-listenErr:
+		case <-time.After(time.Second):
+		}
+		t.Fatalf("Send() error = %v; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+	}
+
+	if err := <-listenErr; err != nil {
+		t.Fatalf("Listen() error = %v; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+	}
+	if got := listenerOut.String(); got != "listener-forced relay payload" {
+		t.Fatalf("listener output = %q, want %q", got, "listener-forced relay payload")
+	}
+	if got := senderStatus.String(); !strings.Contains(got, "udp-relay=true") {
+		t.Fatalf("sender status = %q, want UDP relay path", got)
+	}
+	if got := listenerStatus.String(); !strings.Contains(got, "udp-relay=true") || strings.Contains(got, "udp-handoff-receive-prepare-error") {
+		t.Fatalf("listener status = %q, want UDP relay path without direct handoff prepare", got)
+	}
+}
+
 func TestPublicRelayOnlyStdioRoundTripSingleStripe(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)

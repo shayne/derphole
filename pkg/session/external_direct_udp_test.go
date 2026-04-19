@@ -6494,15 +6494,21 @@ func TestSendExternalRelayUDPConfiguresPacketAEAD(t *testing.T) {
 	if captured.PacketAEAD == nil {
 		t.Fatal("PacketAEAD = nil, want token-derived AEAD")
 	}
+	if !captured.RepairPayloads {
+		t.Fatal("RepairPayloads = false, want force-relay repair support")
+	}
+	if captured.StreamReplayWindowBytes == 0 {
+		t.Fatal("StreamReplayWindowBytes = 0, want retained force-relay repair payloads")
+	}
 }
 
 func TestReceiveExternalRelayUDPConfiguresPacketAEAD(t *testing.T) {
-	prevReceive := externalDirectUDPProbeReceiveToWriterFn
-	t.Cleanup(func() { externalDirectUDPProbeReceiveToWriterFn = prevReceive })
+	prevReceive := externalRelayUDPProbeReceiveToWriterFn
+	t.Cleanup(func() { externalRelayUDPProbeReceiveToWriterFn = prevReceive })
 
 	tok := testExternalSessionToken(0x72)
 	var captured probe.ReceiveConfig
-	externalDirectUDPProbeReceiveToWriterFn = func(ctx context.Context, conn net.PacketConn, remoteAddr string, dst io.Writer, cfg probe.ReceiveConfig) (probe.TransferStats, error) {
+	externalRelayUDPProbeReceiveToWriterFn = func(ctx context.Context, conn net.PacketConn, dst io.Writer, cfg probe.ReceiveConfig) (probe.TransferStats, error) {
 		captured = cfg
 		if cfg.PacketAEAD == nil {
 			return probe.TransferStats{}, errors.New("missing PacketAEAD")
@@ -6537,6 +6543,15 @@ func TestReceiveExternalRelayUDPConfiguresPacketAEAD(t *testing.T) {
 	}
 	if captured.PacketAEAD == nil {
 		t.Fatal("PacketAEAD = nil, want token-derived AEAD")
+	}
+	if !captured.RequireComplete {
+		t.Fatal("RequireComplete = false, want force-relay receive to repair missing data")
+	}
+	if captured.FECGroupSize == 0 {
+		t.Fatal("FECGroupSize = 0, want force-relay FEC repair support")
+	}
+	if !captured.SpoolOutput {
+		t.Fatal("SpoolOutput = false, want force-relay receive to deduplicate repairs before writing")
 	}
 }
 

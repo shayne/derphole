@@ -55,6 +55,124 @@ func TestPublicRelayOnlyOfferedStdioRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPublicRelayOnlyOfferedStdioRoundTripWhenOnlyOfferForcesRelay(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	var senderStatus syncBuffer
+	var receiverStatus syncBuffer
+	tokenSink := make(chan string, 1)
+	offerErr := make(chan error, 1)
+	go func() {
+		_, err := Offer(ctx, OfferConfig{
+			Emitter:       telemetry.New(&senderStatus, telemetry.LevelVerbose),
+			TokenSink:     tokenSink,
+			StdioIn:       strings.NewReader("sender-forced relay payload"),
+			ForceRelay:    true,
+			UsePublicDERP: true,
+		})
+		offerErr <- err
+	}()
+
+	var token string
+	select {
+	case token = <-tokenSink:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for offered token: %v; sender=%q receiver=%q", ctx.Err(), senderStatus.String(), receiverStatus.String())
+	}
+
+	var receiverOut bytes.Buffer
+	if err := Receive(ctx, ReceiveConfig{
+		Token:         token,
+		Emitter:       telemetry.New(&receiverStatus, telemetry.LevelVerbose),
+		StdioOut:      &receiverOut,
+		UsePublicDERP: true,
+	}); err != nil {
+		cancel()
+		select {
+		case <-offerErr:
+		case <-time.After(time.Second):
+		}
+		t.Fatalf("Receive() error = %v; sender=%q receiver=%q", err, senderStatus.String(), receiverStatus.String())
+	}
+
+	if err := <-offerErr; err != nil {
+		t.Fatalf("Offer() error = %v; sender=%q receiver=%q", err, senderStatus.String(), receiverStatus.String())
+	}
+	if got := receiverOut.String(); got != "sender-forced relay payload" {
+		t.Fatalf("receiver output = %q, want %q", got, "sender-forced relay payload")
+	}
+	if got := senderStatus.String(); !strings.Contains(got, "udp-relay=true") {
+		t.Fatalf("sender status = %q, want UDP relay path", got)
+	}
+	if got := receiverStatus.String(); !strings.Contains(got, "udp-relay=true") || strings.Contains(got, "udp-handoff-receive-prepare-error") {
+		t.Fatalf("receiver status = %q, want UDP relay path without direct handoff prepare", got)
+	}
+}
+
+func TestPublicRelayOnlyOfferedStdioRoundTripWhenOnlyReceiveForcesRelay(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	var senderStatus syncBuffer
+	var receiverStatus syncBuffer
+	tokenSink := make(chan string, 1)
+	offerErr := make(chan error, 1)
+	go func() {
+		_, err := Offer(ctx, OfferConfig{
+			Emitter:       telemetry.New(&senderStatus, telemetry.LevelVerbose),
+			TokenSink:     tokenSink,
+			StdioIn:       strings.NewReader("receiver-forced relay payload"),
+			UsePublicDERP: true,
+		})
+		offerErr <- err
+	}()
+
+	var token string
+	select {
+	case token = <-tokenSink:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for offered token: %v; sender=%q receiver=%q", ctx.Err(), senderStatus.String(), receiverStatus.String())
+	}
+
+	var receiverOut bytes.Buffer
+	if err := Receive(ctx, ReceiveConfig{
+		Token:         token,
+		Emitter:       telemetry.New(&receiverStatus, telemetry.LevelVerbose),
+		StdioOut:      &receiverOut,
+		ForceRelay:    true,
+		UsePublicDERP: true,
+	}); err != nil {
+		cancel()
+		select {
+		case <-offerErr:
+		case <-time.After(time.Second):
+		}
+		t.Fatalf("Receive() error = %v; sender=%q receiver=%q", err, senderStatus.String(), receiverStatus.String())
+	}
+
+	if err := <-offerErr; err != nil {
+		t.Fatalf("Offer() error = %v; sender=%q receiver=%q", err, senderStatus.String(), receiverStatus.String())
+	}
+	if got := receiverOut.String(); got != "receiver-forced relay payload" {
+		t.Fatalf("receiver output = %q, want %q", got, "receiver-forced relay payload")
+	}
+	if got := senderStatus.String(); !strings.Contains(got, "udp-relay=true") {
+		t.Fatalf("sender status = %q, want UDP relay path", got)
+	}
+	if got := receiverStatus.String(); !strings.Contains(got, "udp-relay=true") || strings.Contains(got, "udp-handoff-receive-prepare-error") {
+		t.Fatalf("receiver status = %q, want UDP relay path without direct handoff prepare", got)
+	}
+}
+
 func TestOfferedStdioStartsRelayPayloadBeforeDelayedDirectPromotion(t *testing.T) {
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))

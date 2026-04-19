@@ -100,11 +100,13 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (retTok string, retErr 
 			return countedSrc.Count()
 		}, auth)
 
+		peerRelayOnly := externalClaimRelayOnly(*env.Claim)
+		relayOnly := cfg.ForceRelay || peerRelayOnly
 		probeConn := session.probeConn
 		probeConns := []net.PacketConn{session.probeConn}
 		portmaps := []publicPortmap{publicSessionPortmap(session)}
 		cleanupProbeConns := func() {}
-		if !cfg.ForceRelay {
+		if !relayOnly {
 			probeConn, probeConns, portmaps, cleanupProbeConns, err = externalAcceptedDirectUDPSet(session.probeConn, publicSessionPortmap(session), cfg.Emitter)
 			if err != nil {
 				return tok, err
@@ -112,10 +114,11 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (retTok string, retErr 
 		}
 		defer cleanupProbeConns()
 		pm := portmaps[0]
-		decision.Accept.Parallel = len(probeConns)
-		if !cfg.ForceRelay {
+		if !relayOnly {
+			decision.Accept.Parallel = len(probeConns)
 			decision.Accept.Candidates = externalDirectUDPFlattenCandidateSets(externalDirectUDPCandidateSets(ctx, probeConns, session.derpMap, portmaps))
 		} else {
+			decision.Accept.Parallel = 0
 			decision.Accept.Candidates = nil
 		}
 
@@ -139,7 +142,7 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (retTok string, retErr 
 
 		transportCtx, transportCancel := context.WithCancel(ctx)
 		defer transportCancel()
-		transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, session.token, probeConn, session.derpMap, session.derp, peerDERP, localCandidates, pm, cfg.ForceRelay)
+		transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, session.token, probeConn, session.derpMap, session.derp, peerDERP, localCandidates, pm, relayOnly)
 		if err != nil {
 			return tok, err
 		}
@@ -152,7 +155,7 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (retTok string, retErr 
 		remoteCandidates := parseRemoteCandidateStrings(env.Claim.Candidates)
 		punchCtx, punchCancel := context.WithCancel(transportCtx)
 		defer punchCancel()
-		if !cfg.ForceRelay {
+		if !relayOnly {
 			externalDirectUDPStartPunching(punchCtx, probeConns, remoteCandidates)
 		}
 
@@ -179,7 +182,7 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (retTok string, retErr 
 			ParallelPolicy:     cfg.ParallelPolicy,
 		}
 		var sendErr error
-		if cfg.ForceRelay {
+		if relayOnly {
 			sendErr = sendExternalRelayUDP(ctx, countedSrc, transportManager, session.token, cfg.Emitter)
 		} else {
 			sendErr = sendExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixSendConfig{
@@ -288,12 +291,16 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) (retErr error) {
 			cfg.Emitter.Debug("receive-direct-candidate-gather-finish count=" + strconv.Itoa(len(localCandidates)) + " elapsed_ms=" + strconv.FormatInt(time.Since(candidateStart).Milliseconds(), 10))
 		}
 	}
+	claimParallel := len(probeConns)
+	if cfg.ForceRelay {
+		claimParallel = 0
+	}
 	claim := rendezvous.Claim{
 		Version:      tok.Version,
 		SessionID:    tok.SessionID,
 		DERPPublic:   derpPublicKeyRaw32(derpClient.PublicKey()),
 		QUICPublic:   claimIdentity.Public,
-		Parallel:     len(probeConns),
+		Parallel:     claimParallel,
 		Candidates:   localCandidates,
 		Capabilities: tok.Capabilities,
 	}
@@ -351,7 +358,9 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) (retErr error) {
 
 	transportCtx, transportCancel := context.WithCancel(ctx)
 	defer transportCancel()
-	transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, tok, probeConn, dm, derpClient, listenerDERP, parseCandidateStrings(localCandidates), pm, cfg.ForceRelay)
+	remoteRelayOnly := externalDecisionRelayOnly(decision)
+	relayOnly := cfg.ForceRelay || remoteRelayOnly
+	transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, tok, probeConn, dm, derpClient, listenerDERP, parseCandidateStrings(localCandidates), pm, relayOnly)
 	if err != nil {
 		return err
 	}
@@ -363,7 +372,7 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) (retErr error) {
 	remoteCandidates := parseRemoteCandidateStrings(decision.Accept.Candidates)
 	punchCtx, punchCancel := context.WithCancel(transportCtx)
 	defer punchCancel()
-	if !cfg.ForceRelay {
+	if !relayOnly {
 		externalDirectUDPStartPunching(punchCtx, probeConns, remoteCandidates)
 	}
 
@@ -375,7 +384,7 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) (retErr error) {
 	defer countedDst.Close()
 
 	var receiveErr error
-	if cfg.ForceRelay {
+	if relayOnly {
 		receiveErr = receiveExternalRelayUDP(ctx, countedDst, transportManager, tok, cfg.Emitter)
 	} else {
 		listenCfg := ListenConfig{

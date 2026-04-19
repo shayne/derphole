@@ -88,6 +88,10 @@ xcodebuild -quiet test \
   CODE_SIGNING_ALLOWED="${CODE_SIGNING_ALLOWED:-NO}"
 """
 
+[tasks."apple:physical-transfer"]
+description = "Run a live CLI-to-physical-iPhone transfer test"
+run = "bash ./scripts/apple-physical-transfer.sh"
+
 [tasks."apple:mobile-tools"]
 description = "Install gomobile tools into dist/tools/bin"
 shell = "bash -c"
