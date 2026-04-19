@@ -52,6 +52,7 @@ type packetSubscriber struct {
 	queueMu    sync.Mutex
 	queue      []Packet
 	queueReady chan struct{}
+	queueSlots chan struct{}
 
 	deliverMu sync.Mutex
 	closed    bool
@@ -273,6 +274,7 @@ func (c *Client) subscribe(filter func(Packet) bool, mode subscriberMode) (<-cha
 	if mode == subscriberLossless {
 		sub.done = make(chan struct{})
 		sub.queueReady = make(chan struct{}, 1)
+		sub.queueSlots = make(chan struct{}, losslessSubscriberQueueSize)
 		go sub.run(c.stopCh)
 	}
 
@@ -425,9 +427,18 @@ func (s *packetSubscriber) enqueue(stopCh <-chan struct{}, pkt Packet) bool {
 	default:
 	}
 
+	select {
+	case s.queueSlots <- struct{}{}:
+	case <-s.done:
+		return false
+	case <-stopCh:
+		return false
+	}
+
 	s.queueMu.Lock()
 	if s.closed {
 		s.queueMu.Unlock()
+		<-s.queueSlots
 		return false
 	}
 	s.queue = append(s.queue, pkt)
@@ -468,11 +479,17 @@ func (s *packetSubscriber) run(stopCh <-chan struct{}) {
 		if !ok {
 			return
 		}
+		delivered := false
 		select {
 		case s.ch <- pkt:
+			delivered = true
 		case <-s.done:
-			return
 		case <-stopCh:
+		}
+		if s.queueSlots != nil {
+			<-s.queueSlots
+		}
+		if !delivered {
 			return
 		}
 	}
@@ -483,6 +500,8 @@ func (s *packetSubscriber) nextQueuedPacket(stopCh <-chan struct{}) (Packet, boo
 		s.queueMu.Lock()
 		if len(s.queue) > 0 {
 			pkt := s.queue[0]
+			var zero Packet
+			s.queue[0] = zero
 			s.queue = s.queue[1:]
 			s.queueMu.Unlock()
 			return pkt, true

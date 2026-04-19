@@ -551,7 +551,7 @@ func TestClientSubscribeLosslessRetainsAllBackedUpPackets(t *testing.T) {
 	}
 }
 
-func TestClientSubscribeLosslessDoesNotBlockDispatchWhenConsumerBacksUp(t *testing.T) {
+func TestClientSubscribeLosslessBlocksWhenQueueFull(t *testing.T) {
 	c := &Client{
 		stopCh:      make(chan struct{}),
 		subscribers: make(map[uint64]*packetSubscriber),
@@ -560,7 +560,91 @@ func TestClientSubscribeLosslessDoesNotBlockDispatchWhenConsumerBacksUp(t *testi
 	controlCh, unsubscribe := c.SubscribeLossless(func(Packet) bool { return true })
 	defer unsubscribe()
 
-	const total = losslessSubscriberQueueSize + 32
+	for i := 0; i < cap(controlCh); i++ {
+		if !c.dispatchSubscriber(Packet{Payload: []byte{byte(i)}}) {
+			t.Fatalf("dispatchSubscriber(channel-fill %d) = false, want true", i)
+		}
+	}
+	for i := 0; i < losslessSubscriberQueueSize; i++ {
+		if !c.dispatchSubscriber(Packet{Payload: []byte{byte(i + cap(controlCh))}}) {
+			t.Fatalf("dispatchSubscriber(queue-fill %d) = false, want true", i)
+		}
+	}
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- c.dispatchSubscriber(Packet{Payload: []byte("blocked")})
+	}()
+
+	select {
+	case handled := <-done:
+		t.Fatalf("dispatchSubscriber past hard limit returned %v, want blocked", handled)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	<-controlCh
+
+	select {
+	case handled := <-done:
+		if !handled {
+			t.Fatal("dispatchSubscriber after drain = false, want true")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("dispatchSubscriber did not unblock after drain")
+	}
+}
+
+func TestClientSubscribeLosslessUnsubscribeReleasesBlockedDispatch(t *testing.T) {
+	c := &Client{
+		stopCh:      make(chan struct{}),
+		subscribers: make(map[uint64]*packetSubscriber),
+	}
+
+	controlCh, unsubscribe := c.SubscribeLossless(func(Packet) bool { return true })
+	for i := 0; i < cap(controlCh); i++ {
+		if !c.dispatchSubscriber(Packet{Payload: []byte{byte(i)}}) {
+			t.Fatalf("dispatchSubscriber(channel-fill %d) = false, want true", i)
+		}
+	}
+	for i := 0; i < losslessSubscriberQueueSize; i++ {
+		if !c.dispatchSubscriber(Packet{Payload: []byte{byte(i + cap(controlCh))}}) {
+			t.Fatalf("dispatchSubscriber(queue-fill %d) = false, want true", i)
+		}
+	}
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- c.dispatchSubscriber(Packet{Payload: []byte("blocked")})
+	}()
+
+	select {
+	case handled := <-done:
+		t.Fatalf("dispatchSubscriber past hard limit returned %v, want blocked", handled)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	unsubscribe()
+
+	select {
+	case handled := <-done:
+		if handled {
+			t.Fatal("dispatchSubscriber after unsubscribe = true, want false")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("dispatchSubscriber did not unblock after unsubscribe")
+	}
+}
+
+func TestClientSubscribeLosslessDoesNotBlockBeforeHardLimit(t *testing.T) {
+	c := &Client{
+		stopCh:      make(chan struct{}),
+		subscribers: make(map[uint64]*packetSubscriber),
+	}
+
+	controlCh, unsubscribe := c.SubscribeLossless(func(Packet) bool { return true })
+	defer unsubscribe()
+
+	const total = losslessSubscriberQueueSize
 	done := make(chan bool, 1)
 	go func() {
 		handled := true
