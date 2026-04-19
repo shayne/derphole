@@ -50,6 +50,7 @@ type ReceiveConfig struct {
 	UsePublicDERP  bool
 	ForceRelay     bool
 	ParallelPolicy session.ParallelPolicy
+	Progress       func(current, total int64)
 }
 
 type directorySummary struct {
@@ -188,7 +189,7 @@ func Receive(ctx context.Context, cfg ReceiveConfig) error {
 		}
 
 		WriteReceiveToken(cfg.Stderr, token)
-		readErr := readTransfer(pipeReader, token, cfg.Stdout, cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput)
+		readErr := readTransfer(pipeReader, token, cfg.Stdout, cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput, cfg.Progress)
 		listenErr := <-listenErrCh
 		return preferSessionPipeError(readErr, listenErr)
 	}
@@ -226,7 +227,7 @@ func Receive(ctx context.Context, cfg ReceiveConfig) error {
 			}
 			receiveErrCh <- err
 		}()
-		readErr := readTransfer(pipeReader, receiveToken, cfg.Stdout, cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput)
+		readErr := readTransfer(pipeReader, receiveToken, cfg.Stdout, cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput, cfg.Progress)
 		receiveErr := <-receiveErrCh
 		return preferSessionPipeError(readErr, receiveErr)
 	case tok.Capabilities&token.CapabilityStdio != 0:
@@ -243,7 +244,7 @@ func Receive(ctx context.Context, cfg ReceiveConfig) error {
 			return err
 		}
 		defer conn.Close()
-		return readTransfer(conn, receiveToken, cfg.Stdout, cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput)
+		return readTransfer(conn, receiveToken, cfg.Stdout, cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput, cfg.Progress)
 	case tok.Capabilities&token.CapabilityWebFile != 0:
 		return receiveViaWebRelay(ctx, cfg, receiveToken)
 	default:
@@ -252,7 +253,7 @@ func Receive(ctx context.Context, cfg ReceiveConfig) error {
 }
 
 func receiveViaWebRelay(ctx context.Context, cfg ReceiveConfig, receiveToken string) error {
-	sink := newNativeWebFileSink(cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput)
+	sink := newNativeWebFileSink(cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput, cfg.Progress)
 	cb := webrelay.Callbacks{
 		Status: func(status string) {
 			if cfg.Emitter != nil {
@@ -484,7 +485,7 @@ func sendViaSession(ctx context.Context, cfg SendConfig, tx sendTransfer) error 
 	return err
 }
 
-func readTransfer(r io.Reader, token string, stdout io.Writer, outputPath string, stderr, progressOut io.Writer) error {
+func readTransfer(r io.Reader, token string, stdout io.Writer, outputPath string, stderr, progressOut io.Writer, progress func(current, total int64)) error {
 	if stdout == nil {
 		stdout = io.Discard
 	}
@@ -503,15 +504,15 @@ func readTransfer(r io.Reader, token string, stdout io.Writer, outputPath string
 		_, err = io.Copy(stdout, reader)
 		return err
 	case protocol.KindFile:
-		return receiveFile(reader, header, outputPath, stderr, progressOut)
+		return receiveFile(reader, header, outputPath, stderr, progressOut, progress)
 	case protocol.KindDirectoryTar:
-		return receiveDirectory(reader, header, outputPath, stderr, progressOut)
+		return receiveDirectory(reader, header, outputPath, stderr, progressOut, progress)
 	default:
 		return fmt.Errorf("unsupported derphole transfer kind %q", header.Kind)
 	}
 }
 
-func receiveFile(r io.Reader, header protocol.Header, outputPath string, stderr, progressOut io.Writer) error {
+func receiveFile(r io.Reader, header protocol.Header, outputPath string, stderr, progressOut io.Writer, progressCallback func(current, total int64)) error {
 	target, err := ResolveOutputPath(outputPath, header.Name)
 	if err != nil {
 		return err
@@ -531,7 +532,7 @@ func receiveFile(r io.Reader, header protocol.Header, outputPath string, stderr,
 	}
 	defer f.Close()
 
-	progress := NewProgressReporter(progressOut, header.Size)
+	progress := NewProgressReporterWithCallback(progressOut, header.Size, progressCallback)
 	if progress != nil {
 		r = progress.Wrap(r)
 	}
@@ -548,6 +549,9 @@ func receiveFile(r io.Reader, header protocol.Header, outputPath string, stderr,
 		return err
 	}
 	_, err = io.Copy(f, r)
+	if err == nil {
+		progress.Finish()
+	}
 	return err
 }
 
@@ -556,14 +560,16 @@ type nativeWebFileSink struct {
 	stderr      io.Writer
 	progressOut io.Writer
 	progress    *ProgressReporter
+	onProgress  func(current, total int64)
 	file        *os.File
 }
 
-func newNativeWebFileSink(outputPath string, stderr, progressOut io.Writer) *nativeWebFileSink {
+func newNativeWebFileSink(outputPath string, stderr, progressOut io.Writer, progress func(current, total int64)) *nativeWebFileSink {
 	return &nativeWebFileSink{
 		outputPath:  outputPath,
 		stderr:      stderr,
 		progressOut: progressOut,
+		onProgress:  progress,
 	}
 }
 
@@ -586,7 +592,7 @@ func (s *nativeWebFileSink) Open(_ context.Context, meta webproto.Meta) error {
 		return err
 	}
 	s.file = f
-	s.progress = NewProgressReporter(s.progressOut, meta.Size)
+	s.progress = NewProgressReporterWithCallback(s.progressOut, meta.Size, s.onProgress)
 	return nil
 }
 
@@ -621,7 +627,7 @@ func (s *nativeWebFileSink) Close(_ context.Context) error {
 	return nil
 }
 
-func receiveDirectory(r io.Reader, header protocol.Header, outputPath string, stderr, progressOut io.Writer) error {
+func receiveDirectory(r io.Reader, header protocol.Header, outputPath string, stderr, progressOut io.Writer, progressCallback func(current, total int64)) error {
 	destRoot, topLevel, err := ResolveDirectoryOutput(outputPath, header.Name)
 	if err != nil {
 		return err
@@ -632,7 +638,7 @@ func receiveDirectory(r io.Reader, header protocol.Header, outputPath string, st
 			fmt.Fprintf(stderr, "%d files, %s (uncompressed)\n", meta.FileCount, formatProgressBytes(meta.UncompressedBytes))
 		}
 	}
-	progress := NewProgressReporter(progressOut, header.Size)
+	progress := NewProgressReporterWithCallback(progressOut, header.Size, progressCallback)
 	if progress != nil {
 		r = progress.Wrap(r)
 	}

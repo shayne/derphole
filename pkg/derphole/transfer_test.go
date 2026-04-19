@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,7 +25,7 @@ func TestSendTextIssuesTokenAndTransfersPayload(t *testing.T) {
 	defer cancel()
 
 	sendDone := make(chan error, 1)
-	var sendStderr bytes.Buffer
+	var sendStderr synchronizedBuffer
 	go func() {
 		sendDone <- Send(ctx, SendConfig{
 			Text:   "hello derphole",
@@ -52,7 +53,8 @@ func TestReceiveAllocateIssuesTokenAndAcceptsText(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	var recvOut, recvErr bytes.Buffer
+	var recvOut bytes.Buffer
+	var recvErr synchronizedBuffer
 	recvDone := make(chan error, 1)
 	go func() {
 		recvDone <- Receive(ctx, ReceiveConfig{
@@ -88,7 +90,7 @@ func TestSendFileTransfersSuggestedFilename(t *testing.T) {
 	}
 
 	recvDir := t.TempDir()
-	var sendErr bytes.Buffer
+	var sendErr synchronizedBuffer
 	sendDone := make(chan error, 1)
 	go func() {
 		sendDone <- Send(ctx, SendConfig{
@@ -134,7 +136,7 @@ func TestSendDirectoryTransfersTopLevelDirectory(t *testing.T) {
 	}
 
 	recvDir := t.TempDir()
-	var sendErr bytes.Buffer
+	var sendErr synchronizedBuffer
 	sendDone := make(chan error, 1)
 	go func() {
 		sendDone <- Send(ctx, SendConfig{
@@ -183,7 +185,8 @@ func TestSendFileReportsProgressOnBothSides(t *testing.T) {
 	}
 
 	recvDir := t.TempDir()
-	var sendErr, recvErr bytes.Buffer
+	var sendErr synchronizedBuffer
+	var recvErr bytes.Buffer
 	sendDone := make(chan error, 1)
 	go func() {
 		sendDone <- Send(ctx, SendConfig{
@@ -218,7 +221,8 @@ func TestSendTextDoesNotEmitProgressBar(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	var sendErr, recvErr, out bytes.Buffer
+	var sendErr synchronizedBuffer
+	var recvErr, out bytes.Buffer
 	sendDone := make(chan error, 1)
 	go func() {
 		sendDone <- Send(ctx, SendConfig{
@@ -251,6 +255,48 @@ func TestSendTextDoesNotEmitProgressBar(t *testing.T) {
 	}
 	if strings.Contains(recvErr.String(), "100%|") {
 		t.Fatalf("receive stderr = %q, want no progress bar for text", recvErr.String())
+	}
+}
+
+func TestReceiveFileReportsProgressCallback(t *testing.T) {
+	var buf bytes.Buffer
+	header := protocol.Header{Version: 1, Kind: protocol.KindFile, Name: "payload.txt", Size: 5}
+	if err := protocol.WriteHeader(&buf, header); err != nil {
+		t.Fatalf("WriteHeader() error = %v", err)
+	}
+	buf.WriteString("hello")
+
+	var events [][2]int64
+	err := readTransfer(&buf, "", io.Discard, t.TempDir(), io.Discard, nil, func(current, total int64) {
+		events = append(events, [2]int64{current, total})
+	})
+	if err != nil {
+		t.Fatalf("readTransfer() error = %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatal("progress callback was not called")
+	}
+	if got := events[len(events)-1]; got != [2]int64{5, 5} {
+		t.Fatalf("last progress event = %v, want [5 5]", got)
+	}
+}
+
+func TestReceiveZeroByteFileReportsFinalProgressCallback(t *testing.T) {
+	var buf bytes.Buffer
+	header := protocol.Header{Version: 1, Kind: protocol.KindFile, Name: "empty.txt", Size: 0}
+	if err := protocol.WriteHeader(&buf, header); err != nil {
+		t.Fatalf("WriteHeader() error = %v", err)
+	}
+
+	var events [][2]int64
+	err := readTransfer(&buf, "", io.Discard, t.TempDir(), io.Discard, nil, func(current, total int64) {
+		events = append(events, [2]int64{current, total})
+	})
+	if err != nil {
+		t.Fatalf("readTransfer() error = %v", err)
+	}
+	if len(events) != 1 || events[0] != [2]int64{0, 0} {
+		t.Fatalf("progress events = %v, want [[0 0]]", events)
 	}
 }
 
@@ -487,7 +533,7 @@ func (fakeWebDirect) Close() error                 { return nil }
 func TestNativeWebFileSinkWritesFileAndProgress(t *testing.T) {
 	dir := t.TempDir()
 	var stderr bytes.Buffer
-	sink := newNativeWebFileSink(dir, &stderr, &stderr)
+	sink := newNativeWebFileSink(dir, &stderr, &stderr, nil)
 
 	if err := sink.Open(context.Background(), webproto.Meta{Name: "../payload.txt", Size: 5}); err != nil {
 		t.Fatalf("Open() error = %v", err)
@@ -807,7 +853,24 @@ func TestSendPassesKnownFileWireSizeToSession(t *testing.T) {
 	}
 }
 
-func waitForTokenLine(t *testing.T, stderr *bytes.Buffer) string {
+type synchronizedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *synchronizedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func waitForTokenLine(t *testing.T, stderr interface{ String() string }) string {
 	t.Helper()
 
 	deadline := time.Now().Add(2 * time.Second)

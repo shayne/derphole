@@ -27,12 +27,18 @@ type ProgressReporter struct {
 	rateSeconds   progressEMA
 	wroteLine     bool
 	lastLineLen   int
+	onProgress    func(current, total int64)
+	lastCallback  time.Time
 	mu            sync.Mutex
 	current       int64
 }
 
 func NewProgressReporter(out io.Writer, total int64) *ProgressReporter {
-	if out == nil || total < 0 {
+	return NewProgressReporterWithCallback(out, total, nil)
+}
+
+func NewProgressReporterWithCallback(out io.Writer, total int64, onProgress func(current, total int64)) *ProgressReporter {
+	if (out == nil && onProgress == nil) || total < 0 {
 		return nil
 	}
 	now := progressNow()
@@ -44,6 +50,7 @@ func NewProgressReporter(out io.Writer, total int64) *ProgressReporter {
 		lastRateTime: now,
 		rateBytes:    newProgressEMA(progressRateSmoothing),
 		rateSeconds:  newProgressEMA(progressRateSmoothing),
+		onProgress:   onProgress,
 	}
 }
 
@@ -59,19 +66,42 @@ func (p *ProgressReporter) Add(n int) {
 		return
 	}
 
+	var onProgress func(current, total int64)
+	var callbackCurrent, callbackTotal int64
+
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	p.current += int64(n)
+	callbackCurrent = p.current
+	callbackTotal = p.total
 	if p.current >= p.total {
+		if p.shouldCallbackLocked(time.Time{}) {
+			onProgress = p.onProgress
+		}
+		p.mu.Unlock()
+		if onProgress != nil {
+			onProgress(callbackCurrent, callbackTotal)
+		}
 		return
 	}
 	now := progressNow()
+	if p.shouldCallbackLocked(now) {
+		onProgress = p.onProgress
+	}
 	if now.Sub(p.lastRender) < 100*time.Millisecond && p.current < p.total {
+		p.mu.Unlock()
+		if onProgress != nil {
+			onProgress(callbackCurrent, callbackTotal)
+		}
 		return
 	}
 	p.lastRender = now
 	p.renderLocked(false, now)
+	p.mu.Unlock()
+
+	if onProgress != nil {
+		onProgress(callbackCurrent, callbackTotal)
+	}
 }
 
 func (p *ProgressReporter) Finish() {
@@ -79,13 +109,23 @@ func (p *ProgressReporter) Finish() {
 		return
 	}
 
+	var onProgress func(current, total int64)
+	var callbackCurrent, callbackTotal int64
+
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	if p.current < p.total {
 		p.current = p.total
 	}
+	onProgress = p.onProgress
+	callbackCurrent = p.current
+	callbackTotal = p.total
 	p.renderLocked(true, progressNow())
+	p.mu.Unlock()
+
+	if onProgress != nil {
+		onProgress(callbackCurrent, callbackTotal)
+	}
 }
 
 func (p *ProgressReporter) Abort() {
@@ -97,11 +137,18 @@ func (p *ProgressReporter) Abort() {
 	defer p.mu.Unlock()
 
 	if p.wroteLine {
+		if p.out == nil {
+			return
+		}
 		fmt.Fprintln(p.out)
 	}
 }
 
 func (p *ProgressReporter) renderLocked(final bool, now time.Time) {
+	if p.out == nil {
+		return
+	}
+
 	elapsed := now.Sub(p.start)
 	if elapsed <= 0 {
 		elapsed = time.Millisecond
@@ -154,6 +201,27 @@ func (p *ProgressReporter) renderLocked(final bool, now time.Time) {
 		fmt.Fprintln(p.out)
 		p.lastLineLen = 0
 	}
+}
+
+func (p *ProgressReporter) shouldCallbackLocked(now time.Time) bool {
+	if p.onProgress == nil {
+		return false
+	}
+	if p.lastCallback.IsZero() {
+		if now.IsZero() {
+			now = progressNow()
+		}
+		p.lastCallback = now
+		return true
+	}
+	if now.IsZero() {
+		now = progressNow()
+	}
+	if now.Sub(p.lastCallback) < 100*time.Millisecond {
+		return false
+	}
+	p.lastCallback = now
+	return true
 }
 
 func (p *ProgressReporter) rateLocked(final bool, now time.Time, elapsed time.Duration) float64 {

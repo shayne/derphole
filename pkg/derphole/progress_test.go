@@ -57,6 +57,75 @@ func TestProgressReporterClearsStaleTrailingCharacters(t *testing.T) {
 	}
 }
 
+func TestProgressReporterCallbackRunsWithoutWriter(t *testing.T) {
+	var events [][2]int64
+	progress := NewProgressReporterWithCallback(nil, 10, func(current, total int64) {
+		events = append(events, [2]int64{current, total})
+	})
+	if progress == nil {
+		t.Fatal("progress = nil, want reporter when callback is set")
+	}
+	progress.Add(4)
+	progress.Finish()
+
+	if len(events) == 0 {
+		t.Fatal("progress callback was not called")
+	}
+	if got := events[len(events)-1]; got != [2]int64{10, 10} {
+		t.Fatalf("last progress event = %v, want [10 10]", got)
+	}
+}
+
+func TestProgressReporterCallbackIsThrottledAndFinalAlwaysRuns(t *testing.T) {
+	start := time.Unix(0, 0)
+	now := start
+	prevProgressNow := progressNow
+	progressNow = func() time.Time { return now }
+	t.Cleanup(func() { progressNow = prevProgressNow })
+
+	var events [][2]int64
+	progress := NewProgressReporterWithCallback(nil, 10, func(current, total int64) {
+		events = append(events, [2]int64{current, total})
+	})
+
+	progress.Add(1)
+	now = start.Add(50 * time.Millisecond)
+	progress.Add(1)
+	now = start.Add(100 * time.Millisecond)
+	progress.Add(1)
+	progress.Finish()
+
+	want := [][2]int64{{1, 10}, {3, 10}, {10, 10}}
+	if len(events) != len(want) {
+		t.Fatalf("events = %v, want %v", events, want)
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Fatalf("events[%d] = %v, want %v; all events = %v", i, events[i], want[i], events)
+		}
+	}
+}
+
+func TestProgressReporterCallbackRunsOutsideLock(t *testing.T) {
+	var progress *ProgressReporter
+	progress = NewProgressReporterWithCallback(nil, 2, func(current, total int64) {
+		if current == 1 {
+			progress.Finish()
+		}
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		progress.Add(1)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("progress callback appears to run while holding the reporter lock")
+	}
+}
+
 func lastRawProgressLine(output string) string {
 	index := strings.LastIndex(output, "\r")
 	if index < 0 {
