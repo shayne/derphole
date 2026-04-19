@@ -169,7 +169,6 @@ function bindWritableStream(stream) {
 function makeProgress(output, statusEl) {
   const state = {
     started: performance.now(),
-    samples: [],
     bytes: 0,
     total: -1,
   };
@@ -185,7 +184,6 @@ function makeProgress(output, statusEl) {
       progress(bytes, total) {
         state.bytes = bytes;
         state.total = total;
-        recordSample(state, bytes);
         render();
       },
       trace(value) {
@@ -214,15 +212,6 @@ function makeDirectTransport(progress) {
   return direct;
 }
 
-function recordSample(state, bytes) {
-  const now = performance.now();
-  state.samples.push({ time: now, bytes });
-  const cutoff = now - 5000;
-  while (state.samples.length > 2 && state.samples[0].time < cutoff) {
-    state.samples.shift();
-  }
-}
-
 function formatProgress(state) {
   const total = state.total > 0 ? state.total : state.bytes;
   const ratio = total > 0 ? Math.min(1, state.bytes / total) : 0;
@@ -231,22 +220,16 @@ function formatProgress(state) {
   const fill = Math.round(ratio * width);
   const bar = `${"#".repeat(fill)}${".".repeat(width - fill)}`;
   const elapsed = (performance.now() - state.started) / 1000;
-  const rate = currentRate(state);
+  const rate = averageRate(state, elapsed);
   const remaining = rate > 0 && total > state.bytes ? (total - state.bytes) / rate : 0;
   return `${percent}%|${bar}| ${formatBytes(state.bytes)}/${formatBytes(total)} [${formatDuration(elapsed)}<${formatDuration(remaining)}, ${formatBytes(rate)}/s]`;
 }
 
-function currentRate(state) {
-  if (state.samples.length < 2) {
+function averageRate(state, elapsed) {
+  if (elapsed <= 0) {
     return 0;
   }
-  const first = state.samples[0];
-  const last = state.samples[state.samples.length - 1];
-  const seconds = (last.time - first.time) / 1000;
-  if (seconds <= 0) {
-    return 0;
-  }
-  return Math.max(0, (last.bytes - first.bytes) / seconds);
+  return Math.max(0, state.bytes / elapsed);
 }
 
 function formatBytes(value) {
