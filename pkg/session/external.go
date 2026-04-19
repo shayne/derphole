@@ -2359,8 +2359,9 @@ func sendClaimAndReceiveDecision(
 	client *derpbind.Client,
 	dst key.NodePublic,
 	claim rendezvous.Claim,
+	authOpt ...externalPeerControlAuth,
 ) (rendezvous.Decision, error) {
-	return sendClaimAndReceiveDecisionWithTelemetry(ctx, client, dst, claim, nil, "")
+	return sendClaimAndReceiveDecisionWithTelemetry(ctx, client, dst, claim, nil, "", authOpt...)
 }
 
 func sendClaimAndReceiveDecisionWithTelemetry(
@@ -2370,7 +2371,9 @@ func sendClaimAndReceiveDecisionWithTelemetry(
 	claim rendezvous.Claim,
 	emitter *telemetry.Emitter,
 	prefix string,
+	authOpt ...externalPeerControlAuth,
 ) (rendezvous.Decision, error) {
+	auth := optionalPeerControlAuth(authOpt)
 	decisionCh, unsubscribe := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == dst && isDecisionOrAbortPayload(pkt.Payload)
 	})
@@ -2380,7 +2383,7 @@ func sendClaimAndReceiveDecisionWithTelemetry(
 	if emitter != nil {
 		emitter.Debug(prefix + "claim-send-attempt=" + strconv.Itoa(attempt))
 	}
-	if err := sendEnvelope(ctx, client, dst, envelope{Type: envelopeClaim, Claim: &claim}); err != nil {
+	if err := sendAuthenticatedEnvelope(ctx, client, dst, envelope{Type: envelopeClaim, Claim: &claim}, auth); err != nil {
 		return rendezvous.Decision{}, fmt.Errorf("send claim: %w", err)
 	}
 	if emitter != nil {
@@ -2396,7 +2399,10 @@ func sendClaimAndReceiveDecisionWithTelemetry(
 			if !ok {
 				return rendezvous.Decision{}, net.ErrClosed
 			}
-			env, err := decodeEnvelope(pkt.Payload)
+			env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+			if ignoreAuthenticatedEnvelopeError(err, auth) {
+				continue
+			}
 			if err != nil {
 				continue
 			}
@@ -2415,7 +2421,7 @@ func sendClaimAndReceiveDecisionWithTelemetry(
 			if emitter != nil {
 				emitter.Debug(prefix + "claim-send-attempt=" + strconv.Itoa(attempt))
 			}
-			if err := sendEnvelope(ctx, client, dst, envelope{Type: envelopeClaim, Claim: &claim}); err != nil {
+			if err := sendAuthenticatedEnvelope(ctx, client, dst, envelope{Type: envelopeClaim, Claim: &claim}, auth); err != nil {
 				return rendezvous.Decision{}, fmt.Errorf("resend claim: %w", err)
 			}
 			if emitter != nil {

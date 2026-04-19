@@ -264,7 +264,8 @@ func sendExternalViaWGTunnel(ctx context.Context, cfg SendConfig) (retErr error)
 		Capabilities: tok.Capabilities,
 	}
 	claim.BearerMAC = rendezvous.ComputeBearerMAC(tok.BearerSecret, claim)
-	decision, err := sendClaimAndReceiveDecision(ctx, derpClient, listenerDERP, claim)
+	auth := externalPeerControlAuthForToken(tok)
+	decision, err := sendClaimAndReceiveDecision(ctx, derpClient, listenerDERP, claim, auth)
 	if err != nil {
 		return err
 	}
@@ -286,7 +287,6 @@ func sendExternalViaWGTunnel(ctx context.Context, cfg SendConfig) (retErr error)
 		return pkt.From == listenerDERP && isHeartbeatPayload(pkt.Payload)
 	})
 	defer unsubscribeHeartbeat()
-	auth := externalPeerControlAuthForToken(tok)
 	ctx, stopPeerAbort := withPeerControlContext(ctx, derpClient, listenerDERP, abortCh, heartbeatCh, func() int64 {
 		return countedSrc.Count()
 	}, auth)
@@ -356,6 +356,7 @@ func listenExternalViaWGTunnel(ctx context.Context, cfg ListenConfig) (retTok st
 		return isClaimPayload(pkt.Payload)
 	})
 	defer unsubscribeClaims()
+	auth := externalPeerControlAuthForToken(session.token)
 
 	if cfg.TokenSink != nil {
 		select {
@@ -373,7 +374,10 @@ func listenExternalViaWGTunnel(ctx context.Context, cfg ListenConfig) (retTok st
 			}
 			return tok, err
 		}
-		env, err := decodeEnvelope(pkt.Payload)
+		env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+		if ignoreAuthenticatedEnvelopeError(err, auth) {
+			continue
+		}
 		if err != nil || env.Type != envelopeClaim || env.Claim == nil {
 			continue
 		}
@@ -381,7 +385,7 @@ func listenExternalViaWGTunnel(ctx context.Context, cfg ListenConfig) (retTok st
 		peerDERP := key.NodePublicFromRaw32(mem.B(env.Claim.DERPPublic[:]))
 		decision, _ := session.gate.Accept(time.Now(), *env.Claim)
 		if !decision.Accepted {
-			if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
+			if err := sendAuthenticatedEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}, auth); err != nil {
 				return tok, err
 			}
 			continue
@@ -410,7 +414,7 @@ func listenExternalViaWGTunnel(ctx context.Context, cfg ListenConfig) (retTok st
 				return 0
 			}
 			return countedDst.Count()
-		})
+		}, auth)
 		decision.Accept.Parallel = clampExternalWGParallel(env.Claim.Parallel)
 
 		decision.Accept.Candidates = publicInitialProbeCandidates(session.probeConn, publicSessionPortmap(session))
@@ -421,7 +425,6 @@ func listenExternalViaWGTunnel(ctx context.Context, cfg ListenConfig) (retTok st
 
 		transportCtx, transportCancel := context.WithCancel(ctx)
 		defer transportCancel()
-		auth := externalPeerControlAuthForToken(session.token)
 		transportManager, transportCleanup, err := startExternalWGTransportManager(transportCtx, session.probeConn, session.derpMap, session.derp, peerDERP, localCandidates, publicSessionPortmap(session), cfg.ForceRelay, auth)
 		if err != nil {
 			return tok, err
@@ -460,7 +463,7 @@ func listenExternalViaWGTunnel(ctx context.Context, cfg ListenConfig) (retTok st
 		}
 		defer ln.Close()
 
-		if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
+		if err := sendAuthenticatedEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}, auth); err != nil {
 			return tok, err
 		}
 		if cfg.Emitter != nil {

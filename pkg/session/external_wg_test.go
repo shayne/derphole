@@ -728,6 +728,7 @@ func TestSendExternalViaWGTunnelAgainstManualListener(t *testing.T) {
 	defer deleteRelayMailbox(tokStr, session)
 	defer closePublicSessionTransport(session)
 	defer session.derp.Close()
+	auth := externalPeerControlAuthForToken(session.token)
 
 	claimCh, unsubscribeClaims := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return isClaimPayload(pkt.Payload)
@@ -742,7 +743,7 @@ func TestSendExternalViaWGTunnelAgainstManualListener(t *testing.T) {
 			listenerErr <- err
 			return
 		}
-		env, err := decodeEnvelope(pkt.Payload)
+		env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
 		if err != nil || env.Type != envelopeClaim || env.Claim == nil {
 			listenerErr <- io.ErrUnexpectedEOF
 			return
@@ -769,6 +770,7 @@ func TestSendExternalViaWGTunnelAgainstManualListener(t *testing.T) {
 			parseCandidateStrings(decision.Accept.Candidates),
 			publicSessionPortmap(session),
 			true,
+			auth,
 		)
 		if err != nil {
 			listenerErr <- err
@@ -801,10 +803,10 @@ func TestSendExternalViaWGTunnelAgainstManualListener(t *testing.T) {
 		}
 		defer ln.Close()
 
-		if err := sendEnvelope(ctx, session.derp, keyNodePublicFromRaw32(env.Claim.DERPPublic), envelope{
+		if err := sendAuthenticatedEnvelope(ctx, session.derp, keyNodePublicFromRaw32(env.Claim.DERPPublic), envelope{
 			Type:     envelopeDecision,
 			Decision: &decision,
-		}); err != nil {
+		}, auth); err != nil {
 			listenerErr <- err
 			return
 		}
@@ -863,6 +865,7 @@ func TestListenExternalViaWGTunnelAgainstManualSender(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Decode() error = %v", err)
 	}
+	auth := externalPeerControlAuthForToken(tok)
 	dm, err := derpbind.FetchMap(ctx, publicDERPMapURL())
 	if err != nil {
 		t.Fatalf("FetchMap() error = %v", err)
@@ -897,7 +900,7 @@ func TestListenExternalViaWGTunnelAgainstManualSender(t *testing.T) {
 		Capabilities: tok.Capabilities,
 	}
 	claim.BearerMAC = rendezvous.ComputeBearerMAC(tok.BearerSecret, claim)
-	decision, err := sendClaimAndReceiveDecision(ctx, senderDERP, keyNodePublicFromRaw32(tok.DERPPublic), claim)
+	decision, err := sendClaimAndReceiveDecision(ctx, senderDERP, keyNodePublicFromRaw32(tok.DERPPublic), claim, auth)
 	if err != nil {
 		t.Fatalf("sendClaimAndReceiveDecision() error = %v", err)
 	}
@@ -914,6 +917,7 @@ func TestListenExternalViaWGTunnelAgainstManualSender(t *testing.T) {
 		nil,
 		nil,
 		true,
+		auth,
 	)
 	if err != nil {
 		t.Fatalf("startExternalWGTransportManager(sender) error = %v", err)
@@ -968,6 +972,7 @@ func runExternalWGTunnelIssuedPublicSessionPiecesWithTransportManager(t *testing
 	defer deleteRelayMailbox(tokStr, session)
 	defer closePublicSessionTransport(session)
 	defer session.derp.Close()
+	auth := externalPeerControlAuthForToken(session.token)
 
 	tok, err := token.Decode(tokStr, time.Now())
 	if err != nil {
@@ -1013,7 +1018,7 @@ func runExternalWGTunnelIssuedPublicSessionPiecesWithTransportManager(t *testing
 			listenerErr <- err
 			return
 		}
-		env, err := decodeEnvelope(pkt.Payload)
+		env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
 		if err != nil || env.Type != envelopeClaim || env.Claim == nil {
 			listenerErr <- io.ErrUnexpectedEOF
 			return
@@ -1040,6 +1045,7 @@ func runExternalWGTunnelIssuedPublicSessionPiecesWithTransportManager(t *testing
 			parseCandidateStrings(decision.Accept.Candidates),
 			publicSessionPortmap(session),
 			true,
+			auth,
 		)
 		if err != nil {
 			listenerErr <- err
@@ -1072,10 +1078,10 @@ func runExternalWGTunnelIssuedPublicSessionPiecesWithTransportManager(t *testing
 		}
 		defer ln.Close()
 
-		if err := sendEnvelope(ctx, session.derp, senderDERP.PublicKey(), envelope{
+		if err := sendAuthenticatedEnvelope(ctx, session.derp, senderDERP.PublicKey(), envelope{
 			Type:     envelopeDecision,
 			Decision: &decision,
-		}); err != nil {
+		}, auth); err != nil {
 			listenerErr <- err
 			return
 		}
@@ -1101,7 +1107,7 @@ func runExternalWGTunnelIssuedPublicSessionPiecesWithTransportManager(t *testing
 		Capabilities: tok.Capabilities,
 	}
 	claim.BearerMAC = rendezvous.ComputeBearerMAC(tok.BearerSecret, claim)
-	decision, err := sendClaimAndReceiveDecision(ctx, senderDERP, session.derp.PublicKey(), claim)
+	decision, err := sendClaimAndReceiveDecision(ctx, senderDERP, session.derp.PublicKey(), claim, auth)
 	if err != nil {
 		t.Fatalf("sendClaimAndReceiveDecision() error = %v", err)
 	}
@@ -1118,6 +1124,7 @@ func runExternalWGTunnelIssuedPublicSessionPiecesWithTransportManager(t *testing
 		nil,
 		senderPM,
 		true,
+		auth,
 	)
 	if err != nil {
 		t.Fatalf("startExternalWGTransportManager(sender) error = %v", err)

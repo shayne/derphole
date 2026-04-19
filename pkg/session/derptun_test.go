@@ -451,6 +451,91 @@ func TestHandleDerptunServeClaimRejectsSourceMismatch(t *testing.T) {
 	}
 }
 
+func TestHandleDerptunServeClaimRejectsUnsignedEnvelope(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	now := time.Unix(1_700_000_000, 0).UTC()
+	serverToken, err := derptun.GenerateServerToken(derptun.ServerTokenOptions{Now: now, Days: 30})
+	if err != nil {
+		t.Fatalf("GenerateServerToken() error = %v", err)
+	}
+	clientToken, err := derptun.GenerateClientToken(derptun.ClientTokenOptions{
+		Now:         now,
+		ServerToken: serverToken,
+		Days:        7,
+	})
+	if err != nil {
+		t.Fatalf("GenerateClientToken() error = %v", err)
+	}
+	serverCred, err := derptun.DecodeServerToken(serverToken, now)
+	if err != nil {
+		t.Fatalf("DecodeServerToken() error = %v", err)
+	}
+	clientCred, err := derptun.DecodeClientToken(clientToken, now)
+	if err != nil {
+		t.Fatalf("DecodeClientToken() error = %v", err)
+	}
+
+	srv := newSessionTestDERPServer(t)
+	node := srv.Map.Regions[1].Nodes[0]
+	derpClient, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(server) error = %v", err)
+	}
+	defer derpClient.Close()
+	peerDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(peer) error = %v", err)
+	}
+	defer peerDERP.Close()
+
+	probeConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer probeConn.Close()
+
+	claim := derptunClaimForClient(t, clientCred, 96)
+	claim.DERPPublic = derpPublicKeyRaw32(peerDERP.PublicKey())
+	tok, err := clientCred.SessionToken()
+	if err != nil {
+		t.Fatalf("SessionToken() error = %v", err)
+	}
+	claim.BearerMAC = rendezvous.ComputeBearerMAC(tok.BearerSecret, claim)
+	payload, err := json.Marshal(envelope{Type: envelopeClaim, Claim: &claim})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+
+	gate := &derptunClientGate{}
+	active, err := handleDerptunServeClaim(
+		ctx,
+		DerptunServeConfig{ForceRelay: true},
+		serverCred,
+		quicpath.SessionIdentity{},
+		srv.Map,
+		derpClient,
+		probeConn,
+		newBoundPublicPortmap(probeConn, nil),
+		gate,
+		nil,
+		derpbind.Packet{From: peerDERP.PublicKey(), Payload: payload},
+	)
+	if active != nil {
+		defer func() { _ = active.stop(context.Background()) }()
+	}
+	if err != nil {
+		t.Fatalf("handleDerptunServeClaim() error = %v, want nil for ignored unsigned claim", err)
+	}
+	if active != nil {
+		t.Fatalf("active = %+v, want nil", active)
+	}
+	if gate.active != nil {
+		t.Fatalf("gate active = %+v, want nil", gate.active)
+	}
+}
+
 func TestRecoverStaleDerptunActiveReleasesUnresponsiveClaim(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

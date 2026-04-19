@@ -34,6 +34,7 @@ func shareExternal(ctx context.Context, cfg ShareConfig) (string, error) {
 		return isClaimPayload(pkt.Payload)
 	})
 	defer unsubscribeClaims()
+	auth := externalPeerControlAuthForToken(session.token)
 
 	pathEmitter := newTransportPathEmitter(cfg.Emitter)
 	pathEmitter.Emit(StateWaiting)
@@ -53,7 +54,10 @@ func shareExternal(ctx context.Context, cfg ShareConfig) (string, error) {
 			}
 			return tok, err
 		}
-		env, err := decodeEnvelope(pkt.Payload)
+		env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+		if ignoreAuthenticatedEnvelopeError(err, auth) {
+			continue
+		}
 		if err != nil || env.Type != envelopeClaim || env.Claim == nil {
 			continue
 		}
@@ -61,7 +65,7 @@ func shareExternal(ctx context.Context, cfg ShareConfig) (string, error) {
 		peerDERP := key.NodePublicFromRaw32(mem.B(env.Claim.DERPPublic[:]))
 		decision, _ := session.gate.Accept(time.Now(), *env.Claim)
 		if !decision.Accepted {
-			if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
+			if err := sendAuthenticatedEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}, auth); err != nil {
 				return tok, err
 			}
 			continue
@@ -94,10 +98,10 @@ func shareExternal(ctx context.Context, cfg ShareConfig) (string, error) {
 		}
 		defer quicListener.Close()
 
-		if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
+		if err := sendAuthenticatedEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}, auth); err != nil {
 			return tok, err
 		}
-		claimErrCh := rejectAdditionalShareClaims(ctx, session.derp, session.gate, claimCh)
+		claimErrCh := rejectAdditionalShareClaims(ctx, session.derp, session.gate, claimCh, auth)
 		quicConn, err := quicListener.Accept(ctx)
 		if err != nil {
 			return tok, err
@@ -153,7 +157,8 @@ func openExternal(ctx context.Context, cfg OpenConfig, tok token.Token) error {
 		Capabilities: tok.Capabilities,
 	}
 	claim.BearerMAC = rendezvous.ComputeBearerMAC(tok.BearerSecret, claim)
-	decision, err := sendClaimAndReceiveDecision(ctx, derpClient, listenerDERP, claim)
+	auth := externalPeerControlAuthForToken(tok)
+	decision, err := sendClaimAndReceiveDecision(ctx, derpClient, listenerDERP, claim, auth)
 	if err != nil {
 		return err
 	}
@@ -293,6 +298,7 @@ func rejectAdditionalShareClaims(
 	client *derpbind.Client,
 	gate *rendezvous.Gate,
 	claimCh <-chan derpbind.Packet,
+	auth externalPeerControlAuth,
 ) <-chan error {
 	errCh := make(chan error, 1)
 	go func() {
@@ -305,14 +311,17 @@ func rejectAdditionalShareClaims(
 				}
 				return
 			}
-			env, err := decodeEnvelope(pkt.Payload)
+			env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+			if ignoreAuthenticatedEnvelopeError(err, auth) {
+				continue
+			}
 			if err != nil || env.Type != envelopeClaim || env.Claim == nil {
 				continue
 			}
 
 			peerDERP := key.NodePublicFromRaw32(mem.B(env.Claim.DERPPublic[:]))
 			decision, _ := gate.Accept(time.Now(), *env.Claim)
-			if err := sendEnvelope(ctx, client, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
+			if err := sendAuthenticatedEnvelope(ctx, client, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}, auth); err != nil {
 				if ctx.Err() == nil {
 					errCh <- err
 				}

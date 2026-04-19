@@ -552,6 +552,74 @@ func TestSendClaimAndReceiveDecisionReturnsPeerAborted(t *testing.T) {
 	}
 }
 
+func TestSendClaimAndReceiveDecisionIgnoresUnsignedDecisionWhenAuthConfigured(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	node := srv.Map.Regions[1].Nodes[0]
+	senderDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(sender) error = %v", err)
+	}
+	defer senderDERP.Close()
+	listenerDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(listener) error = %v", err)
+	}
+	defer listenerDERP.Close()
+
+	tok := token.Token{
+		Version:      token.SupportedVersion,
+		SessionID:    [16]byte{0x4a},
+		BearerSecret: [32]byte{0x59},
+	}
+	auth := externalPeerControlAuthForToken(tok)
+	claim := rendezvous.Claim{
+		Version:    tok.Version,
+		SessionID:  tok.SessionID,
+		DERPPublic: derpPublicKeyRaw32(senderDERP.PublicKey()),
+	}
+	claim.BearerMAC = rendezvous.ComputeBearerMAC(tok.BearerSecret, claim)
+
+	claimCh, unsubscribe := listenerDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == senderDERP.PublicKey() && isClaimPayload(pkt.Payload)
+	})
+	defer unsubscribe()
+
+	go func() {
+		select {
+		case <-claimCh:
+			_ = sendEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{
+				Type: envelopeDecision,
+				Decision: &rendezvous.Decision{
+					Accepted: false,
+					Reject:   &rendezvous.RejectInfo{Code: rendezvous.RejectBadMAC, Reason: "unsigned forged decision"},
+				},
+			})
+			_ = sendAuthenticatedEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{
+				Type: envelopeDecision,
+				Decision: &rendezvous.Decision{
+					Accepted: true,
+					Accept: &rendezvous.AcceptInfo{
+						Version:   tok.Version,
+						SessionID: tok.SessionID,
+					},
+				},
+			}, auth)
+		case <-ctx.Done():
+		}
+	}()
+
+	decision, err := sendClaimAndReceiveDecision(ctx, senderDERP, listenerDERP.PublicKey(), claim, auth)
+	if err != nil {
+		t.Fatalf("sendClaimAndReceiveDecision() error = %v", err)
+	}
+	if !decision.Accepted {
+		t.Fatalf("decision = %#v, want signed accepted decision", decision)
+	}
+}
+
 func TestSendExternalHandoffDERPStopUsesReceiverHandoffAckBelowReadBoundary(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

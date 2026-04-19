@@ -418,7 +418,8 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) (retErr error
 		Capabilities: tok.Capabilities,
 	}
 	claim.BearerMAC = rendezvous.ComputeBearerMAC(tok.BearerSecret, claim)
-	decision, err := sendClaimAndReceiveDecision(ctx, derpClient, listenerDERP, claim)
+	auth := externalPeerControlAuthForToken(tok)
+	decision, err := sendClaimAndReceiveDecision(ctx, derpClient, listenerDERP, claim, auth)
 	if err != nil {
 		return err
 	}
@@ -440,7 +441,6 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) (retErr error
 		return pkt.From == listenerDERP && isHeartbeatPayload(pkt.Payload)
 	})
 	defer unsubscribeHeartbeat()
-	auth := externalPeerControlAuthForToken(tok)
 	ctx, stopPeerAbort := withPeerControlContext(ctx, derpClient, listenerDERP, abortCh, heartbeatCh, func() int64 {
 		return countedSrc.Count()
 	}, auth)
@@ -928,6 +928,7 @@ func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (retTok s
 		return isClaimPayload(pkt.Payload)
 	})
 	defer unsubscribeClaims()
+	auth := externalPeerControlAuthForToken(session.token)
 
 	if cfg.TokenSink != nil {
 		select {
@@ -945,7 +946,10 @@ func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (retTok s
 			}
 			return tok, err
 		}
-		env, err := decodeEnvelope(pkt.Payload)
+		env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+		if ignoreAuthenticatedEnvelopeError(err, auth) {
+			continue
+		}
 		if err != nil || env.Type != envelopeClaim || env.Claim == nil {
 			continue
 		}
@@ -953,7 +957,7 @@ func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (retTok s
 		peerDERP := key.NodePublicFromRaw32(mem.B(env.Claim.DERPPublic[:]))
 		decision, _ := session.gate.Accept(time.Now(), *env.Claim)
 		if !decision.Accepted {
-			if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
+			if err := sendAuthenticatedEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}, auth); err != nil {
 				return tok, err
 			}
 			continue
@@ -970,7 +974,6 @@ func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (retTok s
 			return pkt.From == peerDERP && isHeartbeatPayload(pkt.Payload)
 		})
 		defer unsubscribeHeartbeat()
-		auth := externalPeerControlAuthForToken(session.token)
 		ctx, stopPeerAbort := withPeerControlContext(ctx, session.derp, peerDERP, abortCh, heartbeatCh, func() int64 {
 			if countedDst == nil {
 				return 0
@@ -1048,7 +1051,7 @@ func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (retTok s
 			defer unsubscribeRelayPrefix()
 		}
 
-		if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
+		if err := sendAuthenticatedEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}, auth); err != nil {
 			return tok, err
 		}
 		if cfg.Emitter != nil {

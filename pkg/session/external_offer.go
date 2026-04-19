@@ -31,6 +31,7 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (retTok string, retErr 
 		return isClaimPayload(pkt.Payload)
 	})
 	defer unsubscribeClaims()
+	auth := externalPeerControlAuthForToken(session.token)
 
 	if cfg.TokenSink != nil {
 		select {
@@ -51,7 +52,10 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (retTok string, retErr 
 			}
 			return tok, err
 		}
-		env, err := decodeEnvelope(pkt.Payload)
+		env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+		if ignoreAuthenticatedEnvelopeError(err, auth) {
+			continue
+		}
 		if err != nil || env.Type != envelopeClaim || env.Claim == nil {
 			continue
 		}
@@ -65,7 +69,7 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (retTok string, retErr 
 			if cfg.Emitter != nil {
 				cfg.Emitter.Debug("offer-decision-send accepted=false")
 			}
-			if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
+			if err := sendAuthenticatedEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}, auth); err != nil {
 				return tok, err
 			}
 			continue
@@ -82,7 +86,6 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (retTok string, retErr 
 			return pkt.From == peerDERP && isHeartbeatPayload(pkt.Payload)
 		})
 		defer unsubscribeHeartbeat()
-		auth := externalPeerControlAuthForToken(session.token)
 		ctx, stopPeerAbort := withPeerControlContext(ctx, session.derp, peerDERP, abortCh, heartbeatCh, func() int64 {
 			if countedSrc == nil {
 				return 0
@@ -160,7 +163,7 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (retTok string, retErr 
 		countedSrc = newByteCountingReadCloser(src)
 		defer countedSrc.Close()
 
-		if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
+		if err := sendAuthenticatedEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}, auth); err != nil {
 			return tok, err
 		}
 		if cfg.Emitter != nil {
@@ -295,6 +298,7 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) (retErr error) {
 		Capabilities: tok.Capabilities,
 	}
 	claim.BearerMAC = rendezvous.ComputeBearerMAC(tok.BearerSecret, claim)
+	auth := externalPeerControlAuthForToken(tok)
 	if cfg.Emitter != nil {
 		if payload, err := json.Marshal(envelope{Type: envelopeClaim, Claim: &claim}); err == nil {
 			cfg.Emitter.Debug("receive-claim-bytes=" + strconv.Itoa(len(payload)))
@@ -303,7 +307,7 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) (retErr error) {
 	if cfg.Emitter != nil {
 		cfg.Emitter.Debug("receive-claim-start")
 	}
-	decision, err := sendClaimAndReceiveDecisionWithTelemetry(ctx, derpClient, listenerDERP, claim, cfg.Emitter, "receive-")
+	decision, err := sendClaimAndReceiveDecisionWithTelemetry(ctx, derpClient, listenerDERP, claim, cfg.Emitter, "receive-", auth)
 	if err != nil {
 		return err
 	}
@@ -328,7 +332,6 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) (retErr error) {
 		return pkt.From == listenerDERP && isHeartbeatPayload(pkt.Payload)
 	})
 	defer unsubscribeHeartbeat()
-	auth := externalPeerControlAuthForToken(tok)
 	ctx, stopPeerAbort := withPeerControlContext(ctx, derpClient, listenerDERP, abortCh, heartbeatCh, func() int64 {
 		if countedDst == nil {
 			return 0

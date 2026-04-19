@@ -176,6 +176,7 @@ func acceptExternalAttachConn(
 		return isClaimPayload(pkt.Payload)
 	})
 	defer unsubscribeClaims()
+	auth := externalPeerControlAuthForToken(session.token)
 
 	for {
 		pkt, err := receiveSubscribedPacket(ctx, claimCh)
@@ -183,7 +184,10 @@ func acceptExternalAttachConn(
 			cleanupSession()
 			return nil, err
 		}
-		env, err := decodeEnvelope(pkt.Payload)
+		env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+		if ignoreAuthenticatedEnvelopeError(err, auth) {
+			continue
+		}
 		if err != nil || env.Type != envelopeClaim || env.Claim == nil {
 			continue
 		}
@@ -191,7 +195,7 @@ func acceptExternalAttachConn(
 		peerDERP := key.NodePublicFromRaw32(mem.B(env.Claim.DERPPublic[:]))
 		decision, _ := session.gate.Accept(time.Now(), *env.Claim)
 		if !decision.Accepted {
-			if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
+			if err := sendAuthenticatedEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}, auth); err != nil {
 				cleanupSession()
 				return nil, err
 			}
@@ -238,7 +242,7 @@ func acceptExternalAttachConn(
 			return nil, err
 		}
 
-		if err := sendEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
+		if err := sendAuthenticatedEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}, auth); err != nil {
 			_ = quicListener.Close()
 			_ = adapter.Close()
 			transportCleanup()
@@ -270,7 +274,7 @@ func acceptExternalAttachConn(
 		activeClaimCh, unsubscribeActiveClaims := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
 			return isClaimPayload(pkt.Payload)
 		})
-		claimErrCh := rejectAdditionalShareClaims(transportCtx, session.derp, session.gate, activeClaimCh)
+		claimErrCh := rejectAdditionalShareClaims(transportCtx, session.derp, session.gate, activeClaimCh, auth)
 
 		var cleanupConnOnce sync.Once
 		cleanupConn := func() {
@@ -346,7 +350,8 @@ func dialAttachExternal(ctx context.Context, cfg AttachDialConfig, tok token.Tok
 	}
 	claim.BearerMAC = rendezvous.ComputeBearerMAC(tok.BearerSecret, claim)
 
-	decision, err := sendClaimAndReceiveDecision(ctx, derpClient, listenerDERP, claim)
+	auth := externalPeerControlAuthForToken(tok)
+	decision, err := sendClaimAndReceiveDecision(ctx, derpClient, listenerDERP, claim, auth)
 	if err != nil {
 		_ = pm.Close()
 		_ = probeConn.Close()

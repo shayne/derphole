@@ -224,7 +224,7 @@ func releaseDerptunActive(emitter *telemetry.Emitter, gate *derptunClientGate, a
 	}
 }
 
-func startDerptunDecisionResender(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, decision rendezvous.Decision, emitter *telemetry.Emitter) context.CancelFunc {
+func startDerptunDecisionResender(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, decision rendezvous.Decision, auth externalPeerControlAuth, emitter *telemetry.Emitter) context.CancelFunc {
 	resendCtx, cancel := context.WithCancel(ctx)
 	go func() {
 		ticker := time.NewTicker(externalClaimRetryInterval)
@@ -233,7 +233,7 @@ func startDerptunDecisionResender(ctx context.Context, client *derpbind.Client, 
 			select {
 			case <-ticker.C:
 				sendCtx, sendCancel := context.WithTimeout(resendCtx, externalClaimRetryInterval)
-				err := sendEnvelope(sendCtx, client, peerDERP, envelope{Type: envelopeDecision, Decision: &decision})
+				err := sendAuthenticatedEnvelope(sendCtx, client, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}, auth)
 				sendCancel()
 				if err != nil && resendCtx.Err() == nil && emitter != nil {
 					emitter.Debug("derptun-decision-resend=" + err.Error())
@@ -287,6 +287,19 @@ func derptunServerTokenForClaim(server derptun.ServerCredential, claim rendezvou
 	serverTok.BearerSecret = client.BearerSecret
 	serverTok.ExpiresUnix = client.ExpiresUnix
 	return serverTok, rendezvous.Decision{}, nil
+}
+
+func derptunClaimEnvelopeAuth(server derptun.ServerCredential, claim rendezvous.Claim) (externalPeerControlAuth, bool) {
+	if claim.Client == nil {
+		return externalPeerControlAuth{}, false
+	}
+	serverTok, err := server.SessionToken()
+	if err != nil {
+		return externalPeerControlAuth{}, false
+	}
+	serverTok.BearerSecret = derptun.DeriveClientBearerSecretForClaim(server.SigningSecret, claim.Client.ClientID)
+	serverTok.ExpiresUnix = claim.Client.ExpiresUnix
+	return externalPeerControlAuthForToken(serverTok), true
 }
 
 func derptunClaimSourceMatches(from key.NodePublic, claim rendezvous.Claim) bool {
@@ -423,17 +436,25 @@ func handleDerptunServeClaim(
 		return active, nil
 	}
 	peerDERP := key.NodePublicFromRaw32(mem.B(claim.DERPPublic[:]))
+	auth, haveAuth := derptunClaimEnvelopeAuth(server, claim)
+	if !haveAuth || !verifyEnvelopeMAC(env, auth) {
+		if cfg.Emitter != nil {
+			cfg.Emitter.Debug("derptun-claim-envelope-unauthenticated")
+		}
+		return active, nil
+	}
 	now := time.Now()
 	claimToken, rejectDecision, err := derptunServerTokenForClaim(server, claim, now)
 	if err != nil {
 		if rejectDecision.Reject == nil {
 			return active, err
 		}
-		if sendErr := sendEnvelope(ctx, derpClient, peerDERP, envelope{Type: envelopeDecision, Decision: &rejectDecision}); sendErr != nil {
+		if sendErr := sendAuthenticatedEnvelope(ctx, derpClient, peerDERP, envelope{Type: envelopeDecision, Decision: &rejectDecision}, auth); sendErr != nil {
 			return active, sendErr
 		}
 		return active, nil
 	}
+	auth = externalPeerControlAuthForToken(claimToken)
 	decision, _ := gate.Accept(now, claimToken, claim)
 	if !decision.Accepted {
 		if decision.Reject != nil && decision.Reject.Code == rendezvous.RejectClaimed && active != nil && !active.sameClaim(claim) {
@@ -448,7 +469,7 @@ func handleDerptunServeClaim(
 		}
 	}
 	if !decision.Accepted {
-		if err := sendEnvelope(ctx, derpClient, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
+		if err := sendAuthenticatedEnvelope(ctx, derpClient, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}, auth); err != nil {
 			return active, err
 		}
 		return active, nil
@@ -458,7 +479,7 @@ func handleDerptunServeClaim(
 		if retryDecision.Accept == nil && retryDecision.Reject == nil {
 			retryDecision = decision
 		}
-		if err := sendEnvelope(ctx, derpClient, peerDERP, envelope{Type: envelopeDecision, Decision: &retryDecision}); err != nil {
+		if err := sendAuthenticatedEnvelope(ctx, derpClient, peerDERP, envelope{Type: envelopeDecision, Decision: &retryDecision}, auth); err != nil {
 			return active, err
 		}
 		return active, nil
@@ -500,7 +521,7 @@ func handleDerptunServeClaim(
 		gate.Release(claim.DERPPublic)
 		return active, err
 	}
-	if err := sendEnvelope(ctx, derpClient, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}); err != nil {
+	if err := sendAuthenticatedEnvelope(ctx, derpClient, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}, auth); err != nil {
 		_ = quicListener.Close()
 		_ = adapter.Close()
 		transportCleanup()
@@ -513,7 +534,7 @@ func handleDerptunServeClaim(
 	tunnelCtx, tunnelCancel := context.WithCancel(ctx)
 	transportDone := make(chan struct{})
 	next := &derptunServeActive{claim: claim, decision: decision, mux: mux, quicDone: transportDone, cancel: tunnelCancel, done: make(chan error, 1)}
-	cancelDecisionResends := startDerptunDecisionResender(ctx, derpClient, peerDERP, decision, cfg.Emitter)
+	cancelDecisionResends := startDerptunDecisionResender(ctx, derpClient, peerDERP, decision, auth, cfg.Emitter)
 	go func() {
 		var quicConn *quic.Conn
 		var err error
@@ -750,7 +771,8 @@ func dialDerptunMux(ctx context.Context, clientToken string, emitter *telemetry.
 		},
 	}
 	claim.BearerMAC = rendezvous.ComputeBearerMAC(tok.BearerSecret, claim)
-	decision, err := sendClaimAndReceiveDecision(ctx, derpClient, listenerDERP, claim)
+	auth := externalPeerControlAuthForToken(tok)
+	decision, err := sendClaimAndReceiveDecision(ctx, derpClient, listenerDERP, claim, auth)
 	if err != nil {
 		_ = pm.Close()
 		_ = probeConn.Close()

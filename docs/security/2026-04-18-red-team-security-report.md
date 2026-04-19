@@ -146,12 +146,12 @@ The remote smoke harnesses now allocate a remote `mktemp -d` directory and place
 
 Peer heartbeat, ACK, abort, transport control, direct UDP control, QUIC mode control, and parallel growth control envelopes now carry token-derived HMACs when session auth is available. Receivers ignore unauthenticated or tampered control envelopes instead of acting on them.
 
-### Low: Claim and decision envelopes still rely on rendezvous bearer MACs
+### Addressed: Bootstrap claim and decision envelopes now have token-derived MACs
 
-Claim and decision envelopes remain covered by the existing rendezvous bearer MAC and DERP sender filtering rather than the generic control-envelope MAC. This keeps the bootstrap path compatible with the existing rendezvous protocol while protecting post-claim control traffic with per-session envelope authentication.
+Claim senders now sign the outer DERP envelope with the token-derived envelope key, listeners verify the envelope before `Gate.Accept`, and decision receivers ignore forged or unsigned decisions. Derptun serve derives the client envelope key from the validated client token fields before accepting the claim, while keeping the existing rendezvous bearer MAC and client proof checks in place.
 
 ## Follow-Up Priority
 
 1. Keep ktzlxc smoke coverage in the release loop with `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1` so direct-path claims are not accidentally satisfied by Tailscale.
 2. Keep adversarial injected-packet tests in `pkg/session` close to the control-envelope code so future control messages are signed by default.
-3. If the bootstrap threat model tightens further, review whether claim and decision should be wrapped in the generic envelope MAC after the rendezvous bearer check.
+3. Keep bootstrap compatibility expectations explicit in release notes because unsigned claim and decision envelopes are now rejected when token auth is available.
