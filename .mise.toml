@@ -40,6 +40,88 @@ go build -o dist/derphole ./cmd/derphole
 go build -o dist/derptun ./cmd/derptun
 """
 
+[tasks."apple:build"]
+description = "Build the Derphole iOS app"
+shell = "bash -c"
+run = """
+set -euo pipefail
+mise run apple:mobile-framework
+apple_build_dir="${APPLE_BUILD_DIR:-$PWD/dist/apple-build}"
+xcodebuild -quiet build \
+  -project apple/Derphole/Derphole.xcodeproj \
+  -target Derphole \
+  -configuration "${APPLE_CONFIGURATION:-Debug}" \
+  -sdk "${APPLE_SDK:-iphonesimulator}" \
+  CODE_SIGNING_ALLOWED="${CODE_SIGNING_ALLOWED:-NO}" \
+  SYMROOT="${apple_build_dir}/Products" \
+  OBJROOT="${apple_build_dir}/Intermediates"
+"""
+
+[tasks."apple:test"]
+description = "Run the Derphole iOS tests"
+shell = "bash -c"
+run = """
+set -euo pipefail
+mise run apple:mobile-framework
+test_destination="${APPLE_TEST_DESTINATION:-}"
+if [[ -z "$test_destination" ]]; then
+  test_device_name="${APPLE_TEST_DEVICE:-iPhone 17}"
+  test_device="$(xcrun simctl list devices available | awk -v wanted="$test_device_name" '/^[[:space:]]+iPhone/ || /^[[:space:]]+iPad/ { line=$0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+[(].*/, "", line); if (line == wanted) { print line; exit } }')"
+  if [[ -z "$test_device" ]]; then
+    test_device="$(xcrun simctl list devices available | awk '(/^[[:space:]]+iPhone/ || /^[[:space:]]+iPad/) && /[(]Booted[)]/ { sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+[(].*/, ""); print; exit }')"
+  fi
+  if [[ -z "$test_device" ]]; then
+    test_device="$(xcrun simctl list devices available | awk '/^[[:space:]]+iPhone/ || /^[[:space:]]+iPad/ { sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+[(].*/, ""); print; exit }')"
+  fi
+  if [[ -z "$test_device" ]]; then
+    echo "No available iOS Simulator devices found; install an iOS simulator or set APPLE_TEST_DESTINATION." >&2
+    exit 1
+  fi
+  test_destination="platform=iOS Simulator,name=${test_device}"
+fi
+xcodebuild -quiet test \
+  -project apple/Derphole/Derphole.xcodeproj \
+  -scheme Derphole \
+  -configuration "${APPLE_CONFIGURATION:-Debug}" \
+  -destination "$test_destination" \
+  -derivedDataPath "${APPLE_DERIVED_DATA:-dist/apple-derived-data}" \
+  CODE_SIGNING_ALLOWED="${CODE_SIGNING_ALLOWED:-NO}"
+"""
+
+[tasks."apple:mobile-tools"]
+description = "Install gomobile tools into dist/tools/bin"
+shell = "bash -c"
+run = """
+set -euo pipefail
+tools_bin="$PWD/dist/tools/bin"
+tools_gopath="$PWD/dist/tools/.gopath"
+tools_mod="$PWD/dist/tools/gomobile.mod"
+gomobile_version="${GOMOBILE_VERSION:-v0.0.0-20260410095206-2cfb76559b7b}"
+mkdir -p "$tools_bin" "$tools_gopath/pkg/gomobile"
+GOBIN="$tools_bin" GOPATH="$tools_gopath" go install "golang.org/x/mobile/cmd/gomobile@$gomobile_version"
+GOBIN="$tools_bin" GOPATH="$tools_gopath" go install "golang.org/x/mobile/cmd/gobind@$gomobile_version"
+cp go.mod "$tools_mod"
+cp go.sum "$PWD/dist/tools/gomobile.sum"
+GOFLAGS="-modfile=$tools_mod -mod=mod" go get "golang.org/x/mobile@$gomobile_version"
+GOFLAGS="-modfile=$tools_mod -mod=mod" go list golang.org/x/mobile/bind golang.org/x/mobile/bind/objc golang.org/x/mobile/cmd/gomobile golang.org/x/mobile/cmd/gobind >/dev/null
+"""
+
+[tasks."apple:mobile-framework"]
+description = "Build the DerpholeMobile iOS XCFramework"
+depends = ["apple:mobile-tools"]
+shell = "bash -c"
+run = """
+set -euo pipefail
+tools_mod="$PWD/dist/tools/gomobile.mod"
+tools_gopath="$PWD/dist/tools/.gopath"
+mkdir -p dist/apple
+PATH="$PWD/dist/tools/bin:$PATH" GOPATH="$tools_gopath" GOFLAGS="-modfile=$tools_mod -mod=mod" gomobile bind \
+  -target=ios,iossimulator \
+  -iosversion "${APPLE_IOS_VERSION:-17.0}" \
+  -o dist/apple/DerpholeMobile.xcframework \
+  ./pkg/derpholemobile
+"""
+
 [tasks.build-linux-amd64]
 shell = "bash -c"
 run = """
