@@ -164,10 +164,7 @@ func Receive(ctx context.Context, cfg ReceiveConfig) error {
 		WriteReceiveToken(cfg.Stderr, token)
 		readErr := readTransfer(pipeReader, token, cfg.Stdout, cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput)
 		listenErr := <-listenErrCh
-		if readErr != nil {
-			return readErr
-		}
-		return listenErr
+		return preferSessionPipeError(readErr, listenErr)
 	}
 
 	receiveToken := cfg.Token
@@ -205,10 +202,7 @@ func Receive(ctx context.Context, cfg ReceiveConfig) error {
 		}()
 		readErr := readTransfer(pipeReader, receiveToken, cfg.Stdout, cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput)
 		receiveErr := <-receiveErrCh
-		if readErr != nil {
-			return readErr
-		}
-		return receiveErr
+		return preferSessionPipeError(readErr, receiveErr)
 	case tok.Capabilities&token.CapabilityStdio != 0:
 		return errors.New("this code expects `derphole send`, not `derphole receive`")
 	case tok.Capabilities&token.CapabilityAttach != 0:
@@ -637,7 +631,7 @@ func preferSessionPipeError(pipeErr, sessionErr error) error {
 	if pipeErr == nil {
 		return sessionErr
 	}
-	if errors.Is(pipeErr, io.ErrClosedPipe) {
+	if errors.Is(pipeErr, io.ErrClosedPipe) || errors.Is(pipeErr, io.EOF) || errors.Is(pipeErr, io.ErrUnexpectedEOF) {
 		return sessionErr
 	}
 	return pipeErr

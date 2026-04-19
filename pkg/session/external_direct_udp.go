@@ -1582,7 +1582,7 @@ func sendExternalHandoffDERP(ctx context.Context, client *derpbind.Client, peerD
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-timer.C:
-				return context.DeadlineExceeded
+				return ErrPeerDisconnected
 			}
 		}
 	}

@@ -944,6 +944,73 @@ func TestSendExternalHandoffDERPStopUsesReceiverHandoffAckBelowReadBoundary(t *t
 	}
 }
 
+func TestSendExternalHandoffDERPStopWithoutHandoffAckReturnsPeerDisconnected(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	defer cancel()
+
+	node := srv.Map.Regions[1].Nodes[0]
+	listenerDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(listener) error = %v", err)
+	}
+	defer listenerDERP.Close()
+	senderDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(sender) error = %v", err)
+	}
+	defer senderDERP.Close()
+	aead := testExternalSessionAEAD(t, 0x62)
+
+	relayFrames, unsubscribe := listenerDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == senderDERP.PublicKey() && externalRelayPrefixDERPFrameKindOf(pkt.Payload) != 0
+	})
+	defer unsubscribe()
+
+	spool, err := newExternalHandoffSpool(strings.NewReader("abcdefghijklmnop"), 4, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spool.Close()
+
+	stopCh := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sendExternalHandoffDERP(ctx, senderDERP, listenerDERP.PublicKey(), spool, stopCh, nil, aead)
+	}()
+
+	for dataFrames := 0; dataFrames < 2; {
+		select {
+		case pkt := <-relayFrames:
+			if externalRelayPrefixDERPFrameKindOf(pkt.Payload) == externalRelayPrefixDERPFrameData {
+				dataFrames++
+			}
+		case err := <-errCh:
+			t.Fatalf("sendExternalHandoffDERP() returned before stop: %v", err)
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("timed out waiting for DERP prefix data frames before stop")
+		}
+	}
+
+	close(stopCh)
+
+	for {
+		select {
+		case pkt := <-relayFrames:
+			if externalRelayPrefixDERPFrameKindOf(pkt.Payload) != externalRelayPrefixDERPFrameHandoff {
+				continue
+			}
+		case err := <-errCh:
+			if !errors.Is(err, ErrPeerDisconnected) {
+				t.Fatalf("sendExternalHandoffDERP() error = %v, want %v", err, ErrPeerDisconnected)
+			}
+			return
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for sendExternalHandoffDERP(): %v", ctx.Err())
+		}
+	}
+}
+
 func TestSendExternalHandoffDERPWaitsForRelayPauseControlBeforeSendingFrames(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

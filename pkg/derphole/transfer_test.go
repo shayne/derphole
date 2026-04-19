@@ -513,6 +513,60 @@ func TestOfferPrefersSessionErrorOverClosedPipe(t *testing.T) {
 	}
 }
 
+func TestReceivePrefersSessionErrorOverIncompleteEOF(t *testing.T) {
+	prev := derpholeSessionReceive
+	t.Cleanup(func() {
+		derpholeSessionReceive = prev
+	})
+
+	for _, tt := range []struct {
+		name string
+		err  error
+	}{
+		{name: "peer aborted", err: session.ErrPeerAborted},
+		{name: "peer disconnected", err: session.ErrPeerDisconnected},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			derpholeSessionReceive = func(_ context.Context, cfg session.ReceiveConfig) error {
+				if err := protocol.WriteHeader(cfg.StdioOut, protocol.Header{
+					Version: 1,
+					Kind:    protocol.KindFile,
+					Name:    "partial.bin",
+					Size:    8,
+					Verify:  VerificationString(cfg.Token),
+				}); err != nil {
+					return err
+				}
+				if _, err := cfg.StdioOut.Write([]byte("abc")); err != nil {
+					return err
+				}
+				if closer, ok := cfg.StdioOut.(io.Closer); ok {
+					_ = closer.Close()
+				}
+				return tt.err
+			}
+
+			tok, err := token.Encode(token.Token{
+				Version:      token.SupportedVersion,
+				ExpiresUnix:  time.Now().Add(time.Hour).Unix(),
+				Capabilities: token.CapabilityStdioOffer,
+			})
+			if err != nil {
+				t.Fatalf("token.Encode() error = %v", err)
+			}
+
+			err = Receive(context.Background(), ReceiveConfig{
+				Token:      tok,
+				OutputPath: t.TempDir(),
+				Stderr:     io.Discard,
+			})
+			if !errors.Is(err, tt.err) {
+				t.Fatalf("Receive() error = %v, want %v", err, tt.err)
+			}
+		})
+	}
+}
+
 func TestOfferSendCancelsWhileWaitingForReceiver(t *testing.T) {
 	prev := derpholeSessionOffer
 	t.Cleanup(func() {
