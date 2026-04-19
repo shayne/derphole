@@ -1882,8 +1882,12 @@ func externalRelayPrefixDERPSendHandoffAck(ctx context.Context, client *derpbind
 }
 
 func externalRelayPrefixDERPDecodeOffset(payload []byte) (int64, error) {
-	if externalRelayPrefixDERPFrameKindOf(payload) == 0 {
+	kind := externalRelayPrefixDERPFrameKindOf(payload)
+	if kind == 0 {
 		return 0, errors.New("invalid relay-prefix DERP frame")
+	}
+	if kind != externalRelayPrefixDERPFrameData && len(payload) != externalRelayPrefixDERPHeaderSize {
+		return 0, errors.New("relay-prefix DERP control frame cannot carry payload")
 	}
 	offset := binary.BigEndian.Uint64(payload[17:25])
 	if offset > uint64(^uint64(0)>>1) {

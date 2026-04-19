@@ -681,6 +681,60 @@ func TestExternalRelayPrefixDERPDataFrameRejectsPlaintextAndTamper(t *testing.T)
 	}
 }
 
+func TestExternalRelayPrefixDERPControlFramesRejectTrailingPayload(t *testing.T) {
+	tests := []struct {
+		name   string
+		kind   externalRelayPrefixDERPFrameKind
+		decode func([]byte) error
+	}{
+		{
+			name: "ack",
+			kind: externalRelayPrefixDERPFrameAck,
+			decode: func(payload []byte) error {
+				_, err := externalRelayPrefixDERPDecodeAck(payload)
+				return err
+			},
+		},
+		{
+			name: "eof",
+			kind: externalRelayPrefixDERPFrameEOF,
+			decode: func(payload []byte) error {
+				_, err := externalRelayPrefixDERPDecodeOffset(payload)
+				return err
+			},
+		},
+		{
+			name: "handoff",
+			kind: externalRelayPrefixDERPFrameHandoff,
+			decode: func(payload []byte) error {
+				_, err := externalRelayPrefixDERPDecodeOffset(payload)
+				return err
+			},
+		},
+		{
+			name: "handoff-ack",
+			kind: externalRelayPrefixDERPFrameHandoffAck,
+			decode: func(payload []byte) error {
+				_, err := externalRelayPrefixDERPDecodeAck(payload)
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wire, err := externalRelayPrefixDERPPayload(tt.kind, 9, nil, nil)
+			if err != nil {
+				t.Fatalf("externalRelayPrefixDERPPayload() error = %v", err)
+			}
+			wire = append(wire, []byte("unexpected-control-payload")...)
+			if err := tt.decode(wire); err == nil {
+				t.Fatal("control frame with trailing payload decoded successfully")
+			}
+		})
+	}
+}
+
 func TestExternalAssertNoPlaintextRelayMarker(t *testing.T) {
 	t.Setenv("DERPHOLE_TEST_RELAY_PLAINTEXT_MARKER", "relay-secret-marker")
 	if err := externalAssertNoPlaintextRelayMarker([]byte("ciphertext bytes only")); err != nil {
