@@ -8,10 +8,10 @@ final class TransferFormattingTests: XCTestCase {
         XCTAssertEqual(TransferFormatting.speed(bytesPerSecond: 2_097_152), "2.0 MiB/s")
         XCTAssertEqual(TransferFormatting.speed(bytesPerSecond: 0), "0.0 MiB/s")
 
-        let token = "dtc1_abcdefghijklmnopqrstuvwxyz"
+        let token = "token_abcdefghijklmnopqrstuvwxyz"
         let fingerprint = TransferFormatting.fingerprint(token)
         XCTAssertLessThan(fingerprint.count, token.count)
-        XCTAssertTrue(fingerprint.hasPrefix("dtc1_"))
+        XCTAssertTrue(fingerprint.hasPrefix("token_"))
         XCTAssertTrue(fingerprint.hasSuffix("wxyz"))
     }
 
