@@ -104,6 +104,33 @@ final class WebTunnelStateTests: XCTestCase {
         XCTAssertFalse(state.isConnected)
         XCTAssertFalse(state.isConnecting)
     }
+
+    @MainActor
+    func testRuntimeInjectedPayloadStartsWebTunnelOnce() async throws {
+        let suiteName = "WebTunnelStateTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = TokenStore(defaults: defaults)
+        let opener = RecordingWebTunnelOpener(boundAddr: "127.0.0.1:49286")
+        let state = WebTunnelState(tokenStore: store, tunnelOpenerFactory: { opener })
+
+        state.openRuntimeInjectedPayloadIfConfigured(
+            environment: ["DERPHOLE_LIVE_WEB_PAYLOAD": " derphole://web?path=%2Fprobe&scheme=http&token=dtc1_runtime_web&v=1 "],
+            arguments: []
+        )
+        await fulfillment(of: [opener.openedExpectation], timeout: 2)
+        await Task.yield()
+
+        state.openRuntimeInjectedPayloadIfConfigured(
+            environment: ["DERPHOLE_LIVE_WEB_PAYLOAD": " derphole://web?path=%2Fsecond&scheme=http&token=dtc1_second_web&v=1 "],
+            arguments: []
+        )
+
+        XCTAssertEqual(store.webToken, "dtc1_runtime_web")
+        XCTAssertEqual(opener.openedToken, "dtc1_runtime_web")
+        XCTAssertEqual(opener.openCallCount, 1)
+        XCTAssertEqual(state.browserURL?.absoluteString, "http://127.0.0.1:49286/probe")
+    }
 }
 
 nonisolated private final class RecordingWebTunnelOpener: WebTunnelOpening, @unchecked Sendable {
@@ -113,12 +140,14 @@ nonisolated private final class RecordingWebTunnelOpener: WebTunnelOpening, @unc
     private(set) var openedToken: String?
     private(set) var openedListenAddr: String?
     private(set) var cancelCalled = false
+    private(set) var openCallCount = 0
 
     init(boundAddr: String) {
         self.boundAddrToReport = boundAddr
     }
 
     func open(token: String, listenAddr: String, callbacks: WebTunnelCallbacks) throws {
+        openCallCount += 1
         openedToken = token
         openedListenAddr = listenAddr
 

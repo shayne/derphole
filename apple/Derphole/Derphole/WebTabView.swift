@@ -31,6 +31,13 @@ struct WebTabView: View {
         }
         .accessibilityIdentifier("webTab")
         .navigationTitle("Web")
+        .onAppear {
+            #if DEBUG
+            DispatchQueue.main.async {
+                state.openRuntimeInjectedPayloadIfConfigured()
+            }
+            #endif
+        }
         .fullScreenCover(isPresented: $state.isScannerPresented, onDismiss: state.scannerDismissed) {
             ScannerSheet(
                 accessibilityIdentifier: "webScannerSheet",

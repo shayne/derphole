@@ -31,7 +31,9 @@ struct WebViewRepresentable: UIViewRepresentable {
             webView.load(URLRequest(url: url))
         }
 
-        browserState.update(canGoBack: webView.canGoBack, canGoForward: webView.canGoForward, url: webView.url ?? url)
+        DispatchQueue.main.async {
+            browserState.update(canGoBack: webView.canGoBack, canGoForward: webView.canGoForward, url: webView.url ?? url)
+        }
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate {

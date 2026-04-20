@@ -92,6 +92,10 @@ xcodebuild -quiet test \
 description = "Run a live CLI-to-physical-iPhone transfer test"
 run = "bash ./scripts/apple-physical-transfer.sh"
 
+[tasks."apple:web-tunnel"]
+description = "Run a live CLI-to-iOS-simulator web tunnel test"
+run = "bash ./scripts/apple-web-tunnel.sh"
+
 [tasks."apple:mobile-tools"]
 description = "Install gomobile tools into dist/tools/bin"
 shell = "bash -c"

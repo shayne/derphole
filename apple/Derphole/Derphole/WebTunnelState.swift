@@ -49,6 +49,9 @@ final class WebTunnelState: ObservableObject {
     private var connectionID = UUID()
     private var currentScheme = "http"
     private var currentPath = "/"
+    #if DEBUG
+    private var runtimeInjectedWebStarted = false
+    #endif
 
     init(
         tokenStore: TokenStore,
@@ -122,6 +125,17 @@ final class WebTunnelState: ObservableObject {
     }
 
     #if DEBUG
+    func openRuntimeInjectedPayloadIfConfigured(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        arguments: [String] = ProcessInfo.processInfo.arguments
+    ) {
+        guard !runtimeInjectedWebStarted else { return }
+        guard let payload = LiveWebLaunchConfiguration.payload(from: environment, arguments: arguments) else { return }
+
+        runtimeInjectedWebStarted = true
+        acceptScannedPayload(payload)
+    }
+
     func acceptPayloadForTesting(kind: String, token: String, scheme: String = "http", path: String = "/") {
         guard kind == "web" else {
             failBeforeConnect(status: "Scanned code was not a web tunnel.", error: "Scan a Derphole web tunnel QR code.")

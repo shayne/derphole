@@ -9,9 +9,14 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var tokenStore = TokenStore()
+    @State private var selectedTab: AppTab
+
+    init(initialTab: AppTab = LiveWebLaunchConfiguration.initialTab()) {
+        _selectedTab = State(initialValue: initialTab)
+    }
 
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             NavigationStack {
                 FilesTabView()
             }
