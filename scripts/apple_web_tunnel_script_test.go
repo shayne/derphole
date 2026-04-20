@@ -49,7 +49,7 @@ func TestAppleWebTunnelTaskUsesRuntimePayload(t *testing.T) {
 			t.Fatalf("LiveWebLaunchConfiguration.swift missing %q", want)
 		}
 	}
-	if !strings.Contains(contentView, "selectedTab") || !strings.Contains(contentView, "LiveWebLaunchConfiguration") {
+	if !strings.Contains(contentView, "selectedTab") || !strings.Contains(contentView, "LiveAppLaunchConfiguration") {
 		t.Fatal("ContentView.swift does not select the Web tab for a live web launch payload")
 	}
 	if !strings.Contains(webTabView, "openRuntimeInjectedPayloadIfConfigured") {

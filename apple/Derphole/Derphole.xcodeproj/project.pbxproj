@@ -35,7 +35,7 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		26D100032F9700010048F045 /* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
+		26D100032F9700010048F045 /* Exceptions for "Derphole" folder in "Derphole" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
@@ -48,7 +48,7 @@
 		264B36132F9556570048F045 /* Derphole */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
-				26D100032F9700010048F045 /* PBXFileSystemSynchronizedBuildFileExceptionSet */,
+				26D100032F9700010048F045 /* Exceptions for "Derphole" folder in "Derphole" target */,
 			);
 			path = Derphole;
 			sourceTree = "<group>";
@@ -418,18 +418,63 @@
 				DEVELOPMENT_TEAM = Z5WJGBZKV9;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
+				"HEADER_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(VVTERM_VENDOR_ROOT)/libghostty/ios/include",
+					"$(VVTERM_VENDOR_ROOT)/libssh2/include",
+				);
+				"HEADER_SEARCH_PATHS[sdk=iphonesimulator*]" = (
+					"$(VVTERM_VENDOR_ROOT)/libghostty/ios-simulator/include",
+					"$(VVTERM_VENDOR_ROOT)/libssh2/include",
+				);
 				INFOPLIST_FILE = Derphole/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(VVTERM_VENDOR_ROOT)/libghostty/ios/lib",
+					"$(VVTERM_VENDOR_ROOT)/libssh2/ios/lib",
+				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = (
+					"$(VVTERM_VENDOR_ROOT)/libghostty/ios-simulator/lib",
+					"$(VVTERM_VENDOR_ROOT)/libssh2/ios-simulator/lib",
+				);
 				MARKETING_VERSION = 1.0;
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"-lghostty",
+					"-lssh2",
+					"-lssl",
+					"-lcrypto",
+					"-lc++",
+					"-lz",
+					"-framework",
+					Metal,
+					"-framework",
+					QuartzCore,
+					"-framework",
+					UIKit,
+				);
+				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
+					"-lghostty",
+					"-lssh2",
+					"-lssl",
+					"-lcrypto",
+					"-lc++",
+					"-lz",
+					"-framework",
+					Metal,
+					"-framework",
+					QuartzCore,
+					"-framework",
+					UIKit,
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = dev.shayne.Derphole;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "Derphole/Derphole-Bridging-Header.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -446,18 +491,63 @@
 				DEVELOPMENT_TEAM = Z5WJGBZKV9;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
+				"HEADER_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(VVTERM_VENDOR_ROOT)/libghostty/ios/include",
+					"$(VVTERM_VENDOR_ROOT)/libssh2/include",
+				);
+				"HEADER_SEARCH_PATHS[sdk=iphonesimulator*]" = (
+					"$(VVTERM_VENDOR_ROOT)/libghostty/ios-simulator/include",
+					"$(VVTERM_VENDOR_ROOT)/libssh2/include",
+				);
 				INFOPLIST_FILE = Derphole/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(VVTERM_VENDOR_ROOT)/libghostty/ios/lib",
+					"$(VVTERM_VENDOR_ROOT)/libssh2/ios/lib",
+				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = (
+					"$(VVTERM_VENDOR_ROOT)/libghostty/ios-simulator/lib",
+					"$(VVTERM_VENDOR_ROOT)/libssh2/ios-simulator/lib",
+				);
 				MARKETING_VERSION = 1.0;
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"-lghostty",
+					"-lssh2",
+					"-lssl",
+					"-lcrypto",
+					"-lc++",
+					"-lz",
+					"-framework",
+					Metal,
+					"-framework",
+					QuartzCore,
+					"-framework",
+					UIKit,
+				);
+				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
+					"-lghostty",
+					"-lssh2",
+					"-lssl",
+					"-lcrypto",
+					"-lc++",
+					"-lz",
+					"-framework",
+					Metal,
+					"-framework",
+					QuartzCore,
+					"-framework",
+					UIKit,
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = dev.shayne.Derphole;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "Derphole/Derphole-Bridging-Header.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -471,6 +561,14 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
+				"HEADER_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(VVTERM_VENDOR_ROOT)/libghostty/ios/include",
+					"$(VVTERM_VENDOR_ROOT)/libssh2/include",
+				);
+				"HEADER_SEARCH_PATHS[sdk=iphonesimulator*]" = (
+					"$(VVTERM_VENDOR_ROOT)/libghostty/ios-simulator/include",
+					"$(VVTERM_VENDOR_ROOT)/libssh2/include",
+				);
 				IPHONEOS_DEPLOYMENT_TARGET = 26.4;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = dev.shayne.DerpholeTests;
@@ -492,6 +590,14 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
+				"HEADER_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(VVTERM_VENDOR_ROOT)/libghostty/ios/include",
+					"$(VVTERM_VENDOR_ROOT)/libssh2/include",
+				);
+				"HEADER_SEARCH_PATHS[sdk=iphonesimulator*]" = (
+					"$(VVTERM_VENDOR_ROOT)/libghostty/ios-simulator/include",
+					"$(VVTERM_VENDOR_ROOT)/libssh2/include",
+				);
 				IPHONEOS_DEPLOYMENT_TARGET = 26.4;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = dev.shayne.DerpholeTests;

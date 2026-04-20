@@ -47,12 +47,18 @@ run = """
 set -euo pipefail
 mise run apple:mobile-framework
 apple_build_dir="${APPLE_BUILD_DIR:-$PWD/dist/apple-build}"
+vvterm_vendor_root="${VVTERM_VENDOR_ROOT:-/Users/shayne/code/vvterm/Vendor}"
+if [[ ! -d "${vvterm_vendor_root}/libghostty" || ! -d "${vvterm_vendor_root}/libssh2" ]]; then
+  echo "VVTerm vendor libraries not found; set VVTERM_VENDOR_ROOT to a directory containing libghostty and libssh2." >&2
+  exit 1
+fi
 xcodebuild -quiet build \
   -project apple/Derphole/Derphole.xcodeproj \
   -target Derphole \
   -configuration "${APPLE_CONFIGURATION:-Debug}" \
   -sdk "${APPLE_SDK:-iphonesimulator}" \
   CODE_SIGNING_ALLOWED="${CODE_SIGNING_ALLOWED:-NO}" \
+  VVTERM_VENDOR_ROOT="${vvterm_vendor_root}" \
   SYMROOT="${apple_build_dir}/Products" \
   OBJROOT="${apple_build_dir}/Intermediates"
 """
@@ -79,12 +85,18 @@ if [[ -z "$test_destination" ]]; then
   fi
   test_destination="platform=iOS Simulator,name=${test_device}"
 fi
+vvterm_vendor_root="${VVTERM_VENDOR_ROOT:-/Users/shayne/code/vvterm/Vendor}"
+if [[ ! -d "${vvterm_vendor_root}/libghostty" || ! -d "${vvterm_vendor_root}/libssh2" ]]; then
+  echo "VVTerm vendor libraries not found; set VVTERM_VENDOR_ROOT to a directory containing libghostty and libssh2." >&2
+  exit 1
+fi
 xcodebuild -quiet test \
   -project apple/Derphole/Derphole.xcodeproj \
   -scheme Derphole \
   -configuration "${APPLE_CONFIGURATION:-Debug}" \
   -destination "$test_destination" \
   -derivedDataPath "${APPLE_DERIVED_DATA:-dist/apple-derived-data}" \
+  VVTERM_VENDOR_ROOT="${vvterm_vendor_root}" \
   CODE_SIGNING_ALLOWED="${CODE_SIGNING_ALLOWED:-NO}"
 """
 
@@ -95,6 +107,10 @@ run = "bash ./scripts/apple-physical-transfer.sh"
 [tasks."apple:web-tunnel"]
 description = "Run a live CLI-to-iOS-simulator web tunnel test"
 run = "bash ./scripts/apple-web-tunnel.sh"
+
+[tasks."apple:ssh-tunnel"]
+description = "Run a live CLI-to-iOS-simulator SSH tunnel terminal test"
+run = "bash ./scripts/apple-ssh-tunnel.sh"
 
 [tasks."apple:mobile-tools"]
 description = "Install gomobile tools into dist/tools/bin"

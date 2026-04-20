@@ -8,21 +8,23 @@ struct SSHTabView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                connectionSection
-
-                if let errorText = state.errorText {
-                    Text(errorText)
-                        .font(.footnote)
-                        .foregroundStyle(.red)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(20)
-        }
+        connectionSection
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("sshTab")
         .navigationTitle("SSH")
+        .toolbar {
+            if state.isConnected {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(role: .destructive) {
+                        state.disconnect()
+                    } label: {
+                        Image(systemName: "xmark.circle")
+                    }
+                    .accessibilityLabel("Disconnect")
+                    .accessibilityIdentifier("sshDisconnectButton")
+                }
+            }
+        }
         .fullScreenCover(isPresented: $state.isScannerPresented, onDismiss: state.scannerDismissed) {
             ScannerSheet(
                 accessibilityIdentifier: "sshScannerSheet",
@@ -42,16 +44,41 @@ struct SSHTabView: View {
                 }
             )
         }
+        #if DEBUG
+        .task {
+            state.openRuntimeInjectedPayloadIfConfigured()
+        }
+        #endif
     }
 
     @ViewBuilder
     private var connectionSection: some View {
         if state.isConnecting {
-            connectingView
+            paddedContent {
+                connectingView
+            }
         } else if state.isConnected {
             connectedView
         } else {
-            zeroStateView
+            paddedContent {
+                zeroStateView
+            }
+        }
+    }
+
+    private func paddedContent<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                content()
+
+                if let errorText = state.errorText {
+                    Text(errorText)
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(20)
         }
     }
 
@@ -124,27 +151,31 @@ struct SSHTabView: View {
     }
 
     private var connectedView: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Label("Connected", systemImage: "checkmark.circle.fill")
-                .font(.headline)
-                .foregroundStyle(.green)
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Label("Connected", systemImage: "checkmark.circle.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.green)
 
-            Text(state.statusText)
-                .font(.callout)
-                .foregroundStyle(.secondary)
+                Spacer()
 
-            Button(role: .destructive) {
-                state.disconnect()
-            } label: {
-                Label("Disconnect", systemImage: "xmark.circle")
-                    .frame(maxWidth: .infinity)
+                Text(state.statusText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
-            .buttonStyle(.bordered)
-            .controlSize(.large)
-            .accessibilityIdentifier("sshDisconnectButton")
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(.bar)
+
+            if let session = state.terminalSession {
+                SSHTerminalSurfaceView(session: session, onExit: state.terminalExited)
+                    .background(.black)
+                    .accessibilityIdentifier("sshTerminalContainer")
+            } else {
+                ContentUnavailableView("Terminal unavailable", systemImage: "terminal")
+            }
         }
-        .padding(16)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
     }
 }
 

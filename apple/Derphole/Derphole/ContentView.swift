@@ -11,7 +11,7 @@ struct ContentView: View {
     @StateObject private var tokenStore = TokenStore()
     @State private var selectedTab: AppTab
 
-    init(initialTab: AppTab = LiveWebLaunchConfiguration.initialTab()) {
+    init(initialTab: AppTab = LiveAppLaunchConfiguration.initialTab()) {
         _selectedTab = State(initialValue: initialTab)
     }
 

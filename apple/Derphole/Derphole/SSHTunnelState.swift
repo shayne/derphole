@@ -3,8 +3,16 @@ import DerpholeMobile
 import Foundation
 
 nonisolated protocol SSHLocalTunnelConnecting {
-    func connect(token: String, username: String, password: String) async throws
+    func connect(token: String, username: String, password: String) async throws -> SSHConnectedTerminalSession
     func disconnect()
+}
+
+nonisolated protocol SSHConnectedTerminalSession: AnyObject, Sendable {
+    var output: AsyncStream<Data> { get }
+
+    func write(_ data: Data) async throws
+    func resize(cols: Int, rows: Int) async throws
+    func close()
 }
 
 enum SSHConnectionError: LocalizedError {
@@ -13,6 +21,10 @@ enum SSHConnectionError: LocalizedError {
     case missingRememberedToken
     case missingCredentials
     case terminalIntegrationPending
+    case terminalInitializationFailed(String)
+    case invalidTunnelEndpoint(String)
+    case authenticationFailed
+    case sshFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -26,6 +38,14 @@ enum SSHConnectionError: LocalizedError {
             return "Enter a username and password."
         case .terminalIntegrationPending:
             return "Terminal integration pending."
+        case .terminalInitializationFailed(let message):
+            return message
+        case .invalidTunnelEndpoint(let endpoint):
+            return "Invalid local SSH tunnel endpoint: \(endpoint)"
+        case .authenticationFailed:
+            return "SSH authentication failed."
+        case .sshFailed(let message):
+            return message
         }
     }
 }
@@ -40,16 +60,22 @@ final class SSHTunnelState: ObservableObject {
     @Published private(set) var errorText: String?
     @Published private(set) var isConnecting = false
     @Published private(set) var isConnected = false
+    @Published private(set) var terminalSession: SSHConnectedTerminalSession?
 
     private let tokenStore: TokenStore
     private let connectorFactory: () -> SSHLocalTunnelConnecting
     private var activeConnector: SSHLocalTunnelConnecting?
     private var connectionID = UUID()
     private var ignoresNextCredentialPromptDismissal = false
+    #if DEBUG
+    private var runtimeInjectedSSHStarted = false
+    #endif
 
     init(
         tokenStore: TokenStore,
-        connectorFactory: @escaping () -> SSHLocalTunnelConnecting = { PlaceholderSSHConnector() }
+        connectorFactory: @escaping () -> SSHLocalTunnelConnecting = {
+            DerpholeSSHConnector() ?? PlaceholderSSHConnector()
+        }
     ) {
         self.tokenStore = tokenStore
         self.connectorFactory = connectorFactory
@@ -142,16 +168,18 @@ final class SSHTunnelState: ObservableObject {
         statusText = "Opening SSH tunnel..."
 
         do {
-            try await connector.connect(token: token, username: trimmedUsername, password: submittedPassword)
+            let session = try await connector.connect(token: token, username: trimmedUsername, password: submittedPassword)
             guard connectionID == currentConnectionID else { return }
             isConnecting = false
             isConnected = true
-            statusText = "SSH tunnel connected."
+            terminalSession = session
+            statusText = "SSH terminal connected."
             errorText = nil
             clearCredentials()
         } catch {
             guard connectionID == currentConnectionID else { return }
             activeConnector = nil
+            terminalSession = nil
             isConnecting = false
             isConnected = false
             let message = error.localizedDescription
@@ -162,6 +190,8 @@ final class SSHTunnelState: ObservableObject {
     }
 
     func disconnect() {
+        terminalSession?.close()
+        terminalSession = nil
         activeConnector?.disconnect()
         activeConnector = nil
         connectionID = UUID()
@@ -173,9 +203,37 @@ final class SSHTunnelState: ObservableObject {
         clearCredentials()
     }
 
+    func terminalExited() {
+        terminalSession?.close()
+        terminalSession = nil
+        activeConnector?.disconnect()
+        activeConnector = nil
+        connectionID = UUID()
+        isCredentialPromptPresented = false
+        isConnecting = false
+        isConnected = false
+        errorText = nil
+        statusText = "SSH session ended."
+        clearCredentials()
+    }
+
+    #if DEBUG
+    func openRuntimeInjectedPayloadIfConfigured(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        arguments: [String] = ProcessInfo.processInfo.arguments
+    ) {
+        guard !runtimeInjectedSSHStarted else { return }
+        guard let payload = LiveSSHLaunchConfiguration.payload(from: environment, arguments: arguments) else { return }
+
+        runtimeInjectedSSHStarted = true
+        acceptScannedPayload(payload)
+    }
+    #endif
+
     private func presentCredentialPrompt(status: String) {
         activeConnector?.disconnect()
         activeConnector = nil
+        terminalSession = nil
         connectionID = UUID()
         clearCredentials()
         isConnecting = false
@@ -202,6 +260,7 @@ final class SSHTunnelState: ObservableObject {
     private func failBeforeConnect(status: String, error: String) {
         activeConnector?.disconnect()
         activeConnector = nil
+        terminalSession = nil
         connectionID = UUID()
         isCredentialPromptPresented = false
         isConnecting = false
@@ -218,7 +277,7 @@ final class SSHTunnelState: ObservableObject {
 }
 
 nonisolated private struct PlaceholderSSHConnector: SSHLocalTunnelConnecting {
-    func connect(token: String, username: String, password: String) async throws {
+    func connect(token: String, username: String, password: String) async throws -> SSHConnectedTerminalSession {
         throw SSHConnectionError.terminalIntegrationPending
     }
 
