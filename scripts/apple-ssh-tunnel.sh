@@ -40,13 +40,13 @@ wait_for_file_value() {
   return 1
 }
 
-wait_for_tcp_payload() {
+wait_for_compact_invite() {
   local log_path="$1"
-  local payload=""
+  local invite=""
   for _ in $(seq 1 300); do
-    payload="$(sed -nE 's/^Payload: (derphole:\/\/tcp[^[:space:]]+).*/\1/p' "${log_path}" | tail -n 1 || true)"
-    if [[ -n "${payload}" ]]; then
-      printf '%s\n' "${payload}"
+    invite="$(sed -nE 's/^Invite: (DT1[^[:space:]]+).*/\1/p' "${log_path}" | tail -n 1 || true)"
+    if [[ -n "${invite}" ]]; then
+      printf '%s\n' "${invite}"
       return 0
     fi
     if [[ -n "${serve_pid}" ]] && ! kill -0 "${serve_pid}" 2>/dev/null; then
@@ -165,12 +165,12 @@ serve_log="${tmp}/derptun-serve.log"
 dist/derptun serve --token "${server_token}" --tcp "${ssh_addr}" --qr >"${tmp}/derptun-serve.out" 2>"${serve_log}" &
 serve_pid=$!
 
-if ! payload="$(wait_for_tcp_payload "${serve_log}")"; then
-  echo "failed to capture derphole://tcp payload from derptun serve" >&2
+if ! invite="$(wait_for_compact_invite "${serve_log}")"; then
+  echo "failed to capture compact invite from derptun serve" >&2
   cat "${serve_log}" >&2 || true
   exit 1
 fi
-echo "payload: ${payload}"
+echo "invite: ${invite}"
 
 test_destination="$(resolve_test_destination)"
 derived_data="${APPLE_DERIVED_DATA:-dist/apple-ssh-derived-data}"
@@ -202,7 +202,7 @@ if [[ -z "${xctestrun_path}" ]]; then
   echo "failed to locate generated xctestrun under ${derived_data}/Build/Products" >&2
   exit 1
 fi
-inject_xctestrun_payload "${xctestrun_path}" "${payload}" "${username}" "${password}" "${input_probe}"
+inject_xctestrun_payload "${xctestrun_path}" "${invite}" "${username}" "${password}" "${input_probe}"
 
 if ! xcodebuild -quiet test-without-building \
     -xctestrun "${xctestrun_path}" \

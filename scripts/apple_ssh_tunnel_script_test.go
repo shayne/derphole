@@ -28,7 +28,8 @@ func TestAppleSSHTunnelScriptIsWiredThroughMise(t *testing.T) {
 	for _, want := range []string{
 		"go run ./tools/ssh-fixture",
 		"derptun serve",
-		"derphole://tcp",
+		"wait_for_compact_invite",
+		"Invite: (DT1[^[:space:]]+)",
 		"DERPHOLE_LIVE_SSH_PAYLOAD",
 		"DERPHOLE_LIVE_SSH_USERNAME",
 		"DERPHOLE_LIVE_SSH_PASSWORD",

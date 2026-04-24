@@ -5,12 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
-	"net/url"
 	"time"
 
 	"github.com/mdp/qrterminal/v3"
-	"github.com/shayne/derphole/pkg/derphole/qrpayload"
 	derptunpkg "github.com/shayne/derphole/pkg/derptun"
 	"github.com/shayne/derphole/pkg/session"
 	"github.com/shayne/derphole/pkg/telemetry"
@@ -24,7 +21,6 @@ type serveFlags struct {
 	TCP        string `flag:"tcp" help:"Local TCP target to expose, for example 127.0.0.1:22"`
 	ForceRelay bool   `flag:"force-relay" help:"Disable direct probing"`
 	QR         bool   `flag:"qr" help:"Render a QR code for mobile tunnel clients"`
-	Web        bool   `flag:"web" help:"Mark the QR payload as an HTTP web tunnel"`
 }
 
 var serveHelpConfig = yargs.HelpConfig{
@@ -40,10 +36,10 @@ var serveHelpConfig = yargs.HelpConfig{
 		"serve": {
 			Name:        "serve",
 			Description: "Expose a local TCP target until Ctrl-C.",
-			Usage:       "(--token TOKEN|--token-file PATH|--token-stdin) --tcp HOST:PORT [--force-relay] [--qr] [--web]",
+			Usage:       "(--token TOKEN|--token-file PATH|--token-stdin) --tcp HOST:PORT [--force-relay] [--qr]",
 			Examples: []string{
 				"derptun serve --token-file server.dts --tcp 127.0.0.1:22",
-				"derptun serve --token-file server.dts --tcp 127.0.0.1:8080 --qr --web",
+				"derptun serve --token-file server.dts --tcp 127.0.0.1:4222 --qr",
 				"printf '%s\\n' \"$DERPTUN_SERVER_TOKEN\" | derptun serve --token-stdin --tcp 127.0.0.1:22",
 			},
 		},
@@ -73,11 +69,6 @@ func runServe(args []string, level telemetry.Level, stdin io.Reader, stderr io.W
 		fmt.Fprint(stderr, serveHelpText())
 		return 2
 	}
-	if parsed.SubCommandFlags.Web && !parsed.SubCommandFlags.QR {
-		fmt.Fprintln(stderr, "--web requires --qr")
-		fmt.Fprint(stderr, serveHelpText())
-		return 2
-	}
 	token, _, err := resolveTokenSource(stdin, tokenSource{
 		Token:      parsed.SubCommandFlags.Token,
 		TokenFile:  parsed.SubCommandFlags.TokenFile,
@@ -89,12 +80,12 @@ func runServe(args []string, level telemetry.Level, stdin io.Reader, stderr io.W
 		return 2
 	}
 	if parsed.SubCommandFlags.QR {
-		payload, webHint, err := serveQRPayload(token, parsed.SubCommandFlags.TCP, parsed.SubCommandFlags.Web)
+		invite, err := serveQRInvite(token)
 		if err != nil {
 			fmt.Fprintln(stderr, err)
 			return 1
 		}
-		writeServeQRInstruction(stderr, payload, webHint)
+		writeServeQRInstruction(stderr, invite)
 	}
 
 	ctx, stop := commandContext()
@@ -116,23 +107,12 @@ func serveHelpText() string {
 	return yargs.GenerateSubCommandHelp(serveHelpConfig, "serve", struct{}{}, serveFlags{}, struct{}{})
 }
 
-func serveQRPayload(serverToken, targetAddr string, web bool) (string, string, error) {
+func serveQRInvite(serverToken string) (string, error) {
 	clientToken, err := deriveServeQRClientToken(serverToken, time.Now())
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
-	if web {
-		payload, err := qrpayload.EncodeWebToken(clientToken, "http", "/")
-		if err != nil {
-			return "", "", err
-		}
-		return payload, webURLHint(targetAddr), nil
-	}
-	payload, err := qrpayload.EncodeTCPToken(clientToken)
-	if err != nil {
-		return "", "", err
-	}
-	return payload, "", nil
+	return derptunpkg.EncodeClientInvite(clientToken)
 }
 
 func deriveServeQRClientToken(serverToken string, now time.Time) (string, error) {
@@ -152,27 +132,11 @@ func deriveServeQRClientToken(serverToken string, now time.Time) (string, error)
 	})
 }
 
-func writeServeQRInstruction(stderr io.Writer, payload, webHint string) {
+func writeServeQRInstruction(stderr io.Writer, invite string) {
 	if stderr == nil {
 		return
 	}
-	if webHint != "" {
-		fmt.Fprintf(stderr, "Scan this QR code with the Derphole iOS app to open %s:\n", webHint)
-		fmt.Fprintf(stderr, "Web URL: %s\n", webHint)
-	} else {
-		fmt.Fprintln(stderr, "Scan this QR code with the Derphole iOS app to open this TCP tunnel:")
-	}
-	fmt.Fprintf(stderr, "Payload: %s\n", payload)
-	qrterminal.GenerateHalfBlock(payload, qrterminal.M, stderr)
-}
-
-func webURLHint(targetAddr string) string {
-	host, port, err := net.SplitHostPort(targetAddr)
-	if err == nil {
-		if host == "" || host == "0.0.0.0" || host == "::" {
-			host = "127.0.0.1"
-		}
-		return (&url.URL{Scheme: "http", Host: net.JoinHostPort(host, port), Path: "/"}).String()
-	}
-	return (&url.URL{Scheme: "http", Host: targetAddr, Path: "/"}).String()
+	fmt.Fprintln(stderr, "Scan this QR code with a derptun-compatible mobile app to open this TCP tunnel:")
+	fmt.Fprintf(stderr, "Invite: %s\n", invite)
+	qrterminal.GenerateHalfBlock(invite, qrterminal.M, stderr)
 }

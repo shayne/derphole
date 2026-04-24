@@ -40,14 +40,13 @@ wait_for_file_value() {
   return 1
 }
 
-wait_for_web_payload() {
+wait_for_compact_invite() {
   local log_path="$1"
-  local payload=""
-  # Parse Payload: (derphole://web[^[:space:]]+) from derptun serve stderr.
+  local invite=""
   for _ in $(seq 1 300); do
-    payload="$(sed -nE 's/^Payload: (derphole:\/\/web[^[:space:]]+).*/\1/p' "${log_path}" | tail -n 1 || true)"
-    if [[ -n "${payload}" ]]; then
-      printf '%s\n' "${payload}"
+    invite="$(sed -nE 's/^Invite: (DT1[^[:space:]]+).*/\1/p' "${log_path}" | tail -n 1 || true)"
+    if [[ -n "${invite}" ]]; then
+      printf '%s\n' "${invite}"
       return 0
     fi
     if [[ -n "${serve_pid}" ]] && ! kill -0 "${serve_pid}" 2>/dev/null; then
@@ -186,15 +185,15 @@ mise run apple:mobile-framework
 
 server_token="$(dist/derptun token server)"
 serve_log="${tmp}/derptun-serve.log"
-dist/derptun serve --token "${server_token}" --tcp "${fixture_addr}" --web --qr >"${tmp}/derptun-serve.out" 2>"${serve_log}" &
+dist/derptun serve --token "${server_token}" --tcp "${fixture_addr}" --qr >"${tmp}/derptun-serve.out" 2>"${serve_log}" &
 serve_pid=$!
 
-if ! payload="$(wait_for_web_payload "${serve_log}")"; then
-  echo "failed to capture derphole://web payload from derptun serve" >&2
+if ! invite="$(wait_for_compact_invite "${serve_log}")"; then
+  echo "failed to capture compact invite from derptun serve" >&2
   cat "${serve_log}" >&2 || true
   exit 1
 fi
-echo "payload: ${payload}"
+echo "invite: ${invite}"
 
 test_destination="$(resolve_test_destination)"
 derived_data="${APPLE_DERIVED_DATA:-dist/apple-web-derived-data}"
@@ -225,7 +224,7 @@ if [[ -z "${xctestrun_path}" ]]; then
   echo "failed to locate generated xctestrun under ${derived_data}/Build/Products" >&2
   exit 1
 fi
-inject_xctestrun_payload "${xctestrun_path}" "${payload}" "${marker}"
+inject_xctestrun_payload "${xctestrun_path}" "${invite}" "${marker}"
 
 if ! xcodebuild -quiet test-without-building \
     -xctestrun "${xctestrun_path}" \

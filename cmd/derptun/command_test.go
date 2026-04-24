@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shayne/derphole/pkg/derphole/qrpayload"
 	"github.com/shayne/derphole/pkg/derptun"
 	"github.com/shayne/derphole/pkg/session"
 )
@@ -59,7 +58,7 @@ func TestRunServeReadsServerTokenFromFile(t *testing.T) {
 	}
 }
 
-func TestRunServeQREmitsTCPPayloadAndServesWithServerToken(t *testing.T) {
+func TestRunServeQREmitsCompactInviteAndServesWithServerToken(t *testing.T) {
 	serverToken := newDerptunServerToken(t)
 	oldServe := derptunServe
 	defer func() { derptunServe = oldServe }()
@@ -83,59 +82,26 @@ func TestRunServeQREmitsTCPPayloadAndServesWithServerToken(t *testing.T) {
 	if !called {
 		t.Fatal("derptunServe was not called")
 	}
-	payload := extractDerptunQRPayload(t, stderr.String())
-	if payload.Kind != qrpayload.KindTCP {
-		t.Fatalf("payload.Kind = %q, want %q", payload.Kind, qrpayload.KindTCP)
+	invite := extractCompactInvite(t, stderr.String())
+	cred, err := derptun.DecodeClientInvite(invite, time.Now())
+	if err != nil {
+		t.Fatalf("DecodeClientInvite() error = %v", err)
 	}
-	assertDerivedDerptunClientToken(t, serverToken, payload.Token)
-}
-
-func TestRunServeQRWebEmitsWebPayloadAndHint(t *testing.T) {
-	serverToken := newDerptunServerToken(t)
-	oldServe := derptunServe
-	defer func() { derptunServe = oldServe }()
-	called := false
-	derptunServe = func(ctx context.Context, cfg session.DerptunServeConfig) error {
-		called = true
-		if cfg.ServerToken != serverToken {
-			t.Fatalf("ServerToken = %q, want original server token", cfg.ServerToken)
-		}
-		if cfg.TargetAddr != "127.0.0.1:8080" {
-			t.Fatalf("TargetAddr = %q, want 127.0.0.1:8080", cfg.TargetAddr)
-		}
-		return nil
-	}
-
-	var stderr bytes.Buffer
-	code := run([]string{"serve", "--token", serverToken, "--tcp", "127.0.0.1:8080", "--qr", "--web"}, strings.NewReader(""), &bytes.Buffer{}, &stderr)
-	if code != 0 {
-		t.Fatalf("code = %d stderr=%s", code, stderr.String())
-	}
-	if !called {
-		t.Fatal("derptunServe was not called")
-	}
-	payload := extractDerptunQRPayload(t, stderr.String())
-	if payload.Kind != qrpayload.KindWeb {
-		t.Fatalf("payload.Kind = %q, want %q", payload.Kind, qrpayload.KindWeb)
-	}
-	if payload.Scheme != "http" || payload.Path != "/" {
-		t.Fatalf("payload = %#v, want http / web payload", payload)
-	}
-	assertDerivedDerptunClientToken(t, serverToken, payload.Token)
-	if !strings.Contains(stderr.String(), "http://127.0.0.1:8080/") {
-		t.Fatalf("stderr = %q, want web URL hint", stderr.String())
+	assertDerivedDerptunClientCredential(t, serverToken, cred)
+	if strings.Contains(stderr.String(), "derphole://") {
+		t.Fatalf("stderr contains legacy URL payload: %q", stderr.String())
 	}
 }
 
-func TestRunServeWebWithoutQRReturnsUsageError(t *testing.T) {
+func TestRunServeRejectsRemovedWebFlag(t *testing.T) {
 	serverToken := newDerptunServerToken(t)
 	var stderr bytes.Buffer
 	code := run([]string{"serve", "--token", serverToken, "--tcp", "127.0.0.1:8080", "--web"}, strings.NewReader(""), &bytes.Buffer{}, &stderr)
 	if code != 2 {
 		t.Fatalf("code = %d, want 2", code)
 	}
-	if !strings.Contains(stderr.String(), "--web requires --qr") {
-		t.Fatalf("stderr = %q, want --web requires --qr", stderr.String())
+	if !strings.Contains(stderr.String(), "unknown flag") && !strings.Contains(stderr.String(), "Usage:") {
+		t.Fatalf("stderr = %q, want usage for removed --web flag", stderr.String())
 	}
 }
 
@@ -232,40 +198,28 @@ func newDerptunServerToken(t *testing.T) string {
 	return token
 }
 
-func extractDerptunQRPayload(t *testing.T, output string) qrpayload.Payload {
+func extractCompactInvite(t *testing.T, output string) string {
 	t.Helper()
 	for _, field := range strings.Fields(output) {
-		if !strings.HasPrefix(field, qrpayload.Scheme+"://") {
-			continue
+		if strings.HasPrefix(field, derptun.CompactInvitePrefix) {
+			return strings.TrimSpace(field)
 		}
-		payload, err := qrpayload.Parse(strings.TrimSpace(field))
-		if err != nil {
-			t.Fatalf("Parse(%q) error = %v", field, err)
-		}
-		return payload
 	}
-	t.Fatalf("QR payload not found in output %q", output)
-	return qrpayload.Payload{}
+	t.Fatalf("compact invite not found in output %q", output)
+	return ""
 }
 
-func assertDerivedDerptunClientToken(t *testing.T, serverToken, clientToken string) {
+func assertDerivedDerptunClientCredential(t *testing.T, serverToken string, clientCred derptun.ClientCredential) {
 	t.Helper()
-	if clientToken == serverToken {
-		t.Fatal("payload token reused server token, want derived client token")
-	}
-	if !strings.HasPrefix(clientToken, derptun.ClientTokenPrefix) {
-		t.Fatalf("payload token = %q, want %s prefix", clientToken, derptun.ClientTokenPrefix)
-	}
 	now := time.Now()
 	serverCred, err := derptun.DecodeServerToken(serverToken, now)
 	if err != nil {
 		t.Fatalf("DecodeServerToken() error = %v", err)
 	}
-	clientCred, err := derptun.DecodeClientToken(clientToken, now)
-	if err != nil {
-		t.Fatalf("DecodeClientToken() error = %v", err)
-	}
 	if clientCred.SessionID != serverCred.SessionID {
 		t.Fatalf("client SessionID = %x, want server SessionID %x", clientCred.SessionID, serverCred.SessionID)
+	}
+	if clientCred.BearerSecret == ([32]byte{}) {
+		t.Fatal("client BearerSecret is empty")
 	}
 }
