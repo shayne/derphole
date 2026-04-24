@@ -230,10 +230,7 @@ func assertDerivedDerptunClientCredential(t *testing.T, serverToken string, clie
 	if err != nil {
 		t.Fatalf("DecodeServerToken() error = %v", err)
 	}
-	if clientCred.SessionID != serverCred.SessionID {
-		t.Fatalf("client SessionID = %x, want server SessionID %x", clientCred.SessionID, serverCred.SessionID)
-	}
-	if clientCred.BearerSecret == ([32]byte{}) {
-		t.Fatal("client BearerSecret is empty")
+	if err := derptun.VerifyClientCredential(serverCred.SigningSecret, clientCred, now); err != nil {
+		t.Fatalf("VerifyClientCredential() error = %v", err)
 	}
 }
