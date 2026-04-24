@@ -103,6 +103,7 @@ public enum DerpholeTunnelError: Error, Equatable, LocalizedError, Sendable {
     case missingBoundAddress
     case invalidBoundAddress(String)
     case openFailed(String)
+    case openAlreadyInProgress
 
     public var errorDescription: String? {
         switch self {
@@ -118,6 +119,8 @@ public enum DerpholeTunnelError: Error, Equatable, LocalizedError, Sendable {
             return "DerpholeMobile reported an invalid bound address: \(address)"
         case .openFailed(let message):
             return "Derptun tunnel failed to open: \(message)"
+        case .openAlreadyInProgress:
+            return "A derptun tunnel is already open or opening; cancel it before opening another tunnel."
         }
     }
 }
@@ -139,7 +142,7 @@ public final class DerptunTunnelClient: @unchecked Sendable {
         onEvent: @escaping @Sendable (DerpholeTunnelEvent) -> Void = { _ in }
     ) async throws -> DerptunEndpoint {
         let adapter = CallbackAdapter(onEvent: onEvent)
-        let generation = beginOpen(adapter: adapter)
+        let generation = try beginOpen(adapter: adapter)
 
         do {
             let endpoint = try await withTaskCancellationHandler(operation: {
@@ -181,8 +184,9 @@ public final class DerptunTunnelClient: @unchecked Sendable {
             }
             return endpoint
         } catch {
-            clearFailedOpen(generation: generation, adapter: adapter)
-            client.cancel()
+            if clearFailedOpen(generation: generation, adapter: adapter) {
+                client.cancel()
+            }
             throw error
         }
     }
@@ -203,10 +207,10 @@ public final class DerptunTunnelClient: @unchecked Sendable {
         cancel()
     }
 
-    private func beginOpen(adapter: CallbackAdapter) -> UInt64 {
+    private func beginOpen(adapter: CallbackAdapter) throws -> UInt64 {
         lock.lock()
         defer { lock.unlock() }
-        return openState.begin(adapter: adapter)
+        return try openState.begin(adapter: adapter)
     }
 
     private func markOpenCanceled() {
@@ -221,38 +225,49 @@ public final class DerptunTunnelClient: @unchecked Sendable {
         return openState.isCanceled(generation)
     }
 
-    private func clearFailedOpen(generation: UInt64, adapter: CallbackAdapter) {
+    private func clearFailedOpen(generation: UInt64, adapter: CallbackAdapter) -> Bool {
         lock.lock()
-        openState.clearFailure(generation: generation, adapter: adapter)
-        lock.unlock()
+        defer { lock.unlock() }
+        return openState.clearFailure(generation: generation, adapter: adapter)
     }
 }
 
 struct TunnelOpenState {
     private(set) var generation: UInt64 = 0
-    private var canceledGeneration: UInt64?
+    private var canceledGenerations: Set<UInt64> = []
+    private var activeGeneration: UInt64?
     private var activeAdapter: CallbackAdapter?
 
-    mutating func begin(adapter: CallbackAdapter) -> UInt64 {
+    mutating func begin(adapter: CallbackAdapter) throws -> UInt64 {
+        guard activeAdapter == nil else {
+            throw DerpholeTunnelError.openAlreadyInProgress
+        }
         generation &+= 1
-        canceledGeneration = nil
+        activeGeneration = generation
         activeAdapter = adapter
         return generation
     }
 
     mutating func cancelActive() {
-        guard activeAdapter != nil else { return }
-        canceledGeneration = generation
+        guard let activeGeneration, activeAdapter != nil else { return }
+        canceledGenerations.insert(activeGeneration)
+        self.activeGeneration = nil
         activeAdapter = nil
     }
 
     func isCanceled(_ generation: UInt64) -> Bool {
-        canceledGeneration == generation
+        canceledGenerations.contains(generation)
     }
 
-    mutating func clearFailure(generation: UInt64, adapter: CallbackAdapter) {
-        guard self.generation == generation, activeAdapter === adapter else { return }
+    func isActive(_ generation: UInt64) -> Bool {
+        activeGeneration == generation && activeAdapter != nil
+    }
+
+    mutating func clearFailure(generation: UInt64, adapter: CallbackAdapter) -> Bool {
+        guard activeGeneration == generation, activeAdapter === adapter else { return false }
+        activeGeneration = nil
         activeAdapter = nil
+        return true
     }
 }
 
@@ -286,6 +301,8 @@ nonisolated final class CallbackAdapter: NSObject, DerpholemobileTunnelCallbacks
             onEvent(.route(.relay))
         case "connected-direct":
             onEvent(.route(.direct))
+        case "negotiating":
+            onEvent(.route(.negotiating))
         default:
             guard !trimmed.isEmpty else { return }
             onEvent(.status(trimmed))

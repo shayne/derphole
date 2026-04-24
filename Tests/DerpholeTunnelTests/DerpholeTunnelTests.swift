@@ -41,6 +41,7 @@ final class DerpholeTunnelTests: XCTestCase {
         adapter.status("connected-relay")
         adapter.status("connected-direct")
         adapter.status("negotiating")
+        adapter.status("warming-up")
         adapter.status("  ")
         adapter.trace(" relay trace ")
         adapter.trace("")
@@ -48,14 +49,15 @@ final class DerpholeTunnelTests: XCTestCase {
         XCTAssertEqual(recorder.events, [
             .route(.relay),
             .route(.direct),
-            .status("negotiating"),
+            .route(.negotiating),
+            .status("warming-up"),
             .trace("relay trace")
         ])
     }
 
-    func testOpenStateTracksExplicitCancelByGeneration() {
+    func testOpenStateTracksExplicitCancelByGeneration() throws {
         var state = TunnelOpenState()
-        let first = state.begin(adapter: CallbackAdapter { _ in })
+        let first = try state.begin(adapter: CallbackAdapter { _ in })
 
         XCTAssertFalse(state.isCanceled(first))
 
@@ -63,10 +65,36 @@ final class DerpholeTunnelTests: XCTestCase {
 
         XCTAssertTrue(state.isCanceled(first))
 
-        let second = state.begin(adapter: CallbackAdapter { _ in })
+        let second = try state.begin(adapter: CallbackAdapter { _ in })
 
         XCTAssertFalse(state.isCanceled(second))
-        XCTAssertFalse(state.isCanceled(first))
+        XCTAssertTrue(state.isCanceled(first))
+    }
+
+    func testOpenStateRejectsSecondBeginWhileActive() throws {
+        var state = TunnelOpenState()
+        _ = try state.begin(adapter: CallbackAdapter { _ in })
+
+        XCTAssertThrowsError(try state.begin(adapter: CallbackAdapter { _ in })) { error in
+            XCTAssertEqual(error as? DerpholeTunnelError, .openAlreadyInProgress)
+        }
+    }
+
+    func testOpenStateStaleFailureCannotClearNewerActiveGeneration() throws {
+        var state = TunnelOpenState()
+        let oldAdapter = CallbackAdapter { _ in }
+        let old = try state.begin(adapter: oldAdapter)
+
+        state.cancelActive()
+
+        let newAdapter = CallbackAdapter { _ in }
+        let newer = try state.begin(adapter: newAdapter)
+
+        XCTAssertFalse(state.clearFailure(generation: old, adapter: oldAdapter))
+        XCTAssertTrue(state.isActive(newer))
+        XCTAssertThrowsError(try state.begin(adapter: CallbackAdapter { _ in })) { error in
+            XCTAssertEqual(error as? DerpholeTunnelError, .openAlreadyInProgress)
+        }
     }
 }
 

@@ -160,8 +160,24 @@ shell = "bash -c"
 run = """
 set -euo pipefail
 mise run swiftpm:framework >/tmp/derphole-swiftpm-checksum.txt
+test_destination="${APPLE_TEST_DESTINATION:-}"
+if [[ -z "$test_destination" ]]; then
+  test_device_name="${APPLE_TEST_DEVICE:-iPhone 17}"
+  test_device="$(xcrun simctl list devices available | awk -v wanted="$test_device_name" '/^[[:space:]]+iPhone/ || /^[[:space:]]+iPad/ { line=$0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+[(].*/, "", line); if (line == wanted) { print line; exit } }')"
+  if [[ -z "$test_device" ]]; then
+    test_device="$(xcrun simctl list devices available | awk '(/^[[:space:]]+iPhone/ || /^[[:space:]]+iPad/) && /[(]Booted[)]/ { sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+[(].*/, ""); print; exit }')"
+  fi
+  if [[ -z "$test_device" ]]; then
+    test_device="$(xcrun simctl list devices available | awk '/^[[:space:]]+iPhone/ || /^[[:space:]]+iPad/ { sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+[(].*/, ""); print; exit }')"
+  fi
+  if [[ -z "$test_device" ]]; then
+    echo "No available iOS Simulator devices found; install an iOS simulator or set APPLE_TEST_DESTINATION." >&2
+    exit 1
+  fi
+  test_destination="platform=iOS Simulator,name=${test_device}"
+fi
 xcodebuild -scheme derphole \
-  -destination 'platform=iOS Simulator,name=iPhone 17' \
+  -destination "$test_destination" \
   -derivedDataPath dist/swiftpm-derived-data \
   test
 """
