@@ -251,6 +251,10 @@ func VerifyClientCredential(secret [32]byte, client ClientCredential, now time.T
 	return nil
 }
 
+func clientNameForID(clientID [16]byte) string {
+	return "client-" + hex.EncodeToString(clientID[:4])
+}
+
 func normalizedNow(now time.Time) time.Time {
 	if now.IsZero() {
 		return time.Now()

@@ -10,9 +10,11 @@ import (
 const (
 	CompactInvitePrefix = "DT1"
 
-	compactInviteRawLen  = 186
-	compactInviteVersion = 1
-	compactInviteKindTCP = 1
+	compactInviteRawLen     = 186
+	compactInvitePayloadLen = 279
+	compactInviteBase       = 41
+	compactInviteVersion    = 1
+	compactInviteKindTCP    = 1
 
 	compactInviteVersionOffset = 0
 	compactInviteKindOffset    = 1
@@ -24,9 +26,9 @@ const (
 	compactInviteQUICOffset    = 90
 	compactInviteBearerOffset  = 122
 	compactInviteProofOffset   = 154
-
-	base45Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
 )
+
+var compactInviteAlphabet = []byte("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./:")
 
 func EncodeClientInvite(clientToken string) (string, error) {
 	cred, err := DecodeClientToken(clientToken, time.Time{})
@@ -53,14 +55,18 @@ func EncodeClientInvite(clientToken string) (string, error) {
 	copy(raw[compactInviteBearerOffset:compactInviteProofOffset], cred.BearerSecret[:])
 	copy(raw[compactInviteProofOffset:], proofMAC)
 
-	return CompactInvitePrefix + base45Encode(raw), nil
+	return CompactInvitePrefix + compactInviteEncode(raw), nil
 }
 
 func DecodeClientInvite(invite string, now time.Time) (ClientCredential, error) {
 	if len(invite) <= len(CompactInvitePrefix) || invite[:len(CompactInvitePrefix)] != CompactInvitePrefix {
 		return ClientCredential{}, ErrInvalidToken
 	}
-	raw, err := base45Decode(invite[len(CompactInvitePrefix):])
+	encoded := invite[len(CompactInvitePrefix):]
+	if len(encoded) != compactInvitePayloadLen {
+		return ClientCredential{}, ErrInvalidToken
+	}
+	raw, err := compactInviteDecode(encoded)
 	if err != nil {
 		return ClientCredential{}, ErrInvalidToken
 	}
@@ -98,34 +104,30 @@ func DecodeClientInvite(invite string, now time.Time) (ClientCredential, error) 
 	return cred, nil
 }
 
-func clientNameForID(clientID [16]byte) string {
-	return "client-" + hex.EncodeToString(clientID[:4])
-}
-
-func base45Encode(raw []byte) string {
+func compactInviteEncode(raw []byte) string {
 	var out strings.Builder
 	out.Grow((len(raw) / 2 * 3) + (len(raw)%2)*2)
 	for i := 0; i < len(raw); {
 		if i+1 < len(raw) {
 			value := int(raw[i])<<8 | int(raw[i+1])
-			out.WriteByte(base45Alphabet[value%45])
-			value /= 45
-			out.WriteByte(base45Alphabet[value%45])
-			value /= 45
-			out.WriteByte(base45Alphabet[value])
+			out.WriteByte(compactInviteAlphabet[value%compactInviteBase])
+			value /= compactInviteBase
+			out.WriteByte(compactInviteAlphabet[value%compactInviteBase])
+			value /= compactInviteBase
+			out.WriteByte(compactInviteAlphabet[value])
 			i += 2
 			continue
 		}
 
 		value := int(raw[i])
-		out.WriteByte(base45Alphabet[value%45])
-		out.WriteByte(base45Alphabet[value/45])
+		out.WriteByte(compactInviteAlphabet[value%compactInviteBase])
+		out.WriteByte(compactInviteAlphabet[value/compactInviteBase])
 		i++
 	}
 	return out.String()
 }
 
-func base45Decode(encoded string) ([]byte, error) {
+func compactInviteDecode(encoded string) ([]byte, error) {
 	if len(encoded)%3 == 1 {
 		return nil, ErrInvalidToken
 	}
@@ -134,19 +136,19 @@ func base45Decode(encoded string) ([]byte, error) {
 	for i := 0; i < len(encoded); {
 		remaining := len(encoded) - i
 		if remaining >= 3 {
-			c0, ok := base45Value(encoded[i])
+			c0, ok := compactInviteValue(encoded[i])
 			if !ok {
 				return nil, ErrInvalidToken
 			}
-			c1, ok := base45Value(encoded[i+1])
+			c1, ok := compactInviteValue(encoded[i+1])
 			if !ok {
 				return nil, ErrInvalidToken
 			}
-			c2, ok := base45Value(encoded[i+2])
+			c2, ok := compactInviteValue(encoded[i+2])
 			if !ok {
 				return nil, ErrInvalidToken
 			}
-			value := c0 + c1*45 + c2*45*45
+			value := c0 + c1*compactInviteBase + c2*compactInviteBase*compactInviteBase
 			if value > 0xffff {
 				return nil, ErrInvalidToken
 			}
@@ -155,15 +157,15 @@ func base45Decode(encoded string) ([]byte, error) {
 			continue
 		}
 
-		c0, ok := base45Value(encoded[i])
+		c0, ok := compactInviteValue(encoded[i])
 		if !ok {
 			return nil, ErrInvalidToken
 		}
-		c1, ok := base45Value(encoded[i+1])
+		c1, ok := compactInviteValue(encoded[i+1])
 		if !ok {
 			return nil, ErrInvalidToken
 		}
-		value := c0 + c1*45
+		value := c0 + c1*compactInviteBase
 		if value > 0xff {
 			return nil, ErrInvalidToken
 		}
@@ -173,7 +175,11 @@ func base45Decode(encoded string) ([]byte, error) {
 	return out, nil
 }
 
-func base45Value(value byte) (int, bool) {
-	index := strings.IndexByte(base45Alphabet, value)
-	return index, index >= 0
+func compactInviteValue(value byte) (int, bool) {
+	for i, allowed := range compactInviteAlphabet {
+		if value == allowed {
+			return i, true
+		}
+	}
+	return 0, false
 }
