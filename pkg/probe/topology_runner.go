@@ -55,6 +55,7 @@ type topologyRemoteEchoReport struct {
 
 type topologyRemotePunchReport struct {
 	LocalAddress string               `json:"local_address,omitempty"`
+	Candidates   []string             `json:"candidates,omitempty"`
 	Received     []topologyEchoPacket `json:"received,omitempty"`
 	SentTo       []string             `json:"sent_to,omitempty"`
 	Error        string               `json:"error,omitempty"`
@@ -626,16 +627,27 @@ func defaultTopologyRunPunchTests(ctx context.Context, cfg TopologyConfig, remot
 	if !strings.HasPrefix(ready, "READY ") {
 		return nil, fmt.Errorf("remote UDP punch did not become ready: %s", ready)
 	}
-	remotePort := strings.TrimSpace(strings.TrimPrefix(ready, "READY "))
+	readyFields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(ready, "READY ")))
+	remotePort := ""
+	if len(readyFields) > 0 {
+		remotePort = readyFields[0]
+	}
+	remoteCandidates := []string(nil)
+	if len(readyFields) > 1 {
+		remoteCandidates = strings.Split(readyFields[1], ",")
+	}
 	remoteAddress := ""
-	if remote.EgressIP != "" {
+	if len(remoteCandidates) > 0 {
+		remoteAddress = remoteCandidates[0]
+	} else if remote.EgressIP != "" && remotePort != "" {
 		remoteAddress = net.JoinHostPort(remote.EgressIP, remotePort)
 	}
 
 	result := UDPPunchResult{
-		Name:          "simultaneous",
-		LocalAddress:  strings.Join(localCandidates, ","),
-		RemoteAddress: remoteAddress,
+		Name:             "simultaneous",
+		LocalAddress:     strings.Join(localCandidates, ","),
+		RemoteAddress:    remoteAddress,
+		RemoteCandidates: remoteCandidates,
 	}
 
 	var remoteUDP *net.UDPAddr
@@ -680,6 +692,12 @@ func defaultTopologyRunPunchTests(ctx context.Context, cfg TopologyConfig, remot
 	if remoteReport.LocalAddress != "" && result.RemoteAddress == "" {
 		result.RemoteAddress = remoteReport.LocalAddress
 	}
+	if len(remoteReport.Candidates) > 0 {
+		result.RemoteCandidates = remoteReport.Candidates
+		if result.RemoteAddress == "" {
+			result.RemoteAddress = remoteReport.Candidates[0]
+		}
+	}
 	if len(remoteReport.Received) > 0 {
 		result.RemoteReceived = true
 	}
@@ -696,17 +714,62 @@ func remoteUDPPunchScript(localCandidatesJSON string, timeout time.Duration) str
 	duration := fmt.Sprintf("%.3f", timeout.Seconds())
 	return fmt.Sprintf(`python3 -u - <<'PY'
 import json
+import os
 import socket
+import struct
 import time
 
 local_candidates = %s
 duration = %s
 received = []
 sent_to = []
+
+def parse_stun_response(data, txid):
+    if len(data) < 20:
+        return ""
+    msg_type, msg_len, cookie, got_txid = struct.unpack("!HHI12s", data[:20])
+    if msg_type != 0x0101 or cookie != 0x2112A442 or got_txid != txid:
+        return ""
+    pos = 20
+    while pos + 4 <= len(data):
+        attr_type, attr_len = struct.unpack("!HH", data[pos:pos+4])
+        val = data[pos+4:pos+4+attr_len]
+        if attr_type == 0x0020 and len(val) >= 8 and val[1] == 1:
+            port = struct.unpack("!H", val[2:4])[0] ^ (0x2112A442 >> 16)
+            cookie_bytes = struct.pack("!I", 0x2112A442)
+            ip = bytes(a ^ b for a, b in zip(val[4:8], cookie_bytes))
+            return socket.inet_ntoa(ip) + ":" + str(port)
+        if attr_type == 0x0001 and len(val) >= 8 and val[1] == 1:
+            port = struct.unpack("!H", val[2:4])[0]
+            return socket.inet_ntoa(val[4:8]) + ":" + str(port)
+        pos += 4 + ((attr_len + 3) // 4) * 4
+    return ""
+
+def discover_stun_candidate(sock):
+    txid = os.urandom(12)
+    request = struct.pack("!HHI12s", 0x0001, 0, 0x2112A442, txid)
+    old_timeout = sock.gettimeout()
+    sock.settimeout(1.0)
+    try:
+        sock.sendto(request, ("stun.l.google.com", 19302))
+        data, _ = sock.recvfrom(2048)
+        return parse_stun_response(data, txid)
+    except Exception:
+        return ""
+    finally:
+        sock.settimeout(old_timeout)
+
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind(("0.0.0.0", 0))
 sock.settimeout(0.05)
-print("READY " + str(sock.getsockname()[1]), flush=True)
+remote_candidates = []
+candidate = discover_stun_candidate(sock)
+if candidate:
+    remote_candidates.append(candidate)
+ready_parts = ["READY", str(sock.getsockname()[1])]
+if remote_candidates:
+    ready_parts.append(",".join(remote_candidates))
+print(" ".join(ready_parts), flush=True)
 end = time.time() + duration
 while time.time() < end:
     for candidate in local_candidates:
@@ -734,6 +797,7 @@ while time.time() < end:
     time.sleep(0.05)
 print(json.dumps({
     "local_address": "0.0.0.0:" + str(sock.getsockname()[1]),
+    "candidates": remote_candidates,
     "received": received,
     "sent_to": sorted(set(sent_to)),
 }, sort_keys=True), flush=True)

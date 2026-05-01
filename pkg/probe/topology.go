@@ -49,12 +49,13 @@ type UDPReachabilityResult struct {
 }
 
 type UDPPunchResult struct {
-	Name           string `json:"name,omitempty"`
-	LocalAddress   string `json:"local_address,omitempty"`
-	RemoteAddress  string `json:"remote_address,omitempty"`
-	LocalReceived  bool   `json:"local_received"`
-	RemoteReceived bool   `json:"remote_received"`
-	Error          string `json:"error,omitempty"`
+	Name             string   `json:"name,omitempty"`
+	LocalAddress     string   `json:"local_address,omitempty"`
+	RemoteAddress    string   `json:"remote_address,omitempty"`
+	RemoteCandidates []string `json:"remote_candidates,omitempty"`
+	LocalReceived    bool     `json:"local_received"`
+	RemoteReceived   bool     `json:"remote_received"`
+	Error            string   `json:"error,omitempty"`
 }
 
 func ClassifyTopology(report TopologyReport) []string {
