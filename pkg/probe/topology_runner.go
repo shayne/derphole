@@ -324,6 +324,29 @@ def run(argv, limit=80):
         lines = [argv[0] + ": exit " + str(proc.returncode)]
     return lines[:limit]
 
+def privileged(argv):
+    if shutil.which("sudo"):
+        return ["sudo", "-n"] + argv
+    return argv
+
+def permission_limited(lines):
+    text = "\n".join(lines).lower()
+    return (
+        "password" in text
+        or "permission denied" in text
+        or "need to be root" in text
+        or "operation not permitted" in text
+    )
+
+def run_privileged(argv, limit=80):
+    lines = run(privileged(argv), limit=limit)
+    if lines and not permission_limited(lines):
+        return lines
+    fallback = run(argv, limit=limit)
+    if fallback:
+        return fallback
+    return lines
+
 facts = {
     "hostname": socket.gethostname(),
     "egress_ip": "",
@@ -357,13 +380,13 @@ for label, argv, limit in (
     ("ufw status", ["ufw", "status"], 40),
     ("nft list ruleset", ["nft", "list", "ruleset"], 80),
 ):
-    lines = run(argv, limit=limit)
+    lines = run_privileged(argv, limit=limit)
     if lines:
         facts["firewall"].extend([label + ": " + line for line in lines])
 
-facts["udp_listen"] = run(["ss", "-H", "-lunp"], limit=120)
+facts["udp_listen"] = run_privileged(["ss", "-H", "-lunp"], limit=120)
 if not facts["udp_listen"]:
-    facts["udp_listen"] = run(["netstat", "-anu"], limit=120)
+    facts["udp_listen"] = run_privileged(["netstat", "-anu"], limit=120)
 
 print(json.dumps(facts, sort_keys=True))
 PY`
