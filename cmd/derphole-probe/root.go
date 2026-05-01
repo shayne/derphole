@@ -37,6 +37,12 @@ var registry = yargs.Registry{
 				Description: "Run the production promotion benchmark matrix.",
 			},
 		},
+		"topology": {
+			Info: yargs.SubCommandInfo{
+				Name:        "topology",
+				Description: "Diagnose direct UDP topology between this host and an SSH target.",
+			},
+		},
 	},
 }
 
@@ -59,6 +65,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runOrchestrate(args[1:], stdout, stderr)
 	case "matrix":
 		return runMatrixCmd(args[1:], stdout, stderr)
+	case "topology":
+		return runTopology(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n", args[0])
 		return 2
@@ -76,7 +84,7 @@ func runHelp(args []string, stderr io.Writer) int {
 	}
 
 	switch args[0] {
-	case "server", "client", "orchestrate", "matrix":
+	case "server", "client", "orchestrate", "matrix", "topology":
 		fmt.Fprint(stderr, subcommandUsageLine(args[0]))
 		if len(args) > 1 {
 			return 2

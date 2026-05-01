@@ -44,6 +44,19 @@ func TestRunHelpCommandShowsSubcommandHelp(t *testing.T) {
 	}
 }
 
+func TestRunHelpCommandShowsTopologySubcommandHelp(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	code := run([]string{"help", "topology"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() code = %d, want 0", code)
+	}
+	if got, want := stderr.String(), "usage: derphole-probe topology\n"; got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+}
+
 func TestRunHelpCommandRejectsExtraArgs(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
