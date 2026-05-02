@@ -27,6 +27,7 @@ func TestRootHelpIncludesRawStreamAndShareCommands(t *testing.T) {
 		"derphole pipe <token>",
 		"derphole share 127.0.0.1:3000",
 		"derphole open <token>",
+		"derphole netcheck",
 	} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("rootHelpText() = %q, want %q", help, want)

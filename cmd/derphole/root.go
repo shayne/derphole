@@ -27,6 +27,7 @@ var rootRegistry = yargs.Registry{
 			"derphole share 127.0.0.1:3000",
 			"derphole open <token>",
 			"derphole ssh invite ~/.ssh/id_ed25519.pub",
+			"derphole netcheck",
 			"derphole version",
 		},
 	},
@@ -77,6 +78,12 @@ var rootRegistry = yargs.Registry{
 			Info: yargs.SubCommandInfo{
 				Name:        "version",
 				Description: "Print the derphole version.",
+			},
+		},
+		"netcheck": {
+			Info: yargs.SubCommandInfo{
+				Name:        "netcheck",
+				Description: "Check local direct UDP network capabilities.",
 			},
 		},
 	},
@@ -133,6 +140,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runSSH(remaining[1:], level, stdin, stdout, stderr)
 	case "version":
 		return runVersion(stdout, stderr)
+	case "netcheck":
+		return runNetcheckCmd(remaining[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\nRun 'derphole --help' for usage\n", remaining[0])
 		return 2
