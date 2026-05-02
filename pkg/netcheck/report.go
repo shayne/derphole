@@ -81,12 +81,11 @@ func Recommendation(verdict string) string {
 func CategorizeCandidateAddresses(raw []string) CandidateReport {
 	var report CandidateReport
 	for _, candidate := range raw {
-		addr, ok := parseCandidateAddr(candidate)
-		if !ok || addr.IsLoopback() || addr.IsUnspecified() || addr.IsMulticast() {
+		addr, value, ok := parseCandidateAddr(candidate)
+		if !ok || addr.IsLoopback() || addr.IsUnspecified() || addr.IsMulticast() || addr.IsLinkLocalUnicast() {
 			continue
 		}
 		addr = addr.Unmap()
-		value := addr.String()
 		switch {
 		case tailscaleIPv4Prefix.Contains(addr) || tailscaleIPv6Prefix.Contains(addr):
 			report.Overlay = appendUnique(report.Overlay, value)
@@ -102,21 +101,23 @@ func CategorizeCandidateAddresses(raw []string) CandidateReport {
 	return report
 }
 
-func parseCandidateAddr(raw string) (netip.Addr, bool) {
+func parseCandidateAddr(raw string) (netip.Addr, string, bool) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return netip.Addr{}, false
+		return netip.Addr{}, "", false
 	}
 	if prefix, err := netip.ParsePrefix(raw); err == nil {
-		return prefix.Addr(), true
+		addr := prefix.Addr().Unmap()
+		return addr, addr.String(), true
 	}
 	if addrPort, err := netip.ParseAddrPort(raw); err == nil {
-		return addrPort.Addr(), true
+		return addrPort.Addr().Unmap(), addrPort.String(), true
 	}
 	if addr, err := netip.ParseAddr(raw); err == nil {
-		return addr, true
+		addr = addr.Unmap()
+		return addr, addr.String(), true
 	}
-	return netip.Addr{}, false
+	return netip.Addr{}, "", false
 }
 
 func appendUnique(values []string, value string) []string {
