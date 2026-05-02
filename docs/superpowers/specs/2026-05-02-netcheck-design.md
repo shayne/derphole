@@ -25,7 +25,7 @@ The command explains whether the current machine looks like a plausible direct U
 ## Non-Goals
 
 - No SSH or remote execution.
-- No pairwise direct-connect proof. That belongs in a later topology command.
+- No pairwise direct-connect proof. Netcheck is local-only; users should compare results from both sides when debugging a specific peer.
 - No transfer benchmark.
 - No port forwarding setup.
 - No UPnP, NAT-PMP, or PCP changes in the first version.
@@ -70,7 +70,7 @@ Candidates:
 
 Direct-connect readiness:
   This side looks capable of direct UDP.
-  Use topology later to test a specific peer.
+  The peer still needs compatible NAT/firewall behavior.
 ```
 
 Example limited output:
@@ -118,7 +118,7 @@ JSON output is stable and machine-readable:
       }
     ]
   },
-  "recommendation": "This side looks capable of direct UDP. Use topology to test a specific peer."
+  "recommendation": "This side looks capable of direct UDP. The peer still needs compatible NAT/firewall behavior."
 }
 ```
 
@@ -190,7 +190,6 @@ First release:
 
 Later:
 
-- pairwise `topology`
 - relay latency checks
 - port mapping checks
 - richer `--verbose` output

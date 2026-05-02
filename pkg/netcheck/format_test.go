@@ -39,6 +39,9 @@ func TestFormatHumanDirectFriendly(t *testing.T) {
 			t.Fatalf("FormatHuman() missing %q in:\n%s", want, got)
 		}
 	}
+	if strings.Contains(got, "topology") {
+		t.Fatalf("FormatHuman() should not reference unavailable topology command:\n%s", got)
+	}
 }
 
 func TestFormatHumanDirectLimited(t *testing.T) {

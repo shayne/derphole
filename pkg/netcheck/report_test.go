@@ -91,10 +91,10 @@ func TestRecommendationMatchesVerdict(t *testing.T) {
 		verdict string
 		want    string
 	}{
-		{VerdictDirectFriendly, "This side looks capable of direct UDP. Use topology to test a specific peer."},
+		{VerdictDirectFriendly, "This side looks capable of direct UDP. The peer still needs compatible NAT/firewall behavior."},
 		{VerdictDirectLimited, "Direct UDP may fail with ordinary hole punching. Use a forwarded UDP port, routable overlay address, or relay fallback."},
 		{VerdictRelayOnlyLikely, "Direct UDP is unlikely from this network. Use relay fallback."},
-		{VerdictUnknown, "Network capabilities are incomplete or contradictory. Use topology to test a specific peer."},
+		{VerdictUnknown, "Network capabilities are incomplete or contradictory. Re-run netcheck or compare results from both sides."},
 	}
 	for _, tc := range tests {
 		t.Run(tc.verdict, func(t *testing.T) {

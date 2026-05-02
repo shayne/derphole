@@ -68,13 +68,13 @@ func Classify(report Report) string {
 func Recommendation(verdict string) string {
 	switch verdict {
 	case VerdictDirectFriendly:
-		return "This side looks capable of direct UDP. Use topology to test a specific peer."
+		return "This side looks capable of direct UDP. The peer still needs compatible NAT/firewall behavior."
 	case VerdictDirectLimited:
 		return "Direct UDP may fail with ordinary hole punching. Use a forwarded UDP port, routable overlay address, or relay fallback."
 	case VerdictRelayOnlyLikely:
 		return "Direct UDP is unlikely from this network. Use relay fallback."
 	default:
-		return "Network capabilities are incomplete or contradictory. Use topology to test a specific peer."
+		return "Network capabilities are incomplete or contradictory. Re-run netcheck or compare results from both sides."
 	}
 }
 
