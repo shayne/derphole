@@ -683,6 +683,12 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 		laneRateBasisMbps := externalDirectUDPDataLaneRateBasisMbps(activeRateMbps, rateCeilingMbps, probeRates)
 		retainedLanes = externalDirectUDPRetainedLanesForRate(laneRateBasisMbps, len(probeConns), sendCfg.StripedBlast)
 	}
+	if cfg.skipDirectUDPRateProbes {
+		noProbeLanes := externalDirectUDPNoProbeActiveLanes(activeRateMbps, len(probeConns))
+		if noProbeLanes > 0 && (retainedLanes == 0 || noProbeLanes < retainedLanes) {
+			retainedLanes = noProbeLanes
+		}
+	}
 	if retainedLanes == 0 {
 		return plan, errors.New("direct UDP established without active send lanes")
 	}
@@ -4902,6 +4908,10 @@ func externalDirectUDPRetainedLanesForRate(rateMbps int, available int, striped 
 		return available
 	}
 	return target
+}
+
+func externalDirectUDPNoProbeActiveLanes(rateMbps int, available int) int {
+	return externalDirectUDPActiveLanesForRate(rateMbps, available)
 }
 
 func externalDirectUDPDataLaneRateBasisMbps(activeRateMbps int, rateCeilingMbps int, probeRates []int) int {

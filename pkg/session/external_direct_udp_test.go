@@ -2223,11 +2223,34 @@ func TestExternalPrepareDirectUDPSendSkipsBlockingRateProbesForRelayPrefixUpgrad
 	})
 	defer unsubscribeStartAck()
 
-	probeConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("ListenPacket() error = %v", err)
+	probeConns := make([]net.PacketConn, 0, externalDirectUDPParallelism)
+	defer func() {
+		for _, conn := range probeConns {
+			_ = conn.Close()
+		}
+	}()
+	for range externalDirectUDPParallelism {
+		conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("ListenPacket() error = %v", err)
+		}
+		probeConns = append(probeConns, conn)
 	}
-	defer probeConn.Close()
+	remoteCandidates := parseCandidateStrings([]string{
+		"198.51.100.10:40000",
+		"198.51.100.10:40001",
+		"198.51.100.10:40002",
+		"198.51.100.10:40003",
+		"198.51.100.10:40004",
+		"198.51.100.10:40005",
+		"198.51.100.10:40006",
+		"198.51.100.10:40007",
+	})
+	origObserve := externalDirectUDPObservePunchAddrsByConn
+	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+		return make([][]net.Addr, externalDirectUDPParallelism)
+	}
+	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = origObserve })
 
 	var rateProbeSendCalled bool
 	prevSendRateProbes := externalDirectUDPSendRateProbesParallelFn
@@ -2259,7 +2282,7 @@ func TestExternalPrepareDirectUDPSendSkipsBlockingRateProbesForRelayPrefixUpgrad
 	}
 	prepareCh := make(chan prepareResult, 1)
 	go func() {
-		plan, err := externalPrepareDirectUDPSend(prepCtx, tok, senderDERP, listenerDERP.PublicKey(), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, []net.PacketConn{probeConn}, nil, readyAckCh, startAckCh, nil, SendConfig{
+		plan, err := externalPrepareDirectUDPSend(prepCtx, tok, senderDERP, listenerDERP.PublicKey(), remoteCandidates[0], probeConns, remoteCandidates, readyAckCh, startAckCh, nil, SendConfig{
 			StdioExpectedBytes:      1 << 30,
 			skipDirectUDPRateProbes: true,
 		})
@@ -2276,7 +2299,7 @@ func TestExternalPrepareDirectUDPSendSkipsBlockingRateProbesForRelayPrefixUpgrad
 	if err := sendAuthenticatedEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{
 		Type: envelopeDirectUDPReadyAck,
 		DirectUDPReadyAck: &directUDPReadyAck{
-			FastDiscard: true,
+			FastDiscard: false,
 		},
 	}, externalPeerControlAuthForToken(tok)); err != nil {
 		t.Fatalf("sendEnvelope(ready-ack) error = %v", err)
@@ -2309,6 +2332,9 @@ func TestExternalPrepareDirectUDPSendSkipsBlockingRateProbesForRelayPrefixUpgrad
 	if got := startEnv.DirectUDPStart.ProbeRates; len(got) != 0 {
 		t.Fatalf("direct UDP start ProbeRates = %v, want none for relay-prefix upgrade", got)
 	}
+	if !startEnv.DirectUDPStart.StripedBlast {
+		t.Fatal("direct UDP start StripedBlast = false, want true for multi-lane relay-prefix upgrade")
+	}
 	if err := sendAuthenticatedEnvelope(ctx, listenerDERP, senderDERP.PublicKey(), envelope{Type: envelopeDirectUDPStartAck}, externalPeerControlAuthForToken(tok)); err != nil {
 		t.Fatalf("sendEnvelope(start-ack) error = %v", err)
 	}
@@ -2330,6 +2356,12 @@ func TestExternalPrepareDirectUDPSendSkipsBlockingRateProbesForRelayPrefixUpgrad
 	}
 	if got, wantMin := result.plan.startRateMbps, externalDirectUDPActiveLaneTwoMaxMbps; got < wantMin {
 		t.Fatalf("relay-prefix no-probe start rate = %d, want at least %d", got, wantMin)
+	}
+	if got, want := len(result.plan.probeConns), externalDirectUDPActiveLanesForRate(externalDirectUDPActiveLaneTwoMaxMbps, externalDirectUDPParallelism); got != want {
+		t.Fatalf("relay-prefix no-probe active lanes = %d, want %d", got, want)
+	}
+	if got, want := len(result.plan.remoteAddrs), len(result.plan.probeConns); got != want {
+		t.Fatalf("relay-prefix no-probe remote addrs = %d, want %d", got, want)
 	}
 }
 
