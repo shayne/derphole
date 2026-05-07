@@ -99,7 +99,8 @@ const (
 	externalRelayPrefixDERPHandoffAckWait          = 5 * time.Second
 	externalRelayPrefixDirectPrepStallWait         = 250 * time.Millisecond
 	externalRelayPrefixNoProbeStartMbps            = 100
-	externalRelayPrefixNoProbeCeilingMbps          = externalDirectUDPInitialProbeFallbackMbps
+	externalRelayPrefixNoProbeCeilingMbps          = externalDirectUDPRateProbeDefaultMaxMbps
+	externalRelayPrefixNoProbeLaneBasisMbps        = externalDirectUDPActiveLaneTwoMaxMbps
 )
 
 var externalDirectUDPRateProbeMagic = [16]byte{0, 'd', 'e', 'r', 'p', 'h', 'o', 'l', 'e', '-', 'r', 'a', 't', 'e', 'v', '1'}
@@ -679,12 +680,10 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 			selectedRateMbps = rateCeilingMbps
 		}
 		activeRateMbps = selectedRateMbps
+		laneBasisMbps := externalDirectUDPNoProbeLaneBasisMbps(activeRateMbps, rateCeilingMbps)
 		sendCfg.RateMbps = activeRateMbps
 		sendCfg.RateCeilingMbps = rateCeilingMbps
-		if maxRateMbps > rateCeilingMbps {
-			sendCfg.RateExplorationCeilingMbps = maxRateMbps
-		}
-		sendCfg.StreamReplayWindowBytes = externalDirectUDPReplayWindowBytesForRate(activeRateMbps)
+		sendCfg.StreamReplayWindowBytes = externalDirectUDPReplayWindowBytesForRate(laneBasisMbps)
 	}
 
 	var retainedLanes int
@@ -695,7 +694,7 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 		retainedLanes = externalDirectUDPRetainedLanesForRate(laneRateBasisMbps, len(probeConns), sendCfg.StripedBlast)
 	}
 	if cfg.skipDirectUDPRateProbes {
-		noProbeLanes := externalDirectUDPNoProbeActiveLanes(activeRateMbps, len(probeConns))
+		noProbeLanes := externalDirectUDPNoProbeActiveLanes(activeRateMbps, rateCeilingMbps, len(probeConns))
 		if noProbeLanes > 0 && (retainedLanes == 0 || noProbeLanes < retainedLanes) {
 			retainedLanes = noProbeLanes
 		}
@@ -4927,8 +4926,17 @@ func externalDirectUDPRetainedLanesForRate(rateMbps int, available int, striped 
 	return target
 }
 
-func externalDirectUDPNoProbeActiveLanes(rateMbps int, available int) int {
-	return externalDirectUDPActiveLanesForRate(rateMbps, available)
+func externalDirectUDPNoProbeActiveLanes(rateMbps int, rateCeilingMbps int, available int) int {
+	laneBasisMbps := externalDirectUDPNoProbeLaneBasisMbps(rateMbps, rateCeilingMbps)
+	return externalDirectUDPActiveLanesForRate(laneBasisMbps, available)
+}
+
+func externalDirectUDPNoProbeLaneBasisMbps(rateMbps int, rateCeilingMbps int) int {
+	laneBasisMbps := rateMbps
+	if rateCeilingMbps >= externalRelayPrefixNoProbeLaneBasisMbps && laneBasisMbps < externalRelayPrefixNoProbeLaneBasisMbps {
+		laneBasisMbps = externalRelayPrefixNoProbeLaneBasisMbps
+	}
+	return laneBasisMbps
 }
 
 func externalDirectUDPActiveLaneCapForPolicy(policy ParallelPolicy, available int) int {

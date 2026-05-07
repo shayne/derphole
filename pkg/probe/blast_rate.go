@@ -6,35 +6,36 @@ import (
 )
 
 const (
-	blastRateFeedbackInterval            = 100 * time.Millisecond
-	blastRateHoldAfterDecrease           = 1500 * time.Millisecond
-	blastRateHoldAfterPressureDecrease   = 5 * time.Second
-	blastRateHighCeilingInitialHold      = 500 * time.Millisecond
-	blastRateHighCeilingPressureHold     = 1 * time.Second
-	blastRateLossConfirmDelay            = 2 * blastRateFeedbackInterval
-	blastRateCommitStallWindow           = 500 * time.Millisecond
-	blastRateRepairPressureEvery         = blastRateHoldAfterDecrease
-	blastPacerMaxScheduleDebt            = 250 * time.Millisecond
-	blastRateIncreaseMultiplier          = 1.08
-	blastRateHighIncreaseMultiplier      = 1.11
-	blastRateMediumIncreaseMultiplier    = 1.02
-	blastRateDecreaseMultiplier          = 0.67
-	blastRatePressureDecreaseMultiplier  = 0.80
-	blastRateLossCeilingMultiplier       = 0.90
-	blastRatePressureCeilingMultiplier   = 0.80
-	blastRateRepairPressureFloor         = maxRepairRequestSeqs / 2
-	blastRateRepairPressureRatio         = 0.001
-	blastRateHighRepairPressureRatio     = 0.005
-	blastRateConservativeFloorMinMbps    = 300
-	blastRateConservativeFloorMaxMbps    = 400
-	blastRateConservativeFloorRepairPkts = maxRepairRequestSeqs * 2
-	blastRateLossBudgetMinPackets        = maxRepairRequestSeqs / 2
-	blastRateSevereLossRatioPercent      = 5
-	blastRateLossCeilingProbeClean       = 30
-	blastRateMediumLossCeilingProbeClean = 5
-	blastRateCleanQueueDelayMax          = 200 * time.Millisecond
-	blastRateMinMbps                     = 1
-	blastReplayPressureThreshold         = 0.75
+	blastRateFeedbackInterval               = 100 * time.Millisecond
+	blastRateHoldAfterDecrease              = 1500 * time.Millisecond
+	blastRateHoldAfterPressureDecrease      = 5 * time.Second
+	blastRateHighCeilingInitialHold         = 500 * time.Millisecond
+	blastRateHighCeilingPressureHold        = 1 * time.Second
+	blastRateLossConfirmDelay               = 2 * blastRateFeedbackInterval
+	blastRateCommitStallWindow              = 500 * time.Millisecond
+	blastRateRepairPressureEvery            = blastRateHoldAfterDecrease
+	blastPacerMaxScheduleDebt               = 250 * time.Millisecond
+	blastRateIncreaseMultiplier             = 1.08
+	blastRateHighIncreaseMultiplier         = 1.11
+	blastRateLowStartHighIncreaseMultiplier = 1.18
+	blastRateMediumIncreaseMultiplier       = 1.02
+	blastRateDecreaseMultiplier             = 0.67
+	blastRatePressureDecreaseMultiplier     = 0.80
+	blastRateLossCeilingMultiplier          = 0.90
+	blastRatePressureCeilingMultiplier      = 0.80
+	blastRateRepairPressureFloor            = maxRepairRequestSeqs / 2
+	blastRateRepairPressureRatio            = 0.001
+	blastRateHighRepairPressureRatio        = 0.005
+	blastRateConservativeFloorMinMbps       = 300
+	blastRateConservativeFloorMaxMbps       = 400
+	blastRateConservativeFloorRepairPkts    = maxRepairRequestSeqs * 2
+	blastRateLossBudgetMinPackets           = maxRepairRequestSeqs / 2
+	blastRateSevereLossRatioPercent         = 5
+	blastRateLossCeilingProbeClean          = 30
+	blastRateMediumLossCeilingProbeClean    = 5
+	blastRateCleanQueueDelayMax             = 200 * time.Millisecond
+	blastRateMinMbps                        = 1
+	blastReplayPressureThreshold            = 0.75
 )
 
 type blastRateFeedback struct {
@@ -95,7 +96,7 @@ func newBlastRateControllerWithInitialLossCeiling(rateMbps int, ceilingMbps int,
 		initialLossCeiling = true
 	}
 	initialHold := blastRateHoldAfterDecrease
-	if ceilingMbps > 1500 && rateMbps >= 700 {
+	if ceilingMbps > 1500 && rateMbps > 0 {
 		initialHold = blastRateHighCeilingInitialHold
 	}
 	return &blastRateController{
@@ -563,6 +564,9 @@ func (c *blastRateController) increase() {
 }
 
 func (c *blastRateController) increaseMultiplier() float64 {
+	if c != nil && c.ceilingMbps > 1500 && c.rateMbps < 700 {
+		return blastRateLowStartHighIncreaseMultiplier
+	}
 	if c != nil && c.ceilingMbps > 1500 {
 		return blastRateHighIncreaseMultiplier
 	}

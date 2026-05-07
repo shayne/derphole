@@ -563,6 +563,48 @@ func TestBlastRateControllerHighCeilingStartsProbingAfterShortInitialHold(t *tes
 	}
 }
 
+func TestBlastRateControllerLowStartHighCeilingStartsProbingAfterShortInitialHold(t *testing.T) {
+	start := time.Unix(0, 0)
+	controller := newBlastRateController(100, 2250, start)
+
+	controller.Observe(start.Add(600*time.Millisecond), blastRateFeedback{
+		SentPayloadBytes:     12_000_000,
+		ReceivedPayloadBytes: 12_000_000,
+		ReceivedPackets:      8_700,
+		MaxSeqPlusOne:        8_700,
+	})
+
+	if got, wantAbove := controller.RateMbps(), 100; got <= wantAbove {
+		t.Fatalf("RateMbps() after low-start high-ceiling clean startup feedback = %d, want above %d", got, wantAbove)
+	}
+}
+
+func TestBlastRateControllerLowStartHighCeilingReachesTwoLaneBasisWithinTwoSeconds(t *testing.T) {
+	start := time.Unix(0, 0)
+	controller := newBlastRateController(100, 2250, start)
+
+	sentBytes := uint64(0)
+	receivedBytes := uint64(0)
+	for i := 1; i <= 20; i++ {
+		sentBytes += 8_000_000
+		receivedBytes += 8_000_000
+		packets := uint64(i) * 5_800
+		controller.Observe(start.Add(time.Duration(i)*blastRateFeedbackInterval), blastRateFeedback{
+			SentPayloadBytes:     sentBytes,
+			ReceivedPayloadBytes: receivedBytes,
+			ReceivedPackets:      packets,
+			MaxSeqPlusOne:        packets,
+		})
+	}
+
+	if got, wantMin := controller.RateMbps(), 700; got < wantMin {
+		t.Fatalf("RateMbps() after low-start high-ceiling clean ramp = %d, want >= %d", got, wantMin)
+	}
+	if got, wantMax := controller.RateMbps(), 2250; got > wantMax {
+		t.Fatalf("RateMbps() after low-start high-ceiling clean ramp = %d, want <= %d", got, wantMax)
+	}
+}
+
 func TestBlastRateControllerOpensInitialExplorationCeilingAfterCleanFeedback(t *testing.T) {
 	start := time.Unix(0, 0)
 	controller := newBlastRateControllerWithInitialLossCeiling(1200, 2250, 1200, start)
