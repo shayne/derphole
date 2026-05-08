@@ -123,6 +123,7 @@ type SendConfig struct {
 	RateExplorationCeilingMbps int
 	StreamReplayWindowBytes    uint64
 	MaxActiveLanes             int
+	MinActiveLanes             int
 }
 
 type ReceiveConfig struct {
@@ -1154,7 +1155,7 @@ func SendBlastParallel(ctx context.Context, conns []net.PacketConn, remoteAddrs 
 		controlCeilingMbps = cfg.RateExplorationCeilingMbps
 	}
 	control := newBlastSendControlWithInitialLossCeiling(cfg.RateMbps, controlCeilingMbps, cfg.RateCeilingMbps, time.Now())
-	activeLanes := parallelActiveLanesForConfig(control.RateMbps(), len(lanes), stripedBlast, cfg.MaxActiveLanes)
+	activeLanes := parallelActiveLanesForConfig(control.RateMbps(), len(lanes), stripedBlast, cfg.MinActiveLanes, cfg.MaxActiveLanes)
 	if activeLanes == 0 {
 		return TransferStats{}, errors.New("no active parallel blast lanes")
 	}
@@ -1227,7 +1228,7 @@ func SendBlastParallel(ctx context.Context, conns []net.PacketConn, remoteAddrs 
 		defer stopControlReader()
 	}
 	updateLaneRates := func() {
-		activeLanes = parallelActiveLanesForConfig(control.RateMbps(), len(lanes), stripedBlast, cfg.MaxActiveLanes)
+		activeLanes = parallelActiveLanesForConfig(control.RateMbps(), len(lanes), stripedBlast, cfg.MinActiveLanes, cfg.MaxActiveLanes)
 		rate := parallelLaneRateMbps(control.RateMbps(), activeLanes)
 		for i, lane := range lanes {
 			if i >= activeLanes {
@@ -1559,8 +1560,14 @@ func parallelActiveLanesForRate(rateMbps int, available int, striped bool) int {
 	return target
 }
 
-func parallelActiveLanesForConfig(rateMbps int, available int, striped bool, maxActiveLanes int) int {
+func parallelActiveLanesForConfig(rateMbps int, available int, striped bool, minActiveLanes int, maxActiveLanes int) int {
 	active := parallelActiveLanesForRate(rateMbps, available, striped)
+	if minActiveLanes > 0 && active < minActiveLanes {
+		active = minActiveLanes
+		if active > available {
+			active = available
+		}
+	}
 	if maxActiveLanes <= 0 || active <= maxActiveLanes {
 		return active
 	}
@@ -3080,7 +3087,7 @@ func (c *blastStreamReceiveCoordinator) sendStatsFeedbackLocked(ctx context.Cont
 	}
 	c.lastStatsAt[runID] = now
 	stats := blastReceiverStats{
-		ReceivedPayloadBytes: c.committedPayloadBytesLocked(state),
+		ReceivedPayloadBytes: c.rateFeedbackPayloadBytesLocked(state),
 		ReceivedPackets:      state.seen.Len(),
 		MaxSeqPlusOne:        state.maxSeqPlusOne,
 		AckFloor:             state.nextWriteSeq,
@@ -3107,7 +3114,7 @@ func (c *blastStreamReceiveCoordinator) sendStripedStatsFeedbackLocked(ctx conte
 	}
 	c.lastStatsAt[runID] = now
 	aggregateStats := blastReceiverStats{
-		ReceivedPayloadBytes: c.committedPayloadBytesLocked(state),
+		ReceivedPayloadBytes: c.rateFeedbackPayloadBytesLocked(state),
 	}
 	for _, stripe := range state.stripes {
 		if stripe == nil {
@@ -3126,12 +3133,15 @@ func (c *blastStreamReceiveCoordinator) sendStripedStatsFeedbackLocked(ctx conte
 	}
 }
 
-func (c *blastStreamReceiveCoordinator) committedPayloadBytesLocked(state *blastReceiveRunState) uint64 {
-	if c == nil || state == nil || c.bytesReceived <= 0 {
+func (c *blastStreamReceiveCoordinator) rateFeedbackPayloadBytesLocked(state *blastReceiveRunState) uint64 {
+	if state == nil {
 		return 0
 	}
-	if state.striped && c.dst != io.Discard {
-		return state.nextOffset
+	if state.feedbackBytes > 0 {
+		return state.feedbackBytes
+	}
+	if c == nil || c.bytesReceived <= 0 {
+		return 0
 	}
 	return uint64(c.bytesReceived)
 }
@@ -3356,10 +3366,9 @@ func (c *blastStreamReceiveCoordinator) acceptStripedSequentialPacketLocked(stat
 	switch packet.Type {
 	case PacketTypeData:
 		if len(packet.Payload) > 0 {
-			state.observeStripedPayload(packet.Payload)
-			state.feedbackBytes += uint64(len(packet.Payload))
-			c.feedbackBytes += int64(len(packet.Payload))
-			c.observePeak(time.Now(), c.feedbackBytes)
+			if stripe == nil || !stripe.feedbackCounted.Has(packet.Seq) {
+				c.countStripedPayloadFeedbackLocked(state, packet.Payload)
+			}
 			if c.dst == io.Discard {
 				c.bytesReceived += int64(len(packet.Payload))
 			} else if packet.Offset == state.nextOffset {
@@ -3396,6 +3405,16 @@ func (c *blastStreamReceiveCoordinator) acceptStripedSequentialPacketLocked(stat
 	return nil
 }
 
+func (c *blastStreamReceiveCoordinator) countStripedPayloadFeedbackLocked(state *blastReceiveRunState, payload []byte) {
+	if c == nil || state == nil || len(payload) == 0 {
+		return
+	}
+	state.observeStripedPayload(payload)
+	state.feedbackBytes += uint64(len(payload))
+	c.feedbackBytes += int64(len(payload))
+	c.observePeak(time.Now(), c.feedbackBytes)
+}
+
 func (c *blastStreamReceiveCoordinator) storeStripedFuturePacketLocked(state *blastReceiveRunState, stripe *blastStreamReceiveStripeState, packet Packet) error {
 	if state == nil || stripe == nil {
 		return nil
@@ -3417,6 +3436,8 @@ func (c *blastStreamReceiveCoordinator) storeStripedFuturePacketLocked(state *bl
 		if packet.Seq+1 > stripe.maxSeqPlusOne {
 			stripe.maxSeqPlusOne = packet.Seq + 1
 		}
+		stripe.feedbackCounted.Add(packet.Seq)
+		c.countStripedPayloadFeedbackLocked(state, packet.Payload)
 		stripe.storeBufferedPacket(packet)
 		state.stripedFutureBufferedBytes += uint64(len(packet.Payload))
 		return nil
@@ -3441,6 +3462,8 @@ func (c *blastStreamReceiveCoordinator) storeStripedFuturePacketLocked(state *bl
 	if packet.Seq+1 > stripe.maxSeqPlusOne {
 		stripe.maxSeqPlusOne = packet.Seq + 1
 	}
+	stripe.feedbackCounted.Add(packet.Seq)
+	c.countStripedPayloadFeedbackLocked(state, packet.Payload)
 	if stripe.bufferedSpool == nil {
 		stripe.bufferedSpool = make(map[uint64]stripedSpooledPacket)
 	}
@@ -4287,6 +4310,7 @@ type blastStreamReceiveStripeState struct {
 	bufferedSpool       map[uint64]stripedSpooledPacket
 	fecGroups           map[uint64]*blastFECReceiveGroup
 	fecParity           map[uint64]blastFECParity
+	feedbackCounted     blastSeqSet
 	expectedSeq         uint64
 	maxSeqPlusOne       uint64
 	done                bool

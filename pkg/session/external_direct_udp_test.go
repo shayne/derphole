@@ -2331,6 +2331,48 @@ func TestExternalDirectUDPOffloadSenderCapsKeepHighProbe(t *testing.T) {
 	}
 }
 
+func TestExternalDirectUDPConstrainedReceiverCapsStartAndLanes(t *testing.T) {
+	ack := directUDPReadyAck{
+		TransportKind:            "batched",
+		TransportRXQOverflow:     true,
+		TransportReadBufferBytes: 8 << 20,
+	}
+
+	if !externalDirectUDPConstrainedReceiver(ack) {
+		t.Fatal("externalDirectUDPConstrainedReceiver() = false, want true for Linux receiver with 8MiB UDP buffer")
+	}
+	if got, want := externalDirectUDPConstrainedReceiverStartRate(ack, 700), externalDirectUDPConstrainedReceiverStartMbps; got != want {
+		t.Fatalf("externalDirectUDPConstrainedReceiverStartRate() = %d, want %d", got, want)
+	}
+	if got, want := externalDirectUDPConstrainedReceiverLaneCap(ack, 4, 8), 2; got != want {
+		t.Fatalf("externalDirectUDPConstrainedReceiverLaneCap() = %d, want %d", got, want)
+	}
+	if got, want := externalDirectUDPConstrainedReceiverMinActiveLanes(ack, 8), 2; got != want {
+		t.Fatalf("externalDirectUDPConstrainedReceiverMinActiveLanes() = %d, want %d", got, want)
+	}
+}
+
+func TestExternalDirectUDPConstrainedReceiverIgnoresLargeBuffers(t *testing.T) {
+	ack := directUDPReadyAck{
+		TransportKind:            "batched",
+		TransportRXQOverflow:     true,
+		TransportReadBufferBytes: 64 << 20,
+	}
+
+	if externalDirectUDPConstrainedReceiver(ack) {
+		t.Fatal("externalDirectUDPConstrainedReceiver() = true, want false for large UDP receive buffer")
+	}
+	if got := externalDirectUDPConstrainedReceiverStartRate(ack, 700); got != 700 {
+		t.Fatalf("externalDirectUDPConstrainedReceiverStartRate() = %d, want unchanged 700", got)
+	}
+	if got := externalDirectUDPConstrainedReceiverLaneCap(ack, 4, 8); got != 4 {
+		t.Fatalf("externalDirectUDPConstrainedReceiverLaneCap() = %d, want unchanged 4", got)
+	}
+	if got := externalDirectUDPConstrainedReceiverMinActiveLanes(ack, 8); got != 0 {
+		t.Fatalf("externalDirectUDPConstrainedReceiverMinActiveLanes() = %d, want unchanged 0", got)
+	}
+}
+
 func TestExternalDirectUDPEffectiveSenderCapsTreatsRemoteLegacyAsLegacyPath(t *testing.T) {
 	got := externalDirectUDPEffectiveSenderCaps(probe.TransportCaps{Kind: "batched"}, directUDPReadyAck{TransportKind: "legacy"})
 

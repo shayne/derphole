@@ -193,6 +193,22 @@ func TestBlastRateControllerIgnoresSmallOverallReorderGapAtHighThroughput(t *tes
 	}
 }
 
+func TestBlastRateControllerProbesThroughSmallReorderGapAfterHold(t *testing.T) {
+	start := time.Unix(0, 0)
+	controller := newBlastRateController(100, 2250, start)
+
+	controller.Observe(start.Add(blastRateHoldAfterDecrease+blastRateFeedbackInterval), blastRateFeedback{
+		SentPayloadBytes:     18_500_000,
+		ReceivedPayloadBytes: 18_250_000,
+		ReceivedPackets:      13_000,
+		MaxSeqPlusOne:        13_064,
+	})
+
+	if got := controller.RateMbps(); got <= 100 {
+		t.Fatalf("RateMbps() = %d, want small reorder gap to keep probing above start rate", got)
+	}
+}
+
 func TestBlastRateControllerIgnoresSmallStartupReorderGap(t *testing.T) {
 	start := time.Unix(0, 0)
 	controller := newBlastRateController(263, 2250, start)

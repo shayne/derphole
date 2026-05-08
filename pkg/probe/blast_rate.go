@@ -365,7 +365,7 @@ func (c *blastRateController) Observe(now time.Time, feedback blastRateFeedback)
 		return
 	}
 	c.clearLossCandidate()
-	clean := receivedDelta > 0 && missing == 0
+	clean := receivedDelta > 0 && blastRateProbeCleanEnough(missing, missingDelta, receivedPacketDelta, feedback.ReceivedPackets)
 	if !clean || now.Before(c.holdIncrease) {
 		return
 	}
@@ -394,6 +394,11 @@ func blastRateLossBudgetPackets(receivedDelta uint64) uint64 {
 		return blastRateLossBudgetMinPackets
 	}
 	return budget
+}
+
+func blastRateProbeCleanEnough(missing uint64, missingDelta uint64, receivedPacketDelta uint64, receivedPackets uint64) bool {
+	return missing <= blastRateLossBudgetPackets(receivedPackets) &&
+		missingDelta <= blastRateLossBudgetPackets(receivedPacketDelta)
 }
 
 func (f blastRateFeedback) MissingPackets() uint64 {

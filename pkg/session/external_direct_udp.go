@@ -94,6 +94,9 @@ const (
 	externalDirectUDPBatchOnlyCleanStartShare      = 0.83
 	externalDirectUDPBatchOnlyLossyStartShare      = 1.00
 	externalDirectUDPBatchOnlyProbeRoundMbps       = 50
+	externalDirectUDPConstrainedReceiverBuffer     = 8 << 20
+	externalDirectUDPConstrainedReceiverStartMbps  = 100
+	externalDirectUDPConstrainedReceiverLaneMax    = 2
 	externalRelayPrefixSkipDirectTail              = 256 << 10
 	externalRelayPrefixDERPChunkSize               = 32 << 10
 	externalRelayPrefixDERPMaxUnacked              = 512 << 10
@@ -575,6 +578,7 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 	}
 	localTransportCaps := externalDirectUDPPreviewTransportCaps(probeConns[0], externalDirectUDPTransportLabel)
 	effectiveTransportCaps := externalDirectUDPEffectiveSenderCaps(localTransportCaps, readyAck)
+	receiverConstrained := externalDirectUDPConstrainedReceiver(readyAck)
 
 	maxRateMbps := externalDirectUDPMaxRateMbps
 	activeRateMbps := externalDirectUDPInitialProbeFallbackMbps
@@ -588,6 +592,9 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 		cfg.Emitter.Debug("udp-tail-replay-bytes=" + strconv.Itoa(externalDirectUDPTailReplayBytes))
 		cfg.Emitter.Debug("udp-fec-group-size=" + strconv.Itoa(externalDirectUDPStreamFECGroupSize))
 		cfg.Emitter.Debug("udp-fast-discard=" + strconv.FormatBool(readyAck.FastDiscard))
+		if receiverConstrained {
+			cfg.Emitter.Debug("udp-receiver-constrained=true")
+		}
 		if peerAddr != nil {
 			cfg.Emitter.Debug("udp-direct-addr=" + peerAddr.String())
 		}
@@ -610,6 +617,7 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 		return plan, err
 	}
 	policyActiveLaneCap := externalDirectUDPActiveLaneCapForPolicy(cfg.ParallelPolicy, len(probeConns))
+	policyActiveLaneCap = externalDirectUDPConstrainedReceiverLaneCap(readyAck, policyActiveLaneCap, len(probeConns))
 	stripedDecisionLanes := len(probeConns)
 	if policyActiveLaneCap > 0 && policyActiveLaneCap < stripedDecisionLanes {
 		stripedDecisionLanes = policyActiveLaneCap
@@ -630,6 +638,7 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 		AllowPartialParallel:     true,
 		ParallelHandshakeTimeout: externalDirectUDPHandshakeWait,
 		MaxActiveLanes:           policyActiveLaneCap,
+		MinActiveLanes:           externalDirectUDPConstrainedReceiverMinActiveLanes(readyAck, len(probeConns)),
 	}
 	emitExternalDirectUDPReceiveStartDebug(cfg.Emitter, directExpectedBytes)
 	start := externalDirectUDPStreamStart(maxRateMbps, directExpectedBytes)
@@ -696,6 +705,7 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 		activeRateMbps = externalDirectUDPClampDataStartRate(selectedRateMbps, activeRateMbps, rateCeilingMbps, len(probeConns), sendCfg.StripedBlast)
 		activeRateMbps = externalDirectUDPSenderStartRateCap(effectiveTransportCaps, selectedRateMbps, activeRateMbps)
 		activeRateMbps = externalDirectUDPSenderApplyProbeRateLimit(activeRateMbps, probeLimit)
+		activeRateMbps = externalDirectUDPConstrainedReceiverStartRate(readyAck, activeRateMbps)
 		sendCfg.RateMbps = activeRateMbps
 		sendCfg.RateCeilingMbps = rateCeilingMbps
 		sendCfg.RateExplorationCeilingMbps = externalDirectUDPDataExplorationCeilingMbpsForProbeSamples(maxRateMbps, selectedRateMbps, rateCeilingMbps, sentProbeSamples, probeResult.Samples)
@@ -711,6 +721,7 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 			selectedRateMbps = rateCeilingMbps
 		}
 		activeRateMbps = selectedRateMbps
+		activeRateMbps = externalDirectUDPConstrainedReceiverStartRate(readyAck, activeRateMbps)
 		laneBasisMbps := externalDirectUDPNoProbeLaneBasisMbps(activeRateMbps, rateCeilingMbps)
 		sendCfg.RateMbps = activeRateMbps
 		sendCfg.RateCeilingMbps = rateCeilingMbps
@@ -766,6 +777,9 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 		cfg.Emitter.Debug("udp-active-lanes-selected=" + strconv.Itoa(len(probeConns)))
 		if sendCfg.MaxActiveLanes > 0 {
 			cfg.Emitter.Debug("udp-active-lane-cap=" + strconv.Itoa(sendCfg.MaxActiveLanes))
+		}
+		if sendCfg.MinActiveLanes > 0 {
+			cfg.Emitter.Debug("udp-active-lane-min=" + strconv.Itoa(sendCfg.MinActiveLanes))
 		}
 		cfg.Emitter.Debug("udp-rate-mbps=" + strconv.Itoa(activeRateMbps))
 		cfg.Emitter.Debug("udp-stream=true")
@@ -837,11 +851,13 @@ func externalPrepareDirectUDPReceive(ctx context.Context, dst io.Writer, tok tok
 	if err := sendAuthenticatedEnvelope(ctx, derpClient, peerDERP, envelope{
 		Type: envelopeDirectUDPReadyAck,
 		DirectUDPReadyAck: &directUDPReadyAck{
-			FastDiscard:          fastDiscard,
-			TransportKind:        localTransportCaps.Kind,
-			TransportBatchSize:   localTransportCaps.BatchSize,
-			TransportTXOffload:   localTransportCaps.TXOffload,
-			TransportRXQOverflow: localTransportCaps.RXQOverflow,
+			FastDiscard:               fastDiscard,
+			TransportKind:             localTransportCaps.Kind,
+			TransportBatchSize:        localTransportCaps.BatchSize,
+			TransportReadBufferBytes:  localTransportCaps.ReadBufferBytes,
+			TransportWriteBufferBytes: localTransportCaps.WriteBufferBytes,
+			TransportTXOffload:        localTransportCaps.TXOffload,
+			TransportRXQOverflow:      localTransportCaps.RXQOverflow,
 		},
 	}, auth); err != nil {
 		return plan, err
@@ -1599,6 +1615,44 @@ func externalDirectUDPEffectiveSenderCaps(localCaps probe.TransportCaps, readyAc
 		}
 	}
 	return localCaps
+}
+
+func externalDirectUDPConstrainedReceiver(readyAck directUDPReadyAck) bool {
+	return readyAck.TransportKind == "batched" &&
+		readyAck.TransportRXQOverflow &&
+		readyAck.TransportReadBufferBytes > 0 &&
+		readyAck.TransportReadBufferBytes <= externalDirectUDPConstrainedReceiverBuffer
+}
+
+func externalDirectUDPConstrainedReceiverStartRate(readyAck directUDPReadyAck, activeRateMbps int) int {
+	if !externalDirectUDPConstrainedReceiver(readyAck) || activeRateMbps <= 0 || activeRateMbps <= externalDirectUDPConstrainedReceiverStartMbps {
+		return activeRateMbps
+	}
+	return externalDirectUDPConstrainedReceiverStartMbps
+}
+
+func externalDirectUDPConstrainedReceiverLaneCap(readyAck directUDPReadyAck, currentCap int, available int) int {
+	if !externalDirectUDPConstrainedReceiver(readyAck) {
+		return currentCap
+	}
+	cap := externalDirectUDPConstrainedReceiverLaneMax
+	if available > 0 && cap > available {
+		cap = available
+	}
+	if currentCap > 0 && currentCap < cap {
+		return currentCap
+	}
+	return cap
+}
+
+func externalDirectUDPConstrainedReceiverMinActiveLanes(readyAck directUDPReadyAck, available int) int {
+	if !externalDirectUDPConstrainedReceiver(readyAck) || available <= 1 {
+		return 0
+	}
+	if available < externalDirectUDPConstrainedReceiverLaneMax {
+		return available
+	}
+	return externalDirectUDPConstrainedReceiverLaneMax
 }
 
 func externalDirectUDPSenderProbeRateLimit(caps probe.TransportCaps, sent []directUDPRateProbeSample, received []directUDPRateProbeSample) externalDirectUDPSenderProbeRateLimitResult {

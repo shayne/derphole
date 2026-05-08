@@ -145,11 +145,13 @@ func newPeerHeartbeat(bytesTransferred int64) *peerHeartbeat {
 }
 
 type directUDPReadyAck struct {
-	FastDiscard          bool   `json:"fast_discard,omitempty"`
-	TransportKind        string `json:"transport_kind,omitempty"`
-	TransportBatchSize   int    `json:"transport_batch_size,omitempty"`
-	TransportTXOffload   bool   `json:"transport_tx_offload,omitempty"`
-	TransportRXQOverflow bool   `json:"transport_rxq_overflow,omitempty"`
+	FastDiscard               bool   `json:"fast_discard,omitempty"`
+	TransportKind             string `json:"transport_kind,omitempty"`
+	TransportBatchSize        int    `json:"transport_batch_size,omitempty"`
+	TransportReadBufferBytes  int    `json:"transport_read_buffer_bytes,omitempty"`
+	TransportWriteBufferBytes int    `json:"transport_write_buffer_bytes,omitempty"`
+	TransportTXOffload        bool   `json:"transport_tx_offload,omitempty"`
+	TransportRXQOverflow      bool   `json:"transport_rxq_overflow,omitempty"`
 }
 
 type directUDPStart struct {

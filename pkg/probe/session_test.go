@@ -980,6 +980,92 @@ func TestSendBlastParallelMaxActiveLanesCapsStripedDataScheduling(t *testing.T) 
 	}
 }
 
+func TestSendBlastParallelMinActiveLanesSpreadsLowRateStripedData(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverA.Close()
+
+	serverB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverB.Close()
+
+	clientABase, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientABase.Close()
+	clientA := &dataCountingPacketConn{PacketConn: clientABase}
+
+	clientBBase, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientBBase.Close()
+	clientB := &dataCountingPacketConn{PacketConn: clientBBase}
+
+	src := bytes.Repeat([]byte("active-lane-min-striped-"), 1<<13)
+	var got bytes.Buffer
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 2)
+	runID := testRunID(0xaa)
+	go func() {
+		stats, err := ReceiveBlastStreamParallelToWriter(ctx, []net.PacketConn{serverA, serverB}, &got, ReceiveConfig{
+			Blast:           true,
+			ExpectedRunID:   runID,
+			RequireComplete: true,
+		}, int64(len(src)))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	sendStats, err := SendBlastParallel(ctx, []net.PacketConn{clientA, clientB}, []string{serverA.LocalAddr().String(), serverB.LocalAddr().String()}, bytes.NewReader(src), SendConfig{
+		Blast:          true,
+		ChunkSize:      512,
+		RunID:          runID,
+		RepairPayloads: true,
+		StripedBlast:   true,
+		RateMbps:       100,
+		MaxActiveLanes: 2,
+		MinActiveLanes: 2,
+	})
+	if err != nil {
+		t.Fatalf("SendBlastParallel() error = %v", err)
+	}
+	if sendStats.BytesSent != int64(len(src)) {
+		t.Fatalf("BytesSent = %d, want %d", sendStats.BytesSent, len(src))
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("parallel striped active-lane min error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(src)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(src))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for striped active-lane min receive: %v", ctx.Err())
+	}
+	if !bytes.Equal(got.Bytes(), src) {
+		t.Fatalf("parallel striped active-lane min payload mismatch: got %d bytes, want %d", got.Len(), len(src))
+	}
+	if clientA.DataWrites() == 0 {
+		t.Fatal("lane 0 wrote no data packets")
+	}
+	if clientB.DataWrites() == 0 {
+		t.Fatal("lane 1 wrote no data packets, want min active lanes to spread low-rate data")
+	}
+}
+
 func TestSendBlastParallelSkipsUnreachableOptionalLane(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -1757,7 +1843,7 @@ func TestBlastStreamReceiveCoordinatorAcksStoredStripedPendingOutput(t *testing.
 	}
 }
 
-func TestBlastStreamReceiveCoordinatorReportsCommittedStripedProgress(t *testing.T) {
+func TestBlastStreamReceiveCoordinatorReportsAcceptedStripedProgress(t *testing.T) {
 	runID := testRunID(0xbf)
 	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
 	batcher0 := &capturingBatcher{}
@@ -1784,8 +1870,8 @@ func TestBlastStreamReceiveCoordinatorReportsCommittedStripedProgress(t *testing
 	if !ok {
 		t.Fatal("failed to unmarshal striped stats payload")
 	}
-	if stats.ReceivedPayloadBytes != 0 {
-		t.Fatalf("striped stats ReceivedPayloadBytes = %d, want 0 while output frontier is stalled", stats.ReceivedPayloadBytes)
+	if stats.ReceivedPayloadBytes != uint64(len("future")) {
+		t.Fatalf("striped stats ReceivedPayloadBytes = %d, want accepted payload bytes %d while output frontier is stalled", stats.ReceivedPayloadBytes, len("future"))
 	}
 
 	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[0], 0, 2, PacketTypeData, runID, 0, 0, 0, []byte("first"), peer); err != nil || complete {
@@ -1798,8 +1884,86 @@ func TestBlastStreamReceiveCoordinatorReportsCommittedStripedProgress(t *testing
 	if !ok {
 		t.Fatal("failed to unmarshal striped stats payload after commit")
 	}
-	if stats.ReceivedPayloadBytes != uint64(len("first")) {
-		t.Fatalf("striped stats ReceivedPayloadBytes = %d, want %d after output frontier advances", stats.ReceivedPayloadBytes, len("first"))
+	if stats.ReceivedPayloadBytes != uint64(len("future")+len("first")) {
+		t.Fatalf("striped stats ReceivedPayloadBytes = %d, want %d after output frontier advances", stats.ReceivedPayloadBytes, len("future")+len("first"))
+	}
+}
+
+func TestBlastStreamReceiveCoordinatorReportsAcceptedStripedProgressForRateControl(t *testing.T) {
+	runID := testRunID(0xc0)
+	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+	batcher0 := &capturingBatcher{}
+	batcher1 := &capturingBatcher{}
+	lanes := []*blastStreamReceiveLane{
+		{batcher: batcher0, peer: peer},
+		{batcher: batcher1, peer: peer},
+	}
+	var dst bytes.Buffer
+	coordinator := newBlastStreamReceiveCoordinator(context.Background(), lanes, &dst, ReceiveConfig{
+		Blast:           true,
+		RequireComplete: true,
+		ExpectedRunID:   runID,
+	}, 0, time.Now())
+
+	blockBytes := uint64(parallelBlastStripeBlockPackets * defaultChunkSize)
+	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[1], 1, 2, PacketTypeData, runID, 0, blockBytes, 0, []byte("future"), peer); err != nil || complete {
+		t.Fatalf("handlePacketStripe(future data) complete=%v err=%v, want false nil", complete, err)
+	}
+	coordinator.sendStatsFeedbackLocked(context.Background(), runID, coordinator.runs[runID], time.Now(), true)
+
+	packet := firstPacketOfType(t, batcher1.writes, PacketTypeStats)
+	stats, ok := unmarshalBlastStatsPayload(packet.Payload)
+	if !ok {
+		t.Fatal("failed to unmarshal striped stats payload")
+	}
+	if stats.ReceivedPayloadBytes != uint64(len("future")) {
+		t.Fatalf("striped stats ReceivedPayloadBytes = %d, want accepted payload bytes %d while output frontier is stalled", stats.ReceivedPayloadBytes, len("future"))
+	}
+	if stats.AckFloor != 1 {
+		t.Fatalf("striped stats AckFloor = %d, want 1 for stripe-local replay ack", stats.AckFloor)
+	}
+	if dst.Len() != 0 {
+		t.Fatalf("dst length = %d, want output frontier still stalled", dst.Len())
+	}
+}
+
+func TestBlastStreamReceiveCoordinatorReportsBufferedStripedFutureProgressForRateControl(t *testing.T) {
+	runID := testRunID(0xc1)
+	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+	batcher0 := &capturingBatcher{}
+	batcher1 := &capturingBatcher{}
+	lanes := []*blastStreamReceiveLane{
+		{batcher: batcher0, peer: peer},
+		{batcher: batcher1, peer: peer},
+	}
+	var dst bytes.Buffer
+	coordinator := newBlastStreamReceiveCoordinator(context.Background(), lanes, &dst, ReceiveConfig{
+		Blast:           true,
+		RequireComplete: true,
+		ExpectedRunID:   runID,
+	}, 0, time.Now())
+
+	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[0], 0, 2, PacketTypeData, runID, 1, uint64(defaultChunkSize), 0, []byte("future"), peer); err != nil || complete {
+		t.Fatalf("handlePacketStripe(future data) complete=%v err=%v, want false nil", complete, err)
+	}
+	coordinator.sendStatsFeedbackLocked(context.Background(), runID, coordinator.runs[runID], time.Now(), true)
+
+	packet := firstPacketOfType(t, batcher0.writes, PacketTypeStats)
+	stats, ok := unmarshalBlastStatsPayload(packet.Payload)
+	if !ok {
+		t.Fatal("failed to unmarshal striped stats payload")
+	}
+	if stats.ReceivedPayloadBytes != uint64(len("future")) {
+		t.Fatalf("striped stats ReceivedPayloadBytes = %d, want buffered future payload bytes %d", stats.ReceivedPayloadBytes, len("future"))
+	}
+	if stats.AckFloor != 0 {
+		t.Fatalf("striped stats AckFloor = %d, want 0 while stripe-local gap remains", stats.AckFloor)
+	}
+	if stats.ReceivedPackets != 1 || stats.MaxSeqPlusOne != 2 {
+		t.Fatalf("striped stats packets=(%d,%d), want received=1 max=2", stats.ReceivedPackets, stats.MaxSeqPlusOne)
+	}
+	if dst.Len() != 0 {
+		t.Fatalf("dst length = %d, want output frontier still stalled", dst.Len())
 	}
 }
 
