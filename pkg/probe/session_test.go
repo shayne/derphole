@@ -2324,6 +2324,23 @@ func TestSendBlastParallelSingleLaneBatchedUsesConnectedUDP(t *testing.T) {
 	}
 }
 
+func TestShouldUseConnectedBatcherForParallelBatchOnlyLowLaneRate(t *testing.T) {
+	batcher := &capsBatcher{caps: TransportCaps{Kind: probeTransportBatched, BatchSize: 128}}
+
+	if !shouldUseConnectedBatcherForParallelSend(batcher, 4, SendConfig{RateCeilingMbps: 1000, MaxActiveLanes: 4}) {
+		t.Fatal("shouldUseConnectedBatcherForParallelSend(batch-only 250 Mbps lanes) = false, want true")
+	}
+	if !shouldUseConnectedBatcherForParallelSend(batcher, 2, SendConfig{RateMbps: 100, RateCeilingMbps: 2250, MaxActiveLanes: 2}) {
+		t.Fatal("shouldUseConnectedBatcherForParallelSend(batch-only low active rate) = false, want true")
+	}
+	if shouldUseConnectedBatcherForParallelSend(batcher, 2, SendConfig{RateCeilingMbps: 1000, MaxActiveLanes: 2}) {
+		t.Fatal("shouldUseConnectedBatcherForParallelSend(batch-only 500 Mbps lanes) = true, want false")
+	}
+	if shouldUseConnectedBatcherForParallelSend(&capsBatcher{caps: TransportCaps{Kind: probeTransportBatched, BatchSize: 128, TXOffload: true, RXQOverflow: true}}, 4, SendConfig{RateCeilingMbps: 1000, MaxActiveLanes: 4}) {
+		t.Fatal("shouldUseConnectedBatcherForParallelSend(offload batcher) = true, want false")
+	}
+}
+
 func TestReceiveBlastParallelToWriterRepairsDroppedDataPacket(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -4306,7 +4323,8 @@ func TestParallelActiveLanesForRateStartsConservativeAndScales(t *testing.T) {
 		{name: "ktzlxc class uses all lanes", rateMbps: 2250, available: 8, want: 8},
 		{name: "clamps available lanes", rateMbps: 2250, available: 3, want: 3},
 		{name: "higher than ktzlxc class uses all", rateMbps: 5000, available: 8, want: 8},
-		{name: "striped keeps all lanes", rateMbps: 350, available: 8, striped: true, want: 8},
+		{name: "striped starts conservatively", rateMbps: 350, available: 8, striped: true, want: 1},
+		{name: "striped scales with rate", rateMbps: 1200, available: 8, striped: true, want: 4},
 	}
 
 	for _, tt := range tests {
@@ -5638,6 +5656,21 @@ func TestServeBlastRepairsParallelDuplicateRequestsDoNotDelayCompletion(t *testi
 type capturingBatcher struct {
 	mu     sync.Mutex
 	writes [][]byte
+}
+
+type capsBatcher struct {
+	caps TransportCaps
+}
+
+func (b *capsBatcher) Capabilities() TransportCaps { return b.caps }
+func (b *capsBatcher) MaxBatch() int               { return b.caps.BatchSize }
+
+func (b *capsBatcher) WriteBatch(ctx context.Context, peer net.Addr, packets [][]byte) (int, error) {
+	return len(packets), ctx.Err()
+}
+
+func (b *capsBatcher) ReadBatch(ctx context.Context, timeout time.Duration, bufs []batchReadBuffer) (int, error) {
+	return 0, testTimeoutError{}
 }
 
 func (b *capturingBatcher) Capabilities() TransportCaps { return TransportCaps{Kind: "test"} }

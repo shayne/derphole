@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"io"
+	"os"
 )
 
 type nopWriteCloser struct {
@@ -25,6 +26,37 @@ func openSendSource(ctx context.Context, cfg SendConfig) (io.ReadCloser, error) 
 		return nopReadCloser{Reader: cfg.StdioIn}, nil
 	}
 	return nopReadCloser{Reader: io.LimitReader(nilReader{}, 0)}, nil
+}
+
+func sendConfigWithInferredExpectedBytes(cfg SendConfig) SendConfig {
+	if cfg.StdioExpectedBytes > 0 {
+		return cfg
+	}
+	expectedBytes, ok := regularFileRemainingBytes(cfg.StdioIn)
+	if ok {
+		cfg.StdioExpectedBytes = expectedBytes
+	}
+	return cfg
+}
+
+func regularFileRemainingBytes(r io.Reader) (int64, bool) {
+	f, ok := r.(*os.File)
+	if !ok || f == nil {
+		return 0, false
+	}
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return 0, false
+	}
+	pos, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, false
+	}
+	remaining := info.Size() - pos
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining, true
 }
 
 func openListenSink(ctx context.Context, cfg ListenConfig) (io.WriteCloser, error) {

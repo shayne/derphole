@@ -29,6 +29,7 @@ const (
 	blastRateConservativeFloorMinMbps       = 300
 	blastRateConservativeFloorMaxMbps       = 400
 	blastRateConservativeFloorRepairPkts    = maxRepairRequestSeqs * 2
+	blastRateHighCeilingPressureFloorMbps   = 100
 	blastRateLossBudgetMinPackets           = maxRepairRequestSeqs / 2
 	blastRateSevereLossRatioPercent         = 5
 	blastRateLossCeilingProbeClean          = 30
@@ -515,8 +516,11 @@ func (c *blastRateController) decreaseWithCeiling(now time.Time, forceLossCeilin
 }
 
 func (c *blastRateController) mediumRateFloorMbps() int {
-	if c == nil || c.ceilingMbps <= 0 || c.ceilingMbps > 700 {
+	if c == nil || c.ceilingMbps <= 0 {
 		return 0
+	}
+	if c.ceilingMbps > 700 {
+		return blastRateHighCeilingPressureFloorMbps
 	}
 	floor := int(float64(c.ceilingMbps)*0.40 + 0.5)
 	if floor < blastRateMinMbps {

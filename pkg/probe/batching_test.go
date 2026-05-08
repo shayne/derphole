@@ -136,6 +136,143 @@ func TestLegacyBatcherWritesAndReadsSinglePacket(t *testing.T) {
 	}
 }
 
+func TestPlatformBatcherUsesDarwinMultiDatagramPath(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skipf("darwin multi-datagram batching is not available on %s", runtime.GOOS)
+	}
+
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	batcher := newPacketBatcher(a, probeTransportBatched)
+	if got, want := batcher.Capabilities().Kind, probeTransportBatched; got != want {
+		t.Fatalf("Capabilities().Kind = %q, want %q", got, want)
+	}
+	if batcher.MaxBatch() <= 1 {
+		t.Fatalf("MaxBatch() = %d, want multi-datagram batching", batcher.MaxBatch())
+	}
+}
+
+func TestPlatformBatcherWritesAndReadsMultiplePacketsOnDarwin(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skipf("darwin multi-datagram batching is not available on %s", runtime.GOOS)
+	}
+
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	packets := [][]byte{[]byte("one"), []byte("two"), []byte("three")}
+	if n, err := newPacketBatcher(a, probeTransportBatched).WriteBatch(ctx, b.LocalAddr(), packets); err != nil {
+		t.Fatalf("WriteBatch() error = %v", err)
+	} else if n != len(packets) {
+		t.Fatalf("WriteBatch() = %d, want %d", n, len(packets))
+	}
+
+	batcher := newPacketBatcher(b, probeTransportBatched)
+	bufs := make([]batchReadBuffer, 8)
+	for i := range bufs {
+		bufs[i].Bytes = make([]byte, 32)
+	}
+	var got []string
+	for len(got) < len(packets) {
+		n, err := batcher.ReadBatch(ctx, time.Second, bufs)
+		if err != nil {
+			t.Fatalf("ReadBatch() error after %d packets = %v", len(got), err)
+		}
+		if n == 0 {
+			t.Fatalf("ReadBatch() = 0 after %d packets", len(got))
+		}
+		for i := 0; i < n; i++ {
+			got = append(got, string(bufs[i].Bytes[:bufs[i].N]))
+		}
+	}
+	want := []string{"one", "two", "three"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("packet %d = %q, want %q; all packets: %v", i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestPlatformBatcherWritesIdealBatchOnDarwin(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skipf("darwin multi-datagram batching is not available on %s", runtime.GOOS)
+	}
+
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	packets := make([][]byte, probeIdealBatchSize)
+	for i := range packets {
+		packets[i] = make([]byte, 1452)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if n, err := newPacketBatcher(a, probeTransportBatched).WriteBatch(ctx, b.LocalAddr(), packets); err != nil {
+		t.Fatalf("WriteBatch(%d packets) wrote %d before error: %v", len(packets), n, err)
+	}
+}
+
+func TestPlatformBatcherSendsIPv4PeerFromDualStackSocketOnDarwin(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skipf("darwin multi-datagram batching is not available on %s", runtime.GOOS)
+	}
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	client, err := net.ListenPacket("udp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if strings.HasPrefix(client.LocalAddr().String(), "127.0.0.1:") {
+		t.Skipf("udp listener is not dual-stack on this platform: %s", client.LocalAddr())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if n, err := newPacketBatcher(client, probeTransportBatched).WriteBatch(ctx, server.LocalAddr(), [][]byte{[]byte("mapped")}); err != nil {
+		t.Fatalf("dual-stack WriteBatch() error after %d packets: %v", n, err)
+	} else if n != 1 {
+		t.Fatalf("dual-stack WriteBatch() = %d, want 1", n)
+	}
+}
+
 func TestConnectedUDPBatcherWritesAndReadsConnectedSocket(t *testing.T) {
 	switch runtime.GOOS {
 	case "darwin", "linux":

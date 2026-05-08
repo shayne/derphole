@@ -605,6 +605,19 @@ func TestBlastRateControllerLowStartHighCeilingReachesTwoLaneBasisWithinTwoSecon
 	}
 }
 
+func TestBlastRateControllerHighCeilingReplayPressureKeepsUsefulFloor(t *testing.T) {
+	start := time.Unix(0, 0)
+	controller := newBlastRateController(1200, 1800, start)
+
+	for i := 1; i <= 20; i++ {
+		controller.decreaseFromReplayPressure(start.Add(time.Duration(i) * blastRateFeedbackInterval))
+	}
+
+	if got, wantMin := controller.RateMbps(), 100; got < wantMin {
+		t.Fatalf("RateMbps() after repeated high-ceiling replay pressure = %d, want >= %d", got, wantMin)
+	}
+}
+
 func TestBlastRateControllerOpensInitialExplorationCeilingAfterCleanFeedback(t *testing.T) {
 	start := time.Unix(0, 0)
 	controller := newBlastRateControllerWithInitialLossCeiling(1200, 2250, 1200, start)

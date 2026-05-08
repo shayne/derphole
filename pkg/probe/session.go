@@ -1544,9 +1544,6 @@ func parallelActiveLanesForRate(rateMbps int, available int, striped bool) int {
 	if available <= 0 {
 		return 0
 	}
-	if striped {
-		return available
-	}
 	target := available
 	switch {
 	case rateMbps <= parallelActiveLaneOneMaxMbps:
@@ -1580,14 +1577,24 @@ func shouldUseConnectedBatcherForParallelSend(batcher packetBatcher, laneCount i
 	if batcher.MaxBatch() == 1 {
 		return true
 	}
-	if laneCount != 1 {
-		return false
+	rateBasisMbps := cfg.RateCeilingMbps
+	if cfg.RateMbps > 0 && (rateBasisMbps <= 0 || cfg.RateMbps < rateBasisMbps) {
+		rateBasisMbps = cfg.RateMbps
 	}
-	ceilingMbps := cfg.RateCeilingMbps
-	if ceilingMbps <= 0 {
-		ceilingMbps = cfg.RateMbps
+	if laneCount > 1 {
+		activeLanes := laneCount
+		if cfg.MaxActiveLanes > 0 && cfg.MaxActiveLanes < activeLanes {
+			activeLanes = cfg.MaxActiveLanes
+		}
+		laneCeilingMbps := parallelLaneRateMbps(rateBasisMbps, activeLanes)
+		caps := batcher.Capabilities()
+		return caps.Kind == probeTransportBatched &&
+			!caps.TXOffload &&
+			!caps.RXQOverflow &&
+			laneCeilingMbps > 0 &&
+			laneCeilingMbps <= parallelActiveLaneOneMaxMbps
 	}
-	return ceilingMbps > 0 && ceilingMbps <= parallelActiveLaneOneMaxMbps
+	return rateBasisMbps > 0 && rateBasisMbps <= parallelActiveLaneOneMaxMbps
 }
 
 func blastParallelLaneIndexForOffset(offset uint64, lanes int, chunkSize int) int {
