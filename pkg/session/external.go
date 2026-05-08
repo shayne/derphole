@@ -2256,7 +2256,7 @@ func notifyPeerAbortOnError(errp *error, ctx context.Context, client *derpbind.C
 		return
 	}
 	*errp = normalizePeerAbortError(ctx, *errp)
-	if *errp == nil || errors.Is(*errp, ErrPeerAborted) || errors.Is(*errp, ErrPeerDisconnected) {
+	if !peerAbortErrorShouldNotify(*errp) {
 		return
 	}
 	var bytes int64
@@ -2264,6 +2264,14 @@ func notifyPeerAbortOnError(errp *error, ctx context.Context, client *derpbind.C
 		bytes = bytesTransferred()
 	}
 	sendPeerAbortBestEffort(client, peerDERP, peerAbortReason(*errp), bytes, optionalPeerControlAuth(authOpt))
+}
+
+func peerAbortErrorShouldNotify(err error) bool {
+	return err != nil &&
+		!errors.Is(err, ErrPeerAborted) &&
+		!errors.Is(err, ErrPeerDisconnected) &&
+		!errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded)
 }
 
 func peerAbortReason(err error) string {

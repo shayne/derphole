@@ -509,6 +509,21 @@ func TestSendPeerAbortBestEffortSendsAbortEnvelope(t *testing.T) {
 	}
 }
 
+func TestPeerAbortErrorShouldNotifySkipsLocalContextCancellation(t *testing.T) {
+	if peerAbortErrorShouldNotify(context.Canceled) {
+		t.Fatal("peerAbortErrorShouldNotify(context.Canceled) = true, want false")
+	}
+	if peerAbortErrorShouldNotify(context.DeadlineExceeded) {
+		t.Fatal("peerAbortErrorShouldNotify(context.DeadlineExceeded) = true, want false")
+	}
+	if peerAbortErrorShouldNotify(ErrPeerDisconnected) {
+		t.Fatal("peerAbortErrorShouldNotify(ErrPeerDisconnected) = true, want false")
+	}
+	if !peerAbortErrorShouldNotify(errors.New("write failed")) {
+		t.Fatal("peerAbortErrorShouldNotify(write failed) = false, want true")
+	}
+}
+
 func TestSendClaimAndReceiveDecisionReturnsPeerAborted(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1935,6 +1950,109 @@ func TestSendExternalViaRelayPrefixThenDirectUDPStartsPrepareBeforeTransportMana
 	cancel()
 	if err := <-errCh; err == nil {
 		t.Fatal("sendExternalViaRelayPrefixThenDirectUDP() error = nil, want canceled context after test shutdown")
+	}
+}
+
+func TestSendExternalViaRelayPrefixThenDirectUDPDoesNotWaitForeverForBlockedRelayAfterPrepareCancel(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	prevSendRelay := externalSendExternalHandoffDERPFn
+	relayStarted := make(chan struct{})
+	releaseRelay := make(chan struct{})
+	externalSendExternalHandoffDERPFn = func(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, spool *externalHandoffSpool, stop <-chan struct{}, metrics *externalTransferMetrics, packetAEAD cipher.AEAD) error {
+		close(relayStarted)
+		<-releaseRelay
+		return nil
+	}
+	t.Cleanup(func() {
+		externalSendExternalHandoffDERPFn = prevSendRelay
+		close(releaseRelay)
+	})
+
+	prevPrepareDirectUDPSend := externalPrepareDirectUDPSendFn
+	externalPrepareDirectUDPSendFn = func(ctx context.Context, tok token.Token, derpClient *derpbind.Client, listenerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, readyAckCh <-chan derpbind.Packet, startAckCh <-chan derpbind.Packet, rateProbeCh <-chan derpbind.Packet, cfg SendConfig) (externalDirectUDPSendPlan, error) {
+		<-relayStarted
+		return externalDirectUDPSendPlan{}, context.Canceled
+	}
+	t.Cleanup(func() { externalPrepareDirectUDPSendFn = prevPrepareDirectUDPSend })
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sendExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixSendConfig{
+			src:          bytes.NewReader(bytes.Repeat([]byte("blocked-relay"), 1024)),
+			decision:     rendezvous.Decision{Accept: &rendezvous.AcceptInfo{}},
+			derpClient:   nil,
+			listenerDERP: key.NodePublic{},
+			cfg:          SendConfig{},
+		})
+	}()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("sendExternalViaRelayPrefixThenDirectUDP() error = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(150 * time.Millisecond):
+		t.Fatal("sendExternalViaRelayPrefixThenDirectUDP() waited for blocked relay sender after direct prepare canceled")
+	}
+}
+
+func TestSendExternalViaRelayPrefixThenDirectUDPReturnsWhenContextCanceledWhileWorkersBlocked(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	prevSendRelay := externalSendExternalHandoffDERPFn
+	relayStarted := make(chan struct{})
+	releaseWorkers := make(chan struct{})
+	externalSendExternalHandoffDERPFn = func(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, spool *externalHandoffSpool, stop <-chan struct{}, metrics *externalTransferMetrics, packetAEAD cipher.AEAD) error {
+		close(relayStarted)
+		<-releaseWorkers
+		return nil
+	}
+	t.Cleanup(func() {
+		externalSendExternalHandoffDERPFn = prevSendRelay
+		close(releaseWorkers)
+	})
+
+	prevPrepareDirectUDPSend := externalPrepareDirectUDPSendFn
+	prepStarted := make(chan struct{})
+	externalPrepareDirectUDPSendFn = func(ctx context.Context, tok token.Token, derpClient *derpbind.Client, listenerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, readyAckCh <-chan derpbind.Packet, startAckCh <-chan derpbind.Packet, rateProbeCh <-chan derpbind.Packet, cfg SendConfig) (externalDirectUDPSendPlan, error) {
+		close(prepStarted)
+		<-releaseWorkers
+		return externalDirectUDPSendPlan{}, nil
+	}
+	t.Cleanup(func() { externalPrepareDirectUDPSendFn = prevPrepareDirectUDPSend })
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sendExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixSendConfig{
+			src:          bytes.NewReader(bytes.Repeat([]byte("blocked-workers"), 1024)),
+			decision:     rendezvous.Decision{Accept: &rendezvous.AcceptInfo{}},
+			derpClient:   nil,
+			listenerDERP: key.NodePublic{},
+			cfg:          SendConfig{},
+		})
+	}()
+
+	select {
+	case <-relayStarted:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("relay worker did not start")
+	}
+	select {
+	case <-prepStarted:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("direct prepare worker did not start")
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("sendExternalViaRelayPrefixThenDirectUDP() error = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(150 * time.Millisecond):
+		t.Fatal("sendExternalViaRelayPrefixThenDirectUDP() did not return after context cancellation")
 	}
 }
 

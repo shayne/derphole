@@ -1237,14 +1237,30 @@ func sendExternalViaRelayPrefixThenDirectUDP(ctx context.Context, rcfg externalR
 	go externalRelayPrefixTransportKeepalive(keepaliveCtx, rcfg.transportManager)
 
 	relayStopCh := make(chan struct{})
+	var relayStopOnce sync.Once
+	stopRelay := func() {
+		relayStopOnce.Do(func() {
+			close(relayStopCh)
+		})
+	}
 	relayErrCh := make(chan error, 1)
 	go func() {
 		relayErrCh <- externalSendExternalHandoffDERPFn(ctx, rcfg.derpClient, rcfg.listenerDERP, spool, relayStopCh, metrics, packetAEAD)
 	}()
 
+	waitRelayErr := func() error {
+		select {
+		case err := <-relayErrCh:
+			return err
+		case <-ctx.Done():
+			stopRelay()
+			return normalizePeerAbortError(ctx, ctx.Err())
+		}
+	}
+
 	handoffRelay := func() (bool, int64, error) {
-		close(relayStopCh)
-		if err := <-relayErrCh; err != nil {
+		stopRelay()
+		if err := waitRelayErr(); err != nil {
 			return false, 0, err
 		}
 		watermark := spool.AckedWatermark()
@@ -1325,6 +1341,10 @@ func sendExternalViaRelayPrefixThenDirectUDP(ctx context.Context, rcfg externalR
 				externalTransferTracef("relay-prefix-send-post-handoff-prepared")
 				activateDirect()
 				return externalExecutePreparedDirectUDPSendFn(ctx, newExternalHandoffSpoolReader(spool), prep.plan, rcfg.cfg, metrics)
+			case <-ctx.Done():
+				prepCancel()
+				stopRelay()
+				return normalizePeerAbortError(ctx, ctx.Err())
 			}
 		}
 	}
@@ -1355,7 +1375,11 @@ func sendExternalViaRelayPrefixThenDirectUDP(ctx context.Context, rcfg externalR
 				if rcfg.cfg.Emitter != nil {
 					rcfg.cfg.Emitter.Debug("udp-handoff-send-prepare-error=" + prep.err.Error())
 				}
-				relayErr := <-relayErrCh
+				if ctx.Err() != nil || errors.Is(prep.err, context.Canceled) {
+					stopRelay()
+					return normalizePeerAbortError(ctx, prep.err)
+				}
+				relayErr := waitRelayErr()
 				if relayErr != nil {
 					return relayErr
 				}
@@ -1366,7 +1390,7 @@ func sendExternalViaRelayPrefixThenDirectUDP(ctx context.Context, rcfg externalR
 				return nil
 			}
 			if externalRelayPrefixShouldFinishRelay(spool) {
-				relayErr := <-relayErrCh
+				relayErr := waitRelayErr()
 				if relayErr != nil {
 					return relayErr
 				}
@@ -1405,6 +1429,10 @@ func sendExternalViaRelayPrefixThenDirectUDP(ctx context.Context, rcfg externalR
 			directReadyCh = nil
 			externalTransferTracef("relay-prefix-send-direct-ready-pre-prepare")
 			activateDirect()
+		case <-ctx.Done():
+			prepCancel()
+			stopRelay()
+			return normalizePeerAbortError(ctx, ctx.Err())
 		}
 	}
 }
