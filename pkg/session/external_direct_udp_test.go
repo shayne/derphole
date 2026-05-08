@@ -2235,6 +2235,68 @@ func TestExternalDirectUDPBatchOnlyProbeRateLimitSkipsOffloadCaps(t *testing.T) 
 	}
 }
 
+func TestExternalDirectUDPBatchOnlyProbeRateLimitKeepsLossyHighGoodputHeadroom(t *testing.T) {
+	caps := probe.TransportCaps{Kind: "batched", BatchSize: 128}
+	sent := []directUDPRateProbeSample{
+		{RateMbps: 8, BytesSent: 200_680, DurationMillis: 200},
+		{RateMbps: 25, BytesSent: 625_568, DurationMillis: 200},
+		{RateMbps: 75, BytesSent: 1_875_320, DurationMillis: 200},
+		{RateMbps: 150, BytesSent: 3_750_640, DurationMillis: 200},
+		{RateMbps: 350, BytesSent: 8_749_648, DurationMillis: 200},
+		{RateMbps: 700, BytesSent: 17_500_680, DurationMillis: 200},
+		{RateMbps: 1000, BytesSent: 25_000_576, DurationMillis: 200},
+		{RateMbps: 1200, BytesSent: 29_999_584, DurationMillis: 200},
+		{RateMbps: 1800, BytesSent: 112_500_000, DurationMillis: 500},
+		{RateMbps: 2000, BytesSent: 125_000_000, DurationMillis: 500},
+		{RateMbps: 2250, BytesSent: 140_625_000, DurationMillis: 500},
+	}
+	received := []directUDPRateProbeSample{
+		{RateMbps: 8, BytesReceived: 200_680, DurationMillis: 200},
+		{RateMbps: 25, BytesReceived: 625_568, DurationMillis: 200},
+		{RateMbps: 75, BytesReceived: 1_875_320, DurationMillis: 200},
+		{RateMbps: 150, BytesReceived: 3_750_640, DurationMillis: 200},
+		{RateMbps: 350, BytesReceived: 8_749_648, DurationMillis: 200},
+		{RateMbps: 700, BytesReceived: 8_751_032, DurationMillis: 200},
+		{RateMbps: 1000, BytesReceived: 18_750_432, DurationMillis: 200},
+		{RateMbps: 1200, BytesReceived: 21_810_456, DurationMillis: 200},
+		{RateMbps: 1800, BytesReceived: 74_146_416, DurationMillis: 500},
+		{RateMbps: 2000, BytesReceived: 92_091_360, DurationMillis: 500},
+		{RateMbps: 2250, BytesReceived: 89_417_472, DurationMillis: 500},
+	}
+
+	got := externalDirectUDPSenderProbeRateLimit(caps, sent, received)
+	want := externalDirectUDPSenderProbeRateLimitResult{StartMbps: 800, CeilingMbps: 800}
+	if got != want {
+		t.Fatalf("externalDirectUDPSenderProbeRateLimit(lossy high goodput) = %#v, want %#v", got, want)
+	}
+}
+
+func TestExternalDirectUDPBatchOnlyProbeRateLimitCapsLossyHighHeadroom(t *testing.T) {
+	caps := probe.TransportCaps{Kind: "batched", BatchSize: 128}
+	sent := []directUDPRateProbeSample{
+		{RateMbps: 700, BytesSent: 17_500_680, DurationMillis: 200},
+		{RateMbps: 1000, BytesSent: 25_000_576, DurationMillis: 200},
+		{RateMbps: 1200, BytesSent: 29_999_584, DurationMillis: 200},
+		{RateMbps: 1800, BytesSent: 112_500_000, DurationMillis: 500},
+		{RateMbps: 2000, BytesSent: 125_000_000, DurationMillis: 500},
+		{RateMbps: 2250, BytesSent: 140_625_000, DurationMillis: 500},
+	}
+	received := []directUDPRateProbeSample{
+		{RateMbps: 700, BytesReceived: 8_749_648, DurationMillis: 200},
+		{RateMbps: 1000, BytesReceived: 18_750_432, DurationMillis: 200},
+		{RateMbps: 1200, BytesReceived: 22_499_688, DurationMillis: 200},
+		{RateMbps: 1800, BytesReceived: 86_119_400, DurationMillis: 500},
+		{RateMbps: 2000, BytesReceived: 105_568_752, DurationMillis: 500},
+		{RateMbps: 2250, BytesReceived: 94_059_408, DurationMillis: 500},
+	}
+
+	got := externalDirectUDPSenderProbeRateLimit(caps, sent, received)
+	want := externalDirectUDPSenderProbeRateLimitResult{StartMbps: 1000, CeilingMbps: 1000}
+	if got != want {
+		t.Fatalf("externalDirectUDPSenderProbeRateLimit(lossy high cap) = %#v, want %#v", got, want)
+	}
+}
+
 func TestExternalDirectUDPSenderApplyProbeRateLimitUsesProbeStartAsTarget(t *testing.T) {
 	limit := externalDirectUDPSenderProbeRateLimitResult{StartMbps: 1000, CeilingMbps: 1000, StartOverride: true}
 	if got, want := externalDirectUDPSenderApplyProbeRateLimit(700, limit), 1000; got != want {

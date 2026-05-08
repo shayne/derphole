@@ -1635,7 +1635,7 @@ func externalDirectUDPSenderProbeRateLimit(caps probe.TransportCaps, sent []dire
 			continue
 		}
 		if sample.RateMbps < externalDirectUDPRateProbeCollapseMinMbps ||
-			delivery < externalDirectUDPRateProbeCeilingDelivery ||
+			delivery < externalDirectUDPRateProbeBufferedCollapse ||
 			goodput < externalDirectUDPRateProbeHighHeadroomMin {
 			continue
 		}
@@ -1688,6 +1688,9 @@ func externalDirectUDPBatchOnlyCleanProbeRateLimit(rateMbps int) externalDirectU
 func externalDirectUDPBatchOnlyLossyProbeRateLimit(rateMbps int, goodputMbps float64, delivery float64) externalDirectUDPSenderProbeRateLimitResult {
 	startMbps := externalDirectUDPRoundBatchOnlyProbeMbps(goodputMbps * delivery * delivery * externalDirectUDPBatchOnlyLossyStartShare)
 	limit := externalDirectUDPNormalizeBatchOnlyProbeRateLimit(startMbps, rateMbps)
+	if limit.StartMbps > externalDirectUDPRateProbeCollapseMinMbps {
+		limit.StartMbps = externalDirectUDPRateProbeCollapseMinMbps
+	}
 	limit.CeilingMbps = limit.StartMbps
 	limit.StartOverride = false
 	return limit
