@@ -242,6 +242,38 @@ func (s *externalHandoffSpool) AckedWatermark() int64 {
 	return s.ackedWatermark
 }
 
+func (s *externalHandoffSpool) WaitForUnackedAtMost(ctx context.Context, maxUnacked int64) error {
+	if maxUnacked < 0 {
+		maxUnacked = 0
+	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			s.mu.Lock()
+			s.cond.Broadcast()
+			s.mu.Unlock()
+		case <-done:
+		}
+	}()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for {
+		if s.readOffset-s.ackedWatermark <= maxUnacked {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if s.closed {
+			return net.ErrClosed
+		}
+		s.cond.Wait()
+	}
+}
+
 func (s *externalHandoffSpool) SetMaxUnacked(maxUnacked int64) {
 	if maxUnacked <= 0 {
 		return

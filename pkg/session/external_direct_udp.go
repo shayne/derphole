@@ -99,8 +99,9 @@ const (
 	externalDirectUDPConstrainedReceiverLaneMax    = 2
 	externalRelayPrefixSkipDirectTail              = 256 << 10
 	externalRelayPrefixDERPChunkSize               = 32 << 10
-	externalRelayPrefixDERPMaxUnacked              = 512 << 10
+	externalRelayPrefixDERPMaxUnacked              = 64 << 10
 	externalRelayPrefixDERPSustainedMax            = 64 << 10
+	externalRelayPrefixDERPHandoffMaxUnacked       = externalRelayPrefixDERPSustainedMax
 	externalRelayPrefixDERPStartupBytes            = 4 << 20
 	externalRelayPrefixDERPHandoffAckWait          = 5 * time.Second
 	externalRelayPrefixDirectPrepStallWait         = 250 * time.Millisecond
@@ -1259,6 +1260,11 @@ func sendExternalViaRelayPrefixThenDirectUDP(ctx context.Context, rcfg externalR
 	}
 
 	handoffRelay := func() (bool, int64, error) {
+		spool.SetMaxUnacked(externalRelayPrefixDERPHandoffMaxUnacked)
+		if err := spool.WaitForUnackedAtMost(ctx, externalRelayPrefixDERPHandoffMaxUnacked); err != nil {
+			stopRelay()
+			return false, 0, err
+		}
 		stopRelay()
 		if err := waitRelayErr(); err != nil {
 			return false, 0, err

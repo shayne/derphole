@@ -1737,11 +1737,16 @@ func TestSendExternalViaRelayPrefixThenDirectUDPContinuesRelayWhileDirectPrepPen
 	}
 }
 
+func TestExternalRelayPrefixStartupWindowFitsHandoffWindow(t *testing.T) {
+	if externalRelayPrefixDERPMaxUnacked > externalRelayPrefixDERPHandoffMaxUnacked {
+		t.Fatalf("relay-prefix startup unacked window = %d, want <= handoff window %d", externalRelayPrefixDERPMaxUnacked, externalRelayPrefixDERPHandoffMaxUnacked)
+	}
+}
+
 func TestSendExternalViaRelayPrefixThenDirectUDPDoesNotResumeRelayAfterHandoff(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	const acked = 64 << 10
 	payload := bytes.Repeat([]byte("small-tail-after-handoff"), 1<<12)
 
 	prevSendRelay := externalSendExternalHandoffDERPFn
@@ -1752,17 +1757,11 @@ func TestSendExternalViaRelayPrefixThenDirectUDPDoesNotResumeRelayAfterHandoff(t
 		if relayCalls > 1 {
 			return errors.New("unexpected post-handoff relay resume")
 		}
-		for {
-			_, err := spool.NextChunk()
-			if err == nil {
-				continue
-			}
-			if errors.Is(err, io.EOF) {
-				break
-			}
+		chunk, err := spool.NextChunk()
+		if err != nil {
 			return err
 		}
-		if err := spool.AckTo(acked); err != nil {
+		if err := spool.AckTo(chunk.Offset + int64(len(chunk.Payload))); err != nil {
 			return err
 		}
 		select {
@@ -1824,24 +1823,17 @@ func TestSendExternalViaRelayPrefixThenDirectUDPWaitsForHandoffReadyBeforeStoppi
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	const acked = 64 << 10
 	payload := bytes.Repeat([]byte("handoff-ready-gate"), 1<<12)
 
 	prevSendRelay := externalSendExternalHandoffDERPFn
 	prepReady := make(chan struct{})
 	relayPaused := make(chan struct{})
 	externalSendExternalHandoffDERPFn = func(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, spool *externalHandoffSpool, stop <-chan struct{}, metrics *externalTransferMetrics, packetAEAD cipher.AEAD) error {
-		for {
-			_, err := spool.NextChunk()
-			if err == nil {
-				continue
-			}
-			if errors.Is(err, io.EOF) {
-				break
-			}
+		chunk, err := spool.NextChunk()
+		if err != nil {
 			return err
 		}
-		if err := spool.AckTo(acked); err != nil {
+		if err := spool.AckTo(chunk.Offset + int64(len(chunk.Payload))); err != nil {
 			return err
 		}
 		select {
