@@ -33,16 +33,16 @@ func main() {
 
 	findings, err := ScanRepo(root)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "private-info-scan: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "private-info-scan: %v\n", err)
 		os.Exit(2)
 	}
 	if len(findings) == 0 {
 		return
 	}
 
-	fmt.Fprintln(os.Stderr, "private-info-scan: private host/service references found")
+	_, _ = fmt.Fprintln(os.Stderr, "private-info-scan: private host/service references found")
 	for _, finding := range findings {
-		fmt.Fprintf(os.Stderr, "%s:%d: matched private pattern\n", finding.Path, finding.Line)
+		_, _ = fmt.Fprintf(os.Stderr, "%s:%d: matched private pattern\n", finding.Path, finding.Line)
 	}
 	os.Exit(1)
 }
@@ -131,6 +131,9 @@ func scanFiles(root string, files []string, patterns []string) ([]Finding, error
 		path := filepath.Join(root, filepath.FromSlash(rel))
 		info, err := os.Stat(path)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
 			return nil, err
 		}
 		if info.IsDir() {

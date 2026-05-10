@@ -1,0 +1,2 @@
+go test fuzz v1
+string("[::ffff:0.0.0.0]:1")

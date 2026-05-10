@@ -10,7 +10,7 @@ cd "$repo_root"
 
 gofmt_targets=()
 while IFS= read -r file; do
-  if [[ "$file" == *.go ]]; then
+  if [[ "$file" == *.go && -f "$file" ]]; then
     gofmt_targets+=("$file")
   fi
 done < <(

@@ -388,20 +388,20 @@ func rankHotspots(signals map[string]*signal) []hotspot {
 
 func formatReport(hotspots []hotspot, summary inputSummary, limit int) string {
 	var b strings.Builder
-	fmt.Fprintln(&b, "Code-quality hotspots ranked by empirical risk")
-	fmt.Fprintf(&b, "Inputs: git-churn=%s coverage=%s golangci=%s crap=%s\n", yesNo(summary.gitChurn), yesNo(summary.coverage), yesNo(summary.golangci), yesNo(summary.crap))
+	_, _ = fmt.Fprintln(&b, "Code-quality hotspots ranked by empirical risk")
+	_, _ = fmt.Fprintf(&b, "Inputs: git-churn=%s coverage=%s golangci=%s crap=%s\n", yesNo(summary.gitChurn), yesNo(summary.coverage), yesNo(summary.golangci), yesNo(summary.crap))
 	if len(hotspots) == 0 {
-		fmt.Fprintln(&b, "No hotspots found from available inputs.")
+		_, _ = fmt.Fprintln(&b, "No hotspots found from available inputs.")
 		return b.String()
 	}
-	fmt.Fprintln(&b)
-	fmt.Fprintln(&b, "Rank Score    Churn Issues CRAP     Coverage Path")
+	_, _ = fmt.Fprintln(&b)
+	_, _ = fmt.Fprintln(&b, "Rank Score    Churn Issues CRAP     Coverage Path")
 	for i, h := range firstHotspots(hotspots, limit) {
 		coverage := "n/a"
 		if h.sig.hasCoverage {
 			coverage = fmt.Sprintf("%.1f%%", h.sig.coverage)
 		}
-		fmt.Fprintf(&b, "%4d %7.1f %5d %6d %8.1f %8s %s\n", i+1, h.score, h.sig.churn, h.sig.issues, h.sig.crap, coverage, h.path)
+		_, _ = fmt.Fprintf(&b, "%4d %7.1f %5d %6d %8.1f %8s %s\n", i+1, h.score, h.sig.churn, h.sig.issues, h.sig.crap, coverage, h.path)
 	}
 	return b.String()
 }

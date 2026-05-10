@@ -23,7 +23,7 @@ func versionString() string {
 }
 
 func runVersion(stdout, stderr io.Writer) int {
-	fmt.Fprintln(stdout, versionString())
+	_, _ = fmt.Fprintln(stdout, versionString())
 	_ = stderr
 	return 0
 }

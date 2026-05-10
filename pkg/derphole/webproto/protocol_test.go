@@ -33,6 +33,23 @@ func TestFrameRoundTrip(t *testing.T) {
 	}
 }
 
+func TestIsWebFrameChecksMagicAndVersion(t *testing.T) {
+	raw, err := Marshal(FrameData, 1, []byte("payload"))
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if !IsWebFrame(raw) {
+		t.Fatal("IsWebFrame(valid frame) = false, want true")
+	}
+	raw[4] = 99
+	if IsWebFrame(raw) {
+		t.Fatal("IsWebFrame(wrong version) = true, want false")
+	}
+	if IsWebFrame([]byte("DHP")) {
+		t.Fatal("IsWebFrame(short frame) = true, want false")
+	}
+}
+
 func TestFrameRejectsOversizedPayload(t *testing.T) {
 	payload := make([]byte, MaxPayloadBytes+1)
 	if _, err := Marshal(FrameData, 0, payload); !errors.Is(err, ErrPayloadTooLarge) {

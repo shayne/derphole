@@ -189,6 +189,81 @@ func TestServerAndClientSessionTokensShareServerIdentity(t *testing.T) {
 	}
 }
 
+func TestVerifyClientCredentialChecksBearerProofAndExpiry(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	server, err := GenerateServerToken(ServerTokenOptions{Now: now, Days: 30})
+	if err != nil {
+		t.Fatalf("GenerateServerToken() error = %v", err)
+	}
+	serverCred, err := DecodeServerToken(server, now)
+	if err != nil {
+		t.Fatalf("DecodeServerToken() error = %v", err)
+	}
+	client, err := GenerateClientToken(ClientTokenOptions{Now: now, ServerToken: server, Days: 7})
+	if err != nil {
+		t.Fatalf("GenerateClientToken() error = %v", err)
+	}
+	clientCred, err := DecodeClientToken(client, now)
+	if err != nil {
+		t.Fatalf("DecodeClientToken() error = %v", err)
+	}
+	if err := VerifyClientCredential(serverCred.SigningSecret, clientCred, now); err != nil {
+		t.Fatalf("VerifyClientCredential(valid) error = %v", err)
+	}
+	if got := DeriveClientBearerSecretForClaim(serverCred.SigningSecret, clientCred.ClientID); got != clientCred.BearerSecret {
+		t.Fatal("DeriveClientBearerSecretForClaim() did not match client bearer secret")
+	}
+
+	badBearer := clientCred
+	badBearer.BearerSecret[0] ^= 0xff
+	if err := VerifyClientCredential(serverCred.SigningSecret, badBearer, now); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("VerifyClientCredential(bad bearer) error = %v, want ErrInvalidToken", err)
+	}
+
+	badProof := clientCred
+	badProof.ProofMAC = "00" + badProof.ProofMAC[2:]
+	if err := VerifyClientCredential(serverCred.SigningSecret, badProof, now); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("VerifyClientCredential(bad proof) error = %v, want ErrInvalidToken", err)
+	}
+	if err := VerifyClientCredential(serverCred.SigningSecret, clientCred, now.Add(8*24*time.Hour)); !errors.Is(err, ErrExpired) {
+		t.Fatalf("VerifyClientCredential(expired) error = %v, want ErrExpired", err)
+	}
+}
+
+func TestEncodeClientCredentialAndDecodeServerValidation(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	server, err := GenerateServerToken(ServerTokenOptions{Now: now, Days: 30})
+	if err != nil {
+		t.Fatalf("GenerateServerToken() error = %v", err)
+	}
+	client, err := GenerateClientToken(ClientTokenOptions{Now: now, ServerToken: server, Days: 7})
+	if err != nil {
+		t.Fatalf("GenerateClientToken() error = %v", err)
+	}
+	clientCred, err := DecodeClientToken(client, now)
+	if err != nil {
+		t.Fatalf("DecodeClientToken() error = %v", err)
+	}
+	encoded, err := EncodeClientCredential(clientCred)
+	if err != nil {
+		t.Fatalf("EncodeClientCredential() error = %v", err)
+	}
+	roundTrip, err := DecodeClientToken(encoded, now)
+	if err != nil {
+		t.Fatalf("DecodeClientToken(encoded credential) error = %v", err)
+	}
+	if roundTrip.ClientID != clientCred.ClientID || roundTrip.ProofMAC != clientCred.ProofMAC {
+		t.Fatal("encoded client credential did not round-trip")
+	}
+
+	payload := decodeTokenPayload(t, ServerTokenPrefix, server)
+	payload["derp_private"] = "not-a-node-key"
+	tampered := encodeTokenPayload(t, ServerTokenPrefix, payload)
+	if _, err := DecodeServerToken(tampered, now); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("DecodeServerToken(bad derp key) error = %v, want ErrInvalidToken", err)
+	}
+}
+
 func decodeTokenPayload(t *testing.T, prefix, encoded string) map[string]any {
 	t.Helper()
 	raw, err := base64.RawURLEncoding.DecodeString(encoded[len(prefix):])

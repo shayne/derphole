@@ -70,6 +70,12 @@ type topologyUDPTarget struct {
 	address string
 }
 
+type topologyPunchReady struct {
+	port       string
+	candidates []string
+	address    string
+}
+
 type topologySSHProcess struct {
 	scanner *bufio.Scanner
 	stderr  *bytes.Buffer
@@ -81,11 +87,8 @@ func RunTopologyDiagnostics(ctx context.Context, cfg TopologyConfig) (TopologyRe
 		return TopologyReport{}, errors.New("nil context")
 	}
 	cfg = normalizeTopologyConfig(cfg)
-	if cfg.Host == "" {
-		return TopologyReport{}, errors.New("host is required")
-	}
-	if cfg.UDPPort <= 0 || cfg.UDPPort > 65535 {
-		return TopologyReport{}, fmt.Errorf("udp port must be between 1 and 65535")
+	if err := validateTopologyConfig(cfg); err != nil {
+		return TopologyReport{}, err
 	}
 
 	runner := SSHRunner{User: cfg.User, Host: cfg.Host}
@@ -93,7 +96,25 @@ func RunTopologyDiagnostics(ctx context.Context, cfg TopologyConfig) (TopologyRe
 		Host:   cfg.Host,
 		Target: runner.target(),
 	}
+	collectTopologyDNS(ctx, cfg, &report)
+	collectTopologyLocal(ctx, cfg, &report)
+	collectTopologyRemote(ctx, cfg, &report)
+	collectTopologyUDP(ctx, cfg, &report)
+	report.Classifications = ClassifyTopology(report)
+	return report, nil
+}
 
+func validateTopologyConfig(cfg TopologyConfig) error {
+	if cfg.Host == "" {
+		return errors.New("host is required")
+	}
+	if cfg.UDPPort <= 0 || cfg.UDPPort > 65535 {
+		return fmt.Errorf("udp port must be between 1 and 65535")
+	}
+	return nil
+}
+
+func collectTopologyDNS(ctx context.Context, cfg TopologyConfig, report *TopologyReport) {
 	stepCtx, cancel := topologyStepContext(ctx, cfg)
 	dns, err := topologyLookupDNS(stepCtx, cfg.Host)
 	cancel()
@@ -102,8 +123,10 @@ func RunTopologyDiagnostics(ctx context.Context, cfg TopologyConfig) (TopologyRe
 	} else {
 		report.DNSAddresses = dns
 	}
+}
 
-	stepCtx, cancel = topologyStepContext(ctx, cfg)
+func collectTopologyLocal(ctx context.Context, cfg TopologyConfig, report *TopologyReport) {
+	stepCtx, cancel := topologyStepContext(ctx, cfg)
 	local, err := topologyGatherLocalHost(stepCtx, cfg)
 	cancel()
 	if err != nil {
@@ -112,8 +135,10 @@ func RunTopologyDiagnostics(ctx context.Context, cfg TopologyConfig) (TopologyRe
 	} else {
 		report.Local = local
 	}
+}
 
-	stepCtx, cancel = topologyStepContextWithTimeout(ctx, cfg.Timeout+10*time.Second)
+func collectTopologyRemote(ctx context.Context, cfg TopologyConfig, report *TopologyReport) {
+	stepCtx, cancel := topologyStepContextWithTimeout(ctx, cfg.Timeout+10*time.Second)
 	remote, err := topologyGatherRemoteHost(stepCtx, cfg)
 	cancel()
 	if err != nil {
@@ -122,25 +147,25 @@ func RunTopologyDiagnostics(ctx context.Context, cfg TopologyConfig) (TopologyRe
 	} else {
 		report.Remote = remote
 	}
+}
 
-	if report.Remote.Error == "" {
-		udpResults, err := topologyCheckUDPReachability(ctx, cfg, report.DNSAddresses, report.Remote)
-		if err != nil {
-			report.Errors = append(report.Errors, "udp reachability: "+err.Error())
-		} else {
-			report.UDPReachability = udpResults
-		}
-
-		punchResults, err := topologyRunPunchTests(ctx, cfg, report.Remote)
-		if err != nil {
-			report.Errors = append(report.Errors, "udp punch: "+err.Error())
-		} else {
-			report.PunchTests = punchResults
-		}
+func collectTopologyUDP(ctx context.Context, cfg TopologyConfig, report *TopologyReport) {
+	if report.Remote.Error != "" {
+		return
+	}
+	udpResults, err := topologyCheckUDPReachability(ctx, cfg, report.DNSAddresses, report.Remote)
+	if err != nil {
+		report.Errors = append(report.Errors, "udp reachability: "+err.Error())
+	} else {
+		report.UDPReachability = udpResults
 	}
 
-	report.Classifications = ClassifyTopology(report)
-	return report, nil
+	punchResults, err := topologyRunPunchTests(ctx, cfg, report.Remote)
+	if err != nil {
+		report.Errors = append(report.Errors, "udp punch: "+err.Error())
+	} else {
+		report.PunchTests = punchResults
+	}
 }
 
 func normalizeTopologyConfig(cfg TopologyConfig) TopologyConfig {
@@ -225,19 +250,23 @@ func topologyInterfaceSummaries() ([]TopologyInterface, error) {
 	}
 	out := make([]TopologyInterface, 0, len(ifaces))
 	for _, iface := range ifaces {
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		summary := TopologyInterface{Name: iface.Name}
-		for _, addr := range addrs {
-			summary.Addrs = append(summary.Addrs, addr.String())
-		}
-		if len(summary.Addrs) > 0 {
+		if summary, ok := topologyInterfaceSummary(iface); ok {
 			out = append(out, summary)
 		}
 	}
 	return out, nil
+}
+
+func topologyInterfaceSummary(iface net.Interface) (TopologyInterface, bool) {
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return TopologyInterface{}, false
+	}
+	summary := TopologyInterface{Name: iface.Name}
+	for _, addr := range addrs {
+		summary.Addrs = append(summary.Addrs, addr.String())
+	}
+	return summary, len(summary.Addrs) > 0
 }
 
 func topologyLookupEgressIP(ctx context.Context, cfg TopologyConfig) (string, error) {
@@ -250,38 +279,50 @@ func topologyLookupEgressIP(ctx context.Context, cfg TopologyConfig) (string, er
 		if url == "" {
 			continue
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		ip, err := lookupEgressURL(ctx, url)
 		if err != nil {
 			errs = append(errs, err.Error())
-			continue
-		}
-		resp, err := topologyHTTPClient.Do(req)
-		if err != nil {
-			errs = append(errs, err.Error())
-			continue
-		}
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 128))
-		closeErr := resp.Body.Close()
-		if readErr != nil {
-			errs = append(errs, readErr.Error())
-			continue
-		}
-		if closeErr != nil {
-			errs = append(errs, closeErr.Error())
-			continue
-		}
-		if resp.StatusCode < 200 || resp.StatusCode > 299 {
-			errs = append(errs, resp.Status)
-			continue
-		}
-		ip := strings.TrimSpace(string(body))
-		if _, err := netip.ParseAddr(ip); err != nil {
-			errs = append(errs, fmt.Sprintf("%s returned non-IP %q", url, ip))
 			continue
 		}
 		return ip, nil
 	}
 	return "", fmt.Errorf("all egress lookups failed: %s", strings.Join(errs, "; "))
+}
+
+func lookupEgressURL(ctx context.Context, url string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := topologyHTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	body, err := readAndCloseLimited(resp.Body, 128)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return "", errors.New(resp.Status)
+	}
+	return parseEgressIP(url, body)
+}
+
+func readAndCloseLimited(body io.ReadCloser, limit int64) ([]byte, error) {
+	data, readErr := io.ReadAll(io.LimitReader(body, limit))
+	closeErr := body.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	return data, closeErr
+}
+
+func parseEgressIP(url string, body []byte) (string, error) {
+	ip := strings.TrimSpace(string(body))
+	if _, err := netip.ParseAddr(ip); err != nil {
+		return "", fmt.Errorf("%s returned non-IP %q", url, ip)
+	}
+	return ip, nil
 }
 
 func defaultTopologyGatherRemoteHost(ctx context.Context, cfg TopologyConfig) (TopologyHost, error) {
@@ -402,32 +443,55 @@ func defaultTopologyCheckUDPReachability(ctx context.Context, cfg TopologyConfig
 	if len(targets) == 0 {
 		return nil, nil
 	}
-
 	conn, err := net.ListenPacket("udp", ":0")
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
-	runCtx, cancel := context.WithTimeout(ctx, cfg.Timeout+2*time.Second)
+	runCtx, cancel, proc, err := startTopologyRemoteEcho(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
 	defer cancel()
+	if err := topologyWaitRemoteEchoReady(runCtx, proc); err != nil {
+		return nil, err
+	}
+	return topologyRunUDPReachabilityExchange(runCtx, conn, proc, targets, cfg.Timeout), nil
+}
 
+func startTopologyRemoteEcho(ctx context.Context, cfg TopologyConfig) (context.Context, context.CancelFunc, *topologySSHProcess, error) {
+	runCtx, cancel := context.WithTimeout(ctx, cfg.Timeout+2*time.Second)
 	runner := SSHRunner{User: cfg.User, Host: cfg.Host}
 	proc, err := startTopologySSHCommand(runCtx, runner, remoteUDPEchoScript(cfg.UDPPort, cfg.Timeout))
 	if err != nil {
-		return nil, err
+		cancel()
+		return nil, nil, nil, err
 	}
+	return runCtx, cancel, proc, nil
+}
 
-	ready, err := proc.readLine(runCtx)
+func topologyWaitRemoteEchoReady(ctx context.Context, proc *topologySSHProcess) error {
+	ready, err := proc.readLine(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if !strings.HasPrefix(ready, "READY ") {
-		return nil, fmt.Errorf("remote UDP echo did not become ready: %s", ready)
+		return fmt.Errorf("remote UDP echo did not become ready: %s", ready)
 	}
+	return nil
+}
 
+func topologyRunUDPReachabilityExchange(ctx context.Context, conn net.PacketConn, proc *topologySSHProcess, targets []topologyUDPTarget, timeout time.Duration) []UDPReachabilityResult {
+	payloadByLabel, started := topologySendUDPReachabilityProbes(conn, targets)
+	replyByLabel := topologyCollectUDPReachabilityReplies(conn, payloadByLabel, timeout)
+	remoteReport, stderr, waitErr := topologyReadRemoteEchoReport(ctx, proc)
+	receivedByLabel := topologyEchoReceivedByLabel(remoteReport, payloadByLabel)
+	return topologyBuildUDPReachabilityResults(targets, receivedByLabel, replyByLabel, remoteReport, waitErr, stderr, time.Since(started))
+}
+
+func topologySendUDPReachabilityProbes(conn net.PacketConn, targets []topologyUDPTarget) (map[string]string, time.Time) {
 	payloadByLabel := make(map[string]string, len(targets))
-	replyByLabel := make(map[string]bool, len(targets))
 	started := time.Now()
 	for _, target := range targets {
 		addr, err := net.ResolveUDPAddr("udp", target.address)
@@ -438,58 +502,90 @@ func defaultTopologyCheckUDPReachability(ctx context.Context, cfg TopologyConfig
 		payloadByLabel[target.label] = payload
 		_, _ = conn.WriteTo([]byte(payload), addr)
 	}
+	return payloadByLabel, started
+}
 
-	deadline := time.Now().Add(cfg.Timeout)
+func topologyCollectUDPReachabilityReplies(conn net.PacketConn, payloadByLabel map[string]string, timeout time.Duration) map[string]bool {
+	replyByLabel := make(map[string]bool, len(payloadByLabel))
+	deadline := time.Now().Add(timeout)
 	buf := make([]byte, 2048)
 	for time.Now().Before(deadline) {
-		if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		if !topologyReadUDPReachabilityReply(conn, buf, payloadByLabel, replyByLabel) {
 			break
-		}
-		n, _, err := conn.ReadFrom(buf)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			break
-		}
-		msg := string(buf[:n])
-		for label, payload := range payloadByLabel {
-			if msg == "ack:"+payload {
-				replyByLabel[label] = true
-			}
 		}
 	}
+	return replyByLabel
+}
 
+func topologyReadUDPReachabilityReply(conn net.PacketConn, buf []byte, payloadByLabel map[string]string, replyByLabel map[string]bool) bool {
+	if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		return false
+	}
+	n, _, err := conn.ReadFrom(buf)
+	if err != nil {
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			return true
+		}
+		return false
+	}
+	topologyMarkReplyByLabel(string(buf[:n]), payloadByLabel, replyByLabel)
+	return true
+}
+
+func topologyMarkReplyByLabel(msg string, payloadByLabel map[string]string, replyByLabel map[string]bool) {
+	for label, payload := range payloadByLabel {
+		if msg == "ack:"+payload {
+			replyByLabel[label] = true
+		}
+	}
+}
+
+func topologyReadRemoteEchoReport(ctx context.Context, proc *topologySSHProcess) (topologyRemoteEchoReport, string, error) {
 	var remoteReport topologyRemoteEchoReport
-	if line, err := proc.readLine(runCtx); err == nil {
+	if line, err := proc.readLine(ctx); err == nil {
 		_ = json.Unmarshal([]byte(line), &remoteReport)
 	}
-	waitErr := proc.wait()
-	stderr := strings.TrimSpace(proc.stderr.String())
+	return remoteReport, strings.TrimSpace(proc.stderr.String()), proc.wait()
+}
 
-	receivedByLabel := make(map[string]bool, len(targets))
-	for _, packet := range remoteReport.Received {
+func topologyEchoReceivedByLabel(report topologyRemoteEchoReport, payloadByLabel map[string]string) map[string]bool {
+	receivedByLabel := make(map[string]bool, len(payloadByLabel))
+	for _, packet := range report.Received {
 		for label, payload := range payloadByLabel {
 			if packet.Payload == payload {
 				receivedByLabel[label] = true
 			}
 		}
 	}
+	return receivedByLabel
+}
 
+func topologyBuildUDPReachabilityResults(
+	targets []topologyUDPTarget,
+	receivedByLabel map[string]bool,
+	replyByLabel map[string]bool,
+	remoteReport topologyRemoteEchoReport,
+	waitErr error,
+	stderr string,
+	elapsed time.Duration,
+) []UDPReachabilityResult {
 	results := make([]UDPReachabilityResult, 0, len(targets))
-	elapsed := time.Since(started)
 	remoteLog := topologyRemoteEchoLog(remoteReport, stderr)
 	for _, target := range targets {
-		var resultErr error
-		if !receivedByLabel[target.label] && !replyByLabel[target.label] {
-			resultErr = errors.New("timeout")
-		}
-		if waitErr != nil && remoteReport.Error == "" {
-			resultErr = waitErr
-		}
+		resultErr := topologyUDPReachabilityError(target, receivedByLabel, replyByLabel, remoteReport, waitErr)
 		results = append(results, topologyUDPReachabilityResult(target.label, target.address, receivedByLabel[target.label], replyByLabel[target.label], elapsed, resultErr, remoteLog))
 	}
-	return results, nil
+	return results
+}
+
+func topologyUDPReachabilityError(target topologyUDPTarget, receivedByLabel map[string]bool, replyByLabel map[string]bool, remoteReport topologyRemoteEchoReport, waitErr error) error {
+	if waitErr != nil && remoteReport.Error == "" {
+		return waitErr
+	}
+	if !receivedByLabel[target.label] && !replyByLabel[target.label] {
+		return errors.New("timeout")
+	}
+	return nil
 }
 
 func topologyUDPTargets(dns []string, remoteEgress string, port int) []topologyUDPTarget {
@@ -582,136 +678,263 @@ PY`, port, duration)
 func topologyRemoteEchoLog(report topologyRemoteEchoReport, stderr string) string {
 	var parts []string
 	for _, packet := range report.Received {
-		if packet.Payload == "" && packet.Peer == "" {
-			continue
-		}
-		parts = append(parts, strings.TrimSpace(packet.Payload+" from "+packet.Peer))
+		parts = appendTopologyEchoPacketLog(parts, packet)
 	}
-	if report.Error != "" {
-		parts = append(parts, "error: "+report.Error)
-	}
-	if stderr != "" {
-		parts = append(parts, "stderr: "+stderr)
-	}
+	parts = appendTopologyLogField(parts, "error: ", report.Error)
+	parts = appendTopologyLogField(parts, "stderr: ", stderr)
 	return strings.Join(parts, "\n")
 }
 
+func appendTopologyEchoPacketLog(parts []string, packet topologyEchoPacket) []string {
+	entry, ok := topologyEchoPacketLog(packet)
+	if !ok {
+		return parts
+	}
+	return append(parts, entry)
+}
+
+func topologyEchoPacketLog(packet topologyEchoPacket) (string, bool) {
+	if packet.Payload == "" && packet.Peer == "" {
+		return "", false
+	}
+	return strings.TrimSpace(packet.Payload + " from " + packet.Peer), true
+}
+
+func appendTopologyLogField(parts []string, prefix, value string) []string {
+	if value == "" {
+		return parts
+	}
+	return append(parts, prefix+value)
+}
+
 func defaultTopologyRunPunchTests(ctx context.Context, cfg TopologyConfig, remote TopologyHost) ([]UDPPunchResult, error) {
+	conn, closeConn, err := topologyListenPunchPacket()
+	if err != nil {
+		return nil, err
+	}
+	defer closeConn()
+	return runDefaultTopologyPunchTests(ctx, cfg, remote, conn)
+}
+
+func topologyListenPunchPacket() (net.PacketConn, func(), error) {
 	conn, err := net.ListenPacket("udp", ":0")
 	if err != nil {
+		return nil, nil, err
+	}
+	return conn, func() { _ = conn.Close() }, nil
+}
+
+func runDefaultTopologyPunchTests(ctx context.Context, cfg TopologyConfig, remote TopologyHost, conn net.PacketConn) ([]UDPPunchResult, error) {
+	localCandidates, result, err := topologyPunchLocalCandidates(ctx, conn)
+	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	if result != nil {
+		return result, nil
+	}
+	return runTopologyRemotePunch(ctx, cfg, remote, conn, localCandidates)
+}
 
+func runTopologyRemotePunch(ctx context.Context, cfg TopologyConfig, remote TopologyHost, conn net.PacketConn, localCandidates []string) ([]UDPPunchResult, error) {
+	runCtx, cancel, proc, err := startTopologyRemotePunch(ctx, cfg, remote, localCandidates)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	readyInfo, err := topologyReadPunchReady(runCtx, proc, remote)
+	if err != nil {
+		return nil, err
+	}
+	return topologyRunPunchExchange(runCtx, conn, proc, cfg.Timeout, localCandidates, readyInfo), nil
+}
+
+func topologyPunchLocalCandidates(ctx context.Context, conn net.PacketConn) ([]string, []UDPPunchResult, error) {
 	candidates, err := topologyDiscoverCandidates(ctx, conn)
 	if err != nil {
-		return []UDPPunchResult{{
-			Name:  "simultaneous",
-			Error: err.Error(),
-		}}, nil
+		return nil, []UDPPunchResult{{Name: "simultaneous", Error: err.Error()}}, nil
 	}
-	localCandidates := CandidateStringsInOrder(candidates)
+	return CandidateStringsInOrder(candidates), nil, nil
+}
+
+func startTopologyRemotePunch(ctx context.Context, cfg TopologyConfig, remote TopologyHost, localCandidates []string) (context.Context, context.CancelFunc, *topologySSHProcess, error) {
 	candidateJSON, err := json.Marshal(localCandidates)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
-
 	runCtx, cancel := context.WithTimeout(ctx, cfg.Timeout+2*time.Second)
-	defer cancel()
-
 	runner := SSHRunner{User: cfg.User, Host: cfg.Host}
 	proc, err := startTopologySSHCommand(runCtx, runner, remoteUDPPunchScript(string(candidateJSON), cfg.Timeout))
 	if err != nil {
-		return nil, err
+		cancel()
+		return nil, nil, nil, err
 	}
-	ready, err := proc.readLine(runCtx)
+	return runCtx, cancel, proc, nil
+}
+
+func topologyReadPunchReady(ctx context.Context, proc *topologySSHProcess, remote TopologyHost) (topologyPunchReady, error) {
+	ready, err := proc.readLine(ctx)
 	if err != nil {
-		return nil, err
+		return topologyPunchReady{}, err
 	}
 	if !strings.HasPrefix(ready, "READY ") {
-		return nil, fmt.Errorf("remote UDP punch did not become ready: %s", ready)
+		return topologyPunchReady{}, fmt.Errorf("remote UDP punch did not become ready: %s", ready)
 	}
-	readyFields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(ready, "READY ")))
-	remotePort := ""
-	if len(readyFields) > 0 {
-		remotePort = readyFields[0]
-	}
-	remoteCandidates := []string(nil)
-	if len(readyFields) > 1 {
-		remoteCandidates = strings.Split(readyFields[1], ",")
-	}
-	remoteAddress := ""
-	if len(remoteCandidates) > 0 {
-		remoteAddress = remoteCandidates[0]
-	} else if remote.EgressIP != "" && remotePort != "" {
-		remoteAddress = net.JoinHostPort(remote.EgressIP, remotePort)
-	}
+	return topologyParsePunchReady(ready, remote), nil
+}
 
-	result := UDPPunchResult{
-		Name:             "simultaneous",
-		LocalAddress:     strings.Join(localCandidates, ","),
-		RemoteAddress:    remoteAddress,
-		RemoteCandidates: remoteCandidates,
-	}
+func topologyRunPunchExchange(ctx context.Context, conn net.PacketConn, proc *topologySSHProcess, timeout time.Duration, localCandidates []string, readyInfo topologyPunchReady) []UDPPunchResult {
+	result := topologyInitialPunchResult(localCandidates, readyInfo)
 
 	var remoteUDP *net.UDPAddr
-	if remoteAddress != "" {
-		remoteUDP, _ = net.ResolveUDPAddr("udp", remoteAddress)
+	if readyInfo.address != "" {
+		remoteUDP, _ = net.ResolveUDPAddr("udp", readyInfo.address)
 	}
 
+	topologyRunLocalPunchLoop(conn, remoteUDP, timeout, &result)
+
+	remoteReport, stderr, waitErr := topologyReadRemotePunchReport(ctx, proc)
+	topologyFinalizePunchResult(&result, remoteReport, waitErr, stderr)
+	return []UDPPunchResult{result}
+}
+
+func topologyParsePunchReady(ready string, remote TopologyHost) topologyPunchReady {
+	fields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(ready, "READY ")))
+	info := topologyPunchReady{
+		port:       topologyPunchReadyPort(fields),
+		candidates: topologyPunchReadyCandidates(fields),
+	}
+	info.address = topologyPunchReadyAddress(info, remote)
+	return info
+}
+
+func topologyPunchReadyPort(fields []string) string {
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+func topologyPunchReadyCandidates(fields []string) []string {
+	if len(fields) <= 1 {
+		return nil
+	}
+	return strings.Split(fields[1], ",")
+}
+
+func topologyPunchReadyAddress(info topologyPunchReady, remote TopologyHost) string {
+	if len(info.candidates) > 0 {
+		return info.candidates[0]
+	}
+	if remote.EgressIP == "" || info.port == "" {
+		return ""
+	}
+	return net.JoinHostPort(remote.EgressIP, info.port)
+}
+
+func topologyInitialPunchResult(localCandidates []string, ready topologyPunchReady) UDPPunchResult {
+	return UDPPunchResult{
+		Name:             "simultaneous",
+		LocalAddress:     strings.Join(localCandidates, ","),
+		RemoteAddress:    ready.address,
+		RemoteCandidates: ready.candidates,
+	}
+}
+
+func topologyRunLocalPunchLoop(conn net.PacketConn, remoteUDP *net.UDPAddr, timeout time.Duration, result *UDPPunchResult) {
 	buf := make([]byte, 2048)
-	localDeadline := time.Now().Add(cfg.Timeout)
-	for time.Now().Before(localDeadline) {
-		if remoteUDP != nil {
-			_, _ = conn.WriteTo([]byte("derphole-topology:punch-local"), remoteUDP)
-		}
-		_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		n, addr, err := conn.ReadFrom(buf)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			result.Error = err.Error()
-			break
-		}
-		msg := string(buf[:n])
-		if strings.HasPrefix(msg, "derphole-topology:punch-remote") || strings.HasPrefix(msg, "ack:") {
-			result.LocalReceived = true
-			result.RemoteAddress = addr.String()
-			_, _ = conn.WriteTo([]byte("ack:derphole-topology:punch-remote"), addr)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !topologyLocalPunchRound(conn, remoteUDP, buf, result) {
+			return
 		}
 	}
+}
 
+func topologyLocalPunchRound(conn net.PacketConn, remoteUDP *net.UDPAddr, buf []byte, result *UDPPunchResult) bool {
+	if remoteUDP != nil {
+		_, _ = conn.WriteTo([]byte("derphole-topology:punch-local"), remoteUDP)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	n, addr, err := conn.ReadFrom(buf)
+	if err != nil {
+		return topologyHandleLocalPunchReadError(err, result)
+	}
+	topologyHandleLocalPunchMessage(conn, string(buf[:n]), addr, result)
+	return true
+}
+
+func topologyHandleLocalPunchReadError(err error, result *UDPPunchResult) bool {
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return true
+	}
+	result.Error = err.Error()
+	return false
+}
+
+func topologyHandleLocalPunchMessage(conn net.PacketConn, msg string, addr net.Addr, result *UDPPunchResult) {
+	if !strings.HasPrefix(msg, "derphole-topology:punch-remote") && !strings.HasPrefix(msg, "ack:") {
+		return
+	}
+	result.LocalReceived = true
+	result.RemoteAddress = addr.String()
+	_, _ = conn.WriteTo([]byte("ack:derphole-topology:punch-remote"), addr)
+}
+
+func topologyReadRemotePunchReport(ctx context.Context, proc *topologySSHProcess) (topologyRemotePunchReport, string, error) {
 	var remoteReport topologyRemotePunchReport
-	if line, err := proc.readLine(runCtx); err == nil {
+	if line, err := proc.readLine(ctx); err == nil {
 		_ = json.Unmarshal([]byte(line), &remoteReport)
 	}
-	waitErr := proc.wait()
-	if waitErr != nil && result.Error == "" {
-		result.Error = waitErr.Error()
+	return remoteReport, strings.TrimSpace(proc.stderr.String()), proc.wait()
+}
+
+func topologyFinalizePunchResult(result *UDPPunchResult, remoteReport topologyRemotePunchReport, waitErr error, stderr string) {
+	topologySetPunchError(result, remoteReport, waitErr, stderr)
+	topologyApplyRemotePunchReport(result, remoteReport)
+	topologySetPunchTimeout(result)
+}
+
+func topologySetPunchError(result *UDPPunchResult, remoteReport topologyRemotePunchReport, waitErr error, stderr string) {
+	result.Error = topologyPunchError(result.Error, remoteReport.Error, waitErr, stderr)
+}
+
+func topologyPunchError(current string, remoteError string, waitErr error, stderr string) string {
+	if current != "" {
+		return current
 	}
-	if strings.TrimSpace(proc.stderr.String()) != "" && result.Error == "" {
-		result.Error = strings.TrimSpace(proc.stderr.String())
+	if waitErr != nil {
+		return waitErr.Error()
 	}
+	if stderr != "" {
+		return stderr
+	}
+	return remoteError
+}
+
+func topologyApplyRemotePunchReport(result *UDPPunchResult, remoteReport topologyRemotePunchReport) {
 	if remoteReport.LocalAddress != "" && result.RemoteAddress == "" {
 		result.RemoteAddress = remoteReport.LocalAddress
 	}
-	if len(remoteReport.Candidates) > 0 {
-		result.RemoteCandidates = remoteReport.Candidates
-		if result.RemoteAddress == "" {
-			result.RemoteAddress = remoteReport.Candidates[0]
-		}
-	}
+	topologyApplyRemotePunchCandidates(result, remoteReport.Candidates)
 	if len(remoteReport.Received) > 0 {
 		result.RemoteReceived = true
 	}
-	if remoteReport.Error != "" && result.Error == "" {
-		result.Error = remoteReport.Error
+}
+
+func topologyApplyRemotePunchCandidates(result *UDPPunchResult, candidates []string) {
+	if len(candidates) == 0 {
+		return
 	}
+	result.RemoteCandidates = candidates
+	if result.RemoteAddress == "" {
+		result.RemoteAddress = candidates[0]
+	}
+}
+
+func topologySetPunchTimeout(result *UDPPunchResult) {
 	if !result.LocalReceived && !result.RemoteReceived && result.Error == "" {
 		result.Error = "timeout"
 	}
-	return []UDPPunchResult{result}, nil
 }
 
 func remoteUDPPunchScript(localCandidatesJSON string, timeout time.Duration) string {

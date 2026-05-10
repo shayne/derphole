@@ -11,19 +11,19 @@ import (
 
 func FormatHuman(report Report) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Network check: %s\n\n", valueOrUnknown(report.Verdict))
-	fmt.Fprintf(&b, "UDP:\n")
-	fmt.Fprintf(&b, "  Outbound UDP: %s\n", yesNo(report.UDP.Outbound))
-	fmt.Fprintf(&b, "  STUN: %s\n", yesNo(report.UDP.STUN))
-	fmt.Fprintf(&b, "  Public endpoint: %s\n", joinOrUnavailable(report.UDP.PublicEndpoints))
-	fmt.Fprintf(&b, "  Mapping: %s\n", mappingText(report))
-	fmt.Fprintf(&b, "  Port preservation: %s\n\n", yesNo(report.UDP.PortPreserving))
-	fmt.Fprintf(&b, "Candidates:\n")
-	fmt.Fprintf(&b, "  LAN: %s\n", joinOrNone(report.Candidates.LAN))
-	fmt.Fprintf(&b, "  Overlay: %s\n", joinOrNone(report.Candidates.Overlay))
-	fmt.Fprintf(&b, "  Public: %s\n\n", joinOrNone(report.Candidates.Public))
-	fmt.Fprintf(&b, "Direct-connect readiness:\n")
-	fmt.Fprintf(&b, "  %s\n", valueOrUnknown(report.Recommendation))
+	_, _ = fmt.Fprintf(&b, "Network check: %s\n\n", valueOrUnknown(report.Verdict))
+	_, _ = fmt.Fprintf(&b, "UDP:\n")
+	_, _ = fmt.Fprintf(&b, "  Outbound UDP: %s\n", yesNo(report.UDP.Outbound))
+	_, _ = fmt.Fprintf(&b, "  STUN: %s\n", yesNo(report.UDP.STUN))
+	_, _ = fmt.Fprintf(&b, "  Public endpoint: %s\n", joinOrUnavailable(report.UDP.PublicEndpoints))
+	_, _ = fmt.Fprintf(&b, "  Mapping: %s\n", mappingText(report))
+	_, _ = fmt.Fprintf(&b, "  Port preservation: %s\n\n", yesNo(report.UDP.PortPreserving))
+	_, _ = fmt.Fprintf(&b, "Candidates:\n")
+	_, _ = fmt.Fprintf(&b, "  LAN: %s\n", joinOrNone(report.Candidates.LAN))
+	_, _ = fmt.Fprintf(&b, "  Overlay: %s\n", joinOrNone(report.Candidates.Overlay))
+	_, _ = fmt.Fprintf(&b, "  Public: %s\n\n", joinOrNone(report.Candidates.Public))
+	_, _ = fmt.Fprintf(&b, "Direct-connect readiness:\n")
+	_, _ = fmt.Fprintf(&b, "  %s\n", valueOrUnknown(report.Recommendation))
 	return b.String()
 }
 

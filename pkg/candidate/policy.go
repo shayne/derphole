@@ -116,14 +116,20 @@ func parseAddrPort(value string, valid func(netip.AddrPort) bool) (netip.AddrPor
 		return netip.AddrPort{}, false
 	}
 	ap, err := netip.ParseAddrPort(value)
-	if err != nil || ap.String() != value || !valid(ap) {
+	parsed := ap
+	ap = normalizeAddrPort(ap)
+	if err != nil || parsed.String() != value || !valid(ap) {
 		return netip.AddrPort{}, false
 	}
 	return ap, true
 }
 
+func normalizeAddrPort(ap netip.AddrPort) netip.AddrPort {
+	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+}
+
 func validPeerAddrPort(ap netip.AddrPort, p policy) bool {
-	addr := ap.Addr()
+	addr := ap.Addr().Unmap()
 	if addr.IsLoopback() && !p.allowLoopback {
 		return false
 	}
@@ -135,7 +141,7 @@ func validPeerAddrPort(ap netip.AddrPort, p policy) bool {
 }
 
 func validLocalAddrPort(ap netip.AddrPort) bool {
-	addr := ap.Addr()
+	addr := ap.Addr().Unmap()
 	return ap.Port() != 0 &&
 		addr.IsValid() &&
 		addr.Zone() == "" &&

@@ -43,69 +43,105 @@ func DiscoverCandidates(ctx context.Context, conn net.PacketConn) ([]net.Addr, e
 		return nil, errors.New("nil packet conn")
 	}
 
-	seen := make(map[string]net.Addr)
-	add := func(addr net.Addr) {
-		if addr == nil {
-			return
-		}
-		switch a := addr.(type) {
-		case *net.UDPAddr:
-			if ip, ok := netip.AddrFromSlice(a.IP); ok && (ip.IsUnspecified() || ip.IsMulticast()) {
-				return
-			}
-			cp := *a
-			if a.IP != nil {
-				cp.IP = append(net.IP(nil), a.IP...)
-			}
-			seen[cp.String()] = &cp
-		default:
-			seen[addr.String()] = addr
-		}
-	}
-
-	add(conn.LocalAddr())
-
-	if addrs, err := interfaceAddrs(); err == nil {
-		if localUDP, ok := conn.LocalAddr().(*net.UDPAddr); ok {
-			port := localUDP.Port
-			for _, raw := range addrs {
-				prefix, err := netip.ParsePrefix(raw.String())
-				if err != nil {
-					continue
-				}
-				ip := prefix.Addr()
-				if !ip.IsValid() || ip.IsUnspecified() || ip.IsMulticast() {
-					continue
-				}
-				add(&net.UDPAddr{
-					IP:   append(net.IP(nil), ip.AsSlice()...),
-					Port: port,
-					Zone: ip.Zone(),
-				})
-			}
-		}
-	}
+	seen := candidateSet{}
+	seen.add(conn.LocalAddr())
+	seen.addInterfaceAddrs(conn.LocalAddr())
 
 	discoveryCtx, cancel := context.WithTimeout(ctx, defaultDiscoveryTimeout)
 	defer cancel()
+	seen.addTraversalCandidates(discoveryCtx, conn)
 
-	if dm, err := fetchDERPMap(discoveryCtx, derpbind.PublicDERPMapURL); err == nil && dm != nil {
-		if raw, err := gatherTraversalPackets(discoveryCtx, conn, dm, nil); err == nil {
-			for _, candidate := range raw {
-				addr, err := net.ResolveUDPAddr("udp", candidate)
-				if err != nil {
-					continue
-				}
-				add(addr)
-			}
+	out := seen.addrs()
+	return preferredCandidates(out, len(out)), nil
+}
+
+type candidateSet map[string]net.Addr
+
+func (s candidateSet) add(addr net.Addr) {
+	if addr == nil {
+		return
+	}
+	if udpAddr, ok := addr.(*net.UDPAddr); ok {
+		s.addUDP(udpAddr)
+		return
+	}
+	s[addr.String()] = addr
+}
+
+func (s candidateSet) addUDP(addr *net.UDPAddr) {
+	if !candidateUDPAddrValid(addr) {
+		return
+	}
+	cp := *addr
+	if addr.IP != nil {
+		cp.IP = append(net.IP(nil), addr.IP...)
+	}
+	s[cp.String()] = &cp
+}
+
+func candidateUDPAddrValid(addr *net.UDPAddr) bool {
+	if addr == nil {
+		return false
+	}
+	ip, ok := netip.AddrFromSlice(addr.IP)
+	return !ok || (!ip.IsUnspecified() && !ip.IsMulticast())
+}
+
+func (s candidateSet) addInterfaceAddrs(local net.Addr) {
+	localUDP, ok := local.(*net.UDPAddr)
+	if !ok {
+		return
+	}
+	addrs, err := interfaceAddrs()
+	if err != nil {
+		return
+	}
+	for _, raw := range addrs {
+		if addr, ok := interfaceCandidate(raw, localUDP.Port); ok {
+			s.add(addr)
 		}
 	}
+}
 
-	out := make([]net.Addr, 0, len(seen))
-	for _, addr := range seen {
+func interfaceCandidate(raw net.Addr, port int) (*net.UDPAddr, bool) {
+	prefix, err := netip.ParsePrefix(raw.String())
+	if err != nil {
+		return nil, false
+	}
+	ip := prefix.Addr()
+	if !ip.IsValid() || ip.IsUnspecified() || ip.IsMulticast() {
+		return nil, false
+	}
+	return &net.UDPAddr{
+		IP:   append(net.IP(nil), ip.AsSlice()...),
+		Port: port,
+		Zone: ip.Zone(),
+	}, true
+}
+
+func (s candidateSet) addTraversalCandidates(ctx context.Context, conn net.PacketConn) {
+	dm, err := fetchDERPMap(ctx, derpbind.PublicDERPMapURL)
+	if err != nil || dm == nil {
+		return
+	}
+	raw, err := gatherTraversalPackets(ctx, conn, dm, nil)
+	if err != nil {
+		return
+	}
+	for _, candidate := range raw {
+		addr, err := net.ResolveUDPAddr("udp", candidate)
+		if err == nil {
+			s.add(addr)
+		}
+	}
+}
+
+func (s candidateSet) addrs() []net.Addr {
+	out := make([]net.Addr, 0, len(s))
+	for _, addr := range s {
 		out = append(out, addr)
 	}
-	return preferredCandidates(out, len(out)), nil
+	return out
 }
 
 func ParseCandidateStrings(raw []string) []net.Addr {
@@ -175,32 +211,47 @@ func preferredCandidates(raw []net.Addr, limit int) []net.Addr {
 }
 
 func candidateRank(addr net.Addr) (int, netip.Addr) {
-	udpAddr, ok := addr.(*net.UDPAddr)
+	ip, ok := candidateIP(addr)
 	if !ok {
 		return 100, netip.Addr{}
 	}
+	return candidateIPRank(ip), ip
+}
+
+func candidateIP(addr net.Addr) (netip.Addr, bool) {
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return netip.Addr{}, false
+	}
 	ip, ok := netip.AddrFromSlice(udpAddr.IP)
 	if !ok || !ip.IsValid() || ip.IsUnspecified() || ip.IsMulticast() {
-		return 100, netip.Addr{}
+		return netip.Addr{}, false
 	}
-	ip = ip.Unmap()
+	return ip.Unmap(), true
+}
+
+func candidateIPRank(ip netip.Addr) int {
 	switch {
 	case tailscaleV4Net.Contains(ip), tailscaleV6Net.Contains(ip):
-		return 70, ip
+		return 70
 	case ip.IsLoopback():
-		return 60, ip
+		return 60
 	case ip.IsLinkLocalUnicast():
-		return 50, ip
+		return 50
 	case ip.IsPrivate():
-		if ip.Is4() {
-			return 30, ip
-		}
-		return 35, ip
+		return privateCandidateRank(ip)
 	case ip.Is6():
-		return 20, ip
+		return 20
 	default:
-		return 10, ip
+		return 10
 	}
+}
+
+func privateCandidateRank(ip netip.Addr) int {
+	if ip.Is4() {
+		return 30
+	}
+	return 35
 }
 
 func PunchAddrs(ctx context.Context, conn net.PacketConn, addrs []net.Addr, payload []byte, interval time.Duration) {
@@ -263,66 +314,9 @@ func ObservePunchAddrsByConn(ctx context.Context, conns []net.PacketConn, wait t
 	observeCtx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
 
-	observed := make([][]net.Addr, len(conns))
-	expected := int32(0)
-	for _, conn := range conns {
-		if conn != nil {
-			expected++
-		}
-	}
-	if expected == 0 {
-		return observed
-	}
-	var observedConns atomic.Int32
-	var wg sync.WaitGroup
-	for i, conn := range conns {
-		if conn == nil {
-			continue
-		}
-		wg.Add(1)
-		go func(i int, conn net.PacketConn) {
-			defer wg.Done()
-			defer conn.SetReadDeadline(time.Time{})
-			buf := make([]byte, 1500)
-			seen := make(map[string]net.Addr)
-			for {
-				if err := observeCtx.Err(); err != nil {
-					observed[i] = mapAddrs(seen)
-					return
-				}
-				deadline := time.Now().Add(50 * time.Millisecond)
-				if ctxDeadline, ok := observeCtx.Deadline(); ok && ctxDeadline.Before(deadline) {
-					deadline = ctxDeadline
-				}
-				if err := conn.SetReadDeadline(deadline); err != nil {
-					observed[i] = mapAddrs(seen)
-					return
-				}
-				n, addr, err := conn.ReadFrom(buf)
-				if err != nil {
-					if observeCtx.Err() != nil {
-						observed[i] = mapAddrs(seen)
-						return
-					}
-					if isNetTimeout(err) {
-						continue
-					}
-					observed[i] = mapAddrs(seen)
-					return
-				}
-				if string(buf[:n]) != defaultPunchPayload {
-					continue
-				}
-				firstForConn := len(seen) == 0
-				seen[addr.String()] = cloneAddr(addr)
-				if firstForConn && observedConns.Add(1) >= expected {
-					cancel()
-				}
-			}
-		}(i, conn)
-	}
-	wg.Wait()
-	return observed
+	observer := newPunchObserver(observeCtx, cancel, conns)
+	observer.run(conns)
+	return observer.observed
 }
 
 func mapAddrs(seen map[string]net.Addr) []net.Addr {
@@ -331,6 +325,111 @@ func mapAddrs(seen map[string]net.Addr) []net.Addr {
 		out = append(out, addr)
 	}
 	return preferredCandidates(out, len(out))
+}
+
+type punchObserver struct {
+	ctx           context.Context
+	cancel        context.CancelFunc
+	observed      [][]net.Addr
+	expected      int32
+	observedConns atomic.Int32
+	wg            sync.WaitGroup
+}
+
+func newPunchObserver(ctx context.Context, cancel context.CancelFunc, conns []net.PacketConn) *punchObserver {
+	return &punchObserver{
+		ctx:      ctx,
+		cancel:   cancel,
+		observed: make([][]net.Addr, len(conns)),
+		expected: countPacketConns(conns),
+	}
+}
+
+func countPacketConns(conns []net.PacketConn) int32 {
+	count := int32(0)
+	for _, conn := range conns {
+		if conn != nil {
+			count++
+		}
+	}
+	return count
+}
+
+func (o *punchObserver) run(conns []net.PacketConn) {
+	if o.expected == 0 {
+		return
+	}
+	for i, conn := range conns {
+		o.start(i, conn)
+	}
+	o.wg.Wait()
+}
+
+func (o *punchObserver) start(i int, conn net.PacketConn) {
+	if conn == nil {
+		return
+	}
+	o.wg.Add(1)
+	go o.observeConn(i, conn)
+}
+
+func (o *punchObserver) observeConn(i int, conn net.PacketConn) {
+	defer o.wg.Done()
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+
+	buf := make([]byte, 1500)
+	seen := make(map[string]net.Addr)
+	for {
+		done, err := o.readPunch(conn, buf, seen)
+		if done || err != nil {
+			o.observed[i] = mapAddrs(seen)
+			return
+		}
+	}
+}
+
+func (o *punchObserver) readPunch(conn net.PacketConn, buf []byte, seen map[string]net.Addr) (bool, error) {
+	if err := o.ctx.Err(); err != nil {
+		return true, err
+	}
+	if err := conn.SetReadDeadline(o.nextReadDeadline()); err != nil {
+		return true, err
+	}
+	n, addr, err := conn.ReadFrom(buf)
+	if err != nil {
+		return o.handleReadError(err)
+	}
+	if string(buf[:n]) != defaultPunchPayload {
+		return false, nil
+	}
+	o.observeAddr(seen, addr)
+	return false, nil
+}
+
+func (o *punchObserver) nextReadDeadline() time.Time {
+	deadline := time.Now().Add(50 * time.Millisecond)
+	if ctxDeadline, ok := o.ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		return ctxDeadline
+	}
+	return deadline
+}
+
+func (o *punchObserver) handleReadError(err error) (bool, error) {
+	if o.ctx.Err() != nil {
+		return true, err
+	}
+	if isNetTimeout(err) {
+		return false, nil
+	}
+	return true, err
+}
+
+func (o *punchObserver) observeAddr(seen map[string]net.Addr, addr net.Addr) {
+	firstForConn := len(seen) == 0
+	seen[addr.String()] = cloneAddr(addr)
+	if firstForConn && o.observedConns.Add(1) >= o.expected {
+		o.cancel()
+	}
 }
 
 func PunchDirect(ctx context.Context, local net.PacketConn, remoteAddr string, remote net.PacketConn, localAddr string) (DirectResult, error) {

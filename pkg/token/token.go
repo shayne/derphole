@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
+	"io"
 	"net/netip"
 	"time"
 )
@@ -61,49 +62,16 @@ const (
 )
 
 func Encode(tok Token) (string, error) {
-	if tok.Version == 0 {
-		tok.Version = SupportedVersion
-	} else if tok.Version != legacyVersion && tok.Version != SupportedVersion {
+	var err error
+	tok.Version, err = encodeVersion(tok.Version)
+	if err != nil {
 		return "", ErrUnsupportedVersion
 	}
 
-	var payload bytes.Buffer
-	if err := binary.Write(&payload, binary.BigEndian, tok.Version); err != nil {
+	payload, err := encodePayload(tok)
+	if err != nil {
 		return "", err
 	}
-	if _, err := payload.Write(tok.SessionID[:]); err != nil {
-		return "", err
-	}
-	if err := binary.Write(&payload, binary.BigEndian, tok.ExpiresUnix); err != nil {
-		return "", err
-	}
-	if err := binary.Write(&payload, binary.BigEndian, tok.BootstrapRegion); err != nil {
-		return "", err
-	}
-	if _, err := payload.Write(tok.DERPPublic[:]); err != nil {
-		return "", err
-	}
-	if _, err := payload.Write(tok.QUICPublic[:]); err != nil {
-		return "", err
-	}
-	if _, err := payload.Write(tok.BearerSecret[:]); err != nil {
-		return "", err
-	}
-	if err := binary.Write(&payload, binary.BigEndian, tok.Capabilities); err != nil {
-		return "", err
-	}
-	if tok.Version >= SupportedVersion {
-		if err := binary.Write(&payload, binary.BigEndian, tok.bootstrapFamily); err != nil {
-			return "", err
-		}
-		if _, err := payload.Write(tok.bootstrapIP[:]); err != nil {
-			return "", err
-		}
-		if err := binary.Write(&payload, binary.BigEndian, tok.bootstrapPort); err != nil {
-			return "", err
-		}
-	}
-
 	sum := crc32.ChecksumIEEE(payload.Bytes())
 	if err := binary.Write(&payload, binary.BigEndian, sum); err != nil {
 		return "", err
@@ -112,77 +80,168 @@ func Encode(tok Token) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(payload.Bytes()), nil
 }
 
-func Decode(encoded string, now time.Time) (Token, error) {
-	var tok Token
+func encodeVersion(version uint8) (uint8, error) {
+	if version == 0 {
+		return SupportedVersion, nil
+	}
+	if version != legacyVersion && version != SupportedVersion {
+		return 0, ErrUnsupportedVersion
+	}
+	return version, nil
+}
 
-	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+type payloadWriter struct {
+	bytes.Buffer
+	err error
+}
+
+func encodePayload(tok Token) (bytes.Buffer, error) {
+	var payload payloadWriter
+	writeTokenFixedPayload(&payload, tok)
+	if tok.Version >= SupportedVersion {
+		writeTokenBootstrapPayload(&payload, tok)
+	}
+	return payload.Buffer, payload.err
+}
+
+func writeTokenFixedPayload(payload *payloadWriter, tok Token) {
+	payload.write(tok.Version)
+	payload.writeBytes(tok.SessionID[:])
+	payload.write(tok.ExpiresUnix)
+	payload.write(tok.BootstrapRegion)
+	payload.writeBytes(tok.DERPPublic[:])
+	payload.writeBytes(tok.QUICPublic[:])
+	payload.writeBytes(tok.BearerSecret[:])
+	payload.write(tok.Capabilities)
+}
+
+func writeTokenBootstrapPayload(payload *payloadWriter, tok Token) {
+	payload.write(tok.bootstrapFamily)
+	payload.writeBytes(tok.bootstrapIP[:])
+	payload.write(tok.bootstrapPort)
+}
+
+func (w *payloadWriter) write(value any) {
+	if w.err != nil {
+		return
+	}
+	w.err = binary.Write(&w.Buffer, binary.BigEndian, value)
+}
+
+func (w *payloadWriter) writeBytes(value []byte) {
+	if w.err != nil {
+		return
+	}
+	_, w.err = w.Write(value)
+}
+
+func Decode(encoded string, now time.Time) (Token, error) {
+	tok, payload, err := decodeEnvelope(encoded)
 	if err != nil {
 		return tok, err
 	}
-	if len(raw) < 1 {
-		return tok, ErrInvalidLength
-	}
-
-	tok.Version = raw[0]
-	if tok.Version != legacyVersion && tok.Version != SupportedVersion {
-		return tok, ErrUnsupportedVersion
-	}
-	wantLen := fixedPayloadSizeV3 + 4
-	if tok.Version >= SupportedVersion {
-		wantLen = fixedPayloadSizeV4 + 4
-	}
-	if len(raw) < wantLen {
-		return tok, ErrInvalidLength
-	}
-
-	payload := raw[:len(raw)-4]
-	checksum := binary.BigEndian.Uint32(raw[len(raw)-4:])
-	if got := crc32.ChecksumIEEE(payload); got != checksum {
-		return tok, ErrChecksum
-	}
-
-	r := bytes.NewReader(payload[1:])
-	if _, err := r.Read(tok.SessionID[:]); err != nil {
+	if err := decodePayload(&tok, payload); err != nil {
 		return tok, err
 	}
-	if err := binary.Read(r, binary.BigEndian, &tok.ExpiresUnix); err != nil {
-		return tok, err
-	}
-	if err := binary.Read(r, binary.BigEndian, &tok.BootstrapRegion); err != nil {
-		return tok, err
-	}
-	if _, err := r.Read(tok.DERPPublic[:]); err != nil {
-		return tok, err
-	}
-	if _, err := r.Read(tok.QUICPublic[:]); err != nil {
-		return tok, err
-	}
-	if _, err := r.Read(tok.BearerSecret[:]); err != nil {
-		return tok, err
-	}
-	if err := binary.Read(r, binary.BigEndian, &tok.Capabilities); err != nil {
-		return tok, err
-	}
-	if tok.Version >= SupportedVersion {
-		if err := binary.Read(r, binary.BigEndian, &tok.bootstrapFamily); err != nil {
-			return tok, err
-		}
-		if _, err := r.Read(tok.bootstrapIP[:]); err != nil {
-			return tok, err
-		}
-		if err := binary.Read(r, binary.BigEndian, &tok.bootstrapPort); err != nil {
-			return tok, err
-		}
-	}
-	if r.Len() != 0 {
-		return tok, ErrInvalidLength
-	}
-
-	if now.Unix() >= tok.ExpiresUnix {
+	if tokenExpired(tok, now) {
 		return tok, ErrExpired
 	}
 
 	return tok, nil
+}
+
+func decodeEnvelope(encoded string) (Token, []byte, error) {
+	var tok Token
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return tok, nil, err
+	}
+	if len(raw) < 1 {
+		return tok, nil, ErrInvalidLength
+	}
+	tok.Version = raw[0]
+	wantLen, ok := tokenWireSize(tok.Version)
+	if !ok {
+		return tok, nil, ErrUnsupportedVersion
+	}
+	if len(raw) < wantLen {
+		return tok, nil, ErrInvalidLength
+	}
+	payload := raw[:len(raw)-4]
+	checksum := binary.BigEndian.Uint32(raw[len(raw)-4:])
+	if got := crc32.ChecksumIEEE(payload); got != checksum {
+		return tok, nil, ErrChecksum
+	}
+	return tok, payload, nil
+}
+
+func tokenWireSize(version uint8) (int, bool) {
+	switch version {
+	case legacyVersion:
+		return fixedPayloadSizeV3 + 4, true
+	case SupportedVersion:
+		return fixedPayloadSizeV4 + 4, true
+	default:
+		return 0, false
+	}
+}
+
+type payloadReader struct {
+	*bytes.Reader
+	err error
+}
+
+func decodePayload(tok *Token, payload []byte) error {
+	reader := payloadReader{Reader: bytes.NewReader(payload[1:])}
+	readTokenFixedPayload(&reader, tok)
+	if tok.Version >= SupportedVersion {
+		readTokenBootstrapPayload(&reader, tok)
+	}
+	return reader.result()
+}
+
+func readTokenFixedPayload(reader *payloadReader, tok *Token) {
+	reader.readBytes(tok.SessionID[:])
+	reader.read(&tok.ExpiresUnix)
+	reader.read(&tok.BootstrapRegion)
+	reader.readBytes(tok.DERPPublic[:])
+	reader.readBytes(tok.QUICPublic[:])
+	reader.readBytes(tok.BearerSecret[:])
+	reader.read(&tok.Capabilities)
+}
+
+func readTokenBootstrapPayload(reader *payloadReader, tok *Token) {
+	reader.read(&tok.bootstrapFamily)
+	reader.readBytes(tok.bootstrapIP[:])
+	reader.read(&tok.bootstrapPort)
+}
+
+func (r *payloadReader) read(value any) {
+	if r.err != nil {
+		return
+	}
+	r.err = binary.Read(r.Reader, binary.BigEndian, value)
+}
+
+func (r *payloadReader) readBytes(value []byte) {
+	if r.err != nil {
+		return
+	}
+	_, r.err = io.ReadFull(r.Reader, value)
+}
+
+func (r *payloadReader) result() error {
+	if r.err != nil {
+		return r.err
+	}
+	if r.Len() != 0 {
+		return ErrInvalidLength
+	}
+	return nil
+}
+
+func tokenExpired(tok Token, now time.Time) bool {
+	return now.Unix() >= tok.ExpiresUnix
 }
 
 func (tok *Token) SetNativeTCPBootstrapAddr(addr netip.AddrPort) {

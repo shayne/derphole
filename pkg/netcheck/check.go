@@ -106,7 +106,7 @@ func chooseProbePort() int {
 	if err != nil {
 		return 0
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if udp, ok := conn.LocalAddr().(*net.UDPAddr); ok {
 		return udp.Port
 	}
@@ -115,16 +115,12 @@ func chooseProbePort() int {
 
 func defaultProbeSTUNServer(ctx context.Context, server string, localPort int) STUNServerResult {
 	result := STUNServerResult{Server: server}
-	address := "0.0.0.0:0"
-	if localPort > 0 {
-		address = net.JoinHostPort("0.0.0.0", strconv.Itoa(localPort))
-	}
-	conn, err := net.ListenPacket("udp4", address)
+	conn, err := listenSTUNProbe(localPort)
 	if err != nil {
 		result.Error = err.Error()
 		return result
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	result.LocalEndpoint = conn.LocalAddr().String()
 
 	serverAddr, err := net.ResolveUDPAddr("udp4", server)
@@ -138,36 +134,84 @@ func defaultProbeSTUNServer(ctx context.Context, server string, localPort int) S
 		return result
 	}
 
-	buf := make([]byte, 2048)
-	for {
-		if err := ctx.Err(); err != nil {
-			result.Error = err.Error()
-			return result
-		}
-		deadline := time.Now().Add(250 * time.Millisecond)
-		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
-			deadline = ctxDeadline
-		}
-		if err := conn.SetReadDeadline(deadline); err != nil {
-			result.Error = err.Error()
-			return result
-		}
-		n, _, err := conn.ReadFrom(buf)
-		if err != nil {
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
-				continue
-			}
-			result.Error = err.Error()
-			return result
-		}
-		gotTxID, mapped, err := stun.ParseResponse(buf[:n])
-		if err != nil || gotTxID != txID {
-			continue
-		}
-		result.MappedEndpoint = mapped.String()
+	mapped, err := readSTUNResponse(ctx, conn, txID)
+	if err != nil {
+		result.Error = err.Error()
 		return result
 	}
+	result.MappedEndpoint = mapped
+	return result
+}
+
+func listenSTUNProbe(localPort int) (net.PacketConn, error) {
+	return net.ListenPacket("udp4", stunListenAddress(localPort))
+}
+
+func stunListenAddress(localPort int) string {
+	if localPort <= 0 {
+		return "0.0.0.0:0"
+	}
+	return net.JoinHostPort("0.0.0.0", strconv.Itoa(localPort))
+}
+
+func readSTUNResponse(ctx context.Context, conn net.PacketConn, txID stun.TxID) (string, error) {
+	buf := make([]byte, 2048)
+	for {
+		mapped, done, err := readSTUNResponseOnce(ctx, conn, txID, buf)
+		if err != nil || done {
+			return mapped, err
+		}
+	}
+}
+
+func readSTUNResponseOnce(ctx context.Context, conn net.PacketConn, txID stun.TxID, buf []byte) (string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	packet, ok, err := readSTUNPacket(ctx, conn, buf)
+	if err != nil {
+		return "", false, err
+	}
+	if !ok {
+		return "", false, nil
+	}
+	mapped, ok := matchingSTUNResponse(packet, txID)
+	return mapped, ok, nil
+}
+
+func readSTUNPacket(ctx context.Context, conn net.PacketConn, buf []byte) ([]byte, bool, error) {
+	if err := conn.SetReadDeadline(stunReadDeadline(ctx, time.Now())); err != nil {
+		return nil, false, err
+	}
+	n, _, err := conn.ReadFrom(buf)
+	if err != nil {
+		if isTimeoutError(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return buf[:n], true, nil
+}
+
+func matchingSTUNResponse(packet []byte, txID stun.TxID) (string, bool) {
+	gotTxID, mapped, err := stun.ParseResponse(packet)
+	if err != nil || gotTxID != txID {
+		return "", false
+	}
+	return mapped.String(), true
+}
+
+func isTimeoutError(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func stunReadDeadline(ctx context.Context, now time.Time) time.Time {
+	deadline := now.Add(250 * time.Millisecond)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		return ctxDeadline
+	}
+	return deadline
 }
 
 func successfulSTUNResults(results []STUNServerResult) []STUNServerResult {
@@ -193,6 +237,13 @@ func mappingStable(results []STUNServerResult) bool {
 	if len(results) == 0 {
 		return false
 	}
+	if stable, ok := mappingStableForSharedLocalEndpoint(results); ok {
+		return stable
+	}
+	return allMappedEndpointsEqual(results)
+}
+
+func mappingStableForSharedLocalEndpoint(results []STUNServerResult) (bool, bool) {
 	groups := make(map[string][]string)
 	for _, result := range results {
 		if result.LocalEndpoint == "" || result.MappedEndpoint == "" {
@@ -204,17 +255,24 @@ func mappingStable(results []STUNServerResult) bool {
 		if len(endpoints) < 2 {
 			continue
 		}
-		first := endpoints[0]
-		for _, endpoint := range endpoints[1:] {
-			if endpoint != first {
-				return false
-			}
-		}
-		return true
+		return allStringsEqual(endpoints), true
 	}
+	return false, false
+}
+
+func allMappedEndpointsEqual(results []STUNServerResult) bool {
 	firstEndpoint := results[0].MappedEndpoint
 	for _, result := range results[1:] {
 		if result.MappedEndpoint != firstEndpoint {
+			return false
+		}
+	}
+	return true
+}
+
+func allStringsEqual(values []string) bool {
+	for _, value := range values[1:] {
+		if value != values[0] {
 			return false
 		}
 	}

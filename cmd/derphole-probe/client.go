@@ -37,64 +37,13 @@ type clientDone struct {
 
 func runClient(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || isRootHelpRequest(args) {
-		fmt.Fprint(stderr, subcommandUsageLine("client"))
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("client"))
 		return 0
 	}
 
-	parsed, err := yargs.ParseKnownFlags[clientFlags](args, yargs.KnownFlagsOptions{})
-	if err != nil {
-		fmt.Fprintln(stderr, err)
-		fmt.Fprint(stderr, subcommandUsageLine("client"))
-		return 2
-	}
-	if len(parsed.RemainingArgs) != 0 {
-		fmt.Fprint(stderr, subcommandUsageLine("client"))
-		return 2
-	}
-
-	mode := parsed.Flags.Mode
-	if mode == "" {
-		mode = "raw"
-	}
-	if mode == "aead" {
-		fmt.Fprintln(stderr, "aead not implemented yet")
-		fmt.Fprint(stderr, subcommandUsageLine("client"))
-		return 2
-	}
-	if mode != "raw" && mode != "blast" && mode != "wg" && mode != "wgos" {
-		fmt.Fprintln(stderr, "unsupported mode:", mode)
-		fmt.Fprint(stderr, subcommandUsageLine("client"))
-		return 2
-	}
-	transport, err := probe.NormalizeTransportForCLI(parsed.Flags.Transport)
-	if err != nil {
-		fmt.Fprintln(stderr, err)
-		fmt.Fprint(stderr, subcommandUsageLine("client"))
-		return 2
-	}
-	remoteAddr := strings.TrimSpace(parsed.Flags.Host)
-	var peerCandidateStrings []string
-	if raw := strings.TrimSpace(parsed.Flags.PeerCandidates); raw != "" {
-		for _, candidate := range strings.Split(raw, ",") {
-			candidate = strings.TrimSpace(candidate)
-			if candidate == "" {
-				continue
-			}
-			peerCandidateStrings = append(peerCandidateStrings, candidate)
-		}
-	}
-	peerCandidates := probe.ParseCandidateStrings(peerCandidateStrings)
-	if remoteAddr == "" && len(peerCandidates) > 0 {
-		remoteAddr = peerCandidates[0].String()
-	}
-	if remoteAddr == "" && mode != "wg" && mode != "wgos" {
-		fmt.Fprint(stderr, subcommandUsageLine("client"))
-		return 2
-	}
-	if parsed.Flags.SizeBytes < 0 {
-		fmt.Fprintln(stderr, "size bytes must be non-negative")
-		fmt.Fprint(stderr, subcommandUsageLine("client"))
-		return 2
+	cfg, code, failed := parseClientRunConfig(args, stderr)
+	if failed {
+		return code
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -102,21 +51,146 @@ func runClient(args []string, stdout, stderr io.Writer) int {
 	ctx, cancel := context.WithTimeout(ctx, clientTimeout)
 	defer cancel()
 
-	conns, err := openServerPacketConns(ctx, mode, ":0", parsed.Flags.Parallel)
+	conns, err := openServerPacketConns(ctx, cfg.mode, ":0", cfg.flags.Parallel)
 	if err != nil {
-		fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
 	defer closePacketConns(conns)
 	conn := conns[0]
 
+	candidates, err := clientDiscoverCandidates(ctx, conns)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if err := writeMachineLine(stdout, "READY", clientReady(conn, candidates, cfg.transport)); err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	punchCtx, punchCancel := context.WithCancel(ctx)
+	defer punchCancel()
+	for _, punchConn := range conns {
+		go probe.PunchAddrs(punchCtx, punchConn, cfg.peerCandidates, nil, 25*time.Millisecond)
+	}
+
+	stats, err := runClientTransfer(ctx, conn, conns, cfg)
+	punchCancel()
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	done := buildClientDone(stats)
+	if err := writeMachineLine(stdout, "DONE", done); err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	_ = stdout
+	return 0
+}
+
+type clientRunConfig struct {
+	flags          clientFlags
+	mode           string
+	transport      string
+	remoteAddr     string
+	peerCandidates []net.Addr
+}
+
+func parseClientRunConfig(args []string, stderr io.Writer) (clientRunConfig, int, bool) {
+	parsed, err := yargs.ParseKnownFlags[clientFlags](args, yargs.KnownFlagsOptions{})
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("client"))
+		return clientRunConfig{}, 2, true
+	}
+	if len(parsed.RemainingArgs) != 0 {
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("client"))
+		return clientRunConfig{}, 2, true
+	}
+
+	mode := parsed.Flags.Mode
+	if mode == "" {
+		mode = "raw"
+	}
+	if code, failed := validateClientMode(mode, stderr); failed {
+		return clientRunConfig{}, code, true
+	}
+	transport, err := probe.NormalizeTransportForCLI(parsed.Flags.Transport)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("client"))
+		return clientRunConfig{}, 2, true
+	}
+	remoteAddr := strings.TrimSpace(parsed.Flags.Host)
+	peerCandidates := probe.ParseCandidateStrings(splitCSVFlag(parsed.Flags.PeerCandidates))
+	if remoteAddr == "" && len(peerCandidates) > 0 {
+		remoteAddr = peerCandidates[0].String()
+	}
+	if code, failed := validateClientTarget(mode, remoteAddr, parsed.Flags.SizeBytes, stderr); failed {
+		return clientRunConfig{}, code, true
+	}
+	return clientRunConfig{
+		flags:          parsed.Flags,
+		mode:           mode,
+		transport:      transport,
+		remoteAddr:     remoteAddr,
+		peerCandidates: peerCandidates,
+	}, 0, false
+}
+
+func validateClientMode(mode string, stderr io.Writer) (int, bool) {
+	if mode == "aead" {
+		_, _ = fmt.Fprintln(stderr, "aead not implemented yet")
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("client"))
+		return 2, true
+	}
+	if mode != "raw" && mode != "blast" && mode != "wg" && mode != "wgos" {
+		_, _ = fmt.Fprintln(stderr, "unsupported mode:", mode)
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("client"))
+		return 2, true
+	}
+	return 0, false
+}
+
+func validateClientTarget(mode string, remoteAddr string, sizeBytes int64, stderr io.Writer) (int, bool) {
+	if remoteAddr == "" && mode != "wg" && mode != "wgos" {
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("client"))
+		return 2, true
+	}
+	if sizeBytes < 0 {
+		_, _ = fmt.Fprintln(stderr, "size bytes must be non-negative")
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("client"))
+		return 2, true
+	}
+	return 0, false
+}
+
+func splitCSVFlag(raw string) []string {
+	var out []string
+	for _, item := range strings.Split(strings.TrimSpace(raw), ",") {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func clientDiscoverCandidates(ctx context.Context, conns []net.PacketConn) ([]net.Addr, error) {
 	discoverCtx, cancelDiscover := context.WithTimeout(ctx, 750*time.Millisecond)
 	candidates, discoverErr := discoverServerCandidates(discoverCtx, conns)
 	cancelDiscover()
 	if discoverErr != nil && len(candidates) == 0 {
-		fmt.Fprintln(stderr, discoverErr)
-		return 1
+		return nil, discoverErr
 	}
+	return candidates, nil
+}
+
+func clientReady(conn net.PacketConn, candidates []net.Addr, transport string) serverReady {
 	ready := serverReady{
 		Addr:       conn.LocalAddr().String(),
 		Candidates: probe.CandidateStringsInOrder(candidates),
@@ -125,80 +199,61 @@ func runClient(args []string, stdout, stderr io.Writer) int {
 	if len(ready.Candidates) == 0 && ready.Addr != "" {
 		ready.Candidates = []string{ready.Addr}
 	}
-	if err := writeMachineLine(stdout, "READY", ready); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
-	}
+	return ready
+}
 
-	punchCtx, punchCancel := context.WithCancel(ctx)
-	defer punchCancel()
-	for _, punchConn := range conns {
-		go probe.PunchAddrs(punchCtx, punchConn, peerCandidates, nil, 25*time.Millisecond)
-	}
-
-	src := sizedReader(parsed.Flags.SizeBytes)
+func runClientTransfer(ctx context.Context, conn net.PacketConn, conns []net.PacketConn, cfg clientRunConfig) (probe.TransferStats, error) {
+	src := sizedReader(cfg.flags.SizeBytes)
 	var stats probe.TransferStats
-	if mode == "wg" {
+	var err error
+	if cfg.mode == "wg" {
 		stats, err = probeSendWireGuard(ctx, conn, &src, probe.WireGuardConfig{
-			Transport:      transport,
-			PrivateKeyHex:  parsed.Flags.WGPrivateKey,
-			PeerPublicHex:  parsed.Flags.WGPeerPublic,
-			LocalAddr:      parsed.Flags.WGLocalAddr,
-			PeerAddr:       parsed.Flags.WGPeerAddr,
-			DirectEndpoint: remoteAddr,
-			PeerCandidates: peerCandidates,
-			Port:           uint16(parsed.Flags.WGPort),
-			Streams:        parsed.Flags.Parallel,
-			SizeBytes:      parsed.Flags.SizeBytes,
+			Transport:      cfg.transport,
+			PrivateKeyHex:  cfg.flags.WGPrivateKey,
+			PeerPublicHex:  cfg.flags.WGPeerPublic,
+			LocalAddr:      cfg.flags.WGLocalAddr,
+			PeerAddr:       cfg.flags.WGPeerAddr,
+			DirectEndpoint: cfg.remoteAddr,
+			PeerCandidates: cfg.peerCandidates,
+			Port:           uint16(cfg.flags.WGPort),
+			Streams:        cfg.flags.Parallel,
+			SizeBytes:      cfg.flags.SizeBytes,
 		})
-	} else if mode == "wgos" {
+	} else if cfg.mode == "wgos" {
 		stats, err = probeSendWireGuardOS(ctx, conn, &src, probe.WireGuardConfig{
-			Transport:      transport,
-			PrivateKeyHex:  parsed.Flags.WGPrivateKey,
-			PeerPublicHex:  parsed.Flags.WGPeerPublic,
-			LocalAddr:      parsed.Flags.WGLocalAddr,
-			PeerAddr:       parsed.Flags.WGPeerAddr,
-			DirectEndpoint: remoteAddr,
-			PeerCandidates: peerCandidates,
-			Port:           uint16(parsed.Flags.WGPort),
-			Streams:        parsed.Flags.Parallel,
-			SizeBytes:      parsed.Flags.SizeBytes,
+			Transport:      cfg.transport,
+			PrivateKeyHex:  cfg.flags.WGPrivateKey,
+			PeerPublicHex:  cfg.flags.WGPeerPublic,
+			LocalAddr:      cfg.flags.WGLocalAddr,
+			PeerAddr:       cfg.flags.WGPeerAddr,
+			DirectEndpoint: cfg.remoteAddr,
+			PeerCandidates: cfg.peerCandidates,
+			Port:           uint16(cfg.flags.WGPort),
+			Streams:        cfg.flags.Parallel,
+			SizeBytes:      cfg.flags.SizeBytes,
 		})
-	} else if mode == "blast" && len(conns) > 1 {
-		stats, err = sendBlastParallelClient(ctx, conns, remoteAddr, peerCandidates, parsed.Flags.SizeBytes, probe.SendConfig{
+	} else if cfg.mode == "blast" && len(conns) > 1 {
+		stats, err = sendBlastParallelClient(ctx, conns, cfg.remoteAddr, cfg.peerCandidates, cfg.flags.SizeBytes, probe.SendConfig{
 			Blast:          true,
-			Transport:      transport,
-			ChunkSize:      parsed.Flags.ChunkSize,
-			WindowSize:     parsed.Flags.WindowSize,
-			RateMbps:       parsed.Flags.RateMbps,
+			Transport:      cfg.transport,
+			ChunkSize:      cfg.flags.ChunkSize,
+			WindowSize:     cfg.flags.WindowSize,
+			RateMbps:       cfg.flags.RateMbps,
 			RepairPayloads: probeEnvBool("DERPHOLE_PROBE_REPAIR_PAYLOADS"),
 		})
 	} else {
-		stats, err = probeSend(ctx, conn, remoteAddr, &src, probe.SendConfig{
-			Raw:            mode == "raw",
-			Blast:          mode == "blast",
-			Transport:      transport,
-			ChunkSize:      parsed.Flags.ChunkSize,
-			WindowSize:     parsed.Flags.WindowSize,
-			Parallel:       parsed.Flags.Parallel,
-			RateMbps:       parsed.Flags.RateMbps,
+		stats, err = probeSend(ctx, conn, cfg.remoteAddr, &src, probe.SendConfig{
+			Raw:            cfg.mode == "raw",
+			Blast:          cfg.mode == "blast",
+			Transport:      cfg.transport,
+			ChunkSize:      cfg.flags.ChunkSize,
+			WindowSize:     cfg.flags.WindowSize,
+			Parallel:       cfg.flags.Parallel,
+			RateMbps:       cfg.flags.RateMbps,
 			RepairPayloads: probeEnvBool("DERPHOLE_PROBE_REPAIR_PAYLOADS"),
 		})
 	}
-	punchCancel()
-	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
-	}
-
-	done := buildClientDone(stats)
-	if err := writeMachineLine(stdout, "DONE", done); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
-	}
-
-	_ = stdout
-	return 0
+	return stats, err
 }
 
 func buildClientDone(stats probe.TransferStats) clientDone {
@@ -281,34 +336,42 @@ func selectClientRemoteAddrsByConn(observedByConn [][]net.Addr, fallback []strin
 	out := make([]string, parallel)
 	seen := make(map[string]bool)
 	seenEndpoint := make(map[string]bool)
-	for i := 0; i < parallel && i < len(observedByConn); i++ {
-		for _, candidate := range probe.CandidateStrings(observedByConn[i]) {
-			endpoint := clientRemoteCandidateEndpointKey(candidate)
-			if candidate == "" || seen[candidate] || seenEndpoint[endpoint] {
-				continue
-			}
-			out[i] = candidate
-			seen[candidate] = true
-			seenEndpoint[endpoint] = true
-			break
-		}
+	fillObservedClientRemoteAddrs(out, observedByConn, seen, seenEndpoint)
+	fillFallbackClientRemoteAddrs(out, fallback, seen, seenEndpoint)
+	return out
+}
+
+func fillObservedClientRemoteAddrs(out []string, observedByConn [][]net.Addr, seen map[string]bool, seenEndpoint map[string]bool) {
+	limit := len(out)
+	if len(observedByConn) < limit {
+		limit = len(observedByConn)
 	}
+	for i := 0; i < limit; i++ {
+		_ = trySelectClientRemoteCandidate(&out[i], probe.CandidateStrings(observedByConn[i]), seen, seenEndpoint)
+	}
+}
+
+func fillFallbackClientRemoteAddrs(out []string, fallback []string, seen map[string]bool, seenEndpoint map[string]bool) {
 	for i := range out {
 		if out[i] != "" {
 			continue
 		}
-		for _, candidate := range fallback {
-			endpoint := clientRemoteCandidateEndpointKey(candidate)
-			if candidate == "" || seen[candidate] || seenEndpoint[endpoint] {
-				continue
-			}
-			out[i] = candidate
-			seen[out[i]] = true
-			seenEndpoint[endpoint] = true
-			break
-		}
+		_ = trySelectClientRemoteCandidate(&out[i], fallback, seen, seenEndpoint)
 	}
-	return out
+}
+
+func trySelectClientRemoteCandidate(dst *string, candidates []string, seen map[string]bool, seenEndpoint map[string]bool) bool {
+	for _, candidate := range candidates {
+		endpoint := clientRemoteCandidateEndpointKey(candidate)
+		if candidate == "" || seen[candidate] || seenEndpoint[endpoint] {
+			continue
+		}
+		*dst = candidate
+		seen[candidate] = true
+		seenEndpoint[endpoint] = true
+		return true
+	}
+	return false
 }
 
 func clientRemoteCandidateEndpointKey(candidate string) string {
@@ -407,7 +470,7 @@ func probeTracef(format string, args ...any) {
 	if strings.TrimSpace(os.Getenv("DERPHOLE_PROBE_TRACE")) == "" {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "probe-trace: "+format+"\n", args...)
+	_, _ = fmt.Fprintf(os.Stderr, "probe-trace: "+format+"\n", args...)
 }
 
 type clientFlags struct {

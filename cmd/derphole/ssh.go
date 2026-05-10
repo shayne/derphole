@@ -88,7 +88,7 @@ func runSSH(args []string, level telemetry.Level, stdin io.Reader, stdout, stder
 	_ = stdout
 
 	if len(args) == 0 || isRootHelpRequest(args) {
-		fmt.Fprint(stderr, sshHelpText())
+		_, _ = fmt.Fprint(stderr, sshHelpText())
 		return 0
 	}
 
@@ -98,8 +98,8 @@ func runSSH(args []string, level telemetry.Level, stdin io.Reader, stdout, stder
 	case "accept":
 		return runSSHAccept(args[1:], level, stdin, stderr)
 	default:
-		fmt.Fprintf(stderr, "unknown ssh command: %s\n", args[0])
-		fmt.Fprint(stderr, sshHelpText())
+		_, _ = fmt.Fprintf(stderr, "unknown ssh command: %s\n", args[0])
+		_, _ = fmt.Fprint(stderr, sshHelpText())
 		return 2
 	}
 }
@@ -112,20 +112,20 @@ func runSSHInvite(args []string, level telemetry.Level, stdin io.Reader, stderr 
 		switch {
 		case errors.Is(err, yargs.ErrHelp), errors.Is(err, yargs.ErrSubCommandHelp), errors.Is(err, yargs.ErrHelpLLM):
 			if parsed != nil && parsed.HelpText != "" {
-				fmt.Fprint(stderr, parsed.HelpText)
+				_, _ = fmt.Fprint(stderr, parsed.HelpText)
 			} else {
-				fmt.Fprint(stderr, sshInviteHelpText())
+				_, _ = fmt.Fprint(stderr, sshInviteHelpText())
 			}
 			return 0
 		default:
-			fmt.Fprintln(stderr, err)
-			fmt.Fprint(stderr, sshInviteHelpText())
+			_, _ = fmt.Fprintln(stderr, err)
+			_, _ = fmt.Fprint(stderr, sshInviteHelpText())
 			return 2
 		}
 	}
 
 	if len(parsed.Parser.Args) > 1 || len(parsed.RemainingArgs) != 0 {
-		fmt.Fprint(stderr, sshInviteHelpText())
+		_, _ = fmt.Fprint(stderr, sshInviteHelpText())
 		return 2
 	}
 
@@ -138,7 +138,7 @@ func runSSHInvite(args []string, level telemetry.Level, stdin io.Reader, stderr 
 		UsePublicDERP: usePublicDERPTransport(),
 		ForceRelay:    parsed.SubCommandFlags.ForceRelay,
 	}); err != nil {
-		fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
 	return 0
@@ -150,24 +150,24 @@ func runSSHAccept(args []string, level telemetry.Level, stdin io.Reader, stderr 
 		switch {
 		case errors.Is(err, yargs.ErrHelp), errors.Is(err, yargs.ErrSubCommandHelp), errors.Is(err, yargs.ErrHelpLLM):
 			if parsed != nil && parsed.HelpText != "" {
-				fmt.Fprint(stderr, parsed.HelpText)
+				_, _ = fmt.Fprint(stderr, parsed.HelpText)
 			} else {
-				fmt.Fprint(stderr, sshAcceptHelpText())
+				_, _ = fmt.Fprint(stderr, sshAcceptHelpText())
 			}
 			return 0
 		default:
-			fmt.Fprintln(stderr, err)
-			fmt.Fprint(stderr, sshAcceptHelpText())
+			_, _ = fmt.Fprintln(stderr, err)
+			_, _ = fmt.Fprint(stderr, sshAcceptHelpText())
 			return 2
 		}
 	}
 
 	if len(parsed.Parser.Args) > 1 || len(parsed.RemainingArgs) != 0 {
-		fmt.Fprint(stderr, sshAcceptHelpText())
+		_, _ = fmt.Fprint(stderr, sshAcceptHelpText())
 		return 2
 	}
 	if parsed.Args.Token == "" {
-		fmt.Fprint(stderr, sshAcceptHelpText())
+		_, _ = fmt.Fprint(stderr, sshAcceptHelpText())
 		return 2
 	}
 
@@ -182,7 +182,7 @@ func runSSHAccept(args []string, level telemetry.Level, stdin io.Reader, stderr 
 		UsePublicDERP: usePublicDERPTransport(),
 		ForceRelay:    parsed.SubCommandFlags.ForceRelay,
 	}); err != nil {
-		fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
 	return 0
@@ -218,10 +218,10 @@ func executeSSHInviteCommand(ctx context.Context, cfg sshInviteCommandConfig) er
 	if err != nil {
 		return err
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
-	fmt.Fprintln(cfg.Stderr, "On the other machine, run:")
-	fmt.Fprintf(cfg.Stderr, "derphole ssh accept %s\n", listener.Token)
+	_, _ = fmt.Fprintln(cfg.Stderr, "On the other machine, run:")
+	_, _ = fmt.Fprintf(cfg.Stderr, "derphole ssh accept %s\n", listener.Token)
 
 	if err := pkgssh.Invite(ctx, pkgssh.InviteConfig{
 		Listener:       listener,
@@ -230,7 +230,7 @@ func executeSSHInviteCommand(ctx context.Context, cfg sshInviteCommandConfig) er
 		return err
 	}
 
-	fmt.Fprintf(cfg.Stderr, "Appended SSH public key to %s\n", authPath)
+	_, _ = fmt.Fprintf(cfg.Stderr, "Appended SSH public key to %s\n", authPath)
 	return nil
 }
 
@@ -240,15 +240,9 @@ func executeSSHAcceptCommand(ctx context.Context, cfg sshAcceptCommandConfig) er
 		return err
 	}
 
-	fmt.Fprintf(cfg.Stderr, "Sending public key type='%s' keyid='%s'\n", kind, keyID)
-	if !cfg.Yes {
-		ok, err := confirmSSHSend(cfg.Stdin, cfg.Stderr, keyID)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return errors.New("aborted")
-		}
+	_, _ = fmt.Fprintf(cfg.Stderr, "Sending public key type='%s' keyid='%s'\n", kind, keyID)
+	if err := confirmSSHAccept(cfg, keyID); err != nil {
+		return err
 	}
 
 	if err := pkgssh.Accept(ctx, pkgssh.AcceptConfig{
@@ -260,7 +254,21 @@ func executeSSHAcceptCommand(ctx context.Context, cfg sshAcceptCommandConfig) er
 		return err
 	}
 
-	fmt.Fprintln(cfg.Stderr, "Public key sent.")
+	_, _ = fmt.Fprintln(cfg.Stderr, "Public key sent.")
+	return nil
+}
+
+func confirmSSHAccept(cfg sshAcceptCommandConfig, keyID string) error {
+	if cfg.Yes {
+		return nil
+	}
+	ok, err := confirmSSHSend(cfg.Stdin, cfg.Stderr, keyID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("aborted")
+	}
 	return nil
 }
 
@@ -268,7 +276,7 @@ func confirmSSHSend(stdin io.Reader, stderr io.Writer, keyID string) (bool, erro
 	if stdin == nil {
 		return false, errors.New("confirmation required; rerun with --yes")
 	}
-	fmt.Fprintf(stderr, "Really send public key %q? [y/N] ", keyID)
+	_, _ = fmt.Fprintf(stderr, "Really send public key %q? [y/N] ", keyID)
 	line, err := bufio.NewReader(stdin).ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return false, err

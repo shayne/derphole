@@ -35,7 +35,7 @@ func Invite(ctx context.Context, cfg InviteConfig) error {
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if err := protocol.WriteHeader(conn, protocol.Header{
 		Version: 1,
@@ -69,7 +69,7 @@ func Accept(ctx context.Context, cfg AcceptConfig) error {
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	reader := bufio.NewReader(conn)
 	hdr, err := protocol.ReadHeader(reader)

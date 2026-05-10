@@ -33,7 +33,21 @@ func main() {
 }
 
 func run(addr, addrFile, shellOpenedFile, inputLogFile, username, password, marker string) error {
-	config := &ssh.ServerConfig{
+	config := sshFixtureServerConfig(username, password)
+	if err := addEphemeralHostKey(config); err != nil {
+		return err
+	}
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = listener.Close() }()
+
+	return serveSSHFixture(listener, config, addrFile, shellOpenedFile, inputLogFile, marker)
+}
+
+func sshFixtureServerConfig(username, password string) *ssh.ServerConfig {
+	return &ssh.ServerConfig{
 		PasswordCallback: func(conn ssh.ConnMetadata, supplied []byte) (*ssh.Permissions, error) {
 			if conn.User() == username && string(supplied) == password {
 				return nil, nil
@@ -41,24 +55,12 @@ func run(addr, addrFile, shellOpenedFile, inputLogFile, username, password, mark
 			return nil, fmt.Errorf("invalid credentials for %s", conn.User())
 		},
 	}
-	if err := addEphemeralHostKey(config); err != nil {
+}
+
+func serveSSHFixture(listener net.Listener, config *ssh.ServerConfig, addrFile, shellOpenedFile, inputLogFile, marker string) error {
+	if err := writeSSHFixtureAddr(listener.Addr().String(), addrFile); err != nil {
 		return err
 	}
-
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
-	}
-	defer listener.Close()
-
-	boundAddr := listener.Addr().String()
-	if addrFile != "" {
-		if err := os.WriteFile(addrFile, []byte(boundAddr+"\n"), 0o600); err != nil {
-			return err
-		}
-	}
-	fmt.Printf("addr: %s\n", boundAddr)
-
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -66,6 +68,16 @@ func run(addr, addrFile, shellOpenedFile, inputLogFile, username, password, mark
 		}
 		go handleConn(conn, config, shellOpenedFile, inputLogFile, marker)
 	}
+}
+
+func writeSSHFixtureAddr(boundAddr, addrFile string) error {
+	if addrFile != "" {
+		if err := os.WriteFile(addrFile, []byte(boundAddr+"\n"), 0o600); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("addr: %s\n", boundAddr)
+	return nil
 }
 
 func addEphemeralHostKey(config *ssh.ServerConfig) error {
@@ -87,7 +99,7 @@ func handleConn(conn net.Conn, config *ssh.ServerConfig, shellOpenedFile, inputL
 		_ = conn.Close()
 		return
 	}
-	defer serverConn.Close()
+	defer func() { _ = serverConn.Close() }()
 	go ssh.DiscardRequests(requests)
 
 	for newChannel := range channels {
@@ -104,7 +116,7 @@ func handleConn(conn net.Conn, config *ssh.ServerConfig, shellOpenedFile, inputL
 }
 
 func handleSessionChannel(channel ssh.Channel, requests <-chan *ssh.Request, shellOpenedFile, inputLogFile, marker string) {
-	defer channel.Close()
+	defer func() { _ = channel.Close() }()
 	for request := range requests {
 		switch request.Type {
 		case "pty-req":

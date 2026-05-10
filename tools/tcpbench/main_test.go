@@ -25,6 +25,35 @@ func TestRunRejectsInvalidArgs(t *testing.T) {
 	if err := run([]string{"send", "127.0.0.1:1"}, &bytes.Buffer{}); err == nil {
 		t.Fatal("run() error = nil, want usage error")
 	}
+	if err := run([]string{"unknown", "127.0.0.1:1"}, &bytes.Buffer{}); err == nil {
+		t.Fatal("run(unknown) error = nil, want usage error")
+	}
+	if _, err := parseAddrOnly(nil); err == nil {
+		t.Fatal("parseAddrOnly(nil) error = nil, want usage error")
+	}
+	if _, _, err := parseAddrAndBytes([]string{"127.0.0.1:1", "-1"}); err == nil {
+		t.Fatal("parseAddrAndBytes(negative) error = nil, want usage error")
+	}
+}
+
+func TestCommandWrappersRejectInvalidArgs(t *testing.T) {
+	t.Parallel()
+
+	for name, fn := range map[string]benchCommand{
+		"send-stdin":        runSendStdinCommand,
+		"recv":              runRecvCommand,
+		"listen-send":       runListenSendCommand,
+		"listen-send-stdin": runListenSendStdinCommand,
+		"send-tls":          runSendTLSCommand,
+		"listen-tls":        runListenTLSCommand,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := fn(nil); err == nil {
+				t.Fatalf("%s(nil) error = nil, want usage error", name)
+			}
+		})
+	}
 }
 
 func TestSendFromReaderWritesAllBytes(t *testing.T) {
@@ -63,6 +92,44 @@ func TestSendFromReaderWritesAllBytes(t *testing.T) {
 	}
 	if got := <-gotCh; got != len("hello world") {
 		t.Fatalf("server bytes = %d, want %d", got, len("hello world"))
+	}
+}
+
+func TestRunSendPrintsTransferMetrics(t *testing.T) {
+	t.Parallel()
+
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer ln.Close()
+
+	received := make(chan int64, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+		n, err := io.Copy(io.Discard, conn)
+		received <- n
+		errCh <- err
+	}()
+
+	var stdout bytes.Buffer
+	if err := run([]string{"send", ln.Addr().String(), "17"}, &stdout); err != nil {
+		t.Fatalf("run(send) error = %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("server copy error = %v", err)
+	}
+	if n := <-received; n != 17 {
+		t.Fatalf("server bytes = %d, want 17", n)
+	}
+	if !bytes.Contains(stdout.Bytes(), []byte("bytes=17 ")) {
+		t.Fatalf("run(send) output = %q, want bytes=17", stdout.String())
 	}
 }
 
@@ -110,6 +177,38 @@ func TestSendTLSWritesAllBytes(t *testing.T) {
 	}
 	if got := <-gotCh; got != int64(len("hello tls")) {
 		t.Fatalf("server bytes = %d, want %d", got, len("hello tls"))
+	}
+}
+
+func TestListenTLSReceivesPayload(t *testing.T) {
+	t.Parallel()
+
+	addr := reserveTCP4Address(t)
+	done := make(chan struct {
+		n   int64
+		err error
+		out string
+	}, 1)
+	go func() {
+		var got bytes.Buffer
+		n, err := listenTLS(addr, &got)
+		done <- struct {
+			n   int64
+			err error
+			out string
+		}{n: n, err: err, out: got.String()}
+	}()
+
+	n := sendTLSWhenReady(t, addr, []byte("hello listener tls"))
+	if n != int64(len("hello listener tls")) {
+		t.Fatalf("sendTLS() = %d, want %d", n, len("hello listener tls"))
+	}
+	result := <-done
+	if result.err != nil {
+		t.Fatalf("listenTLS() error = %v", result.err)
+	}
+	if result.n != int64(len("hello listener tls")) || result.out != "hello listener tls" {
+		t.Fatalf("listenTLS() = %d %q, want payload", result.n, result.out)
 	}
 }
 
@@ -228,14 +327,7 @@ func TestRunRecvDiscardPrintsTransferMetrics(t *testing.T) {
 func TestListenAndSendWritesAllBytes(t *testing.T) {
 	t.Parallel()
 
-	probe, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen() error = %v", err)
-	}
-	addr := probe.Addr().String()
-	if err := probe.Close(); err != nil {
-		t.Fatalf("Close() error = %v", err)
-	}
+	addr := reserveTCP4Address(t)
 
 	sendDone := make(chan struct {
 		n   int64
@@ -249,18 +341,7 @@ func TestListenAndSendWritesAllBytes(t *testing.T) {
 		}{n: n, err: err}
 	}()
 
-	var conn net.Conn
-	deadline := time.Now().Add(time.Second)
-	for {
-		conn, err = net.Dial("tcp4", addr)
-		if err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("Dial() error = %v", err)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	conn := waitForTCP4(t, addr)
 	defer conn.Close()
 
 	payload, err := io.ReadAll(conn)
@@ -282,14 +363,7 @@ func TestListenAndSendWritesAllBytes(t *testing.T) {
 func TestListenAndSendFromReaderWritesAllBytes(t *testing.T) {
 	t.Parallel()
 
-	probe, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen() error = %v", err)
-	}
-	addr := probe.Addr().String()
-	if err := probe.Close(); err != nil {
-		t.Fatalf("Close() error = %v", err)
-	}
+	addr := reserveTCP4Address(t)
 
 	sendDone := make(chan struct {
 		n   int64
@@ -303,18 +377,7 @@ func TestListenAndSendFromReaderWritesAllBytes(t *testing.T) {
 		}{n: n, err: err}
 	}()
 
-	var conn net.Conn
-	deadline := time.Now().Add(time.Second)
-	for {
-		conn, err = net.Dial("tcp4", addr)
-		if err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("Dial() error = %v", err)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	conn := waitForTCP4(t, addr)
 	defer conn.Close()
 
 	payload, err := io.ReadAll(conn)
@@ -330,6 +393,54 @@ func TestListenAndSendFromReaderWritesAllBytes(t *testing.T) {
 	}
 	if string(payload) != "hello listen-send-stdin" {
 		t.Fatalf("received payload = %q, want %q", string(payload), "hello listen-send-stdin")
+	}
+}
+
+func reserveTCP4Address(t *testing.T) string {
+	t.Helper()
+
+	probe, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	addr := probe.Addr().String()
+	if err := probe.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	return addr
+}
+
+func waitForTCP4(t *testing.T, addr string) net.Conn {
+	t.Helper()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		conn, err := net.Dial("tcp4", addr)
+		if err == nil {
+			return conn
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Dial() error = %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func sendTLSWhenReady(t *testing.T, addr string, payload []byte) int64 {
+	t.Helper()
+
+	deadline := time.Now().Add(time.Second)
+	var lastErr error
+	for {
+		n, err := sendTLS(addr, bytes.NewReader(payload))
+		if err == nil {
+			return n
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			t.Fatalf("sendTLS() error = %v", lastErr)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

@@ -6055,8 +6055,12 @@ func TestBlastParallelSendLaneCopyPayloadUsesWarmPool(t *testing.T) {
 		buf := lane.copyPayload(payload)
 		lane.releasePayload(buf)
 	})
-	if allocs >= 2 {
-		t.Fatalf("copyPayload warm-pool allocations = %.2f, want fewer than 2", allocs)
+	maxAllocs := 2.0
+	if raceDetectorEnabled {
+		maxAllocs = 3.0
+	}
+	if allocs >= maxAllocs {
+		t.Fatalf("copyPayload warm-pool allocations = %.2f, want fewer than %.0f", allocs, maxAllocs)
 	}
 }
 

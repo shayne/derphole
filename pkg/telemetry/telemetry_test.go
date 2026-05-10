@@ -6,6 +6,7 @@ package telemetry
 
 import (
 	"bytes"
+	"io"
 	"testing"
 )
 
@@ -61,5 +62,18 @@ func TestEmitterOutputByLevel(t *testing.T) {
 				t.Fatal("output empty, want text")
 			}
 		})
+	}
+}
+
+func TestEmitterDebugEnabled(t *testing.T) {
+	var nilEmitter *Emitter
+	if nilEmitter.DebugEnabled() {
+		t.Fatal("nil DebugEnabled() = true, want false")
+	}
+	if !New(io.Discard, LevelVerbose).DebugEnabled() {
+		t.Fatal("verbose DebugEnabled() = false, want true")
+	}
+	if New(io.Discard, LevelDefault).DebugEnabled() {
+		t.Fatal("default DebugEnabled() = true, want false")
 	}
 }

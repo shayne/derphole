@@ -4,7 +4,10 @@
 
 package quicpath
 
-import "testing"
+import (
+	"crypto/x509"
+	"testing"
+)
 
 func TestDefaultQUICConfigUsesConservativeInitialPacketSize(t *testing.T) {
 	cfg := DefaultQUICConfig()
@@ -35,5 +38,22 @@ func TestDefaultQUICConfigEnablesMetricsTracerFromEnv(t *testing.T) {
 	cfg := DefaultQUICConfig()
 	if cfg.Tracer == nil {
 		t.Fatal("Tracer = nil, want metrics tracer from DERPHOLE_QUIC_METRICS_DIR")
+	}
+}
+
+func TestGenerateSelfSignedCertificateReturnsUsableCertificate(t *testing.T) {
+	cert, err := GenerateSelfSignedCertificate()
+	if err != nil {
+		t.Fatalf("GenerateSelfSignedCertificate() error = %v", err)
+	}
+	if len(cert.Certificate) == 0 {
+		t.Fatal("certificate chain is empty")
+	}
+	parsed, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatalf("ParseCertificate() error = %v", err)
+	}
+	if parsed.Subject.CommonName != ServerName {
+		t.Fatalf("CommonName = %q, want %q", parsed.Subject.CommonName, ServerName)
 	}
 }

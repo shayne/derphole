@@ -21,59 +21,54 @@ var runOrchestrateProbe = probe.RunOrchestrate
 
 func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || isRootHelpRequest(args) {
-		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
 		return 0
 	}
 
-	parsed, err := yargs.ParseKnownFlags[orchestrateFlags](args, yargs.KnownFlagsOptions{})
-	if err != nil {
-		fmt.Fprintln(stderr, err)
-		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
-		return 2
-	}
-	if len(parsed.RemainingArgs) != 0 {
-		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
-		return 2
-	}
-
-	flags := parsed.Flags
-	flags.Host = strings.TrimSpace(flags.Host)
-	if flags.Mode == "aead" {
-		fmt.Fprintln(stderr, "aead not implemented yet")
-		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
-		return 2
-	}
-	if strings.TrimSpace(flags.Host) == "" {
-		fmt.Fprintln(stderr, "host is required")
-		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
-		return 2
-	}
-	if flags.SizeBytes < 0 {
-		fmt.Fprintln(stderr, "size bytes must be non-negative")
-		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
-		return 2
-	}
-	if flags.Mode != "raw" && flags.Mode != "blast" && flags.Mode != "wg" && flags.Mode != "wgos" && flags.Mode != "wgiperf" {
-		fmt.Fprintln(stderr, "unsupported mode:", flags.Mode)
-		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
-		return 2
-	}
-	transport, err := probe.NormalizeTransportForCLI(flags.Transport)
-	if err != nil {
-		fmt.Fprintln(stderr, err)
-		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
-		return 2
-	}
-	if flags.Direction != "" && flags.Direction != "forward" && flags.Direction != "reverse" {
-		fmt.Fprintln(stderr, "unsupported direction:", flags.Direction)
-		fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
-		return 2
+	cfg, code, failed := parseOrchestrateConfig(args, stderr)
+	if failed {
+		return code
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	report, err := runOrchestrateProbe(ctx, probe.OrchestrateConfig{
+	report, err := runOrchestrateProbe(ctx, cfg)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	enc := json.NewEncoder(stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(report); err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	return 0
+}
+
+func parseOrchestrateConfig(args []string, stderr io.Writer) (probe.OrchestrateConfig, int, bool) {
+	parsed, err := yargs.ParseKnownFlags[orchestrateFlags](args, yargs.KnownFlagsOptions{})
+	if err != nil {
+		return probe.OrchestrateConfig{}, writeOrchestrateUsageError(stderr, err.Error()), true
+	}
+	if len(parsed.RemainingArgs) != 0 {
+		return probe.OrchestrateConfig{}, writeOrchestrateUsage(stderr), true
+	}
+
+	flags := parsed.Flags
+	flags.Host = strings.TrimSpace(flags.Host)
+	if code, failed := validateOrchestrateFlags(flags, stderr); failed {
+		return probe.OrchestrateConfig{}, code, true
+	}
+	transport, err := probe.NormalizeTransportForCLI(flags.Transport)
+	if err != nil {
+		return probe.OrchestrateConfig{}, writeOrchestrateUsageError(stderr, err.Error()), true
+	}
+
+	return probe.OrchestrateConfig{
 		Host:      flags.Host,
 		User:      flags.User,
 		Mode:      flags.Mode,
@@ -81,20 +76,45 @@ func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 		Direction: flags.Direction,
 		SizeBytes: flags.SizeBytes,
 		Parallel:  flags.Parallel,
-	})
-	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
-	}
+	}, 0, false
+}
 
-	enc := json.NewEncoder(stdout)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(report); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
+func validateOrchestrateFlags(flags orchestrateFlags, stderr io.Writer) (int, bool) {
+	if flags.Mode == "aead" {
+		return writeOrchestrateUsageError(stderr, "aead not implemented yet"), true
 	}
+	if flags.Host == "" {
+		return writeOrchestrateUsageError(stderr, "host is required"), true
+	}
+	if flags.SizeBytes < 0 {
+		return writeOrchestrateUsageError(stderr, "size bytes must be non-negative"), true
+	}
+	if !supportedOrchestrateMode(flags.Mode) {
+		return writeOrchestrateUsageError(stderr, fmt.Sprintf("unsupported mode: %s", flags.Mode)), true
+	}
+	if flags.Direction != "" && flags.Direction != "forward" && flags.Direction != "reverse" {
+		return writeOrchestrateUsageError(stderr, fmt.Sprintf("unsupported direction: %s", flags.Direction)), true
+	}
+	return 0, false
+}
 
-	return 0
+func supportedOrchestrateMode(mode string) bool {
+	switch mode {
+	case "raw", "blast", "wg", "wgos", "wgiperf":
+		return true
+	default:
+		return false
+	}
+}
+
+func writeOrchestrateUsage(stderr io.Writer) int {
+	_, _ = fmt.Fprint(stderr, subcommandUsageLine("orchestrate"))
+	return 2
+}
+
+func writeOrchestrateUsageError(stderr io.Writer, msg string) int {
+	_, _ = fmt.Fprintln(stderr, msg)
+	return writeOrchestrateUsage(stderr)
 }
 
 type orchestrateFlags struct {

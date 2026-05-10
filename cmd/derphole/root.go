@@ -98,57 +98,66 @@ var rootHelpConfig = rootRegistry.HelpConfig()
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	parsed, err := yargs.ParseKnownFlags[rootGlobalFlags](args, yargs.KnownFlagsOptions{})
 	if err != nil {
-		fmt.Fprintln(stderr, err)
-		fmt.Fprint(stderr, rootHelpText())
+		_, _ = fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprint(stderr, rootHelpText())
 		return 2
 	}
 
 	level, err := rootTelemetryLevel(parsed.Flags)
 	if err != nil {
-		fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprintln(stderr, err)
 		return 2
 	}
 
 	remaining := parsed.RemainingArgs
 	if len(remaining) == 0 || isRootHelpRequest(remaining) {
-		fmt.Fprint(stderr, rootHelpText())
+		_, _ = fmt.Fprint(stderr, rootHelpText())
 		return 0
 	}
 	if len(remaining) == 1 && remaining[0] == "--help-llm" {
-		fmt.Fprint(stderr, yargs.GenerateGlobalHelpLLM(rootHelpConfig, rootGlobalFlags{}))
+		_, _ = fmt.Fprint(stderr, yargs.GenerateGlobalHelpLLM(rootHelpConfig, rootGlobalFlags{}))
 		return 0
 	}
 	if strings.HasPrefix(remaining[0], "-") {
-		fmt.Fprintf(stderr, "unknown flag: %s\n", remaining[0])
-		fmt.Fprint(stderr, rootHelpText())
+		_, _ = fmt.Fprintf(stderr, "unknown flag: %s\n", remaining[0])
+		_, _ = fmt.Fprint(stderr, rootHelpText())
 		return 2
 	}
 	if remaining[0] == "help" {
 		return runHelpCommand(remaining[1:], stderr)
 	}
 
-	switch canonicalRootCommand(remaining[0]) {
-	case "send":
-		return runSend(remaining[1:], level, stdin, stdout, stderr)
-	case "receive":
-		return runReceive(remaining[1:], level, stdin, stdout, stderr)
-	case "listen":
-		return runListen(remaining[1:], level, stdout, stderr)
-	case "pipe":
-		return runPipe(remaining[1:], level, stdin, stdout, stderr)
-	case "share":
-		return runShare(remaining[1:], level, stdout, stderr)
-	case "open":
-		return runOpen(remaining[1:], level, stdout, stderr)
-	case "ssh":
-		return runSSH(remaining[1:], level, stdin, stdout, stderr)
-	case "version":
-		return runVersion(stdout, stderr)
-	case "netcheck":
-		return runNetcheckCmd(remaining[1:], stdout, stderr)
-	default:
-		fmt.Fprintf(stderr, "unknown command: %s\nRun 'derphole --help' for usage\n", remaining[0])
-		return 2
+	command := canonicalRootCommand(remaining[0])
+	if handler, ok := rootCommandHandlers()[command]; ok {
+		return handler(remaining[1:], level, stdin, stdout, stderr)
+	}
+	_, _ = fmt.Fprintf(stderr, "unknown command: %s\nRun 'derphole --help' for usage\n", remaining[0])
+	return 2
+}
+
+type rootCommandHandler func(args []string, level telemetry.Level, stdin io.Reader, stdout, stderr io.Writer) int
+
+func rootCommandHandlers() map[string]rootCommandHandler {
+	return map[string]rootCommandHandler{
+		"send":    runSend,
+		"receive": runReceive,
+		"listen": func(args []string, level telemetry.Level, _ io.Reader, stdout, stderr io.Writer) int {
+			return runListen(args, level, stdout, stderr)
+		},
+		"pipe": runPipe,
+		"share": func(args []string, level telemetry.Level, _ io.Reader, stdout, stderr io.Writer) int {
+			return runShare(args, level, stdout, stderr)
+		},
+		"open": func(args []string, level telemetry.Level, _ io.Reader, stdout, stderr io.Writer) int {
+			return runOpen(args, level, stdout, stderr)
+		},
+		"ssh": runSSH,
+		"version": func(_ []string, _ telemetry.Level, _ io.Reader, stdout, stderr io.Writer) int {
+			return runVersion(stdout, stderr)
+		},
+		"netcheck": func(args []string, _ telemetry.Level, _ io.Reader, stdout, stderr io.Writer) int {
+			return runNetcheckCmd(args, stdout, stderr)
+		},
 	}
 }
 
@@ -173,38 +182,28 @@ func canonicalRootCommand(name string) string {
 
 func runHelpCommand(args []string, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprint(stderr, rootHelpText())
+		_, _ = fmt.Fprint(stderr, rootHelpText())
 		return 0
 	}
 
-	switch canonicalRootCommand(args[0]) {
-	case "send":
-		fmt.Fprint(stderr, sendHelpText())
+	if helpText, ok := rootSubcommandHelp()[canonicalRootCommand(args[0])]; ok {
+		_, _ = fmt.Fprint(stderr, helpText())
 		return 0
-	case "receive":
-		fmt.Fprint(stderr, receiveHelpText())
-		return 0
-	case "listen":
-		fmt.Fprint(stderr, listenHelpText())
-		return 0
-	case "pipe":
-		fmt.Fprint(stderr, pipeHelpText())
-		return 0
-	case "share":
-		fmt.Fprint(stderr, shareHelpText())
-		return 0
-	case "open":
-		fmt.Fprint(stderr, openHelpText())
-		return 0
-	case "ssh":
-		fmt.Fprint(stderr, sshHelpText())
-		return 0
-	case "version":
-		fmt.Fprint(stderr, versionHelpText())
-		return 0
-	default:
-		fmt.Fprintf(stderr, "unknown command: %s\nRun 'derphole --help' for usage\n", args[0])
-		return 2
+	}
+	_, _ = fmt.Fprintf(stderr, "unknown command: %s\nRun 'derphole --help' for usage\n", args[0])
+	return 2
+}
+
+func rootSubcommandHelp() map[string]func() string {
+	return map[string]func() string{
+		"send":    sendHelpText,
+		"receive": receiveHelpText,
+		"listen":  listenHelpText,
+		"pipe":    pipeHelpText,
+		"share":   shareHelpText,
+		"open":    openHelpText,
+		"ssh":     sshHelpText,
+		"version": versionHelpText,
 	}
 }
 

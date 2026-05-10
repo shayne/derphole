@@ -74,27 +74,37 @@ func ClassifyTopology(report TopologyReport) []string {
 	if hasSSHFrontDoorMismatch(report) {
 		add(TopologyClassSSHFrontDoorMismatch)
 	}
-	if len(report.UDPReachability) > 0 {
-		anyReceived := false
-		for _, result := range report.UDPReachability {
-			if result.Received || result.Reply {
-				anyReceived = true
-				break
-			}
-		}
-		if anyReceived {
-			add(TopologyClassDirectUDPPossible)
-		} else {
-			add(TopologyClassRemoteUDPUnreachable)
-		}
-	}
-	for _, result := range report.PunchTests {
-		if result.LocalReceived || result.RemoteReceived {
-			add(TopologyClassDirectUDPPossible)
-			break
-		}
-	}
+	add(classifyUDPReachability(report.UDPReachability))
+	add(classifyPunchTests(report.PunchTests))
 	return classes
+}
+
+func classifyUDPReachability(results []UDPReachabilityResult) string {
+	if len(results) == 0 {
+		return ""
+	}
+	if anyUDPReachabilityReceived(results) {
+		return TopologyClassDirectUDPPossible
+	}
+	return TopologyClassRemoteUDPUnreachable
+}
+
+func anyUDPReachabilityReceived(results []UDPReachabilityResult) bool {
+	for _, result := range results {
+		if result.Received || result.Reply {
+			return true
+		}
+	}
+	return false
+}
+
+func classifyPunchTests(results []UDPPunchResult) string {
+	for _, result := range results {
+		if result.LocalReceived || result.RemoteReceived {
+			return TopologyClassDirectUDPPossible
+		}
+	}
+	return ""
 }
 
 func hasSSHFrontDoorMismatch(report TopologyReport) bool {

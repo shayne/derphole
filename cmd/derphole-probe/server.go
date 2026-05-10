@@ -11,7 +11,6 @@ import (
 	"io"
 	"net"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -45,200 +44,167 @@ func boolPtr(v bool) *bool {
 
 func runServer(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || isRootHelpRequest(args) {
-		fmt.Fprint(stderr, subcommandUsageLine("server"))
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("server"))
 		return 0
 	}
 
+	cfg, code, failed := parseServerRunConfig(args, stderr)
+	if failed {
+		return code
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	conns, err := openServerPacketConns(ctx, cfg.mode, cfg.listenAddr, cfg.flags.Parallel)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
+	defer closePacketConns(conns)
+	conn := conns[0]
+
+	candidates, err := clientDiscoverCandidates(ctx, conns)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
+	stats, err := runServerTransfer(ctx, conn, conns, cfg, candidates, stdout)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
+	done := buildServerDone(stats)
+	if err := writeMachineLine(stdout, "DONE", done); err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	_ = stdout
+	return 0
+}
+
+type serverRunConfig struct {
+	flags          serverFlags
+	mode           string
+	transport      string
+	listenAddr     string
+	peerCandidates []net.Addr
+}
+
+func parseServerRunConfig(args []string, stderr io.Writer) (serverRunConfig, int, bool) {
 	parsed, err := yargs.ParseKnownFlags[serverFlags](args, yargs.KnownFlagsOptions{})
 	if err != nil {
-		fmt.Fprintln(stderr, err)
-		fmt.Fprint(stderr, subcommandUsageLine("server"))
-		return 2
+		_, _ = fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("server"))
+		return serverRunConfig{}, 2, true
 	}
 	if len(parsed.RemainingArgs) != 0 {
-		fmt.Fprint(stderr, subcommandUsageLine("server"))
-		return 2
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("server"))
+		return serverRunConfig{}, 2, true
 	}
 
 	mode := parsed.Flags.Mode
 	if mode == "" {
 		mode = "raw"
 	}
-	if mode == "aead" {
-		fmt.Fprintln(stderr, "aead not implemented yet")
-		fmt.Fprint(stderr, subcommandUsageLine("server"))
-		return 2
-	}
-	if mode != "raw" && mode != "blast" && mode != "wg" && mode != "wgos" && mode != "wgiperf" {
-		fmt.Fprintln(stderr, "unsupported mode:", mode)
-		fmt.Fprint(stderr, subcommandUsageLine("server"))
-		return 2
+	if code, failed := validateServerMode(mode, stderr); failed {
+		return serverRunConfig{}, code, true
 	}
 	transport, err := probe.NormalizeTransportForCLI(parsed.Flags.Transport)
 	if err != nil {
-		fmt.Fprintln(stderr, err)
-		fmt.Fprint(stderr, subcommandUsageLine("server"))
-		return 2
+		_, _ = fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("server"))
+		return serverRunConfig{}, 2, true
 	}
-
-	var peerCandidateStrings []string
-	if raw := strings.TrimSpace(parsed.Flags.PeerCandidates); raw != "" {
-		for _, candidate := range strings.Split(raw, ",") {
-			candidate = strings.TrimSpace(candidate)
-			if candidate == "" {
-				continue
-			}
-			peerCandidateStrings = append(peerCandidateStrings, candidate)
-		}
-	}
-	peerCandidates := probe.ParseCandidateStrings(peerCandidateStrings)
-
 	listenAddr := parsed.Flags.ListenAddr
 	if listenAddr == "" {
 		listenAddr = ":0"
 	}
+	return serverRunConfig{
+		flags:          parsed.Flags,
+		mode:           mode,
+		transport:      transport,
+		listenAddr:     listenAddr,
+		peerCandidates: probe.ParseCandidateStrings(splitCSVFlag(parsed.Flags.PeerCandidates)),
+	}, 0, false
+}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+func validateServerMode(mode string, stderr io.Writer) (int, bool) {
+	if mode == "aead" {
+		_, _ = fmt.Fprintln(stderr, "aead not implemented yet")
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("server"))
+		return 2, true
+	}
+	if mode != "raw" && mode != "blast" && mode != "wg" && mode != "wgos" && mode != "wgiperf" {
+		_, _ = fmt.Fprintln(stderr, "unsupported mode:", mode)
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("server"))
+		return 2, true
+	}
+	return 0, false
+}
 
-	conns, err := openServerPacketConns(ctx, mode, listenAddr, parsed.Flags.Parallel)
+func runServerTransfer(ctx context.Context, conn net.PacketConn, conns []net.PacketConn, cfg serverRunConfig, candidates []net.Addr, stdout io.Writer) (probe.TransferStats, error) {
+	if cfg.mode == "wgiperf" {
+		return runWGIPerfServer(ctx, conn, cfg, candidates, stdout)
+	}
+	if err := writeMachineLine(stdout, "READY", clientReady(conn, candidates, cfg.transport)); err != nil {
+		return probe.TransferStats{}, err
+	}
+	punchCtx, punchCancel := context.WithCancel(ctx)
+	defer punchCancel()
+	for _, punchConn := range conns {
+		go probe.PunchAddrs(punchCtx, punchConn, cfg.peerCandidates, nil, 25*time.Millisecond)
+	}
+	stats, err := receiveServerTransfer(ctx, conn, conns, cfg)
+	punchCancel()
+	return stats, err
+}
+
+func runWGIPerfServer(ctx context.Context, conn net.PacketConn, cfg serverRunConfig, candidates []net.Addr, stdout io.Writer) (probe.TransferStats, error) {
+	server, err := probe.StartWireGuardOSIperfServer(ctx, conn, serverWireGuardConfig(cfg))
 	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
+		return probe.TransferStats{}, err
 	}
-	defer closePacketConns(conns)
-	conn := conns[0]
-
-	discoverCtx, cancelDiscover := context.WithTimeout(ctx, 750*time.Millisecond)
-	candidates, discoverErr := discoverServerCandidates(discoverCtx, conns)
-	cancelDiscover()
-	if discoverErr != nil && len(candidates) == 0 {
-		fmt.Fprintln(stderr, discoverErr)
-		return 1
+	defer func() { _ = server.Close() }()
+	if err := writeMachineLine(stdout, "READY", clientReady(conn, candidates, cfg.transport)); err != nil {
+		return probe.TransferStats{}, err
 	}
-	var stats probe.TransferStats
-	if mode == "wgiperf" {
-		server, err := probe.StartWireGuardOSIperfServer(ctx, conn, probe.WireGuardConfig{
-			Transport:      transport,
-			PrivateKeyHex:  parsed.Flags.WGPrivateKey,
-			PeerPublicHex:  parsed.Flags.WGPeerPublic,
-			LocalAddr:      parsed.Flags.WGLocalAddr,
-			PeerAddr:       parsed.Flags.WGPeerAddr,
-			PeerCandidates: peerCandidates,
-			Port:           uint16(parsed.Flags.WGPort),
-			Streams:        parsed.Flags.Parallel,
-			SizeBytes:      parsed.Flags.SizeBytes,
-		})
-		if err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		defer server.Close()
-		ready := serverReady{
-			Addr:       conn.LocalAddr().String(),
-			Candidates: probe.CandidateStringsInOrder(candidates),
-			Transport:  probe.PreviewTransportCaps(conn, transport),
-		}
-		if len(ready.Candidates) == 0 && ready.Addr != "" {
-			ready.Candidates = []string{ready.Addr}
-		}
-		if err := writeMachineLine(stdout, "READY", ready); err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		waitStats, waitErr := server.Wait()
-		if waitErr != nil {
-			fmt.Fprintln(stderr, waitErr)
-			return 1
-		}
-		stats = waitStats
-	} else {
-		ready := serverReady{
-			Addr:       conn.LocalAddr().String(),
-			Candidates: probe.CandidateStringsInOrder(candidates),
-			Transport:  probe.PreviewTransportCaps(conn, transport),
-		}
-		if len(ready.Candidates) == 0 && ready.Addr != "" {
-			ready.Candidates = []string{ready.Addr}
-		}
-		if err := writeMachineLine(stdout, "READY", ready); err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
+	return server.Wait()
+}
 
-		punchCtx, punchCancel := context.WithCancel(ctx)
-		defer punchCancel()
-		for _, punchConn := range conns {
-			go probe.PunchAddrs(punchCtx, punchConn, peerCandidates, nil, 25*time.Millisecond)
+func receiveServerTransfer(ctx context.Context, conn net.PacketConn, conns []net.PacketConn, cfg serverRunConfig) (probe.TransferStats, error) {
+	switch cfg.mode {
+	case "wg":
+		return probe.ReceiveWireGuardToWriter(ctx, conn, io.Discard, serverWireGuardConfig(cfg))
+	case "wgos":
+		return probe.ReceiveWireGuardOSToWriter(ctx, conn, io.Discard, serverWireGuardConfig(cfg))
+	case "blast":
+		if cfg.flags.SizeBytes <= 0 {
+			return probe.TransferStats{}, fmt.Errorf("size bytes is required for blast server mode")
 		}
-
-		if mode == "wg" {
-			waitStats, waitErr := probe.ReceiveWireGuardToWriter(ctx, conn, io.Discard, probe.WireGuardConfig{
-				Transport:      transport,
-				PrivateKeyHex:  parsed.Flags.WGPrivateKey,
-				PeerPublicHex:  parsed.Flags.WGPeerPublic,
-				LocalAddr:      parsed.Flags.WGLocalAddr,
-				PeerAddr:       parsed.Flags.WGPeerAddr,
-				PeerCandidates: peerCandidates,
-				Port:           uint16(parsed.Flags.WGPort),
-				Streams:        parsed.Flags.Parallel,
-				SizeBytes:      parsed.Flags.SizeBytes,
-			})
-			if waitErr != nil {
-				fmt.Fprintln(stderr, waitErr)
-				return 1
-			}
-			stats = waitStats
-		} else if mode == "wgos" {
-			waitStats, waitErr := probe.ReceiveWireGuardOSToWriter(ctx, conn, io.Discard, probe.WireGuardConfig{
-				Transport:      transport,
-				PrivateKeyHex:  parsed.Flags.WGPrivateKey,
-				PeerPublicHex:  parsed.Flags.WGPeerPublic,
-				LocalAddr:      parsed.Flags.WGLocalAddr,
-				PeerAddr:       parsed.Flags.WGPeerAddr,
-				PeerCandidates: peerCandidates,
-				Port:           uint16(parsed.Flags.WGPort),
-				Streams:        parsed.Flags.Parallel,
-				SizeBytes:      parsed.Flags.SizeBytes,
-			})
-			if waitErr != nil {
-				fmt.Fprintln(stderr, waitErr)
-				return 1
-			}
-			stats = waitStats
-		} else if mode == "blast" {
-			if parsed.Flags.SizeBytes <= 0 {
-				fmt.Fprintln(stderr, "size bytes is required for blast server mode")
-				return 2
-			}
-			waitStats, waitErr := probe.ReceiveBlastParallelToWriter(ctx, conns, io.Discard, probe.ReceiveConfig{
-				Blast:           true,
-				Transport:       transport,
-				RequireComplete: probeEnvBool("DERPHOLE_PROBE_REQUIRE_COMPLETE"),
-			}, parsed.Flags.SizeBytes)
-			if waitErr != nil {
-				fmt.Fprintln(stderr, waitErr)
-				return 1
-			}
-			stats = waitStats
-		} else {
-			waitStats, waitErr := probe.ReceiveToWriter(ctx, conn, "", io.Discard, probe.ReceiveConfig{Raw: mode == "raw", Blast: mode == "blast", Transport: transport})
-			if waitErr != nil {
-				fmt.Fprintln(stderr, waitErr)
-				return 1
-			}
-			stats = waitStats
-		}
-		punchCancel()
+		return probe.ReceiveBlastParallelToWriter(ctx, conns, io.Discard, probe.ReceiveConfig{
+			Blast:           true,
+			Transport:       cfg.transport,
+			RequireComplete: probeEnvBool("DERPHOLE_PROBE_REQUIRE_COMPLETE"),
+		}, cfg.flags.SizeBytes)
+	default:
+		return probe.ReceiveToWriter(ctx, conn, "", io.Discard, probe.ReceiveConfig{Raw: cfg.mode == "raw", Blast: cfg.mode == "blast", Transport: cfg.transport})
 	}
-	done := buildServerDone(stats)
-	if err := writeMachineLine(stdout, "DONE", done); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
-	}
+}
 
-	_ = stdout
-	return 0
+func serverWireGuardConfig(cfg serverRunConfig) probe.WireGuardConfig {
+	return probe.WireGuardConfig{
+		Transport:      cfg.transport,
+		PrivateKeyHex:  cfg.flags.WGPrivateKey,
+		PeerPublicHex:  cfg.flags.WGPeerPublic,
+		LocalAddr:      cfg.flags.WGLocalAddr,
+		PeerAddr:       cfg.flags.WGPeerAddr,
+		PeerCandidates: cfg.peerCandidates,
+		Port:           uint16(cfg.flags.WGPort),
+		Streams:        cfg.flags.Parallel,
+		SizeBytes:      cfg.flags.SizeBytes,
+	}
 }
 
 func buildServerDone(stats probe.TransferStats) serverDone {
@@ -304,12 +270,17 @@ func closePacketConns(conns []net.PacketConn) {
 }
 
 func discoverServerCandidates(ctx context.Context, conns []net.PacketConn) ([]net.Addr, error) {
-	type result struct {
-		index int
-		addrs []net.Addr
-		err   error
+	results := runServerCandidateDiscovery(ctx, conns)
+	byConn, firstErr := collectServerCandidateResults(conns, results)
+	out := orderedServerCandidates(byConn)
+	if len(out) == 0 && firstErr != nil {
+		return nil, firstErr
 	}
-	results := make(chan result, len(conns))
+	return out, nil
+}
+
+func runServerCandidateDiscovery(ctx context.Context, conns []net.PacketConn) <-chan resultServerCandidates {
+	results := make(chan resultServerCandidates, len(conns))
 	var wg sync.WaitGroup
 	for i, conn := range conns {
 		if conn == nil {
@@ -319,14 +290,22 @@ func discoverServerCandidates(ctx context.Context, conns []net.PacketConn) ([]ne
 		go func(i int, conn net.PacketConn) {
 			defer wg.Done()
 			addrs, err := discoverProbeCandidates(ctx, conn)
-			results <- result{index: i, addrs: addrs, err: err}
+			results <- resultServerCandidates{index: i, addrs: addrs, err: err}
 		}(i, conn)
 	}
 	wg.Wait()
 	close(results)
+	return results
+}
 
+type resultServerCandidates struct {
+	index int
+	addrs []net.Addr
+	err   error
+}
+
+func collectServerCandidateResults(conns []net.PacketConn, results <-chan resultServerCandidates) ([][]net.Addr, error) {
 	byConn := make([][]net.Addr, len(conns))
-	seen := make(map[string]net.Addr)
 	var firstErr error
 	for result := range results {
 		if result.err != nil && firstErr == nil {
@@ -336,37 +315,34 @@ func discoverServerCandidates(ctx context.Context, conns []net.PacketConn) ([]ne
 			byConn[result.index] = result.addrs
 		}
 	}
+	return byConn, firstErr
+}
+
+func orderedServerCandidates(byConn [][]net.Addr) []net.Addr {
 	out := make([]net.Addr, 0)
+	seen := make(map[string]net.Addr)
 	for _, addrs := range byConn {
-		for _, addr := range firstPreferredCandidate(addrs) {
-			if addr == nil {
-				continue
-			}
-			key := addr.String()
-			if seen[key] != nil {
-				continue
-			}
-			seen[key] = addr
-			out = append(out, addr)
-		}
+		out = appendUniqueServerCandidates(out, seen, firstPreferredCandidate(addrs))
 	}
 	for _, addrs := range byConn {
-		for _, addr := range addrs {
-			if addr == nil {
-				continue
-			}
-			key := addr.String()
-			if seen[key] != nil {
-				continue
-			}
-			seen[key] = addr
-			out = append(out, addr)
+		out = appendUniqueServerCandidates(out, seen, addrs)
+	}
+	return out
+}
+
+func appendUniqueServerCandidates(out []net.Addr, seen map[string]net.Addr, addrs []net.Addr) []net.Addr {
+	for _, addr := range addrs {
+		if addr == nil {
+			continue
 		}
+		key := addr.String()
+		if seen[key] != nil {
+			continue
+		}
+		seen[key] = addr
+		out = append(out, addr)
 	}
-	if len(out) == 0 && firstErr != nil {
-		return nil, firstErr
-	}
-	return out, nil
+	return out
 }
 
 func firstPreferredCandidate(addrs []net.Addr) []net.Addr {

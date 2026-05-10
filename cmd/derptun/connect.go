@@ -49,23 +49,11 @@ var derptunConnect = session.DerptunConnect
 
 func runConnect(args []string, level telemetry.Level, stdin io.Reader, stdout, stderr io.Writer) int {
 	parsed, err := yargs.ParseWithCommandAndHelp[struct{}, connectFlags, struct{}](append([]string{"connect"}, args...), connectHelpConfig)
-	if err != nil {
-		switch {
-		case errors.Is(err, yargs.ErrHelp), errors.Is(err, yargs.ErrSubCommandHelp), errors.Is(err, yargs.ErrHelpLLM):
-			if parsed != nil && parsed.HelpText != "" {
-				fmt.Fprint(stderr, parsed.HelpText)
-			} else {
-				fmt.Fprint(stderr, connectHelpText())
-			}
-			return 0
-		default:
-			fmt.Fprintln(stderr, err)
-			fmt.Fprint(stderr, connectHelpText())
-			return 2
-		}
+	if code, handled := handleYargsError(parsed, err, stderr, connectHelpText); handled {
+		return code
 	}
 	if !parsed.SubCommandFlags.Stdio || len(parsed.Parser.Args) != 0 || len(parsed.RemainingArgs) != 0 {
-		fmt.Fprint(stderr, connectHelpText())
+		_, _ = fmt.Fprint(stderr, connectHelpText())
 		return 2
 	}
 	token, streamIn, err := resolveTokenSource(stdin, tokenSource{
@@ -74,8 +62,8 @@ func runConnect(args []string, level telemetry.Level, stdin io.Reader, stdout, s
 		TokenStdin: parsed.SubCommandFlags.TokenStdin,
 	})
 	if err != nil {
-		fmt.Fprintln(stderr, err)
-		fmt.Fprint(stderr, connectHelpText())
+		_, _ = fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprint(stderr, connectHelpText())
 		return 2
 	}
 
@@ -89,7 +77,7 @@ func runConnect(args []string, level telemetry.Level, stdin io.Reader, stdout, s
 		ForceRelay:    parsed.SubCommandFlags.ForceRelay,
 		UsePublicDERP: usePublicDERPTransport(),
 	}); err != nil && !errors.Is(err, context.Canceled) {
-		fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
 	return 0

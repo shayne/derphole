@@ -157,8 +157,8 @@ func serveSharedTarget(ctx context.Context, cfg ShareConfig, tunnel *localTunnel
 		}
 
 		go func() {
-			defer overlayConn.Close()
-			defer backendConn.Close()
+			defer func() { _ = overlayConn.Close() }()
+			defer func() { _ = backendConn.Close() }()
 			_ = stream.Bridge(ctx, overlayConn, backendConn)
 		}()
 	}

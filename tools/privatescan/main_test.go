@@ -6,6 +6,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -77,6 +78,93 @@ func TestScanDirSkipsBinaryFiles(t *testing.T) {
 	}
 }
 
+func TestScanRepoUsesGitCandidateFiles(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	root := t.TempDir()
+	runGit(t, root, "init")
+	writeLocalInstructions(t, root)
+	writeFile(t, root, "tracked.txt", "safe\n")
+	writeFile(t, root, "leak.txt", "host "+exampleHost()+"\n")
+
+	findings, err := ScanRepo(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 || findings[0].Path != "leak.txt" {
+		t.Fatalf("ScanRepo() findings = %#v, want leak.txt through git candidate path", findings)
+	}
+}
+
+func TestScanRepoSkipsDeletedTrackedFiles(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	root := t.TempDir()
+	runGit(t, root, "init")
+	runGit(t, root, "config", "user.email", "test@example.invalid")
+	runGit(t, root, "config", "user.name", "Test User")
+	writeLocalInstructions(t, root)
+	writeFile(t, root, "deleted.txt", "safe\n")
+	runGit(t, root, "add", "AGENTS.local.md", "deleted.txt")
+	runGit(t, root, "commit", "-m", "seed")
+	if err := os.Remove(filepath.Join(root, "deleted.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	findings, err := ScanRepo(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("ScanRepo() findings = %#v, want none for deleted file", findings)
+	}
+}
+
+func TestParsePrivatePatternsCleansAndDeduplicatesHostTable(t *testing.T) {
+	got := parsePrivatePatterns(strings.Join([]string{
+		"before",
+		"## Host reference",
+		"| Host label | Real hostname | Host Tailscale DNS | Service Tailscale DNS | Install / SSH target |",
+		"| --- | --- | --- | --- | --- |",
+		"| sample | `edge.example.invalid.` | `edge.example.invalid.` | `svc.example.invalid.` | `ops@svc.example.invalid` |",
+		"| ignored words | host with spaces | | | |",
+		"## Other section",
+		"| outside | `not-included.example.invalid` |",
+	}, "\n"))
+	joined := strings.Join(got, "\n")
+	for _, want := range []string{"edge.example.invalid", "edge", "svc.example.invalid", "svc", "ops@svc.example.invalid"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("parsePrivatePatterns() = %v, missing %q", got, want)
+		}
+	}
+	if strings.Contains(joined, "not-included") || strings.Contains(joined, "host with spaces") {
+		t.Fatalf("parsePrivatePatterns() = %v, included ignored tokens", got)
+	}
+}
+
+func TestIgnorePathHelpers(t *testing.T) {
+	for _, rel := range []string{
+		"AGENTS.local.md",
+		"dist/package/index.js",
+		"website/node_modules/pkg/index.js",
+		"coverage/report.out",
+	} {
+		if !shouldIgnorePath(rel) {
+			t.Fatalf("shouldIgnorePath(%q) = false, want true", rel)
+		}
+	}
+	if shouldIgnorePath("docs/readme.md") {
+		t.Fatal("shouldIgnorePath(docs/readme.md) = true, want false")
+	}
+	if got, want := pathBase("a/b/c.txt"), "c.txt"; got != want {
+		t.Fatalf("pathBase() = %q, want %q", got, want)
+	}
+}
+
 func writeLocalInstructions(t *testing.T, root string) {
 	t.Helper()
 	writeFile(t, root, "AGENTS.local.md", strings.Join([]string{
@@ -113,5 +201,14 @@ func writeBytes(t *testing.T, root, name string, data []byte) {
 	}
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func runGit(t *testing.T, root string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v failed: %v\n%s", args, err, out)
 	}
 }

@@ -48,46 +48,44 @@ var openHelpConfig = yargs.HelpConfig{
 	},
 }
 
+var openSession = session.Open
+
 func runOpen(args []string, level telemetry.Level, stdout, stderr io.Writer) int {
 	parsed, err := yargs.ParseWithCommandAndHelp[struct{}, openFlags, openArgs](append([]string{"open"}, args...), openHelpConfig)
-	if err != nil {
-		switch {
-		case errors.Is(err, yargs.ErrHelp), errors.Is(err, yargs.ErrSubCommandHelp), errors.Is(err, yargs.ErrHelpLLM):
-			if parsed != nil && parsed.HelpText != "" {
-				fmt.Fprint(stderr, parsed.HelpText)
-			} else {
-				fmt.Fprint(stderr, openHelpText())
-			}
-			return 0
-		default:
-			fmt.Fprintln(stderr, err)
-			fmt.Fprint(stderr, openHelpText())
-			return 2
-		}
+	if code, handled := handleYargsError(parsed, err, stderr, openHelpText, nil); handled {
+		return code
 	}
 
 	if parsed.Args.Token == "" || len(parsed.Parser.Args) > 2 || len(parsed.RemainingArgs) != 0 {
-		fmt.Fprint(stderr, openHelpText())
+		_, _ = fmt.Fprint(stderr, openHelpText())
 		return 2
 	}
 
-	policy := session.DefaultParallelPolicy()
-	if parsed.SubCommandFlags.Parallel != "" {
-		policy, err = session.ParseParallelPolicy(parsed.SubCommandFlags.Parallel)
-		if err != nil {
-			fmt.Fprintln(stderr, err)
-			fmt.Fprint(stderr, openHelpText())
-			return 2
-		}
+	policy, code, failed := parseParallelPolicy(parsed.SubCommandFlags.Parallel, stderr, openHelpText)
+	if failed {
+		return code
 	}
 
 	ctx, stop := commandContext()
 	defer stop()
+	return runOpenSession(ctx, parsed, policy, level, stdout, stderr)
+}
 
+func runOpenSession(ctx context.Context, parsed *yargs.TypedParseResult[struct{}, openFlags, openArgs], policy session.ParallelPolicy, level telemetry.Level, stdout, stderr io.Writer) int {
+	bindSink, done := startOpenSession(ctx, parsed, policy, level, stderr)
+	if code, finished := waitOpenBind(bindSink, done, stderr); finished {
+		return code
+	}
+
+	_ = stdout
+	return waitOpenDone(done, stderr)
+}
+
+func startOpenSession(ctx context.Context, parsed *yargs.TypedParseResult[struct{}, openFlags, openArgs], policy session.ParallelPolicy, level telemetry.Level, stderr io.Writer) (<-chan string, <-chan error) {
 	bindSink := make(chan string, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- session.Open(ctx, session.OpenConfig{
+		done <- openSession(ctx, session.OpenConfig{
 			Token:          parsed.Args.Token,
 			BindAddr:       parsed.Args.BindAddr,
 			BindAddrSink:   bindSink,
@@ -97,23 +95,28 @@ func runOpen(args []string, level telemetry.Level, stdout, stderr io.Writer) int
 			ParallelPolicy: policy,
 		})
 	}()
+	return bindSink, done
+}
 
+func waitOpenBind(bindSink <-chan string, done <-chan error, stderr io.Writer) (int, bool) {
 	select {
 	case bindAddr := <-bindSink:
-		fmt.Fprintf(stderr, "listening on %s\n", bindAddr)
+		_, _ = fmt.Fprintf(stderr, "listening on %s\n", bindAddr)
+		return 0, false
 	case err := <-done:
 		if err != nil && !errors.Is(err, context.Canceled) {
-			fmt.Fprintln(stderr, err)
-			return 1
+			_, _ = fmt.Fprintln(stderr, err)
+			return 1, true
 		}
-		return 0
+		return 0, true
 	}
+}
 
+func waitOpenDone(done <-chan error, stderr io.Writer) int {
 	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
-		fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
-	_ = stdout
 	return 0
 }
 

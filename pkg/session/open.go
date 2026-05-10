@@ -45,7 +45,7 @@ func Open(ctx context.Context, cfg OpenConfig) error {
 	if err != nil {
 		return err
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	notifyBindAddr(cfg.BindAddrSink, listener.Addr().String(), ctx)
 
 	emitStatus(cfg.Emitter, claim.path)
@@ -108,8 +108,8 @@ func serveOpenListener(ctx context.Context, listener net.Listener, dial func(con
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer clientConn.Close()
-			defer overlayConn.Close()
+			defer func() { _ = clientConn.Close() }()
+			defer func() { _ = overlayConn.Close() }()
 			_ = stream.Bridge(ctx, clientConn, overlayConn)
 		}()
 	}

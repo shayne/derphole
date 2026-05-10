@@ -67,3 +67,50 @@ func TestRunRejectsUnknownCommand(t *testing.T) {
 		t.Fatalf("stdout = %q, want empty", got)
 	}
 }
+
+func TestRunMainRoutesVersion(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runMain([]string{"version"}, strings.NewReader("ignored"), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("runMain() = %d, want 0", code)
+	}
+	if got := stdout.String(); got != versionString()+"\n" {
+		t.Fatalf("stdout = %q, want version", got)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty", got)
+	}
+}
+
+func TestRunShowsLLMHelp(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--help-llm"}, strings.NewReader("ignored"), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0", code)
+	}
+	if got := stderr.String(); !strings.Contains(got, "derphole") || !strings.Contains(got, "send") {
+		t.Fatalf("stderr = %q, want LLM root help", got)
+	}
+}
+
+func TestRunRejectsConflictingTelemetryFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--verbose", "--quiet", "version"}, strings.NewReader("ignored"), &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("run() = %d, want 2", code)
+	}
+	if got := stderr.String(); !strings.Contains(got, "only one of --verbose, --quiet, or --silent") {
+		t.Fatalf("stderr = %q, want telemetry conflict", got)
+	}
+}
+
+func TestRunRejectsUnknownFlag(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--not-a-flag"}, strings.NewReader("ignored"), &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("run() = %d, want 2", code)
+	}
+	if got := stderr.String(); !strings.Contains(got, "unknown flag") {
+		t.Fatalf("stderr = %q, want unknown flag", got)
+	}
+}

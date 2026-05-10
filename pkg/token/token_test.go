@@ -295,3 +295,91 @@ func TestDecodeRejectsUnsupportedVersionWithWrongLength(t *testing.T) {
 		t.Fatalf("Decode() error = %v, want ErrUnsupportedVersion", err)
 	}
 }
+
+func FuzzDecode(f *testing.F) {
+	now := time.Unix(1700000000, 0)
+	valid, err := Encode(Token{
+		Version:      SupportedVersion,
+		SessionID:    [16]byte{1, 2, 3, 4},
+		ExpiresUnix:  now.Add(time.Hour).Unix(),
+		BearerSecret: [32]byte{5, 6, 7, 8},
+		Capabilities: CapabilityStdio | CapabilityShare,
+	})
+	if err != nil {
+		f.Fatalf("Encode(seed) error = %v", err)
+	}
+	for _, seed := range []string{
+		valid,
+		"",
+		"bad",
+		"AAAA",
+		strings.TrimRight(valid, "A"),
+	} {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, encoded string) {
+		decoded, err := Decode(encoded, now)
+		if err != nil {
+			return
+		}
+		roundTrip, err := Encode(decoded)
+		if err != nil {
+			t.Fatalf("Encode(decoded) error = %v", err)
+		}
+		decodedAgain, err := Decode(roundTrip, now)
+		if err != nil {
+			t.Fatalf("Decode(re-encoded) error = %v", err)
+		}
+		if decodedAgain != decoded {
+			t.Fatalf("decoded token changed after re-encode: %+v != %+v", decodedAgain, decoded)
+		}
+	})
+}
+
+func FuzzEncodeDecode(f *testing.F) {
+	f.Add([]byte("derphole seed"), int64(1), uint32(CapabilityStdio), false)
+	f.Add([]byte(strings.Repeat("x", 128)), int64(3600), uint32(CapabilityShare), true)
+
+	f.Fuzz(func(t *testing.T, seed []byte, expiresDelta int64, capabilities uint32, legacy bool) {
+		now := time.Unix(1700000000, 0)
+		if expiresDelta < 0 {
+			expiresDelta = -expiresDelta
+		}
+		tok := Token{
+			Version:      SupportedVersion,
+			ExpiresUnix:  now.Unix() + 1 + expiresDelta%86400,
+			Capabilities: capabilities,
+		}
+		if legacy {
+			tok.Version = legacyVersion
+		}
+		copy(tok.SessionID[:], seed)
+		copy(tok.DERPPublic[:], seed)
+		if len(seed) > 32 {
+			copy(tok.QUICPublic[:], seed[32:])
+		} else {
+			copy(tok.QUICPublic[:], seed)
+		}
+		if len(seed) > 64 {
+			copy(tok.BearerSecret[:], seed[64:])
+		} else {
+			copy(tok.BearerSecret[:], seed)
+		}
+		if !legacy && len(seed) > 0 {
+			tok.SetNativeTCPBootstrapAddr(netip.AddrPortFrom(netip.AddrFrom4([4]byte{203, 0, 113, seed[0]}), 12345))
+		}
+
+		encoded, err := Encode(tok)
+		if err != nil {
+			t.Fatalf("Encode() error = %v", err)
+		}
+		decoded, err := Decode(encoded, now)
+		if err != nil {
+			t.Fatalf("Decode(Encode(tok)) error = %v", err)
+		}
+		if decoded != tok {
+			t.Fatalf("Decode(Encode(tok)) = %+v, want %+v", decoded, tok)
+		}
+	})
+}

@@ -60,38 +60,68 @@ func readBlastSendControlEvents(ctx context.Context, batcher packetBatcher, runI
 		n, err := batcher.ReadBatch(ctx, blastRepairInterval, readBufs)
 		now := time.Now()
 		if err != nil {
-			if ctx.Err() != nil || isNetTimeout(err) {
-				if ctx.Err() != nil {
-					return
-				}
-				continue
-			}
-			if errors.Is(err, net.ErrClosed) {
-				select {
-				case events <- blastSendControlEvent{err: err, receivedAt: now}:
-				case <-ctx.Done():
-				}
+			if stop := handleBlastSendControlReadError(ctx, events, err, now); stop {
 				return
 			}
 			continue
 		}
-		for i := 0; i < n; i++ {
-			packetType, payload, packetRunID, _, _, ok := decodeBlastPacketFull(readBufs[i].Bytes[:readBufs[i].N])
-			if !ok || packetRunID != runID {
-				continue
-			}
-			stripeID := binary.BigEndian.Uint16(readBufs[i].Bytes[2:4])
-			switch packetType {
-			case PacketTypeRepairComplete, PacketTypeRepairRequest, PacketTypeStats:
-				eventPayload := append([]byte(nil), payload...)
-				select {
-				case events <- blastSendControlEvent{typ: packetType, stripe: stripeID, payload: eventPayload, receivedAt: now}:
-				case <-ctx.Done():
-					return
-				}
-			}
+		if !emitBlastSendControlEvents(ctx, events, runID, readBufs[:n], now) {
+			return
 		}
 	}
+}
+
+func handleBlastSendControlReadError(ctx context.Context, events chan<- blastSendControlEvent, err error, now time.Time) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	if isNetTimeout(err) {
+		return false
+	}
+	if !errors.Is(err, net.ErrClosed) {
+		return false
+	}
+	select {
+	case events <- blastSendControlEvent{err: err, receivedAt: now}:
+	case <-ctx.Done():
+	}
+	return true
+}
+
+func emitBlastSendControlEvents(ctx context.Context, events chan<- blastSendControlEvent, runID [16]byte, readBufs []batchReadBuffer, now time.Time) bool {
+	for i := range readBufs {
+		event, ok := decodeBlastSendControlEvent(readBufs[i], runID, now)
+		if !ok {
+			continue
+		}
+		select {
+		case events <- event:
+		case <-ctx.Done():
+			return false
+		}
+	}
+	return true
+}
+
+func decodeBlastSendControlEvent(buf batchReadBuffer, runID [16]byte, now time.Time) (blastSendControlEvent, bool) {
+	packetType, payload, packetRunID, _, _, ok := decodeBlastPacketFull(buf.Bytes[:buf.N])
+	if !ok || packetRunID != runID {
+		return blastSendControlEvent{}, false
+	}
+	if !isBlastSendControlPacket(packetType) {
+		return blastSendControlEvent{}, false
+	}
+	stripeID := binary.BigEndian.Uint16(buf.Bytes[2:4])
+	return blastSendControlEvent{
+		typ:        packetType,
+		stripe:     stripeID,
+		payload:    append([]byte(nil), payload...),
+		receivedAt: now,
+	}, true
+}
+
+func isBlastSendControlPacket(packetType PacketType) bool {
+	return packetType == PacketTypeRepairComplete || packetType == PacketTypeRepairRequest || packetType == PacketTypeStats
 }
 
 func drainBlastSendControlEvents(ctx context.Context, batcher packetBatcher, peer net.Addr, history *blastRepairHistory, stats *TransferStats, deduper *blastRepairDeduper, control *blastSendControl, events <-chan blastSendControlEvent) (bool, error) {
@@ -121,29 +151,39 @@ func handleBlastSendControlEvent(ctx context.Context, batcher packetBatcher, pee
 	case PacketTypeRepairComplete:
 		return true, false, nil
 	case PacketTypeRepairRequest:
-		if batcher == nil || stats == nil {
-			return false, false, nil
-		}
-		retransmits, err := sendBlastRepairs(ctx, batcher, peer, history, event.payload, stats, deduper, event.receivedAt)
-		if err != nil {
-			return false, false, err
-		}
-		if control != nil && retransmits > 0 {
-			control.ObserveRepairPressure(event.receivedAt, retransmits)
-		}
-		return false, true, nil
+		return handleBlastRepairRequestEvent(ctx, batcher, peer, history, stats, deduper, control, event)
 	case PacketTypeStats:
-		if control != nil {
-			sessionTracef("blast stats receive rx_payload_len=%d", len(event.payload))
-			control.ObserveReceiverStats(event.payload, event.receivedAt)
-		}
-		if stats != nil {
-			if receiverStats, ok := unmarshalBlastStatsPayload(event.payload); ok {
-				stats.observePeakGoodput(event.receivedAt, int64(receiverStats.ReceivedPayloadBytes))
-			}
-		}
+		handleBlastStatsEvent(stats, control, event)
 	}
 	return false, false, nil
+}
+
+func handleBlastRepairRequestEvent(ctx context.Context, batcher packetBatcher, peer net.Addr, history *blastRepairHistory, stats *TransferStats, deduper *blastRepairDeduper, control *blastSendControl, event blastSendControlEvent) (bool, bool, error) {
+	if batcher == nil || stats == nil {
+		return false, false, nil
+	}
+	retransmits, err := sendBlastRepairs(ctx, batcher, peer, history, event.payload, stats, deduper, event.receivedAt)
+	if err != nil {
+		return false, false, err
+	}
+	if control != nil && retransmits > 0 {
+		control.ObserveRepairPressure(event.receivedAt, retransmits)
+	}
+	return false, true, nil
+}
+
+func handleBlastStatsEvent(stats *TransferStats, control *blastSendControl, event blastSendControlEvent) {
+	if control != nil {
+		sessionTracef("blast stats receive rx_payload_len=%d", len(event.payload))
+		control.ObserveReceiverStats(event.payload, event.receivedAt)
+	}
+	if stats == nil {
+		return
+	}
+	receiverStats, ok := unmarshalBlastStatsPayload(event.payload)
+	if ok {
+		stats.observePeakGoodput(event.receivedAt, int64(receiverStats.ReceivedPayloadBytes))
+	}
 }
 
 func observeStripedBlastStatsEvent(stats *TransferStats, history *blastRepairHistory, control *blastSendControl, event blastSendControlEvent) bool {

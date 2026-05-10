@@ -74,19 +74,48 @@ var runMatrixCommand = func(ctx context.Context, script string, host string, siz
 
 func runMatrixCmd(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || isRootHelpRequest(args) {
-		fmt.Fprint(stderr, subcommandUsageLine("matrix"))
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("matrix"))
 		return 0
 	}
 
+	cfg, outPath, code, failed := parseMatrixConfig(args, stderr)
+	if failed {
+		return code
+	}
+
+	runs, err := runMatrix(context.Background(), cfg)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	report := matrixReport{
+		Config:    cfg,
+		Runs:      runs,
+		Summaries: summarizeMatrixRuns(runs),
+	}
+	if code, failed := attachMatrixBaseline(&report, stderr); failed {
+		return code
+	}
+	if code, failed := writeMatrixReport(stdout, stderr, report, outPath); failed {
+		return code
+	}
+	if matrixHasFailures(runs) || matrixHasRegressions(report.Comparisons) {
+		return 1
+	}
+	return 0
+}
+
+func parseMatrixConfig(args []string, stderr io.Writer) (matrixConfig, string, int, bool) {
 	parsed, err := yargs.ParseKnownFlags[matrixFlags](args, yargs.KnownFlagsOptions{})
 	if err != nil {
-		fmt.Fprintln(stderr, err)
-		fmt.Fprint(stderr, subcommandUsageLine("matrix"))
-		return 2
+		_, _ = fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("matrix"))
+		return matrixConfig{}, "", 2, true
 	}
 	if len(parsed.RemainingArgs) != 0 {
-		fmt.Fprint(stderr, subcommandUsageLine("matrix"))
-		return 2
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("matrix"))
+		return matrixConfig{}, "", 2, true
 	}
 
 	cfg := matrixConfig{
@@ -97,67 +126,60 @@ func runMatrixCmd(args []string, stdout, stderr io.Writer) int {
 		Baseline:   strings.TrimSpace(parsed.Flags.Baseline),
 	}
 	if len(cfg.Hosts) == 0 {
-		fmt.Fprintln(stderr, "at least one host is required")
-		fmt.Fprint(stderr, subcommandUsageLine("matrix"))
-		return 2
+		_, _ = fmt.Fprintln(stderr, "at least one host is required")
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("matrix"))
+		return matrixConfig{}, "", 2, true
 	}
 	if len(cfg.Tools) == 0 {
-		fmt.Fprintln(stderr, "at least one tool is required")
-		fmt.Fprint(stderr, subcommandUsageLine("matrix"))
-		return 2
+		_, _ = fmt.Fprintln(stderr, "at least one tool is required")
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("matrix"))
+		return matrixConfig{}, "", 2, true
 	}
 	if cfg.Iterations <= 0 {
-		fmt.Fprintln(stderr, "iterations must be positive")
-		fmt.Fprint(stderr, subcommandUsageLine("matrix"))
-		return 2
+		_, _ = fmt.Fprintln(stderr, "iterations must be positive")
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("matrix"))
+		return matrixConfig{}, "", 2, true
 	}
 	if cfg.SizeMiB <= 0 {
-		fmt.Fprintln(stderr, "size-mib must be positive")
-		fmt.Fprint(stderr, subcommandUsageLine("matrix"))
-		return 2
+		_, _ = fmt.Fprintln(stderr, "size-mib must be positive")
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine("matrix"))
+		return matrixConfig{}, "", 2, true
 	}
+	return cfg, parsed.Flags.Out, 0, false
+}
 
-	runs, err := runMatrix(context.Background(), cfg)
+func attachMatrixBaseline(report *matrixReport, stderr io.Writer) (int, bool) {
+	if report.Config.Baseline == "" {
+		return 0, false
+	}
+	comparisons, err := loadMatrixBaselineComparisons(report.Config.Baseline, report.Summaries)
 	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1, true
 	}
+	report.Comparisons = comparisons
+	return 0, false
+}
 
-	report := matrixReport{
-		Config:    cfg,
-		Runs:      runs,
-		Summaries: summarizeMatrixRuns(runs),
-	}
-	if cfg.Baseline != "" {
-		comparisons, err := loadMatrixBaselineComparisons(cfg.Baseline, report.Summaries)
-		if err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		report.Comparisons = comparisons
-	}
-
+func writeMatrixReport(stdout, stderr io.Writer, report matrixReport, outPath string) (int, bool) {
 	var encoded bytes.Buffer
 	enc := json.NewEncoder(&encoded)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(report); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1, true
 	}
-	if parsed.Flags.Out != "" {
-		if err := os.WriteFile(parsed.Flags.Out, encoded.Bytes(), 0o644); err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
+	if outPath != "" {
+		if err := os.WriteFile(outPath, encoded.Bytes(), 0o644); err != nil {
+			_, _ = fmt.Fprintln(stderr, err)
+			return 1, true
 		}
 	}
 	if _, err := stdout.Write(encoded.Bytes()); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1, true
 	}
-	if matrixHasFailures(runs) || matrixHasRegressions(report.Comparisons) {
-		return 1
-	}
-	return 0
+	return 0, false
 }
 
 func runMatrix(ctx context.Context, cfg matrixConfig) ([]probe.RunReport, error) {
@@ -201,82 +223,112 @@ func runMatrix(ctx context.Context, cfg matrixConfig) ([]probe.RunReport, error)
 }
 
 func parsePromotionSummary(raw []byte) (probe.RunReport, error) {
-	var out probe.RunReport
-	var (
-		haveHost      bool
-		haveDirection bool
-		haveSize      bool
-		haveDuration  bool
-		haveGoodput   bool
-		havePeak      bool
-		haveFirstByte bool
-		haveSuccess   bool
-	)
+	state := promotionSummaryState{
+		have: make(map[string]bool),
+	}
 	for _, line := range bytes.Split(raw, []byte{'\n'}) {
 		text := string(bytes.TrimSpace(line))
-		switch {
-		case strings.HasPrefix(text, "benchmark-host="):
-			out.Host = strings.TrimPrefix(text, "benchmark-host=")
-			haveHost = true
-		case strings.HasPrefix(text, "benchmark-direction="):
-			out.Direction = strings.TrimPrefix(text, "benchmark-direction=")
-			haveDirection = true
-		case strings.HasPrefix(text, "benchmark-size-bytes="):
-			value := strings.TrimPrefix(text, "benchmark-size-bytes=")
-			parsed, err := strconv.ParseInt(value, 10, 64)
-			if err != nil {
-				return probe.RunReport{}, fmt.Errorf("parse benchmark-size-bytes: %w", err)
-			}
-			out.SizeBytes = parsed
-			haveSize = true
-		case strings.HasPrefix(text, "benchmark-total-duration-ms="):
-			value := strings.TrimPrefix(text, "benchmark-total-duration-ms=")
-			parsed, err := strconv.ParseInt(value, 10, 64)
-			if err != nil {
-				return probe.RunReport{}, fmt.Errorf("parse benchmark-total-duration-ms: %w", err)
-			}
-			out.DurationMS = parsed
-			haveDuration = true
-		case strings.HasPrefix(text, "benchmark-goodput-mbps="):
-			value := strings.TrimPrefix(text, "benchmark-goodput-mbps=")
-			parsed, err := strconv.ParseFloat(value, 64)
-			if err != nil {
-				return probe.RunReport{}, fmt.Errorf("parse benchmark-goodput-mbps: %w", err)
-			}
-			out.GoodputMbps = parsed
-			haveGoodput = true
-		case strings.HasPrefix(text, "benchmark-peak-goodput-mbps="):
-			value := strings.TrimPrefix(text, "benchmark-peak-goodput-mbps=")
-			parsed, err := strconv.ParseFloat(value, 64)
-			if err != nil {
-				return probe.RunReport{}, fmt.Errorf("parse benchmark-peak-goodput-mbps: %w", err)
-			}
-			out.PeakGoodputMbps = parsed
-			havePeak = true
-		case strings.HasPrefix(text, "benchmark-first-byte-ms="):
-			value := strings.TrimPrefix(text, "benchmark-first-byte-ms=")
-			parsed, err := strconv.ParseInt(value, 10, 64)
-			if err != nil {
-				return probe.RunReport{}, fmt.Errorf("parse benchmark-first-byte-ms: %w", err)
-			}
-			out.FirstByteMS = parsed
-			haveFirstByte = true
-		case strings.HasPrefix(text, "benchmark-success="):
-			value := strings.TrimPrefix(text, "benchmark-success=")
-			if value != "true" && value != "false" {
-				return probe.RunReport{}, fmt.Errorf("parse benchmark-success: invalid value %q", value)
-			}
-			success := value == "true"
-			out.Success = &success
-			haveSuccess = true
-		case strings.HasPrefix(text, "benchmark-error="):
-			out.Error = strings.TrimPrefix(text, "benchmark-error=")
+		if err := state.parseLine(text); err != nil {
+			return probe.RunReport{}, err
 		}
 	}
-	if !haveHost || !haveDirection || !haveSize || !haveDuration || !haveGoodput || !havePeak || !haveFirstByte || !haveSuccess {
+	if !state.complete() {
 		return probe.RunReport{}, fmt.Errorf("missing benchmark footer in output")
 	}
-	return out, nil
+	return state.report, nil
+}
+
+type promotionSummaryState struct {
+	report probe.RunReport
+	have   map[string]bool
+}
+
+type promotionSummaryField struct {
+	name   string
+	prefix string
+	apply  func(*probe.RunReport, string) error
+}
+
+var promotionSummaryRequiredFields = []string{
+	"host",
+	"direction",
+	"size",
+	"duration",
+	"goodput",
+	"peak",
+	"first-byte",
+	"success",
+}
+
+var promotionSummaryFields = []promotionSummaryField{
+	{name: "host", prefix: "benchmark-host=", apply: func(report *probe.RunReport, value string) error {
+		report.Host = value
+		return nil
+	}},
+	{name: "direction", prefix: "benchmark-direction=", apply: func(report *probe.RunReport, value string) error {
+		report.Direction = value
+		return nil
+	}},
+	{name: "size", prefix: "benchmark-size-bytes=", apply: func(report *probe.RunReport, value string) error {
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		report.SizeBytes = parsed
+		return err
+	}},
+	{name: "duration", prefix: "benchmark-total-duration-ms=", apply: func(report *probe.RunReport, value string) error {
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		report.DurationMS = parsed
+		return err
+	}},
+	{name: "goodput", prefix: "benchmark-goodput-mbps=", apply: func(report *probe.RunReport, value string) error {
+		parsed, err := strconv.ParseFloat(value, 64)
+		report.GoodputMbps = parsed
+		return err
+	}},
+	{name: "peak", prefix: "benchmark-peak-goodput-mbps=", apply: func(report *probe.RunReport, value string) error {
+		parsed, err := strconv.ParseFloat(value, 64)
+		report.PeakGoodputMbps = parsed
+		return err
+	}},
+	{name: "first-byte", prefix: "benchmark-first-byte-ms=", apply: func(report *probe.RunReport, value string) error {
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		report.FirstByteMS = parsed
+		return err
+	}},
+	{name: "success", prefix: "benchmark-success=", apply: func(report *probe.RunReport, value string) error {
+		if value != "true" && value != "false" {
+			return fmt.Errorf("invalid value %q", value)
+		}
+		success := value == "true"
+		report.Success = &success
+		return nil
+	}},
+	{name: "error", prefix: "benchmark-error=", apply: func(report *probe.RunReport, value string) error {
+		report.Error = value
+		return nil
+	}},
+}
+
+func (s *promotionSummaryState) parseLine(text string) error {
+	for _, field := range promotionSummaryFields {
+		if !strings.HasPrefix(text, field.prefix) {
+			continue
+		}
+		value := strings.TrimPrefix(text, field.prefix)
+		if err := field.apply(&s.report, value); err != nil {
+			return fmt.Errorf("parse %s: %w", strings.TrimSuffix(field.prefix, "="), err)
+		}
+		s.have[field.name] = true
+	}
+	return nil
+}
+
+func (s *promotionSummaryState) complete() bool {
+	for _, field := range promotionSummaryRequiredFields {
+		if !s.have[field] {
+			return false
+		}
+	}
+	return true
 }
 
 func splitMatrixHosts(raw string) []string {

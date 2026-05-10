@@ -564,6 +564,30 @@ func TestReadFrameRejectsOversizedPayloadLength(t *testing.T) {
 	}
 }
 
+func TestMuxActivityAndStreamCounters(t *testing.T) {
+	mux := NewMux(MuxConfig{Role: MuxRoleClient})
+	if got := mux.LastPeerActivity(); !got.IsZero() {
+		t.Fatalf("LastPeerActivity() = %v, want zero", got)
+	}
+	if got := mux.ActiveStreamCount(); got != 0 {
+		t.Fatalf("ActiveStreamCount() = %d, want 0", got)
+	}
+
+	want := time.Unix(0, 1234)
+	mux.lastPeerActivityUnixNano.Store(want.UnixNano())
+	if got := mux.LastPeerActivity(); !got.Equal(want) {
+		t.Fatalf("LastPeerActivity() = %v, want %v", got, want)
+	}
+
+	mux.mu.Lock()
+	mux.streams[1] = &muxStream{}
+	mux.streams[3] = &muxStream{}
+	mux.mu.Unlock()
+	if got := mux.ActiveStreamCount(); got != 2 {
+		t.Fatalf("ActiveStreamCount() = %d, want 2", got)
+	}
+}
+
 func newMuxPair(t *testing.T, reconnectTimeout time.Duration) (*Mux, *Mux) {
 	t.Helper()
 

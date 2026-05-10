@@ -80,17 +80,13 @@ func (b *darwinBatcher) WriteBatch(ctx context.Context, peer net.Addr, packets [
 	if len(packets) == 0 {
 		return 0, nil
 	}
-	if b == nil || b.conn == nil || b.raw == nil {
-		return 0, errors.New("nil packet conn")
-	}
-	deadline, err := batchWriteDeadline(ctx)
-	if err != nil {
+	if err := b.requireReady(); err != nil {
 		return 0, err
 	}
-	if err := b.conn.SetWriteDeadline(deadline); err != nil {
+	if err := b.setWriteDeadline(ctx); err != nil {
 		return 0, err
 	}
-	defer b.conn.SetWriteDeadline(time.Time{})
+	defer b.clearWriteDeadline()
 
 	batch := b.getBatch()
 	defer b.putBatch(batch)
@@ -99,26 +95,33 @@ func (b *darwinBatcher) WriteBatch(ctx context.Context, peer net.Addr, packets [
 	if err != nil {
 		return 0, err
 	}
+	return b.writePackets(batch, name, namelen, packets)
+}
+
+func (b *darwinBatcher) requireReady() error {
+	if b == nil || b.conn == nil || b.raw == nil {
+		return errors.New("nil packet conn")
+	}
+	return nil
+}
+
+func (b *darwinBatcher) setWriteDeadline(ctx context.Context) error {
+	deadline, err := batchWriteDeadline(ctx)
+	if err != nil {
+		return err
+	}
+	return b.conn.SetWriteDeadline(deadline)
+}
+
+func (b *darwinBatcher) clearWriteDeadline() {
+	_ = b.conn.SetWriteDeadline(time.Time{})
+}
+
+func (b *darwinBatcher) writePackets(batch *darwinBatch, name *byte, namelen uint32, packets [][]byte) (int, error) {
 	sent := 0
 	for sent < len(packets) {
-		chunk := len(packets) - sent
-		if chunk > len(batch.hdrs) {
-			chunk = len(batch.hdrs)
-		}
-		for i := 0; i < chunk; i++ {
-			packet := packets[sent+i]
-			batch.iovs[i] = unix.Iovec{Len: uint64(len(packet))}
-			if len(packet) > 0 {
-				batch.iovs[i].Base = &packet[0]
-			}
-			batch.hdrs[i] = darwinMsgHdrX{
-				Name:    name,
-				Namelen: namelen,
-				Iov:     &batch.iovs[i],
-				Iovlen:  1,
-			}
-		}
-		n, err := darwinSendmsgX(b.raw, batch.hdrs[:chunk])
+		chunk := b.prepareWriteChunk(batch, name, namelen, packets[sent:])
+		n, err := b.sendWriteChunk(batch, chunk)
 		sent += n
 		if err != nil {
 			runtime.KeepAlive(packets)
@@ -133,25 +136,73 @@ func (b *darwinBatcher) WriteBatch(ctx context.Context, peer net.Addr, packets [
 	return sent, nil
 }
 
+func (b *darwinBatcher) prepareWriteChunk(batch *darwinBatch, name *byte, namelen uint32, packets [][]byte) int {
+	chunk := len(packets)
+	if chunk > len(batch.hdrs) {
+		chunk = len(batch.hdrs)
+	}
+	for i := 0; i < chunk; i++ {
+		packet := packets[i]
+		batch.iovs[i] = darwinIovecForPacket(packet)
+		batch.hdrs[i] = darwinMsgHdrX{
+			Name:    name,
+			Namelen: namelen,
+			Iov:     &batch.iovs[i],
+			Iovlen:  1,
+		}
+	}
+	return chunk
+}
+
+func darwinIovecForPacket(packet []byte) unix.Iovec {
+	iov := unix.Iovec{Len: uint64(len(packet))}
+	if len(packet) > 0 {
+		iov.Base = &packet[0]
+	}
+	return iov
+}
+
+func (b *darwinBatcher) sendWriteChunk(batch *darwinBatch, chunk int) (int, error) {
+	return darwinSendmsgX(b.raw, batch.hdrs[:chunk])
+}
+
 func (b *darwinBatcher) ReadBatch(ctx context.Context, timeout time.Duration, bufs []batchReadBuffer) (int, error) {
 	if len(bufs) == 0 {
 		return 0, nil
 	}
-	if b == nil || b.conn == nil || b.raw == nil {
-		return 0, errors.New("nil packet conn")
-	}
-	deadline, err := batchReadDeadline(ctx, timeout)
-	if err != nil {
+	if err := b.requireReady(); err != nil {
 		return 0, err
 	}
-	if err := b.conn.SetReadDeadline(deadline); err != nil {
+	if err := b.setReadDeadline(ctx, timeout); err != nil {
 		return 0, err
 	}
-	defer b.conn.SetReadDeadline(time.Time{})
+	defer b.clearReadDeadline()
 
 	batch := b.getBatch()
 	defer b.putBatch(batch)
 
+	limit := b.prepareReadBatch(batch, bufs)
+	n, err := darwinRecvmsgX(b.raw, batch.hdrs[:limit])
+	if err != nil {
+		return 0, err
+	}
+	b.fillReadBuffers(batch, bufs, n)
+	return n, nil
+}
+
+func (b *darwinBatcher) setReadDeadline(ctx context.Context, timeout time.Duration) error {
+	deadline, err := batchReadDeadline(ctx, timeout)
+	if err != nil {
+		return err
+	}
+	return b.conn.SetReadDeadline(deadline)
+}
+
+func (b *darwinBatcher) clearReadDeadline() {
+	_ = b.conn.SetReadDeadline(time.Time{})
+}
+
+func (b *darwinBatcher) prepareReadBatch(batch *darwinBatch, bufs []batchReadBuffer) int {
 	limit := len(bufs)
 	if limit > len(batch.hdrs) {
 		limit = len(batch.hdrs)
@@ -159,10 +210,7 @@ func (b *darwinBatcher) ReadBatch(ctx context.Context, timeout time.Duration, bu
 	nameLen := uint32(unsafe.Sizeof(batch.names[0]))
 	for i := 0; i < limit; i++ {
 		batch.names[i] = unix.RawSockaddrAny{}
-		batch.iovs[i] = unix.Iovec{Len: uint64(len(bufs[i].Bytes))}
-		if len(bufs[i].Bytes) > 0 {
-			batch.iovs[i].Base = &bufs[i].Bytes[0]
-		}
+		batch.iovs[i] = darwinIovecForPacket(bufs[i].Bytes)
 		batch.hdrs[i] = darwinMsgHdrX{
 			Name:    (*byte)(unsafe.Pointer(&batch.names[i])),
 			Namelen: nameLen,
@@ -170,11 +218,10 @@ func (b *darwinBatcher) ReadBatch(ctx context.Context, timeout time.Duration, bu
 			Iovlen:  1,
 		}
 	}
+	return limit
+}
 
-	n, err := darwinRecvmsgX(b.raw, batch.hdrs[:limit])
-	if err != nil {
-		return 0, err
-	}
+func (b *darwinBatcher) fillReadBuffers(batch *darwinBatch, bufs []batchReadBuffer, n int) {
 	for i := 0; i < n; i++ {
 		size := int(batch.hdrs[i].Datalen)
 		if size > len(bufs[i].Bytes) {
@@ -187,7 +234,6 @@ func (b *darwinBatcher) ReadBatch(ctx context.Context, timeout time.Duration, bu
 		bufs[i].N = 0
 		bufs[i].Addr = nil
 	}
-	return n, nil
 }
 
 func (b *darwinBatcher) getBatch() *darwinBatch {
@@ -210,8 +256,9 @@ func darwinSendmsgX(raw syscall.RawConn, hdrs []darwinMsgHdrX) (int, error) {
 	var sent int
 	var callErr error
 	err := raw.Write(func(fd uintptr) bool {
+		// Go does not expose Darwin sendmsg_x; this is the platform batch path.
 		//lint:ignore SA1019 Go does not expose Darwin sendmsg_x; this is the platform batch path.
-		n, _, errno := syscall.Syscall6(unix.SYS_SENDMSG_X, fd, uintptr(unsafe.Pointer(&hdrs[0])), uintptr(len(hdrs)), 0, 0, 0)
+		n, _, errno := syscall.Syscall6(unix.SYS_SENDMSG_X, fd, uintptr(unsafe.Pointer(&hdrs[0])), uintptr(len(hdrs)), 0, 0, 0) //nolint:staticcheck
 		if errno == 0 {
 			sent = int(n)
 			return true
@@ -235,8 +282,9 @@ func darwinRecvmsgX(raw syscall.RawConn, hdrs []darwinMsgHdrX) (int, error) {
 	var received int
 	var callErr error
 	err := raw.Read(func(fd uintptr) bool {
+		// Go does not expose Darwin recvmsg_x; this is the platform batch path.
 		//lint:ignore SA1019 Go does not expose Darwin recvmsg_x; this is the platform batch path.
-		n, _, errno := syscall.Syscall6(unix.SYS_RECVMSG_X, fd, uintptr(unsafe.Pointer(&hdrs[0])), uintptr(len(hdrs)), 0, 0, 0)
+		n, _, errno := syscall.Syscall6(unix.SYS_RECVMSG_X, fd, uintptr(unsafe.Pointer(&hdrs[0])), uintptr(len(hdrs)), 0, 0, 0) //nolint:staticcheck
 		if errno == 0 {
 			received = int(n)
 			return true

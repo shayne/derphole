@@ -63,23 +63,42 @@ func EncodeClientInvite(clientToken string) (string, error) {
 }
 
 func DecodeClientInvite(invite string, now time.Time) (ClientCredential, error) {
-	if len(invite) <= len(CompactInvitePrefix) || invite[:len(CompactInvitePrefix)] != CompactInvitePrefix {
-		return ClientCredential{}, ErrInvalidToken
-	}
-	encoded := invite[len(CompactInvitePrefix):]
-	if len(encoded) != compactInvitePayloadLen {
-		return ClientCredential{}, ErrInvalidToken
-	}
-	raw, err := compactInviteDecode(encoded)
+	raw, err := compactInviteRaw(invite)
 	if err != nil {
 		return ClientCredential{}, ErrInvalidToken
 	}
-	if len(raw) != compactInviteRawLen ||
-		raw[compactInviteVersionOffset] != compactInviteVersion ||
-		raw[compactInviteKindOffset] != compactInviteKindTCP {
+	if !validCompactInviteHeader(raw) {
 		return ClientCredential{}, ErrInvalidToken
 	}
 
+	cred := compactInviteCredential(raw)
+	if !validClientInviteCredential(cred) {
+		return ClientCredential{}, ErrInvalidToken
+	}
+	if expired(now, cred.ExpiresUnix) {
+		return ClientCredential{}, ErrExpired
+	}
+	return cred, nil
+}
+
+func compactInviteRaw(invite string) ([]byte, error) {
+	if len(invite) <= len(CompactInvitePrefix) || invite[:len(CompactInvitePrefix)] != CompactInvitePrefix {
+		return nil, ErrInvalidToken
+	}
+	encoded := invite[len(CompactInvitePrefix):]
+	if len(encoded) != compactInvitePayloadLen {
+		return nil, ErrInvalidToken
+	}
+	return compactInviteDecode(encoded)
+}
+
+func validCompactInviteHeader(raw []byte) bool {
+	return len(raw) == compactInviteRawLen &&
+		raw[compactInviteVersionOffset] == compactInviteVersion &&
+		raw[compactInviteKindOffset] == compactInviteKindTCP
+}
+
+func compactInviteCredential(raw []byte) ClientCredential {
 	cred := ClientCredential{
 		Version:     TokenVersion,
 		ExpiresUnix: int64(binary.BigEndian.Uint64(raw[compactInviteExpiryOffset:compactInviteDERPOffset])),
@@ -92,20 +111,17 @@ func DecodeClientInvite(invite string, now time.Time) (ClientCredential, error) 
 	copy(cred.QUICPublic[:], raw[compactInviteQUICOffset:compactInviteBearerOffset])
 	copy(cred.BearerSecret[:], raw[compactInviteBearerOffset:compactInviteProofOffset])
 	cred.ClientName = clientNameForID(cred.ClientID)
+	return cred
+}
 
-	if cred.SessionID == ([16]byte{}) ||
-		cred.ClientID == ([16]byte{}) ||
-		cred.TokenID == ([16]byte{}) ||
-		cred.DERPPublic == ([32]byte{}) ||
-		cred.QUICPublic == ([32]byte{}) ||
-		cred.BearerSecret == ([32]byte{}) ||
-		!validProofMACHex(cred.ProofMAC) {
-		return ClientCredential{}, ErrInvalidToken
-	}
-	if expired(now, cred.ExpiresUnix) {
-		return ClientCredential{}, ErrExpired
-	}
-	return cred, nil
+func validClientInviteCredential(cred ClientCredential) bool {
+	return cred.SessionID != ([16]byte{}) &&
+		cred.ClientID != ([16]byte{}) &&
+		cred.TokenID != ([16]byte{}) &&
+		cred.DERPPublic != ([32]byte{}) &&
+		cred.QUICPublic != ([32]byte{}) &&
+		cred.BearerSecret != ([32]byte{}) &&
+		validProofMACHex(cred.ProofMAC)
 }
 
 func compactInviteEncode(raw []byte) string {
@@ -140,20 +156,8 @@ func compactInviteDecode(encoded string) ([]byte, error) {
 	for i := 0; i < len(encoded); {
 		remaining := len(encoded) - i
 		if remaining >= 3 {
-			c0, ok := compactInviteValue(encoded[i])
-			if !ok {
-				return nil, ErrInvalidToken
-			}
-			c1, ok := compactInviteValue(encoded[i+1])
-			if !ok {
-				return nil, ErrInvalidToken
-			}
-			c2, ok := compactInviteValue(encoded[i+2])
-			if !ok {
-				return nil, ErrInvalidToken
-			}
-			value := c0 + c1*compactInviteBase + c2*compactInviteBase*compactInviteBase
-			if value > 0xffff {
+			value, err := compactInviteDecodeTriple(encoded[i], encoded[i+1], encoded[i+2])
+			if err != nil {
 				return nil, ErrInvalidToken
 			}
 			out = append(out, byte(value>>8), byte(value))
@@ -161,22 +165,55 @@ func compactInviteDecode(encoded string) ([]byte, error) {
 			continue
 		}
 
-		c0, ok := compactInviteValue(encoded[i])
-		if !ok {
-			return nil, ErrInvalidToken
-		}
-		c1, ok := compactInviteValue(encoded[i+1])
-		if !ok {
-			return nil, ErrInvalidToken
-		}
-		value := c0 + c1*compactInviteBase
-		if value > 0xff {
+		value, err := compactInviteDecodePair(encoded[i], encoded[i+1])
+		if err != nil {
 			return nil, ErrInvalidToken
 		}
 		out = append(out, byte(value))
 		i += 2
 	}
 	return out, nil
+}
+
+func compactInviteDecodeTriple(a, b, c byte) (int, error) {
+	c0, c1, c2, ok := compactInviteTripleValues(a, b, c)
+	if !ok {
+		return 0, ErrInvalidToken
+	}
+	value := c0 + c1*compactInviteBase + c2*compactInviteBase*compactInviteBase
+	if value > 0xffff {
+		return 0, ErrInvalidToken
+	}
+	return value, nil
+}
+
+func compactInviteTripleValues(a, b, c byte) (int, int, int, bool) {
+	c0, ok := compactInviteValue(a)
+	if !ok {
+		return 0, 0, 0, false
+	}
+	c1, ok := compactInviteValue(b)
+	if !ok {
+		return 0, 0, 0, false
+	}
+	c2, ok := compactInviteValue(c)
+	return c0, c1, c2, ok
+}
+
+func compactInviteDecodePair(a, b byte) (int, error) {
+	c0, ok := compactInviteValue(a)
+	if !ok {
+		return 0, ErrInvalidToken
+	}
+	c1, ok := compactInviteValue(b)
+	if !ok {
+		return 0, ErrInvalidToken
+	}
+	value := c0 + c1*compactInviteBase
+	if value > 0xff {
+		return 0, ErrInvalidToken
+	}
+	return value, nil
 }
 
 func compactInviteValue(value byte) (int, bool) {

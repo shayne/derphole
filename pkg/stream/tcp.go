@@ -14,7 +14,7 @@ func ListenOnce(ctx context.Context, addr string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	type result struct {
 		conn net.Conn

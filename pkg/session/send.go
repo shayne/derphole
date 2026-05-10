@@ -39,7 +39,7 @@ func Send(ctx context.Context, cfg SendConfig) error {
 	if err != nil {
 		return err
 	}
-	defer src.Close()
+	defer func() { _ = src.Close() }()
 
 	payload, err := io.ReadAll(src)
 	if err != nil {
@@ -86,7 +86,7 @@ func detectPath(ctx context.Context, forceRelay bool, peer net.PacketConn) State
 	if err != nil {
 		return StateRelay
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	probe, err := traversal.ProbeDirect(ctx, conn, peer.LocalAddr().String(), peer, conn.LocalAddr().String())
 	if err != nil {

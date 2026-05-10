@@ -148,47 +148,66 @@ func derpDialTargets(node *tailcfg.DERPNode, host, port string) ([]derpDialTarge
 	if node == nil {
 		return nil, false
 	}
-	add := func(targets []derpDialTarget, network, host, port string) []derpDialTarget {
-		return append(targets, derpDialTarget{
-			network: network,
-			addr:    net.JoinHostPort(host, port),
-		})
-	}
-	var targets []derpDialTarget
-	explicitDisable := false
-
 	if host == node.HostName {
-		switch ip := net.ParseIP(node.IPv4); {
-		case ip != nil && ip.To4() != nil:
-			targets = add(targets, "tcp4", ip.String(), port)
-		case node.IPv4 == "":
-			targets = add(targets, "tcp4", host, port)
-		default:
-			explicitDisable = true
-		}
-		switch ip := net.ParseIP(node.IPv6); {
-		case ip != nil && ip.To4() == nil:
-			targets = add(targets, "tcp6", ip.String(), port)
-		case node.IPv6 == "":
-			targets = add(targets, "tcp6", host, port)
-		default:
-			explicitDisable = true
-		}
-		return targets, explicitDisable
+		return derpDialTargetsForNodeHost(node, host, port)
 	}
 
 	if ip := net.ParseIP(host); ip != nil {
-		if ip.To4() != nil {
-			targets = add(targets, "tcp4", ip.String(), port)
-			return targets, false
-		}
-		targets = add(targets, "tcp6", ip.String(), port)
-		return targets, false
+		return derpDialTargetsForIP(ip, port), false
 	}
 
-	targets = add(targets, "tcp4", host, port)
-	targets = add(targets, "tcp6", host, port)
-	return targets, false
+	return []derpDialTarget{
+		derpDialTargetFor("tcp4", host, port),
+		derpDialTargetFor("tcp6", host, port),
+	}, false
+}
+
+func derpDialTargetsForNodeHost(node *tailcfg.DERPNode, host, port string) ([]derpDialTarget, bool) {
+	var targets []derpDialTarget
+	explicitDisable := false
+	if target, ok, disabled := derpDialTargetForNodeIP("tcp4", node.IPv4, host, port, true); ok {
+		targets = append(targets, target)
+	} else if disabled {
+		explicitDisable = true
+	}
+	if target, ok, disabled := derpDialTargetForNodeIP("tcp6", node.IPv6, host, port, false); ok {
+		targets = append(targets, target)
+	} else if disabled {
+		explicitDisable = true
+	}
+	return targets, explicitDisable
+}
+
+func derpDialTargetForNodeIP(network string, configuredHost string, fallbackHost string, port string, wantV4 bool) (derpDialTarget, bool, bool) {
+	ip := net.ParseIP(configuredHost)
+	if ipMatchesFamily(ip, wantV4) {
+		return derpDialTargetFor(network, ip.String(), port), true, false
+	}
+	if configuredHost == "" {
+		return derpDialTargetFor(network, fallbackHost, port), true, false
+	}
+	return derpDialTarget{}, false, true
+}
+
+func ipMatchesFamily(ip net.IP, wantV4 bool) bool {
+	if ip == nil {
+		return false
+	}
+	return (ip.To4() != nil) == wantV4
+}
+
+func derpDialTargetsForIP(ip net.IP, port string) []derpDialTarget {
+	if ip.To4() != nil {
+		return []derpDialTarget{derpDialTargetFor("tcp4", ip.String(), port)}
+	}
+	return []derpDialTarget{derpDialTargetFor("tcp6", ip.String(), port)}
+}
+
+func derpDialTargetFor(network, host, port string) derpDialTarget {
+	return derpDialTarget{
+		network: network,
+		addr:    net.JoinHostPort(host, port),
+	}
 }
 
 func raceDERPDial(ctx context.Context, logf logger.Logf, netMon *netmon.Monitor, targets []derpDialTarget) (net.Conn, error) {
@@ -341,37 +360,54 @@ func (c *Client) recvLoop() {
 
 		msg, err := c.dc.Recv()
 		if err != nil {
-			select {
-			case <-c.stopCh:
-				return
-			default:
-			}
-			select {
-			case <-time.After(10 * time.Millisecond):
-			case <-c.stopCh:
+			if !c.waitAfterRecvError() {
 				return
 			}
 			continue
 		}
-		pkt, ok := msg.(derp.ReceivedPacket)
-		if !ok {
-			if ping, ok := msg.(derp.PingMessage); ok {
-				pingData := [8]byte(ping)
-				go func() {
-					_ = c.dc.SendPong(pingData)
-				}()
-			}
-			continue
-		}
-		out := Packet{
-			From:    pkt.Source,
-			Payload: append([]byte(nil), pkt.Data...),
-		}
-		if c.dispatchSubscriber(out) {
-			continue
-		}
-		c.enqueueFallback(out)
+		c.handleDERPMessage(msg)
 	}
+}
+
+func (c *Client) waitAfterRecvError() bool {
+	select {
+	case <-c.stopCh:
+		return false
+	default:
+	}
+	select {
+	case <-time.After(10 * time.Millisecond):
+		return true
+	case <-c.stopCh:
+		return false
+	}
+}
+
+func (c *Client) handleDERPMessage(msg derp.ReceivedMessage) {
+	pkt, ok := msg.(derp.ReceivedPacket)
+	if !ok {
+		c.handleDERPControlMessage(msg)
+		return
+	}
+	out := Packet{
+		From:    pkt.Source,
+		Payload: append([]byte(nil), pkt.Data...),
+	}
+	if c.dispatchSubscriber(out) {
+		return
+	}
+	c.enqueueFallback(out)
+}
+
+func (c *Client) handleDERPControlMessage(msg derp.ReceivedMessage) {
+	ping, ok := msg.(derp.PingMessage)
+	if !ok {
+		return
+	}
+	pingData := [8]byte(ping)
+	go func() {
+		_ = c.dc.SendPong(pingData)
+	}()
 }
 
 func (c *Client) enqueueFallback(pkt Packet) {
@@ -538,11 +574,8 @@ func (s *packetSubscriber) tryDeliverLossy(stopCh <-chan struct{}, pkt Packet) b
 	default:
 	}
 
-	select {
-	case <-s.ch:
-	case <-stopCh:
+	if !s.dropLossyPacket(stopCh) {
 		return true
-	default:
 	}
 
 	if s.closed {
@@ -554,4 +587,15 @@ func (s *packetSubscriber) tryDeliverLossy(stopCh <-chan struct{}, pkt Packet) b
 	case <-stopCh:
 	}
 	return true
+}
+
+func (s *packetSubscriber) dropLossyPacket(stopCh <-chan struct{}) bool {
+	select {
+	case <-s.ch:
+		return true
+	case <-stopCh:
+		return false
+	default:
+		return true
+	}
 }

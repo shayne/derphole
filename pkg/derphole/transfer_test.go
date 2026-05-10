@@ -5,6 +5,7 @@
 package derphole
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -301,6 +302,59 @@ func TestReceiveZeroByteFileReportsFinalProgressCallback(t *testing.T) {
 	}
 	if len(events) != 1 || events[0] != [2]int64{0, 0} {
 		t.Fatalf("progress events = %v, want [[0 0]]", events)
+	}
+}
+
+func TestWriteTransferWritesHeaderBodyAndFinishesProgress(t *testing.T) {
+	tx := sendTransfer{
+		header:        protocol.Header{Version: 1, Kind: protocol.KindText},
+		body:          strings.NewReader("transfer body"),
+		summary:       "Sending test body",
+		progressTotal: int64(len("transfer body")),
+	}
+
+	var wire bytes.Buffer
+	var progress bytes.Buffer
+	var stderr bytes.Buffer
+	if err := writeTransfer(&wire, tx, &progress, &stderr); err != nil {
+		t.Fatalf("writeTransfer() error = %v", err)
+	}
+	reader := bufio.NewReader(&wire)
+	header, err := protocol.ReadHeader(reader)
+	if err != nil {
+		t.Fatalf("ReadHeader() error = %v", err)
+	}
+	if header.Kind != protocol.KindText {
+		t.Fatalf("header.Kind = %v, want text", header.Kind)
+	}
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll(body) error = %v", err)
+	}
+	if got := string(body); got != "transfer body" {
+		t.Fatalf("body = %q, want transfer body", got)
+	}
+	if !strings.Contains(stderr.String(), "Sending test body") {
+		t.Fatalf("stderr = %q, want summary", stderr.String())
+	}
+	if !strings.Contains(progress.String(), "100%|") {
+		t.Fatalf("progress = %q, want final progress", progress.String())
+	}
+}
+
+func TestDecodeDirectorySummaryHandlesEmptyInvalidAndValidMetadata(t *testing.T) {
+	if meta, ok := decodeDirectorySummary(nil); ok || meta.FileCount != 0 {
+		t.Fatalf("decodeDirectorySummary(empty) = (%+v, %t), want false", meta, ok)
+	}
+	if _, ok := decodeDirectorySummary([]byte("{")); ok {
+		t.Fatal("decodeDirectorySummary(invalid) ok = true, want false")
+	}
+	meta, ok := decodeDirectorySummary([]byte(`{"file_count":3,"uncompressed_bytes":99}`))
+	if !ok {
+		t.Fatal("decodeDirectorySummary(valid) ok = false, want true")
+	}
+	if meta.FileCount != 3 || meta.UncompressedBytes != 99 {
+		t.Fatalf("decodeDirectorySummary(valid) = %+v, want file_count=3 bytes=99", meta)
 	}
 }
 

@@ -147,6 +147,40 @@ func TestCompactInviteCodecRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCompactInviteDecodePairBoundaries(t *testing.T) {
+	got, err := compactInviteDecodePair(compactInviteAlphabet[0], compactInviteAlphabet[0])
+	if err != nil {
+		t.Fatalf("compactInviteDecodePair(zero) error = %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("compactInviteDecodePair(zero) = %d, want 0", got)
+	}
+
+	got, err = compactInviteDecodePair(compactInviteAlphabet[255%compactInviteBase], compactInviteAlphabet[255/compactInviteBase])
+	if err != nil {
+		t.Fatalf("compactInviteDecodePair(max byte) error = %v", err)
+	}
+	if got != 255 {
+		t.Fatalf("compactInviteDecodePair(max byte) = %d, want 255", got)
+	}
+
+	for _, tc := range []struct {
+		name string
+		a    byte
+		b    byte
+	}{
+		{name: "invalid first", a: '_', b: compactInviteAlphabet[0]},
+		{name: "invalid second", a: compactInviteAlphabet[0], b: '_'},
+		{name: "overflow", a: compactInviteAlphabet[0], b: compactInviteAlphabet[256/compactInviteBase+1]},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := compactInviteDecodePair(tc.a, tc.b); !errors.Is(err, ErrInvalidToken) {
+				t.Fatalf("compactInviteDecodePair(%q, %q) error = %v, want ErrInvalidToken", tc.a, tc.b, err)
+			}
+		})
+	}
+}
+
 func generateCompactInvite(t *testing.T, now time.Time) string {
 	t.Helper()
 	server, err := GenerateServerToken(ServerTokenOptions{Now: now, Days: 7})

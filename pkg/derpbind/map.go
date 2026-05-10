@@ -30,7 +30,7 @@ func FetchMap(ctx context.Context, url string) (*tailcfg.DERPMap, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 
 	if res.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("fetch derp map: %s", res.Status)

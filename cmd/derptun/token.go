@@ -52,7 +52,7 @@ var tokenHelpConfig = yargs.HelpConfig{
 
 func runToken(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		fmt.Fprint(stderr, tokenHelpText())
+		_, _ = fmt.Fprint(stderr, tokenHelpText())
 		if len(args) == 0 {
 			return 2
 		}
@@ -64,7 +64,7 @@ func runToken(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "client":
 		return runTokenClient(args[1:], stdin, stdout, stderr)
 	default:
-		fmt.Fprint(stderr, tokenHelpText())
+		_, _ = fmt.Fprint(stderr, tokenHelpText())
 		return 2
 	}
 }
@@ -75,20 +75,20 @@ func runTokenServer(args []string, stdout, stderr io.Writer) int {
 		return handleTokenParseError(parsed, err, stderr)
 	}
 	if len(parsed.Parser.Args) != 0 || len(parsed.RemainingArgs) != 0 {
-		fmt.Fprint(stderr, tokenHelpText())
+		_, _ = fmt.Fprint(stderr, tokenHelpText())
 		return 2
 	}
 	expires, ok := parseOptionalTokenExpires(parsed.SubCommandFlags.Expires, stderr)
 	if !ok {
-		fmt.Fprint(stderr, tokenHelpText())
+		_, _ = fmt.Fprint(stderr, tokenHelpText())
 		return 2
 	}
 	tokenValue, err := derptun.GenerateServerToken(derptun.ServerTokenOptions{Days: parsed.SubCommandFlags.Days, Expires: expires})
 	if err != nil {
-		fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
-	fmt.Fprintln(stdout, tokenValue)
+	_, _ = fmt.Fprintln(stdout, tokenValue)
 	return 0
 }
 
@@ -98,7 +98,7 @@ func runTokenClient(args []string, stdin io.Reader, stdout, stderr io.Writer) in
 		return handleTokenParseError(parsed, err, stderr)
 	}
 	if len(parsed.Parser.Args) != 0 || len(parsed.RemainingArgs) != 0 {
-		fmt.Fprint(stderr, tokenHelpText())
+		_, _ = fmt.Fprint(stderr, tokenHelpText())
 		return 2
 	}
 	serverToken, _, err := resolveTokenSource(stdin, tokenSource{
@@ -107,13 +107,13 @@ func runTokenClient(args []string, stdin io.Reader, stdout, stderr io.Writer) in
 		TokenStdin: parsed.SubCommandFlags.TokenStdin,
 	})
 	if err != nil {
-		fmt.Fprintln(stderr, err)
-		fmt.Fprint(stderr, tokenHelpText())
+		_, _ = fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprint(stderr, tokenHelpText())
 		return 2
 	}
 	expires, ok := parseOptionalTokenExpires(parsed.SubCommandFlags.Expires, stderr)
 	if !ok {
-		fmt.Fprint(stderr, tokenHelpText())
+		_, _ = fmt.Fprint(stderr, tokenHelpText())
 		return 2
 	}
 	tokenValue, err := derptun.GenerateClientToken(derptun.ClientTokenOptions{
@@ -122,25 +122,34 @@ func runTokenClient(args []string, stdin io.Reader, stdout, stderr io.Writer) in
 		Expires:     expires,
 	})
 	if err != nil {
-		fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
-	fmt.Fprintln(stdout, tokenValue)
+	_, _ = fmt.Fprintln(stdout, tokenValue)
 	return 0
 }
 
 func handleTokenParseError[S any](parsed *yargs.TypedParseResult[struct{}, S, struct{}], err error, stderr io.Writer) int {
-	if errors.Is(err, yargs.ErrHelp) || errors.Is(err, yargs.ErrSubCommandHelp) || errors.Is(err, yargs.ErrHelpLLM) {
-		if parsed != nil && parsed.HelpText != "" {
-			fmt.Fprint(stderr, parsed.HelpText)
-		} else {
-			fmt.Fprint(stderr, tokenHelpText())
-		}
+	if tokenParseErrIsHelp(err) {
+		_, _ = fmt.Fprint(stderr, tokenParseHelpText(parsed))
 		return 0
 	}
-	fmt.Fprintln(stderr, err)
-	fmt.Fprint(stderr, tokenHelpText())
+	_, _ = fmt.Fprintln(stderr, err)
+	_, _ = fmt.Fprint(stderr, tokenHelpText())
 	return 2
+}
+
+func tokenParseErrIsHelp(err error) bool {
+	return errors.Is(err, yargs.ErrHelp) ||
+		errors.Is(err, yargs.ErrSubCommandHelp) ||
+		errors.Is(err, yargs.ErrHelpLLM)
+}
+
+func tokenParseHelpText[S any](parsed *yargs.TypedParseResult[struct{}, S, struct{}]) string {
+	if parsed != nil && parsed.HelpText != "" {
+		return parsed.HelpText
+	}
+	return tokenHelpText()
 }
 
 func parseOptionalTokenExpires(value string, stderr io.Writer) (time.Time, bool) {
@@ -149,7 +158,7 @@ func parseOptionalTokenExpires(value string, stderr io.Writer) (time.Time, bool)
 	}
 	expires, err := parseTokenExpires(value)
 	if err != nil {
-		fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprintln(stderr, err)
 		return time.Time{}, false
 	}
 	return expires, true

@@ -44,6 +44,12 @@ type externalNativeTCPAuth struct {
 	PeerPublic   [32]byte
 }
 
+type externalNativeTCPConnResult struct {
+	conn     net.Conn
+	accepted bool
+	err      error
+}
+
 func externalNativeTCPAddrAllowedDefault(addr net.Addr) bool {
 	ip, ok := sessionAddrIP(addr)
 	if !ok {
@@ -449,7 +455,7 @@ func dialExternalNativeTCPBootstrapConns(ctx context.Context, addr net.Addr, tls
 }
 
 func acceptExternalNativeTCPBootstrapConns(ctx context.Context, ln net.Listener, auth externalNativeTCPAuth, localCap int) ([]net.Conn, error) {
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	firstConn, err := acceptExternalNativeTCP(ctx, ln, auth)
 	if err != nil {
 		return nil, err
@@ -578,7 +584,7 @@ func dialExternalNativeTCPConns(ctx context.Context, addr net.Addr, tlsConfig *t
 }
 
 func acceptExternalNativeTCPConns(ctx context.Context, ln net.Listener, auth externalNativeTCPAuth, connCount int) ([]net.Conn, error) {
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	if connCount < 1 {
 		return nil, errors.New("native tcp connection count must be positive")
@@ -596,7 +602,7 @@ func acceptExternalNativeTCPConns(ctx context.Context, ln net.Listener, auth ext
 }
 
 func connectExternalNativeTCPConns(ctx context.Context, ln net.Listener, peerAddr net.Addr, clientTLSConfig *tls.Config, auth externalNativeTCPAuth, dialDelay time.Duration, connCount int) ([]net.Conn, error) {
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	if connCount < 1 {
 		return nil, errors.New("native tcp connection count must be positive")
@@ -635,7 +641,7 @@ func connectExternalNativeTCPListener(ctx context.Context, ln net.Listener, peer
 }
 
 func connectExternalNativeTCP(ctx context.Context, ln net.Listener, peerAddr net.Addr, clientTLSConfig *tls.Config, auth externalNativeTCPAuth, dialDelay time.Duration) (net.Conn, error) {
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	conn, _, err := connectExternalNativeTCPConn(ctx, ln, peerAddr, clientTLSConfig, auth, dialDelay)
 	return conn, err
 }
@@ -644,61 +650,88 @@ func connectExternalNativeTCPConn(ctx context.Context, ln net.Listener, peerAddr
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	type result struct {
-		conn     net.Conn
-		accepted bool
-		err      error
-	}
-	resultCh := make(chan result, 2)
-	go func() {
-		conn, err := acceptExternalNativeTCP(connCtx, ln, auth)
-		resultCh <- result{conn: conn, accepted: true, err: err}
-	}()
-	go func() {
-		timer := time.NewTimer(dialDelay)
-		defer timer.Stop()
-		select {
-		case <-connCtx.Done():
-			resultCh <- result{err: connCtx.Err()}
-			return
-		case <-timer.C:
-		}
-		conn, err := dialExternalNativeTCP(connCtx, peerAddr, clientTLSConfig, auth)
-		resultCh <- result{conn: conn, err: err}
-	}()
+	resultCh := make(chan externalNativeTCPConnResult, 2)
+	startExternalNativeTCPAcceptRace(connCtx, ln, auth, resultCh)
+	startExternalNativeTCPDialRace(connCtx, peerAddr, clientTLSConfig, auth, dialDelay, resultCh)
 
+	return receiveExternalNativeTCPConnRace(connCtx, cancel, resultCh)
+}
+
+func startExternalNativeTCPAcceptRace(ctx context.Context, ln net.Listener, auth externalNativeTCPAuth, resultCh chan<- externalNativeTCPConnResult) {
+	go func() {
+		conn, err := acceptExternalNativeTCP(ctx, ln, auth)
+		resultCh <- externalNativeTCPConnResult{conn: conn, accepted: true, err: err}
+	}()
+}
+
+func startExternalNativeTCPDialRace(ctx context.Context, peerAddr net.Addr, clientTLSConfig *tls.Config, auth externalNativeTCPAuth, dialDelay time.Duration, resultCh chan<- externalNativeTCPConnResult) {
+	go func() {
+		if err := waitExternalNativeTCPDialDelay(ctx, dialDelay); err != nil {
+			resultCh <- externalNativeTCPConnResult{err: err}
+			return
+		}
+		conn, err := dialExternalNativeTCP(ctx, peerAddr, clientTLSConfig, auth)
+		resultCh <- externalNativeTCPConnResult{conn: conn, err: err}
+	}()
+}
+
+func waitExternalNativeTCPDialDelay(ctx context.Context, dialDelay time.Duration) error {
+	timer := time.NewTimer(dialDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func receiveExternalNativeTCPConnRace(connCtx context.Context, cancel context.CancelFunc, resultCh <-chan externalNativeTCPConnResult) (net.Conn, bool, error) {
 	var firstErr error
 	for i := 0; i < 2; i++ {
 		select {
 		case result := <-resultCh:
 			if result.err == nil && result.conn != nil {
-				cancel()
-				select {
-				case extra := <-resultCh:
-					if extra.conn != nil {
-						_ = extra.conn.Close()
-					}
-				case <-time.After(externalNativeTCPDialFallbackDelay):
-				}
-				return result.conn, result.accepted, nil
+				return completeExternalNativeTCPConnRace(cancel, resultCh, result)
 			}
-			if result.conn != nil {
-				_ = result.conn.Close()
-			}
-			if firstErr == nil {
-				firstErr = result.err
-			}
+			firstErr = externalNativeTCPFirstRaceErr(firstErr, result)
 		case <-connCtx.Done():
-			if firstErr != nil {
-				return nil, false, firstErr
-			}
-			return nil, false, connCtx.Err()
+			return nil, false, externalNativeTCPConnRaceDoneErr(connCtx, firstErr)
 		}
 	}
 	if firstErr != nil {
 		return nil, false, firstErr
 	}
 	return nil, false, errors.New("native tcp direct connection unavailable")
+}
+
+func completeExternalNativeTCPConnRace(cancel context.CancelFunc, resultCh <-chan externalNativeTCPConnResult, result externalNativeTCPConnResult) (net.Conn, bool, error) {
+	cancel()
+	select {
+	case extra := <-resultCh:
+		if extra.conn != nil {
+			_ = extra.conn.Close()
+		}
+	case <-time.After(externalNativeTCPDialFallbackDelay):
+	}
+	return result.conn, result.accepted, nil
+}
+
+func externalNativeTCPFirstRaceErr(firstErr error, result externalNativeTCPConnResult) error {
+	if result.conn != nil {
+		_ = result.conn.Close()
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	return result.err
+}
+
+func externalNativeTCPConnRaceDoneErr(ctx context.Context, firstErr error) error {
+	if firstErr != nil {
+		return firstErr
+	}
+	return ctx.Err()
 }
 
 func copyExternalNativeTCP(ctx context.Context, dst io.Writer, src io.Reader) error {
@@ -724,7 +757,7 @@ func dialExternalNativeTCPBearerAuth(ctx context.Context, conn net.Conn, session
 	if err := conn.SetDeadline(time.Now().Add(externalNativeQUICWait)); err != nil {
 		return err
 	}
-	defer conn.SetDeadline(time.Time{})
+	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 
 	var msg [externalNativeTCPBearerAuthSize]byte
 	if _, err := rand.Read(msg[:32]); err != nil {
@@ -748,7 +781,7 @@ func acceptExternalNativeTCPBearerAuth(ctx context.Context, conn net.Conn, sessi
 	if err := conn.SetDeadline(time.Now().Add(externalNativeQUICWait)); err != nil {
 		return err
 	}
-	defer conn.SetDeadline(time.Time{})
+	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 
 	var msg [externalNativeTCPBearerAuthSize]byte
 	if _, err := io.ReadFull(conn, msg[:]); err != nil {

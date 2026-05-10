@@ -174,21 +174,25 @@ func DecodeClientToken(encoded string, now time.Time) (ClientCredential, error) 
 	if err := decodeJSONToken(encoded, ClientTokenPrefix, &cred); err != nil {
 		return ClientCredential{}, err
 	}
-	if cred.Version != TokenVersion ||
-		cred.SessionID == ([16]byte{}) ||
-		cred.ClientID == ([16]byte{}) ||
-		cred.TokenID == ([16]byte{}) ||
-		cred.ClientName == "" ||
-		cred.DERPPublic == ([32]byte{}) ||
-		cred.QUICPublic == ([32]byte{}) ||
-		cred.BearerSecret == ([32]byte{}) ||
-		!validProofMACHex(cred.ProofMAC) {
+	if !validClientCredential(cred) {
 		return ClientCredential{}, ErrInvalidToken
 	}
 	if expired(now, cred.ExpiresUnix) {
 		return ClientCredential{}, ErrExpired
 	}
 	return cred, nil
+}
+
+func validClientCredential(cred ClientCredential) bool {
+	return cred.Version == TokenVersion &&
+		cred.SessionID != ([16]byte{}) &&
+		cred.ClientID != ([16]byte{}) &&
+		cred.TokenID != ([16]byte{}) &&
+		cred.ClientName != "" &&
+		cred.DERPPublic != ([32]byte{}) &&
+		cred.QUICPublic != ([32]byte{}) &&
+		cred.BearerSecret != ([32]byte{}) &&
+		validProofMACHex(cred.ProofMAC)
 }
 
 func (cred ServerCredential) DERPKey() (key.NodePrivate, error) {
@@ -352,6 +356,6 @@ func computeClientProofMAC(secret [32]byte, client ClientCredential) string {
 	mac.Write(client.DERPPublic[:])
 	mac.Write(client.QUICPublic[:])
 	mac.Write(client.BearerSecret[:])
-	mac.Write([]byte(fmt.Sprintf("%d", client.ExpiresUnix)))
+	_, _ = fmt.Fprintf(mac, "%d", client.ExpiresUnix)
 	return hex.EncodeToString(mac.Sum(nil))
 }

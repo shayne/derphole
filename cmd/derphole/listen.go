@@ -5,7 +5,7 @@
 package main
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"io"
 
@@ -42,36 +42,41 @@ var listenHelpConfig = yargs.HelpConfig{
 	},
 }
 
+var listenSession = session.Listen
+
 func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) int {
 	parsed, err := yargs.ParseWithCommandAndHelp[struct{}, listenFlags, struct{}](append([]string{"listen"}, args...), listenHelpConfig)
-	if err != nil {
-		if errors.Is(err, yargs.ErrHelp) || errors.Is(err, yargs.ErrSubCommandHelp) || errors.Is(err, yargs.ErrHelpLLM) {
-			if parsed != nil && parsed.HelpText != "" {
-				fmt.Fprint(stderr, parsed.HelpText)
-			} else if errors.Is(err, yargs.ErrHelpLLM) {
-				fmt.Fprint(stderr, listenHelpLLMText())
-			} else {
-				fmt.Fprint(stderr, listenHelpText())
-			}
-			return 0
-		}
-		fmt.Fprintln(stderr, err)
-		fmt.Fprint(stderr, listenHelpText())
-		return 2
+	if code, handled := handleYargsError(parsed, err, stderr, listenHelpText, listenHelpLLMText); handled {
+		return code
 	}
 
 	if len(parsed.Parser.Args) != 0 || len(parsed.RemainingArgs) != 0 {
-		fmt.Fprint(stderr, listenHelpText())
+		_, _ = fmt.Fprint(stderr, listenHelpText())
 		return 2
 	}
 
 	emitter := telemetry.New(stderr, commandSessionTelemetryLevel(level))
-	tokenSink := make(chan string, 1)
-	done := make(chan error, 1)
 	ctx, stop := commandContext()
 	defer stop()
+	tokenSink, done := startListenSession(ctx, parsed, emitter, stdout)
+	tok, code, finished := waitListenToken(tokenSink, done, stderr)
+	if finished {
+		return code
+	}
+	if tok == "" {
+		_, _ = fmt.Fprintln(stderr, "failed to issue session token")
+		return 1
+	}
+
+	_, _ = fmt.Fprintln(listenTokenWriter(parsed, stdout, stderr), tok)
+	return waitListenDone(done, stderr)
+}
+
+func startListenSession(ctx context.Context, parsed *yargs.TypedParseResult[struct{}, listenFlags, struct{}], emitter *telemetry.Emitter, stdout io.Writer) (<-chan string, <-chan error) {
+	tokenSink := make(chan string, 1)
+	done := make(chan error, 1)
 	go func() {
-		_, err := session.Listen(ctx, session.ListenConfig{
+		_, err := listenSession(ctx, session.ListenConfig{
 			Emitter:       emitter,
 			TokenSink:     tokenSink,
 			StdioOut:      stdout,
@@ -80,29 +85,32 @@ func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) i
 		})
 		done <- err
 	}()
+	return tokenSink, done
+}
 
-	var tok string
+func waitListenToken(tokenSink <-chan string, done <-chan error, stderr io.Writer) (string, int, bool) {
 	select {
-	case tok = <-tokenSink:
+	case tok := <-tokenSink:
+		return tok, 0, false
 	case err := <-done:
 		if err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
+			_, _ = fmt.Fprintln(stderr, err)
+			return "", 1, true
 		}
+		return "", 0, true
 	}
-	if tok == "" {
-		fmt.Fprintln(stderr, "failed to issue session token")
-		return 1
-	}
+}
 
-	tokenOut := stderr
+func listenTokenWriter(parsed *yargs.TypedParseResult[struct{}, listenFlags, struct{}], stdout, stderr io.Writer) io.Writer {
 	if parsed.SubCommandFlags.PrintTokenOnly {
-		tokenOut = stdout
+		return stdout
 	}
-	fmt.Fprintln(tokenOut, tok)
+	return stderr
+}
 
+func waitListenDone(done <-chan error, stderr io.Writer) int {
 	if err := <-done; err != nil {
-		fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
 	return 0

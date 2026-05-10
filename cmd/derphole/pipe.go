@@ -5,7 +5,7 @@
 package main
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"io"
 
@@ -46,55 +46,50 @@ var pipeHelpConfig = yargs.HelpConfig{
 	},
 }
 
+var sendSession = session.Send
+
 func runPipe(args []string, level telemetry.Level, stdin io.Reader, stdout, stderr io.Writer) int {
 	parsed, err := yargs.ParseWithCommandAndHelp[struct{}, pipeFlags, pipeArgs](append([]string{"pipe"}, args...), pipeHelpConfig)
-	if err != nil {
-		switch {
-		case errors.Is(err, yargs.ErrHelp), errors.Is(err, yargs.ErrSubCommandHelp), errors.Is(err, yargs.ErrHelpLLM):
-			if parsed != nil && parsed.HelpText != "" {
-				fmt.Fprint(stderr, parsed.HelpText)
-			} else {
-				fmt.Fprint(stderr, pipeHelpText())
-			}
-			return 0
-		default:
-			fmt.Fprintln(stderr, err)
-			fmt.Fprint(stderr, pipeHelpText())
-			return 2
-		}
+	if code, handled := handleYargsError(parsed, err, stderr, pipeHelpText, nil); handled {
+		return code
 	}
-
-	if parsed.Args.Token == "" || len(parsed.Parser.Args) > 1 || len(parsed.RemainingArgs) != 0 {
-		fmt.Fprint(stderr, pipeHelpText())
+	if !validPipeArgs(parsed) {
+		_, _ = fmt.Fprint(stderr, pipeHelpText())
 		return 2
 	}
+	return runParsedPipe(parsed, level, stdin, stdout, stderr)
+}
 
-	policy := session.DefaultParallelPolicy()
-	if parsed.SubCommandFlags.Parallel != "" {
-		policy, err = session.ParseParallelPolicy(parsed.SubCommandFlags.Parallel)
-		if err != nil {
-			fmt.Fprintln(stderr, err)
-			fmt.Fprint(stderr, pipeHelpText())
-			return 2
-		}
+func validPipeArgs(parsed *yargs.TypedParseResult[struct{}, pipeFlags, pipeArgs]) bool {
+	return parsed.Args.Token != "" && len(parsed.Parser.Args) <= 1 && len(parsed.RemainingArgs) == 0
+}
+
+func runParsedPipe(parsed *yargs.TypedParseResult[struct{}, pipeFlags, pipeArgs], level telemetry.Level, stdin io.Reader, stdout, stderr io.Writer) int {
+	policy, code, failed := parseParallelPolicy(parsed.SubCommandFlags.Parallel, stderr, pipeHelpText)
+	if failed {
+		return code
 	}
 
 	ctx, stop := commandContext()
 	defer stop()
-	if err := session.Send(ctx, session.SendConfig{
+	if err := executePipeSession(ctx, parsed, policy, level, stdin, stderr); err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	_ = stdout
+	return 0
+}
+
+func executePipeSession(ctx context.Context, parsed *yargs.TypedParseResult[struct{}, pipeFlags, pipeArgs], policy session.ParallelPolicy, level telemetry.Level, stdin io.Reader, stderr io.Writer) error {
+	return sendSession(ctx, session.SendConfig{
 		Token:          parsed.Args.Token,
 		Emitter:        telemetry.New(stderr, commandSessionTelemetryLevel(level)),
 		StdioIn:        stdin,
 		ForceRelay:     parsed.SubCommandFlags.ForceRelay,
 		UsePublicDERP:  usePublicDERPTransport(),
 		ParallelPolicy: policy,
-	}); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
-	}
-
-	_ = stdout
-	return 0
+	})
 }
 
 func pipeHelpText() string {

@@ -31,14 +31,14 @@ func (e *Emitter) Status(msg string) {
 	if e.level == LevelQuiet || e.level == LevelSilent {
 		return
 	}
-	fmt.Fprintln(e.w, msg)
+	_, _ = fmt.Fprintln(e.w, msg)
 }
 
 func (e *Emitter) Debug(msg string) {
 	if e.level != LevelVerbose {
 		return
 	}
-	fmt.Fprintln(e.w, msg)
+	_, _ = fmt.Fprintln(e.w, msg)
 }
 
 func (e *Emitter) DebugEnabled() bool {

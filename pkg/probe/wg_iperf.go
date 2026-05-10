@@ -75,7 +75,7 @@ func SendWireGuardOSIperf(ctx context.Context, conn net.PacketConn, cfg WireGuar
 	if err != nil {
 		return TransferStats{}, err
 	}
-	defer node.Close()
+	defer func() { _ = node.Close() }()
 
 	punchCtx, punchCancel := context.WithCancel(ctx)
 	defer punchCancel()

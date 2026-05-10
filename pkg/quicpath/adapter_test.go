@@ -6,7 +6,9 @@ package quicpath
 
 import (
 	"context"
+	"errors"
 	"net"
+	"os"
 	"syscall"
 	"testing"
 	"time"
@@ -150,6 +152,68 @@ func TestAdapterWriteToUsesTransportSend(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("transport did not receive datagram")
+	}
+}
+
+func TestAdapterDeadlines(t *testing.T) {
+	peer := newFakePeerDatagramConn()
+	conn := NewAdapter(peer)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	past := time.Now().Add(-time.Second)
+	if err := conn.SetWriteDeadline(past); err != nil {
+		t.Fatalf("SetWriteDeadline() error = %v", err)
+	}
+	if _, err := conn.WriteTo([]byte("late"), peer.remote); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("WriteTo(expired deadline) error = %v, want %v", err, os.ErrDeadlineExceeded)
+	}
+
+	future := time.Now().Add(time.Second)
+	if err := conn.SetDeadline(future); err != nil {
+		t.Fatalf("SetDeadline() error = %v", err)
+	}
+	if _, err := conn.WriteTo([]byte("on-time"), peer.remote); err != nil {
+		t.Fatalf("WriteTo(future deadline) error = %v", err)
+	}
+
+	if err := conn.SetReadDeadline(past); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+	buf := make([]byte, 8)
+	if _, _, err := conn.ReadFrom(buf); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("ReadFrom(expired deadline) error = %v, want %v", err, os.ErrDeadlineExceeded)
+	}
+}
+
+type bufferingPeerDatagramConn struct {
+	*fakePeerDatagramConn
+	readBuffer  int
+	writeBuffer int
+}
+
+func (p *bufferingPeerDatagramConn) SetReadBuffer(bytes int) error {
+	p.readBuffer = bytes
+	return nil
+}
+
+func (p *bufferingPeerDatagramConn) SetWriteBuffer(bytes int) error {
+	p.writeBuffer = bytes
+	return nil
+}
+
+func TestAdapterBufferSettersDelegateWhenAvailable(t *testing.T) {
+	peer := &bufferingPeerDatagramConn{fakePeerDatagramConn: newFakePeerDatagramConn()}
+	conn := NewAdapter(peer)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	if err := conn.SetReadBuffer(4096); err != nil {
+		t.Fatalf("SetReadBuffer() error = %v", err)
+	}
+	if err := conn.SetWriteBuffer(8192); err != nil {
+		t.Fatalf("SetWriteBuffer() error = %v", err)
+	}
+	if peer.readBuffer != 4096 || peer.writeBuffer != 8192 {
+		t.Fatalf("buffer sizes = %d/%d, want 4096/8192", peer.readBuffer, peer.writeBuffer)
 	}
 }
 

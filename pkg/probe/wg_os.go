@@ -35,7 +35,7 @@ func SendWireGuardOS(ctx context.Context, conn net.PacketConn, src io.Reader, cf
 	if err != nil {
 		return TransferStats{}, err
 	}
-	defer node.Close()
+	defer func() { _ = node.Close() }()
 
 	punchCtx, punchCancel := context.WithCancel(ctx)
 	defer punchCancel()
@@ -55,54 +55,9 @@ func SendWireGuardOS(ctx context.Context, conn net.PacketConn, src io.Reader, cf
 			return dialer.DialContext(ctx, "tcp4", net.JoinHostPort(resolved.peerAddr.String(), strconv.Itoa(int(resolved.port))))
 		}, cfg)
 	}
-	tcpConn, err := dialer.DialContext(ctx, "tcp4", net.JoinHostPort(resolved.peerAddr.String(), strconv.Itoa(int(resolved.port))))
-	if err != nil {
-		return TransferStats{}, err
-	}
-	defer tcpConn.Close()
-
-	var closeWrite func() error
-	if closer, ok := tcpConn.(interface{ CloseWrite() error }); ok {
-		closeWrite = closer.CloseWrite
-	}
-
-	buf := make([]byte, 128<<10)
-	for {
-		if err := ctx.Err(); err != nil {
-			return TransferStats{}, err
-		}
-		n, readErr := src.Read(buf)
-		if n > 0 {
-			written, writeErr := tcpConn.Write(buf[:n])
-			if written > 0 {
-				if stats.FirstByteAt.IsZero() {
-					stats.FirstByteAt = time.Now()
-				}
-				stats.BytesSent += int64(written)
-			}
-			if writeErr != nil {
-				return TransferStats{}, writeErr
-			}
-			if written != n {
-				return TransferStats{}, io.ErrShortWrite
-			}
-		}
-		if readErr == io.EOF {
-			if closeWrite != nil {
-				if err := closeWrite(); err != nil {
-					return TransferStats{}, err
-				}
-			}
-			if err := waitForWireGuardAck(ctx, tcpConn); err != nil {
-				return TransferStats{}, err
-			}
-			stats.CompletedAt = time.Now()
-			return stats, nil
-		}
-		if readErr != nil {
-			return TransferStats{}, readErr
-		}
-	}
+	return sendWireGuardSingle(ctx, &stats, src, func(ctx context.Context) (net.Conn, error) {
+		return dialer.DialContext(ctx, "tcp4", net.JoinHostPort(resolved.peerAddr.String(), strconv.Itoa(int(resolved.port))))
+	})
 }
 
 func ReceiveWireGuardOSToWriter(ctx context.Context, conn net.PacketConn, dst io.Writer, cfg WireGuardConfig) (TransferStats, error) {
@@ -110,7 +65,7 @@ func ReceiveWireGuardOSToWriter(ctx context.Context, conn net.PacketConn, dst io
 	if err != nil {
 		return TransferStats{}, err
 	}
-	defer node.Close()
+	defer func() { _ = node.Close() }()
 
 	punchCtx, punchCancel := context.WithCancel(ctx)
 	defer punchCancel()
@@ -129,61 +84,13 @@ func ReceiveWireGuardOSToWriter(ctx context.Context, conn net.PacketConn, dst io
 	if err != nil {
 		return TransferStats{}, err
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	if wireGuardStreamCount(cfg) > 1 {
 		return receiveWireGuardParallel(ctx, &stats, ln, dst, cfg)
 	}
-
-	tcpConn, err := acceptConn(ctx, ln)
-	if err != nil {
-		return TransferStats{}, err
-	}
-	defer tcpConn.Close()
-
-	buf := make([]byte, 128<<10)
-	ackSent := false
-	for {
-		if err := ctx.Err(); err != nil {
-			return TransferStats{}, err
-		}
-		n, readErr := tcpConn.Read(buf)
-		if n > 0 {
-			if stats.FirstByteAt.IsZero() {
-				stats.FirstByteAt = time.Now()
-			}
-			written, writeErr := dst.Write(buf[:n])
-			if written > 0 {
-				stats.BytesReceived += int64(written)
-			}
-			if writeErr != nil {
-				return TransferStats{}, writeErr
-			}
-			if written != n {
-				return TransferStats{}, io.ErrShortWrite
-			}
-			if !ackSent && cfg.SizeBytes > 0 && stats.BytesReceived >= cfg.SizeBytes {
-				if _, err := tcpConn.Write(wireGuardDrainAck); err != nil {
-					return TransferStats{}, err
-				}
-				ackSent = true
-			}
-		}
-		if readErr == io.EOF {
-			if cfg.SizeBytes > 0 && stats.BytesReceived < cfg.SizeBytes {
-				return TransferStats{}, io.ErrUnexpectedEOF
-			}
-			if !ackSent {
-				if _, err := tcpConn.Write(wireGuardDrainAck); err != nil {
-					return TransferStats{}, err
-				}
-			}
-			stats.CompletedAt = time.Now()
-			return stats, nil
-		}
-		if readErr != nil {
-			return TransferStats{}, readErr
-		}
-	}
+	return receiveWireGuardSingle(ctx, &stats, dst, cfg, func(ctx context.Context) (net.Conn, error) {
+		return acceptConn(ctx, ln)
+	})
 }
 
 func newWireGuardOSNode(conn net.PacketConn, cfg WireGuardConfig) (*wireGuardOSNode, resolvedWireGuardConfig, error) {
@@ -191,39 +98,61 @@ func newWireGuardOSNode(conn net.PacketConn, cfg WireGuardConfig) (*wireGuardOSN
 	if err != nil {
 		return nil, resolvedWireGuardConfig{}, err
 	}
-	ifaceHint := platformWGInterfaceHint()
-	tunDev, err := tun.CreateTUN(ifaceHint, defaultWireGuardKernelMTU)
+	tunDev, iface, err := newWireGuardOSTUN()
 	if err != nil {
 		return nil, resolvedWireGuardConfig{}, err
 	}
-	iface, err := tunDev.Name()
+	dev, err := startWireGuardOSDevice(conn, tunDev, cfg, resolved)
 	if err != nil {
-		tunDev.Close()
-		return nil, resolvedWireGuardConfig{}, err
-	}
-
-	bind := wgtransport.NewBind(wgtransport.BindConfig{
-		PacketConn:     conn,
-		Transport:      cfg.Transport,
-		DirectEndpoint: strings.TrimSpace(cfg.DirectEndpoint),
-	})
-	dev := device.NewDevice(tunDev, bind, device.NewLogger(device.LogLevelSilent, "derphole-probe: "))
-	if err := dev.IpcSet(wireGuardUAPI(resolved, strings.TrimSpace(cfg.DirectEndpoint))); err != nil {
-		dev.Close()
-		tunDev.Close()
-		return nil, resolvedWireGuardConfig{}, err
-	}
-	if err := dev.Up(); err != nil {
-		dev.Close()
-		tunDev.Close()
 		return nil, resolvedWireGuardConfig{}, err
 	}
 	if err := configureWireGuardOSInterface(iface, resolved.localAddr, resolved.peerAddr); err != nil {
 		dev.Close()
-		tunDev.Close()
+		_ = tunDev.Close()
 		return nil, resolvedWireGuardConfig{}, err
 	}
 	return &wireGuardOSNode{iface: iface, device: dev, tun: tunDev}, resolved, nil
+}
+
+func newWireGuardOSTUN() (tun.Device, string, error) {
+	tunDev, err := tun.CreateTUN(platformWGInterfaceHint(), defaultWireGuardKernelMTU)
+	if err != nil {
+		return nil, "", err
+	}
+	iface, err := tunDev.Name()
+	if err != nil {
+		_ = tunDev.Close()
+		return nil, "", err
+	}
+	return tunDev, iface, nil
+}
+
+func startWireGuardOSDevice(conn net.PacketConn, tunDev tun.Device, cfg WireGuardConfig, resolved resolvedWireGuardConfig) (*device.Device, error) {
+	directEndpoint := strings.TrimSpace(cfg.DirectEndpoint)
+	bind := wgtransport.NewBind(wgtransport.BindConfig{
+		PacketConn:     conn,
+		Transport:      cfg.Transport,
+		DirectEndpoint: directEndpoint,
+	})
+	dev := device.NewDevice(tunDev, bind, device.NewLogger(device.LogLevelSilent, "derphole-probe: "))
+	if err := configureWireGuardDevice(dev, tunDev, wireGuardUAPI(resolved, directEndpoint)); err != nil {
+		return nil, err
+	}
+	return dev, nil
+}
+
+func configureWireGuardDevice(dev *device.Device, tunDev tun.Device, uapi string) error {
+	if err := dev.IpcSet(uapi); err != nil {
+		dev.Close()
+		_ = tunDev.Close()
+		return err
+	}
+	if err := dev.Up(); err != nil {
+		dev.Close()
+		_ = tunDev.Close()
+		return err
+	}
+	return nil
 }
 
 func (n *wireGuardOSNode) Close() error {
@@ -250,7 +179,7 @@ func resolveWireGuardConfig(conn net.PacketConn, cfg WireGuardConfig) (resolvedW
 		cfg.Transport = probeTransportBatched
 	}
 	if cfg.Transport != probeTransportBatched {
-		return resolvedWireGuardConfig{}, fmt.Errorf("wireguard os probe mode requires %q transport", probeTransportBatched)
+		return resolvedWireGuardConfig{}, fmt.Errorf("wireguard probe mode requires %q transport", probeTransportBatched)
 	}
 	privateKey, err := parseHex32(cfg.PrivateKeyHex)
 	if err != nil {

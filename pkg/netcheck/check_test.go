@@ -9,8 +9,11 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
+
+	"tailscale.com/net/stun"
 )
 
 func TestRunReportsDirectFriendlyMapping(t *testing.T) {
@@ -126,6 +129,165 @@ func TestRunReportsRelayOnlyLikelyWhenSTUNFails(t *testing.T) {
 	}
 	if report.UDP.Outbound || report.UDP.STUN {
 		t.Fatalf("UDP = %#v, want blocked", report.UDP)
+	}
+}
+
+func TestSTUNListenAddress(t *testing.T) {
+	if got, want := stunListenAddress(0), "0.0.0.0:0"; got != want {
+		t.Fatalf("stunListenAddress(0) = %q, want %q", got, want)
+	}
+	if got, want := stunListenAddress(19302), "0.0.0.0:19302"; got != want {
+		t.Fatalf("stunListenAddress(19302) = %q, want %q", got, want)
+	}
+}
+
+func TestDefaultProbeSTUNServerReceivesMappedEndpoint(t *testing.T) {
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = server.Close() }()
+
+	mapped := netip.MustParseAddrPort("203.0.113.42:45678")
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 2048)
+		n, addr, err := server.ReadFrom(buf)
+		if err != nil {
+			done <- err
+			return
+		}
+		txID, err := stun.ParseBindingRequest(buf[:n])
+		if err != nil {
+			done <- err
+			return
+		}
+		_, err = server.WriteTo(stun.Response(txID, mapped), addr)
+		done <- err
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result := defaultProbeSTUNServer(ctx, server.LocalAddr().String(), 0)
+	if result.Error != "" {
+		t.Fatalf("defaultProbeSTUNServer() error = %q", result.Error)
+	}
+	if result.MappedEndpoint != mapped.String() {
+		t.Fatalf("MappedEndpoint = %q, want %q", result.MappedEndpoint, mapped)
+	}
+	if result.LocalEndpoint == "" {
+		t.Fatal("LocalEndpoint is empty")
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("STUN server error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("STUN server did not receive request")
+	}
+}
+
+func TestDefaultProbeSTUNServerReportsResolveError(t *testing.T) {
+	result := defaultProbeSTUNServer(context.Background(), "not a valid udp addr", 0)
+	if result.Error == "" {
+		t.Fatal("defaultProbeSTUNServer() Error is empty, want resolver error")
+	}
+}
+
+func TestReadSTUNResponseOnceIgnoresTimeoutAndMismatchedResponse(t *testing.T) {
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	txID := stun.NewTxID()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	if mapped, done, err := readSTUNResponseOnce(ctx, conn, txID, make([]byte, 2048)); mapped != "" || done || err != nil {
+		t.Fatalf("readSTUNResponseOnce(timeout) = %q, %v, %v; want empty retry", mapped, done, err)
+	}
+
+	sender, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sender.Close() }()
+	otherTxID := stun.NewTxID()
+	if _, err := sender.WriteTo(stun.Response(otherTxID, netip.MustParseAddrPort("198.51.100.1:1234")), conn.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if mapped, done, err := readSTUNResponseOnce(ctx, conn, txID, make([]byte, 2048)); mapped != "" || done || err != nil {
+		t.Fatalf("readSTUNResponseOnce(mismatch) = %q, %v, %v; want ignored packet", mapped, done, err)
+	}
+}
+
+func TestSTUNServerResultStringIncludesPresentFields(t *testing.T) {
+	result := STUNServerResult{
+		Server:         "stun.example:3478",
+		LocalEndpoint:  "0.0.0.0:1234",
+		MappedEndpoint: "203.0.113.5:1234",
+		Error:          "timeout",
+	}
+	got := result.String()
+	for _, want := range []string{"stun.example:3478", "local=0.0.0.0:1234", "mapped=203.0.113.5:1234", "error=timeout"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("STUNServerResult.String() = %q, missing %q", got, want)
+		}
+	}
+}
+
+func TestSTUNReadDeadlineUsesSoonerContextDeadline(t *testing.T) {
+	now := time.Unix(100, 0)
+	ctx, cancel := context.WithDeadline(context.Background(), now.Add(50*time.Millisecond))
+	defer cancel()
+
+	if got, want := stunReadDeadline(ctx, now), now.Add(50*time.Millisecond); !got.Equal(want) {
+		t.Fatalf("stunReadDeadline() = %v, want %v", got, want)
+	}
+}
+
+func TestSTUNReadDeadlineCapsAtProbeInterval(t *testing.T) {
+	now := time.Unix(100, 0)
+	ctx, cancel := context.WithDeadline(context.Background(), now.Add(time.Second))
+	defer cancel()
+
+	if got, want := stunReadDeadline(ctx, now), now.Add(250*time.Millisecond); !got.Equal(want) {
+		t.Fatalf("stunReadDeadline() = %v, want %v", got, want)
+	}
+}
+
+func TestMappingStableUsesSharedLocalEndpointBeforeGlobalComparison(t *testing.T) {
+	results := []STUNServerResult{
+		{LocalEndpoint: "0.0.0.0:1000", MappedEndpoint: "203.0.113.10:1000"},
+		{LocalEndpoint: "0.0.0.0:1000", MappedEndpoint: "203.0.113.10:1000"},
+		{LocalEndpoint: "0.0.0.0:1001", MappedEndpoint: "203.0.113.11:1001"},
+	}
+
+	if !mappingStable(results) {
+		t.Fatal("mappingStable() = false, want true from repeated local endpoint")
+	}
+}
+
+func TestMappingStableFallsBackToAllMappedEndpoints(t *testing.T) {
+	stable := []STUNServerResult{
+		{LocalEndpoint: "0.0.0.0:1000", MappedEndpoint: "203.0.113.10:1000"},
+		{LocalEndpoint: "0.0.0.0:1001", MappedEndpoint: "203.0.113.10:1000"},
+	}
+	unstable := []STUNServerResult{
+		{LocalEndpoint: "0.0.0.0:1000", MappedEndpoint: "203.0.113.10:1000"},
+		{LocalEndpoint: "0.0.0.0:1001", MappedEndpoint: "203.0.113.11:1001"},
+	}
+
+	if !mappingStable(stable) {
+		t.Fatal("mappingStable(stable) = false, want true")
+	}
+	if mappingStable(unstable) {
+		t.Fatal("mappingStable(unstable) = true, want false")
 	}
 }
 

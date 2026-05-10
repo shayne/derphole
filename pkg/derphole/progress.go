@@ -37,6 +37,17 @@ type ProgressReporter struct {
 	current       int64
 }
 
+type progressCallback struct {
+	fn             func(current, total int64)
+	current, total int64
+}
+
+func (cb progressCallback) emit() {
+	if cb.fn != nil {
+		cb.fn(cb.current, cb.total)
+	}
+}
+
 func NewProgressReporter(out io.Writer, total int64) *ProgressReporter {
 	return NewProgressReporterWithCallback(out, total, nil)
 }
@@ -69,43 +80,25 @@ func (p *ProgressReporter) Add(n int) {
 	if p == nil || n <= 0 {
 		return
 	}
+	p.addLocked(n).emit()
+}
 
-	var onProgress func(current, total int64)
-	var callbackCurrent, callbackTotal int64
-
+func (p *ProgressReporter) addLocked(n int) progressCallback {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	p.current += int64(n)
-	callbackCurrent = p.current
-	callbackTotal = p.total
 	if p.current >= p.total {
-		if p.shouldCallbackLocked(time.Time{}) {
-			onProgress = p.onProgress
-		}
-		p.mu.Unlock()
-		if onProgress != nil {
-			onProgress(callbackCurrent, callbackTotal)
-		}
-		return
+		return p.callbackLocked(time.Time{})
 	}
-	now := progressNow()
-	if p.shouldCallbackLocked(now) {
-		onProgress = p.onProgress
-	}
-	if now.Sub(p.lastRender) < 100*time.Millisecond && p.current < p.total {
-		p.mu.Unlock()
-		if onProgress != nil {
-			onProgress(callbackCurrent, callbackTotal)
-		}
-		return
-	}
-	p.lastRender = now
-	p.renderLocked(false, now)
-	p.mu.Unlock()
 
-	if onProgress != nil {
-		onProgress(callbackCurrent, callbackTotal)
+	now := progressNow()
+	callback := p.callbackLocked(now)
+	if p.shouldRenderLocked(now) {
+		p.lastRender = now
+		p.renderLocked(false, now)
 	}
+	return callback
 }
 
 func (p *ProgressReporter) Finish() {
@@ -144,7 +137,7 @@ func (p *ProgressReporter) Abort() {
 		if p.out == nil {
 			return
 		}
-		fmt.Fprintln(p.out)
+		_, _ = fmt.Fprintln(p.out)
 	}
 }
 
@@ -153,58 +146,101 @@ func (p *ProgressReporter) renderLocked(final bool, now time.Time) {
 		return
 	}
 
-	elapsed := now.Sub(p.start)
-	if elapsed <= 0 {
-		elapsed = time.Millisecond
-	}
-
+	elapsed := progressElapsed(p.start, now)
 	rate := p.rateLocked(final, now, elapsed)
-	eta := "--:--"
-	if p.total > 0 && p.current > 0 && p.current < p.total {
-		remaining := float64(p.total-p.current) / rate
-		eta = formatProgressDuration(time.Duration(remaining * float64(time.Second)))
-	} else if p.total > 0 && p.current >= p.total {
-		eta = "00:00"
-	}
+	line := formatProgressLine(
+		progressPercent(p.current, p.total),
+		p.current,
+		p.total,
+		elapsed,
+		progressETA(p.current, p.total, rate),
+		rate,
+	)
+	p.writeProgressLineLocked(line, final)
+}
 
-	percent := 1.0
-	if p.total > 0 {
-		percent = float64(p.current) / float64(p.total)
-		if percent < 0 {
-			percent = 0
-		}
-		if percent > 1 {
-			percent = 1
-		}
+func progressElapsed(start, now time.Time) time.Duration {
+	elapsed := now.Sub(start)
+	if elapsed <= 0 {
+		return time.Millisecond
 	}
+	return elapsed
+}
 
+func progressETA(current, total int64, rate float64) string {
+	if total <= 0 {
+		return "--:--"
+	}
+	if current >= total {
+		return "00:00"
+	}
+	if current <= 0 || rate <= 0 {
+		return "--:--"
+	}
+	remaining := float64(total-current) / rate
+	return formatProgressDuration(time.Duration(remaining * float64(time.Second)))
+}
+
+func progressPercent(current, total int64) float64 {
+	if total <= 0 {
+		return 1
+	}
+	percent := float64(current) / float64(total)
+	if percent < 0 {
+		return 0
+	}
+	if percent > 1 {
+		return 1
+	}
+	return percent
+}
+
+func progressBar(percent float64) string {
 	filled := int(percent * progressBarWidth)
 	if filled > progressBarWidth {
 		filled = progressBarWidth
 	}
-	bar := strings.Repeat("#", filled) + strings.Repeat(".", progressBarWidth-filled)
-	line := fmt.Sprintf(
+	return strings.Repeat("#", filled) + strings.Repeat(".", progressBarWidth-filled)
+}
+
+func formatProgressLine(percent float64, current, total int64, elapsed time.Duration, eta string, rate float64) string {
+	return fmt.Sprintf(
 		"%3.0f%%|%s| %s/%s [%s<%s, %s/s]",
 		percent*100,
-		bar,
-		formatProgressBytes(p.current),
-		formatProgressBytes(p.total),
+		progressBar(percent),
+		formatProgressBytes(current),
+		formatProgressBytes(total),
 		formatProgressDuration(elapsed),
 		eta,
 		formatProgressBytes(int64(rate)),
 	)
+}
+
+func (p *ProgressReporter) writeProgressLineLocked(line string, final bool) {
 	// Match tqdm's status_printer: shorter redraws must erase stale tail chars.
 	padding := ""
 	if p.lastLineLen > len(line) {
 		padding = strings.Repeat(" ", p.lastLineLen-len(line))
 	}
-	fmt.Fprintf(p.out, "\r%s%s", line, padding)
+	_, _ = fmt.Fprintf(p.out, "\r%s%s", line, padding)
 	p.lastLineLen = len(line)
 	p.wroteLine = true
 	if final {
-		fmt.Fprintln(p.out)
+		_, _ = fmt.Fprintln(p.out)
 		p.lastLineLen = 0
 	}
+}
+
+func (p *ProgressReporter) callbackLocked(now time.Time) progressCallback {
+	callback := progressCallback{current: p.current, total: p.total}
+	if p.shouldCallbackLocked(now) {
+		callback.fn = p.onProgress
+	}
+	return callback
+}
+
+func (p *ProgressReporter) shouldRenderLocked(now time.Time) bool {
+	return now.Sub(p.lastRender) >= 100*time.Millisecond || p.current >= p.total
 }
 
 func (p *ProgressReporter) shouldCallbackLocked(now time.Time) bool {

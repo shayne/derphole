@@ -108,26 +108,32 @@ func (h *iperf3ServerHandle) Wait() (iperf3Result, error) {
 }
 
 func runIperf3Client(ctx context.Context, cfg iperf3ClientConfig) (iperf3Result, error) {
-	if strings.TrimSpace(cfg.BindAddr) == "" {
-		return iperf3Result{}, errors.New("iperf3 bind addr is required")
-	}
-	if strings.TrimSpace(cfg.Target) == "" {
-		return iperf3Result{}, errors.New("iperf3 target is required")
-	}
-	if cfg.Port <= 0 {
-		return iperf3Result{}, errors.New("iperf3 port is required")
+	if err := validateIperf3ClientConfig(cfg); err != nil {
+		return iperf3Result{}, err
 	}
 	argv, err := iperf3BaseArgs()
 	if err != nil {
 		return iperf3Result{}, err
 	}
-	argv = append(argv,
-		"-c", cfg.Target,
-		"--json",
-		"-4",
-		"-B", cfg.BindAddr,
-		"-p", strconv.Itoa(cfg.Port),
-	)
+	argv = appendIperf3ClientArgs(argv, cfg)
+	return runIperf3ClientCommand(ctx, argv)
+}
+
+func validateIperf3ClientConfig(cfg iperf3ClientConfig) error {
+	if strings.TrimSpace(cfg.BindAddr) == "" {
+		return errors.New("iperf3 bind addr is required")
+	}
+	if strings.TrimSpace(cfg.Target) == "" {
+		return errors.New("iperf3 target is required")
+	}
+	if cfg.Port <= 0 {
+		return errors.New("iperf3 port is required")
+	}
+	return nil
+}
+
+func appendIperf3ClientArgs(argv []string, cfg iperf3ClientConfig) []string {
+	argv = append(argv, "-c", cfg.Target, "--json", "-4", "-B", cfg.BindAddr, "-p", strconv.Itoa(cfg.Port))
 	if cfg.SizeBytes > 0 {
 		argv = append(argv, "-n", strconv.FormatInt(cfg.SizeBytes, 10))
 	}
@@ -137,6 +143,10 @@ func runIperf3Client(ctx context.Context, cfg iperf3ClientConfig) (iperf3Result,
 	if cfg.Reverse {
 		argv = append(argv, "-R")
 	}
+	return argv
+}
+
+func runIperf3ClientCommand(ctx context.Context, argv []string) (iperf3Result, error) {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer

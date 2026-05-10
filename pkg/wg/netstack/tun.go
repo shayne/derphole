@@ -44,12 +44,29 @@ type netTun struct {
 type Net netTun
 
 func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device, *Net, error) {
+	dev := newNetTun(dnsServers, mtu)
+	if err := configureTCPOptions(dev.stack); err != nil {
+		return nil, nil, err
+	}
+	dev.ep.AddNotify(dev)
+	if err := dev.stack.CreateNIC(1, dev.ep); err != nil {
+		return nil, nil, fmt.Errorf("CreateNIC: %v", err)
+	}
+	if err := addLocalAddresses(dev, localAddresses); err != nil {
+		return nil, nil, err
+	}
+	addDefaultRoutes(dev)
+	dev.events <- tun.EventUp
+	return dev, (*Net)(dev), nil
+}
+
+func newNetTun(dnsServers []netip.Addr, mtu int) *netTun {
 	opts := stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4},
 		HandleLocal:        true,
 	}
-	dev := &netTun{
+	return &netTun{
 		ep:             channel.New(1024, uint32(mtu), ""),
 		stack:          stack.New(opts),
 		events:         make(chan tun.Event, 10),
@@ -58,53 +75,73 @@ func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device,
 		dnsServers:     dnsServers,
 		mtu:            mtu,
 	}
+}
+
+func configureTCPOptions(ipstack *stack.Stack) error {
 	sackEnabledOpt := tcpip.TCPSACKEnabled(true)
-	if err := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabledOpt); err != nil {
-		return nil, nil, fmt.Errorf("could not enable TCP SACK: %v", err)
+	if err := setTCPProtocolOption(ipstack, &sackEnabledOpt, "could not enable TCP SACK"); err != nil {
+		return err
 	}
 	tcpRecoveryOpt := tcpip.TCPRecovery(0)
-	if err := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpRecoveryOpt); err != nil {
-		return nil, nil, fmt.Errorf("could not disable TCP RACK: %v", err)
+	if err := setTCPProtocolOption(ipstack, &tcpRecoveryOpt, "could not disable TCP RACK"); err != nil {
+		return err
 	}
 	renoOpt := tcpip.CongestionControlOption("reno")
-	if err := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &renoOpt); err != nil {
-		return nil, nil, fmt.Errorf("could not set reno congestion control: %v", err)
+	if err := setTCPProtocolOption(ipstack, &renoOpt, "could not set reno congestion control"); err != nil {
+		return err
 	}
-	if err := setTCPBufSizes(dev.stack); err != nil {
-		return nil, nil, err
+	return setTCPBufSizes(ipstack)
+}
+
+func setTCPProtocolOption(ipstack *stack.Stack, opt tcpip.SettableTransportProtocolOption, message string) error {
+	if err := ipstack.SetTransportProtocolOption(tcp.ProtocolNumber, opt); err != nil {
+		return fmt.Errorf("%s: %v", message, err)
 	}
-	dev.ep.AddNotify(dev)
-	if err := dev.stack.CreateNIC(1, dev.ep); err != nil {
-		return nil, nil, fmt.Errorf("CreateNIC: %v", err)
-	}
+	return nil
+}
+
+func addLocalAddresses(dev *netTun, localAddresses []netip.Addr) error {
 	for _, ip := range localAddresses {
-		var protoNumber tcpip.NetworkProtocolNumber
-		if ip.Is4() {
-			protoNumber = ipv4.ProtocolNumber
-		} else if ip.Is6() {
-			protoNumber = ipv6.ProtocolNumber
-		}
-		protoAddr := tcpip.ProtocolAddress{
-			Protocol:          protoNumber,
-			AddressWithPrefix: tcpip.AddrFromSlice(ip.AsSlice()).WithPrefix(),
-		}
+		protoAddr := protocolAddress(ip)
 		if err := dev.stack.AddProtocolAddress(1, protoAddr, stack.AddressProperties{}); err != nil {
-			return nil, nil, fmt.Errorf("AddProtocolAddress(%v): %v", ip, err)
+			return fmt.Errorf("AddProtocolAddress(%v): %v", ip, err)
 		}
-		if ip.Is4() {
-			dev.hasV4 = true
-		} else if ip.Is6() {
-			dev.hasV6 = true
-		}
+		dev.markIPFamily(ip)
 	}
+	return nil
+}
+
+func protocolAddress(ip netip.Addr) tcpip.ProtocolAddress {
+	return tcpip.ProtocolAddress{
+		Protocol:          networkProtocol(ip),
+		AddressWithPrefix: tcpip.AddrFromSlice(ip.AsSlice()).WithPrefix(),
+	}
+}
+
+func networkProtocol(ip netip.Addr) tcpip.NetworkProtocolNumber {
+	if ip.Is4() {
+		return ipv4.ProtocolNumber
+	}
+	return ipv6.ProtocolNumber
+}
+
+func (tun *netTun) markIPFamily(ip netip.Addr) {
+	if ip.Is4() {
+		tun.hasV4 = true
+		return
+	}
+	if ip.Is6() {
+		tun.hasV6 = true
+	}
+}
+
+func addDefaultRoutes(dev *netTun) {
 	if dev.hasV4 {
 		dev.stack.AddRoute(tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: 1})
 	}
 	if dev.hasV6 {
 		dev.stack.AddRoute(tcpip.Route{Destination: header.IPv6EmptySubnet, NIC: 1})
 	}
-	dev.events <- tun.EventUp
-	return dev, (*Net)(dev), nil
 }
 
 func setTCPBufSizes(ipstack *stack.Stack) error {

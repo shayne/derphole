@@ -105,7 +105,7 @@ func SendWireGuard(ctx context.Context, conn net.PacketConn, src io.Reader, cfg 
 	if err != nil {
 		return TransferStats{}, err
 	}
-	defer node.Close()
+	defer func() { _ = node.Close() }()
 
 	punchCtx, punchCancel := context.WithCancel(ctx)
 	defer punchCancel()
@@ -122,61 +122,9 @@ func SendWireGuard(ctx context.Context, conn net.PacketConn, src io.Reader, cfg 
 			return node.DialTCP(ctx, netip.AddrPortFrom(resolved.peerAddr, resolved.port))
 		}, cfg)
 	}
-	probeWGTracef("send single dial start peer=%s:%d", resolved.peerAddr, resolved.port)
-	tcpConn, err := node.DialTCP(ctx, netip.AddrPortFrom(resolved.peerAddr, resolved.port))
-	if err != nil {
-		probeWGTracef("send single dial error=%v", err)
-		return TransferStats{}, err
-	}
-	probeWGTracef("send single dial ok local=%v remote=%v", tcpConn.LocalAddr(), tcpConn.RemoteAddr())
-	defer tcpConn.Close()
-
-	var closeWrite func() error
-	if closer, ok := tcpConn.(interface{ CloseWrite() error }); ok {
-		closeWrite = closer.CloseWrite
-	}
-
-	buf := make([]byte, 128<<10)
-	for {
-		if err := ctx.Err(); err != nil {
-			return TransferStats{}, err
-		}
-		n, readErr := src.Read(buf)
-		if n > 0 {
-			written, writeErr := tcpConn.Write(buf[:n])
-			if written > 0 {
-				if stats.FirstByteAt.IsZero() {
-					stats.FirstByteAt = time.Now()
-				}
-				stats.BytesSent += int64(written)
-				stats.observePeakGoodput(time.Now(), stats.BytesSent)
-			}
-			if writeErr != nil {
-				return TransferStats{}, writeErr
-			}
-			if written != n {
-				return TransferStats{}, io.ErrShortWrite
-			}
-		}
-		if readErr == io.EOF {
-			if closeWrite != nil {
-				if err := closeWrite(); err != nil {
-					probeWGTracef("send single closewrite error=%v sent=%d", err, stats.BytesSent)
-					return TransferStats{}, err
-				}
-			}
-			if err := waitForWireGuardAck(ctx, tcpConn); err != nil {
-				probeWGTracef("send single ack error=%v sent=%d", err, stats.BytesSent)
-				return TransferStats{}, err
-			}
-			probeWGTracef("send single done sent=%d", stats.BytesSent)
-			stats.markComplete(time.Now())
-			return stats, nil
-		}
-		if readErr != nil {
-			return TransferStats{}, readErr
-		}
-	}
+	return sendWireGuardSingle(ctx, &stats, src, func(ctx context.Context) (net.Conn, error) {
+		return node.DialTCP(ctx, netip.AddrPortFrom(resolved.peerAddr, resolved.port))
+	})
 }
 
 func ReceiveWireGuardToWriter(ctx context.Context, conn net.PacketConn, dst io.Writer, cfg WireGuardConfig) (TransferStats, error) {
@@ -184,7 +132,7 @@ func ReceiveWireGuardToWriter(ctx context.Context, conn net.PacketConn, dst io.W
 	if err != nil {
 		return TransferStats{}, err
 	}
-	defer node.Close()
+	defer func() { _ = node.Close() }()
 
 	punchCtx, punchCancel := context.WithCancel(ctx)
 	defer punchCancel()
@@ -200,69 +148,13 @@ func ReceiveWireGuardToWriter(ctx context.Context, conn net.PacketConn, dst io.W
 	if err != nil {
 		return TransferStats{}, err
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	if wireGuardStreamCount(cfg) > 1 {
 		return receiveWireGuardParallel(ctx, &stats, ln, dst, cfg)
 	}
-
-	probeWGTracef("recv single accept start port=%d", resolved.port)
-	tcpConn, err := acceptConn(ctx, ln)
-	if err != nil {
-		probeWGTracef("recv single accept error=%v", err)
-		return TransferStats{}, err
-	}
-	probeWGTracef("recv single accept ok local=%v remote=%v", tcpConn.LocalAddr(), tcpConn.RemoteAddr())
-	defer tcpConn.Close()
-
-	buf := make([]byte, 128<<10)
-	ackSent := false
-	for {
-		if err := ctx.Err(); err != nil {
-			return TransferStats{}, err
-		}
-		n, readErr := tcpConn.Read(buf)
-		if n > 0 {
-			if stats.FirstByteAt.IsZero() {
-				stats.FirstByteAt = time.Now()
-			}
-			written, writeErr := dst.Write(buf[:n])
-			if written > 0 {
-				stats.BytesReceived += int64(written)
-				stats.observePeakGoodput(time.Now(), stats.BytesReceived)
-			}
-			if writeErr != nil {
-				return TransferStats{}, writeErr
-			}
-			if written != n {
-				return TransferStats{}, io.ErrShortWrite
-			}
-			if !ackSent && cfg.SizeBytes > 0 && stats.BytesReceived >= cfg.SizeBytes {
-				if err := writeWireGuardDrainAck(tcpConn); err != nil {
-					probeWGTracef("recv single target ack write error=%v received=%d", err, stats.BytesReceived)
-					return TransferStats{}, err
-				}
-				probeWGTracef("recv single reached target received=%d", stats.BytesReceived)
-				ackSent = true
-			}
-		}
-		if readErr == io.EOF {
-			if cfg.SizeBytes > 0 && stats.BytesReceived < cfg.SizeBytes {
-				return TransferStats{}, io.ErrUnexpectedEOF
-			}
-			if !ackSent {
-				if err := writeWireGuardDrainAck(tcpConn); err != nil {
-					probeWGTracef("recv single ack write error=%v received=%d", err, stats.BytesReceived)
-					return TransferStats{}, err
-				}
-			}
-			probeWGTracef("recv single done received=%d", stats.BytesReceived)
-			stats.markComplete(time.Now())
-			return stats, nil
-		}
-		if readErr != nil {
-			return TransferStats{}, readErr
-		}
-	}
+	return receiveWireGuardSingle(ctx, &stats, dst, cfg, func(ctx context.Context) (net.Conn, error) {
+		return acceptConn(ctx, ln)
+	})
 }
 
 func wireGuardStreamCount(cfg WireGuardConfig) int {
@@ -304,7 +196,7 @@ func probeWGTracef(format string, args ...any) {
 	if !probeWGTraceEnabled() {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "probe-wg: "+format+"\n", args...)
+	_, _ = fmt.Fprintf(os.Stderr, "probe-wg: "+format+"\n", args...)
 }
 
 func (r *zeroReader) Read(p []byte) (int, error) {
@@ -322,6 +214,144 @@ func (r *zeroReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+func sendWireGuardSingle(ctx context.Context, stats *TransferStats, src io.Reader, dial func(context.Context) (net.Conn, error)) (TransferStats, error) {
+	probeWGTracef("send single dial start")
+	tcpConn, err := dial(ctx)
+	if err != nil {
+		probeWGTracef("send single dial error=%v", err)
+		return TransferStats{}, err
+	}
+	probeWGTracef("send single dial ok local=%v remote=%v", tcpConn.LocalAddr(), tcpConn.RemoteAddr())
+	defer func() { _ = tcpConn.Close() }()
+
+	buf := make([]byte, 128<<10)
+	for {
+		if err := ctx.Err(); err != nil {
+			return TransferStats{}, err
+		}
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			if err := writeWireGuardSingleChunk(stats, tcpConn, buf[:n]); err != nil {
+				return TransferStats{}, err
+			}
+		}
+		if readErr == io.EOF {
+			return finishWireGuardSingleSend(ctx, stats, tcpConn)
+		}
+		if readErr != nil {
+			return TransferStats{}, readErr
+		}
+	}
+}
+
+func writeWireGuardSingleChunk(stats *TransferStats, conn net.Conn, chunk []byte) error {
+	written, err := conn.Write(chunk)
+	if written > 0 {
+		if stats.FirstByteAt.IsZero() {
+			stats.FirstByteAt = time.Now()
+		}
+		stats.BytesSent += int64(written)
+		stats.observePeakGoodput(time.Now(), stats.BytesSent)
+	}
+	if err != nil {
+		return err
+	}
+	if written != len(chunk) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func finishWireGuardSingleSend(ctx context.Context, stats *TransferStats, conn net.Conn) (TransferStats, error) {
+	if closer, ok := conn.(interface{ CloseWrite() error }); ok {
+		if err := closer.CloseWrite(); err != nil {
+			probeWGTracef("send single closewrite error=%v sent=%d", err, stats.BytesSent)
+			return TransferStats{}, err
+		}
+	}
+	if err := waitForWireGuardAck(ctx, conn); err != nil {
+		probeWGTracef("send single ack error=%v sent=%d", err, stats.BytesSent)
+		return TransferStats{}, err
+	}
+	probeWGTracef("send single done sent=%d", stats.BytesSent)
+	stats.markComplete(time.Now())
+	return *stats, nil
+}
+
+func receiveWireGuardSingle(ctx context.Context, stats *TransferStats, dst io.Writer, cfg WireGuardConfig, accept func(context.Context) (net.Conn, error)) (TransferStats, error) {
+	probeWGTracef("recv single accept start")
+	tcpConn, err := accept(ctx)
+	if err != nil {
+		probeWGTracef("recv single accept error=%v", err)
+		return TransferStats{}, err
+	}
+	probeWGTracef("recv single accept ok local=%v remote=%v", tcpConn.LocalAddr(), tcpConn.RemoteAddr())
+	defer func() { _ = tcpConn.Close() }()
+
+	buf := make([]byte, 128<<10)
+	ackSent := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return TransferStats{}, err
+		}
+		n, readErr := tcpConn.Read(buf)
+		if n > 0 {
+			var err error
+			ackSent, err = receiveWireGuardSingleChunk(stats, dst, tcpConn, buf[:n], cfg, ackSent)
+			if err != nil {
+				return TransferStats{}, err
+			}
+		}
+		if readErr == io.EOF {
+			return finishWireGuardSingleReceive(stats, tcpConn, cfg, ackSent)
+		}
+		if readErr != nil {
+			return TransferStats{}, readErr
+		}
+	}
+}
+
+func receiveWireGuardSingleChunk(stats *TransferStats, dst io.Writer, conn net.Conn, chunk []byte, cfg WireGuardConfig, ackSent bool) (bool, error) {
+	if stats.FirstByteAt.IsZero() {
+		stats.FirstByteAt = time.Now()
+	}
+	written, err := dst.Write(chunk)
+	if written > 0 {
+		stats.BytesReceived += int64(written)
+		stats.observePeakGoodput(time.Now(), stats.BytesReceived)
+	}
+	if err != nil {
+		return ackSent, err
+	}
+	if written != len(chunk) {
+		return ackSent, io.ErrShortWrite
+	}
+	if ackSent || cfg.SizeBytes <= 0 || stats.BytesReceived < cfg.SizeBytes {
+		return ackSent, nil
+	}
+	if err := writeWireGuardDrainAck(conn); err != nil {
+		probeWGTracef("recv single target ack write error=%v received=%d", err, stats.BytesReceived)
+		return ackSent, err
+	}
+	probeWGTracef("recv single reached target received=%d", stats.BytesReceived)
+	return true, nil
+}
+
+func finishWireGuardSingleReceive(stats *TransferStats, conn net.Conn, cfg WireGuardConfig, ackSent bool) (TransferStats, error) {
+	if cfg.SizeBytes > 0 && stats.BytesReceived < cfg.SizeBytes {
+		return TransferStats{}, io.ErrUnexpectedEOF
+	}
+	if !ackSent {
+		if err := writeWireGuardDrainAck(conn); err != nil {
+			probeWGTracef("recv single ack write error=%v received=%d", err, stats.BytesReceived)
+			return TransferStats{}, err
+		}
+	}
+	probeWGTracef("recv single done received=%d", stats.BytesReceived)
+	stats.markComplete(time.Now())
+	return *stats, nil
+}
+
 func sendWireGuardParallel(ctx context.Context, stats *TransferStats, dial func(context.Context) (net.Conn, error), cfg WireGuardConfig) (TransferStats, error) {
 	if cfg.SizeBytes <= 0 {
 		return TransferStats{}, fmt.Errorf("parallel wireguard send requires positive size bytes")
@@ -330,101 +360,131 @@ func sendWireGuardParallel(ctx context.Context, stats *TransferStats, dial func(
 	if err != nil {
 		return TransferStats{}, err
 	}
-	var (
-		wg       sync.WaitGroup
-		errCh    = make(chan error, len(shares))
-		firstSet sync.Once
-		total    atomic.Int64
-		peakMu   sync.Mutex
-		peak     intervalStats
-	)
-	peak.Observe(stats.StartedAt, 0)
-	observePeak := func(now time.Time, totalBytes int64) {
-		peakMu.Lock()
-		peak.Observe(now, totalBytes)
-		peakMu.Unlock()
+	return newWireGuardParallelSender(ctx, stats, dial).run(shares)
+}
+
+type wireGuardParallelSender struct {
+	ctx      context.Context
+	stats    *TransferStats
+	dial     func(context.Context) (net.Conn, error)
+	errCh    chan error
+	firstSet sync.Once
+	total    atomic.Int64
+	peakMu   sync.Mutex
+	peak     intervalStats
+}
+
+func newWireGuardParallelSender(ctx context.Context, stats *TransferStats, dial func(context.Context) (net.Conn, error)) *wireGuardParallelSender {
+	sender := &wireGuardParallelSender{
+		ctx:   ctx,
+		stats: stats,
+		dial:  dial,
 	}
+	sender.peak.Observe(stats.StartedAt, 0)
+	return sender
+}
+
+func (s *wireGuardParallelSender) run(shares []int64) (TransferStats, error) {
+	s.errCh = make(chan error, len(shares))
+	var (
+		wg sync.WaitGroup
+	)
 	for i, share := range shares {
-		streamID := i + 1
-		share := share
 		wg.Add(1)
-		go func(streamID int, share int64) {
-			defer wg.Done()
-			probeWGTracef("send stream=%d dial start share=%d", streamID, share)
-			tcpConn, err := dial(ctx)
-			if err != nil {
-				probeWGTracef("send stream=%d dial error=%v", streamID, err)
-				errCh <- err
-				return
-			}
-			probeWGTracef("send stream=%d dial ok local=%v remote=%v", streamID, tcpConn.LocalAddr(), tcpConn.RemoteAddr())
-			defer tcpConn.Close()
-			buf := make([]byte, 128<<10)
-			reader := &zeroReader{remaining: share}
-			var sent int64
-			for {
-				if err := ctx.Err(); err != nil {
-					probeWGTracef("send stream=%d ctx error=%v sent=%d", streamID, err, sent)
-					errCh <- err
-					return
-				}
-				n, readErr := reader.Read(buf)
-				if n > 0 {
-					written, writeErr := tcpConn.Write(buf[:n])
-					if written > 0 {
-						firstSet.Do(func() {
-							stats.FirstByteAt = time.Now()
-						})
-						totalBytes := total.Add(int64(written))
-						observePeak(time.Now(), totalBytes)
-						sent += int64(written)
-					}
-					if writeErr != nil {
-						probeWGTracef("send stream=%d write error=%v sent=%d", streamID, writeErr, sent)
-						errCh <- writeErr
-						return
-					}
-					if written != n {
-						probeWGTracef("send stream=%d short write written=%d want=%d sent=%d", streamID, written, n, sent)
-						errCh <- io.ErrShortWrite
-						return
-					}
-				}
-				if readErr == io.EOF {
-					if closer, ok := tcpConn.(interface{ CloseWrite() error }); ok {
-						if err := closer.CloseWrite(); err != nil {
-							probeWGTracef("send stream=%d closewrite error=%v sent=%d", streamID, err, sent)
-							errCh <- err
-							return
-						}
-					}
-					if err := waitForWireGuardAck(ctx, tcpConn); err != nil {
-						probeWGTracef("send stream=%d ack error=%v sent=%d", streamID, err, sent)
-						errCh <- err
-						return
-					}
-					probeWGTracef("send stream=%d done sent=%d", streamID, sent)
-					return
-				}
-				if readErr != nil {
-					probeWGTracef("send stream=%d read error=%v sent=%d", streamID, readErr, sent)
-					errCh <- readErr
-					return
-				}
-			}
-		}(streamID, share)
+		go s.runStream(&wg, i+1, share)
 	}
 	wg.Wait()
-	close(errCh)
-	for err := range errCh {
+	close(s.errCh)
+	for err := range s.errCh {
 		if err != nil {
 			return TransferStats{}, err
 		}
 	}
-	stats.BytesSent = total.Load()
-	stats.PeakGoodputMbps = peak.PeakMbps()
-	stats.markComplete(time.Now())
-	return *stats, nil
+	s.stats.BytesSent = s.total.Load()
+	s.stats.PeakGoodputMbps = s.peak.PeakMbps()
+	s.stats.markComplete(time.Now())
+	return *s.stats, nil
+}
+
+func (s *wireGuardParallelSender) runStream(wg *sync.WaitGroup, streamID int, share int64) {
+	defer wg.Done()
+	probeWGTracef("send stream=%d dial start share=%d", streamID, share)
+	tcpConn, err := s.dial(s.ctx)
+	if err != nil {
+		s.reportStreamError(streamID, "dial", err, 0)
+		return
+	}
+	probeWGTracef("send stream=%d dial ok local=%v remote=%v", streamID, tcpConn.LocalAddr(), tcpConn.RemoteAddr())
+	defer func() { _ = tcpConn.Close() }()
+
+	reader := &zeroReader{remaining: share}
+	buf := make([]byte, 128<<10)
+	var sent int64
+	for {
+		if err := s.ctx.Err(); err != nil {
+			s.reportStreamError(streamID, "ctx", err, sent)
+			return
+		}
+		n, readErr := reader.Read(buf)
+		if n > 0 {
+			written, err := s.writeStreamChunk(tcpConn, buf[:n])
+			sent += written
+			if err != nil {
+				s.reportStreamError(streamID, "write", err, sent)
+				return
+			}
+		}
+		if readErr == io.EOF {
+			s.finishStream(streamID, tcpConn, sent)
+			return
+		}
+		if readErr != nil {
+			s.reportStreamError(streamID, "read", readErr, sent)
+			return
+		}
+	}
+}
+
+func (s *wireGuardParallelSender) writeStreamChunk(conn net.Conn, chunk []byte) (int64, error) {
+	written, err := conn.Write(chunk)
+	if written > 0 {
+		s.firstSet.Do(func() {
+			s.stats.FirstByteAt = time.Now()
+		})
+		s.observePeak(time.Now(), s.total.Add(int64(written)))
+	}
+	if err != nil {
+		return int64(written), err
+	}
+	if written != len(chunk) {
+		return int64(written), io.ErrShortWrite
+	}
+	return int64(written), nil
+}
+
+func (s *wireGuardParallelSender) finishStream(streamID int, conn net.Conn, sent int64) {
+	if closer, ok := conn.(interface{ CloseWrite() error }); ok {
+		if err := closer.CloseWrite(); err != nil {
+			s.reportStreamError(streamID, "closewrite", err, sent)
+			return
+		}
+	}
+	if err := waitForWireGuardAck(s.ctx, conn); err != nil {
+		s.reportStreamError(streamID, "ack", err, sent)
+		return
+	}
+	probeWGTracef("send stream=%d done sent=%d", streamID, sent)
+}
+
+func (s *wireGuardParallelSender) observePeak(now time.Time, totalBytes int64) {
+	s.peakMu.Lock()
+	defer s.peakMu.Unlock()
+	s.peak.Observe(now, totalBytes)
+}
+
+func (s *wireGuardParallelSender) reportStreamError(streamID int, phase string, err error, sent int64) {
+	probeWGTracef("send stream=%d %s error=%v sent=%d", streamID, phase, err, sent)
+	s.errCh <- err
 }
 
 func receiveWireGuardParallel(ctx context.Context, stats *TransferStats, ln net.Listener, dst io.Writer, cfg WireGuardConfig) (TransferStats, error) {
@@ -434,195 +494,266 @@ func receiveWireGuardParallel(ctx context.Context, stats *TransferStats, ln net.
 	if dst != io.Discard {
 		return TransferStats{}, fmt.Errorf("parallel wireguard receive only supports io.Discard")
 	}
+	return newWireGuardParallelReceiver(ctx, stats, ln, cfg).run()
+}
+
+type wireGuardParallelReceiver struct {
+	ctx            context.Context
+	recvCtx        context.Context
+	cancel         context.CancelFunc
+	stats          *TransferStats
+	ln             net.Listener
+	cfg            WireGuardConfig
+	wg             sync.WaitGroup
+	firstSet       sync.Once
+	total          atomic.Int64
+	peakMu         sync.Mutex
+	peak           intervalStats
+	targetReached  atomic.Bool
+	activeMu       sync.Mutex
+	activeConn     []net.Conn
+	readerDone     chan struct{}
+	connCh         chan net.Conn
+	errCh          chan error
+	stopAcceptOnce sync.Once
+}
+
+func newWireGuardParallelReceiver(ctx context.Context, stats *TransferStats, ln net.Listener, cfg WireGuardConfig) *wireGuardParallelReceiver {
 	recvCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	var (
-		wg             sync.WaitGroup
-		firstSet       sync.Once
-		total          atomic.Int64
-		peakMu         sync.Mutex
-		peak           intervalStats
-		targetReached  atomic.Bool
-		activeMu       sync.Mutex
-		activeConn     []net.Conn
-		readerDone     = make(chan struct{}, wireGuardStreamCount(cfg))
-		connCh         = make(chan net.Conn, wireGuardStreamCount(cfg))
-		errCh          = make(chan error, 1)
-		stopAcceptOnce sync.Once
-	)
-	peak.Observe(stats.StartedAt, 0)
-	observePeak := func(now time.Time, totalBytes int64) {
-		peakMu.Lock()
-		peak.Observe(now, totalBytes)
-		peakMu.Unlock()
+	receiver := &wireGuardParallelReceiver{
+		ctx:        ctx,
+		recvCtx:    recvCtx,
+		cancel:     cancel,
+		stats:      stats,
+		ln:         ln,
+		cfg:        cfg,
+		readerDone: make(chan struct{}, wireGuardStreamCount(cfg)),
+		connCh:     make(chan net.Conn, wireGuardStreamCount(cfg)),
+		errCh:      make(chan error, 1),
 	}
+	receiver.peak.Observe(stats.StartedAt, 0)
+	return receiver
+}
 
-	stopAccepting := func() {
-		stopAcceptOnce.Do(func() {
-			_ = ln.Close()
-		})
-	}
-
-	stop := func() {
-		cancel()
-		stopAccepting()
-		activeMu.Lock()
-		defer activeMu.Unlock()
-		for _, conn := range activeConn {
-			_ = conn.Close()
-		}
-		activeConn = nil
-	}
-
-	go func() {
-		defer close(connCh)
-		for {
-			tcpConn, err := acceptConn(recvCtx, ln)
-			if err != nil {
-				if recvCtx.Err() != nil || errors.Is(err, net.ErrClosed) {
-					return
-				}
-				select {
-				case errCh <- err:
-				default:
-				}
-				return
-			}
-			select {
-			case connCh <- tcpConn:
-			case <-recvCtx.Done():
-				_ = tcpConn.Close()
-				return
-			}
-		}
-	}()
+func (r *wireGuardParallelReceiver) run() (TransferStats, error) {
+	defer r.cancel()
+	go r.acceptLoop()
 
 	streamsAccepted := 0
 	accepting := true
-	for {
-		activeMu.Lock()
-		active := len(activeConn)
-		activeMu.Unlock()
-		if targetReached.Load() && !accepting && active == 0 {
-			break
-		}
+	for !r.done(accepting) {
 		select {
-		case tcpConn, ok := <-connCh:
-			if !ok {
-				accepting = false
-				connCh = nil
-				if streamsAccepted == 0 {
-					stop()
-					if err := recvCtx.Err(); err != nil && err != context.Canceled {
-						return TransferStats{}, err
-					}
-					return TransferStats{}, io.ErrUnexpectedEOF
-				}
-				continue
-			}
-			streamsAccepted++
-			streamID := streamsAccepted
-			probeWGTracef("recv accept stream=%d local=%v remote=%v", streamID, tcpConn.LocalAddr(), tcpConn.RemoteAddr())
-			activeMu.Lock()
-			activeConn = append(activeConn, tcpConn)
-			activeMu.Unlock()
-			wg.Add(1)
-			go func(streamID int, conn net.Conn) {
-				defer wg.Done()
-				defer func() {
-					_ = conn.Close()
-					activeMu.Lock()
-					for i, active := range activeConn {
-						if active == conn {
-							activeConn = append(activeConn[:i], activeConn[i+1:]...)
-							break
-						}
-					}
-					activeMu.Unlock()
-					select {
-					case readerDone <- struct{}{}:
-					default:
-					}
-					probeWGTracef("recv stream=%d reader done total=%d", streamID, total.Load())
-				}()
-
-				buf := make([]byte, 128<<10)
-				var received int64
-				for {
-					if err := recvCtx.Err(); err != nil {
-						probeWGTracef("recv stream=%d ctx error=%v received=%d total=%d", streamID, err, received, total.Load())
-						return
-					}
-					n, readErr := conn.Read(buf)
-					if n > 0 {
-						firstSet.Do(func() {
-							stats.FirstByteAt = time.Now()
-						})
-						newTotal := total.Add(int64(n))
-						observePeak(time.Now(), newTotal)
-						received += int64(n)
-						if newTotal >= cfg.SizeBytes && targetReached.CompareAndSwap(false, true) {
-							probeWGTracef("recv stream=%d reached target received=%d total=%d", streamID, received, newTotal)
-							stopAccepting()
-						}
-					}
-					if readErr == io.EOF {
-						if err := writeWireGuardDrainAck(conn); err != nil {
-							probeWGTracef("recv stream=%d ack write error=%v received=%d total=%d", streamID, err, received, total.Load())
-							select {
-							case errCh <- err:
-							default:
-							}
-							stop()
-							return
-						}
-						probeWGTracef("recv stream=%d eof received=%d total=%d", streamID, received, total.Load())
-						return
-					}
-					if readErr != nil {
-						probeWGTracef("recv stream=%d read error=%v received=%d total=%d", streamID, readErr, received, total.Load())
-						select {
-						case errCh <- readErr:
-						default:
-						}
-						stop()
-						return
-					}
-				}
-			}(streamID, tcpConn)
-		case err := <-errCh:
+		case tcpConn, ok := <-r.connCh:
+			var err error
+			accepting, streamsAccepted, err = r.handleAcceptedConn(tcpConn, ok, accepting, streamsAccepted)
 			if err != nil {
-				stop()
-				wg.Wait()
 				return TransferStats{}, err
 			}
-		case <-readerDone:
-			if !accepting {
-				activeMu.Lock()
-				active := len(activeConn)
-				activeMu.Unlock()
-				if active == 0 && total.Load() < cfg.SizeBytes {
-					stop()
-					wg.Wait()
-					return TransferStats{}, io.ErrUnexpectedEOF
-				}
+		case err := <-r.errCh:
+			if err != nil {
+				return r.stopAndWaitErr(err)
 			}
-		case <-ctx.Done():
-			stop()
-			wg.Wait()
-			return TransferStats{}, ctx.Err()
+		case <-r.readerDone:
+			if err := r.checkReaderDrain(accepting); err != nil {
+				return TransferStats{}, err
+			}
+		case <-r.ctx.Done():
+			return r.stopAndWaitErr(r.ctx.Err())
 		}
 	}
 
-	stop()
-	wg.Wait()
-	if err := ctx.Err(); err != nil && err != context.Canceled {
+	r.stop()
+	r.wg.Wait()
+	return r.finish()
+}
+
+func (r *wireGuardParallelReceiver) finish() (TransferStats, error) {
+	if err := r.ctx.Err(); err != nil && err != context.Canceled {
 		return TransferStats{}, err
 	}
-	stats.BytesReceived = min(total.Load(), cfg.SizeBytes)
-	stats.PeakGoodputMbps = peak.PeakMbps()
-	stats.markComplete(time.Now())
-	return *stats, nil
+	r.stats.BytesReceived = min(r.total.Load(), r.cfg.SizeBytes)
+	r.stats.PeakGoodputMbps = r.peak.PeakMbps()
+	r.stats.markComplete(time.Now())
+	return *r.stats, nil
+}
+
+func (r *wireGuardParallelReceiver) done(accepting bool) bool {
+	return r.targetReached.Load() && !accepting && r.activeCount() == 0
+}
+
+func (r *wireGuardParallelReceiver) activeCount() int {
+	r.activeMu.Lock()
+	defer r.activeMu.Unlock()
+	return len(r.activeConn)
+}
+
+func (r *wireGuardParallelReceiver) acceptLoop() {
+	defer close(r.connCh)
+	for {
+		tcpConn, err := acceptConn(r.recvCtx, r.ln)
+		if err != nil {
+			if r.recvCtx.Err() == nil && !errors.Is(err, net.ErrClosed) {
+				r.reportErr(err)
+			}
+			return
+		}
+		select {
+		case r.connCh <- tcpConn:
+		case <-r.recvCtx.Done():
+			_ = tcpConn.Close()
+			return
+		}
+	}
+}
+
+func (r *wireGuardParallelReceiver) handleAcceptedConn(tcpConn net.Conn, ok bool, accepting bool, streamsAccepted int) (bool, int, error) {
+	if !ok {
+		return r.handleAcceptClosed(streamsAccepted)
+	}
+	streamsAccepted++
+	r.startReader(streamsAccepted, tcpConn)
+	return accepting, streamsAccepted, nil
+}
+
+func (r *wireGuardParallelReceiver) handleAcceptClosed(streamsAccepted int) (bool, int, error) {
+	r.connCh = nil
+	if streamsAccepted > 0 {
+		return false, streamsAccepted, nil
+	}
+	r.stop()
+	if err := r.recvCtx.Err(); err != nil && err != context.Canceled {
+		return false, streamsAccepted, err
+	}
+	return false, streamsAccepted, io.ErrUnexpectedEOF
+}
+
+func (r *wireGuardParallelReceiver) startReader(streamID int, conn net.Conn) {
+	probeWGTracef("recv accept stream=%d local=%v remote=%v", streamID, conn.LocalAddr(), conn.RemoteAddr())
+	r.activeMu.Lock()
+	r.activeConn = append(r.activeConn, conn)
+	r.activeMu.Unlock()
+	r.wg.Add(1)
+	go r.readStream(streamID, conn)
+}
+
+func (r *wireGuardParallelReceiver) readStream(streamID int, conn net.Conn) {
+	defer r.finishReader(streamID, conn)
+	buf := make([]byte, 128<<10)
+	var received int64
+	for {
+		if err := r.recvCtx.Err(); err != nil {
+			probeWGTracef("recv stream=%d ctx error=%v received=%d total=%d", streamID, err, received, r.total.Load())
+			return
+		}
+		n, readErr := conn.Read(buf)
+		if n > 0 {
+			received += r.observeRead(streamID, int64(n), received)
+		}
+		if readErr == io.EOF {
+			r.ackStreamEOF(streamID, conn, received)
+			return
+		}
+		if readErr != nil {
+			r.reportReadError(streamID, readErr, received)
+			return
+		}
+	}
+}
+
+func (r *wireGuardParallelReceiver) observeRead(streamID int, n int64, received int64) int64 {
+	r.firstSet.Do(func() {
+		r.stats.FirstByteAt = time.Now()
+	})
+	newTotal := r.total.Add(n)
+	r.observePeak(time.Now(), newTotal)
+	if newTotal >= r.cfg.SizeBytes && r.targetReached.CompareAndSwap(false, true) {
+		probeWGTracef("recv stream=%d reached target received=%d total=%d", streamID, received+n, newTotal)
+		r.stopAccepting()
+	}
+	return n
+}
+
+func (r *wireGuardParallelReceiver) ackStreamEOF(streamID int, conn net.Conn, received int64) {
+	if err := writeWireGuardDrainAck(conn); err != nil {
+		probeWGTracef("recv stream=%d ack write error=%v received=%d total=%d", streamID, err, received, r.total.Load())
+		r.reportErr(err)
+		r.stop()
+		return
+	}
+	probeWGTracef("recv stream=%d eof received=%d total=%d", streamID, received, r.total.Load())
+}
+
+func (r *wireGuardParallelReceiver) reportReadError(streamID int, err error, received int64) {
+	probeWGTracef("recv stream=%d read error=%v received=%d total=%d", streamID, err, received, r.total.Load())
+	r.reportErr(err)
+	r.stop()
+}
+
+func (r *wireGuardParallelReceiver) finishReader(streamID int, conn net.Conn) {
+	r.wg.Done()
+	_ = conn.Close()
+	r.removeActive(conn)
+	select {
+	case r.readerDone <- struct{}{}:
+	default:
+	}
+	probeWGTracef("recv stream=%d reader done total=%d", streamID, r.total.Load())
+}
+
+func (r *wireGuardParallelReceiver) removeActive(conn net.Conn) {
+	r.activeMu.Lock()
+	defer r.activeMu.Unlock()
+	for i, active := range r.activeConn {
+		if active == conn {
+			r.activeConn = append(r.activeConn[:i], r.activeConn[i+1:]...)
+			return
+		}
+	}
+}
+
+func (r *wireGuardParallelReceiver) checkReaderDrain(accepting bool) error {
+	if accepting || r.activeCount() > 0 || r.total.Load() >= r.cfg.SizeBytes {
+		return nil
+	}
+	r.stop()
+	r.wg.Wait()
+	return io.ErrUnexpectedEOF
+}
+
+func (r *wireGuardParallelReceiver) observePeak(now time.Time, totalBytes int64) {
+	r.peakMu.Lock()
+	defer r.peakMu.Unlock()
+	r.peak.Observe(now, totalBytes)
+}
+
+func (r *wireGuardParallelReceiver) stopAccepting() {
+	r.stopAcceptOnce.Do(func() {
+		_ = r.ln.Close()
+	})
+}
+
+func (r *wireGuardParallelReceiver) stop() {
+	r.cancel()
+	r.stopAccepting()
+	r.activeMu.Lock()
+	defer r.activeMu.Unlock()
+	for _, conn := range r.activeConn {
+		_ = conn.Close()
+	}
+	r.activeConn = nil
+}
+
+func (r *wireGuardParallelReceiver) stopAndWaitErr(err error) (TransferStats, error) {
+	r.stop()
+	r.wg.Wait()
+	return TransferStats{}, err
+}
+
+func (r *wireGuardParallelReceiver) reportErr(err error) {
+	select {
+	case r.errCh <- err:
+	default:
+	}
 }
 
 type resolvedWireGuardConfig struct {
@@ -634,40 +765,15 @@ type resolvedWireGuardConfig struct {
 }
 
 func newWireGuardNode(conn net.PacketConn, cfg WireGuardConfig) (*wgtransport.Node, resolvedWireGuardConfig, error) {
-	if conn == nil {
-		return nil, resolvedWireGuardConfig{}, fmt.Errorf("nil packet conn")
-	}
-	if strings.TrimSpace(cfg.Transport) == "" {
-		cfg.Transport = probeTransportBatched
-	}
-	if cfg.Transport != probeTransportBatched {
-		return nil, resolvedWireGuardConfig{}, fmt.Errorf("wireguard probe mode requires %q transport", probeTransportBatched)
-	}
-	privateKey, err := parseHex32(cfg.PrivateKeyHex)
+	resolved, err := resolveWireGuardConfig(conn, cfg)
 	if err != nil {
-		return nil, resolvedWireGuardConfig{}, fmt.Errorf("parse wg private key: %w", err)
-	}
-	peerPublic, err := parseHex32(cfg.PeerPublicHex)
-	if err != nil {
-		return nil, resolvedWireGuardConfig{}, fmt.Errorf("parse wg peer public key: %w", err)
-	}
-	localAddr, err := netip.ParseAddr(strings.TrimSpace(cfg.LocalAddr))
-	if err != nil {
-		return nil, resolvedWireGuardConfig{}, fmt.Errorf("parse wg local addr: %w", err)
-	}
-	peerAddr, err := netip.ParseAddr(strings.TrimSpace(cfg.PeerAddr))
-	if err != nil {
-		return nil, resolvedWireGuardConfig{}, fmt.Errorf("parse wg peer addr: %w", err)
-	}
-	port := cfg.Port
-	if port == 0 {
-		port = defaultWireGuardProbePort
+		return nil, resolvedWireGuardConfig{}, err
 	}
 	node, err := wgtransport.NewNode(wgtransport.Config{
-		PrivateKey:     privateKey,
-		PeerPublicKey:  peerPublic,
-		LocalAddr:      localAddr,
-		PeerAddr:       peerAddr,
+		PrivateKey:     resolved.privateKey,
+		PeerPublicKey:  resolved.peerPublic,
+		LocalAddr:      resolved.localAddr,
+		PeerAddr:       resolved.peerAddr,
 		PacketConn:     conn,
 		Transport:      cfg.Transport,
 		DirectEndpoint: strings.TrimSpace(cfg.DirectEndpoint),
@@ -675,13 +781,7 @@ func newWireGuardNode(conn net.PacketConn, cfg WireGuardConfig) (*wgtransport.No
 	if err != nil {
 		return nil, resolvedWireGuardConfig{}, err
 	}
-	return node, resolvedWireGuardConfig{
-		privateKey: privateKey,
-		peerPublic: peerPublic,
-		localAddr:  localAddr,
-		peerAddr:   peerAddr,
-		port:       port,
-	}, nil
+	return node, resolved, nil
 }
 
 func parseHex32(raw string) ([32]byte, error) {

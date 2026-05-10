@@ -21,6 +21,17 @@ func TestEncodeFileToken(t *testing.T) {
 	}
 }
 
+func TestEncodeReceiveTokenUsesFilePayload(t *testing.T) {
+	got, err := EncodeReceiveToken("receive-token")
+	if err != nil {
+		t.Fatalf("EncodeReceiveToken() error = %v", err)
+	}
+	const want = "derphole://file?token=receive-token&v=1"
+	if got != want {
+		t.Fatalf("EncodeReceiveToken() = %q, want %q", got, want)
+	}
+}
+
 func TestEncodeFileTokenTrimsAndEscapesToken(t *testing.T) {
 	got, err := EncodeFileToken(" token with spaces ")
 	if err != nil {

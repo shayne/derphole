@@ -370,27 +370,44 @@ func (m *Manager) Updates(ctx context.Context) <-chan Update {
 	updates := make(chan Update, 1)
 	go func() {
 		defer close(updates)
-
-		last := PathUnknown
-		for {
-			path, notify := m.snapshotUpdate()
-			if path != last {
-				select {
-				case updates <- Update{Path: path}:
-					last = path
-				case <-ctx.Done():
-					return
-				}
-			}
-
-			select {
-			case <-ctx.Done():
-				return
-			case <-notify:
-			}
-		}
+		m.runUpdates(ctx, updates)
 	}()
 	return updates
+}
+
+func (m *Manager) runUpdates(ctx context.Context, updates chan<- Update) {
+	last := PathUnknown
+	for {
+		path, notify := m.snapshotUpdate()
+		if !m.sendUpdateIfChanged(ctx, updates, path, &last) {
+			return
+		}
+		if !waitForStateNotify(ctx, notify) {
+			return
+		}
+	}
+}
+
+func (m *Manager) sendUpdateIfChanged(ctx context.Context, updates chan<- Update, path Path, last *Path) bool {
+	if path == *last {
+		return true
+	}
+	select {
+	case updates <- Update{Path: path}:
+		*last = path
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func waitForStateNotify(ctx context.Context, notify <-chan struct{}) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-notify:
+		return true
+	}
 }
 
 func (m *Manager) DroppedPeerDatagrams() uint64 {

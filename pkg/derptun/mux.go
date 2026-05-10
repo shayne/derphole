@@ -236,6 +236,18 @@ func (m *Mux) ActiveStreamCount() int {
 }
 
 func (m *Mux) Ping(ctx context.Context, timeout time.Duration) error {
+	deadline := m.pingDeadline(ctx, timeout)
+	id := m.nextPing()
+	pong := m.registerPongWaiter(id)
+	defer m.removePongWaiter(id)
+
+	if err := m.writeFrameUntilContext(ctx, frameHeader{Type: frameTypePing, Seq: id}, nil, deadline); err != nil {
+		return fmt.Errorf("send ping: %w", err)
+	}
+	return m.waitPong(ctx, pong, deadline)
+}
+
+func (m *Mux) pingDeadline(ctx context.Context, timeout time.Duration) time.Time {
 	if timeout <= 0 {
 		timeout = m.cfg.ReconnectTimeout
 	}
@@ -244,17 +256,12 @@ func (m *Mux) Ping(ctx context.Context, timeout time.Duration) error {
 	}
 	deadline := time.Now().Add(timeout)
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
-		deadline = ctxDeadline
+		return ctxDeadline
 	}
+	return deadline
+}
 
-	id := m.nextPing()
-	pong := m.registerPongWaiter(id)
-	defer m.removePongWaiter(id)
-
-	if err := m.writeFrameUntilContext(ctx, frameHeader{Type: frameTypePing, Seq: id}, nil, deadline); err != nil {
-		return fmt.Errorf("send ping: %w", err)
-	}
-
+func (m *Mux) waitPong(ctx context.Context, pong <-chan struct{}, deadline time.Time) error {
 	wait := time.Until(deadline)
 	if wait <= 0 {
 		return context.DeadlineExceeded
@@ -435,7 +442,7 @@ func (m *Mux) writeOnCarrier(carrier io.ReadWriteCloser, generation uint64, head
 	}
 	if deadlineSetter, ok := carrier.(interface{ SetWriteDeadline(time.Time) error }); ok {
 		_ = deadlineSetter.SetWriteDeadline(deadline)
-		defer deadlineSetter.SetWriteDeadline(time.Time{})
+		defer func() { _ = deadlineSetter.SetWriteDeadline(time.Time{}) }()
 	}
 
 	if _, err := carrier.Write(prefix[:]); err != nil {
@@ -484,73 +491,88 @@ func (m *Mux) readLoop(generation uint64, carrier io.ReadWriteCloser) {
 func (m *Mux) handleFrame(header frameHeader, payload []byte) error {
 	switch header.Type {
 	case frameTypeOpen:
-		_, appConn := m.getOrCreateRemoteStream(header.StreamID)
-		if err := m.writeFrameUntil(frameHeader{
-			Type:     frameTypeAck,
-			StreamID: header.StreamID,
-			Seq:      0,
-		}, nil, m.deadline()); err != nil {
-			return err
-		}
-		if appConn == nil {
-			return nil
-		}
-
-		select {
-		case m.acceptCh <- appConn:
-			return nil
-		case <-m.closeCh:
-			_ = appConn.Close()
-			return net.ErrClosed
-		}
-
+		return m.handleOpenFrame(header)
 	case frameTypeData:
-		stream := m.getStream(header.StreamID)
-		if stream == nil {
-			return nil
-		}
-		go func() {
-			ackSeq, err := stream.deliver(header.Seq, payload)
-			if err != nil {
-				m.removeStream(header.StreamID, stream)
-				_ = stream.conn.Close()
-				return
-			}
-			_ = m.writeFrameUntil(frameHeader{
-				Type:     frameTypeAck,
-				StreamID: header.StreamID,
-				Seq:      ackSeq,
-			}, nil, m.deadline())
-		}()
-		return nil
-
+		return m.handleDataFrame(header, payload)
 	case frameTypeAck:
-		stream := m.getStream(header.StreamID)
-		if stream != nil {
-			if header.Seq == 0 {
-				stream.handleOpenAck()
-			}
-			stream.handleAck(header.Seq)
-		}
+		m.handleAckFrame(header)
 		return nil
-
 	case frameTypePing:
 		return m.writeFrameUntil(frameHeader{Type: frameTypePong, Seq: header.Seq}, nil, m.deadline())
-
 	case frameTypePong:
 		m.handlePong(header.Seq)
 		return nil
-
 	case frameTypeClose:
-		stream := m.getStream(header.StreamID)
-		if stream != nil {
-			m.removeStream(header.StreamID, stream)
-			_ = stream.conn.Close()
-		}
+		m.handleCloseFrame(header)
 		return nil
 	}
 
 	return nil
+}
+
+func (m *Mux) handleOpenFrame(header frameHeader) error {
+	_, appConn := m.getOrCreateRemoteStream(header.StreamID)
+	if err := m.writeFrameUntil(frameHeader{
+		Type:     frameTypeAck,
+		StreamID: header.StreamID,
+		Seq:      0,
+	}, nil, m.deadline()); err != nil {
+		return err
+	}
+	if appConn == nil {
+		return nil
+	}
+
+	select {
+	case m.acceptCh <- appConn:
+		return nil
+	case <-m.closeCh:
+		_ = appConn.Close()
+		return net.ErrClosed
+	}
+}
+
+func (m *Mux) handleDataFrame(header frameHeader, payload []byte) error {
+	stream := m.getStream(header.StreamID)
+	if stream == nil {
+		return nil
+	}
+	go m.deliverDataFrame(stream, header, payload)
+	return nil
+}
+
+func (m *Mux) deliverDataFrame(stream *muxStream, header frameHeader, payload []byte) {
+	ackSeq, err := stream.deliver(header.Seq, payload)
+	if err != nil {
+		m.removeStream(header.StreamID, stream)
+		_ = stream.conn.Close()
+		return
+	}
+	_ = m.writeFrameUntil(frameHeader{
+		Type:     frameTypeAck,
+		StreamID: header.StreamID,
+		Seq:      ackSeq,
+	}, nil, m.deadline())
+}
+
+func (m *Mux) handleAckFrame(header frameHeader) {
+	stream := m.getStream(header.StreamID)
+	if stream == nil {
+		return
+	}
+	if header.Seq == 0 {
+		stream.handleOpenAck()
+	}
+	stream.handleAck(header.Seq)
+}
+
+func (m *Mux) handleCloseFrame(header frameHeader) {
+	stream := m.getStream(header.StreamID)
+	if stream == nil {
+		return
+	}
+	m.removeStream(header.StreamID, stream)
+	_ = stream.conn.Close()
 }
 
 func readFrame(r io.Reader) (frameHeader, []byte, error) {

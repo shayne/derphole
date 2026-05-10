@@ -87,24 +87,12 @@ func (w *streamReplayWindow) AddPacket(packetType PacketType, stripeID uint16, s
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
 	slotIndex := int(seq % uint64(len(w.slots)))
 	slot := &w.slots[slotIndex]
-	if slot.present && slot.seq != seq {
-		return nil, errStreamReplayWindowFull
-	}
-	packetBytes := uint64(headerLen + len(payload))
-	if w.packetAEAD != nil {
-		packetBytes += uint64(w.packetAEAD.Overhead())
-	}
-	if packetBytes > uint64(w.packetStride) {
-		return nil, errors.New("stream replay packet exceeds slot size")
-	}
-	retainedAfterReplace := w.retained
-	if slot.present && slot.bytes <= retainedAfterReplace {
-		retainedAfterReplace -= slot.bytes
-	}
-	if w.maxBytes > 0 && retainedAfterReplace+packetBytes > w.maxBytes {
-		return nil, errStreamReplayWindowFull
+	packetBytes, err := w.reserveSlot(slot, seq, payload)
+	if err != nil {
+		return nil, err
 	}
 	packetBuf := w.packetBufferForSlot(slotIndex, int(packetBytes))
 	wire, err := marshalBlastPayloadPacketInto(packetBuf, packetType, w.runID, stripeID, seq, offset, 0, 0, payload, w.packetAEAD, &w.nonce)
@@ -121,6 +109,36 @@ func (w *streamReplayWindow) AddPacket(packetType PacketType, stripeID uint16, s
 	w.retained += packetBytes
 	w.maxRetained = max(w.maxRetained, w.retained)
 	return wire, nil
+}
+
+func (w *streamReplayWindow) reserveSlot(slot *streamReplaySlot, seq uint64, payload []byte) (uint64, error) {
+	if slot.present && slot.seq != seq {
+		return 0, errStreamReplayWindowFull
+	}
+	packetBytes := w.packetBytes(len(payload))
+	if packetBytes > uint64(w.packetStride) {
+		return 0, errors.New("stream replay packet exceeds slot size")
+	}
+	if w.wouldExceedMax(slot, packetBytes) {
+		return 0, errStreamReplayWindowFull
+	}
+	return packetBytes, nil
+}
+
+func (w *streamReplayWindow) packetBytes(payloadLen int) uint64 {
+	packetBytes := uint64(headerLen + payloadLen)
+	if w.packetAEAD != nil {
+		packetBytes += uint64(w.packetAEAD.Overhead())
+	}
+	return packetBytes
+}
+
+func (w *streamReplayWindow) wouldExceedMax(slot *streamReplaySlot, packetBytes uint64) bool {
+	retainedAfterReplace := w.retained
+	if slot.present && slot.bytes <= retainedAfterReplace {
+		retainedAfterReplace -= slot.bytes
+	}
+	return w.maxBytes > 0 && retainedAfterReplace+packetBytes > w.maxBytes
 }
 
 func (w *streamReplayWindow) AckFloor(seq uint64) {

@@ -135,28 +135,43 @@ func receiveSTUNPackets(ctx context.Context, conn net.PacketConn, recv func([]by
 		}
 		n, addr, err := conn.ReadFrom(buf)
 		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+			if !continueSTUNRead(ctx, err) {
 				return
 			}
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
-				continue
-			}
 			continue
 		}
-		if !stun.Is(buf[:n]) {
-			continue
-		}
-		udpAddr, ok := addr.(*net.UDPAddr)
+		packet, ok := stunPacketFromAddr(buf[:n], addr)
 		if !ok {
 			continue
 		}
-		addrPort, ok := netip.AddrFromSlice(udpAddr.IP)
-		if !ok {
-			continue
-		}
-		recv(append([]byte(nil), buf[:n]...), netip.AddrPortFrom(addrPort.Unmap(), uint16(udpAddr.Port)))
+		recv(packet.Payload, packet.Addr)
 	}
+}
+
+func continueSTUNRead(ctx context.Context, err error) bool {
+	if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+		return false
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func stunPacketFromAddr(payload []byte, addr net.Addr) (STUNPacket, bool) {
+	if !stun.Is(payload) {
+		return STUNPacket{}, false
+	}
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return STUNPacket{}, false
+	}
+	addrPort, ok := netip.AddrFromSlice(udpAddr.IP)
+	if !ok {
+		return STUNPacket{}, false
+	}
+	return STUNPacket{
+		Payload: append([]byte(nil), payload...),
+		Addr:    netip.AddrPortFrom(addrPort.Unmap(), uint16(udpAddr.Port)),
+	}, true
 }
 
 func appendMappedCandidate(candidates []string, mapped netip.AddrPort, ok bool) []string {

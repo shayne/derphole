@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,8 @@ import (
 	"github.com/shayne/derphole/pkg/derpbind"
 	"github.com/shayne/derphole/pkg/derphole/webproto"
 	"github.com/shayne/derphole/pkg/rendezvous"
+	"github.com/shayne/derphole/pkg/token"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
 
@@ -32,6 +35,33 @@ type fakeDirect struct {
 
 	sentMu sync.Mutex
 	sent   [][]byte
+}
+
+func TestFrameKindNameCoversKnownAndUnknownKinds(t *testing.T) {
+	for _, tc := range []struct {
+		kind webproto.FrameKind
+		want string
+	}{
+		{webproto.FrameClaim, "claim"},
+		{webproto.FrameDecision, "decision"},
+		{webproto.FrameMeta, "meta"},
+		{webproto.FrameData, "data"},
+		{webproto.FrameDone, "done"},
+		{webproto.FrameAck, "ack"},
+		{webproto.FrameAbort, "abort"},
+		{webproto.FrameWebRTCOffer, "webrtc-offer"},
+		{webproto.FrameWebRTCAnswer, "webrtc-answer"},
+		{webproto.FrameWebRTCIceCandidate, "webrtc-candidate"},
+		{webproto.FrameWebRTCIceComplete, "webrtc-ice-complete"},
+		{webproto.FrameDirectReady, "direct-ready"},
+		{webproto.FramePathSwitch, "path-switch"},
+		{webproto.FrameDirectFailed, "direct-failed"},
+		{webproto.FrameKind(255), "unknown"},
+	} {
+		if got := frameKindName(tc.kind); got != tc.want {
+			t.Fatalf("frameKindName(%d) = %q, want %q", tc.kind, got, tc.want)
+		}
+	}
 }
 
 func newFakeDirect() *fakeDirect {
@@ -102,6 +132,7 @@ type fakeDERPClient struct {
 	pub key.NodePublic
 
 	sendHook func(key.NodePublic, []byte)
+	closeErr error
 
 	mu          sync.Mutex
 	sent        []sentDERPPacket
@@ -137,7 +168,7 @@ func (c *fakeDERPClient) Close() error {
 		close(sub.ch)
 		delete(c.subscribers, id)
 	}
-	return nil
+	return c.closeErr
 }
 
 func (c *fakeDERPClient) Send(ctx context.Context, dst key.NodePublic, payload []byte) error {
@@ -230,6 +261,226 @@ func (c *fakeDERPClient) sentFrames(t *testing.T) []webproto.Frame {
 		frames = append(frames, frame)
 	}
 	return frames
+}
+
+func TestWebRelaySmallHelpers(t *testing.T) {
+	direct := &directState{}
+	direct.noteReady()
+	if !direct.ready || direct.active {
+		t.Fatalf("noteReady() state = %+v, want ready inactive", direct)
+	}
+	direct.noteSwitched()
+	if !direct.ready || !direct.active || direct.fallbackReason != "" {
+		t.Fatalf("noteSwitched() state = %+v, want active without fallback", direct)
+	}
+	direct.noteFailure(errors.New("fallback"))
+	if direct.ready || direct.active || direct.fallbackReason != "fallback" {
+		t.Fatalf("noteFailure() state = %+v, want fallback recorded", direct)
+	}
+
+	if got := chooseSendPath(TransferOptions{}, true); got != sendPathRelay {
+		t.Fatalf("chooseSendPath(no direct) = %v, want relay", got)
+	}
+	if got := chooseSendPath(TransferOptions{Direct: newFakeDirect()}, true); got != sendPathDirect {
+		t.Fatalf("chooseSendPath(active direct) = %v, want direct", got)
+	}
+	if got := chooseSendPath(TransferOptions{Direct: newFakeDirect()}, false); got != sendPathRelay {
+		t.Fatalf("chooseSendPath(inactive direct) = %v, want relay", got)
+	}
+
+	if got := FormatError("send", nil); got != nil {
+		t.Fatalf("FormatError(nil) = %v, want nil", got)
+	}
+	if got := FormatError("send", errors.New("boom")); got == nil || got.Error() != "send: boom" {
+		t.Fatalf("FormatError() = %v, want wrapped prefix", got)
+	}
+}
+
+func TestWebRelayTokenAndDERPHelpers(t *testing.T) {
+	client := newFakeDERPClient()
+	node := &tailcfg.DERPNode{RegionID: 7, HostName: "derp.example.com", DERPPort: 8443}
+	tokValue, encoded, err := newEncodedOfferToken(client, node)
+	if err != nil {
+		t.Fatalf("newEncodedOfferToken() error = %v", err)
+	}
+	if tokValue.BootstrapRegion != 7 || tokValue.Capabilities != token.CapabilityWebFile {
+		t.Fatalf("token = %+v, want web file bootstrap region 7", tokValue)
+	}
+	decoded, err := decodeWebFileToken(encoded)
+	if err != nil {
+		t.Fatalf("decodeWebFileToken(encoded) error = %v", err)
+	}
+	if decoded.SessionID != tokValue.SessionID {
+		t.Fatal("decoded token session mismatch")
+	}
+
+	nonWeb := tokValue
+	nonWeb.Capabilities = 0
+	nonWebEncoded, err := token.Encode(nonWeb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeWebFileToken(nonWebEncoded); err == nil {
+		t.Fatal("decodeWebFileToken(non-web) error = nil, want failure")
+	}
+
+	if got := publicDERPServerURL(node); got != "https://derp.example.com:8443/derp" {
+		t.Fatalf("publicDERPServerURL(custom port) = %q", got)
+	}
+	if got := publicDERPServerURL(&tailcfg.DERPNode{HostName: "derp.example.com", DERPPort: 443}); got != "https://derp.example.com/derp" {
+		t.Fatalf("publicDERPServerURL(443) = %q", got)
+	}
+	if got := publicDERPServerURL(nil); got != "" {
+		t.Fatalf("publicDERPServerURL(nil) = %q, want empty", got)
+	}
+}
+
+func TestWebRelayDERPMapSelectionAndEnvOverrides(t *testing.T) {
+	dm := &tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{
+		1: {RegionID: 1, Nodes: []*tailcfg.DERPNode{{Name: "one", RegionID: 1}}},
+		9: {RegionID: 9, Nodes: []*tailcfg.DERPNode{{Name: "nine", RegionID: 9}}},
+	}}
+	if got := firstDERPNode(dm, 9); got == nil || got.Name != "nine" {
+		t.Fatalf("firstDERPNode(region 9) = %#v, want nine", got)
+	}
+	if got := firstDERPNode(dm, 0); got == nil {
+		t.Fatal("firstDERPNode(region 0) = nil, want first map node")
+	}
+	if got := firstDERPNode(nil, 1); got != nil {
+		t.Fatalf("firstDERPNode(nil) = %#v, want nil", got)
+	}
+	if got := firstDERPNode(&tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{}}, 1); got != nil {
+		t.Fatalf("firstDERPNode(empty) = %#v, want nil", got)
+	}
+
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", "https://example.test/map")
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", "https://example.test/derp")
+	if got := publicDERPMapURL(); got != "https://example.test/map" {
+		t.Fatalf("publicDERPMapURL() = %q, want override", got)
+	}
+	if got := publicDERPServerURL(&tailcfg.DERPNode{HostName: "ignored"}); got != "https://example.test/derp" {
+		t.Fatalf("publicDERPServerURL() = %q, want override", got)
+	}
+}
+
+func TestWebRelayPayloadHelpers(t *testing.T) {
+	frame, err := marshalDirectReadyFrame(12, 345)
+	if err != nil {
+		t.Fatalf("marshalDirectReadyFrame() error = %v", err)
+	}
+	var ready webproto.DirectReady
+	if err := unmarshalFramePayload(frame, &ready); err != nil {
+		t.Fatalf("unmarshalFramePayload() error = %v", err)
+	}
+	if ready.NextSeq != 12 || ready.BytesReceived != 345 {
+		t.Fatalf("direct ready = %+v, want next 12 bytes 345", ready)
+	}
+
+	if err := decodeAbort([]byte(`{"reason":"sender stopped"}`)); err == nil || err.Error() != "sender stopped" {
+		t.Fatalf("decodeAbort(reason) = %v, want sender stopped", err)
+	}
+	if err := decodeAbort([]byte(`{}`)); err == nil || err.Error() != "peer aborted" {
+		t.Fatalf("decodeAbort(empty) = %v, want peer aborted", err)
+	}
+	if err := decodeAbort([]byte(`{`)); err == nil {
+		t.Fatal("decodeAbort(malformed) error = nil, want failure")
+	}
+
+	if got := directFailureErr(nil); got == nil || got.Error() != "direct path failed" {
+		t.Fatalf("directFailureErr(nil) = %v, want default failure", got)
+	}
+	if got := safeName(""); got != "derphole-download" {
+		t.Fatalf("safeName(empty) = %q, want default", got)
+	}
+	longName := string(bytes.Repeat([]byte("a"), maxFilenameBytes+10))
+	if got := safeName(longName); len(got) != maxFilenameBytes {
+		t.Fatalf("safeName(long) length = %d, want %d", len(got), maxFilenameBytes)
+	}
+}
+
+func TestOfferCloseReturnsClientError(t *testing.T) {
+	sentinel := errors.New("close failed")
+	offer := &Offer{client: &fakeDERPClient{closeErr: sentinel}}
+	if err := offer.Close(); !errors.Is(err, sentinel) {
+		t.Fatalf("Offer.Close() error = %v, want sentinel", err)
+	}
+	if err := (*Offer)(nil).Close(); err != nil {
+		t.Fatalf("nil Offer.Close() error = %v, want nil", err)
+	}
+}
+
+func TestDERPSignalPeerForwardsOnlyDirectSignalFrames(t *testing.T) {
+	client := newFakeDERPClient()
+	peer := key.NewNode().Public()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	signalPeer := newDERPSignalPeer(ctx, client, peer)
+	defer signalPeer.close()
+
+	if err := signalPeer.SendSignal(ctx, webproto.FrameDirectFailed, 44, []byte("bad")); err != nil {
+		t.Fatalf("SendSignal() error = %v", err)
+	}
+	sent := client.sentFrames(t)
+	if len(sent) != 1 || sent[0].Kind != webproto.FrameDirectFailed || sent[0].Seq != 44 {
+		t.Fatalf("sent signal frames = %#v, want direct failed seq 44", sent)
+	}
+
+	relayFrame, err := webproto.Marshal(webproto.FrameData, 1, []byte("ignored"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.emit(peer, relayFrame)
+	signalFrame, err := webproto.Marshal(webproto.FrameWebRTCOffer, 2, []byte("offer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.emit(peer, signalFrame)
+	select {
+	case got := <-signalPeer.Signals():
+		if got.Kind != webproto.FrameWebRTCOffer {
+			t.Fatalf("Signals() frame = %v, want offer", got.Kind)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for forwarded signal frame")
+	}
+
+	otherPeer := key.NewNode().Public()
+	client.emit(otherPeer, signalFrame)
+	select {
+	case got := <-signalPeer.Signals():
+		t.Fatalf("unexpected signal from other peer: %#v", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestNextRawFrameReportsDirectFailure(t *testing.T) {
+	direct := newFakeDirect()
+	direct.fail(errors.New("direct boom"))
+	if _, err := nextRawFrame(context.Background(), make(chan []byte), direct, true); err == nil || err.Error() != "direct boom" {
+		t.Fatalf("nextRawFrame(direct failure) error = %v, want direct boom", err)
+	}
+
+	direct = newFakeDirect()
+	direct.fail(nil)
+	if _, err := nextRawFrame(context.Background(), make(chan []byte), direct, true); err == nil || err.Error() != "direct path failed" {
+		t.Fatalf("nextRawFrame(nil direct failure) error = %v, want default failure", err)
+	}
+
+	rawCh := make(chan []byte, 1)
+	rawCh <- []byte("relay")
+	raw, err := nextRawFrame(context.Background(), rawCh, nil, false)
+	if err != nil || string(raw) != "relay" {
+		t.Fatalf("nextRawFrame(relay) = %q, %v; want relay nil", raw, err)
+	}
+}
+
+func TestPublicDERPServerURLFormatsIPv6Host(t *testing.T) {
+	node := &tailcfg.DERPNode{HostName: "2001:db8::1", DERPPort: 8443}
+	got := publicDERPServerURL(node)
+	wantHost := net.JoinHostPort("2001:db8::1", "8443")
+	if got != "https://"+wantHost+"/derp" {
+		t.Fatalf("publicDERPServerURL(IPv6) = %q, want bracketed host", got)
+	}
 }
 
 func (c *fakeDERPClient) waitForSubscribers(t *testing.T, want int) {

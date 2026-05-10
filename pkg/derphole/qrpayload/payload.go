@@ -92,23 +92,44 @@ func Parse(raw string) (Payload, error) {
 		return Payload{Kind: KindFile, Token: raw}, nil
 	}
 
-	parsed, err := url.Parse(raw)
+	parsed, err := parsePayloadURL(raw)
 	if err != nil {
 		return Payload{}, err
 	}
+	kind, err := parsePayloadKind(parsed.Host)
+	if err != nil {
+		return Payload{}, err
+	}
+	payload, err := parsePayloadValues(kind, parsed.Query())
+	if err != nil {
+		return Payload{}, err
+	}
+	return payload, nil
+}
+
+func parsePayloadURL(raw string) (*url.URL, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
 	if parsed.Scheme != Scheme {
-		return Payload{}, ErrUnsupportedPayload
+		return nil, ErrUnsupportedPayload
 	}
+	return parsed, nil
+}
 
-	kind := Kind(parsed.Host)
+func parsePayloadKind(host string) (Kind, error) {
+	kind := Kind(host)
 	if kind == Kind(ReceiveHost) {
-		kind = KindFile
+		return KindFile, nil
 	}
-	if kind != KindFile && kind != KindWeb && kind != KindTCP {
-		return Payload{}, ErrUnsupportedPayload
+	if kind == KindFile || kind == KindWeb || kind == KindTCP {
+		return kind, nil
 	}
+	return "", ErrUnsupportedPayload
+}
 
-	values := parsed.Query()
+func parsePayloadValues(kind Kind, values url.Values) (Payload, error) {
 	if got := values.Get("v"); got != Version {
 		return Payload{}, ErrUnsupportedVersion
 	}
@@ -116,17 +137,21 @@ func Parse(raw string) (Payload, error) {
 	if token == "" {
 		return Payload{}, ErrMissingToken
 	}
-
 	payload := Payload{Kind: kind, Token: token}
-	if kind == KindWeb {
-		payload.Scheme = strings.TrimSpace(values.Get("scheme"))
-		if payload.Scheme == "" {
-			return Payload{}, ErrUnsupportedPayload
-		}
-		payload.Path = strings.TrimSpace(values.Get("path"))
-		if payload.Path == "" {
-			payload.Path = "/"
-		}
+	if kind != KindWeb {
+		return payload, nil
+	}
+	return parseWebPayload(payload, values)
+}
+
+func parseWebPayload(payload Payload, values url.Values) (Payload, error) {
+	payload.Scheme = strings.TrimSpace(values.Get("scheme"))
+	if payload.Scheme == "" {
+		return Payload{}, ErrUnsupportedPayload
+	}
+	payload.Path = strings.TrimSpace(values.Get("path"))
+	if payload.Path == "" {
+		payload.Path = "/"
 	}
 	return payload, nil
 }

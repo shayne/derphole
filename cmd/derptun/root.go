@@ -47,41 +47,52 @@ var rootHelpConfig = rootRegistry.HelpConfig()
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	parsed, err := yargs.ParseKnownFlags[rootGlobalFlags](args, yargs.KnownFlagsOptions{})
 	if err != nil {
-		fmt.Fprintln(stderr, err)
-		fmt.Fprint(stderr, rootHelpText())
+		_, _ = fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprint(stderr, rootHelpText())
 		return 2
 	}
 	level, err := rootTelemetryLevel(parsed.Flags)
 	if err != nil {
-		fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprintln(stderr, err)
 		return 2
 	}
 	remaining := parsed.RemainingArgs
 	if len(remaining) == 0 || isRootHelpRequest(remaining) {
-		fmt.Fprint(stderr, rootHelpText())
+		_, _ = fmt.Fprint(stderr, rootHelpText())
 		return 0
 	}
 	if strings.HasPrefix(remaining[0], "-") {
-		fmt.Fprintf(stderr, "unknown flag: %s\n", remaining[0])
-		fmt.Fprint(stderr, rootHelpText())
+		_, _ = fmt.Fprintf(stderr, "unknown flag: %s\n", remaining[0])
+		_, _ = fmt.Fprint(stderr, rootHelpText())
 		return 2
 	}
-	switch remaining[0] {
-	case "token":
-		return runToken(remaining[1:], stdin, stdout, stderr)
-	case "serve":
-		return runServe(remaining[1:], level, stdin, stderr)
-	case "open":
-		return runOpen(remaining[1:], level, stdin, stderr)
-	case "connect":
-		return runConnect(remaining[1:], level, stdin, stdout, stderr)
-	case "version":
-		return runVersion(stdout, stderr)
-	case "netcheck":
-		return runNetcheckCmd(remaining[1:], stdout, stderr)
-	default:
-		fmt.Fprintf(stderr, "unknown command: %s\nRun 'derptun --help' for usage\n", remaining[0])
-		return 2
+	if handler, ok := rootCommandHandlers()[remaining[0]]; ok {
+		return handler(remaining[1:], level, stdin, stdout, stderr)
+	}
+	_, _ = fmt.Fprintf(stderr, "unknown command: %s\nRun 'derptun --help' for usage\n", remaining[0])
+	return 2
+}
+
+type rootCommandHandler func(args []string, level telemetry.Level, stdin io.Reader, stdout, stderr io.Writer) int
+
+func rootCommandHandlers() map[string]rootCommandHandler {
+	return map[string]rootCommandHandler{
+		"token": func(args []string, _ telemetry.Level, stdin io.Reader, stdout, stderr io.Writer) int {
+			return runToken(args, stdin, stdout, stderr)
+		},
+		"serve": func(args []string, level telemetry.Level, stdin io.Reader, _ io.Writer, stderr io.Writer) int {
+			return runServe(args, level, stdin, stderr)
+		},
+		"open": func(args []string, level telemetry.Level, stdin io.Reader, _ io.Writer, stderr io.Writer) int {
+			return runOpen(args, level, stdin, stderr)
+		},
+		"connect": runConnect,
+		"version": func(_ []string, _ telemetry.Level, _ io.Reader, stdout, stderr io.Writer) int {
+			return runVersion(stdout, stderr)
+		},
+		"netcheck": func(args []string, _ telemetry.Level, _ io.Reader, stdout, stderr io.Writer) int {
+			return runNetcheckCmd(args, stdout, stderr)
+		},
 	}
 }
 

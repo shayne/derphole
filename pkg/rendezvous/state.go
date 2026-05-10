@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -65,22 +66,17 @@ func (g *Gate) Accept(now time.Time, claim Claim) (Decision, error) {
 }
 
 func sameClaim(a, b Claim) bool {
-	if a.Version != b.Version ||
-		a.SessionID != b.SessionID ||
-		a.BearerMAC != b.BearerMAC ||
-		a.DERPPublic != b.DERPPublic ||
-		a.QUICPublic != b.QUICPublic ||
-		a.Parallel != b.Parallel ||
-		a.Capabilities != b.Capabilities ||
-		len(a.Candidates) != len(b.Candidates) {
-		return false
-	}
-	for i := range a.Candidates {
-		if a.Candidates[i] != b.Candidates[i] {
-			return false
-		}
-	}
-	return true
+	return sameClaimMetadata(a, b) && slices.Equal(a.Candidates, b.Candidates)
+}
+
+func sameClaimMetadata(a, b Claim) bool {
+	return a.Version == b.Version &&
+		a.SessionID == b.SessionID &&
+		a.BearerMAC == b.BearerMAC &&
+		a.DERPPublic == b.DERPPublic &&
+		a.QUICPublic == b.QUICPublic &&
+		a.Parallel == b.Parallel &&
+		a.Capabilities == b.Capabilities
 }
 
 func validBearerMAC(secret [32]byte, claim Claim) bool {

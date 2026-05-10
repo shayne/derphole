@@ -5,7 +5,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"io"
 
@@ -52,24 +51,12 @@ var runSendTransfer = pkgderphole.Send
 
 func runSend(args []string, level telemetry.Level, stdin io.Reader, stdout, stderr io.Writer) int {
 	parsed, err := yargs.ParseWithCommandAndHelp[struct{}, sendFlags, sendArgs](append([]string{"send"}, args...), sendHelpConfig)
-	if err != nil {
-		switch {
-		case errors.Is(err, yargs.ErrHelp), errors.Is(err, yargs.ErrSubCommandHelp), errors.Is(err, yargs.ErrHelpLLM):
-			if parsed != nil && parsed.HelpText != "" {
-				fmt.Fprint(stderr, parsed.HelpText)
-			} else {
-				fmt.Fprint(stderr, sendHelpText())
-			}
-			return 0
-		default:
-			fmt.Fprintln(stderr, err)
-			fmt.Fprint(stderr, sendHelpText())
-			return 2
-		}
+	if code, handled := handleYargsError(parsed, err, stderr, sendHelpText, nil); handled {
+		return code
 	}
 
 	if len(parsed.Parser.Args) > 1 || len(parsed.RemainingArgs) != 0 {
-		fmt.Fprint(stderr, sendHelpText())
+		_, _ = fmt.Fprint(stderr, sendHelpText())
 		return 2
 	}
 
@@ -92,7 +79,7 @@ func runSend(args []string, level telemetry.Level, stdin io.Reader, stdout, stde
 		QR:             parsed.SubCommandFlags.QR,
 		ParallelPolicy: session.DefaultParallelPolicy(),
 	}); err != nil {
-		fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
 

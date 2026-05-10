@@ -21,7 +21,7 @@ func AppendAuthorizedKey(path, publicKey string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	publicKey = strings.TrimSpace(publicKey)
 	if publicKey == "" {
@@ -48,48 +48,65 @@ func AuthorizedKeysPath(userName string) (string, error) {
 }
 
 func FindPublicKey(hint string) (string, string, string, error) {
+	path, err := resolvePublicKeyPath(hint)
+	if err != nil {
+		return "", "", "", err
+	}
+	return readPublicKey(path)
+}
+
+func resolvePublicKeyPath(hint string) (string, error) {
 	if hint == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
-			return "", "", "", err
+			return "", err
 		}
 		hint = filepath.Join(home, ".ssh")
 	}
 
 	info, err := os.Stat(hint)
 	if err != nil {
-		return "", "", "", err
+		return "", err
 	}
 
-	path := hint
 	if info.IsDir() {
-		entries, err := os.ReadDir(hint)
-		if err != nil {
-			return "", "", "", err
-		}
+		return publicKeyPathFromDirectory(hint)
+	}
+	return hint, nil
+}
 
-		var pubkeys []string
-		for _, entry := range entries {
-			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".pub") {
-				continue
-			}
-			pubkeys = append(pubkeys, filepath.Join(hint, entry.Name()))
-		}
-		switch len(pubkeys) {
-		case 0:
-			return "", "", "", errors.New("no public keys found; pass --key-file")
-		case 1:
-			path = pubkeys[0]
-		default:
-			return "", "", "", errors.New("multiple public keys found; pass --key-file")
-		}
+func publicKeyPathFromDirectory(dir string) (string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
 	}
 
+	var pubkeys []string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".pub") {
+			continue
+		}
+		pubkeys = append(pubkeys, filepath.Join(dir, entry.Name()))
+	}
+	switch len(pubkeys) {
+	case 0:
+		return "", errors.New("no public keys found; pass --key-file")
+	case 1:
+		return pubkeys[0], nil
+	default:
+		return "", errors.New("multiple public keys found; pass --key-file")
+	}
+}
+
+func readPublicKey(path string) (string, string, string, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return "", "", "", err
 	}
+	return parsePublicKey(string(raw))
+}
 
+func parsePublicKey(raw string) (string, string, string, error) {
 	pubkey := strings.TrimSpace(string(raw))
 	parts := strings.Fields(pubkey)
 	if len(parts) < 2 {

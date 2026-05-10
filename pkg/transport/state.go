@@ -86,11 +86,23 @@ func (s pathState) discoveryPlan(now time.Time, refreshInterval, staleAfter time
 		return discoveryPlan{}
 	}
 
-	shouldAttempt := s.current != PathDirect || s.directIsStale(now, staleAfter)
-	if !shouldAttempt {
+	if !s.shouldAttemptDiscovery(now, staleAfter) {
 		return discoveryPlan{}
 	}
 
+	return discoveryPlan{
+		needRefresh:   s.needsEndpointRefresh(now, refreshInterval),
+		sendCallMe:    s.needsCallMeMaybe(now, refreshInterval),
+		probeTargets:  s.probeTargets(),
+		shouldAttempt: true,
+	}
+}
+
+func (s pathState) shouldAttemptDiscovery(now time.Time, staleAfter time.Duration) bool {
+	return s.current != PathDirect || s.directIsStale(now, staleAfter)
+}
+
+func (s pathState) probeTargets() []net.Addr {
 	targets := make([]net.Addr, 0, len(s.endpoints))
 	if s.bestEndpoint != "" {
 		if endpoint, ok := s.endpoints[s.bestEndpoint]; ok {
@@ -103,15 +115,16 @@ func (s pathState) discoveryPlan(now time.Time, refreshInterval, staleAfter time
 		}
 		targets = append(targets, cloneAddr(endpoint))
 	}
+	return targets
+}
 
-	needRefresh := s.lastRefreshAt.IsZero() || now.Sub(s.lastRefreshAt) >= refreshInterval
-	sendCallMe := s.relayConfigured && (s.lastCallMeMaybeAt.IsZero() || now.Sub(s.lastCallMeMaybeAt) >= refreshInterval)
-	return discoveryPlan{
-		needRefresh:   needRefresh,
-		sendCallMe:    sendCallMe,
-		probeTargets:  targets,
-		shouldAttempt: true,
-	}
+func (s pathState) needsEndpointRefresh(now time.Time, refreshInterval time.Duration) bool {
+	return s.lastRefreshAt.IsZero() || now.Sub(s.lastRefreshAt) >= refreshInterval
+}
+
+func (s pathState) needsCallMeMaybe(now time.Time, refreshInterval time.Duration) bool {
+	return s.relayConfigured &&
+		(s.lastCallMeMaybeAt.IsZero() || now.Sub(s.lastCallMeMaybeAt) >= refreshInterval)
 }
 
 func (s pathState) directIsStale(now time.Time, staleAfter time.Duration) bool {
@@ -135,13 +148,7 @@ func (s *pathState) noteCallMeMaybeSuccess(now time.Time) {
 func (s *pathState) noteCandidates(now time.Time, candidates []net.Addr) bool {
 	prevBest := s.bestEndpoint
 	prevBestAddr := cloneAddr(s.endpoints[prevBest])
-	next := make(map[string]net.Addr, len(candidates))
-	for _, candidate := range candidates {
-		if candidate == nil {
-			continue
-		}
-		next[candidate.String()] = cloneAddr(candidate)
-	}
+	next := candidateMap(candidates)
 
 	if s.current == PathDirect && prevBest != "" {
 		if _, ok := next[prevBest]; !ok && prevBestAddr != nil {
@@ -149,40 +156,57 @@ func (s *pathState) noteCandidates(now time.Time, candidates []net.Addr) bool {
 		}
 	}
 
-	changed := len(next) != len(s.endpoints)
-	if !changed {
-		for key := range next {
-			if _, ok := s.endpoints[key]; !ok {
-				changed = true
-				break
-			}
-		}
-	}
-
+	changed := candidateMapChanged(s.endpoints, next)
 	s.endpoints = next
-	for key := range s.pendingProbes {
-		if _, ok := s.endpoints[key]; !ok {
-			delete(s.pendingProbes, key)
+	s.pruneEndpointState()
+	changed = s.relayIfBestEndpointLost(now) || changed
+	s.lastPeerEndpointsAt = now
+	return changed
+}
+
+func candidateMap(candidates []net.Addr) map[string]net.Addr {
+	next := make(map[string]net.Addr, len(candidates))
+	for _, candidate := range candidates {
+		if candidate != nil {
+			next[candidate.String()] = cloneAddr(candidate)
 		}
 	}
-	for key := range s.endpointLatency {
-		if _, ok := s.endpoints[key]; !ok {
-			delete(s.endpointLatency, key)
+	return next
+}
+
+func candidateMapChanged(current map[string]net.Addr, next map[string]net.Addr) bool {
+	if len(next) != len(current) {
+		return true
+	}
+	for key := range next {
+		if _, ok := current[key]; !ok {
+			return true
 		}
 	}
+	return false
+}
+
+func (s *pathState) pruneEndpointState() {
+	pruneMissingKeys(s.pendingProbes, s.endpoints)
+	pruneMissingKeys(s.endpointLatency, s.endpoints)
+}
+
+func pruneMissingKeys[T any](values map[string]T, keep map[string]net.Addr) {
+	for key := range values {
+		if _, ok := keep[key]; !ok {
+			delete(values, key)
+		}
+	}
+}
+
+func (s *pathState) relayIfBestEndpointLost(now time.Time) bool {
 	lostActiveDirect := s.current == PathDirect && s.bestEndpoint != ""
 	if s.bestEndpoint != "" {
 		if _, ok := s.endpoints[s.bestEndpoint]; !ok {
 			s.bestEndpoint = ""
 		}
 	}
-	if lostActiveDirect && s.bestEndpoint == "" {
-		if s.noteRelay(now) {
-			changed = true
-		}
-	}
-	s.lastPeerEndpointsAt = now
-	return changed
+	return lostActiveDirect && s.bestEndpoint == "" && s.noteRelay(now)
 }
 
 func (s *pathState) noteDirect(now time.Time, addr net.Addr) bool {
@@ -195,12 +219,9 @@ func (s *pathState) noteDirect(now time.Time, addr net.Addr) bool {
 		return false
 	}
 
-	if s.current == PathDirect && s.bestEndpoint != "" && s.bestEndpoint != key {
-		best, ok := s.endpoints[s.bestEndpoint]
-		if ok && !betterDirectAddr(candidate, s.endpointLatency[key], best, s.endpointLatency[s.bestEndpoint]) {
-			s.lastDirectAt = now
-			return false
-		}
+	if !s.shouldSelectDirectEndpoint(key, candidate) {
+		s.lastDirectAt = now
+		return false
 	}
 
 	changed := s.current != PathDirect || s.bestEndpoint != key
@@ -211,6 +232,17 @@ func (s *pathState) noteDirect(now time.Time, addr net.Addr) bool {
 	s.bestEndpoint = key
 	s.lastDirectAt = now
 	return changed
+}
+
+func (s *pathState) shouldSelectDirectEndpoint(key string, candidate net.Addr) bool {
+	if s.current != PathDirect || s.bestEndpoint == "" || s.bestEndpoint == key {
+		return true
+	}
+	best, ok := s.endpoints[s.bestEndpoint]
+	if !ok {
+		return true
+	}
+	return betterDirectAddr(candidate, s.endpointLatency[key], best, s.endpointLatency[s.bestEndpoint])
 }
 
 func (s *pathState) noteDirectActivity(now time.Time, addr net.Addr) {
@@ -375,18 +407,26 @@ func addrIP(addr net.Addr) (net.IP, bool) {
 func sameAddr(a, b net.Addr) bool {
 	switch av := a.(type) {
 	case *net.UDPAddr:
-		bv, ok := b.(*net.UDPAddr)
-		if !ok || av == nil || bv == nil {
-			return false
-		}
-		return av.Port == bv.Port && av.Zone == bv.Zone && av.IP.Equal(bv.IP)
+		return sameUDPAddr(av, b)
 	case *net.IPAddr:
-		bv, ok := b.(*net.IPAddr)
-		if !ok || av == nil || bv == nil {
-			return false
-		}
-		return av.Zone == bv.Zone && av.IP.Equal(bv.IP)
+		return sameIPAddr(av, b)
 	default:
 		return a == b
 	}
+}
+
+func sameUDPAddr(a *net.UDPAddr, b net.Addr) bool {
+	bv, ok := b.(*net.UDPAddr)
+	if !ok || a == nil || bv == nil {
+		return false
+	}
+	return a.Port == bv.Port && a.Zone == bv.Zone && a.IP.Equal(bv.IP)
+}
+
+func sameIPAddr(a *net.IPAddr, b net.Addr) bool {
+	bv, ok := b.(*net.IPAddr)
+	if !ok || a == nil || bv == nil {
+		return false
+	}
+	return a.Zone == bv.Zone && a.IP.Equal(bv.IP)
 }

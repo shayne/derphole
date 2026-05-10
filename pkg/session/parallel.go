@@ -144,28 +144,30 @@ func (c *parallelAutoController) Observe(w parallelWindow) parallelDecision {
 		return parallelDecision{}
 	}
 	if w.Target < floorTarget {
-		nextTarget = floorTarget
-		c.lastApplied = nextTarget
-		c.holdSamples = AutoParallelHoldSamples
-		return parallelDecision{NextTarget: nextTarget}
+		return c.applyTarget(floorTarget)
 	}
-	if c.lastApplied == 0 {
-		c.lastApplied = nextTarget
-		c.holdSamples = AutoParallelHoldSamples
-		return parallelDecision{NextTarget: nextTarget}
+	if c.shouldApplyGrowth(w) {
+		return c.applyTarget(nextTarget)
 	}
-	if w.PreviousThroughput <= 0 {
-		c.lastApplied = nextTarget
-		c.holdSamples = AutoParallelHoldSamples
-		return parallelDecision{NextTarget: nextTarget}
-	}
+	return c.stopGrowthIfDiminishing(w)
+}
+
+func (c *parallelAutoController) shouldApplyGrowth(w parallelWindow) bool {
+	return c.lastApplied == 0 || w.PreviousThroughput <= 0
+}
+
+func (c *parallelAutoController) applyTarget(nextTarget int) parallelDecision {
+	c.lastApplied = nextTarget
+	c.holdSamples = AutoParallelHoldSamples
+	return parallelDecision{NextTarget: nextTarget}
+}
+
+func (c *parallelAutoController) stopGrowthIfDiminishing(w parallelWindow) parallelDecision {
 	gainMbps := w.ThroughputMbps - w.PreviousThroughput
 	gainPct := (gainMbps / w.PreviousThroughput) * 100
 	if gainMbps < AutoParallelMinGainMbps || gainPct < AutoParallelMinGainPercent {
 		c.stopped = true
 		return parallelDecision{StopReason: "diminishing-return"}
 	}
-	c.lastApplied = nextTarget
-	c.holdSamples = AutoParallelHoldSamples
-	return parallelDecision{NextTarget: nextTarget}
+	return c.applyTarget(min(w.Target+AutoParallelGrowthStep, c.policy.Cap))
 }

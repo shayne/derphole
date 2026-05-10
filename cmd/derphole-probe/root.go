@@ -54,7 +54,7 @@ var helpConfig = registry.HelpConfig()
 
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || isRootHelpRequest(args) {
-		fmt.Fprint(stderr, yargs.GenerateGlobalHelp(helpConfig, struct{}{}))
+		_, _ = fmt.Fprint(stderr, yargs.GenerateGlobalHelp(helpConfig, struct{}{}))
 		return 0
 	}
 
@@ -72,7 +72,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "topology":
 		return runTopology(args[1:], stdout, stderr)
 	default:
-		fmt.Fprintf(stderr, "unknown command: %s\n", args[0])
+		_, _ = fmt.Fprintf(stderr, "unknown command: %s\n", args[0])
 		return 2
 	}
 }
@@ -83,19 +83,19 @@ func isRootHelpRequest(args []string) bool {
 
 func runHelp(args []string, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprint(stderr, yargs.GenerateGlobalHelp(helpConfig, struct{}{}))
+		_, _ = fmt.Fprint(stderr, yargs.GenerateGlobalHelp(helpConfig, struct{}{}))
 		return 0
 	}
 
 	switch args[0] {
 	case "server", "client", "orchestrate", "matrix", "topology":
-		fmt.Fprint(stderr, subcommandUsageLine(args[0]))
+		_, _ = fmt.Fprint(stderr, subcommandUsageLine(args[0]))
 		if len(args) > 1 {
 			return 2
 		}
 		return 0
 	default:
-		fmt.Fprintf(stderr, "unknown command: %s\n", args[0])
+		_, _ = fmt.Fprintf(stderr, "unknown command: %s\n", args[0])
 		return 2
 	}
 }

@@ -409,6 +409,31 @@ func TestEndpointDstToStringUsesAddrPort(t *testing.T) {
 	}
 }
 
+func TestEndpointAndBindHelperAccessors(t *testing.T) {
+	bind := NewBind(BindConfig{})
+	if err := bind.SetMark(123); err != nil {
+		t.Fatalf("SetMark() error = %v", err)
+	}
+	if sent, received := bind.Stats(); sent != 0 || received != 0 {
+		t.Fatalf("Stats() = %d, %d; want zero", sent, received)
+	}
+
+	ep := &Endpoint{dst: "derp", ip: netip.MustParseAddr("127.0.0.1")}
+	ep.ClearSrc()
+	if got := ep.SrcToString(); got != "" {
+		t.Fatalf("SrcToString() = %q, want empty", got)
+	}
+	if got := string(ep.DstToBytes()); got != "derp" {
+		t.Fatalf("DstToBytes() = %q, want derp", got)
+	}
+	if got := ep.DstIP(); got != netip.MustParseAddr("127.0.0.1") {
+		t.Fatalf("DstIP() = %v, want 127.0.0.1", got)
+	}
+	if got := ep.SrcIP(); got.IsValid() {
+		t.Fatalf("SrcIP() = %v, want invalid", got)
+	}
+}
+
 func TestBindSendFallsBackToEndpointAddrPort(t *testing.T) {
 	sender := newLoopPacketConn(t)
 	defer sender.Close()
@@ -444,6 +469,116 @@ func TestBindSendFallsBackToEndpointAddrPort(t *testing.T) {
 	}
 	if got := string(buf[:n]); got != string(payload) {
 		t.Fatalf("received payload = %q, want %q", got, payload)
+	}
+}
+
+func TestGenerateKeypairProducesClampedPrivateKeyAndPublicKey(t *testing.T) {
+	private, public, err := GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair() error = %v", err)
+	}
+	if private[0]&7 != 0 {
+		t.Fatalf("private[0] = 0x%x, want low three bits cleared", private[0])
+	}
+	if private[31]&0x80 != 0 || private[31]&0x40 == 0 {
+		t.Fatalf("private[31] = 0x%x, want Curve25519 clamp", private[31])
+	}
+	if public == ([32]byte{}) {
+		t.Fatal("public key is all zero")
+	}
+}
+
+func TestBindPureHelpersCoverEdgeCases(t *testing.T) {
+	bind := NewBind(BindConfig{DirectEndpoint: "127.0.0.1:1234"})
+	if got := bind.DirectEndpoint(); got != "127.0.0.1:1234" {
+		t.Fatalf("DirectEndpoint() = %q, want configured endpoint", got)
+	}
+	if err := bind.SetDirectEndpoint(""); err != nil {
+		t.Fatalf("SetDirectEndpoint(empty) error = %v", err)
+	}
+	if got := bind.DirectEndpoint(); got != "" {
+		t.Fatalf("DirectEndpoint() after clear = %q, want empty", got)
+	}
+	if err := bind.SetDirectEndpoint("not an address"); err == nil {
+		t.Fatal("SetDirectEndpoint(invalid) error = nil, want error")
+	}
+
+	if addr := resolveUDPAddr("not an address"); addr != nil {
+		t.Fatalf("resolveUDPAddr(invalid) = %v, want nil", addr)
+	}
+	if got := udpNetwork(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 80}); got != "" {
+		t.Fatalf("udpNetwork(non-udp) = %q, want empty", got)
+	}
+	if got := udpNetwork(&net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 80}); got != "udp6" {
+		t.Fatalf("udpNetwork(IPv6) = %q, want udp6", got)
+	}
+	if _, ok := udpAddrPort(nil); ok {
+		t.Fatal("udpAddrPort(nil) ok = true, want false")
+	}
+
+	if err := writePackets(nil, nil, nil, nil, 0); err != nil {
+		t.Fatalf("writePackets(empty) error = %v", err)
+	}
+	if _, err := (&Endpoint{dst: "not an address"}).udpAddr(); err == nil {
+		t.Fatal("Endpoint.udpAddr(invalid dst) error = nil, want error")
+	}
+	if addr, err := (&Endpoint{dst: "derp"}).udpAddr(); err != nil || addr != nil {
+		t.Fatalf("Endpoint.udpAddr(derp) = %v, %v; want nil, nil", addr, err)
+	}
+	if addr, err := (*Endpoint)(nil).udpAddr(); err != nil || addr != nil {
+		t.Fatalf("Endpoint.udpAddr(nil) = %v, %v; want nil, nil", addr, err)
+	}
+}
+
+func TestNodeDirectEndpointDelegatesToBind(t *testing.T) {
+	node := &Node{bind: NewBind(BindConfig{})}
+	if err := node.SetDirectEndpoint("127.0.0.1:54321"); err != nil {
+		t.Fatalf("SetDirectEndpoint() error = %v", err)
+	}
+	if got := node.DirectEndpoint(); got != "127.0.0.1:54321" {
+		t.Fatalf("DirectEndpoint() = %q, want configured endpoint", got)
+	}
+	if node.DirectConfirmed() {
+		t.Fatal("DirectConfirmed() = true before validation, want false")
+	}
+}
+
+func TestBindStateRelayAndErrorHelpers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	state := &bindState{
+		recvCh:   make(chan inboundPacket, 2),
+		errCh:    make(chan error, 1),
+		closeCtx: ctx,
+		closeFn:  cancel,
+	}
+	state.reportErr(io.ErrUnexpectedEOF)
+	state.reportErr(errors.New("dropped because error channel is full"))
+
+	packets := [][]byte{make([]byte, 16), make([]byte, 16)}
+	sizes := make([]int, len(packets))
+	eps := make([]conn.Endpoint, len(packets))
+	if n, err, ok := state.receiveRelayNow(packets, sizes, eps); !ok || n != 0 || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("receiveRelayNow(error) = %d, %v, %v; want queued error", n, err, ok)
+	}
+
+	ep := &Endpoint{dst: "derp"}
+	state.recvCh <- inboundPacket{payload: []byte("one"), ep: ep}
+	state.recvCh <- inboundPacket{payload: []byte("two"), ep: ep}
+	if n, err, ok := state.receiveRelayNow(packets, sizes, eps); !ok || err != nil || n != 2 {
+		t.Fatalf("receiveRelayNow(payloads) = %d, %v, %v; want two packets", n, err, ok)
+	}
+	if got := string(packets[0][:sizes[0]]); got != "one" {
+		t.Fatalf("first relay payload = %q, want one", got)
+	}
+	if got := string(packets[1][:sizes[1]]); got != "two" {
+		t.Fatalf("second relay payload = %q, want two", got)
+	}
+
+	cancel()
+	if n, err, ok := state.receiveRelayNow(packets, sizes, eps); !ok || n != 0 || !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("receiveRelayNow(closed) = %d, %v, %v; want net.ErrClosed", n, err, ok)
 	}
 }
 

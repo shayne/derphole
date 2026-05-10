@@ -86,23 +86,33 @@ func CategorizeCandidateAddresses(raw []string) CandidateReport {
 	var report CandidateReport
 	for _, candidate := range raw {
 		addr, value, ok := parseCandidateAddr(candidate)
-		if !ok || addr.IsLoopback() || addr.IsUnspecified() || addr.IsMulticast() || addr.IsLinkLocalUnicast() {
+		if !ok || !usableCandidateAddr(addr) {
 			continue
 		}
-		addr = addr.Unmap()
-		switch {
-		case tailscaleIPv4Prefix.Contains(addr) || tailscaleIPv6Prefix.Contains(addr):
-			report.Overlay = appendUnique(report.Overlay, value)
-		case addr.IsPrivate():
-			report.LAN = appendUnique(report.LAN, value)
-		default:
-			report.Public = appendUnique(report.Public, value)
-		}
+		appendCandidateAddr(&report, addr.Unmap(), value)
 	}
 	sort.Strings(report.LAN)
 	sort.Strings(report.Overlay)
 	sort.Strings(report.Public)
 	return report
+}
+
+func usableCandidateAddr(addr netip.Addr) bool {
+	return !addr.IsLoopback() &&
+		!addr.IsUnspecified() &&
+		!addr.IsMulticast() &&
+		!addr.IsLinkLocalUnicast()
+}
+
+func appendCandidateAddr(report *CandidateReport, addr netip.Addr, value string) {
+	switch {
+	case tailscaleIPv4Prefix.Contains(addr) || tailscaleIPv6Prefix.Contains(addr):
+		report.Overlay = appendUnique(report.Overlay, value)
+	case addr.IsPrivate():
+		report.LAN = appendUnique(report.LAN, value)
+	default:
+		report.Public = appendUnique(report.Public, value)
+	}
 }
 
 func parseCandidateAddr(raw string) (netip.Addr, string, bool) {

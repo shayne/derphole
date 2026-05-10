@@ -107,20 +107,33 @@ func (m *Manager) discoveryTick(ctx context.Context, forceCandidateRefresh bool)
 		return
 	}
 
-	if forceCandidateRefresh || plan.needRefresh {
-		if err := m.sendCandidateUpdate(ctx); err == nil {
-			m.noteEndpointRefreshIfCurrent(plan.generation, m.now())
-		}
-	}
-	if plan.sendCallMe {
-		if err := m.sendCallMeMaybe(ctx); err == nil {
-			m.noteCallMeMaybeIfCurrent(plan.generation, m.now())
-		}
-	}
+	m.sendCandidateUpdateForPlan(ctx, plan, forceCandidateRefresh)
+	m.sendCallMeForPlan(ctx, plan)
 	if m.cfg.DirectConn == nil {
 		return
 	}
+	m.sendDirectProbes(plan)
+}
 
+func (m *Manager) sendCandidateUpdateForPlan(ctx context.Context, plan discoveryPlan, forceCandidateRefresh bool) {
+	if !forceCandidateRefresh && !plan.needRefresh {
+		return
+	}
+	if err := m.sendCandidateUpdate(ctx); err == nil {
+		m.noteEndpointRefreshIfCurrent(plan.generation, m.now())
+	}
+}
+
+func (m *Manager) sendCallMeForPlan(ctx context.Context, plan discoveryPlan) {
+	if !plan.sendCallMe {
+		return
+	}
+	if err := m.sendCallMeMaybe(ctx); err == nil {
+		m.noteCallMeMaybeIfCurrent(plan.generation, m.now())
+	}
+}
+
+func (m *Manager) sendDirectProbes(plan discoveryPlan) {
 	for _, target := range plan.probeTargets {
 		if target == nil {
 			continue
@@ -157,14 +170,7 @@ func (m *Manager) directBatchConn() DirectBatchConn {
 }
 
 func (m *Manager) directPacketReadLoop(ctx context.Context) {
-	bufLen := maxDirectPayloadSize
-	if len(discoProbePayload)+1 > bufLen {
-		bufLen = len(discoProbePayload) + 1
-	}
-	if len(discoAckPayload)+1 > bufLen {
-		bufLen = len(discoAckPayload) + 1
-	}
-	buf := make([]byte, bufLen)
+	buf := make([]byte, directReadBufferSize())
 	for {
 		if ctx.Err() != nil {
 			return
@@ -174,19 +180,24 @@ func (m *Manager) directPacketReadLoop(ctx context.Context) {
 		}
 		n, addr, err := m.cfg.DirectConn.ReadFrom(buf)
 		if err != nil {
-			if ctx.Err() != nil || isTerminalReadError(err) {
-				return
-			}
-			if isTimeout(err) {
-				continue
-			}
-			if !m.waitForNextDirectRead(ctx) {
+			if !m.shouldContinueDirectRead(ctx, err) {
 				return
 			}
 			continue
 		}
 		m.handleDirectPacket(addr, buf[:n])
 	}
+}
+
+func directReadBufferSize() int {
+	bufLen := maxDirectPayloadSize
+	if len(discoProbePayload)+1 > bufLen {
+		bufLen = len(discoProbePayload) + 1
+	}
+	if len(discoAckPayload)+1 > bufLen {
+		bufLen = len(discoAckPayload) + 1
+	}
+	return bufLen
 }
 
 func (m *Manager) directBatchReadLoop(ctx context.Context, batchConn DirectBatchConn) {
@@ -207,13 +218,7 @@ func (m *Manager) directBatchReadLoop(ctx context.Context, batchConn DirectBatch
 		}
 		n, err := batchConn.ReadBatch(msgs, 0)
 		if err != nil {
-			if ctx.Err() != nil || isTerminalReadError(err) {
-				return
-			}
-			if isTimeout(err) {
-				continue
-			}
-			if !m.waitForNextDirectRead(ctx) {
+			if !m.shouldContinueDirectRead(ctx, err) {
 				return
 			}
 			continue
@@ -225,6 +230,13 @@ func (m *Manager) directBatchReadLoop(ctx context.Context, batchConn DirectBatch
 			m.handleDirectPacket(msgs[i].Addr, msgs[i].Buffers[0][:msgs[i].N])
 		}
 	}
+}
+
+func (m *Manager) shouldContinueDirectRead(ctx context.Context, err error) bool {
+	if ctx.Err() != nil || isTerminalReadError(err) {
+		return false
+	}
+	return isTimeout(err) || m.waitForNextDirectRead(ctx)
 }
 
 func (m *Manager) handleDirectPacket(addr net.Addr, payload []byte) {

@@ -147,16 +147,28 @@ func closeOfferSession(session *offerSession) {
 		return
 	}
 	session.closeOnce.Do(func() {
-		if session.reader != nil && !session.claimed {
-			_ = session.reader.Close()
-		}
-		if session.writer != nil {
-			_ = session.writer.Close()
-		}
-		if session.probeConn != nil {
-			_ = session.probeConn.Close()
-		}
+		closeOfferSessionReader(session)
+		closeOfferSessionWriter(session)
+		closeOfferSessionProbeConn(session)
 	})
+}
+
+func closeOfferSessionReader(session *offerSession) {
+	if session.reader != nil && !session.claimed {
+		_ = session.reader.Close()
+	}
+}
+
+func closeOfferSessionWriter(session *offerSession) {
+	if session.writer != nil {
+		_ = session.writer.Close()
+	}
+}
+
+func closeOfferSessionProbeConn(session *offerSession) {
+	if session.probeConn != nil {
+		_ = session.probeConn.Close()
+	}
 }
 
 func deleteOfferMailbox(tok string, session *offerSession) {
@@ -181,30 +193,13 @@ func Listen(ctx context.Context, cfg ListenConfig) (string, error) {
 	defer deleteRelayMailbox(tok, session)
 
 	emitStatus(cfg.Emitter, StateWaiting)
-	if cfg.TokenSink != nil {
-		select {
-		case cfg.TokenSink <- tok:
-		case <-ctx.Done():
-			return tok, ctx.Err()
-		}
+	if err := emitListenToken(ctx, cfg.TokenSink, tok); err != nil {
+		return tok, err
 	}
 
 	select {
 	case msg := <-session.mailbox:
-		path := msg.path
-		if path == "" {
-			path = StateRelay
-		}
-		emitStatus(cfg.Emitter, path)
-		dst, err := openListenSink(ctx, cfg)
-		if err == nil {
-			_, err = dst.Write(msg.payload)
-			closeErr := dst.Close()
-			if err == nil {
-				err = closeErr
-			}
-		}
-		msg.ack <- err
+		err := handleLocalListenMessage(ctx, cfg, msg)
 		if err != nil {
 			return tok, err
 		}
@@ -213,4 +208,40 @@ func Listen(ctx context.Context, cfg ListenConfig) (string, error) {
 	case <-ctx.Done():
 		return tok, ctx.Err()
 	}
+}
+
+func emitListenToken(ctx context.Context, sink chan<- string, tok string) error {
+	if sink == nil {
+		return nil
+	}
+	select {
+	case sink <- tok:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func handleLocalListenMessage(ctx context.Context, cfg ListenConfig, msg relayMessage) error {
+	path := msg.path
+	if path == "" {
+		path = StateRelay
+	}
+	emitStatus(cfg.Emitter, path)
+	err := writeLocalListenMessage(ctx, cfg, msg.payload)
+	msg.ack <- err
+	return err
+}
+
+func writeLocalListenMessage(ctx context.Context, cfg ListenConfig, payload []byte) error {
+	dst, err := openListenSink(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	_, err = dst.Write(payload)
+	closeErr := dst.Close()
+	if err == nil {
+		err = closeErr
+	}
+	return err
 }

@@ -122,6 +122,131 @@ func TestExternalNativeQUICTransfersWhenOnlyListenerDialPathWorks(t *testing.T) 
 	}
 }
 
+func TestExternalNativeQUICGrowthNoopAndNilPaths(t *testing.T) {
+	ctx := context.Background()
+
+	var nilSession *externalNativeQUICStripedSession
+	if got := nilSession.StripeCount(); got != 0 {
+		t.Fatalf("nil StripeCount() = %d, want 0", got)
+	}
+	if _, err := nilSession.PrepareGrowth(ctx, 1); err == nil {
+		t.Fatal("nil PrepareGrowth() error = nil, want error")
+	}
+	if _, err := nilSession.OpenGrowth(ctx, nil, nil); err == nil {
+		t.Fatal("nil OpenGrowth() error = nil, want error")
+	}
+	if got := nilSession.CommitGrowth(nil); got != 0 {
+		t.Fatalf("nil CommitGrowth(nil) = %d, want 0", got)
+	}
+
+	session := &externalNativeQUICStripedSession{
+		conns:       make([]*quic.Conn, 2),
+		openStreams: []bool{true, false},
+	}
+	if got := session.StripeCount(); got != 2 {
+		t.Fatalf("StripeCount() = %d, want 2", got)
+	}
+	plan, err := session.PrepareGrowth(ctx, 2)
+	if err != nil {
+		t.Fatalf("PrepareGrowth(noop) error = %v", err)
+	}
+	if plan != nil {
+		t.Fatalf("PrepareGrowth(noop) = %#v, want nil", plan)
+	}
+	growth, err := session.OpenGrowth(ctx, nil, nil)
+	if err != nil {
+		t.Fatalf("OpenGrowth(nil plan) error = %v", err)
+	}
+	if growth != nil {
+		t.Fatalf("OpenGrowth(nil plan) = %#v, want nil", growth)
+	}
+	if got := session.CommitGrowth(nil); got != 2 {
+		t.Fatalf("CommitGrowth(nil) = %d, want existing stripe count", got)
+	}
+
+	growth, err = session.OpenGrowth(ctx, &externalNativeQUICGrowthPlan{}, nil)
+	if err != nil {
+		t.Fatalf("OpenGrowth(empty plan) error = %v", err)
+	}
+	if growth == nil {
+		t.Fatal("OpenGrowth(empty plan) = nil, want empty growth result")
+	}
+	closeExternalNativeQUICGrowthResult(growth)
+
+	committed := session.CommitGrowth(&externalNativeQUICGrowthResult{
+		plan:        &externalNativeQUICGrowthPlan{},
+		conns:       []*quic.Conn{nil},
+		openStreams: []bool{true},
+	})
+	if committed != 3 {
+		t.Fatalf("CommitGrowth(result) = %d, want 3", committed)
+	}
+}
+
+func TestCloseExternalNativeQUICGrowthHelpers(t *testing.T) {
+	closeExternalNativeQUICGrowthPlan(nil)
+	closeExternalNativeQUICGrowthResult(nil)
+	closeExternalNativeQUICTransports([]*quic.Transport{nil})
+
+	var closed int
+	streams := []io.ReadWriteCloser{
+		nil,
+		countingReadWriteCloser{closed: &closed},
+	}
+	closeExternalNativeQUICReadWriteStreams(streams)
+	if closed != 1 {
+		t.Fatalf("closed streams = %d, want 1", closed)
+	}
+
+	closeExternalNativeQUICGrowthResult(&externalNativeQUICGrowthResult{
+		plan:    &externalNativeQUICGrowthPlan{},
+		streams: []io.ReadWriteCloser{countingReadWriteCloser{closed: &closed}},
+		conns:   []*quic.Conn{nil},
+	})
+	if closed != 2 {
+		t.Fatalf("closed streams after growth result = %d, want 2", closed)
+	}
+}
+
+func TestSelectExternalNativeQUICPrimaryPeerAddr(t *testing.T) {
+	if _, err := selectExternalNativeQUICPrimaryPeerAddr(nil); err == nil {
+		t.Fatal("selectExternalNativeQUICPrimaryPeerAddr(nil) error = nil, want error")
+	}
+
+	peer := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 10), Port: 443}
+	got, err := selectExternalNativeQUICPrimaryPeerAddr(peer)
+	if err != nil {
+		t.Fatalf("selectExternalNativeQUICPrimaryPeerAddr() error = %v", err)
+	}
+	udpAddr, ok := got.(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("addr type = %T, want *net.UDPAddr", got)
+	}
+	if udpAddr.String() != peer.String() {
+		t.Fatalf("addr = %s, want %s", udpAddr, peer)
+	}
+	if udpAddr == peer {
+		t.Fatal("addr was not cloned")
+	}
+}
+
+type countingReadWriteCloser struct {
+	closed *int
+}
+
+func (c countingReadWriteCloser) Read([]byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (c countingReadWriteCloser) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
+func (c countingReadWriteCloser) Close() error {
+	(*c.closed)++
+	return nil
+}
+
 func TestDialOrAcceptExternalNativeQUICConnOnTransportReturnsAfterFirstDialSuccess(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -824,30 +949,6 @@ func TestExternalNativeQUICStripedSessionOpenQUICStreamsSupportsMixedStreamRoles
 	if len(senderStreams) != 2 {
 		t.Fatalf("sender OpenQUICStreams() len = %d, want 2", len(senderStreams))
 	}
-}
-
-func TestCloseExternalNativeQUICSendSetupResultAsyncReturnsBeforeSetupResultArrives(t *testing.T) {
-	resultCh := make(chan externalNativeQUICSendSetupResult, 1)
-	start := time.Now()
-
-	closeExternalNativeQUICSendSetupResultAsync(resultCh)
-
-	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
-		t.Fatalf("closeExternalNativeQUICSendSetupResultAsync() blocked for %v waiting for setup result", elapsed)
-	}
-	resultCh <- externalNativeQUICSendSetupResult{}
-}
-
-func TestCloseExternalNativeQUICListenSetupResultAsyncReturnsBeforeSetupResultArrives(t *testing.T) {
-	resultCh := make(chan externalNativeQUICListenSetupResult, 1)
-	start := time.Now()
-
-	closeExternalNativeQUICListenSetupResultAsync(resultCh)
-
-	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
-		t.Fatalf("closeExternalNativeQUICListenSetupResultAsync() blocked for %v waiting for setup result", elapsed)
-	}
-	resultCh <- externalNativeQUICListenSetupResult{}
 }
 
 func TestWaitExternalNativeQUICSetupGraceReturnsRelayResultWhenRelayFinishesWithinGrace(t *testing.T) {

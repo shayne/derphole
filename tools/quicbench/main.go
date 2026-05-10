@@ -36,7 +36,7 @@ type sendArgs struct {
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		_, _ = fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
@@ -45,113 +45,182 @@ func run(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		return errors.New("usage: quicbench listen [addr] | quicbench send <addr> <bytes>")
 	}
-	switch args[0] {
+	return runCommand(args[0], args[1:], stdout, stderr)
+}
+
+func runCommand(command string, args []string, stdout, stderr io.Writer) error {
+	switch command {
 	case "listen":
-		addr := "0.0.0.0:0"
-		if len(args) > 2 {
-			return errors.New(listenUsage)
-		}
-		if len(args) == 2 {
-			addr = args[1]
+		addr, err := parseListenAddr(args)
+		if err != nil {
+			return err
 		}
 		return runListen(addr, stdout, stderr)
 	case "send":
-		parsed, err := parseSendArgs(args[1:])
+		parsed, err := parseSendArgs(args)
 		if err != nil {
 			return err
 		}
 		return runSend(parsed, stdout)
 	default:
-		return fmt.Errorf("unknown command %q", args[0])
+		return fmt.Errorf("unknown command %q", command)
 	}
+}
+
+func parseListenAddr(args []string) (string, error) {
+	if len(args) > 1 {
+		return "", errors.New(listenUsage)
+	}
+	if len(args) == 1 {
+		return args[0], nil
+	}
+	return "0.0.0.0:0", nil
 }
 
 func runListen(addr string, stdout, stderr io.Writer) error {
-	udpConn, err := net.ListenPacket("udp4", addr)
+	udpConn, listener, err := listenQUIC(addr)
 	if err != nil {
 		return err
 	}
-	defer udpConn.Close()
+	defer func() { _ = listener.Close() }()
+	defer func() { _ = udpConn.Close() }()
 
-	cert, err := quicpath.GenerateSelfSignedCertificate()
-	if err != nil {
-		return err
-	}
-	listener, err := quic.Listen(udpConn, quicpath.DefaultTLSConfig(cert, quicpath.ServerName), quicpath.DefaultQUICConfig())
-	if err != nil {
-		return err
-	}
-	defer listener.Close()
+	_, _ = fmt.Fprintf(stderr, "listening on %s\n", udpConn.LocalAddr())
 
-	fmt.Fprintf(stderr, "listening on %s\n", udpConn.LocalAddr())
-
-	conn, err := listener.Accept(context.Background())
+	conns, req, err := acceptBenchRequest(listener)
 	if err != nil {
 		return err
 	}
-	conns := []*quic.Conn{conn}
 	defer closeQUICConns(conns)
 
-	stream, err := conn.AcceptStream(context.Background())
-	if err != nil {
-		return err
-	}
-	defer stream.Close()
-
-	req, err := readBenchRequest(stream)
-	if err != nil {
-		return err
-	}
-	for len(conns) < req.connections {
-		conn, err := listener.Accept(context.Background())
-		if err != nil {
-			return err
-		}
-		conns = append(conns, conn)
-	}
-
 	started := time.Now()
-	var n int64
-	if req.reverse {
-		n, err = runListenReverseStreams(conns, req)
-		if err != nil {
-			return err
-		}
-		if n != req.bytesToSend {
-			return fmt.Errorf("sent %d bytes, want %d", n, req.bytesToSend)
-		}
-	} else {
-		n, err = runListenForwardStreams(conns, req)
-		if err != nil {
-			return err
-		}
+	n, err := runListenTransfer(conns, req)
+	if err != nil {
+		return err
 	}
 	elapsed := time.Since(started)
-	fmt.Fprintf(stdout, "bytes=%d duration=%s mbps=%.2f\n", n, elapsed, throughputMbps(n, elapsed))
+	_, _ = fmt.Fprintf(stdout, "bytes=%d duration=%s mbps=%.2f\n", n, elapsed, throughputMbps(n, elapsed))
 	return nil
 }
 
+func listenQUIC(addr string) (net.PacketConn, *quic.Listener, error) {
+	udpConn, err := net.ListenPacket("udp4", addr)
+	if err != nil {
+		return nil, nil, err
+	}
+	cert, err := quicpath.GenerateSelfSignedCertificate()
+	if err != nil {
+		_ = udpConn.Close()
+		return nil, nil, err
+	}
+	listener, err := quic.Listen(udpConn, quicpath.DefaultTLSConfig(cert, quicpath.ServerName), quicpath.DefaultQUICConfig())
+	if err != nil {
+		_ = udpConn.Close()
+		return nil, nil, err
+	}
+	return udpConn, listener, nil
+}
+
+func acceptBenchRequest(listener *quic.Listener) ([]*quic.Conn, sendArgs, error) {
+	conn, err := listener.Accept(context.Background())
+	if err != nil {
+		return nil, sendArgs{}, err
+	}
+	conns := []*quic.Conn{conn}
+	req, err := readInitialBenchRequest(conn)
+	if err != nil {
+		closeQUICConns(conns)
+		return nil, sendArgs{}, err
+	}
+	conns, err = acceptExtraQUICConns(listener, conns, req.connections)
+	if err != nil {
+		closeQUICConns(conns)
+		return nil, sendArgs{}, err
+	}
+	return conns, req, nil
+}
+
+func readInitialBenchRequest(conn *quic.Conn) (sendArgs, error) {
+	stream, err := conn.AcceptStream(context.Background())
+	if err != nil {
+		return sendArgs{}, err
+	}
+	defer func() { _ = stream.Close() }()
+	return readBenchRequest(stream)
+}
+
+func acceptExtraQUICConns(listener *quic.Listener, conns []*quic.Conn, want int) ([]*quic.Conn, error) {
+	for len(conns) < want {
+		conn, err := listener.Accept(context.Background())
+		if err != nil {
+			return conns, err
+		}
+		conns = append(conns, conn)
+	}
+	return conns, nil
+}
+
+func runListenTransfer(conns []*quic.Conn, req sendArgs) (int64, error) {
+	if !req.reverse {
+		return runListenForwardStreams(conns, req)
+	}
+	n, err := runListenReverseStreams(conns, req)
+	if err != nil {
+		return 0, err
+	}
+	if n != req.bytesToSend {
+		return 0, fmt.Errorf("sent %d bytes, want %d", n, req.bytesToSend)
+	}
+	return n, nil
+}
+
 func runSend(cfg sendArgs, stdout io.Writer) error {
-	serverAddr, err := net.ResolveUDPAddr("udp4", cfg.addr)
+	transport, conns, err := dialInitialQUICConn(cfg.addr)
 	if err != nil {
 		return err
+	}
+	defer func() { _ = transport.Close() }()
+	defer func() { closeQUICConns(conns) }()
+
+	serverAddr := conns[0].RemoteAddr()
+	if err := sendBenchRequest(conns[0], cfg); err != nil {
+		return err
+	}
+	conns, err = dialExtraQUICConns(transport, serverAddr, conns, cfg.connections)
+	if err != nil {
+		return err
+	}
+
+	started := time.Now()
+	n, err := runSendTransfer(conns, cfg)
+	if err != nil {
+		return err
+	}
+	elapsed := time.Since(started)
+	_, _ = fmt.Fprintf(stdout, "bytes=%d duration=%s mbps=%.2f\n", n, elapsed, throughputMbps(n, elapsed))
+	return nil
+}
+
+func dialInitialQUICConn(addr string) (*quic.Transport, []*quic.Conn, error) {
+	serverAddr, err := net.ResolveUDPAddr("udp4", addr)
+	if err != nil {
+		return nil, nil, err
 	}
 	udpConn, err := net.ListenPacket("udp4", sendLocalBindAddr(serverAddr).String())
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	defer udpConn.Close()
-
 	transport := &quic.Transport{Conn: udpConn}
-	defer transport.Close()
-
 	conn, err := transport.Dial(context.Background(), serverAddr, quicpath.DefaultClientTLSConfig(), quicpath.DefaultQUICConfig())
 	if err != nil {
-		return err
+		_ = transport.Close()
+		return nil, nil, err
 	}
 	conns := []*quic.Conn{conn}
-	defer closeQUICConns(conns)
+	return transport, conns, nil
+}
 
+func sendBenchRequest(conn *quic.Conn, cfg sendArgs) error {
 	stream, err := conn.OpenStreamSync(context.Background())
 	if err != nil {
 		return err
@@ -162,67 +231,80 @@ func runSend(cfg sendArgs, stdout io.Writer) error {
 	if err := stream.Close(); err != nil {
 		return err
 	}
-	for len(conns) < cfg.connections {
-		conn, err := transport.Dial(context.Background(), serverAddr, quicpath.DefaultClientTLSConfig(), quicpath.DefaultQUICConfig())
+	return nil
+}
+
+func dialExtraQUICConns(transport *quic.Transport, serverAddr net.Addr, conns []*quic.Conn, want int) ([]*quic.Conn, error) {
+	udpAddr, ok := serverAddr.(*net.UDPAddr)
+	if !ok {
+		return conns, fmt.Errorf("unexpected QUIC remote address %T", serverAddr)
+	}
+	for len(conns) < want {
+		conn, err := transport.Dial(context.Background(), udpAddr, quicpath.DefaultClientTLSConfig(), quicpath.DefaultQUICConfig())
 		if err != nil {
-			return err
+			return conns, err
 		}
 		conns = append(conns, conn)
 	}
+	return conns, nil
+}
 
-	started := time.Now()
-	var n int64
+func runSendTransfer(conns []*quic.Conn, cfg sendArgs) (int64, error) {
 	if cfg.reverse {
-		n, err = runSendReverseStreams(conns, cfg)
-		if err != nil {
-			return err
-		}
-	} else {
-		n, err = runSendForwardStreams(conns, cfg)
-		if err != nil {
-			return err
-		}
-		if n != cfg.bytesToSend {
-			return fmt.Errorf("sent %d bytes, want %d", n, cfg.bytesToSend)
-		}
+		return runSendReverseStreams(conns, cfg)
 	}
-	elapsed := time.Since(started)
-	fmt.Fprintf(stdout, "bytes=%d duration=%s mbps=%.2f\n", n, elapsed, throughputMbps(n, elapsed))
-	return nil
+	n, err := runSendForwardStreams(conns, cfg)
+	if err != nil {
+		return 0, err
+	}
+	if n != cfg.bytesToSend {
+		return 0, fmt.Errorf("sent %d bytes, want %d", n, cfg.bytesToSend)
+	}
+	return n, nil
 }
 
 func parseSendArgs(args []string) (sendArgs, error) {
 	cfg := sendArgs{streams: 1, connections: 1}
 	for len(args) > 0 {
-		switch args[0] {
-		case "--reverse":
-			cfg.reverse = true
-			args = args[1:]
-		case "--streams":
-			if len(args) < 2 {
-				return sendArgs{}, errors.New(sendUsage)
-			}
-			streams, err := strconv.Atoi(args[1])
-			if err != nil || streams < 1 {
-				return sendArgs{}, errors.New(sendUsage)
-			}
-			cfg.streams = streams
-			args = args[2:]
-		case "--connections":
-			if len(args) < 2 {
-				return sendArgs{}, errors.New(sendUsage)
-			}
-			connections, err := strconv.Atoi(args[1])
-			if err != nil || connections < 1 {
-				return sendArgs{}, errors.New(sendUsage)
-			}
-			cfg.connections = connections
-			args = args[2:]
-		default:
-			goto positional
+		remaining, parsed, err := parseSendOption(&cfg, args)
+		if err != nil {
+			return sendArgs{}, err
 		}
+		if !parsed {
+			break
+		}
+		args = remaining
 	}
-positional:
+	return parseSendPositionals(cfg, args)
+}
+
+func parseSendOption(cfg *sendArgs, args []string) ([]string, bool, error) {
+	switch args[0] {
+	case "--reverse":
+		cfg.reverse = true
+		return args[1:], true, nil
+	case "--streams":
+		return parsePositiveIntOption(args, &cfg.streams)
+	case "--connections":
+		return parsePositiveIntOption(args, &cfg.connections)
+	default:
+		return args, false, nil
+	}
+}
+
+func parsePositiveIntOption(args []string, target *int) ([]string, bool, error) {
+	if len(args) < 2 {
+		return nil, true, errors.New(sendUsage)
+	}
+	value, err := strconv.Atoi(args[1])
+	if err != nil || value < 1 {
+		return nil, true, errors.New(sendUsage)
+	}
+	*target = value
+	return args[2:], true, nil
+}
+
+func parseSendPositionals(cfg sendArgs, args []string) (sendArgs, error) {
 	if len(args) != 2 {
 		return sendArgs{}, errors.New(sendUsage)
 	}
@@ -304,35 +386,53 @@ func runSendReverseStreams(conns []*quic.Conn, cfg sendArgs) (int64, error) {
 	return drainIncomingStreams(conns, cfg.streams)
 }
 
+type streamResult struct {
+	n   int64
+	err error
+}
+
 func drainIncomingStreams(conns []*quic.Conn, streamCount int) (int64, error) {
-	type streamResult struct {
-		n   int64
-		err error
+	streams, err := acceptIncomingStreams(conns, streamCount)
+	if err != nil {
+		return 0, err
 	}
+	return drainStreams(streams)
+}
+
+func acceptIncomingStreams(conns []*quic.Conn, streamCount int) ([]*quic.Stream, error) {
 	streams := make([]*quic.Stream, 0, len(conns)*streamCount)
 	for _, conn := range conns {
 		for range streamCount {
 			stream, err := conn.AcceptStream(context.Background())
 			if err != nil {
-				return 0, err
+				return nil, err
 			}
 			streams = append(streams, stream)
 		}
 	}
+	return streams, nil
+}
+
+func drainStreams(streams []*quic.Stream) (int64, error) {
 	results := make(chan streamResult, len(streams))
 	var wg sync.WaitGroup
 	for _, stream := range streams {
 		wg.Add(1)
-		go func(stream *quic.Stream) {
-			defer wg.Done()
-			n, err := io.CopyBuffer(io.Discard, stream, make([]byte, copyBufferSize))
-			_ = stream.Close()
-			results <- streamResult{n: n, err: err}
-		}(stream)
+		go drainStream(stream, results, &wg)
 	}
 	wg.Wait()
 	close(results)
+	return collectStreamResults(results)
+}
 
+func drainStream(stream *quic.Stream, results chan<- streamResult, wg *sync.WaitGroup) {
+	defer wg.Done()
+	n, err := io.CopyBuffer(io.Discard, stream, make([]byte, copyBufferSize))
+	_ = stream.Close()
+	results <- streamResult{n: n, err: err}
+}
+
+func collectStreamResults(results <-chan streamResult) (int64, error) {
 	var total int64
 	for result := range results {
 		if result.err != nil {
@@ -344,40 +444,29 @@ func drainIncomingStreams(conns []*quic.Conn, streamCount int) (int64, error) {
 }
 
 func transferFixedStreams(streams []*quic.Stream, bytesToSend int64) (int64, error) {
-	type streamResult struct {
-		n   int64
-		err error
-	}
 	results := make(chan streamResult, len(streams))
 	var wg sync.WaitGroup
 	for i, stream := range streams {
-		bytesToSend := bytesForStream(bytesToSend, len(streams), i)
 		wg.Add(1)
-		go func(stream *quic.Stream, bytesToSend int64) {
-			defer wg.Done()
-			n, err := io.CopyBuffer(stream, io.LimitReader(zeroReader{}, bytesToSend), make([]byte, copyBufferSize))
-			if closeErr := stream.Close(); err == nil {
-				err = closeErr
-			} else {
-				_ = stream.Close()
-			}
-			if err == nil && n != bytesToSend {
-				err = fmt.Errorf("sent %d bytes, want %d", n, bytesToSend)
-			}
-			results <- streamResult{n: n, err: err}
-		}(stream, bytesToSend)
+		go transferFixedStream(stream, bytesForStream(bytesToSend, len(streams), i), results, &wg)
 	}
 	wg.Wait()
 	close(results)
+	return collectStreamResults(results)
+}
 
-	var total int64
-	for result := range results {
-		if result.err != nil {
-			return 0, result.err
-		}
-		total += result.n
+func transferFixedStream(stream *quic.Stream, bytesToSend int64, results chan<- streamResult, wg *sync.WaitGroup) {
+	defer wg.Done()
+	n, err := io.CopyBuffer(stream, io.LimitReader(zeroReader{}, bytesToSend), make([]byte, copyBufferSize))
+	if closeErr := stream.Close(); err == nil {
+		err = closeErr
+	} else {
+		_ = stream.Close()
 	}
-	return total, nil
+	if err == nil && n != bytesToSend {
+		err = fmt.Errorf("sent %d bytes, want %d", n, bytesToSend)
+	}
+	results <- streamResult{n: n, err: err}
 }
 
 func closeQUICConns(conns []*quic.Conn) {
@@ -429,20 +518,31 @@ func throughputMbps(byteCount int64, elapsed time.Duration) float64 {
 
 func sendLocalBindAddr(serverAddr *net.UDPAddr) net.Addr {
 	fallbackAddr := &net.UDPAddr{Port: 0}
-	if serverAddr == nil || len(serverAddr.IP) == 0 || serverAddr.IP.IsUnspecified() {
+	if !usableUDPAddr(serverAddr) {
 		return fallbackAddr
 	}
-	routeProbe, err := net.DialUDP("udp4", nil, serverAddr)
-	if err != nil {
-		return fallbackAddr
-	}
-	defer routeProbe.Close()
-
-	localAddr, ok := routeProbe.LocalAddr().(*net.UDPAddr)
-	if !ok || localAddr == nil || len(localAddr.IP) == 0 || localAddr.IP.IsUnspecified() {
+	localAddr := probedLocalUDPAddr(serverAddr)
+	if !usableUDPAddr(localAddr) {
 		return fallbackAddr
 	}
 	return &net.UDPAddr{IP: append(net.IP(nil), localAddr.IP...), Port: 0}
+}
+
+func usableUDPAddr(addr *net.UDPAddr) bool {
+	return addr != nil && len(addr.IP) > 0 && !addr.IP.IsUnspecified()
+}
+
+func probedLocalUDPAddr(serverAddr *net.UDPAddr) *net.UDPAddr {
+	routeProbe, err := net.DialUDP("udp4", nil, serverAddr)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = routeProbe.Close() }()
+	localAddr, ok := routeProbe.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return nil
+	}
+	return localAddr
 }
 
 type zeroReader struct{}

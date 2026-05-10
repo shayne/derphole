@@ -48,29 +48,55 @@ func (d *jsDirectTransport) Start(ctx context.Context, role webrelay.DirectRole,
 	if d == nil {
 		return errors.New("nil direct transport")
 	}
-	if !isFunction(d.api.Get("start")) || !isFunction(d.api.Get("applySignal")) || !isFunction(d.api.Get("ready")) || !isFunction(d.api.Get("send")) || !isFunction(d.api.Get("onFrame")) {
-		return errors.New("invalid browser direct transport")
+	if err := d.validateAPI(); err != nil {
+		return err
 	}
 
+	d.installFrameHandler()
+	signalSink := d.installSignalSink(ctx, peer)
+	d.startWatchers(ctx, peer)
+	if _, err := await(ctx, d.api.Call("start", string(role), signalSink)); err != nil {
+		d.fail(err)
+		return err
+	}
+	return nil
+}
+
+func (d *jsDirectTransport) validateAPI() error {
+	for _, name := range []string{"start", "applySignal", "ready", "send", "onFrame"} {
+		if !isFunction(d.api.Get(name)) {
+			return errors.New("invalid browser direct transport")
+		}
+	}
+	return nil
+}
+
+func (d *jsDirectTransport) installFrameHandler() {
 	onFrame := js.FuncOf(func(this js.Value, args []js.Value) any {
 		if len(args) == 0 {
 			return nil
 		}
-		raw, err := bytesFromJS(args[0])
-		if err != nil {
-			d.fail(err)
-			return nil
-		}
-		select {
-		case d.recvCh <- raw:
-		default:
-			d.fail(errors.New("direct receive queue full"))
-		}
+		d.receiveFrameFromJS(args[0])
 		return nil
 	})
 	d.keep(onFrame)
 	d.api.Call("onFrame", onFrame)
+}
 
+func (d *jsDirectTransport) receiveFrameFromJS(v js.Value) {
+	raw, err := bytesFromJS(v)
+	if err != nil {
+		d.fail(err)
+		return
+	}
+	select {
+	case d.recvCh <- raw:
+	default:
+		d.fail(errors.New("direct receive queue full"))
+	}
+}
+
+func (d *jsDirectTransport) installSignalSink(ctx context.Context, peer webrelay.DirectSignalPeer) js.Func {
 	signalSink := js.FuncOf(func(this js.Value, args []js.Value) any {
 		if len(args) == 0 {
 			return nil
@@ -79,16 +105,13 @@ func (d *jsDirectTransport) Start(ctx context.Context, role webrelay.DirectRole,
 		return nil
 	})
 	d.keep(signalSink)
+	return signalSink
+}
 
+func (d *jsDirectTransport) startWatchers(ctx context.Context, peer webrelay.DirectSignalPeer) {
 	go d.forwardRemoteSignals(ctx, peer)
 	go d.waitReady(ctx)
 	go d.watchFailed(ctx)
-
-	if _, err := await(ctx, d.api.Call("start", string(role), signalSink)); err != nil {
-		d.fail(err)
-		return err
-	}
-	return nil
 }
 
 func (d *jsDirectTransport) Ready() <-chan struct{} { return d.readyCh }
@@ -190,22 +213,30 @@ func (d *jsDirectTransport) sendLocalSignal(ctx context.Context, peer webrelay.D
 
 func (d *jsDirectTransport) forwardRemoteSignals(ctx context.Context, peer webrelay.DirectSignalPeer) {
 	for {
-		select {
-		case frame, ok := <-peer.Signals():
-			if !ok {
-				return
-			}
-			if !isRemoteWebRTCSignal(frame.Kind) {
-				continue
-			}
-			if _, err := await(ctx, d.api.Call("applySignal", string(frame.Payload))); err != nil {
-				d.fail(err)
-				return
-			}
-		case <-ctx.Done():
+		if d.forwardNextRemoteSignal(ctx, peer) {
 			return
 		}
 	}
+}
+
+func (d *jsDirectTransport) forwardNextRemoteSignal(ctx context.Context, peer webrelay.DirectSignalPeer) bool {
+	select {
+	case frame, ok := <-peer.Signals():
+		return !ok || d.forwardRemoteSignal(ctx, frame)
+	case <-ctx.Done():
+		return true
+	}
+}
+
+func (d *jsDirectTransport) forwardRemoteSignal(ctx context.Context, frame webproto.Frame) bool {
+	if !isRemoteWebRTCSignal(frame.Kind) {
+		return false
+	}
+	if _, err := await(ctx, d.api.Call("applySignal", string(frame.Payload))); err != nil {
+		d.fail(err)
+		return true
+	}
+	return false
 }
 
 func marshalJSWebRTCSignal(v js.Value) ([]byte, webproto.FrameKind, error) {
@@ -224,17 +255,25 @@ func marshalJSWebRTCSignal(v js.Value) ([]byte, webproto.FrameKind, error) {
 	if err != nil {
 		return nil, 0, err
 	}
+	frameKind, ok := jsWebRTCFrameKind(kind)
+	if !ok {
+		return nil, 0, errors.New("unknown webrtc signal kind")
+	}
+	return payload, frameKind, nil
+}
+
+func jsWebRTCFrameKind(kind string) (webproto.FrameKind, bool) {
 	switch kind {
 	case "offer":
-		return payload, webproto.FrameWebRTCOffer, nil
+		return webproto.FrameWebRTCOffer, true
 	case "answer":
-		return payload, webproto.FrameWebRTCAnswer, nil
+		return webproto.FrameWebRTCAnswer, true
 	case "candidate":
-		return payload, webproto.FrameWebRTCIceCandidate, nil
+		return webproto.FrameWebRTCIceCandidate, true
 	case "ice-complete":
-		return payload, webproto.FrameWebRTCIceComplete, nil
+		return webproto.FrameWebRTCIceComplete, true
 	default:
-		return nil, 0, errors.New("unknown webrtc signal kind")
+		return 0, false
 	}
 }
 

@@ -20,6 +20,20 @@ type tokenSource struct {
 }
 
 func resolveTokenSource(stdin io.Reader, source tokenSource) (string, io.Reader, error) {
+	if tokenSourceCount(source) != 1 {
+		return "", stdin, errors.New("exactly one of --token, --token-file, or --token-stdin is required")
+	}
+	if source.Token != "" {
+		return strings.TrimSpace(source.Token), stdin, nil
+	}
+	if source.TokenFile != "" {
+		token, err := readTokenFile(source.TokenFile)
+		return token, stdin, err
+	}
+	return readTokenStdin(stdin)
+}
+
+func tokenSourceCount(source tokenSource) int {
 	count := 0
 	if source.Token != "" {
 		count++
@@ -30,27 +44,23 @@ func resolveTokenSource(stdin io.Reader, source tokenSource) (string, io.Reader,
 	if source.TokenStdin {
 		count++
 	}
-	if count != 1 {
-		return "", stdin, errors.New("exactly one of --token, --token-file, or --token-stdin is required")
+	return count
+}
+
+func readTokenFile(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read --token-file: %w", err)
 	}
-	if source.Token != "" {
-		return strings.TrimSpace(source.Token), stdin, nil
+	token := strings.TrimSpace(string(raw))
+	if token == "" {
+		return "", errors.New("--token-file is empty")
 	}
-	if source.TokenFile != "" {
-		raw, err := os.ReadFile(source.TokenFile)
-		if err != nil {
-			return "", stdin, fmt.Errorf("read --token-file: %w", err)
-		}
-		token := strings.TrimSpace(string(raw))
-		if token == "" {
-			return "", stdin, errors.New("--token-file is empty")
-		}
-		return token, stdin, nil
-	}
-	reader, ok := stdin.(*bufio.Reader)
-	if !ok {
-		reader = bufio.NewReader(stdin)
-	}
+	return token, nil
+}
+
+func readTokenStdin(stdin io.Reader) (string, io.Reader, error) {
+	reader := bufferedTokenReader(stdin)
 	line, err := reader.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return "", reader, fmt.Errorf("read --token-stdin: %w", err)
@@ -60,4 +70,11 @@ func resolveTokenSource(stdin io.Reader, source tokenSource) (string, io.Reader,
 		return "", reader, errors.New("--token-stdin is empty")
 	}
 	return token, reader, nil
+}
+
+func bufferedTokenReader(stdin io.Reader) *bufio.Reader {
+	if reader, ok := stdin.(*bufio.Reader); ok {
+		return reader
+	}
+	return bufio.NewReader(stdin)
 }

@@ -63,3 +63,27 @@ func TestRunTopologyRejectsEmptyHost(t *testing.T) {
 		t.Fatalf("stderr = %q, want host validation", stderr.String())
 	}
 }
+
+func TestParseTopologyConfigValidatesPortTimeoutAndTrims(t *testing.T) {
+	var stderr bytes.Buffer
+	cfg, code, failed := parseTopologyConfig([]string{"--host", " example.com ", "--user", " alice ", "--udp-port", "12345", "--timeout", "250ms"}, &stderr)
+	if failed || code != 0 {
+		t.Fatalf("parseTopologyConfig(valid) failed=%v code=%d stderr=%q", failed, code, stderr.String())
+	}
+	if cfg.Host != "example.com" || cfg.User != "alice" || cfg.UDPPort != 12345 || cfg.Timeout != 250*time.Millisecond {
+		t.Fatalf("cfg = %+v, want trimmed host/user port timeout", cfg)
+	}
+
+	for _, args := range [][]string{
+		{"--host", "example.com", "--udp-port", "0"},
+		{"--host", "example.com", "--udp-port", "70000"},
+		{"--host", "example.com", "--timeout", "0s"},
+		{"--host", "example.com", "--timeout", "not-a-duration"},
+		{"--host", "example.com", "extra"},
+	} {
+		stderr.Reset()
+		if _, code, failed := parseTopologyConfig(args, &stderr); !failed || code != 2 {
+			t.Fatalf("parseTopologyConfig(%v) failed=%v code=%d stderr=%q, want code 2", args, failed, code, stderr.String())
+		}
+	}
+}

@@ -23,9 +23,11 @@ import (
 
 const usage = "usage: tcpbench send <addr> <bytes> | tcpbench send-stdin <addr> | tcpbench recv <addr> | tcpbench recv-discard <addr> | tcpbench listen-send <addr> <bytes> | tcpbench listen-send-stdin <addr> | tcpbench send-tls <addr> | tcpbench listen-tls <addr>"
 
+type benchCommand func(args []string) (int64, error)
+
 func main() {
 	if err := run(os.Args[1:], os.Stdout); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		_, _ = fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
@@ -35,68 +37,116 @@ func run(args []string, stdout io.Writer) error {
 		return errors.New(usage)
 	}
 	started := time.Now()
-	var (
-		n   int64
-		err error
-	)
-	switch args[0] {
-	case "send":
-		if len(args) != 3 {
-			return errors.New(usage)
-		}
-		bytesToSend, parseErr := strconv.ParseInt(args[2], 10, 64)
-		if parseErr != nil || bytesToSend < 0 {
-			return errors.New(usage)
-		}
-		n, err = send(args[1], bytesToSend)
-	case "send-stdin":
-		if len(args) != 2 {
-			return errors.New(usage)
-		}
-		n, err = sendFromReader(args[1], os.Stdin)
-	case "recv":
-		if len(args) != 2 {
-			return errors.New(usage)
-		}
-		n, err = receiveToWriter(args[1], os.Stdout)
-	case "recv-discard":
-		if len(args) != 2 {
-			return errors.New(usage)
-		}
-		n, err = receiveToWriter(args[1], io.Discard)
-	case "listen-send":
-		if len(args) != 3 {
-			return errors.New(usage)
-		}
-		bytesToSend, parseErr := strconv.ParseInt(args[2], 10, 64)
-		if parseErr != nil || bytesToSend < 0 {
-			return errors.New(usage)
-		}
-		n, err = listenAndSend(args[1], bytesToSend)
-	case "listen-send-stdin":
-		if len(args) != 2 {
-			return errors.New(usage)
-		}
-		n, err = listenAndSendFromReader(args[1], os.Stdin)
-	case "send-tls":
-		if len(args) != 2 {
-			return errors.New(usage)
-		}
-		n, err = sendTLS(args[1], os.Stdin)
-	case "listen-tls":
-		if len(args) != 2 {
-			return errors.New(usage)
-		}
-		n, err = listenTLS(args[1], os.Stdout)
-	default:
-		return errors.New(usage)
-	}
+	n, err := runBenchCommand(args)
 	if err != nil {
 		return err
 	}
 	elapsed := time.Since(started)
-	fmt.Fprintf(stdout, "bytes=%d duration=%s mbps=%.2f\n", n, elapsed, float64(n*8)/elapsed.Seconds()/1e6)
+	_, _ = fmt.Fprintf(stdout, "bytes=%d duration=%s mbps=%.2f\n", n, elapsed, float64(n*8)/elapsed.Seconds()/1e6)
 	return nil
+}
+
+func runBenchCommand(args []string) (int64, error) {
+	handler, ok := benchCommands()[args[0]]
+	if !ok {
+		return 0, errors.New(usage)
+	}
+	return handler(args[1:])
+}
+
+func benchCommands() map[string]benchCommand {
+	return map[string]benchCommand{
+		"send":              runSendCommand,
+		"send-stdin":        runSendStdinCommand,
+		"recv":              runRecvCommand,
+		"recv-discard":      runRecvDiscardCommand,
+		"listen-send":       runListenSendCommand,
+		"listen-send-stdin": runListenSendStdinCommand,
+		"send-tls":          runSendTLSCommand,
+		"listen-tls":        runListenTLSCommand,
+	}
+}
+
+func runSendCommand(args []string) (int64, error) {
+	addr, bytesToSend, err := parseAddrAndBytes(args)
+	if err != nil {
+		return 0, err
+	}
+	return send(addr, bytesToSend)
+}
+
+func runSendStdinCommand(args []string) (int64, error) {
+	addr, err := parseAddrOnly(args)
+	if err != nil {
+		return 0, err
+	}
+	return sendFromReader(addr, os.Stdin)
+}
+
+func runRecvCommand(args []string) (int64, error) {
+	addr, err := parseAddrOnly(args)
+	if err != nil {
+		return 0, err
+	}
+	return receiveToWriter(addr, os.Stdout)
+}
+
+func runRecvDiscardCommand(args []string) (int64, error) {
+	addr, err := parseAddrOnly(args)
+	if err != nil {
+		return 0, err
+	}
+	return receiveToWriter(addr, io.Discard)
+}
+
+func runListenSendCommand(args []string) (int64, error) {
+	addr, bytesToSend, err := parseAddrAndBytes(args)
+	if err != nil {
+		return 0, err
+	}
+	return listenAndSend(addr, bytesToSend)
+}
+
+func runListenSendStdinCommand(args []string) (int64, error) {
+	addr, err := parseAddrOnly(args)
+	if err != nil {
+		return 0, err
+	}
+	return listenAndSendFromReader(addr, os.Stdin)
+}
+
+func runSendTLSCommand(args []string) (int64, error) {
+	addr, err := parseAddrOnly(args)
+	if err != nil {
+		return 0, err
+	}
+	return sendTLS(addr, os.Stdin)
+}
+
+func runListenTLSCommand(args []string) (int64, error) {
+	addr, err := parseAddrOnly(args)
+	if err != nil {
+		return 0, err
+	}
+	return listenTLS(addr, os.Stdout)
+}
+
+func parseAddrOnly(args []string) (string, error) {
+	if len(args) != 1 {
+		return "", errors.New(usage)
+	}
+	return args[0], nil
+}
+
+func parseAddrAndBytes(args []string) (string, int64, error) {
+	if len(args) != 2 {
+		return "", 0, errors.New(usage)
+	}
+	bytesToSend, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil || bytesToSend < 0 {
+		return "", 0, errors.New(usage)
+	}
+	return args[0], bytesToSend, nil
 }
 
 func send(addr string, bytesToSend int64) (int64, error) {
@@ -104,25 +154,33 @@ func send(addr string, bytesToSend int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	buf := make([]byte, 1<<20)
 	var sent int64
 	for sent < bytesToSend {
-		n := int64(len(buf))
-		if remaining := bytesToSend - sent; remaining < n {
-			n = remaining
-		}
-		wrote, err := conn.Write(buf[:n])
+		wrote, err := conn.Write(buf[:tcpBenchChunkSize(buf, bytesToSend-sent)])
 		sent += int64(wrote)
 		if err != nil {
 			return sent, err
 		}
 	}
+	closeTCPWrite(conn)
+	return sent, nil
+}
+
+func tcpBenchChunkSize(buf []byte, remaining int64) int {
+	n := int64(len(buf))
+	if remaining < n {
+		return int(remaining)
+	}
+	return int(n)
+}
+
+func closeTCPWrite(conn net.Conn) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		_ = tcpConn.CloseWrite()
 	}
-	return sent, nil
 }
 
 func sendFromReader(addr string, src io.Reader) (int64, error) {
@@ -130,7 +188,7 @@ func sendFromReader(addr string, src io.Reader) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	buf := make([]byte, 1<<20)
 	var total int64
@@ -164,7 +222,7 @@ func sendTLS(addr string, src io.Reader) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	return writeFromReader(conn, src)
 }
@@ -203,7 +261,7 @@ func listenTLS(addr string, dst io.Writer) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	return receiveFromListener(ln, dst)
 }
@@ -213,7 +271,7 @@ func receiveFromListener(ln net.Listener, dst io.Writer) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	return io.Copy(dst, conn)
 }
@@ -223,7 +281,7 @@ func receiveToWriter(addr string, dst io.Writer) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	return io.Copy(dst, conn)
 }
@@ -233,13 +291,13 @@ func listenAndSend(addr string, bytesToSend int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	conn, err := ln.Accept()
 	if err != nil {
 		return 0, err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	buf := make([]byte, 1<<20)
 	var sent int64
@@ -265,13 +323,13 @@ func listenAndSendFromReader(addr string, src io.Reader) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	conn, err := ln.Accept()
 	if err != nil {
 		return 0, err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	n, err := writeFromReader(conn, src)
 	if tcpConn, ok := conn.(*net.TCPConn); ok {

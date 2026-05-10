@@ -49,23 +49,11 @@ var derptunOpen = session.DerptunOpen
 
 func runOpen(args []string, level telemetry.Level, stdin io.Reader, stderr io.Writer) int {
 	parsed, err := yargs.ParseWithCommandAndHelp[struct{}, openFlags, struct{}](append([]string{"open"}, args...), openHelpConfig)
-	if err != nil {
-		switch {
-		case errors.Is(err, yargs.ErrHelp), errors.Is(err, yargs.ErrSubCommandHelp), errors.Is(err, yargs.ErrHelpLLM):
-			if parsed != nil && parsed.HelpText != "" {
-				fmt.Fprint(stderr, parsed.HelpText)
-			} else {
-				fmt.Fprint(stderr, openHelpText())
-			}
-			return 0
-		default:
-			fmt.Fprintln(stderr, err)
-			fmt.Fprint(stderr, openHelpText())
-			return 2
-		}
+	if code, handled := handleYargsError(parsed, err, stderr, openHelpText); handled {
+		return code
 	}
 	if len(parsed.Parser.Args) != 0 || len(parsed.RemainingArgs) != 0 {
-		fmt.Fprint(stderr, openHelpText())
+		_, _ = fmt.Fprint(stderr, openHelpText())
 		return 2
 	}
 	token, _, err := resolveTokenSource(stdin, tokenSource{
@@ -74,13 +62,17 @@ func runOpen(args []string, level telemetry.Level, stdin io.Reader, stderr io.Wr
 		TokenStdin: parsed.SubCommandFlags.TokenStdin,
 	})
 	if err != nil {
-		fmt.Fprintln(stderr, err)
-		fmt.Fprint(stderr, openHelpText())
+		_, _ = fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprint(stderr, openHelpText())
 		return 2
 	}
 
 	ctx, stop := commandContext()
 	defer stop()
+	return runOpenSession(ctx, token, parsed, level, stderr)
+}
+
+func runOpenSession(ctx context.Context, token string, parsed *yargs.TypedParseResult[struct{}, openFlags, struct{}], level telemetry.Level, stderr io.Writer) int {
 	bindSink := make(chan string, 1)
 	done := make(chan error, 1)
 	go func() {
@@ -96,16 +88,16 @@ func runOpen(args []string, level telemetry.Level, stdin io.Reader, stderr io.Wr
 
 	select {
 	case bindAddr := <-bindSink:
-		fmt.Fprintf(stderr, "listening on %s\n", bindAddr)
+		_, _ = fmt.Fprintf(stderr, "listening on %s\n", bindAddr)
 	case err := <-done:
 		if err != nil && !errors.Is(err, context.Canceled) {
-			fmt.Fprintln(stderr, err)
+			_, _ = fmt.Fprintln(stderr, err)
 			return 1
 		}
 		return 0
 	}
 	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
-		fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
 	return 0

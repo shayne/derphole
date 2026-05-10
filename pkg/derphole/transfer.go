@@ -91,23 +91,24 @@ func normalizeParallelPolicy(policy session.ParallelPolicy) session.ParallelPoli
 
 func Send(ctx context.Context, cfg SendConfig) error {
 	cfg.ParallelPolicy = normalizeParallelPolicy(cfg.ParallelPolicy)
-
 	if err := validateQRSendConfig(cfg); err != nil {
 		return err
 	}
-
 	tx, err := prepareSendTransfer(cfg)
 	if err != nil {
 		return err
 	}
 	if tx.cleanup != nil {
-		defer tx.cleanup()
+		defer func() { _ = tx.cleanup() }()
 	}
 
 	if cfg.Token == "" {
 		return offerTransfer(ctx, cfg, tx)
 	}
+	return sendWithReceiveToken(ctx, cfg, tx)
+}
 
+func sendWithReceiveToken(ctx context.Context, cfg SendConfig, tx sendTransfer) error {
 	tok, err := token.Decode(cfg.Token, time.Now())
 	if err != nil {
 		return err
@@ -118,22 +119,26 @@ func Send(ctx context.Context, cfg SendConfig) error {
 	case tok.Capabilities&token.CapabilityStdioOffer != 0:
 		return errors.New("this code expects `derphole receive`, not `derphole send`")
 	case tok.Capabilities&token.CapabilityAttach != 0:
-		tx.header.Verify = VerificationString(cfg.Token)
-		conn, err := derpholeSessionDialAttach(ctx, session.AttachDialConfig{
-			Token:          cfg.Token,
-			Emitter:        cfg.Emitter,
-			UsePublicDERP:  cfg.UsePublicDERP,
-			ForceRelay:     cfg.ForceRelay,
-			ParallelPolicy: cfg.ParallelPolicy,
-		})
-		if err != nil {
-			return err
-		}
-		defer conn.Close()
-		return writeTransfer(conn, tx, cfg.ProgressOutput, cfg.Stderr)
+		return sendViaAttach(ctx, cfg, tx)
 	default:
 		return errors.New("unsupported receive code")
 	}
+}
+
+func sendViaAttach(ctx context.Context, cfg SendConfig, tx sendTransfer) error {
+	tx.header.Verify = VerificationString(cfg.Token)
+	conn, err := derpholeSessionDialAttach(ctx, session.AttachDialConfig{
+		Token:          cfg.Token,
+		Emitter:        cfg.Emitter,
+		UsePublicDERP:  cfg.UsePublicDERP,
+		ForceRelay:     cfg.ForceRelay,
+		ParallelPolicy: cfg.ParallelPolicy,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	return writeTransfer(conn, tx, cfg.ProgressOutput, cfg.Stderr)
 }
 
 func validateQRSendConfig(cfg SendConfig) error {
@@ -159,101 +164,130 @@ func validateQRSendConfig(cfg SendConfig) error {
 
 func Receive(ctx context.Context, cfg ReceiveConfig) error {
 	cfg.ParallelPolicy = normalizeParallelPolicy(cfg.ParallelPolicy)
-
-	stdin := cfg.Stdin
-	if stdin == nil {
-		stdin = strings.NewReader("")
-	}
-
 	if cfg.Allocate {
-		tokenSink := make(chan string, 1)
-		pipeReader, pipeWriter := io.Pipe()
-		listenErrCh := make(chan error, 1)
-		go func() {
-			_, err := derpholeSessionListen(ctx, session.ListenConfig{
-				Emitter:       cfg.Emitter,
-				TokenSink:     tokenSink,
-				StdioOut:      pipeWriter,
-				UsePublicDERP: cfg.UsePublicDERP,
-				ForceRelay:    cfg.ForceRelay,
-			})
-			if err != nil {
-				_ = pipeWriter.CloseWithError(err)
-			}
-			listenErrCh <- err
-		}()
-
-		var token string
-		select {
-		case token = <-tokenSink:
-		case err := <-listenErrCh:
-			return err
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-
-		WriteReceiveToken(cfg.Stderr, token)
-		readErr := readTransfer(pipeReader, token, cfg.Stdout, cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput, cfg.Progress)
-		listenErr := <-listenErrCh
-		return preferSessionPipeError(readErr, listenErr)
+		return receiveAllocated(ctx, cfg)
 	}
+	receiveToken, err := resolveReceiveToken(cfg, receivePromptInput(cfg.Stdin))
+	if err != nil {
+		return err
+	}
+	return receiveWithToken(ctx, cfg, receiveToken)
+}
 
+func receivePromptInput(r io.Reader) io.Reader {
+	if r != nil {
+		return r
+	}
+	return strings.NewReader("")
+}
+
+func receiveAllocated(ctx context.Context, cfg ReceiveConfig) error {
+	tokenSink := make(chan string, 1)
+	pipeReader, pipeWriter := io.Pipe()
+	listenErrCh := make(chan error, 1)
+	go func() {
+		_, err := derpholeSessionListen(ctx, session.ListenConfig{
+			Emitter:       cfg.Emitter,
+			TokenSink:     tokenSink,
+			StdioOut:      pipeWriter,
+			UsePublicDERP: cfg.UsePublicDERP,
+			ForceRelay:    cfg.ForceRelay,
+		})
+		if err != nil {
+			_ = pipeWriter.CloseWithError(err)
+		}
+		listenErrCh <- err
+	}()
+
+	token, err := waitForAllocatedToken(ctx, tokenSink, listenErrCh)
+	if err != nil {
+		return err
+	}
+	WriteReceiveToken(cfg.Stderr, token)
+	readErr := readTransfer(pipeReader, token, cfg.Stdout, cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput, cfg.Progress)
+	listenErr := <-listenErrCh
+	return preferSessionPipeError(readErr, listenErr)
+}
+
+func waitForAllocatedToken(ctx context.Context, tokenSink <-chan string, listenErrCh <-chan error) (string, error) {
+	select {
+	case token := <-tokenSink:
+		return token, nil
+	case err := <-listenErrCh:
+		return "", err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func resolveReceiveToken(cfg ReceiveConfig, stdin io.Reader) (string, error) {
 	receiveToken := cfg.Token
 	if receiveToken == "" && cfg.PromptFor != nil {
 		var err error
 		receiveToken, err = cfg.PromptFor(stdin, cfg.Stderr)
 		if err != nil {
-			return err
+			return "", err
 		}
 	}
 	if receiveToken == "" {
-		return errors.New("receive code is required")
+		return "", errors.New("receive code is required")
 	}
+	return receiveToken, nil
+}
 
+func receiveWithToken(ctx context.Context, cfg ReceiveConfig, receiveToken string) error {
 	tok, err := token.Decode(receiveToken, time.Now())
 	if err != nil {
 		return err
 	}
 	switch {
 	case tok.Capabilities&token.CapabilityStdioOffer != 0:
-		pipeReader, pipeWriter := io.Pipe()
-		receiveErrCh := make(chan error, 1)
-		go func() {
-			err := derpholeSessionReceive(ctx, session.ReceiveConfig{
-				Token:         receiveToken,
-				Emitter:       cfg.Emitter,
-				StdioOut:      pipeWriter,
-				UsePublicDERP: cfg.UsePublicDERP,
-				ForceRelay:    cfg.ForceRelay,
-			})
-			if err != nil {
-				_ = pipeWriter.CloseWithError(err)
-			}
-			receiveErrCh <- err
-		}()
-		readErr := readTransfer(pipeReader, receiveToken, cfg.Stdout, cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput, cfg.Progress)
-		receiveErr := <-receiveErrCh
-		return preferSessionPipeError(readErr, receiveErr)
+		return receiveViaStdioOffer(ctx, cfg, receiveToken)
 	case tok.Capabilities&token.CapabilityStdio != 0:
 		return errors.New("this code expects `derphole send`, not `derphole receive`")
 	case tok.Capabilities&token.CapabilityAttach != 0:
-		conn, err := derpholeSessionDialAttach(ctx, session.AttachDialConfig{
-			Token:          receiveToken,
-			Emitter:        cfg.Emitter,
-			UsePublicDERP:  cfg.UsePublicDERP,
-			ForceRelay:     cfg.ForceRelay,
-			ParallelPolicy: cfg.ParallelPolicy,
-		})
-		if err != nil {
-			return err
-		}
-		defer conn.Close()
-		return readTransfer(conn, receiveToken, cfg.Stdout, cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput, cfg.Progress)
+		return receiveViaAttach(ctx, cfg, receiveToken)
 	case tok.Capabilities&token.CapabilityWebFile != 0:
 		return receiveViaWebRelay(ctx, cfg, receiveToken)
 	default:
 		return errors.New("unsupported send code")
 	}
+}
+
+func receiveViaStdioOffer(ctx context.Context, cfg ReceiveConfig, receiveToken string) error {
+	pipeReader, pipeWriter := io.Pipe()
+	receiveErrCh := make(chan error, 1)
+	go func() {
+		err := derpholeSessionReceive(ctx, session.ReceiveConfig{
+			Token:         receiveToken,
+			Emitter:       cfg.Emitter,
+			StdioOut:      pipeWriter,
+			UsePublicDERP: cfg.UsePublicDERP,
+			ForceRelay:    cfg.ForceRelay,
+		})
+		if err != nil {
+			_ = pipeWriter.CloseWithError(err)
+		}
+		receiveErrCh <- err
+	}()
+	readErr := readTransfer(pipeReader, receiveToken, cfg.Stdout, cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput, cfg.Progress)
+	receiveErr := <-receiveErrCh
+	return preferSessionPipeError(readErr, receiveErr)
+}
+
+func receiveViaAttach(ctx context.Context, cfg ReceiveConfig, receiveToken string) error {
+	conn, err := derpholeSessionDialAttach(ctx, session.AttachDialConfig{
+		Token:          receiveToken,
+		Emitter:        cfg.Emitter,
+		UsePublicDERP:  cfg.UsePublicDERP,
+		ForceRelay:     cfg.ForceRelay,
+		ParallelPolicy: cfg.ParallelPolicy,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	return readTransfer(conn, receiveToken, cfg.Stdout, cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput, cfg.Progress)
 }
 
 func receiveViaWebRelay(ctx context.Context, cfg ReceiveConfig, receiveToken string) error {
@@ -377,7 +411,7 @@ func transferSessionExpectedBytes(tx sendTransfer) int64 {
 
 func writeTransferWithProgress(w io.Writer, tx sendTransfer, progressOut, stderr io.Writer) (*ProgressReporter, error) {
 	if tx.summary != "" && stderr != nil {
-		fmt.Fprintln(stderr, tx.summary)
+		_, _ = fmt.Fprintln(stderr, tx.summary)
 	}
 	body := tx.body
 	progress := NewProgressReporter(progressOut, tx.progressTotal)
@@ -517,46 +551,65 @@ func readTransfer(r io.Reader, token string, stdout io.Writer, outputPath string
 }
 
 func receiveFile(r io.Reader, header protocol.Header, outputPath string, stderr, progressOut io.Writer, progressCallback func(current, total int64)) error {
-	target, err := ResolveOutputPath(outputPath, header.Name)
+	target, err := prepareReceiveFileTarget(outputPath, header, stderr)
 	if err != nil {
 		return err
 	}
-	if stderr != nil {
-		fmt.Fprintf(stderr, "Receiving file (%s) into: %q\n", formatProgressBytes(header.Size), filepath.Base(target))
-	}
-	if dir := filepath.Dir(target); dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
-	}
-
 	f, err := os.Create(target)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	progress := NewProgressReporterWithCallback(progressOut, header.Size, progressCallback)
 	if progress != nil {
 		r = progress.Wrap(r)
 	}
+	return copyReceiveFile(f, r, header.Size, progress)
+}
 
-	if header.Size > 0 {
-		var copied int64
-		copied, err = io.CopyN(f, r, header.Size)
+func prepareReceiveFileTarget(outputPath string, header protocol.Header, stderr io.Writer) (string, error) {
+	target, err := ResolveOutputPath(outputPath, header.Name)
+	if err != nil {
+		return "", err
+	}
+	if stderr != nil {
+		_, _ = fmt.Fprintf(stderr, "Receiving file (%s) into: %q\n", formatProgressBytes(header.Size), filepath.Base(target))
+	}
+	if err := ensureOutputDir(target); err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
+func ensureOutputDir(target string) error {
+	dir := filepath.Dir(target)
+	if dir == "." {
+		return nil
+	}
+	return os.MkdirAll(dir, 0o755)
+}
+
+func copyReceiveFile(f io.Writer, r io.Reader, size int64, progress *ProgressReporter) error {
+	if size <= 0 {
+		_, err := io.Copy(f, r)
 		if err == nil {
 			progress.Finish()
 		}
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return fmt.Errorf("incomplete file transfer: received %s of %s: %w", formatProgressBytes(copied), formatProgressBytes(header.Size), err)
-		}
 		return err
 	}
-	_, err = io.Copy(f, r)
+	copied, err := io.CopyN(f, r, size)
 	if err == nil {
 		progress.Finish()
 	}
+	if isIncompleteTransfer(err) {
+		return fmt.Errorf("incomplete file transfer: received %s of %s: %w", formatProgressBytes(copied), formatProgressBytes(size), err)
+	}
 	return err
+}
+
+func isIncompleteTransfer(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 type nativeWebFileSink struct {
@@ -583,7 +636,7 @@ func (s *nativeWebFileSink) Open(_ context.Context, meta webproto.Meta) error {
 		return err
 	}
 	if s.stderr != nil {
-		fmt.Fprintf(s.stderr, "Receiving file (%s) into: %q\n", formatProgressBytes(meta.Size), filepath.Base(target))
+		_, _ = fmt.Fprintf(s.stderr, "Receiving file (%s) into: %q\n", formatProgressBytes(meta.Size), filepath.Base(target))
 	}
 	if dir := filepath.Dir(target); dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -637,9 +690,9 @@ func receiveDirectory(r io.Reader, header protocol.Header, outputPath string, st
 		return err
 	}
 	if stderr != nil {
-		fmt.Fprintf(stderr, "Receiving directory (%s) into: %q/\n", formatProgressBytes(header.Size), topLevel)
+		_, _ = fmt.Fprintf(stderr, "Receiving directory (%s) into: %q/\n", formatProgressBytes(header.Size), topLevel)
 		if meta, ok := decodeDirectorySummary(header.Metadata); ok {
-			fmt.Fprintf(stderr, "%d files, %s (uncompressed)\n", meta.FileCount, formatProgressBytes(meta.UncompressedBytes))
+			_, _ = fmt.Fprintf(stderr, "%d files, %s (uncompressed)\n", meta.FileCount, formatProgressBytes(meta.UncompressedBytes))
 		}
 	}
 	progress := NewProgressReporterWithCallback(progressOut, header.Size, progressCallback)

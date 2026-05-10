@@ -105,40 +105,7 @@ func ListenAttach(ctx context.Context, cfg AttachListenConfig) (*AttachListener,
 
 	listener := &AttachListener{Token: tok}
 	listener.accept = func(ctx context.Context) (net.Conn, error) {
-		for {
-			session.mu.Lock()
-			if session.conn != nil {
-				conn := session.conn
-				session.conn = nil
-				session.mu.Unlock()
-				return conn, nil
-			}
-			if session.closed {
-				session.mu.Unlock()
-				return nil, net.ErrClosed
-			}
-			wake := session.wake
-			session.mu.Unlock()
-
-			select {
-			case <-wake:
-				continue
-			case <-ctx.Done():
-				session.mu.Lock()
-				if session.conn != nil {
-					conn := session.conn
-					session.conn = nil
-					session.mu.Unlock()
-					return conn, nil
-				}
-				if session.closed {
-					session.mu.Unlock()
-					return nil, net.ErrClosed
-				}
-				session.mu.Unlock()
-				return nil, ctx.Err()
-			}
-		}
+		return acceptLocalAttach(ctx, session)
 	}
 	listener.close = func() error {
 		closeAttachSession(tok, session)
@@ -156,17 +123,61 @@ func ListenAttach(ctx context.Context, cfg AttachListenConfig) (*AttachListener,
 	return listener, nil
 }
 
+func acceptLocalAttach(ctx context.Context, session *attachSession) (net.Conn, error) {
+	for {
+		conn, wake, err := nextAttachConn(session)
+		if conn != nil || err != nil {
+			return conn, err
+		}
+		select {
+		case <-wake:
+		case <-ctx.Done():
+			return attachConnAfterContext(session, ctx.Err())
+		}
+	}
+}
+
+func nextAttachConn(session *attachSession) (net.Conn, <-chan struct{}, error) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.conn != nil {
+		conn := session.conn
+		session.conn = nil
+		return conn, nil, nil
+	}
+	if session.closed {
+		return nil, nil, net.ErrClosed
+	}
+	return nil, session.wake, nil
+}
+
+func attachConnAfterContext(session *attachSession, ctxErr error) (net.Conn, error) {
+	conn, _, err := nextAttachConn(session)
+	if conn != nil || err != nil {
+		return conn, err
+	}
+	return nil, ctxErr
+}
+
 func DialAttach(ctx context.Context, cfg AttachDialConfig) (net.Conn, error) {
 	if cfg.UsePublicDERP {
-		tok, err := token.Decode(cfg.Token, time.Now())
-		if err != nil {
-			return nil, err
-		}
-		if tok.Capabilities&token.CapabilityAttach == 0 {
-			return nil, ErrUnknownSession
-		}
-		return dialAttachExternal(ctx, cfg, tok)
+		return dialExternalAttachToken(ctx, cfg)
 	}
+	return dialLocalAttach(ctx, cfg)
+}
+
+func dialExternalAttachToken(ctx context.Context, cfg AttachDialConfig) (net.Conn, error) {
+	tok, err := token.Decode(cfg.Token, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	if tok.Capabilities&token.CapabilityAttach == 0 {
+		return nil, ErrUnknownSession
+	}
+	return dialAttachExternal(ctx, cfg, tok)
+}
+
+func dialLocalAttach(ctx context.Context, cfg AttachDialConfig) (net.Conn, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -186,8 +197,7 @@ func DialAttach(ctx context.Context, cfg AttachDialConfig) (net.Conn, error) {
 	}
 	select {
 	case <-ctx.Done():
-		_ = left.Close()
-		_ = right.Close()
+		closeConnPair(left, right)
 		return nil, ctx.Err()
 	default:
 	}
@@ -195,14 +205,12 @@ func DialAttach(ctx context.Context, cfg AttachDialConfig) (net.Conn, error) {
 	session.mu.Lock()
 	if session.closed {
 		session.mu.Unlock()
-		_ = left.Close()
-		_ = right.Close()
+		closeConnPair(left, right)
 		return nil, net.ErrClosed
 	}
 	if session.conn != nil {
 		session.mu.Unlock()
-		_ = left.Close()
-		_ = right.Close()
+		closeConnPair(left, right)
 		return nil, ErrUnknownSession
 	}
 
@@ -212,4 +220,9 @@ func DialAttach(ctx context.Context, cfg AttachDialConfig) (net.Conn, error) {
 	session.signal()
 
 	return left, nil
+}
+
+func closeConnPair(left, right net.Conn) {
+	_ = left.Close()
+	_ = right.Close()
 }

@@ -25,8 +25,8 @@ func WriteSendInstruction(stderr io.Writer, token string) {
 	if stderr == nil {
 		return
 	}
-	fmt.Fprintln(stderr, "On the other machine, run:")
-	fmt.Fprintf(stderr, "npx -y derphole@latest receive %s\n", token)
+	_, _ = fmt.Fprintln(stderr, "On the other machine, run:")
+	_, _ = fmt.Fprintf(stderr, "npx -y derphole@latest receive %s\n", token)
 }
 
 func WriteSendQRInstruction(stderr io.Writer, token string) {
@@ -35,10 +35,10 @@ func WriteSendQRInstruction(stderr io.Writer, token string) {
 	}
 	payload, err := qrpayload.EncodeFileToken(token)
 	if err != nil {
-		fmt.Fprintf(stderr, "Could not render QR payload: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "Could not render QR payload: %v\n", err)
 		return
 	}
-	fmt.Fprintln(stderr, "Scan this QR code with the Derphole iOS app:")
+	_, _ = fmt.Fprintln(stderr, "Scan this QR code with the Derphole iOS app:")
 	qrterminal.GenerateHalfBlock(payload, qrterminal.M, stderr)
 }
 
@@ -46,5 +46,5 @@ func WriteReceiveToken(stderr io.Writer, token string) {
 	if stderr == nil {
 		return
 	}
-	fmt.Fprintln(stderr, token)
+	_, _ = fmt.Fprintln(stderr, token)
 }

@@ -7,6 +7,7 @@ package probe
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -86,6 +87,110 @@ func TestWireGuardTransferRejectsLegacyTransport(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "requires \"batched\" transport") {
 		t.Fatalf("ReceiveWireGuardToWriter() error = %v, want batched transport rejection", err)
 	}
+}
+
+func TestResolveWireGuardConfigDefaultsTransportAndPort(t *testing.T) {
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	plan, err := newWireGuardPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resolved, err := resolveWireGuardConfig(conn, WireGuardConfig{
+		PrivateKeyHex: plan.listenerPrivHex,
+		PeerPublicHex: plan.senderPubHex,
+		LocalAddr:     plan.listenerAddr.String(),
+		PeerAddr:      plan.senderAddr.String(),
+	})
+	if err != nil {
+		t.Fatalf("resolveWireGuardConfig() error = %v", err)
+	}
+	if resolved.port != defaultWireGuardProbePort {
+		t.Fatalf("resolved port = %d, want default %d", resolved.port, defaultWireGuardProbePort)
+	}
+	if resolved.localAddr != plan.listenerAddr || resolved.peerAddr != plan.senderAddr {
+		t.Fatalf("resolved addrs = %s/%s, want %s/%s", resolved.localAddr, resolved.peerAddr, plan.listenerAddr, plan.senderAddr)
+	}
+}
+
+func TestResolveWireGuardConfigRejectsInvalidInputs(t *testing.T) {
+	plan, err := newWireGuardPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := WireGuardConfig{
+		Transport:     probeTransportBatched,
+		PrivateKeyHex: plan.listenerPrivHex,
+		PeerPublicHex: plan.senderPubHex,
+		LocalAddr:     plan.listenerAddr.String(),
+		PeerAddr:      plan.senderAddr.String(),
+		Port:          uint16(plan.port),
+	}
+
+	tests := []struct {
+		name string
+		conn net.PacketConn
+		cfg  WireGuardConfig
+		want string
+	}{
+		{name: "nil conn", cfg: valid, want: "nil packet conn"},
+		{name: "legacy transport", conn: mustPacketConn(t), cfg: withWireGuardTransport(valid, probeTransportLegacy), want: `requires "batched" transport`},
+		{name: "private key", conn: mustPacketConn(t), cfg: withWireGuardPrivateKey(valid, "nope"), want: "parse wg private key"},
+		{name: "peer public key", conn: mustPacketConn(t), cfg: withWireGuardPeerPublicKey(valid, "nope"), want: "parse wg peer public key"},
+		{name: "local addr", conn: mustPacketConn(t), cfg: withWireGuardLocalAddr(valid, "nope"), want: "parse wg local addr"},
+		{name: "peer addr", conn: mustPacketConn(t), cfg: withWireGuardPeerAddr(valid, "nope"), want: "parse wg peer addr"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.conn != nil {
+				defer tc.conn.Close()
+			}
+			_, err := resolveWireGuardConfig(tc.conn, tc.cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("resolveWireGuardConfig() error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func mustPacketConn(t *testing.T) net.PacketConn {
+	t.Helper()
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return conn
+}
+
+func withWireGuardTransport(cfg WireGuardConfig, transport string) WireGuardConfig {
+	cfg.Transport = transport
+	return cfg
+}
+
+func withWireGuardPrivateKey(cfg WireGuardConfig, key string) WireGuardConfig {
+	cfg.PrivateKeyHex = key
+	return cfg
+}
+
+func withWireGuardPeerPublicKey(cfg WireGuardConfig, key string) WireGuardConfig {
+	cfg.PeerPublicHex = key
+	return cfg
+}
+
+func withWireGuardLocalAddr(cfg WireGuardConfig, addr string) WireGuardConfig {
+	cfg.LocalAddr = addr
+	return cfg
+}
+
+func withWireGuardPeerAddr(cfg WireGuardConfig, addr string) WireGuardConfig {
+	cfg.PeerAddr = addr
+	return cfg
 }
 
 func TestReceiveWireGuardParallelReturnsAfterExpectedBytesWithoutAllStreams(t *testing.T) {
@@ -184,6 +289,204 @@ func TestReceiveWireGuardParallelAcksAllStreamsAfterTargetReached(t *testing.T) 
 		if err := <-errCh; err != nil {
 			t.Fatalf("stream %d error = %v", i+1, err)
 		}
+	}
+}
+
+func TestSendWireGuardParallelSendsSharesAndWaitsForAcks(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	const streams = 4
+	const totalBytes = 17
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	receivedCh := make(chan int64, streams)
+	for i := 0; i < streams; i++ {
+		go func() {
+			conn, err := acceptConn(ctx, ln)
+			if err != nil {
+				t.Error(err)
+				receivedCh <- 0
+				return
+			}
+			defer conn.Close()
+			n, err := io.Copy(io.Discard, conn)
+			if err != nil {
+				t.Error(err)
+				receivedCh <- n
+				return
+			}
+			if err := writeWireGuardDrainAck(conn); err != nil {
+				t.Error(err)
+			}
+			receivedCh <- n
+		}()
+	}
+
+	stats, err := sendWireGuardParallel(ctx, &TransferStats{StartedAt: time.Now()}, func(ctx context.Context) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, "tcp4", ln.Addr().String())
+	}, WireGuardConfig{Streams: streams, SizeBytes: totalBytes})
+	if err != nil {
+		t.Fatalf("sendWireGuardParallel() error = %v", err)
+	}
+	if stats.BytesSent != totalBytes {
+		t.Fatalf("BytesSent = %d, want %d", stats.BytesSent, totalBytes)
+	}
+
+	var received int64
+	for i := 0; i < streams; i++ {
+		received += <-receivedCh
+	}
+	if received != totalBytes {
+		t.Fatalf("received bytes = %d, want %d", received, totalBytes)
+	}
+}
+
+func TestReceiveWireGuardSingleWritesPayloadAndAck(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	payload := []byte("wireguard-single")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := net.Dial("tcp4", ln.Addr().String())
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+		if _, err := conn.Write(payload); err != nil {
+			errCh <- err
+			return
+		}
+		if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+			errCh <- err
+			return
+		}
+		ack := make([]byte, len(wireGuardDrainAck))
+		if _, err := io.ReadFull(conn, ack); err != nil {
+			errCh <- err
+			return
+		}
+		if !bytes.Equal(ack, wireGuardDrainAck) {
+			errCh <- fmt.Errorf("ack = %q, want %q", ack, wireGuardDrainAck)
+			return
+		}
+		errCh <- nil
+	}()
+
+	var dst bytes.Buffer
+	stats, err := receiveWireGuardSingle(ctx, &TransferStats{StartedAt: time.Now()}, &dst, WireGuardConfig{
+		SizeBytes: int64(len(payload)),
+	}, func(ctx context.Context) (net.Conn, error) {
+		return acceptConn(ctx, ln)
+	})
+	if err != nil {
+		t.Fatalf("receiveWireGuardSingle() error = %v", err)
+	}
+	if !bytes.Equal(dst.Bytes(), payload) {
+		t.Fatalf("received = %q, want %q", dst.Bytes(), payload)
+	}
+	if stats.BytesReceived != int64(len(payload)) {
+		t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(payload))
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("sender error = %v", err)
+	}
+}
+
+func TestWireGuardParallelReceiverHelperErrors(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	receiver := newWireGuardParallelReceiver(ctx, &TransferStats{StartedAt: time.Now()}, ln, WireGuardConfig{SizeBytes: 100})
+
+	if err := receiver.checkReaderDrain(true); err != nil {
+		t.Fatalf("checkReaderDrain(accepting) error = %v", err)
+	}
+
+	connA, connB := net.Pipe()
+	receiver.activeConn = []net.Conn{connA}
+	if err := receiver.checkReaderDrain(false); err != nil {
+		t.Fatalf("checkReaderDrain(active) error = %v", err)
+	}
+	_ = connB.Close()
+	_ = connA.Close()
+	receiver.activeConn = nil
+
+	if err := receiver.checkReaderDrain(false); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("checkReaderDrain(drained) error = %v, want unexpected EOF", err)
+	}
+
+	reportErr := errors.New("receiver failed")
+	receiver.reportErr(reportErr)
+	receiver.reportErr(errors.New("dropped"))
+	if got := <-receiver.errCh; !errors.Is(got, reportErr) {
+		t.Fatalf("reportErr() = %v, want first error", got)
+	}
+
+	stats, err := receiver.stopAndWaitErr(reportErr)
+	if !errors.Is(err, reportErr) || stats != (TransferStats{}) {
+		t.Fatalf("stopAndWaitErr() = %#v, %v; want zero stats and error", stats, err)
+	}
+}
+
+func TestWireGuardParallelReceiverAckAndReadError(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	receiver := newWireGuardParallelReceiver(ctx, &TransferStats{StartedAt: time.Now()}, ln, WireGuardConfig{SizeBytes: 100})
+
+	connA, connB := net.Pipe()
+	ackDone := make(chan error, 1)
+	go func() {
+		ack := make([]byte, len(wireGuardDrainAck))
+		_, err := io.ReadFull(connB, ack)
+		if err == nil && !bytes.Equal(ack, wireGuardDrainAck) {
+			err = fmt.Errorf("ack = %q, want %q", ack, wireGuardDrainAck)
+		}
+		ackDone <- err
+	}()
+	receiver.ackStreamEOF(1, connA, 10)
+	if err := <-ackDone; err != nil {
+		t.Fatalf("ack read error = %v", err)
+	}
+	_ = connA.Close()
+	_ = connB.Close()
+
+	brokenA, brokenB := net.Pipe()
+	_ = brokenB.Close()
+	receiver.ackStreamEOF(2, brokenA, 10)
+	if err := <-receiver.errCh; err == nil {
+		t.Fatal("ackStreamEOF(broken) error = nil, want reported error")
+	}
+	_ = brokenA.Close()
+
+	readErr := errors.New("read failed")
+	receiver.reportReadError(3, readErr, 10)
+	if err := <-receiver.errCh; !errors.Is(err, readErr) {
+		t.Fatalf("reportReadError() = %v, want read error", err)
 	}
 }
 

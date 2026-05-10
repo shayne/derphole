@@ -262,60 +262,78 @@ func (t *Transport) forwardSignals(ctx context.Context, peer webrelay.DirectSign
 }
 
 func (t *Transport) applySignal(ctx context.Context, peer webrelay.DirectSignalPeer, frame webproto.Frame) error {
-	var signal webproto.WebRTCSignal
-	if err := json.Unmarshal(frame.Payload, &signal); err != nil {
+	signal, pc, err := t.signalTarget(frame)
+	if err != nil {
 		return err
 	}
-	if signal.Lane < 0 || signal.Lane >= dataChannelCount {
-		return errors.New("invalid webrtc signal lane")
-	}
-	t.mu.Lock()
-	if signal.Lane >= len(t.pcs) {
-		t.mu.Unlock()
-		return errors.New("webrtc peer connection is not started")
-	}
-	pc := t.pcs[signal.Lane]
-	t.mu.Unlock()
 	switch frame.Kind {
 	case webproto.FrameWebRTCOffer:
-		if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: signal.SDP}); err != nil {
-			return err
-		}
-		if err := t.flushPendingCandidates(pc, signal.Lane); err != nil {
-			return err
-		}
-		answer, err := pc.CreateAnswer(nil)
-		if err != nil {
-			return err
-		}
-		if err := pc.SetLocalDescription(answer); err != nil {
-			return err
-		}
-		return sendSignal(ctx, peer, webproto.FrameWebRTCAnswer, webproto.WebRTCSignal{Lane: signal.Lane, Kind: "answer", Type: answer.Type.String(), SDP: answer.SDP})
+		return t.applyOfferSignal(ctx, peer, pc, signal)
 	case webproto.FrameWebRTCAnswer:
-		if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: signal.SDP}); err != nil {
-			return err
-		}
-		return t.flushPendingCandidates(pc, signal.Lane)
+		return t.applyAnswerSignal(pc, signal)
 	case webproto.FrameWebRTCIceCandidate:
-		candidate := webrtc.ICECandidateInit{
-			Candidate:        signal.Candidate,
-			SDPMid:           &signal.SDPMid,
-			SDPMLineIndex:    uint16Ptr(uint16(signal.SDPMLineIndex)),
-			UsernameFragment: &signal.UsernameFragment,
-		}
-		if pc.RemoteDescription() == nil {
-			t.mu.Lock()
-			t.pending[signal.Lane] = append(t.pending[signal.Lane], candidate)
-			t.mu.Unlock()
-			return nil
-		}
-		return pc.AddICECandidate(candidate)
+		return t.applyCandidateSignal(pc, signal)
 	case webproto.FrameWebRTCIceComplete:
 		return nil
 	default:
 		return nil
 	}
+}
+
+func (t *Transport) signalTarget(frame webproto.Frame) (webproto.WebRTCSignal, *webrtc.PeerConnection, error) {
+	var signal webproto.WebRTCSignal
+	if err := json.Unmarshal(frame.Payload, &signal); err != nil {
+		return webproto.WebRTCSignal{}, nil, err
+	}
+	if signal.Lane < 0 || signal.Lane >= dataChannelCount {
+		return webproto.WebRTCSignal{}, nil, errors.New("invalid webrtc signal lane")
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if signal.Lane >= len(t.pcs) {
+		return webproto.WebRTCSignal{}, nil, errors.New("webrtc peer connection is not started")
+	}
+	return signal, t.pcs[signal.Lane], nil
+}
+
+func (t *Transport) applyOfferSignal(ctx context.Context, peer webrelay.DirectSignalPeer, pc *webrtc.PeerConnection, signal webproto.WebRTCSignal) error {
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: signal.SDP}); err != nil {
+		return err
+	}
+	if err := t.flushPendingCandidates(pc, signal.Lane); err != nil {
+		return err
+	}
+	answer, err := pc.CreateAnswer(nil)
+	if err != nil {
+		return err
+	}
+	if err := pc.SetLocalDescription(answer); err != nil {
+		return err
+	}
+	return sendSignal(ctx, peer, webproto.FrameWebRTCAnswer, webproto.WebRTCSignal{Lane: signal.Lane, Kind: "answer", Type: answer.Type.String(), SDP: answer.SDP})
+}
+
+func (t *Transport) applyAnswerSignal(pc *webrtc.PeerConnection, signal webproto.WebRTCSignal) error {
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: signal.SDP}); err != nil {
+		return err
+	}
+	return t.flushPendingCandidates(pc, signal.Lane)
+}
+
+func (t *Transport) applyCandidateSignal(pc *webrtc.PeerConnection, signal webproto.WebRTCSignal) error {
+	candidate := webrtc.ICECandidateInit{
+		Candidate:        signal.Candidate,
+		SDPMid:           &signal.SDPMid,
+		SDPMLineIndex:    uint16Ptr(uint16(signal.SDPMLineIndex)),
+		UsernameFragment: &signal.UsernameFragment,
+	}
+	if pc.RemoteDescription() != nil {
+		return pc.AddICECandidate(candidate)
+	}
+	t.mu.Lock()
+	t.pending[signal.Lane] = append(t.pending[signal.Lane], candidate)
+	t.mu.Unlock()
+	return nil
 }
 
 func (t *Transport) flushPendingCandidates(pc *webrtc.PeerConnection, lane int) error {

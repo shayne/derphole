@@ -401,3 +401,25 @@ func TestClientRefreshTransitionsAndStability(t *testing.T) {
 		t.Fatal("second identical Refresh() changed = true, want false")
 	}
 }
+
+func TestApplyMappingUpdatesSnapshotAndNilSafe(t *testing.T) {
+	var nilClient *Client
+	nilClient.applyMapping(portmappertype.Mapping{})
+
+	c := NewForTest(&fakeMapper{}, telemetry.New(io.Discard, telemetry.LevelVerbose))
+	external := netip.MustParseAddrPort("203.0.113.20:4444")
+	c.applyMapping(portmappertype.Mapping{
+		External: external,
+		Type:     "pcp",
+	})
+
+	if got, ok := c.Snapshot(); !ok || got != external {
+		t.Fatalf("Snapshot() = %v, %v, want %v, true", got, ok, external)
+	}
+	c.mu.Lock()
+	mapType := c.mapType
+	c.mu.Unlock()
+	if mapType != "pcp" {
+		t.Fatalf("mapType = %q, want pcp", mapType)
+	}
+}

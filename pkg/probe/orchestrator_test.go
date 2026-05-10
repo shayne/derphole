@@ -5,11 +5,13 @@
 package probe
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -100,6 +102,296 @@ func TestRemoteCommandsIncludeBlastParallel(t *testing.T) {
 	}), " ")
 	if !strings.Contains(clientCmd, "/tmp/derphole-probe client --mode blast --transport batched --size-bytes 1024 --peer-candidates 198.51.100.10:40000,203.0.113.10:50000 --parallel 4") {
 		t.Fatalf("client command missing blast parallel: %s", clientCmd)
+	}
+}
+
+func TestSSHRunnerDefaultsAndEnvironmentInjection(t *testing.T) {
+	t.Setenv("HOME", "/tmp/test-home")
+	t.Setenv("DERPHOLE_PROBE_WG_TRACE", "1")
+	t.Setenv("DERPHOLE_PROBE_TRACE", "yes")
+	t.Setenv("DERPHOLE_PROBE_RATE_MBPS", "750")
+	t.Setenv("DERPHOLE_PROBE_REQUIRE_COMPLETE", "true")
+	t.Setenv("DERPHOLE_PROBE_REPAIR_PAYLOADS", "0")
+
+	runner := SSHRunner{Host: "example.test"}
+	if got := runner.target(); got != "example.test" {
+		t.Fatalf("target() = %q, want host", got)
+	}
+	if got := runner.binaryPath(); got != defaultProbeRemotePath {
+		t.Fatalf("binaryPath() = %q, want default", got)
+	}
+
+	cmd := runner.ServerCommand(ServerConfig{})
+	joined := strings.Join(cmd, " ")
+	for _, want := range []string{
+		"UserKnownHostsFile=/tmp/test-home/.ssh/known_hosts",
+		"env DERPHOLE_PROBE_WG_TRACE=1",
+		"DERPHOLE_PROBE_TRACE=yes",
+		"DERPHOLE_PROBE_RATE_MBPS=750",
+		"DERPHOLE_PROBE_REQUIRE_COMPLETE=true",
+		"DERPHOLE_PROBE_REPAIR_PAYLOADS=0",
+		defaultProbeRemotePath + " server --listen :0 --mode raw --transport legacy",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("ServerCommand() missing %q: %#v", want, cmd)
+		}
+	}
+
+	runner.User = "root"
+	runner.RemotePath = "/opt/probe"
+	if got := runner.target(); got != "root@example.test" {
+		t.Fatalf("target() with user = %q, want user@host", got)
+	}
+	if got := runner.binaryPath(); got != "/opt/probe" {
+		t.Fatalf("binaryPath() = %q, want remote path", got)
+	}
+}
+
+func TestCommandHelpersValidateDefaultsAndOptionalFlags(t *testing.T) {
+	if got := defaultProbeMode(""); got != "raw" {
+		t.Fatalf("defaultProbeMode(empty) = %q, want raw", got)
+	}
+	if got := defaultProbeTransport(""); got != probeTransportLegacy {
+		t.Fatalf("defaultProbeTransport(empty) = %q, want legacy", got)
+	}
+
+	argv := appendOptionalStringFlag([]string{"probe"}, "--flag", "")
+	if len(argv) != 1 {
+		t.Fatalf("appendOptionalStringFlag(empty) = %#v, want unchanged", argv)
+	}
+	argv = appendOptionalStringFlag(argv, "--flag", "value")
+	if joined := strings.Join(argv, " "); !strings.Contains(joined, "--flag value") {
+		t.Fatalf("appendOptionalStringFlag(value) = %#v", argv)
+	}
+
+	argv = appendOptionalInt64Flag([]string{"probe"}, "--size", 0)
+	if len(argv) != 1 {
+		t.Fatalf("appendOptionalInt64Flag(zero) = %#v, want unchanged", argv)
+	}
+	argv = appendOptionalInt64Flag(argv, "--size", 42)
+	if joined := strings.Join(argv, " "); !strings.Contains(joined, "--size 42") {
+		t.Fatalf("appendOptionalInt64Flag(value) = %#v", argv)
+	}
+
+	if got := appendParallelFlag([]string{"server"}, "aead", 8); len(got) != 1 {
+		t.Fatalf("appendParallelFlag(unsupported) = %#v, want unchanged", got)
+	}
+	for _, mode := range []string{"raw", "blast", "wg", "wgos"} {
+		if !modeSupportsParallelFlag(mode) {
+			t.Fatalf("modeSupportsParallelFlag(%q) = false, want true", mode)
+		}
+	}
+}
+
+func TestRemoteProcessWaitErrorIncludesStderrWhenPresent(t *testing.T) {
+	baseErr := errors.New("exit status 1")
+	var stderr bytes.Buffer
+	if got := remoteProcessWaitError("remote failed", baseErr, &stderr); !errors.Is(got, baseErr) || got.Error() != baseErr.Error() {
+		t.Fatalf("remoteProcessWaitError(empty) = %v, want base error", got)
+	}
+
+	stderr.WriteString("boom\n")
+	got := remoteProcessWaitError("remote failed", baseErr, &stderr)
+	if !errors.Is(got, baseErr) || !strings.Contains(got.Error(), "remote failed") || !strings.Contains(got.Error(), "boom") {
+		t.Fatalf("remoteProcessWaitError(stderr) = %v, want wrapped stderr", got)
+	}
+}
+
+func TestWaitForReceiveAndDoneCancellationPaths(t *testing.T) {
+	recvCh := make(chan orchestrateReceiveResult, 1)
+	doneCh := make(chan orchestrateDoneResult, 1)
+	recvCh <- orchestrateReceiveResult{stats: TransferStats{BytesReceived: 10}}
+	doneCh <- orchestrateDoneResult{done: remoteDone{BytesSent: 10}}
+	stats, done, err := waitForReceiveAndDone(context.Background(), func() {}, func() {}, recvCh, doneCh)
+	if err != nil {
+		t.Fatalf("waitForReceiveAndDone(success) error = %v", err)
+	}
+	if stats.BytesReceived != 10 || done.BytesSent != 10 {
+		t.Fatalf("waitForReceiveAndDone(success) = %#v %#v, want stats and done", stats, done)
+	}
+
+	recvErr := errors.New("receive failed")
+	recvCh = make(chan orchestrateReceiveResult, 1)
+	doneCh = make(chan orchestrateDoneResult, 1)
+	recvCh <- orchestrateReceiveResult{err: recvErr}
+	var recvCanceled, punchCanceled bool
+	_, _, err = waitForReceiveAndDone(context.Background(), func() { recvCanceled = true }, func() { punchCanceled = true }, recvCh, doneCh)
+	if !errors.Is(err, recvErr) || !punchCanceled || recvCanceled {
+		t.Fatalf("receive error = %v recvCanceled=%v punchCanceled=%v, want punch cancel only", err, recvCanceled, punchCanceled)
+	}
+
+	doneErr := errors.New("done failed")
+	recvCh = make(chan orchestrateReceiveResult, 1)
+	doneCh = make(chan orchestrateDoneResult, 1)
+	doneCh <- orchestrateDoneResult{err: doneErr}
+	recvCanceled, punchCanceled = false, false
+	_, _, err = waitForReceiveAndDone(context.Background(), func() { recvCanceled = true }, func() { punchCanceled = true }, recvCh, doneCh)
+	if !errors.Is(err, doneErr) || !recvCanceled || !punchCanceled {
+		t.Fatalf("done error = %v recvCanceled=%v punchCanceled=%v, want both canceled", err, recvCanceled, punchCanceled)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	recvCanceled, punchCanceled = false, false
+	_, _, err = waitForReceiveAndDone(ctx, func() { recvCanceled = true }, func() { punchCanceled = true }, make(chan orchestrateReceiveResult), make(chan orchestrateDoneResult))
+	if !errors.Is(err, context.Canceled) || !recvCanceled || !punchCanceled {
+		t.Fatalf("context error = %v recvCanceled=%v punchCanceled=%v, want both canceled", err, recvCanceled, punchCanceled)
+	}
+}
+
+func TestPreferredRemoteEndpointFallbacks(t *testing.T) {
+	endpoint, err := preferredRemoteEndpoint(remoteReady{Candidates: []string{"bad-candidate"}, Addr: "203.0.113.10:5000"})
+	if err != nil {
+		t.Fatalf("preferredRemoteEndpoint(fallback) error = %v", err)
+	}
+	if endpoint.addr != "203.0.113.10:5000" || len(endpoint.candidates) != 1 {
+		t.Fatalf("preferredRemoteEndpoint(fallback) = %#v, want addr candidate", endpoint)
+	}
+
+	endpoint, err = preferredRemoteEndpoint(remoteReady{Candidates: []string{"198.51.100.20:6000"}, Addr: "203.0.113.10:5000"})
+	if err != nil {
+		t.Fatalf("preferredRemoteEndpoint(candidate) error = %v", err)
+	}
+	if endpoint.addr != "198.51.100.20:6000" {
+		t.Fatalf("preferredRemoteEndpoint(candidate).addr = %q, want candidate", endpoint.addr)
+	}
+
+	if _, err := preferredRemoteEndpoint(remoteReady{}); err == nil {
+		t.Fatal("preferredRemoteEndpoint(empty) error = nil, want unusable address")
+	}
+	if candidates := remoteCandidatesFromAddr("bad address"); candidates != nil {
+		t.Fatalf("remoteCandidatesFromAddr(invalid) = %#v, want nil", candidates)
+	}
+}
+
+func TestWireGuardPlanApplicationAndConfigs(t *testing.T) {
+	plan := wireGuardPlan{
+		listenerPrivHex: "listener-private",
+		listenerPubHex:  "listener-public",
+		senderPrivHex:   "sender-private",
+		senderPubHex:    "sender-public",
+		listenerAddr:    netip.MustParseAddr("100.64.0.1"),
+		senderAddr:      netip.MustParseAddr("100.64.0.2"),
+		port:            7777,
+	}
+
+	var serverCfg ServerConfig
+	applyServerWireGuardPlan(&serverCfg, plan)
+	if serverCfg.WGPrivateKeyHex != "listener-private" || serverCfg.WGPeerPublicHex != "sender-public" || serverCfg.WGLocalAddr != "100.64.0.1" || serverCfg.WGPeerAddr != "100.64.0.2" || serverCfg.WGPort != 7777 {
+		t.Fatalf("applyServerWireGuardPlan() = %#v", serverCfg)
+	}
+
+	var clientCfg ClientConfig
+	applyClientWireGuardPlan(&clientCfg, plan)
+	if clientCfg.WGPrivateKeyHex != "sender-private" || clientCfg.WGPeerPublicHex != "listener-public" || clientCfg.WGLocalAddr != "100.64.0.2" || clientCfg.WGPeerAddr != "100.64.0.1" || clientCfg.WGPort != 7777 {
+		t.Fatalf("applyClientWireGuardPlan() = %#v", clientCfg)
+	}
+
+	candidate := &net.UDPAddr{IP: net.ParseIP("198.51.100.10"), Port: 9000}
+	cfg := OrchestrateConfig{Transport: "batched", Parallel: 4, SizeBytes: 1024}
+	forward := forwardWireGuardConfig(cfg, plan, remoteEndpoint{addr: "198.51.100.10:9000", candidates: []net.Addr{candidate}})
+	if forward.PrivateKeyHex != "sender-private" || forward.PeerPublicHex != "listener-public" || forward.DirectEndpoint != "198.51.100.10:9000" || forward.Port != 7777 || forward.Streams != 4 || forward.SizeBytes != 1024 {
+		t.Fatalf("forwardWireGuardConfig() = %#v", forward)
+	}
+	reverse := reverseWireGuardConfig(cfg, plan, []net.Addr{candidate})
+	if reverse.PrivateKeyHex != "listener-private" || reverse.PeerPublicHex != "sender-public" || reverse.DirectEndpoint != "" || reverse.Port != 7777 || reverse.Streams != 4 || reverse.SizeBytes != 1024 {
+		t.Fatalf("reverseWireGuardConfig() = %#v", reverse)
+	}
+}
+
+func TestAppendBlastClientRateFlagOnlyForBlastMode(t *testing.T) {
+	t.Setenv("DERPHOLE_PROBE_RATE_MBPS", "900")
+	got := appendBlastClientRateFlag([]string{"client"}, "blast")
+	if joined := strings.Join(got, " "); !strings.Contains(joined, "--rate-mbps 900") {
+		t.Fatalf("appendBlastClientRateFlag(blast) = %q, want rate flag", joined)
+	}
+
+	got = appendBlastClientRateFlag([]string{"client"}, "raw")
+	if joined := strings.Join(got, " "); strings.Contains(joined, "--rate-mbps") {
+		t.Fatalf("appendBlastClientRateFlag(raw) = %q, want no rate flag", joined)
+	}
+
+	t.Setenv("DERPHOLE_PROBE_RATE_MBPS", " ")
+	got = appendBlastClientRateFlag([]string{"client"}, "blast")
+	if len(got) != 1 {
+		t.Fatalf("appendBlastClientRateFlag(blank) = %#v, want unchanged", got)
+	}
+}
+
+func TestParallelCandidateStringsPreferUniquePortsThenFillUniqueAddrs(t *testing.T) {
+	candidates := []net.Addr{
+		&net.UDPAddr{IP: net.ParseIP("198.51.100.1"), Port: 4000},
+		&net.UDPAddr{IP: net.ParseIP("198.51.100.2"), Port: 4000},
+		&net.UDPAddr{IP: net.ParseIP("198.51.100.3"), Port: 4001},
+	}
+
+	got := parallelCandidateStrings(candidates, 3)
+	if len(got) != 3 {
+		t.Fatalf("parallelCandidateStrings() = %v, want 3 candidates", got)
+	}
+	if got[0] == got[1] || got[1] == got[2] || got[0] == got[2] {
+		t.Fatalf("parallelCandidateStrings() = %v, want unique addresses", got)
+	}
+}
+
+func TestWaitForRemoteReadyAndDoneHandleEventsAndErrors(t *testing.T) {
+	readyCh := make(chan outputEvent, 1)
+	readyCh <- outputEvent{ready: &remoteReady{Addr: "127.0.0.1:1"}}
+	ready, err := waitForRemoteReady(context.Background(), readyCh, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("waitForRemoteReady() error = %v", err)
+	}
+	if ready.Addr != "127.0.0.1:1" {
+		t.Fatalf("waitForRemoteReady() = %#v, want addr", ready)
+	}
+
+	doneCh := make(chan outputEvent, 1)
+	doneCh <- outputEvent{done: &remoteDone{BytesReceived: 99}}
+	done, err := waitForRemoteDone(context.Background(), doneCh, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("waitForRemoteDone() error = %v", err)
+	}
+	if done.BytesReceived != 99 {
+		t.Fatalf("waitForRemoteDone() = %#v, want bytes", done)
+	}
+
+	closed := make(chan outputEvent)
+	close(closed)
+	var stderr bytes.Buffer
+	stderr.WriteString("remote failed")
+	if _, err := waitForRemoteReady(context.Background(), closed, &stderr); err == nil || !strings.Contains(err.Error(), "remote failed") {
+		t.Fatalf("waitForRemoteReady(closed) error = %v, want stderr", err)
+	}
+}
+
+func TestParseAndScanRemoteOutput(t *testing.T) {
+	input := strings.NewReader(`ignored
+READY {"addr":"127.0.0.1:7000","candidates":["127.0.0.1:7000"]}
+DONE {"bytes_received":42,"duration_ms":7}
+`)
+	events := make(chan outputEvent, 4)
+	scanRemoteOutput(input, events)
+	var sawReady, sawDone bool
+	for ev := range events {
+		if ev.err != nil {
+			t.Fatalf("scanRemoteOutput() event error = %v", ev.err)
+		}
+		if ev.ready != nil && ev.ready.Addr == "127.0.0.1:7000" {
+			sawReady = true
+		}
+		if ev.done != nil && ev.done.BytesReceived == 42 {
+			sawDone = true
+		}
+	}
+	if !sawReady || !sawDone {
+		t.Fatalf("scanRemoteOutput() sawReady=%v sawDone=%v, want both", sawReady, sawDone)
+	}
+
+	if _, ok := parseRemoteLine("noise"); ok {
+		t.Fatal("parseRemoteLine(noise) ok = true, want false")
+	}
+	if ev, ok := parseRemoteLine("READY {"); !ok || ev.err == nil {
+		t.Fatalf("parseRemoteLine(invalid ready) = %#v, %v; want error event", ev, ok)
 	}
 }
 
@@ -1214,6 +1506,54 @@ func TestProbeSendTuningDefaultsAndOverrides(t *testing.T) {
 	}
 	if got := probeChunkSize(); got != 1300 {
 		t.Fatalf("probeChunkSize() = %d, want 1300", got)
+	}
+}
+
+func TestProbeMetricAndReaderEdgeHelpers(t *testing.T) {
+	start := time.Unix(10, 0)
+	first := start.Add(25 * time.Millisecond)
+	result := firstByteMetrics(start, first, 0, nil)
+	if result.ms != 25 || result.measured == nil || !*result.measured {
+		t.Fatalf("firstByteMetrics(primary) = %#v, want measured 25ms", result)
+	}
+
+	measuredFalse := false
+	result = firstByteMetrics(start, time.Time{}, 99, &measuredFalse)
+	if result.ms != 0 || result.measured == nil || *result.measured {
+		t.Fatalf("firstByteMetrics(false fallback) = %#v, want explicit unmeasured", result)
+	}
+
+	result = firstByteMetrics(start, time.Time{}, 17, nil)
+	if result.ms != 17 || result.measured == nil || !*result.measured {
+		t.Fatalf("firstByteMetrics(ms fallback) = %#v, want measured fallback", result)
+	}
+
+	if got := goodputMbps(0, 10); got != 0 {
+		t.Fatalf("goodputMbps(zero bytes) = %f, want 0", got)
+	}
+	if got := goodputMbps(1000, 0); got != 0 {
+		t.Fatalf("goodputMbps(zero duration) = %f, want 0", got)
+	}
+	if got := elapsedMS(time.Time{}, first); got != 0 {
+		t.Fatalf("elapsedMS(zero start) = %d, want 0", got)
+	}
+	if got := elapsedMS(first, start); got != 0 {
+		t.Fatalf("elapsedMS(backwards) = %d, want 0", got)
+	}
+
+	reader := newSizedReader(-1)
+	buf := make([]byte, 1)
+	if n, err := reader.Read(buf); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("newSizedReader(-1).Read() = %d, %v; want EOF", n, err)
+	}
+	reader = newSizedReader(1)
+	if n, err := reader.Read(nil); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("newSizedReader(1).Read(nil) = %d, %v; want EOF", n, err)
+	}
+
+	t.Setenv("DERPHOLE_PROBE_RATE_MBPS", "not-a-number")
+	if got := probeRateMbps(); got != 0 {
+		t.Fatalf("probeRateMbps(invalid) = %d, want fallback 0", got)
 	}
 }
 

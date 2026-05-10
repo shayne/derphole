@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/cipher"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -5613,6 +5614,64 @@ func TestExternalDirectUDPRateProbePayloadEncodesIndex(t *testing.T) {
 	}
 }
 
+func TestExternalDirectUDPRateProbeAuthFromStartValidatesNonce(t *testing.T) {
+	tok := token.Token{}
+	if auth, err := externalDirectUDPRateProbeAuthFromStart(tok, directUDPStart{}); err != nil || auth.enabled() {
+		t.Fatalf("externalDirectUDPRateProbeAuthFromStart(no probes) = %#v, %v; want disabled nil", auth, err)
+	}
+	if _, err := externalDirectUDPRateProbeAuthFromStart(tok, directUDPStart{ProbeRates: []int{8}}); err == nil {
+		t.Fatal("externalDirectUDPRateProbeAuthFromStart(missing nonce) error = nil")
+	}
+	if _, err := externalDirectUDPRateProbeAuthFromStart(tok, directUDPStart{ProbeRates: []int{8}, ProbeNonce: "not base64?"}); err == nil {
+		t.Fatal("externalDirectUDPRateProbeAuthFromStart(bad base64) error = nil")
+	}
+	if _, err := externalDirectUDPRateProbeAuthFromStart(tok, directUDPStart{ProbeRates: []int{8}, ProbeNonce: base64.RawURLEncoding.EncodeToString([]byte("short"))}); err == nil {
+		t.Fatal("externalDirectUDPRateProbeAuthFromStart(short nonce) error = nil")
+	}
+
+	var nonce [16]byte
+	copy(nonce[:], []byte("1234567890abcdef"))
+	auth, err := externalDirectUDPRateProbeAuthFromStart(tok, directUDPStart{
+		ProbeRates: []int{8},
+		ProbeNonce: base64.RawURLEncoding.EncodeToString(nonce[:]),
+	})
+	if err != nil {
+		t.Fatalf("externalDirectUDPRateProbeAuthFromStart(valid) error = %v", err)
+	}
+	if !auth.enabled() || auth.Nonce != nonce {
+		t.Fatalf("externalDirectUDPRateProbeAuthFromStart(valid) = %#v, want enabled nonce", auth)
+	}
+}
+
+func TestExternalDirectUDPRateProbePayloadRejectsInvalidInputs(t *testing.T) {
+	auth := testExternalDirectUDPRateProbeAuth()
+	if _, err := externalDirectUDPRateProbePayload(-1, 128, auth); err == nil {
+		t.Fatal("externalDirectUDPRateProbePayload(negative) error = nil")
+	}
+	if _, err := externalDirectUDPRateProbePayload(0, 128, externalDirectUDPRateProbeAuth{}); err == nil {
+		t.Fatal("externalDirectUDPRateProbePayload(no auth) error = nil")
+	}
+
+	payload, err := externalDirectUDPRateProbePayload(2, 1, auth)
+	if err != nil {
+		t.Fatalf("externalDirectUDPRateProbePayload(min size) error = %v", err)
+	}
+	if len(payload) != externalDirectUDPRateProbeHeaderSize {
+		t.Fatalf("payload len = %d, want header size %d", len(payload), externalDirectUDPRateProbeHeaderSize)
+	}
+	if _, ok := externalDirectUDPRateProbeIndex(payload[:externalDirectUDPRateProbeHeaderSize-1], 3, auth); ok {
+		t.Fatal("externalDirectUDPRateProbeIndex(short) ok = true")
+	}
+	if _, ok := externalDirectUDPRateProbeIndex(payload, 2, auth); ok {
+		t.Fatal("externalDirectUDPRateProbeIndex(out of range) ok = true")
+	}
+	wrongNonce := auth
+	wrongNonce.Nonce[0] ^= 0xff
+	if _, ok := externalDirectUDPRateProbeIndex(payload, 3, wrongNonce); ok {
+		t.Fatal("externalDirectUDPRateProbeIndex(wrong nonce) ok = true")
+	}
+}
+
 func TestExternalDirectUDPRateProbeIndexRejectsForgedMAC(t *testing.T) {
 	auth := testExternalDirectUDPRateProbeAuth()
 	payload, err := externalDirectUDPRateProbePayload(0, 128, auth)
@@ -5622,6 +5681,32 @@ func TestExternalDirectUDPRateProbeIndexRejectsForgedMAC(t *testing.T) {
 	payload[len(payload)-1] ^= 0x01
 	if _, ok := externalDirectUDPRateProbeIndex(payload, 1, auth); ok {
 		t.Fatal("forged rate-probe packet was accepted")
+	}
+}
+
+func TestExternalDirectUDPRateProbeAllowedSourcesAndAccounting(t *testing.T) {
+	allowed, err := externalDirectUDPRateProbeAllowedSources([]string{"127.0.0.1:1234", ""})
+	if err != nil {
+		t.Fatalf("externalDirectUDPRateProbeAllowedSources() error = %v", err)
+	}
+	if !externalDirectUDPRateProbeSourceAllowed(&net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1234}, allowed) {
+		t.Fatal("externalDirectUDPRateProbeSourceAllowed() = false, want true")
+	}
+	if externalDirectUDPRateProbeSourceAllowed(nil, allowed) {
+		t.Fatal("externalDirectUDPRateProbeSourceAllowed(nil) = true, want false")
+	}
+	if _, err := externalDirectUDPRateProbeAllowedSources([]string{""}); err == nil {
+		t.Fatal("externalDirectUDPRateProbeAllowedSources(empty) error = nil")
+	}
+	if _, err := externalDirectUDPRateProbeAllowedSources([]string{"bad addr"}); err == nil {
+		t.Fatal("externalDirectUDPRateProbeAllowedSources(bad) error = nil")
+	}
+
+	samples := []directUDPRateProbeSample{{RateMbps: 8}}
+	var mu sync.Mutex
+	externalDirectUDPRecordRateProbeBytes(samples, 0, 99, &mu)
+	if samples[0].BytesReceived != 99 {
+		t.Fatalf("BytesReceived = %d, want 99", samples[0].BytesReceived)
 	}
 }
 
@@ -7537,6 +7622,105 @@ func TestExternalDirectUDPDiscardParallelPrefersLaterLaneErrorOverEarlyContextCa
 	)
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("externalDirectUDPSendDiscardParallel() error = %v, want %v", err, sentinel)
+	}
+}
+
+func TestExternalDirectUDPSpoolDiscardLanesSplitsAndCleansUp(t *testing.T) {
+	spool, err := externalDirectUDPSpoolDiscardLanes(context.Background(), strings.NewReader("abcdefghij"), 3, 2)
+	if err != nil {
+		t.Fatalf("externalDirectUDPSpoolDiscardLanes() error = %v", err)
+	}
+	path := spool.Path
+	if spool.TotalBytes != 10 {
+		t.Fatalf("TotalBytes = %d, want 10", spool.TotalBytes)
+	}
+	if !slices.Equal(spool.Offsets, []int64{0, 4, 7}) {
+		t.Fatalf("Offsets = %v, want [0 4 7]", spool.Offsets)
+	}
+	if !slices.Equal(spool.Sizes, []int64{4, 3, 3}) {
+		t.Fatalf("Sizes = %v, want [4 3 3]", spool.Sizes)
+	}
+	payload := make([]byte, 10)
+	if _, err := spool.File.ReadAt(payload, 0); err != nil {
+		t.Fatalf("ReadAt() error = %v", err)
+	}
+	if string(payload) != "abcdefghij" {
+		t.Fatalf("spool payload = %q, want source bytes", payload)
+	}
+	if err := spool.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("spool path after Close() stat error = %v, want not exist", err)
+	}
+}
+
+func TestExternalDirectUDPSpoolDiscardLanesRejectsInvalidInputs(t *testing.T) {
+	if _, err := externalDirectUDPSpoolDiscardLanes(context.Background(), strings.NewReader("x"), 0, 1); err == nil {
+		t.Fatal("externalDirectUDPSpoolDiscardLanes(no lanes) error = nil")
+	}
+	if _, err := externalDirectUDPSpoolDiscardLanes(context.Background(), nil, 1, 1); err == nil {
+		t.Fatal("externalDirectUDPSpoolDiscardLanes(nil reader) error = nil")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := externalDirectUDPSpoolDiscardLanes(ctx, strings.NewReader("x"), 1, 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("externalDirectUDPSpoolDiscardLanes(canceled) error = %v, want context.Canceled", err)
+	}
+}
+
+func TestExternalDirectUDPCandidateSelectionHelpers(t *testing.T) {
+	out, seen := externalDirectUDPAppendUniqueCandidates([]string{"a"}, map[string]bool{"a": true}, []string{"", "a", "b", "c"}, 2)
+	if !slices.Equal(out, []string{"a", "b"}) || !seen["b"] {
+		t.Fatalf("externalDirectUDPAppendUniqueCandidates() = %v seen=%v, want [a b]", out, seen)
+	}
+	if _, ok := externalDirectUDPAddrPort(nil); ok {
+		t.Fatal("externalDirectUDPAddrPort(nil) ok = true")
+	}
+	if _, ok := externalDirectUDPAddrPort(&net.UDPAddr{IP: net.IPv4zero, Port: 1}); ok {
+		t.Fatal("externalDirectUDPAddrPort(unspecified) ok = true")
+	}
+	if addr, ok := externalDirectUDPAddrPort(&net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1234}); !ok || addr.String() != "127.0.0.1:1234" {
+		t.Fatalf("externalDirectUDPAddrPort(valid) = %v, %v; want 127.0.0.1:1234", addr, ok)
+	}
+
+	loopbackFirst := externalDirectUDPPreferLoopbackStrings([]string{"198.51.100.10:1", "127.0.0.1:2"})
+	if loopbackFirst[0] != "127.0.0.1:2" {
+		t.Fatalf("externalDirectUDPPreferLoopbackStrings() = %v, want loopback first", loopbackFirst)
+	}
+	peer := &net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 4444}
+	peerFirst := externalDirectUDPPreferPeerAddrStrings([]string{"198.51.100.10:1", "203.0.113.10:2"}, peer)
+	if peerFirst[0] != "203.0.113.10:2" {
+		t.Fatalf("externalDirectUDPPreferPeerAddrStrings() = %v, want peer IP first", peerFirst)
+	}
+
+	selected := []string{"", "198.51.100.10:1000", ""}
+	filled := externalDirectUDPFillMissingSelectedAddrs(selected, []string{"10.0.0.1:1", "198.51.100.11:1001", "198.51.100.12:1002"})
+	if externalDirectUDPSelectedAddrCount(filled) != len(filled) {
+		t.Fatalf("externalDirectUDPFillMissingSelectedAddrs() = %v, want all filled", filled)
+	}
+}
+
+func TestExternalDirectUDPProbeWarmupStateDetectsRiskySelectedRate(t *testing.T) {
+	sent := []directUDPRateProbeSample{
+		{RateMbps: 700, BytesSent: 10_000},
+		{RateMbps: 1200, BytesSent: 10_000},
+	}
+	lossySelected := []directUDPRateProbeSample{
+		{RateMbps: 1200, BytesReceived: 100, DurationMillis: 200},
+	}
+	if !externalDirectUDPProbeLacksCleanWarmupForSelectedRate(1200, sent, lossySelected) {
+		t.Fatal("externalDirectUDPProbeLacksCleanWarmupForSelectedRate(lossy selected) = false, want true")
+	}
+	cleanWarmup := []directUDPRateProbeSample{
+		{RateMbps: 700, BytesReceived: 10_000, DurationMillis: 200},
+		{RateMbps: 1200, BytesReceived: 100, DurationMillis: 200},
+	}
+	if externalDirectUDPProbeLacksCleanWarmupForSelectedRate(1200, sent, cleanWarmup) {
+		t.Fatal("externalDirectUDPProbeLacksCleanWarmupForSelectedRate(clean warmup) = true, want false")
+	}
+	if externalDirectUDPProbeLacksCleanWarmupForSelectedRate(100, sent, lossySelected) {
+		t.Fatal("externalDirectUDPProbeLacksCleanWarmupForSelectedRate(low selected) = true, want false")
 	}
 }
 

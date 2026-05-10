@@ -383,31 +383,91 @@ func externalSessionPacketAEAD(tok token.Token) (cipher.AEAD, error) {
 }
 
 func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) (retErr error) {
-	cfg = sendConfigWithInferredExpectedBytes(cfg)
-	tok, err := token.Decode(cfg.Token, time.Now())
+	rt, err := newExternalDirectUDPSendRuntime(ctx, cfg)
 	if err != nil {
 		return err
+	}
+	defer rt.Close()
+	ctx, stopPeerAbort := rt.withPeerControl(ctx)
+	defer stopPeerAbort()
+	defer rt.notifyPeerAbortOnError(&retErr, ctx)
+	defer rt.notifyPeerAbortOnLocalCancel(&retErr, ctx)
+	return rt.run(ctx)
+}
+
+type externalDirectUDPSendRuntime struct {
+	cfg          SendConfig
+	tok          token.Token
+	countedSrc   *byteCountingReadCloser
+	listenerDERP key.NodePublic
+	dm           *tailcfg.DERPMap
+	derpClient   *derpbind.Client
+	probeConn    net.PacketConn
+	probeConns   []net.PacketConn
+	portmaps     []publicPortmap
+	pm           publicPortmap
+	auth         externalPeerControlAuth
+	decision     rendezvous.Decision
+	subs         externalDirectUDPSendSubscriptions
+	cleanupConns func()
+}
+
+func newExternalDirectUDPSendRuntime(ctx context.Context, cfg SendConfig) (*externalDirectUDPSendRuntime, error) {
+	rt := &externalDirectUDPSendRuntime{cfg: sendConfigWithInferredExpectedBytes(cfg)}
+	var err error
+	rt.tok, err = decodeExternalDirectUDPSendToken(rt.cfg.Token)
+	if err != nil {
+		return nil, err
+	}
+	if err := rt.openSource(ctx); err != nil {
+		return nil, err
+	}
+	if err := rt.openDERP(ctx); err != nil {
+		rt.Close()
+		return nil, err
+	}
+	if err := rt.openProbeConns(); err != nil {
+		rt.Close()
+		return nil, err
+	}
+	if err := rt.claim(ctx); err != nil {
+		rt.Close()
+		return nil, err
+	}
+	rt.subs = subscribeExternalDirectUDPSend(rt.derpClient, rt.listenerDERP)
+	return rt, nil
+}
+
+func decodeExternalDirectUDPSendToken(raw string) (token.Token, error) {
+	tok, err := token.Decode(raw, time.Now())
+	if err != nil {
+		return token.Token{}, err
 	}
 	if tok.Capabilities&token.CapabilityStdio == 0 {
-		return ErrUnknownSession
+		return token.Token{}, ErrUnknownSession
 	}
-	src, err := openSendSource(ctx, cfg)
+	return tok, nil
+}
+
+func (rt *externalDirectUDPSendRuntime) openSource(ctx context.Context) error {
+	src, err := openSendSource(ctx, rt.cfg)
 	if err != nil {
 		return err
 	}
-	countedSrc := newByteCountingReadCloser(src)
-	defer countedSrc.Close()
+	rt.countedSrc = newByteCountingReadCloser(src)
+	return nil
+}
 
-	listenerDERP := key.NodePublicFromRaw32(mem.B(tok.DERPPublic[:]))
-	if listenerDERP.IsZero() {
+func (rt *externalDirectUDPSendRuntime) openDERP(ctx context.Context) error {
+	rt.listenerDERP = key.NodePublicFromRaw32(mem.B(rt.tok.DERPPublic[:]))
+	if rt.listenerDERP.IsZero() {
 		return ErrUnknownSession
 	}
-
 	dm, err := derpbind.FetchMap(ctx, publicDERPMapURL())
 	if err != nil {
 		return err
 	}
-	node := firstDERPNode(dm, int(tok.BootstrapRegion))
+	node := firstDERPNode(dm, int(rt.tok.BootstrapRegion))
 	if node == nil {
 		return errors.New("no bootstrap DERP node available")
 	}
@@ -415,44 +475,68 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) (retErr error
 	if err != nil {
 		return err
 	}
-	defer derpClient.Close()
+	rt.dm = dm
+	rt.derpClient = derpClient
+	return nil
+}
 
-	probeConns, portmaps, cleanupProbeConns, err := externalDirectUDPConnsFn(nil, nil, externalDirectUDPParallelism, cfg.Emitter)
+func (rt *externalDirectUDPSendRuntime) openProbeConns() error {
+	probeConns, portmaps, cleanupProbeConns, err := externalDirectUDPConnsFn(nil, nil, externalDirectUDPParallelism, rt.cfg.Emitter)
 	if err != nil {
 		return err
 	}
-	defer cleanupProbeConns()
-	probeConn := probeConns[0]
-	pm := portmaps[0]
+	rt.probeConns = probeConns
+	rt.portmaps = portmaps
+	rt.cleanupConns = cleanupProbeConns
+	rt.probeConn = probeConns[0]
+	rt.pm = portmaps[0]
+	return nil
+}
 
+func (rt *externalDirectUDPSendRuntime) claim(ctx context.Context) error {
 	claimIdentity, err := quicpath.GenerateSessionIdentity()
 	if err != nil {
 		return err
 	}
-
-	var localCandidates []string
-	if !cfg.ForceRelay {
-		localCandidates = externalDirectUDPFlattenCandidateSets(externalDirectUDPCandidateSets(ctx, probeConns, dm, portmaps))
+	localCandidates := externalDirectUDPSendLocalCandidates(ctx, rt.cfg, rt.probeConns, rt.dm, rt.portmaps)
+	claim := externalDirectUDPSendClaim(rt.tok, rt.derpClient.PublicKey(), claimIdentity.Public, len(rt.probeConns), localCandidates, rt.cfg)
+	rt.auth = externalPeerControlAuthForToken(rt.tok)
+	decision, err := sendClaimAndReceiveDecision(ctx, rt.derpClient, rt.listenerDERP, claim, rt.auth)
+	if err != nil {
+		return err
 	}
-	claimParallel := len(probeConns)
+	if err := validateExternalDirectUDPDecision(decision); err != nil {
+		return err
+	}
+	rt.decision = decision
+	return nil
+}
+
+func externalDirectUDPSendLocalCandidates(ctx context.Context, cfg SendConfig, probeConns []net.PacketConn, dm *tailcfg.DERPMap, portmaps []publicPortmap) []string {
 	if cfg.ForceRelay {
-		claimParallel = 0
+		return nil
+	}
+	return externalDirectUDPFlattenCandidateSets(externalDirectUDPCandidateSets(ctx, probeConns, dm, portmaps))
+}
+
+func externalDirectUDPSendClaim(tok token.Token, derpPublic key.NodePublic, quicPublic [32]byte, parallel int, localCandidates []string, cfg SendConfig) rendezvous.Claim {
+	if cfg.ForceRelay {
+		parallel = 0
 	}
 	claim := rendezvous.Claim{
 		Version:      tok.Version,
 		SessionID:    tok.SessionID,
-		DERPPublic:   derpPublicKeyRaw32(derpClient.PublicKey()),
-		QUICPublic:   claimIdentity.Public,
-		Parallel:     claimParallel,
+		DERPPublic:   derpPublicKeyRaw32(derpPublic),
+		QUICPublic:   quicPublic,
+		Parallel:     parallel,
 		Candidates:   localCandidates,
 		Capabilities: tok.Capabilities,
 	}
 	claim.BearerMAC = rendezvous.ComputeBearerMAC(tok.BearerSecret, claim)
-	auth := externalPeerControlAuthForToken(tok)
-	decision, err := sendClaimAndReceiveDecision(ctx, derpClient, listenerDERP, claim, auth)
-	if err != nil {
-		return err
-	}
+	return claim
+}
+
+func validateExternalDirectUDPDecision(decision rendezvous.Decision) error {
 	if !decision.Accepted {
 		if decision.Reject != nil {
 			return errors.New(decision.Reject.Reason)
@@ -462,93 +546,201 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) (retErr error
 	if decision.Accept == nil {
 		return errors.New("accepted decision missing accept payload")
 	}
-	ackCh, unsubscribeAck := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
+	return nil
+}
+
+type externalDirectUDPSendSubscriptions struct {
+	ackCh                <-chan derpbind.Packet
+	abortCh              <-chan derpbind.Packet
+	heartbeatCh          <-chan derpbind.Packet
+	readyAckCh           <-chan derpbind.Packet
+	startAckCh           <-chan derpbind.Packet
+	rateProbeCh          <-chan derpbind.Packet
+	unsubscribeAck       func()
+	unsubscribeAbort     func()
+	unsubscribeHeartbeat func()
+	unsubscribeReadyAck  func()
+	unsubscribeStartAck  func()
+	unsubscribeRateProbe func()
+}
+
+func (s externalDirectUDPSendSubscriptions) Close() {
+	if s.unsubscribeAck != nil {
+		s.unsubscribeAck()
+	}
+	if s.unsubscribeAbort != nil {
+		s.unsubscribeAbort()
+	}
+	if s.unsubscribeHeartbeat != nil {
+		s.unsubscribeHeartbeat()
+	}
+	if s.unsubscribeReadyAck != nil {
+		s.unsubscribeReadyAck()
+	}
+	if s.unsubscribeStartAck != nil {
+		s.unsubscribeStartAck()
+	}
+	if s.unsubscribeRateProbe != nil {
+		s.unsubscribeRateProbe()
+	}
+}
+
+func subscribeExternalDirectUDPSend(client *derpbind.Client, listenerDERP key.NodePublic) externalDirectUDPSendSubscriptions {
+	ackCh, unsubscribeAck := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == listenerDERP && isAckOrAbortPayload(pkt.Payload)
 	})
-	defer unsubscribeAck()
-	abortCh, unsubscribeAbort := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
+	abortCh, unsubscribeAbort := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == listenerDERP && isAbortPayload(pkt.Payload)
 	})
-	defer unsubscribeAbort()
-	heartbeatCh, unsubscribeHeartbeat := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
+	heartbeatCh, unsubscribeHeartbeat := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == listenerDERP && isHeartbeatPayload(pkt.Payload)
 	})
-	defer unsubscribeHeartbeat()
-	ctx, stopPeerAbort := withPeerControlContext(ctx, derpClient, listenerDERP, abortCh, heartbeatCh, func() int64 {
-		return countedSrc.Count()
-	}, auth)
-	defer stopPeerAbort()
-	defer notifyPeerAbortOnError(&retErr, ctx, derpClient, listenerDERP, func() int64 {
-		return countedSrc.Count()
-	}, auth)
-	defer notifyPeerAbortOnLocalCancel(&retErr, ctx, derpClient, listenerDERP, func() int64 {
-		return countedSrc.Count()
-	}, auth)
-	readyAckCh, unsubscribeReadyAck := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
+	readyAckCh, unsubscribeReadyAck := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == listenerDERP && isDirectUDPReadyAckPayload(pkt.Payload)
 	})
-	defer unsubscribeReadyAck()
-	startAckCh, unsubscribeStartAck := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
+	startAckCh, unsubscribeStartAck := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == listenerDERP && isDirectUDPStartAckPayload(pkt.Payload)
 	})
-	defer unsubscribeStartAck()
-	rateProbeCh, unsubscribeRateProbe := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
+	rateProbeCh, unsubscribeRateProbe := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == listenerDERP && isDirectUDPRateProbePayload(pkt.Payload)
 	})
-	defer unsubscribeRateProbe()
-	pathEmitter := newTransportPathEmitter(cfg.Emitter)
+	return externalDirectUDPSendSubscriptions{
+		ackCh:                ackCh,
+		abortCh:              abortCh,
+		heartbeatCh:          heartbeatCh,
+		readyAckCh:           readyAckCh,
+		startAckCh:           startAckCh,
+		rateProbeCh:          rateProbeCh,
+		unsubscribeAck:       unsubscribeAck,
+		unsubscribeAbort:     unsubscribeAbort,
+		unsubscribeHeartbeat: unsubscribeHeartbeat,
+		unsubscribeReadyAck:  unsubscribeReadyAck,
+		unsubscribeStartAck:  unsubscribeStartAck,
+		unsubscribeRateProbe: unsubscribeRateProbe,
+	}
+}
+
+func (rt *externalDirectUDPSendRuntime) withPeerControl(ctx context.Context) (context.Context, func()) {
+	return withPeerControlContext(ctx, rt.derpClient, rt.listenerDERP, rt.subs.abortCh, rt.subs.heartbeatCh, rt.countedSrc.Count, rt.auth)
+}
+
+func (rt *externalDirectUDPSendRuntime) notifyPeerAbortOnError(retErr *error, ctx context.Context) {
+	notifyPeerAbortOnError(retErr, ctx, rt.derpClient, rt.listenerDERP, rt.countedSrc.Count, rt.auth)
+}
+
+func (rt *externalDirectUDPSendRuntime) notifyPeerAbortOnLocalCancel(retErr *error, ctx context.Context) {
+	notifyPeerAbortOnLocalCancel(retErr, ctx, rt.derpClient, rt.listenerDERP, rt.countedSrc.Count, rt.auth)
+}
+
+func (rt *externalDirectUDPSendRuntime) run(ctx context.Context) error {
+	pathEmitter := newTransportPathEmitter(rt.cfg.Emitter)
 	pathEmitter.Emit(StateProbing)
 	pathEmitter.SuppressWatcherDirect()
-	transportCtx, transportCancel := context.WithCancel(ctx)
-	defer transportCancel()
-	remoteRelayOnly := externalDecisionRelayOnly(decision)
-	relayOnly := cfg.ForceRelay || remoteRelayOnly
-	transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, tok, probeConn, dm, derpClient, listenerDERP, parseCandidateStrings(localCandidates), pm, relayOnly)
+	tr, err := rt.startTransport(ctx, pathEmitter)
 	if err != nil {
 		return err
 	}
-	defer transportCleanup()
-	pathEmitter.Watch(transportCtx, transportManager)
-	pathEmitter.Flush(transportManager)
-	seedAcceptedDecisionCandidates(transportCtx, transportManager, decision)
-	remoteCandidates := parseRemoteCandidateStrings(decision.Accept.Candidates)
-	punchCtx, punchCancel := context.WithCancel(transportCtx)
-	defer punchCancel()
-	if !relayOnly {
-		externalDirectUDPStartPunching(punchCtx, probeConns, remoteCandidates)
-	}
+	defer tr.Close()
 
-	var sendErr error
-	if relayOnly {
-		sendErr = sendExternalRelayUDP(ctx, countedSrc, transportManager, tok, cfg.Emitter)
-	} else {
-		sendErr = sendExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixSendConfig{
-			src:              countedSrc,
-			tok:              tok,
-			decision:         decision,
-			derpClient:       derpClient,
-			listenerDERP:     listenerDERP,
-			transportCtx:     transportCtx,
-			transportManager: transportManager,
-			pathEmitter:      pathEmitter,
-			punchCancel:      punchCancel,
-			probeConn:        probeConn,
-			probeConns:       probeConns,
-			remoteCandidates: remoteCandidates,
-			readyAckCh:       readyAckCh,
-			startAckCh:       startAckCh,
-			rateProbeCh:      rateProbeCh,
-			cfg:              cfg,
-		})
-	}
+	sendErr := rt.send(ctx, tr)
 	if sendErr != nil {
 		return sendErr
 	}
-	if err := waitForPeerAckWithTimeout(ctx, ackCh, countedSrc.Count(), externalDirectUDPAckWait, auth); err != nil {
+	if err := waitForPeerAckWithTimeout(ctx, rt.subs.ackCh, rt.countedSrc.Count(), externalDirectUDPAckWait, rt.auth); err != nil {
 		return err
 	}
-	pathEmitter.Complete(transportManager)
+	pathEmitter.Complete(tr.manager)
 	return nil
+}
+
+type externalDirectUDPSendTransport struct {
+	ctx              context.Context
+	cancel           context.CancelFunc
+	manager          *transport.Manager
+	cleanup          func()
+	pathEmitter      *transportPathEmitter
+	relayOnly        bool
+	remoteCandidates []net.Addr
+	punchCancel      context.CancelFunc
+}
+
+func (rt *externalDirectUDPSendRuntime) startTransport(ctx context.Context, pathEmitter *transportPathEmitter) (externalDirectUDPSendTransport, error) {
+	transportCtx, transportCancel := context.WithCancel(ctx)
+	relayOnly := rt.cfg.ForceRelay || externalDecisionRelayOnly(rt.decision)
+	localCandidates := parseCandidateStrings(rt.decision.Accept.Candidates)
+	manager, cleanup, err := startExternalTransportManager(transportCtx, rt.tok, rt.probeConn, rt.dm, rt.derpClient, rt.listenerDERP, localCandidates, rt.pm, relayOnly)
+	if err != nil {
+		transportCancel()
+		return externalDirectUDPSendTransport{}, err
+	}
+	pathEmitter.Watch(transportCtx, manager)
+	pathEmitter.Flush(manager)
+	seedAcceptedDecisionCandidates(transportCtx, manager, rt.decision)
+	tr := externalDirectUDPSendTransport{
+		ctx:              transportCtx,
+		cancel:           transportCancel,
+		manager:          manager,
+		cleanup:          cleanup,
+		pathEmitter:      pathEmitter,
+		relayOnly:        relayOnly,
+		remoteCandidates: parseRemoteCandidateStrings(rt.decision.Accept.Candidates),
+		punchCancel:      func() {},
+	}
+	if !relayOnly {
+		punchCtx, punchCancel := context.WithCancel(transportCtx)
+		tr.punchCancel = punchCancel
+		externalDirectUDPStartPunching(punchCtx, rt.probeConns, tr.remoteCandidates)
+	}
+	return tr, nil
+}
+
+func (tr externalDirectUDPSendTransport) Close() {
+	if tr.punchCancel != nil {
+		tr.punchCancel()
+	}
+	if tr.cleanup != nil {
+		tr.cleanup()
+	}
+	if tr.cancel != nil {
+		tr.cancel()
+	}
+}
+
+func (rt *externalDirectUDPSendRuntime) send(ctx context.Context, tr externalDirectUDPSendTransport) error {
+	if tr.relayOnly {
+		return sendExternalRelayUDP(ctx, rt.countedSrc, tr.manager, rt.tok, rt.cfg.Emitter)
+	}
+	return sendExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixSendConfig{
+		src:              rt.countedSrc,
+		tok:              rt.tok,
+		decision:         rt.decision,
+		derpClient:       rt.derpClient,
+		listenerDERP:     rt.listenerDERP,
+		transportCtx:     tr.ctx,
+		transportManager: tr.manager,
+		pathEmitter:      tr.pathEmitter,
+		punchCancel:      tr.punchCancel,
+		probeConn:        rt.probeConn,
+		probeConns:       rt.probeConns,
+		remoteCandidates: tr.remoteCandidates,
+		readyAckCh:       rt.subs.readyAckCh,
+		startAckCh:       rt.subs.startAckCh,
+		rateProbeCh:      rt.subs.rateProbeCh,
+		cfg:              rt.cfg,
+	})
+}
+
+func (rt *externalDirectUDPSendRuntime) Close() {
+	rt.subs.Close()
+	if rt.cleanupConns != nil {
+		rt.cleanupConns()
+	}
+	if rt.derpClient != nil {
+		_ = rt.derpClient.Close()
+	}
+	if rt.countedSrc != nil {
+		_ = rt.countedSrc.Close()
+	}
 }
 
 func externalDirectUDPActivateDirectPath(pathEmitter *transportPathEmitter, transportManager *transport.Manager, punchCancel context.CancelFunc) {
@@ -566,76 +758,155 @@ func externalDirectUDPActivateDirectPath(pathEmitter *transportPathEmitter, tran
 func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClient *derpbind.Client, listenerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, readyAckCh <-chan derpbind.Packet, startAckCh <-chan derpbind.Packet, rateProbeCh <-chan derpbind.Packet, cfg SendConfig) (externalDirectUDPSendPlan, error) {
 	plan := externalDirectUDPSendPlan{}
 	auth := externalPeerControlAuthForToken(tok)
-	externalTransferTracef("direct-udp-send-ready-send addr=%v", peerAddr)
-	if err := sendAuthenticatedEnvelope(ctx, derpClient, listenerDERP, envelope{Type: envelopeDirectUDPReady}, auth); err != nil {
-		return plan, err
-	}
-	externalTransferTracef("direct-udp-send-ready-wait-ack addr=%v", peerAddr)
-	readyAck, err := externalDirectUDPWaitReadyAckFn(ctx, readyAckCh, auth)
+	readyAck, err := externalDirectUDPSendReadyHandshake(ctx, derpClient, listenerDERP, peerAddr, readyAckCh, auth)
 	if err != nil {
 		return plan, err
 	}
-	externalTransferTracef("direct-udp-send-ready-ack addr=%v fast-discard=%v", peerAddr, readyAck.FastDiscard)
-
-	externalTransferTracef("direct-udp-send-remote-addrs-start addr=%v candidates=%d conns=%d", peerAddr, len(remoteCandidates), len(probeConns))
-	remoteAddrs := externalDirectUDPSelectRemoteAddrs(ctx, probeConns, remoteCandidates, peerAddr, cfg.Emitter)
-	externalTransferTracef("direct-udp-send-remote-addrs-done addr=%v selected=%d", peerAddr, len(remoteAddrs))
-	probeConns, remoteAddrs = externalDirectUDPPairs(probeConns, remoteAddrs)
-	if len(probeConns) == 0 {
-		return plan, errors.New("direct UDP established without usable remote addresses")
-	}
-	localTransportCaps := externalDirectUDPPreviewTransportCaps(probeConns[0], externalDirectUDPTransportLabel)
-	effectiveTransportCaps := externalDirectUDPEffectiveSenderCaps(localTransportCaps, readyAck)
-	receiverConstrained := externalDirectUDPConstrainedReceiver(readyAck)
-
-	maxRateMbps := externalDirectUDPMaxRateMbps
-	activeRateMbps := externalDirectUDPInitialProbeFallbackMbps
-	rateCeilingMbps := maxRateMbps
-	if cfg.Emitter != nil {
-		cfg.Emitter.Debug("udp-blast=true")
-		cfg.Emitter.Debug("udp-lanes=" + strconv.Itoa(len(probeConns)))
-		cfg.Emitter.Debug("udp-rate-max-mbps=" + strconv.Itoa(maxRateMbps))
-		cfg.Emitter.Debug("udp-adaptive-rate=true")
-		cfg.Emitter.Debug("udp-repair-payloads=" + strconv.FormatBool(externalDirectUDPRepairPayloads))
-		cfg.Emitter.Debug("udp-tail-replay-bytes=" + strconv.Itoa(externalDirectUDPTailReplayBytes))
-		cfg.Emitter.Debug("udp-fec-group-size=" + strconv.Itoa(externalDirectUDPStreamFECGroupSize))
-		cfg.Emitter.Debug("udp-fast-discard=" + strconv.FormatBool(readyAck.FastDiscard))
-		if receiverConstrained {
-			cfg.Emitter.Debug("udp-receiver-constrained=true")
-		}
-		if peerAddr != nil {
-			cfg.Emitter.Debug("udp-direct-addr=" + peerAddr.String())
-		}
-		cfg.Emitter.Debug("udp-direct-addrs=" + strings.Join(remoteAddrs, ","))
-	}
-	externalTransferTracef("direct-udp-send-handoff-ready-signal addr=%v", peerAddr)
-	signalExternalDirectUDPHandoffReady(ctx)
-	externalTransferTracef("direct-udp-send-handoff-proceed-wait addr=%v", peerAddr)
-	if err := waitExternalDirectUDPHandoffProceed(ctx); err != nil {
+	probeConns, remoteAddrs, effectiveTransportCaps, receiverConstrained, err := externalDirectUDPSendRemoteSetup(ctx, probeConns, remoteCandidates, peerAddr, readyAck, cfg.Emitter)
+	if err != nil {
 		return plan, err
 	}
-	externalTransferTracef("direct-udp-send-handoff-proceed addr=%v", peerAddr)
-	handoffWatermark := int64(0)
-	if watermark, ok := externalDirectUDPHandoffProceedWatermark(ctx); ok {
-		handoffWatermark = watermark
+	rateState := externalDirectUDPInitialSendRateState()
+	emitExternalDirectUDPSendInitialDebug(cfg.Emitter, peerAddr, remoteAddrs, len(probeConns), rateState.maxRateMbps, readyAck, receiverConstrained)
+	directExpectedBytes, err := externalDirectUDPSendWaitHandoffExpectedBytes(ctx, peerAddr, cfg.StdioExpectedBytes)
+	if err != nil {
+		return plan, err
 	}
-	directExpectedBytes := externalDirectUDPRemainingExpectedBytes(cfg.StdioExpectedBytes, handoffWatermark)
 	packetAEAD, err := externalSessionPacketAEAD(tok)
 	if err != nil {
 		return plan, err
 	}
 	policyActiveLaneCap := externalDirectUDPActiveLaneCapForPolicy(cfg.ParallelPolicy, len(probeConns))
 	policyActiveLaneCap = externalDirectUDPConstrainedReceiverLaneCap(readyAck, policyActiveLaneCap, len(probeConns))
-	stripedDecisionLanes := len(probeConns)
-	if policyActiveLaneCap > 0 && policyActiveLaneCap < stripedDecisionLanes {
-		stripedDecisionLanes = policyActiveLaneCap
+	sendCfg := externalDirectUDPNewSendConfig(tok, packetAEAD, readyAck, policyActiveLaneCap, len(probeConns), rateState)
+	emitExternalDirectUDPReceiveStartDebug(cfg.Emitter, directExpectedBytes)
+	start, rateProbeAuth, err := externalDirectUDPSendStart(ctx, tok, cfg, directExpectedBytes, sendCfg.StripedBlast, &rateState)
+	if err != nil {
+		return plan, err
 	}
-	sendCfg := probe.SendConfig{
+	if err := externalDirectUDPSendStartHandshake(ctx, derpClient, listenerDERP, peerAddr, startAckCh, start, auth); err != nil {
+		return plan, err
+	}
+	rateState, sendCfg, err = externalDirectUDPResolveSendRates(ctx, probeConns, remoteAddrs, rateProbeCh, auth, rateProbeAuth, readyAck, effectiveTransportCaps, sendCfg, rateState)
+	if err != nil {
+		return plan, err
+	}
+	retainedLanes := externalDirectUDPSendRetainedLanes(rateState, sendCfg, policyActiveLaneCap, len(probeConns), effectiveTransportCaps)
+	if retainedLanes == 0 {
+		return plan, errors.New("direct UDP established without active send lanes")
+	}
+	if retainedLanes < len(probeConns) {
+		probeConns = probeConns[:retainedLanes]
+		remoteAddrs = remoteAddrs[:retainedLanes]
+	}
+	rateState, sendCfg = externalDirectUDPFinalizeSendRates(rateState, sendCfg, len(probeConns))
+	emitExternalDirectUDPSendFinalDebug(cfg.Emitter, probeConns, sendCfg, rateState)
+
+	plan.probeConns = probeConns
+	plan.remoteAddrs = remoteAddrs
+	plan.sendCfg = sendCfg
+	plan.selectedRateMbps = rateState.selectedRateMbps
+	plan.startRateMbps = rateState.activeRateMbps
+	plan.rateCeilingMbps = rateState.rateCeilingMbps
+	plan.probeRates = rateState.probeRates
+	plan.sentProbeSamples = rateState.sentProbeSamples
+	plan.receivedProbeSamples = rateState.probeResult.Samples
+	return plan, nil
+}
+
+type externalDirectUDPSendRateState struct {
+	maxRateMbps               int
+	activeRateMbps            int
+	selectedRateMbps          int
+	rateCeilingMbps           int
+	probeRates                []int
+	useRelayPrefixNoProbePath bool
+	sentProbeSamples          []directUDPRateProbeSample
+	probeResult               directUDPRateProbeResult
+}
+
+func externalDirectUDPInitialSendRateState() externalDirectUDPSendRateState {
+	activeRateMbps := externalDirectUDPInitialProbeFallbackMbps
+	maxRateMbps := externalDirectUDPMaxRateMbps
+	return externalDirectUDPSendRateState{
+		maxRateMbps:      maxRateMbps,
+		activeRateMbps:   activeRateMbps,
+		selectedRateMbps: activeRateMbps,
+		rateCeilingMbps:  maxRateMbps,
+	}
+}
+
+func externalDirectUDPSendReadyHandshake(ctx context.Context, derpClient *derpbind.Client, listenerDERP key.NodePublic, peerAddr net.Addr, readyAckCh <-chan derpbind.Packet, auth externalPeerControlAuth) (directUDPReadyAck, error) {
+	externalTransferTracef("direct-udp-send-ready-send addr=%v", peerAddr)
+	if err := sendAuthenticatedEnvelope(ctx, derpClient, listenerDERP, envelope{Type: envelopeDirectUDPReady}, auth); err != nil {
+		return directUDPReadyAck{}, err
+	}
+	externalTransferTracef("direct-udp-send-ready-wait-ack addr=%v", peerAddr)
+	readyAck, err := externalDirectUDPWaitReadyAckFn(ctx, readyAckCh, auth)
+	if err != nil {
+		return directUDPReadyAck{}, err
+	}
+	externalTransferTracef("direct-udp-send-ready-ack addr=%v fast-discard=%v", peerAddr, readyAck.FastDiscard)
+	return readyAck, nil
+}
+
+func externalDirectUDPSendRemoteSetup(ctx context.Context, probeConns []net.PacketConn, remoteCandidates []net.Addr, peerAddr net.Addr, readyAck directUDPReadyAck, emitter *telemetry.Emitter) ([]net.PacketConn, []string, probe.TransportCaps, bool, error) {
+	externalTransferTracef("direct-udp-send-remote-addrs-start addr=%v candidates=%d conns=%d", peerAddr, len(remoteCandidates), len(probeConns))
+	remoteAddrs := externalDirectUDPSelectRemoteAddrs(ctx, probeConns, remoteCandidates, peerAddr, emitter)
+	externalTransferTracef("direct-udp-send-remote-addrs-done addr=%v selected=%d", peerAddr, len(remoteAddrs))
+	probeConns, remoteAddrs = externalDirectUDPPairs(probeConns, remoteAddrs)
+	if len(probeConns) == 0 {
+		return nil, nil, probe.TransportCaps{}, false, errors.New("direct UDP established without usable remote addresses")
+	}
+	localTransportCaps := externalDirectUDPPreviewTransportCaps(probeConns[0], externalDirectUDPTransportLabel)
+	effectiveTransportCaps := externalDirectUDPEffectiveSenderCaps(localTransportCaps, readyAck)
+	return probeConns, remoteAddrs, effectiveTransportCaps, externalDirectUDPConstrainedReceiver(readyAck), nil
+}
+
+func emitExternalDirectUDPSendInitialDebug(emitter *telemetry.Emitter, peerAddr net.Addr, remoteAddrs []string, lanes int, maxRateMbps int, readyAck directUDPReadyAck, receiverConstrained bool) {
+	if emitter == nil {
+		return
+	}
+	emitter.Debug("udp-blast=true")
+	emitter.Debug("udp-lanes=" + strconv.Itoa(lanes))
+	emitter.Debug("udp-rate-max-mbps=" + strconv.Itoa(maxRateMbps))
+	emitter.Debug("udp-adaptive-rate=true")
+	emitter.Debug("udp-repair-payloads=" + strconv.FormatBool(externalDirectUDPRepairPayloads))
+	emitter.Debug("udp-tail-replay-bytes=" + strconv.Itoa(externalDirectUDPTailReplayBytes))
+	emitter.Debug("udp-fec-group-size=" + strconv.Itoa(externalDirectUDPStreamFECGroupSize))
+	emitter.Debug("udp-fast-discard=" + strconv.FormatBool(readyAck.FastDiscard))
+	if receiverConstrained {
+		emitter.Debug("udp-receiver-constrained=true")
+	}
+	if peerAddr != nil {
+		emitter.Debug("udp-direct-addr=" + peerAddr.String())
+	}
+	emitter.Debug("udp-direct-addrs=" + strings.Join(remoteAddrs, ","))
+}
+
+func externalDirectUDPSendWaitHandoffExpectedBytes(ctx context.Context, peerAddr net.Addr, expectedBytes int64) (int64, error) {
+	externalTransferTracef("direct-udp-send-handoff-ready-signal addr=%v", peerAddr)
+	signalExternalDirectUDPHandoffReady(ctx)
+	externalTransferTracef("direct-udp-send-handoff-proceed-wait addr=%v", peerAddr)
+	if err := waitExternalDirectUDPHandoffProceed(ctx); err != nil {
+		return 0, err
+	}
+	externalTransferTracef("direct-udp-send-handoff-proceed addr=%v", peerAddr)
+	handoffWatermark := int64(0)
+	if watermark, ok := externalDirectUDPHandoffProceedWatermark(ctx); ok {
+		handoffWatermark = watermark
+	}
+	return externalDirectUDPRemainingExpectedBytes(expectedBytes, handoffWatermark), nil
+}
+
+func externalDirectUDPNewSendConfig(tok token.Token, packetAEAD cipher.AEAD, readyAck directUDPReadyAck, policyActiveLaneCap int, lanes int, rateState externalDirectUDPSendRateState) probe.SendConfig {
+	stripedDecisionLanes := externalDirectUDPStripedDecisionLanes(lanes, policyActiveLaneCap)
+	return probe.SendConfig{
 		Blast:                    true,
 		Transport:                externalDirectUDPTransportLabel,
 		ChunkSize:                externalDirectUDPChunkSize,
-		RateMbps:                 activeRateMbps,
-		RateCeilingMbps:          maxRateMbps,
+		RateMbps:                 rateState.activeRateMbps,
+		RateCeilingMbps:          rateState.maxRateMbps,
 		RunID:                    tok.SessionID,
 		RepairPayloads:           externalDirectUDPRepairPayloads,
 		TailReplayBytes:          externalDirectUDPTailReplayBytes,
@@ -646,164 +917,225 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 		AllowPartialParallel:     true,
 		ParallelHandshakeTimeout: externalDirectUDPHandshakeWait,
 		MaxActiveLanes:           policyActiveLaneCap,
-		MinActiveLanes:           externalDirectUDPConstrainedReceiverMinActiveLanes(readyAck, len(probeConns)),
+		MinActiveLanes:           externalDirectUDPConstrainedReceiverMinActiveLanes(readyAck, lanes),
 	}
-	emitExternalDirectUDPReceiveStartDebug(cfg.Emitter, directExpectedBytes)
-	start := externalDirectUDPStreamStart(maxRateMbps, directExpectedBytes)
-	probeRates := append([]int(nil), start.ProbeRates...)
-	useRelayPrefixNoProbePath := externalDirectUDPUseRelayPrefixNoProbePath(ctx, cfg.skipDirectUDPRateProbes, probeRates)
-	if useRelayPrefixNoProbePath {
+}
+
+func externalDirectUDPStripedDecisionLanes(lanes int, policyActiveLaneCap int) int {
+	if policyActiveLaneCap > 0 && policyActiveLaneCap < lanes {
+		return policyActiveLaneCap
+	}
+	return lanes
+}
+
+func externalDirectUDPSendStart(ctx context.Context, tok token.Token, cfg SendConfig, directExpectedBytes int64, stripedBlast bool, rateState *externalDirectUDPSendRateState) (directUDPStart, externalDirectUDPRateProbeAuth, error) {
+	start := externalDirectUDPStreamStart(rateState.maxRateMbps, directExpectedBytes)
+	rateState.probeRates = append([]int(nil), start.ProbeRates...)
+	rateState.useRelayPrefixNoProbePath = externalDirectUDPUseRelayPrefixNoProbePath(ctx, cfg.skipDirectUDPRateProbes, rateState.probeRates)
+	if rateState.useRelayPrefixNoProbePath {
 		start.ProbeRates = nil
-		probeRates = nil
-		reason := "relay-prefix-upgrade"
-		if !cfg.skipDirectUDPRateProbes {
-			reason = "relay-prefix-small-remaining"
-		}
-		externalTransferTracef("direct-udp-send-rate-probe-skipped reason=%s", reason)
+		rateState.probeRates = nil
+		externalTransferTracef("direct-udp-send-rate-probe-skipped reason=%s", externalDirectUDPSendProbeSkipReason(cfg))
 	}
-	var rateProbeAuth externalDirectUDPRateProbeAuth
-	if len(probeRates) > 0 {
-		rateProbeAuth, start.ProbeNonce, err = newExternalDirectUDPRateProbeAuth(tok)
-		if err != nil {
-			return plan, err
-		}
+	rateProbeAuth, err := externalDirectUDPSendRateProbeAuth(tok, &start, rateState.probeRates)
+	start.StripedBlast = stripedBlast
+	return start, rateProbeAuth, err
+}
+
+func externalDirectUDPSendProbeSkipReason(cfg SendConfig) string {
+	if cfg.skipDirectUDPRateProbes {
+		return "relay-prefix-upgrade"
 	}
-	start.StripedBlast = sendCfg.StripedBlast
+	return "relay-prefix-small-remaining"
+}
+
+func externalDirectUDPSendRateProbeAuth(tok token.Token, start *directUDPStart, probeRates []int) (externalDirectUDPRateProbeAuth, error) {
+	if len(probeRates) == 0 {
+		return externalDirectUDPRateProbeAuth{}, nil
+	}
+	rateProbeAuth, nonce, err := newExternalDirectUDPRateProbeAuth(tok)
+	if err != nil {
+		return externalDirectUDPRateProbeAuth{}, err
+	}
+	start.ProbeNonce = nonce
+	return rateProbeAuth, nil
+}
+
+func externalDirectUDPSendStartHandshake(ctx context.Context, derpClient *derpbind.Client, listenerDERP key.NodePublic, peerAddr net.Addr, startAckCh <-chan derpbind.Packet, start directUDPStart, auth externalPeerControlAuth) error {
 	externalTransferTracef("direct-udp-send-start-send addr=%v", peerAddr)
 	if err := sendAuthenticatedEnvelope(ctx, derpClient, listenerDERP, envelope{
 		Type:           envelopeDirectUDPStart,
 		DirectUDPStart: &start,
 	}, auth); err != nil {
-		return plan, err
+		return err
 	}
 	externalTransferTracef("direct-udp-send-start-wait-ack addr=%v", peerAddr)
 	if err := externalDirectUDPWaitStartAckFn(ctx, startAckCh, auth); err != nil {
-		return plan, err
+		return err
 	}
 	externalTransferTracef("direct-udp-send-start-ack addr=%v", peerAddr)
 	signalExternalDirectUDPDirectReady(ctx)
+	return nil
+}
 
-	selectedRateMbps := activeRateMbps
-	var sentProbeSamples []directUDPRateProbeSample
-	var probeResult directUDPRateProbeResult
-	if len(probeRates) > 0 {
-		externalTransferTracef("direct-udp-send-rate-probe-start rates=%s", strings.Trim(strings.Join(strings.Fields(fmt.Sprint(probeRates)), ","), "[]"))
-		sentProbeSamples, err = externalDirectUDPSendRateProbesParallelFn(ctx, probeConns, remoteAddrs, probeRates, rateProbeAuth)
-		if err != nil {
-			externalTransferTracef("direct-udp-send-rate-probe-done err=%v", err)
-			return plan, err
-		}
-		probeResult, err = externalDirectUDPWaitRateProbeFn(ctx, rateProbeCh, auth)
-		if err != nil {
-			externalTransferTracef("direct-udp-send-rate-probe-done err=%v", err)
-			return plan, err
-		}
-		externalTransferTracef("direct-udp-send-rate-probe-done err=<nil> samples=%d", len(probeResult.Samples))
-		selectedRateMbps = externalDirectUDPSelectInitialRateMbps(maxRateMbps, sentProbeSamples, probeResult.Samples)
-		rateCeilingMbps = externalDirectUDPSelectRateCeilingMbps(maxRateMbps, selectedRateMbps, sentProbeSamples, probeResult.Samples)
-		probeLimit := externalDirectUDPSenderProbeRateLimit(effectiveTransportCaps, sentProbeSamples, probeResult.Samples)
-		rateCeilingMbps = externalDirectUDPSenderRateCeilingCap(effectiveTransportCaps, rateCeilingMbps)
-		if probeLimit.CeilingMbps > 0 && (rateCeilingMbps <= 0 || probeLimit.CeilingMbps < rateCeilingMbps) {
-			rateCeilingMbps = probeLimit.CeilingMbps
-		}
-		if rateCeilingMbps > 0 && selectedRateMbps > rateCeilingMbps {
-			selectedRateMbps = rateCeilingMbps
-		}
-		activeRateMbps = externalDirectUDPDataStartRateMbpsForProbeSamples(selectedRateMbps, rateCeilingMbps, sentProbeSamples, probeResult.Samples)
-		activeRateMbps = externalDirectUDPClampDataStartRate(selectedRateMbps, activeRateMbps, rateCeilingMbps, len(probeConns), sendCfg.StripedBlast)
-		activeRateMbps = externalDirectUDPSenderStartRateCap(effectiveTransportCaps, selectedRateMbps, activeRateMbps)
-		activeRateMbps = externalDirectUDPSenderApplyProbeRateLimit(activeRateMbps, probeLimit)
-		activeRateMbps = externalDirectUDPConstrainedReceiverStartRate(readyAck, activeRateMbps)
-		sendCfg.RateMbps = activeRateMbps
-		sendCfg.RateCeilingMbps = rateCeilingMbps
-		sendCfg.RateExplorationCeilingMbps = externalDirectUDPDataExplorationCeilingMbpsForProbeSamples(maxRateMbps, selectedRateMbps, rateCeilingMbps, sentProbeSamples, probeResult.Samples)
-		sendCfg.RateExplorationCeilingMbps = externalDirectUDPSenderExplorationCeilingCap(effectiveTransportCaps, sendCfg.RateExplorationCeilingMbps)
-		if probeLimit.CeilingMbps > 0 && sendCfg.RateExplorationCeilingMbps > probeLimit.CeilingMbps {
-			sendCfg.RateExplorationCeilingMbps = probeLimit.CeilingMbps
-		}
-		sendCfg.StreamReplayWindowBytes = externalDirectUDPDataPathBudget(selectedRateMbps, activeRateMbps, rateCeilingMbps, len(probeConns), sendCfg.StripedBlast).ReplayWindowBytes
-	} else if useRelayPrefixNoProbePath {
-		rateCeilingMbps = externalDirectUDPRelayPrefixNoProbeRateCeilingMbps(maxRateMbps)
-		selectedRateMbps = externalRelayPrefixNoProbeStartMbps
-		if rateCeilingMbps > 0 && selectedRateMbps > rateCeilingMbps {
-			selectedRateMbps = rateCeilingMbps
-		}
-		activeRateMbps = selectedRateMbps
-		activeRateMbps = externalDirectUDPConstrainedReceiverStartRate(readyAck, activeRateMbps)
-		laneBasisMbps := externalDirectUDPNoProbeLaneBasisMbps(activeRateMbps, rateCeilingMbps)
-		sendCfg.RateMbps = activeRateMbps
-		sendCfg.RateCeilingMbps = rateCeilingMbps
-		sendCfg.StreamReplayWindowBytes = externalDirectUDPReplayWindowBytesForRate(laneBasisMbps)
+func externalDirectUDPResolveSendRates(ctx context.Context, probeConns []net.PacketConn, remoteAddrs []string, rateProbeCh <-chan derpbind.Packet, auth externalPeerControlAuth, rateProbeAuth externalDirectUDPRateProbeAuth, readyAck directUDPReadyAck, effectiveTransportCaps probe.TransportCaps, sendCfg probe.SendConfig, rateState externalDirectUDPSendRateState) (externalDirectUDPSendRateState, probe.SendConfig, error) {
+	if len(rateState.probeRates) > 0 {
+		return externalDirectUDPResolveProbedSendRates(ctx, probeConns, remoteAddrs, rateProbeCh, auth, rateProbeAuth, readyAck, effectiveTransportCaps, sendCfg, rateState)
 	}
+	if rateState.useRelayPrefixNoProbePath {
+		return externalDirectUDPResolveNoProbeSendRates(readyAck, sendCfg, rateState)
+	}
+	return rateState, sendCfg, nil
+}
 
-	var retainedLanes int
-	if len(sentProbeSamples) > 0 || len(probeResult.Samples) > 0 {
-		retainedLanes = externalDirectUDPDataPathBudget(selectedRateMbps, activeRateMbps, rateCeilingMbps, len(probeConns), sendCfg.StripedBlast).ActiveLanes
-	} else {
-		laneRateBasisMbps := externalDirectUDPDataLaneRateBasisMbps(activeRateMbps, rateCeilingMbps, probeRates)
-		retainedLanes = externalDirectUDPRetainedLanesForRate(laneRateBasisMbps, len(probeConns), sendCfg.StripedBlast)
+func externalDirectUDPResolveProbedSendRates(ctx context.Context, probeConns []net.PacketConn, remoteAddrs []string, rateProbeCh <-chan derpbind.Packet, auth externalPeerControlAuth, rateProbeAuth externalDirectUDPRateProbeAuth, readyAck directUDPReadyAck, effectiveTransportCaps probe.TransportCaps, sendCfg probe.SendConfig, rateState externalDirectUDPSendRateState) (externalDirectUDPSendRateState, probe.SendConfig, error) {
+	sentProbeSamples, probeResult, err := externalDirectUDPSendRunRateProbes(ctx, probeConns, remoteAddrs, rateState.probeRates, rateProbeCh, auth, rateProbeAuth)
+	if err != nil {
+		return rateState, sendCfg, err
 	}
-	if useRelayPrefixNoProbePath {
-		noProbeLanes := externalDirectUDPNoProbeActiveLanes(activeRateMbps, rateCeilingMbps, len(probeConns))
-		if noProbeLanes > 0 && (retainedLanes == 0 || noProbeLanes < retainedLanes) {
-			retainedLanes = noProbeLanes
-		}
+	rateState.sentProbeSamples = sentProbeSamples
+	rateState.probeResult = probeResult
+	rateState.selectedRateMbps = externalDirectUDPSelectInitialRateMbps(rateState.maxRateMbps, sentProbeSamples, probeResult.Samples)
+	rateState.rateCeilingMbps = externalDirectUDPSelectRateCeilingMbps(rateState.maxRateMbps, rateState.selectedRateMbps, sentProbeSamples, probeResult.Samples)
+	probeLimit := externalDirectUDPSenderProbeRateLimit(effectiveTransportCaps, sentProbeSamples, probeResult.Samples)
+	rateState.rateCeilingMbps = externalDirectUDPSendApplyProbeCeiling(effectiveTransportCaps, rateState.rateCeilingMbps, probeLimit)
+	rateState.selectedRateMbps = externalDirectUDPClampSelectedRate(rateState.selectedRateMbps, rateState.rateCeilingMbps)
+	rateState.activeRateMbps = externalDirectUDPDataStartRateMbpsForProbeSamples(rateState.selectedRateMbps, rateState.rateCeilingMbps, sentProbeSamples, probeResult.Samples)
+	rateState.activeRateMbps = externalDirectUDPClampDataStartRate(rateState.selectedRateMbps, rateState.activeRateMbps, rateState.rateCeilingMbps, len(probeConns), sendCfg.StripedBlast)
+	rateState.activeRateMbps = externalDirectUDPSenderStartRateCap(effectiveTransportCaps, rateState.selectedRateMbps, rateState.activeRateMbps)
+	rateState.activeRateMbps = externalDirectUDPSenderApplyProbeRateLimit(rateState.activeRateMbps, probeLimit)
+	rateState.activeRateMbps = externalDirectUDPConstrainedReceiverStartRate(readyAck, rateState.activeRateMbps)
+	sendCfg.RateMbps = rateState.activeRateMbps
+	sendCfg.RateCeilingMbps = rateState.rateCeilingMbps
+	sendCfg.RateExplorationCeilingMbps = externalDirectUDPSendExplorationCeiling(rateState, effectiveTransportCaps, probeLimit)
+	sendCfg.StreamReplayWindowBytes = externalDirectUDPDataPathBudget(rateState.selectedRateMbps, rateState.activeRateMbps, rateState.rateCeilingMbps, len(probeConns), sendCfg.StripedBlast).ReplayWindowBytes
+	return rateState, sendCfg, nil
+}
+
+func externalDirectUDPSendRunRateProbes(ctx context.Context, probeConns []net.PacketConn, remoteAddrs []string, probeRates []int, rateProbeCh <-chan derpbind.Packet, auth externalPeerControlAuth, rateProbeAuth externalDirectUDPRateProbeAuth) ([]directUDPRateProbeSample, directUDPRateProbeResult, error) {
+	externalTransferTracef("direct-udp-send-rate-probe-start rates=%s", strings.Trim(strings.Join(strings.Fields(fmt.Sprint(probeRates)), ","), "[]"))
+	sentProbeSamples, err := externalDirectUDPSendRateProbesParallelFn(ctx, probeConns, remoteAddrs, probeRates, rateProbeAuth)
+	if err != nil {
+		externalTransferTracef("direct-udp-send-rate-probe-done err=%v", err)
+		return nil, directUDPRateProbeResult{}, err
 	}
+	probeResult, err := externalDirectUDPWaitRateProbeFn(ctx, rateProbeCh, auth)
+	if err != nil {
+		externalTransferTracef("direct-udp-send-rate-probe-done err=%v", err)
+		return nil, directUDPRateProbeResult{}, err
+	}
+	externalTransferTracef("direct-udp-send-rate-probe-done err=<nil> samples=%d", len(probeResult.Samples))
+	return sentProbeSamples, probeResult, nil
+}
+
+func externalDirectUDPSendApplyProbeCeiling(effectiveTransportCaps probe.TransportCaps, rateCeilingMbps int, probeLimit externalDirectUDPSenderProbeRateLimitResult) int {
+	rateCeilingMbps = externalDirectUDPSenderRateCeilingCap(effectiveTransportCaps, rateCeilingMbps)
+	if probeLimit.CeilingMbps > 0 && (rateCeilingMbps <= 0 || probeLimit.CeilingMbps < rateCeilingMbps) {
+		return probeLimit.CeilingMbps
+	}
+	return rateCeilingMbps
+}
+
+func externalDirectUDPClampSelectedRate(selectedRateMbps int, rateCeilingMbps int) int {
+	if rateCeilingMbps > 0 && selectedRateMbps > rateCeilingMbps {
+		return rateCeilingMbps
+	}
+	return selectedRateMbps
+}
+
+func externalDirectUDPSendExplorationCeiling(rateState externalDirectUDPSendRateState, effectiveTransportCaps probe.TransportCaps, probeLimit externalDirectUDPSenderProbeRateLimitResult) int {
+	ceiling := externalDirectUDPDataExplorationCeilingMbpsForProbeSamples(rateState.maxRateMbps, rateState.selectedRateMbps, rateState.rateCeilingMbps, rateState.sentProbeSamples, rateState.probeResult.Samples)
+	ceiling = externalDirectUDPSenderExplorationCeilingCap(effectiveTransportCaps, ceiling)
+	if probeLimit.CeilingMbps > 0 && ceiling > probeLimit.CeilingMbps {
+		return probeLimit.CeilingMbps
+	}
+	return ceiling
+}
+
+func externalDirectUDPResolveNoProbeSendRates(readyAck directUDPReadyAck, sendCfg probe.SendConfig, rateState externalDirectUDPSendRateState) (externalDirectUDPSendRateState, probe.SendConfig, error) {
+	rateState.rateCeilingMbps = externalDirectUDPRelayPrefixNoProbeRateCeilingMbps(rateState.maxRateMbps)
+	rateState.selectedRateMbps = externalRelayPrefixNoProbeStartMbps
+	rateState.selectedRateMbps = externalDirectUDPClampSelectedRate(rateState.selectedRateMbps, rateState.rateCeilingMbps)
+	rateState.activeRateMbps = externalDirectUDPConstrainedReceiverStartRate(readyAck, rateState.selectedRateMbps)
+	laneBasisMbps := externalDirectUDPNoProbeLaneBasisMbps(rateState.activeRateMbps, rateState.rateCeilingMbps)
+	sendCfg.RateMbps = rateState.activeRateMbps
+	sendCfg.RateCeilingMbps = rateState.rateCeilingMbps
+	sendCfg.StreamReplayWindowBytes = externalDirectUDPReplayWindowBytesForRate(laneBasisMbps)
+	return rateState, sendCfg, nil
+}
+
+func externalDirectUDPSendRetainedLanes(rateState externalDirectUDPSendRateState, sendCfg probe.SendConfig, policyActiveLaneCap int, lanes int, effectiveTransportCaps probe.TransportCaps) int {
+	retainedLanes := externalDirectUDPBaseRetainedLanes(rateState, sendCfg, lanes)
+	retainedLanes = externalDirectUDPApplyNoProbeRetainedLanes(retainedLanes, rateState, lanes)
+	retainedLanes = externalDirectUDPApplyPolicyRetainedLanes(retainedLanes, policyActiveLaneCap)
+	return externalDirectUDPSenderRetainedLaneCap(effectiveTransportCaps, rateState.selectedRateMbps, rateState.activeRateMbps, rateState.rateCeilingMbps, retainedLanes)
+}
+
+func externalDirectUDPBaseRetainedLanes(rateState externalDirectUDPSendRateState, sendCfg probe.SendConfig, lanes int) int {
+	if len(rateState.sentProbeSamples) > 0 || len(rateState.probeResult.Samples) > 0 {
+		return externalDirectUDPDataPathBudget(rateState.selectedRateMbps, rateState.activeRateMbps, rateState.rateCeilingMbps, lanes, sendCfg.StripedBlast).ActiveLanes
+	}
+	laneRateBasisMbps := externalDirectUDPDataLaneRateBasisMbps(rateState.activeRateMbps, rateState.rateCeilingMbps, rateState.probeRates)
+	return externalDirectUDPRetainedLanesForRate(laneRateBasisMbps, lanes, sendCfg.StripedBlast)
+}
+
+func externalDirectUDPApplyNoProbeRetainedLanes(retainedLanes int, rateState externalDirectUDPSendRateState, lanes int) int {
+	if !rateState.useRelayPrefixNoProbePath {
+		return retainedLanes
+	}
+	noProbeLanes := externalDirectUDPNoProbeActiveLanes(rateState.activeRateMbps, rateState.rateCeilingMbps, lanes)
+	if noProbeLanes > 0 && (retainedLanes == 0 || noProbeLanes < retainedLanes) {
+		return noProbeLanes
+	}
+	return retainedLanes
+}
+
+func externalDirectUDPApplyPolicyRetainedLanes(retainedLanes int, policyActiveLaneCap int) int {
 	if policyActiveLaneCap > 0 && (retainedLanes == 0 || policyActiveLaneCap < retainedLanes) {
-		retainedLanes = policyActiveLaneCap
+		return policyActiveLaneCap
 	}
-	retainedLanes = externalDirectUDPSenderRetainedLaneCap(effectiveTransportCaps, selectedRateMbps, activeRateMbps, rateCeilingMbps, retainedLanes)
-	if retainedLanes == 0 {
-		return plan, errors.New("direct UDP established without active send lanes")
-	}
-	if retainedLanes < len(probeConns) {
-		probeConns = probeConns[:retainedLanes]
-		remoteAddrs = remoteAddrs[:retainedLanes]
-	}
-	rateCeilingMbps = externalDirectUDPDataRateCeilingMbps(rateCeilingMbps, activeRateMbps, len(probeConns))
-	sendCfg.RateCeilingMbps = rateCeilingMbps
-	if sendCfg.RateExplorationCeilingMbps > 0 {
-		sendCfg.RateExplorationCeilingMbps = externalDirectUDPDataRateCeilingMbps(sendCfg.RateExplorationCeilingMbps, activeRateMbps, len(probeConns))
-		if sendCfg.RateExplorationCeilingMbps < rateCeilingMbps {
-			sendCfg.RateExplorationCeilingMbps = rateCeilingMbps
-		}
-	}
-	if cfg.Emitter != nil {
-		cfg.Emitter.Debug("udp-striped-available-lanes=" + strconv.Itoa(len(probeConns)))
-		cfg.Emitter.Debug("udp-striped-decision=" + strconv.FormatBool(sendCfg.StripedBlast))
-		cfg.Emitter.Debug("udp-striped-blast=" + strconv.FormatBool(sendCfg.StripedBlast))
-		cfg.Emitter.Debug("udp-rate-ceiling-mbps=" + strconv.Itoa(rateCeilingMbps))
-		if sendCfg.RateExplorationCeilingMbps > rateCeilingMbps {
-			cfg.Emitter.Debug("udp-rate-exploration-ceiling-mbps=" + strconv.Itoa(sendCfg.RateExplorationCeilingMbps))
-		}
-		if len(probeRates) > 0 {
-			cfg.Emitter.Debug("udp-rate-probe-rates=" + strings.Trim(strings.Join(strings.Fields(fmt.Sprint(probeRates)), ","), "[]"))
-			cfg.Emitter.Debug("udp-rate-probe-samples=" + externalDirectUDPFormatRateProbeSamples(sentProbeSamples, probeResult.Samples))
-		}
-		cfg.Emitter.Debug("udp-rate-selected-mbps=" + strconv.Itoa(selectedRateMbps))
-		cfg.Emitter.Debug("udp-rate-start-mbps=" + strconv.Itoa(activeRateMbps))
-		cfg.Emitter.Debug("udp-active-lanes-selected=" + strconv.Itoa(len(probeConns)))
-		if sendCfg.MaxActiveLanes > 0 {
-			cfg.Emitter.Debug("udp-active-lane-cap=" + strconv.Itoa(sendCfg.MaxActiveLanes))
-		}
-		if sendCfg.MinActiveLanes > 0 {
-			cfg.Emitter.Debug("udp-active-lane-min=" + strconv.Itoa(sendCfg.MinActiveLanes))
-		}
-		cfg.Emitter.Debug("udp-rate-mbps=" + strconv.Itoa(activeRateMbps))
-		cfg.Emitter.Debug("udp-stream=true")
-		cfg.Emitter.Debug("udp-stream-replay-window-bytes=" + strconv.FormatUint(sendCfg.StreamReplayWindowBytes, 10))
-	}
+	return retainedLanes
+}
 
-	plan.probeConns = probeConns
-	plan.remoteAddrs = remoteAddrs
-	plan.sendCfg = sendCfg
-	plan.selectedRateMbps = selectedRateMbps
-	plan.startRateMbps = activeRateMbps
-	plan.rateCeilingMbps = rateCeilingMbps
-	plan.probeRates = probeRates
-	plan.sentProbeSamples = sentProbeSamples
-	plan.receivedProbeSamples = probeResult.Samples
-	return plan, nil
+func externalDirectUDPFinalizeSendRates(rateState externalDirectUDPSendRateState, sendCfg probe.SendConfig, lanes int) (externalDirectUDPSendRateState, probe.SendConfig) {
+	rateState.rateCeilingMbps = externalDirectUDPDataRateCeilingMbps(rateState.rateCeilingMbps, rateState.activeRateMbps, lanes)
+	sendCfg.RateCeilingMbps = rateState.rateCeilingMbps
+	if sendCfg.RateExplorationCeilingMbps > 0 {
+		sendCfg.RateExplorationCeilingMbps = externalDirectUDPDataRateCeilingMbps(sendCfg.RateExplorationCeilingMbps, rateState.activeRateMbps, lanes)
+		if sendCfg.RateExplorationCeilingMbps < rateState.rateCeilingMbps {
+			sendCfg.RateExplorationCeilingMbps = rateState.rateCeilingMbps
+		}
+	}
+	return rateState, sendCfg
+}
+
+func emitExternalDirectUDPSendFinalDebug(emitter *telemetry.Emitter, probeConns []net.PacketConn, sendCfg probe.SendConfig, rateState externalDirectUDPSendRateState) {
+	if emitter == nil {
+		return
+	}
+	emitter.Debug("udp-striped-available-lanes=" + strconv.Itoa(len(probeConns)))
+	emitter.Debug("udp-striped-decision=" + strconv.FormatBool(sendCfg.StripedBlast))
+	emitter.Debug("udp-striped-blast=" + strconv.FormatBool(sendCfg.StripedBlast))
+	emitter.Debug("udp-rate-ceiling-mbps=" + strconv.Itoa(rateState.rateCeilingMbps))
+	if sendCfg.RateExplorationCeilingMbps > rateState.rateCeilingMbps {
+		emitter.Debug("udp-rate-exploration-ceiling-mbps=" + strconv.Itoa(sendCfg.RateExplorationCeilingMbps))
+	}
+	if len(rateState.probeRates) > 0 {
+		emitter.Debug("udp-rate-probe-rates=" + strings.Trim(strings.Join(strings.Fields(fmt.Sprint(rateState.probeRates)), ","), "[]"))
+		emitter.Debug("udp-rate-probe-samples=" + externalDirectUDPFormatRateProbeSamples(rateState.sentProbeSamples, rateState.probeResult.Samples))
+	}
+	emitter.Debug("udp-rate-selected-mbps=" + strconv.Itoa(rateState.selectedRateMbps))
+	emitter.Debug("udp-rate-start-mbps=" + strconv.Itoa(rateState.activeRateMbps))
+	emitter.Debug("udp-active-lanes-selected=" + strconv.Itoa(len(probeConns)))
+	if sendCfg.MaxActiveLanes > 0 {
+		emitter.Debug("udp-active-lane-cap=" + strconv.Itoa(sendCfg.MaxActiveLanes))
+	}
+	if sendCfg.MinActiveLanes > 0 {
+		emitter.Debug("udp-active-lane-min=" + strconv.Itoa(sendCfg.MinActiveLanes))
+	}
+	emitter.Debug("udp-rate-mbps=" + strconv.Itoa(rateState.activeRateMbps))
+	emitter.Debug("udp-stream=true")
+	emitter.Debug("udp-stream-replay-window-bytes=" + strconv.FormatUint(sendCfg.StreamReplayWindowBytes, 10))
 }
 
 func externalExecutePreparedDirectUDPSend(ctx context.Context, src io.Reader, plan externalDirectUDPSendPlan, cfg SendConfig, metrics *externalTransferMetrics) error {
@@ -837,25 +1169,79 @@ func externalExecutePreparedDirectUDPSend(ctx context.Context, src io.Reader, pl
 func externalPrepareDirectUDPReceive(ctx context.Context, dst io.Writer, tok token.Token, derpClient *derpbind.Client, peerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, decision rendezvous.Decision, readyCh <-chan derpbind.Packet, startCh <-chan derpbind.Packet, cfg ListenConfig) (externalDirectUDPReceivePlan, error) {
 	plan := externalDirectUDPReceivePlan{decision: decision, peerAddr: peerAddr}
 	auth := externalPeerControlAuthForToken(tok)
-	externalTransferTracef("direct-udp-recv-ready-wait addr=%v", peerAddr)
-	if err := externalDirectUDPWaitReadyFn(ctx, readyCh, auth); err != nil {
+	if err := externalDirectUDPReceiveReadyWait(ctx, peerAddr, readyCh, auth); err != nil {
 		return plan, err
 	}
+	probeConns, remoteAddrs, err := externalDirectUDPReceiveRemotePairs(probeConns, remoteCandidates, peerAddr)
+	if err != nil {
+		return plan, err
+	}
+	localTransportCaps := externalDirectUDPPreviewTransportCaps(probeConns[0], externalDirectUDPTransportLabel)
+	receiveDst, flushDst := externalDirectUDPBufferedWriter(dst)
+	receiveDst, flushDst, fastDiscard := externalDirectUDPReceiveWriter(dst, receiveDst, flushDst)
+	if err := externalDirectUDPReceiveReadyAck(ctx, derpClient, peerDERP, peerAddr, fastDiscard, localTransportCaps, auth); err != nil {
+		return plan, err
+	}
+	emitExternalDirectUDPReceiveInitialDebug(cfg.Emitter, peerAddr, remoteAddrs, len(probeConns), fastDiscard)
+	packetAEAD, err := externalSessionPacketAEAD(tok)
+	if err != nil {
+		return plan, err
+	}
+	receiveCfg := externalDirectUDPFastDiscardReceiveConfig()
+	receiveCfg.PacketAEAD = packetAEAD
+	start, rateProbeAuth, err := externalDirectUDPReceiveStart(ctx, tok, peerAddr, startCh, auth)
+	if err != nil {
+		return plan, err
+	}
+	emitExternalDirectUDPReceiveStartModeDebug(cfg.Emitter, start)
+	emitExternalDirectUDPReceiveStartDebug(cfg.Emitter, start.ExpectedBytes)
+	if err := externalDirectUDPReceiveStartAck(ctx, derpClient, peerDERP, peerAddr, auth); err != nil {
+		return plan, err
+	}
+	signalExternalDirectUDPDirectReady(ctx)
+	if err := externalDirectUDPReceiveRateProbeResult(ctx, derpClient, peerDERP, probeConns, remoteAddrs, start, rateProbeAuth, cfg.Emitter, auth); err != nil {
+		return plan, err
+	}
+	plan.probeConns = probeConns
+	plan.remoteAddrs = remoteAddrs
+	plan.receiveDst = receiveDst
+	plan.flushDst = flushDst
+	plan.receiveCfg = receiveCfg
+	plan.fastDiscard = fastDiscard
+	plan.start = start
+	return plan, nil
+}
+
+func externalDirectUDPReceiveReadyWait(ctx context.Context, peerAddr net.Addr, readyCh <-chan derpbind.Packet, auth externalPeerControlAuth) error {
+	externalTransferTracef("direct-udp-recv-ready-wait addr=%v", peerAddr)
+	if err := externalDirectUDPWaitReadyFn(ctx, readyCh, auth); err != nil {
+		return err
+	}
 	externalTransferTracef("direct-udp-recv-ready addr=%v", peerAddr)
+	return nil
+}
+
+func externalDirectUDPReceiveRemotePairs(probeConns []net.PacketConn, remoteCandidates []net.Addr, peerAddr net.Addr) ([]net.PacketConn, []string, error) {
 	remoteAddrs := externalDirectUDPParallelCandidateStringsForPeer(remoteCandidates, len(probeConns), peerAddr)
 	if len(remoteAddrs) > 0 {
 		probeConns, remoteAddrs = externalDirectUDPPairs(probeConns, remoteAddrs)
 	}
 	if len(probeConns) == 0 {
-		return plan, errors.New("direct UDP ready without usable receive sockets")
+		return nil, nil, errors.New("direct UDP ready without usable receive sockets")
 	}
-	localTransportCaps := externalDirectUDPPreviewTransportCaps(probeConns[0], externalDirectUDPTransportLabel)
+	return probeConns, remoteAddrs, nil
+}
 
-	receiveDst, flushDst := externalDirectUDPBufferedWriter(dst)
+func externalDirectUDPReceiveWriter(dst io.Writer, receiveDst io.Writer, flushDst func() error) (io.Writer, func() error, bool) {
 	fastDiscard := receiveDst == io.Discard
-	if !fastDiscard {
-		receiveDst, flushDst = externalDirectUDPSectionWriterForTarget(dst, receiveDst, flushDst)
+	if fastDiscard {
+		return receiveDst, flushDst, true
 	}
+	receiveDst, flushDst = externalDirectUDPSectionWriterForTarget(dst, receiveDst, flushDst)
+	return receiveDst, flushDst, false
+}
+
+func externalDirectUDPReceiveReadyAck(ctx context.Context, derpClient *derpbind.Client, peerDERP key.NodePublic, peerAddr net.Addr, fastDiscard bool, localTransportCaps probe.TransportCaps, auth externalPeerControlAuth) error {
 	if err := sendAuthenticatedEnvelope(ctx, derpClient, peerDERP, envelope{
 		Type: envelopeDirectUDPReadyAck,
 		DirectUDPReadyAck: &directUDPReadyAck{
@@ -868,118 +1254,144 @@ func externalPrepareDirectUDPReceive(ctx context.Context, dst io.Writer, tok tok
 			TransportRXQOverflow:      localTransportCaps.RXQOverflow,
 		},
 	}, auth); err != nil {
-		return plan, err
+		return err
 	}
 	externalTransferTracef("direct-udp-recv-ready-ack-send addr=%v fast-discard=%v", peerAddr, fastDiscard)
-	if cfg.Emitter != nil {
-		cfg.Emitter.Debug("udp-blast=true")
-		cfg.Emitter.Debug("udp-lanes=" + strconv.Itoa(len(probeConns)))
-		cfg.Emitter.Debug("udp-require-complete=" + strconv.FormatBool(!fastDiscard))
-		cfg.Emitter.Debug("udp-fec-group-size=" + strconv.Itoa(externalDirectUDPStreamFECGroupSize))
-		cfg.Emitter.Debug("udp-fast-discard=" + strconv.FormatBool(fastDiscard))
-		if peerAddr != nil {
-			cfg.Emitter.Debug("udp-direct-addr=" + peerAddr.String())
-		}
-		cfg.Emitter.Debug("udp-direct-addrs=" + strings.Join(remoteAddrs, ","))
+	return nil
+}
+
+func emitExternalDirectUDPReceiveInitialDebug(emitter *telemetry.Emitter, peerAddr net.Addr, remoteAddrs []string, lanes int, fastDiscard bool) {
+	if emitter == nil {
+		return
 	}
-	packetAEAD, err := externalSessionPacketAEAD(tok)
-	if err != nil {
-		return plan, err
+	emitter.Debug("udp-blast=true")
+	emitter.Debug("udp-lanes=" + strconv.Itoa(lanes))
+	emitter.Debug("udp-require-complete=" + strconv.FormatBool(!fastDiscard))
+	emitter.Debug("udp-fec-group-size=" + strconv.Itoa(externalDirectUDPStreamFECGroupSize))
+	emitter.Debug("udp-fast-discard=" + strconv.FormatBool(fastDiscard))
+	if peerAddr != nil {
+		emitter.Debug("udp-direct-addr=" + peerAddr.String())
 	}
-	receiveCfg := externalDirectUDPFastDiscardReceiveConfig()
-	receiveCfg.PacketAEAD = packetAEAD
+	emitter.Debug("udp-direct-addrs=" + strings.Join(remoteAddrs, ","))
+}
+
+func externalDirectUDPReceiveStart(ctx context.Context, tok token.Token, peerAddr net.Addr, startCh <-chan derpbind.Packet, auth externalPeerControlAuth) (directUDPStart, externalDirectUDPRateProbeAuth, error) {
 	externalTransferTracef("direct-udp-recv-start-wait addr=%v", peerAddr)
 	start, err := externalDirectUDPWaitStartFn(ctx, startCh, auth)
 	if err != nil {
-		return plan, err
+		return directUDPStart{}, externalDirectUDPRateProbeAuth{}, err
 	}
 	rateProbeAuth, err := externalDirectUDPRateProbeAuthFromStart(tok, start)
 	if err != nil {
-		return plan, err
+		return directUDPStart{}, externalDirectUDPRateProbeAuth{}, err
 	}
 	externalTransferTracef("direct-udp-recv-start addr=%v stream=%v", peerAddr, start.Stream)
-	if cfg.Emitter != nil {
-		cfg.Emitter.Debug("udp-stream=" + strconv.FormatBool(start.Stream))
-		cfg.Emitter.Debug("udp-striped-blast=" + strconv.FormatBool(start.StripedBlast))
+	return start, rateProbeAuth, nil
+}
+
+func emitExternalDirectUDPReceiveStartModeDebug(emitter *telemetry.Emitter, start directUDPStart) {
+	if emitter == nil {
+		return
 	}
-	emitExternalDirectUDPReceiveStartDebug(cfg.Emitter, start.ExpectedBytes)
+	emitter.Debug("udp-stream=" + strconv.FormatBool(start.Stream))
+	emitter.Debug("udp-striped-blast=" + strconv.FormatBool(start.StripedBlast))
+}
+
+func externalDirectUDPReceiveStartAck(ctx context.Context, derpClient *derpbind.Client, peerDERP key.NodePublic, peerAddr net.Addr, auth externalPeerControlAuth) error {
 	if err := sendAuthenticatedEnvelope(ctx, derpClient, peerDERP, envelope{Type: envelopeDirectUDPStartAck}, auth); err != nil {
-		return plan, err
+		return err
 	}
 	externalTransferTracef("direct-udp-recv-start-ack-send addr=%v", peerAddr)
-	signalExternalDirectUDPDirectReady(ctx)
-	if len(start.ProbeRates) > 0 {
-		probeSamples, probeErr := externalDirectUDPReceiveRateProbesFn(ctx, probeConns, remoteAddrs, start.ProbeRates, rateProbeAuth)
-		if probeErr != nil {
-			return plan, probeErr
-		}
-		if cfg.Emitter != nil {
-			cfg.Emitter.Debug("udp-rate-probe-samples=" + externalDirectUDPFormatRateProbeSamples(nil, probeSamples))
-		}
-		if err := sendAuthenticatedEnvelope(ctx, derpClient, peerDERP, envelope{
-			Type: envelopeDirectUDPRateProbe,
-			DirectUDPRateProbe: &directUDPRateProbeResult{
-				Samples: probeSamples,
-			},
-		}, auth); err != nil {
-			return plan, err
-		}
+	return nil
+}
+
+func externalDirectUDPReceiveRateProbeResult(ctx context.Context, derpClient *derpbind.Client, peerDERP key.NodePublic, probeConns []net.PacketConn, remoteAddrs []string, start directUDPStart, rateProbeAuth externalDirectUDPRateProbeAuth, emitter *telemetry.Emitter, auth externalPeerControlAuth) error {
+	if len(start.ProbeRates) == 0 {
+		return nil
 	}
-	plan.probeConns = probeConns
-	plan.remoteAddrs = remoteAddrs
-	plan.receiveDst = receiveDst
-	plan.flushDst = flushDst
-	plan.receiveCfg = receiveCfg
-	plan.fastDiscard = fastDiscard
-	plan.start = start
-	return plan, nil
+	probeSamples, err := externalDirectUDPReceiveRateProbesFn(ctx, probeConns, remoteAddrs, start.ProbeRates, rateProbeAuth)
+	if err != nil {
+		return err
+	}
+	if emitter != nil {
+		emitter.Debug("udp-rate-probe-samples=" + externalDirectUDPFormatRateProbeSamples(nil, probeSamples))
+	}
+	return sendAuthenticatedEnvelope(ctx, derpClient, peerDERP, envelope{
+		Type: envelopeDirectUDPRateProbe,
+		DirectUDPRateProbe: &directUDPRateProbeResult{
+			Samples: probeSamples,
+		},
+	}, auth)
 }
 
 func externalExecutePreparedDirectUDPReceive(ctx context.Context, plan externalDirectUDPReceivePlan, tok token.Token, cfg ListenConfig, metrics *externalTransferMetrics) error {
-	if metrics == nil {
-		metrics = externalTransferMetricsFromContext(ctx)
-	}
-	if metrics == nil {
-		metrics = newExternalTransferMetrics(time.Now())
-	}
+	metrics = externalTransferMetricsOrNew(ctx, metrics)
 	receiveCfg := plan.receiveCfg
-	var (
-		stats probe.TransferStats
-		err   error
-	)
+	stats, err := externalDirectUDPExecuteReceivePlan(ctx, plan, tok, receiveCfg)
+	externalTransferTracef("direct-udp-recv-execute-done err=%v bytes=%d lanes=%d first-byte-zero=%v complete-zero=%v", err, stats.BytesReceived, stats.Lanes, stats.FirstByteAt.IsZero(), stats.CompletedAt.IsZero())
+	emitExternalDirectUDPReceiveDebug(cfg.Emitter, stats, err)
+	err = externalDirectUDPFlushReceivePlan(plan, err)
+	externalDirectUDPRecordReceiveMetrics(metrics, cfg.Emitter, stats)
+	return err
+}
+
+func externalTransferMetricsOrNew(ctx context.Context, metrics *externalTransferMetrics) *externalTransferMetrics {
+	if metrics != nil {
+		return metrics
+	}
+	metrics = externalTransferMetricsFromContext(ctx)
+	if metrics != nil {
+		return metrics
+	}
+	return newExternalTransferMetrics(time.Now())
+}
+
+func externalDirectUDPExecuteReceivePlan(ctx context.Context, plan externalDirectUDPReceivePlan, tok token.Token, receiveCfg probe.ReceiveConfig) (probe.TransferStats, error) {
 	if plan.start.Stream {
 		receiveCfg.RequireComplete = true
 		receiveCfg.FECGroupSize = externalDirectUDPStreamFECGroupSize
 		receiveCfg.ExpectedRunID = tok.SessionID
 		externalTransferTracef("direct-udp-recv-execute-start stream=true lanes=%d expected=%d", len(plan.probeConns), plan.start.ExpectedBytes)
-		stats, err = probe.ReceiveBlastStreamParallelToWriter(ctx, plan.probeConns, plan.receiveDst, receiveCfg, plan.start.ExpectedBytes)
-	} else if plan.fastDiscard {
+		return probe.ReceiveBlastStreamParallelToWriter(ctx, plan.probeConns, plan.receiveDst, receiveCfg, plan.start.ExpectedBytes)
+	}
+	if plan.fastDiscard {
 		externalTransferTracef("direct-udp-recv-execute-start fast-discard=true lanes=%d expected=%d", len(plan.probeConns), plan.start.ExpectedBytes)
-		stats, err = probe.ReceiveBlastParallelToWriter(ctx, plan.probeConns, plan.receiveDst, receiveCfg, plan.start.ExpectedBytes)
-	} else {
-		receiveCfg.RequireComplete = true
-		probeConns, orderErr := externalDirectUDPOrderConnsForSections(plan.probeConns, plan.decision.Accept.Candidates, plan.start.SectionAddrs)
-		if orderErr != nil {
-			return orderErr
-		}
-		receiveCfg.ExpectedRunIDs = externalDirectUDPLaneRunIDs(tok.SessionID, len(probeConns))
-		externalTransferTracef("direct-udp-recv-execute-start sections=true lanes=%d expected=%d", len(probeConns), plan.start.ExpectedBytes)
-		stats, err = externalDirectUDPReceiveSectionSpoolParallel(ctx, probeConns, plan.receiveDst, receiveCfg, plan.start.ExpectedBytes, plan.start.SectionSizes)
+		return probe.ReceiveBlastParallelToWriter(ctx, plan.probeConns, plan.receiveDst, receiveCfg, plan.start.ExpectedBytes)
 	}
-	externalTransferTracef("direct-udp-recv-execute-done err=%v bytes=%d lanes=%d first-byte-zero=%v complete-zero=%v", err, stats.BytesReceived, stats.Lanes, stats.FirstByteAt.IsZero(), stats.CompletedAt.IsZero())
-	emitExternalDirectUDPReceiveResultDebug(cfg.Emitter, stats, err)
-	if cfg.Emitter != nil {
-		cfg.Emitter.Debug("udp-receive-transport=" + stats.Transport.Summary())
+	return externalDirectUDPExecuteSectionReceivePlan(ctx, plan, tok, receiveCfg)
+}
+
+func externalDirectUDPExecuteSectionReceivePlan(ctx context.Context, plan externalDirectUDPReceivePlan, tok token.Token, receiveCfg probe.ReceiveConfig) (probe.TransferStats, error) {
+	receiveCfg.RequireComplete = true
+	probeConns, orderErr := externalDirectUDPOrderConnsForSections(plan.probeConns, plan.decision.Accept.Candidates, plan.start.SectionAddrs)
+	if orderErr != nil {
+		return probe.TransferStats{}, orderErr
+	}
+	receiveCfg.ExpectedRunIDs = externalDirectUDPLaneRunIDs(tok.SessionID, len(probeConns))
+	externalTransferTracef("direct-udp-recv-execute-start sections=true lanes=%d expected=%d", len(probeConns), plan.start.ExpectedBytes)
+	return externalDirectUDPReceiveSectionSpoolParallel(ctx, probeConns, plan.receiveDst, receiveCfg, plan.start.ExpectedBytes, plan.start.SectionSizes)
+}
+
+func emitExternalDirectUDPReceiveDebug(emitter *telemetry.Emitter, stats probe.TransferStats, err error) {
+	emitExternalDirectUDPReceiveResultDebug(emitter, stats, err)
+	if emitter != nil {
+		emitter.Debug("udp-receive-transport=" + stats.Transport.Summary())
 		if stats.Lanes > 0 {
-			cfg.Emitter.Debug("udp-receive-active-lanes=" + strconv.Itoa(stats.Lanes))
+			emitter.Debug("udp-receive-active-lanes=" + strconv.Itoa(stats.Lanes))
 		}
-		cfg.Emitter.Debug("udp-receive-retransmits=" + strconv.FormatInt(stats.Retransmits, 10))
-		emitExternalDirectUDPStats(cfg.Emitter, "udp-receive", stats.BytesReceived, stats.StartedAt, stats.FirstByteAt, stats.CompletedAt)
+		emitter.Debug("udp-receive-retransmits=" + strconv.FormatInt(stats.Retransmits, 10))
+		emitExternalDirectUDPStats(emitter, "udp-receive", stats.BytesReceived, stats.StartedAt, stats.FirstByteAt, stats.CompletedAt)
 	}
+}
+
+func externalDirectUDPFlushReceivePlan(plan externalDirectUDPReceivePlan, err error) error {
 	if err == nil {
-		err = plan.flushDst()
+		return plan.flushDst()
 	}
-	completedAt := time.Now()
+	return err
+}
+
+func externalDirectUDPRecordReceiveMetrics(metrics *externalTransferMetrics, emitter *telemetry.Emitter, stats probe.TransferStats) {
 	if stats.BytesReceived > 0 {
 		directFirstByteAt := stats.FirstByteAt
 		if directFirstByteAt.IsZero() {
@@ -987,8 +1399,7 @@ func externalExecutePreparedDirectUDPReceive(ctx context.Context, plan externalD
 		}
 		metrics.RecordDirectWrite(stats.BytesReceived, directFirstByteAt)
 	}
-	emitExternalTransferMetricsComplete(metrics, cfg.Emitter, "udp-receive", stats, completedAt)
-	return err
+	emitExternalTransferMetricsComplete(metrics, emitter, "udp-receive", stats, time.Now())
 }
 
 func sendExternalViaDirectUDPOnly(ctx context.Context, src io.Reader, tok token.Token, derpClient *derpbind.Client, listenerDERP key.NodePublic, transportManager *transport.Manager, pathEmitter *transportPathEmitter, punchCancel context.CancelFunc, probeConn net.PacketConn, probeConns []net.PacketConn, remoteCandidates []net.Addr, readyAckCh <-chan derpbind.Packet, startAckCh <-chan derpbind.Packet, rateProbeCh <-chan derpbind.Packet, cfg SendConfig) error {
@@ -1010,185 +1421,363 @@ func sendExternalViaDirectUDPOnly(ctx context.Context, src io.Reader, tok token.
 }
 
 func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (retTok string, retErr error) {
-	tok, session, err := issuePublicSession(ctx)
+	rt, err := newExternalDirectUDPListenRuntime(ctx, cfg)
 	if err != nil {
 		return "", err
 	}
-	defer deleteRelayMailbox(tok, session)
-	defer closePublicSessionTransport(session)
-	defer session.derp.Close()
+	defer rt.Close()
+	if err := rt.publishToken(ctx); err != nil {
+		return rt.tok, err
+	}
+	return rt.run(ctx)
+}
 
+type externalDirectUDPListenRuntime struct {
+	cfg               ListenConfig
+	tok               string
+	session           *relaySession
+	pathEmitter       *transportPathEmitter
+	claimCh           <-chan derpbind.Packet
+	unsubscribeClaims func()
+	auth              externalPeerControlAuth
+}
+
+func newExternalDirectUDPListenRuntime(ctx context.Context, cfg ListenConfig) (*externalDirectUDPListenRuntime, error) {
+	tok, session, err := issuePublicSession(ctx)
+	if err != nil {
+		return nil, err
+	}
 	pathEmitter := newTransportPathEmitter(cfg.Emitter)
 	pathEmitter.Emit(StateWaiting)
-
 	claimCh, unsubscribeClaims := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return isClaimPayload(pkt.Payload)
 	})
-	defer unsubscribeClaims()
-	auth := externalPeerControlAuthForToken(session.token)
+	return &externalDirectUDPListenRuntime{
+		cfg:               cfg,
+		tok:               tok,
+		session:           session,
+		pathEmitter:       pathEmitter,
+		claimCh:           claimCh,
+		unsubscribeClaims: unsubscribeClaims,
+		auth:              externalPeerControlAuthForToken(session.token),
+	}, nil
+}
 
-	if cfg.TokenSink != nil {
-		select {
-		case cfg.TokenSink <- tok:
-		case <-ctx.Done():
-			return tok, ctx.Err()
-		}
+func (rt *externalDirectUDPListenRuntime) Close() {
+	if rt.unsubscribeClaims != nil {
+		rt.unsubscribeClaims()
 	}
+	if rt.session != nil {
+		deleteRelayMailbox(rt.tok, rt.session)
+		closePublicSessionTransport(rt.session)
+		_ = rt.session.derp.Close()
+	}
+}
 
+func (rt *externalDirectUDPListenRuntime) publishToken(ctx context.Context) error {
+	if rt.cfg.TokenSink == nil {
+		return nil
+	}
+	select {
+	case rt.cfg.TokenSink <- rt.tok:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type externalDirectUDPAcceptedClaim struct {
+	env      envelope
+	peerDERP key.NodePublic
+	decision rendezvous.Decision
+}
+
+func (rt *externalDirectUDPListenRuntime) run(ctx context.Context) (string, error) {
 	for {
-		pkt, err := receiveSubscribedPacket(ctx, claimCh)
+		accepted, ok, err := rt.nextAcceptedClaim(ctx)
 		if err != nil {
-			if ctx.Err() != nil {
-				return tok, ctx.Err()
-			}
-			return tok, err
+			return rt.tok, err
 		}
-		env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
-		if ignoreAuthenticatedEnvelopeError(err, auth) {
+		if !ok {
 			continue
 		}
-		if err != nil || env.Type != envelopeClaim || env.Claim == nil {
-			continue
+		if err := rt.receiveAccepted(ctx, accepted); err != nil {
+			return rt.tok, err
 		}
-
-		peerDERP := key.NodePublicFromRaw32(mem.B(env.Claim.DERPPublic[:]))
-		decision, _ := session.gate.Accept(time.Now(), *env.Claim)
-		if !decision.Accepted {
-			if err := sendAuthenticatedEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}, auth); err != nil {
-				return tok, err
-			}
-			continue
-		}
-		if decision.Accept == nil {
-			return tok, errors.New("accepted decision missing accept payload")
-		}
-		abortCh, unsubscribeAbort := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
-			return pkt.From == peerDERP && isAbortPayload(pkt.Payload)
-		})
-		defer unsubscribeAbort()
-		var countedDst *byteCountingWriteCloser
-		heartbeatCh, unsubscribeHeartbeat := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
-			return pkt.From == peerDERP && isHeartbeatPayload(pkt.Payload)
-		})
-		defer unsubscribeHeartbeat()
-		ctx, stopPeerAbort := withPeerControlContext(ctx, session.derp, peerDERP, abortCh, heartbeatCh, func() int64 {
-			if countedDst == nil {
-				return 0
-			}
-			return countedDst.Count()
-		}, auth)
-		defer stopPeerAbort()
-		defer notifyPeerAbortOnError(&retErr, ctx, session.derp, peerDERP, func() int64 {
-			if countedDst == nil {
-				return 0
-			}
-			return countedDst.Count()
-		}, auth)
-		probeConn := session.probeConn
-		probeConns := []net.PacketConn{session.probeConn}
-		portmaps := []publicPortmap{publicSessionPortmap(session)}
-		cleanupProbeConns := func() {}
-		peerRelayOnly := externalClaimRelayOnly(*env.Claim)
-		relayOnly := cfg.ForceRelay || peerRelayOnly
-		if !relayOnly {
-			probeConn, probeConns, portmaps, cleanupProbeConns, err = externalAcceptedDirectUDPSet(session.probeConn, publicSessionPortmap(session), cfg.Emitter)
-			if err != nil {
-				return tok, err
-			}
-		}
-		defer cleanupProbeConns()
-		pm := portmaps[0]
-		if !relayOnly {
-			decision.Accept.Parallel = len(probeConns)
-			decision.Accept.Candidates = externalDirectUDPFlattenCandidateSets(externalDirectUDPCandidateSets(ctx, probeConns, session.derpMap, portmaps))
-		} else {
-			decision.Accept.Parallel = 0
-			decision.Accept.Candidates = nil
-		}
-		localCandidates := parseCandidateStrings(decision.Accept.Candidates)
-		readyCh, unsubscribeReady := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
-			return pkt.From == peerDERP && isDirectUDPReadyPayload(pkt.Payload)
-		})
-		defer unsubscribeReady()
-		startCh, unsubscribeStart := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
-			return pkt.From == peerDERP && isDirectUDPStartPayload(pkt.Payload)
-		})
-		defer unsubscribeStart()
-		if cfg.Emitter != nil {
-			cfg.Emitter.Debug("claim-accepted")
-		}
-
-		transportCtx, transportCancel := context.WithCancel(ctx)
-		defer transportCancel()
-		transportManager, transportCleanup, err := startExternalTransportManager(transportCtx, session.token, probeConn, session.derpMap, session.derp, peerDERP, localCandidates, pm, relayOnly)
-		if err != nil {
-			return tok, err
-		}
-		defer transportCleanup()
-		pathEmitter.SuppressWatcherDirect()
-		pathEmitter.Watch(transportCtx, transportManager)
-		pathEmitter.Flush(transportManager)
-		seedAcceptedClaimCandidates(transportCtx, transportManager, *env.Claim)
-		remoteCandidates := parseRemoteCandidateStrings(env.Claim.Candidates)
-		punchCtx, punchCancel := context.WithCancel(transportCtx)
-		defer punchCancel()
-		if !relayOnly {
-			externalDirectUDPStartPunching(punchCtx, probeConns, remoteCandidates)
-		}
-
-		dst, err := openListenSink(ctx, cfg)
-		if err != nil {
-			return tok, err
-		}
-		countedDst = newByteCountingWriteCloser(dst)
-		defer countedDst.Close()
-		var relayPrefixPackets <-chan derpbind.Packet
-		if !relayOnly {
-			var unsubscribeRelayPrefix func()
-			relayPrefixPackets, unsubscribeRelayPrefix = session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
-				return pkt.From == peerDERP && externalRelayPrefixDERPFrameKindOf(pkt.Payload) != 0
-			})
-			defer unsubscribeRelayPrefix()
-		}
-
-		if err := sendAuthenticatedEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}, auth); err != nil {
-			return tok, err
-		}
-		if cfg.Emitter != nil {
-			cfg.Emitter.Debug("decision-sent")
-		}
-
-		var receiveErr error
-		if relayOnly {
-			receiveErr = receiveExternalRelayUDP(ctx, countedDst, transportManager, session.token, cfg.Emitter)
-		} else {
-			receiveErr = receiveExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixReceiveConfig{
-				dst:              countedDst,
-				tok:              session.token,
-				derpClient:       session.derp,
-				peerDERP:         peerDERP,
-				transportManager: transportManager,
-				pathEmitter:      pathEmitter,
-				punchCancel:      punchCancel,
-				probeConn:        probeConn,
-				probeConns:       probeConns,
-				remoteCandidates: remoteCandidates,
-				decision:         decision,
-				readyCh:          readyCh,
-				startCh:          startCh,
-				relayPackets:     relayPrefixPackets,
-				cfg:              cfg,
-			})
-		}
-		if receiveErr != nil {
-			return tok, receiveErr
-		}
-		if err := sendPeerAck(ctx, session.derp, peerDERP, countedDst.Count(), auth); err != nil {
-			return tok, err
-		}
-		pathEmitter.Complete(transportManager)
-		return tok, nil
+		return rt.tok, nil
 	}
+}
+
+func (rt *externalDirectUDPListenRuntime) nextAcceptedClaim(ctx context.Context) (externalDirectUDPAcceptedClaim, bool, error) {
+	claim, ok, err := rt.receiveClaim(ctx)
+	if err != nil || !ok {
+		return externalDirectUDPAcceptedClaim{}, false, err
+	}
+	if !claim.decision.Accepted {
+		return externalDirectUDPAcceptedClaim{}, false, rt.sendDecision(ctx, claim.peerDERP, claim.decision)
+	}
+	if claim.decision.Accept == nil {
+		return externalDirectUDPAcceptedClaim{}, false, errors.New("accepted decision missing accept payload")
+	}
+	return claim, true, nil
+}
+
+func (rt *externalDirectUDPListenRuntime) receiveClaim(ctx context.Context) (externalDirectUDPAcceptedClaim, bool, error) {
+	pkt, err := receiveSubscribedPacket(ctx, rt.claimCh)
+	if err != nil {
+		if ctx.Err() != nil {
+			return externalDirectUDPAcceptedClaim{}, false, ctx.Err()
+		}
+		return externalDirectUDPAcceptedClaim{}, false, err
+	}
+	env, err := decodeAuthenticatedEnvelope(pkt.Payload, rt.auth)
+	if ignoreAuthenticatedEnvelopeError(err, rt.auth) || err != nil || env.Type != envelopeClaim || env.Claim == nil {
+		return externalDirectUDPAcceptedClaim{}, false, nil
+	}
+	peerDERP := key.NodePublicFromRaw32(mem.B(env.Claim.DERPPublic[:]))
+	decision, _ := rt.session.gate.Accept(time.Now(), *env.Claim)
+	return externalDirectUDPAcceptedClaim{env: env, peerDERP: peerDERP, decision: decision}, true, nil
+}
+
+func (rt *externalDirectUDPListenRuntime) sendDecision(ctx context.Context, peerDERP key.NodePublic, decision rendezvous.Decision) error {
+	return sendAuthenticatedEnvelope(ctx, rt.session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}, rt.auth)
+}
+
+type externalDirectUDPListenPeerSubscriptions struct {
+	abortCh              <-chan derpbind.Packet
+	heartbeatCh          <-chan derpbind.Packet
+	readyCh              <-chan derpbind.Packet
+	startCh              <-chan derpbind.Packet
+	unsubscribeAbort     func()
+	unsubscribeHeartbeat func()
+	unsubscribeReady     func()
+	unsubscribeStart     func()
+}
+
+func (s externalDirectUDPListenPeerSubscriptions) Close() {
+	if s.unsubscribeAbort != nil {
+		s.unsubscribeAbort()
+	}
+	if s.unsubscribeHeartbeat != nil {
+		s.unsubscribeHeartbeat()
+	}
+	if s.unsubscribeReady != nil {
+		s.unsubscribeReady()
+	}
+	if s.unsubscribeStart != nil {
+		s.unsubscribeStart()
+	}
+}
+
+func (rt *externalDirectUDPListenRuntime) subscribePeer(peerDERP key.NodePublic) externalDirectUDPListenPeerSubscriptions {
+	abortCh, unsubscribeAbort := rt.session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == peerDERP && isAbortPayload(pkt.Payload)
+	})
+	heartbeatCh, unsubscribeHeartbeat := rt.session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == peerDERP && isHeartbeatPayload(pkt.Payload)
+	})
+	readyCh, unsubscribeReady := rt.session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == peerDERP && isDirectUDPReadyPayload(pkt.Payload)
+	})
+	startCh, unsubscribeStart := rt.session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == peerDERP && isDirectUDPStartPayload(pkt.Payload)
+	})
+	return externalDirectUDPListenPeerSubscriptions{
+		abortCh:              abortCh,
+		heartbeatCh:          heartbeatCh,
+		readyCh:              readyCh,
+		startCh:              startCh,
+		unsubscribeAbort:     unsubscribeAbort,
+		unsubscribeHeartbeat: unsubscribeHeartbeat,
+		unsubscribeReady:     unsubscribeReady,
+		unsubscribeStart:     unsubscribeStart,
+	}
+}
+
+type externalDirectUDPListenTransfer struct {
+	relayOnly         bool
+	probeConn         net.PacketConn
+	probeConns        []net.PacketConn
+	portmaps          []publicPortmap
+	remoteCandidates  []net.Addr
+	transportCtx      context.Context
+	transportCancel   context.CancelFunc
+	transportManager  *transport.Manager
+	transportCleanup  func()
+	punchCancel       context.CancelFunc
+	cleanupProbeConns func()
+}
+
+func (tr externalDirectUDPListenTransfer) Close() {
+	if tr.punchCancel != nil {
+		tr.punchCancel()
+	}
+	if tr.transportCleanup != nil {
+		tr.transportCleanup()
+	}
+	if tr.transportCancel != nil {
+		tr.transportCancel()
+	}
+	if tr.cleanupProbeConns != nil {
+		tr.cleanupProbeConns()
+	}
+}
+
+func (rt *externalDirectUDPListenRuntime) receiveAccepted(ctx context.Context, accepted externalDirectUDPAcceptedClaim) (retErr error) {
+	peerSubs := rt.subscribePeer(accepted.peerDERP)
+	defer peerSubs.Close()
+	var countedDst *byteCountingWriteCloser
+	ctx, stopPeerAbort := withPeerControlContext(ctx, rt.session.derp, accepted.peerDERP, peerSubs.abortCh, peerSubs.heartbeatCh, func() int64 {
+		return externalDirectUDPCountedDstBytes(countedDst)
+	}, rt.auth)
+	defer stopPeerAbort()
+	defer notifyPeerAbortOnError(&retErr, ctx, rt.session.derp, accepted.peerDERP, func() int64 {
+		return externalDirectUDPCountedDstBytes(countedDst)
+	}, rt.auth)
+
+	emitExternalDirectUDPClaimAccepted(rt.cfg.Emitter)
+	tr, decision, err := rt.prepareTransfer(ctx, accepted)
+	if err != nil {
+		return err
+	}
+	accepted.decision = decision
+	defer tr.Close()
+	countedDst, err = rt.openCountedSink(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = countedDst.Close() }()
+	relayPrefixPackets, unsubscribeRelayPrefix := rt.subscribeRelayPrefix(accepted.peerDERP, tr.relayOnly)
+	defer unsubscribeRelayPrefix()
+
+	if err := rt.sendDecision(ctx, accepted.peerDERP, accepted.decision); err != nil {
+		return err
+	}
+	emitExternalDirectUDPDecisionSent(rt.cfg.Emitter)
+	if err := rt.receivePayload(ctx, accepted, tr, countedDst, peerSubs, relayPrefixPackets); err != nil {
+		return err
+	}
+	if err := sendPeerAck(ctx, rt.session.derp, accepted.peerDERP, countedDst.Count(), rt.auth); err != nil {
+		return err
+	}
+	rt.pathEmitter.Complete(tr.transportManager)
+	return nil
+}
+
+func externalDirectUDPCountedDstBytes(countedDst *byteCountingWriteCloser) int64 {
+	if countedDst == nil {
+		return 0
+	}
+	return countedDst.Count()
+}
+
+func emitExternalDirectUDPClaimAccepted(emitter *telemetry.Emitter) {
+	if emitter != nil {
+		emitter.Debug("claim-accepted")
+	}
+}
+
+func (rt *externalDirectUDPListenRuntime) prepareTransfer(ctx context.Context, accepted externalDirectUDPAcceptedClaim) (externalDirectUDPListenTransfer, rendezvous.Decision, error) {
+	tr, err := rt.prepareProbeSet(accepted)
+	if err != nil {
+		return externalDirectUDPListenTransfer{}, accepted.decision, err
+	}
+	rt.applyDecisionCandidates(ctx, &accepted.decision, tr)
+	localCandidates := parseCandidateStrings(accepted.decision.Accept.Candidates)
+	tr.transportCtx, tr.transportCancel = context.WithCancel(ctx)
+	tr.transportManager, tr.transportCleanup, err = startExternalTransportManager(tr.transportCtx, rt.session.token, tr.probeConn, rt.session.derpMap, rt.session.derp, accepted.peerDERP, localCandidates, tr.portmaps[0], tr.relayOnly)
+	if err != nil {
+		tr.Close()
+		return externalDirectUDPListenTransfer{}, accepted.decision, err
+	}
+	rt.startTransferTransport(accepted, &tr)
+	return tr, accepted.decision, nil
+}
+
+func (rt *externalDirectUDPListenRuntime) prepareProbeSet(accepted externalDirectUDPAcceptedClaim) (externalDirectUDPListenTransfer, error) {
+	tr := externalDirectUDPListenTransfer{
+		relayOnly:         rt.cfg.ForceRelay || externalClaimRelayOnly(*accepted.env.Claim),
+		probeConn:         rt.session.probeConn,
+		probeConns:        []net.PacketConn{rt.session.probeConn},
+		portmaps:          []publicPortmap{publicSessionPortmap(rt.session)},
+		cleanupProbeConns: func() {},
+		punchCancel:       func() {},
+	}
+	if tr.relayOnly {
+		return tr, nil
+	}
+	var err error
+	tr.probeConn, tr.probeConns, tr.portmaps, tr.cleanupProbeConns, err = externalAcceptedDirectUDPSet(rt.session.probeConn, publicSessionPortmap(rt.session), rt.cfg.Emitter)
+	return tr, err
+}
+
+func (rt *externalDirectUDPListenRuntime) applyDecisionCandidates(ctx context.Context, decision *rendezvous.Decision, tr externalDirectUDPListenTransfer) {
+	if tr.relayOnly {
+		decision.Accept.Parallel = 0
+		decision.Accept.Candidates = nil
+		return
+	}
+	decision.Accept.Parallel = len(tr.probeConns)
+	decision.Accept.Candidates = externalDirectUDPFlattenCandidateSets(externalDirectUDPCandidateSets(ctx, tr.probeConns, rt.session.derpMap, tr.portmaps))
+}
+
+func (rt *externalDirectUDPListenRuntime) startTransferTransport(accepted externalDirectUDPAcceptedClaim, tr *externalDirectUDPListenTransfer) {
+	rt.pathEmitter.SuppressWatcherDirect()
+	rt.pathEmitter.Watch(tr.transportCtx, tr.transportManager)
+	rt.pathEmitter.Flush(tr.transportManager)
+	seedAcceptedClaimCandidates(tr.transportCtx, tr.transportManager, *accepted.env.Claim)
+	tr.remoteCandidates = parseRemoteCandidateStrings(accepted.env.Claim.Candidates)
+	if !tr.relayOnly {
+		punchCtx, punchCancel := context.WithCancel(tr.transportCtx)
+		tr.punchCancel = punchCancel
+		externalDirectUDPStartPunching(punchCtx, tr.probeConns, tr.remoteCandidates)
+	}
+}
+
+func (rt *externalDirectUDPListenRuntime) openCountedSink(ctx context.Context) (*byteCountingWriteCloser, error) {
+	dst, err := openListenSink(ctx, rt.cfg)
+	if err != nil {
+		return nil, err
+	}
+	return newByteCountingWriteCloser(dst), nil
+}
+
+func (rt *externalDirectUDPListenRuntime) subscribeRelayPrefix(peerDERP key.NodePublic, relayOnly bool) (<-chan derpbind.Packet, func()) {
+	if relayOnly {
+		return nil, func() {}
+	}
+	return rt.session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == peerDERP && externalRelayPrefixDERPFrameKindOf(pkt.Payload) != 0
+	})
+}
+
+func emitExternalDirectUDPDecisionSent(emitter *telemetry.Emitter) {
+	if emitter != nil {
+		emitter.Debug("decision-sent")
+	}
+}
+
+func (rt *externalDirectUDPListenRuntime) receivePayload(ctx context.Context, accepted externalDirectUDPAcceptedClaim, tr externalDirectUDPListenTransfer, countedDst *byteCountingWriteCloser, peerSubs externalDirectUDPListenPeerSubscriptions, relayPrefixPackets <-chan derpbind.Packet) error {
+	if tr.relayOnly {
+		return receiveExternalRelayUDP(ctx, countedDst, tr.transportManager, rt.session.token, rt.cfg.Emitter)
+	}
+	return receiveExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixReceiveConfig{
+		dst:              countedDst,
+		tok:              rt.session.token,
+		derpClient:       rt.session.derp,
+		peerDERP:         accepted.peerDERP,
+		transportManager: tr.transportManager,
+		pathEmitter:      rt.pathEmitter,
+		punchCancel:      tr.punchCancel,
+		probeConn:        tr.probeConn,
+		probeConns:       tr.probeConns,
+		remoteCandidates: tr.remoteCandidates,
+		decision:         accepted.decision,
+		readyCh:          peerSubs.readyCh,
+		startCh:          peerSubs.startCh,
+		relayPackets:     relayPrefixPackets,
+		cfg:              rt.cfg,
+	})
 }
 
 func receiveExternalViaDirectUDPOnly(ctx context.Context, dst io.Writer, tok token.Token, derpClient *derpbind.Client, peerDERP key.NodePublic, transportManager *transport.Manager, pathEmitter *transportPathEmitter, punchCancel context.CancelFunc, probeConn net.PacketConn, probeConns []net.PacketConn, remoteCandidates []net.Addr, decision rendezvous.Decision, readyCh <-chan derpbind.Packet, startCh <-chan derpbind.Packet, cfg ListenConfig) error {
@@ -1229,225 +1818,329 @@ func sendExternalViaRelayPrefixThenDirectUDP(ctx context.Context, rcfg externalR
 	if rcfg.decision.Accept == nil {
 		return externalSendDirectUDPOnlyFn(ctx, rcfg.src, rcfg.tok, rcfg.derpClient, rcfg.listenerDERP, rcfg.transportManager, rcfg.pathEmitter, rcfg.punchCancel, rcfg.probeConn, rcfg.probeConns, rcfg.remoteCandidates, rcfg.readyAckCh, rcfg.startAckCh, rcfg.rateProbeCh, rcfg.cfg)
 	}
+	rt, err := newExternalRelayPrefixSendRuntime(ctx, rcfg)
+	if err != nil {
+		return err
+	}
+	defer rt.Close()
+	return rt.run()
+}
+
+type externalRelayPrefixSendPrepResult struct {
+	plan externalDirectUDPSendPlan
+	err  error
+}
+
+type externalRelayPrefixSendRuntime struct {
+	ctx                  context.Context
+	rcfg                 externalRelayPrefixSendConfig
+	metrics              *externalTransferMetrics
+	spool                *externalHandoffSpool
+	keepaliveCancel      context.CancelFunc
+	relayStopCh          chan struct{}
+	relayStopOnce        sync.Once
+	relayErrCh           chan error
+	prepCtx              context.Context
+	prepCancel           context.CancelFunc
+	handoffReadyCh       <-chan struct{}
+	signalHandoffProceed func()
+	directReadyCh        <-chan struct{}
+	prepCh               chan externalRelayPrefixSendPrepResult
+	stallTimer           *time.Timer
+	stallFired           bool
+	handoffReady         bool
+	directActivated      bool
+}
+
+func newExternalRelayPrefixSendRuntime(ctx context.Context, rcfg externalRelayPrefixSendConfig) (*externalRelayPrefixSendRuntime, error) {
 	metrics := newExternalTransferMetrics(time.Now())
 	ctx = withExternalTransferMetrics(ctx, metrics)
 	packetAEAD, err := externalSessionPacketAEAD(rcfg.tok)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	spool, err := newExternalHandoffSpool(rcfg.src, externalRelayPrefixDERPChunkSize, externalRelayPrefixDERPMaxUnacked)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer spool.Close()
 	keepaliveCtx, keepaliveCancel := context.WithCancel(ctx)
-	defer keepaliveCancel()
 	go externalRelayPrefixTransportKeepalive(keepaliveCtx, rcfg.transportManager)
-
-	relayStopCh := make(chan struct{})
-	var relayStopOnce sync.Once
-	stopRelay := func() {
-		relayStopOnce.Do(func() {
-			close(relayStopCh)
-		})
+	rt := &externalRelayPrefixSendRuntime{
+		ctx:             ctx,
+		rcfg:            rcfg,
+		metrics:         metrics,
+		spool:           spool,
+		keepaliveCancel: keepaliveCancel,
+		relayStopCh:     make(chan struct{}),
+		relayErrCh:      make(chan error, 1),
+		stallTimer:      time.NewTimer(externalRelayPrefixDirectPrepStallWait),
 	}
 	relayErrCh := make(chan error, 1)
+	rt.relayErrCh = relayErrCh
 	go func() {
-		relayErrCh <- externalSendExternalHandoffDERPFn(ctx, rcfg.derpClient, rcfg.listenerDERP, spool, relayStopCh, metrics, packetAEAD)
+		relayErrCh <- externalSendExternalHandoffDERPFn(ctx, rcfg.derpClient, rcfg.listenerDERP, spool, rt.relayStopCh, metrics, packetAEAD)
 	}()
-
-	waitRelayErr := func() error {
-		select {
-		case err := <-relayErrCh:
-			return err
-		case <-ctx.Done():
-			stopRelay()
-			return normalizePeerAbortError(ctx, ctx.Err())
-		}
-	}
-
-	handoffRelay := func() (bool, int64, error) {
-		spool.SetMaxUnacked(externalRelayPrefixDERPHandoffMaxUnacked)
-		if err := spool.WaitForUnackedAtMost(ctx, externalRelayPrefixDERPHandoffMaxUnacked); err != nil {
-			stopRelay()
-			return false, 0, err
-		}
-		stopRelay()
-		if err := waitRelayErr(); err != nil {
-			return false, 0, err
-		}
-		watermark := spool.AckedWatermark()
-		if spool.Done() {
-			if rcfg.cfg.Emitter != nil {
-				rcfg.cfg.Emitter.Debug("udp-handoff-finished-on-relay=true")
-			}
-			emitExternalTransferMetricsComplete(metrics, rcfg.cfg.Emitter, "udp-send", probe.TransferStats{}, time.Now())
-			return true, watermark, nil
-		}
-		return false, watermark, spool.RewindTo(watermark)
-	}
-
 	prepCtx, prepCancel := context.WithCancel(ctx)
-	defer prepCancel()
 	prepCtx, handoffReadyCh := withExternalDirectUDPHandoffReadySignal(prepCtx)
 	prepCtx, signalHandoffProceed := withExternalDirectUDPHandoffProceedSignal(prepCtx)
 	prepCtx, directReadyCh := withExternalDirectUDPDirectReadySignal(prepCtx)
-	type sendPrepResult struct {
-		plan externalDirectUDPSendPlan
-		err  error
+	rt.prepCtx = prepCtx
+	rt.prepCancel = prepCancel
+	rt.handoffReadyCh = handoffReadyCh
+	rt.signalHandoffProceed = signalHandoffProceed
+	rt.directReadyCh = directReadyCh
+	rt.prepCh = make(chan externalRelayPrefixSendPrepResult, 1)
+	rt.startPrepare()
+	return rt, nil
+}
+
+func (rt *externalRelayPrefixSendRuntime) Close() {
+	rt.stopRelay()
+	if rt.stallTimer != nil {
+		rt.stallTimer.Stop()
 	}
-	prepCh := make(chan sendPrepResult, 1)
-	var peerAddr net.Addr
-	if rcfg.transportManager != nil {
-		peerAddr, _ = rcfg.transportManager.DirectAddr()
+	if rt.prepCancel != nil {
+		rt.prepCancel()
 	}
+	if rt.keepaliveCancel != nil {
+		rt.keepaliveCancel()
+	}
+	if rt.spool != nil {
+		_ = rt.spool.Close()
+	}
+}
+
+func (rt *externalRelayPrefixSendRuntime) startPrepare() {
+	peerAddr := externalRelayPrefixPeerAddr(rt.rcfg.transportManager)
 	go func() {
-		sendCfg := rcfg.cfg
+		sendCfg := rt.rcfg.cfg
 		sendCfg.skipDirectUDPRateProbes = externalRelayPrefixShouldSkipDirectUDPRateProbes(sendCfg.StdioExpectedBytes)
-		plan, err := externalPrepareDirectUDPSendFn(prepCtx, rcfg.tok, rcfg.derpClient, rcfg.listenerDERP, peerAddr, rcfg.probeConns, rcfg.remoteCandidates, rcfg.readyAckCh, rcfg.startAckCh, rcfg.rateProbeCh, sendCfg)
-		prepCh <- sendPrepResult{plan: plan, err: err}
+		plan, err := externalPrepareDirectUDPSendFn(rt.prepCtx, rt.rcfg.tok, rt.rcfg.derpClient, rt.rcfg.listenerDERP, peerAddr, rt.rcfg.probeConns, rt.rcfg.remoteCandidates, rt.rcfg.readyAckCh, rt.rcfg.startAckCh, rt.rcfg.rateProbeCh, sendCfg)
+		rt.prepCh <- externalRelayPrefixSendPrepResult{plan: plan, err: err}
 	}()
-	stallTimer := time.NewTimer(externalRelayPrefixDirectPrepStallWait)
-	defer stallTimer.Stop()
-	stallFired := false
-	handoffReady := false
-	directActivated := false
-	activateDirect := func() {
-		if directActivated {
-			return
-		}
-		externalDirectUDPActivateDirectPath(rcfg.pathEmitter, rcfg.transportManager, rcfg.punchCancel)
-		directActivated = true
+}
+
+func externalRelayPrefixPeerAddr(manager *transport.Manager) net.Addr {
+	if manager == nil {
+		return nil
 	}
-	postHandoff := func() error {
-		externalTransferTracef("relay-prefix-send-post-handoff-start")
-		done, watermark, err := handoffRelay()
-		if err != nil {
+	peerAddr, _ := manager.DirectAddr()
+	return peerAddr
+}
+
+func (rt *externalRelayPrefixSendRuntime) run() error {
+	for {
+		if rt.drainDirectReady() {
+			continue
+		}
+		if err, done := rt.runOnce(); done {
 			return err
 		}
-		if done {
-			externalTransferTracef("relay-prefix-send-post-handoff-done-on-relay")
-			return nil
-		}
-		externalTransferTracef("relay-prefix-send-post-handoff-proceed")
-		recordExternalDirectUDPHandoffProceedWatermark(prepCtx, watermark)
-		signalHandoffProceed()
-		for {
-			if directReadyCh != nil {
-				select {
-				case <-directReadyCh:
-					directReadyCh = nil
-					activateDirect()
-					continue
-				default:
-				}
-			}
-			select {
-			case <-directReadyCh:
-				directReadyCh = nil
-				externalTransferTracef("relay-prefix-send-post-handoff-direct-ready")
-				activateDirect()
-			case prep := <-prepCh:
-				if prep.err != nil {
-					return prep.err
-				}
-				externalTransferTracef("relay-prefix-send-post-handoff-prepared")
-				activateDirect()
-				return externalExecutePreparedDirectUDPSendFn(ctx, newExternalHandoffSpoolReader(spool), prep.plan, rcfg.cfg, metrics)
-			case <-ctx.Done():
-				prepCancel()
-				stopRelay()
-				return normalizePeerAbortError(ctx, ctx.Err())
-			}
-		}
 	}
+}
 
+func (rt *externalRelayPrefixSendRuntime) runOnce() (error, bool) {
+	select {
+	case relayErr := <-rt.relayErrCh:
+		return rt.handleRelayDone(relayErr), true
+	case prep := <-rt.prepCh:
+		return rt.handlePrep(prep), true
+	case <-rt.stallTimer.C:
+		return rt.handleStall()
+	case <-rt.handoffReadyCh:
+		return rt.handleHandoffReady()
+	case <-rt.directReadyCh:
+		rt.directReadyCh = nil
+		externalTransferTracef("relay-prefix-send-direct-ready-pre-prepare")
+		rt.activateDirect()
+		return nil, false
+	case <-rt.ctx.Done():
+		return rt.cancelWithPeerError(), true
+	}
+}
+
+func (rt *externalRelayPrefixSendRuntime) stopRelay() {
+	rt.relayStopOnce.Do(func() {
+		close(rt.relayStopCh)
+	})
+}
+
+func (rt *externalRelayPrefixSendRuntime) waitRelayErr() error {
+	select {
+	case err := <-rt.relayErrCh:
+		return err
+	case <-rt.ctx.Done():
+		rt.stopRelay()
+		return normalizePeerAbortError(rt.ctx, rt.ctx.Err())
+	}
+}
+
+func (rt *externalRelayPrefixSendRuntime) handoffRelay() (bool, int64, error) {
+	rt.spool.SetMaxUnacked(externalRelayPrefixDERPHandoffMaxUnacked)
+	if err := rt.spool.WaitForUnackedAtMost(rt.ctx, externalRelayPrefixDERPHandoffMaxUnacked); err != nil {
+		rt.stopRelay()
+		return false, 0, err
+	}
+	rt.stopRelay()
+	if err := rt.waitRelayErr(); err != nil {
+		return false, 0, err
+	}
+	watermark := rt.spool.AckedWatermark()
+	if rt.spool.Done() {
+		rt.finishOnRelay()
+		return true, watermark, nil
+	}
+	return false, watermark, rt.spool.RewindTo(watermark)
+}
+
+func (rt *externalRelayPrefixSendRuntime) finishOnRelay() {
+	if rt.rcfg.cfg.Emitter != nil {
+		rt.rcfg.cfg.Emitter.Debug("udp-handoff-finished-on-relay=true")
+	}
+	emitExternalTransferMetricsComplete(rt.metrics, rt.rcfg.cfg.Emitter, "udp-send", probe.TransferStats{}, time.Now())
+}
+
+func (rt *externalRelayPrefixSendRuntime) activateDirect() {
+	if rt.directActivated {
+		return
+	}
+	externalDirectUDPActivateDirectPath(rt.rcfg.pathEmitter, rt.rcfg.transportManager, rt.rcfg.punchCancel)
+	rt.directActivated = true
+}
+
+func (rt *externalRelayPrefixSendRuntime) drainDirectReady() bool {
+	if rt.directReadyCh == nil {
+		return false
+	}
+	select {
+	case <-rt.directReadyCh:
+		rt.directReadyCh = nil
+		rt.activateDirect()
+		return true
+	default:
+		return false
+	}
+}
+
+func (rt *externalRelayPrefixSendRuntime) handleRelayDone(relayErr error) error {
+	rt.prepCancel()
+	if relayErr != nil {
+		return relayErr
+	}
+	rt.finishOnRelay()
+	return nil
+}
+
+func (rt *externalRelayPrefixSendRuntime) handlePrep(prep externalRelayPrefixSendPrepResult) error {
+	if prep.err != nil {
+		return rt.handlePrepError(prep.err)
+	}
+	if externalRelayPrefixShouldFinishRelay(rt.spool) {
+		return rt.finishAfterRelayWait()
+	}
+	externalTransferTracef("relay-prefix-send-prepare-complete")
+	done, watermark, err := rt.handoffRelay()
+	if err != nil {
+		return err
+	}
+	if done {
+		externalTransferTracef("relay-prefix-send-prepare-complete-done-on-relay")
+		return nil
+	}
+	recordExternalDirectUDPHandoffProceedWatermark(rt.prepCtx, watermark)
+	rt.activateDirect()
+	return rt.executePrepared(prep.plan)
+}
+
+func (rt *externalRelayPrefixSendRuntime) handlePrepError(prepErr error) error {
+	if rt.rcfg.cfg.Emitter != nil {
+		rt.rcfg.cfg.Emitter.Debug("udp-handoff-send-prepare-error=" + prepErr.Error())
+	}
+	if rt.ctx.Err() != nil || errors.Is(prepErr, context.Canceled) {
+		rt.stopRelay()
+		return normalizePeerAbortError(rt.ctx, prepErr)
+	}
+	if err := rt.waitRelayErr(); err != nil {
+		return err
+	}
+	rt.finishOnRelay()
+	return nil
+}
+
+func (rt *externalRelayPrefixSendRuntime) finishAfterRelayWait() error {
+	if err := rt.waitRelayErr(); err != nil {
+		return err
+	}
+	rt.finishOnRelay()
+	return nil
+}
+
+func (rt *externalRelayPrefixSendRuntime) handleStall() (error, bool) {
+	rt.stallFired = true
+	externalTransferTracef("relay-prefix-send-stall-timer handoff-ready=%v", rt.handoffReady)
+	if rt.handoffReady {
+		return rt.postHandoff(), true
+	}
+	return nil, false
+}
+
+func (rt *externalRelayPrefixSendRuntime) handleHandoffReady() (error, bool) {
+	rt.handoffReady = true
+	rt.handoffReadyCh = nil
+	externalTransferTracef("relay-prefix-send-handoff-ready stall-fired=%v", rt.stallFired)
+	if rt.stallFired {
+		return rt.postHandoff(), true
+	}
+	return nil, false
+}
+
+func (rt *externalRelayPrefixSendRuntime) postHandoff() error {
+	externalTransferTracef("relay-prefix-send-post-handoff-start")
+	done, watermark, err := rt.handoffRelay()
+	if err != nil {
+		return err
+	}
+	if done {
+		externalTransferTracef("relay-prefix-send-post-handoff-done-on-relay")
+		return nil
+	}
+	externalTransferTracef("relay-prefix-send-post-handoff-proceed")
+	recordExternalDirectUDPHandoffProceedWatermark(rt.prepCtx, watermark)
+	rt.signalHandoffProceed()
+	return rt.waitPreparedAfterHandoff()
+}
+
+func (rt *externalRelayPrefixSendRuntime) waitPreparedAfterHandoff() error {
 	for {
-		if directReadyCh != nil {
-			select {
-			case <-directReadyCh:
-				directReadyCh = nil
-				activateDirect()
-				continue
-			default:
-			}
+		if rt.drainDirectReady() {
+			continue
 		}
 		select {
-		case relayErr := <-relayErrCh:
-			prepCancel()
-			if relayErr != nil {
-				return relayErr
-			}
-			if rcfg.cfg.Emitter != nil {
-				rcfg.cfg.Emitter.Debug("udp-handoff-finished-on-relay=true")
-			}
-			emitExternalTransferMetricsComplete(metrics, rcfg.cfg.Emitter, "udp-send", probe.TransferStats{}, time.Now())
-			return nil
-		case prep := <-prepCh:
+		case <-rt.directReadyCh:
+			rt.directReadyCh = nil
+			externalTransferTracef("relay-prefix-send-post-handoff-direct-ready")
+			rt.activateDirect()
+		case prep := <-rt.prepCh:
 			if prep.err != nil {
-				if rcfg.cfg.Emitter != nil {
-					rcfg.cfg.Emitter.Debug("udp-handoff-send-prepare-error=" + prep.err.Error())
-				}
-				if ctx.Err() != nil || errors.Is(prep.err, context.Canceled) {
-					stopRelay()
-					return normalizePeerAbortError(ctx, prep.err)
-				}
-				relayErr := waitRelayErr()
-				if relayErr != nil {
-					return relayErr
-				}
-				if rcfg.cfg.Emitter != nil {
-					rcfg.cfg.Emitter.Debug("udp-handoff-finished-on-relay=true")
-				}
-				emitExternalTransferMetricsComplete(metrics, rcfg.cfg.Emitter, "udp-send", probe.TransferStats{}, time.Now())
-				return nil
+				return prep.err
 			}
-			if externalRelayPrefixShouldFinishRelay(spool) {
-				relayErr := waitRelayErr()
-				if relayErr != nil {
-					return relayErr
-				}
-				if rcfg.cfg.Emitter != nil {
-					rcfg.cfg.Emitter.Debug("udp-handoff-finished-on-relay=true")
-				}
-				emitExternalTransferMetricsComplete(metrics, rcfg.cfg.Emitter, "udp-send", probe.TransferStats{}, time.Now())
-				return nil
-			}
-			externalTransferTracef("relay-prefix-send-prepare-complete")
-			done, watermark, err := handoffRelay()
-			if err != nil {
-				return err
-			}
-			if done {
-				externalTransferTracef("relay-prefix-send-prepare-complete-done-on-relay")
-				return nil
-			}
-			recordExternalDirectUDPHandoffProceedWatermark(prepCtx, watermark)
-			externalDirectUDPActivateDirectPath(rcfg.pathEmitter, rcfg.transportManager, rcfg.punchCancel)
-			return externalExecutePreparedDirectUDPSendFn(ctx, newExternalHandoffSpoolReader(spool), prep.plan, rcfg.cfg, metrics)
-		case <-stallTimer.C:
-			stallFired = true
-			externalTransferTracef("relay-prefix-send-stall-timer handoff-ready=%v", handoffReady)
-			if handoffReady {
-				return postHandoff()
-			}
-		case <-handoffReadyCh:
-			handoffReady = true
-			handoffReadyCh = nil
-			externalTransferTracef("relay-prefix-send-handoff-ready stall-fired=%v", stallFired)
-			if stallFired {
-				return postHandoff()
-			}
-		case <-directReadyCh:
-			directReadyCh = nil
-			externalTransferTracef("relay-prefix-send-direct-ready-pre-prepare")
-			activateDirect()
-		case <-ctx.Done():
-			prepCancel()
-			stopRelay()
-			return normalizePeerAbortError(ctx, ctx.Err())
+			externalTransferTracef("relay-prefix-send-post-handoff-prepared")
+			rt.activateDirect()
+			return rt.executePrepared(prep.plan)
+		case <-rt.ctx.Done():
+			return rt.cancelWithPeerError()
 		}
 	}
+}
+
+func (rt *externalRelayPrefixSendRuntime) executePrepared(plan externalDirectUDPSendPlan) error {
+	return externalExecutePreparedDirectUDPSendFn(rt.ctx, newExternalHandoffSpoolReader(rt.spool), plan, rt.rcfg.cfg, rt.metrics)
+}
+
+func (rt *externalRelayPrefixSendRuntime) cancelWithPeerError() error {
+	rt.prepCancel()
+	rt.stopRelay()
+	return normalizePeerAbortError(rt.ctx, rt.ctx.Err())
 }
 
 type externalRelayPrefixReceiveConfig struct {
@@ -1469,119 +2162,189 @@ type externalRelayPrefixReceiveConfig struct {
 }
 
 func receiveExternalViaRelayPrefixThenDirectUDP(ctx context.Context, rcfg externalRelayPrefixReceiveConfig) error {
+	rt, err := newExternalRelayPrefixReceiveRuntime(ctx, rcfg)
+	if err != nil {
+		return err
+	}
+	defer rt.Close()
+	return rt.run()
+}
+
+type externalRelayPrefixReceivePrepResult struct {
+	plan externalDirectUDPReceivePlan
+	err  error
+}
+
+type externalRelayPrefixReceiveRuntime struct {
+	ctx             context.Context
+	rcfg            externalRelayPrefixReceiveConfig
+	metrics         *externalTransferMetrics
+	keepaliveCancel context.CancelFunc
+	relayErrCh      chan error
+	prepCtx         context.Context
+	prepCancel      context.CancelFunc
+	directReadyCh   <-chan struct{}
+	prepCh          chan externalRelayPrefixReceivePrepResult
+	directActivated bool
+	relayHandedOff  bool
+}
+
+func newExternalRelayPrefixReceiveRuntime(ctx context.Context, rcfg externalRelayPrefixReceiveConfig) (*externalRelayPrefixReceiveRuntime, error) {
 	metrics := newExternalTransferMetrics(time.Now())
 	ctx = withExternalTransferMetrics(ctx, metrics)
 	packetAEAD, err := externalSessionPacketAEAD(rcfg.tok)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	rx := newExternalHandoffReceiver(externalTransferMetricsWriter{w: rcfg.dst, record: metrics.RecordRelayWrite}, externalHandoffMaxUnackedBytes)
 	keepaliveCtx, keepaliveCancel := context.WithCancel(ctx)
-	defer keepaliveCancel()
 	go externalRelayPrefixTransportKeepalive(keepaliveCtx, rcfg.transportManager)
 	relayErrCh := make(chan error, 1)
 	go func() {
 		relayErrCh <- externalReceiveExternalHandoffDERPFn(ctx, rcfg.derpClient, rcfg.peerDERP, rx, rcfg.relayPackets, nil, packetAEAD)
 	}()
-
-	waitRelayOrReturnDirectError := func(directErr error) error {
-		relayErr := <-relayErrCh
-		switch {
-		case relayErr == nil:
-			if rcfg.cfg.Emitter != nil {
-				rcfg.cfg.Emitter.Debug("udp-handoff-finished-on-relay=true")
-			}
-			emitExternalTransferMetricsComplete(metrics, rcfg.cfg.Emitter, "udp-receive", probe.TransferStats{}, time.Now())
-			return nil
-		case errors.Is(relayErr, errExternalHandoffCarrierHandoff):
-			return directErr
-		default:
-			return relayErr
-		}
-	}
-
 	prepCtx, prepCancel := context.WithCancel(ctx)
-	defer prepCancel()
 	prepCtx, directReadyCh := withExternalDirectUDPDirectReadySignal(prepCtx)
-	type receivePrepResult struct {
-		plan externalDirectUDPReceivePlan
-		err  error
+	rt := &externalRelayPrefixReceiveRuntime{
+		ctx:             ctx,
+		rcfg:            rcfg,
+		metrics:         metrics,
+		keepaliveCancel: keepaliveCancel,
+		relayErrCh:      relayErrCh,
+		prepCtx:         prepCtx,
+		prepCancel:      prepCancel,
+		directReadyCh:   directReadyCh,
+		prepCh:          make(chan externalRelayPrefixReceivePrepResult, 1),
 	}
-	prepCh := make(chan receivePrepResult, 1)
-	var peerAddr net.Addr
-	if rcfg.transportManager != nil {
-		peerAddr, _ = rcfg.transportManager.DirectAddr()
-	}
-	go func() {
-		plan, err := externalPrepareDirectUDPReceiveFn(prepCtx, rcfg.dst, rcfg.tok, rcfg.derpClient, rcfg.peerDERP, peerAddr, rcfg.probeConns, rcfg.remoteCandidates, rcfg.decision, rcfg.readyCh, rcfg.startCh, rcfg.cfg)
-		prepCh <- receivePrepResult{plan: plan, err: err}
-	}()
-	directActivated := false
-	relayHandedOff := false
-	activateDirect := func() {
-		if directActivated {
-			return
-		}
-		externalDirectUDPActivateDirectPath(rcfg.pathEmitter, rcfg.transportManager, rcfg.punchCancel)
-		directActivated = true
-	}
+	rt.startPrepare()
+	return rt, nil
+}
 
+func (rt *externalRelayPrefixReceiveRuntime) Close() {
+	if rt.prepCancel != nil {
+		rt.prepCancel()
+	}
+	if rt.keepaliveCancel != nil {
+		rt.keepaliveCancel()
+	}
+}
+
+func (rt *externalRelayPrefixReceiveRuntime) startPrepare() {
+	peerAddr := externalRelayPrefixPeerAddr(rt.rcfg.transportManager)
+	go func() {
+		plan, err := externalPrepareDirectUDPReceiveFn(rt.prepCtx, rt.rcfg.dst, rt.rcfg.tok, rt.rcfg.derpClient, rt.rcfg.peerDERP, peerAddr, rt.rcfg.probeConns, rt.rcfg.remoteCandidates, rt.rcfg.decision, rt.rcfg.readyCh, rt.rcfg.startCh, rt.rcfg.cfg)
+		rt.prepCh <- externalRelayPrefixReceivePrepResult{plan: plan, err: err}
+	}()
+}
+
+func (rt *externalRelayPrefixReceiveRuntime) run() error {
 	for {
-		if directReadyCh != nil {
-			select {
-			case <-directReadyCh:
-				directReadyCh = nil
-				activateDirect()
-				continue
-			default:
-			}
+		if rt.drainDirectReady() {
+			continue
 		}
 		select {
-		case relayErr := <-relayErrCh:
-			if relayErr == nil {
-				prepCancel()
-				if rcfg.cfg.Emitter != nil {
-					rcfg.cfg.Emitter.Debug("udp-handoff-finished-on-relay=true")
-				}
-				emitExternalTransferMetricsComplete(metrics, rcfg.cfg.Emitter, "udp-receive", probe.TransferStats{}, time.Now())
-				return nil
+		case relayErr := <-rt.relayErrCh:
+			if err, done := rt.handleRelayErr(relayErr); done {
+				return err
 			}
-			if !errors.Is(relayErr, errExternalHandoffCarrierHandoff) {
-				prepCancel()
-				return relayErr
-			}
-			relayErrCh = nil
-			relayHandedOff = true
-		case <-directReadyCh:
-			directReadyCh = nil
-			activateDirect()
-		case prep := <-prepCh:
-			if prep.err != nil {
-				if rcfg.cfg.Emitter != nil {
-					rcfg.cfg.Emitter.Debug("udp-handoff-receive-prepare-error=" + prep.err.Error())
-				}
-				if relayHandedOff {
-					return prep.err
-				}
-				return waitRelayOrReturnDirectError(prep.err)
-			}
-			if !relayHandedOff {
-				relayErr := <-relayErrCh
-				if relayErr == nil {
-					if rcfg.cfg.Emitter != nil {
-						rcfg.cfg.Emitter.Debug("udp-handoff-finished-on-relay=true")
-					}
-					emitExternalTransferMetricsComplete(metrics, rcfg.cfg.Emitter, "udp-receive", probe.TransferStats{}, time.Now())
-					return nil
-				}
-				if !errors.Is(relayErr, errExternalHandoffCarrierHandoff) {
-					return relayErr
-				}
-				relayHandedOff = true
-			}
-			activateDirect()
-			return externalExecutePreparedDirectUDPReceiveFn(ctx, prep.plan, rcfg.tok, rcfg.cfg, metrics)
+		case <-rt.directReadyCh:
+			rt.directReadyCh = nil
+			rt.activateDirect()
+		case prep := <-rt.prepCh:
+			return rt.handlePrep(prep)
 		}
+	}
+}
+
+func (rt *externalRelayPrefixReceiveRuntime) activateDirect() {
+	if rt.directActivated {
+		return
+	}
+	externalDirectUDPActivateDirectPath(rt.rcfg.pathEmitter, rt.rcfg.transportManager, rt.rcfg.punchCancel)
+	rt.directActivated = true
+}
+
+func (rt *externalRelayPrefixReceiveRuntime) drainDirectReady() bool {
+	if rt.directReadyCh == nil {
+		return false
+	}
+	select {
+	case <-rt.directReadyCh:
+		rt.directReadyCh = nil
+		rt.activateDirect()
+		return true
+	default:
+		return false
+	}
+}
+
+func (rt *externalRelayPrefixReceiveRuntime) handleRelayErr(relayErr error) (error, bool) {
+	if relayErr == nil {
+		rt.prepCancel()
+		rt.finishOnRelay()
+		return nil, true
+	}
+	if !errors.Is(relayErr, errExternalHandoffCarrierHandoff) {
+		rt.prepCancel()
+		return relayErr, true
+	}
+	rt.relayErrCh = nil
+	rt.relayHandedOff = true
+	return nil, false
+}
+
+func (rt *externalRelayPrefixReceiveRuntime) finishOnRelay() {
+	if rt.rcfg.cfg.Emitter != nil {
+		rt.rcfg.cfg.Emitter.Debug("udp-handoff-finished-on-relay=true")
+	}
+	emitExternalTransferMetricsComplete(rt.metrics, rt.rcfg.cfg.Emitter, "udp-receive", probe.TransferStats{}, time.Now())
+}
+
+func (rt *externalRelayPrefixReceiveRuntime) handlePrep(prep externalRelayPrefixReceivePrepResult) error {
+	if prep.err != nil {
+		return rt.handlePrepErr(prep.err)
+	}
+	if !rt.relayHandedOff {
+		if err, done := rt.waitRelayBeforeDirect(); done {
+			return err
+		}
+	}
+	rt.activateDirect()
+	return externalExecutePreparedDirectUDPReceiveFn(rt.ctx, prep.plan, rt.rcfg.tok, rt.rcfg.cfg, rt.metrics)
+}
+
+func (rt *externalRelayPrefixReceiveRuntime) handlePrepErr(prepErr error) error {
+	if rt.rcfg.cfg.Emitter != nil {
+		rt.rcfg.cfg.Emitter.Debug("udp-handoff-receive-prepare-error=" + prepErr.Error())
+	}
+	if rt.relayHandedOff {
+		return prepErr
+	}
+	return rt.waitRelayOrReturnDirectError(prepErr)
+}
+
+func (rt *externalRelayPrefixReceiveRuntime) waitRelayBeforeDirect() (error, bool) {
+	relayErr := <-rt.relayErrCh
+	if relayErr == nil {
+		rt.finishOnRelay()
+		return nil, true
+	}
+	if !errors.Is(relayErr, errExternalHandoffCarrierHandoff) {
+		return relayErr, true
+	}
+	return nil, false
+}
+
+func (rt *externalRelayPrefixReceiveRuntime) waitRelayOrReturnDirectError(directErr error) error {
+	relayErr := <-rt.relayErrCh
+	switch {
+	case relayErr == nil:
+		rt.finishOnRelay()
+		return nil
+	case errors.Is(relayErr, errExternalHandoffCarrierHandoff):
+		return directErr
+	default:
+		return relayErr
 	}
 }
 
@@ -1622,22 +2385,47 @@ func externalDirectUDPSenderRetainedLaneCap(caps probe.TransportCaps, selectedRa
 	if retainedLanes <= 2 {
 		return retainedLanes
 	}
-	if caps.Kind != "legacy" && caps.Kind != "batched" {
+	if !externalDirectUDPSenderCapsConstrainRetainedLanes(caps) {
 		return retainedLanes
 	}
-	if caps.Kind == "legacy" &&
-		selectedRateMbps < externalDirectUDPActiveLaneTwoMaxMbps &&
-		activeRateMbps < externalDirectUDPActiveLaneTwoMaxMbps {
+	if externalDirectUDPLegacySenderCanRetainLanes(caps, selectedRateMbps, activeRateMbps) {
 		return retainedLanes
 	}
-	if caps.Kind == "batched" &&
-		(caps.TXOffload || caps.RXQOverflow ||
-			(rateCeilingMbps > 0 && retainedLanes > 0 && rateCeilingMbps/retainedLanes <= externalDirectUDPActiveLaneOneMaxMbps) ||
-			(rateCeilingMbps > 0 && rateCeilingMbps <= externalDirectUDPDataStartHighMbps) ||
-			(selectedRateMbps < externalDirectUDPActiveLaneTwoMaxMbps && activeRateMbps < externalDirectUDPActiveLaneTwoMaxMbps)) {
+	if externalDirectUDPBatchedSenderCanRetainLanes(caps, selectedRateMbps, activeRateMbps, rateCeilingMbps, retainedLanes) {
 		return retainedLanes
 	}
 	return 2
+}
+
+func externalDirectUDPSenderCapsConstrainRetainedLanes(caps probe.TransportCaps) bool {
+	return caps.Kind == "legacy" || caps.Kind == "batched"
+}
+
+func externalDirectUDPLegacySenderCanRetainLanes(caps probe.TransportCaps, selectedRateMbps int, activeRateMbps int) bool {
+	return caps.Kind == "legacy" &&
+		selectedRateMbps < externalDirectUDPActiveLaneTwoMaxMbps &&
+		activeRateMbps < externalDirectUDPActiveLaneTwoMaxMbps
+}
+
+func externalDirectUDPBatchedSenderCanRetainLanes(caps probe.TransportCaps, selectedRateMbps int, activeRateMbps int, rateCeilingMbps int, retainedLanes int) bool {
+	return caps.Kind == "batched" &&
+		(caps.TXOffload ||
+			caps.RXQOverflow ||
+			externalDirectUDPLowPerLaneCeiling(rateCeilingMbps, retainedLanes) ||
+			externalDirectUDPLowTotalCeiling(rateCeilingMbps) ||
+			externalDirectUDPLowSelectedAndActiveRates(selectedRateMbps, activeRateMbps))
+}
+
+func externalDirectUDPLowPerLaneCeiling(rateCeilingMbps int, retainedLanes int) bool {
+	return rateCeilingMbps > 0 && retainedLanes > 0 && rateCeilingMbps/retainedLanes <= externalDirectUDPActiveLaneOneMaxMbps
+}
+
+func externalDirectUDPLowTotalCeiling(rateCeilingMbps int) bool {
+	return rateCeilingMbps > 0 && rateCeilingMbps <= externalDirectUDPDataStartHighMbps
+}
+
+func externalDirectUDPLowSelectedAndActiveRates(selectedRateMbps int, activeRateMbps int) bool {
+	return selectedRateMbps < externalDirectUDPActiveLaneTwoMaxMbps && activeRateMbps < externalDirectUDPActiveLaneTwoMaxMbps
 }
 
 func externalDirectUDPEffectiveSenderCaps(localCaps probe.TransportCaps, readyAck directUDPReadyAck) probe.TransportCaps {
@@ -1700,56 +2488,79 @@ func externalDirectUDPSenderProbeRateLimit(caps probe.TransportCaps, sent []dire
 	if caps.Kind != "batched" || caps.TXOffload || caps.RXQOverflow || len(sent) == 0 || len(received) == 0 {
 		return externalDirectUDPSenderProbeRateLimitResult{}
 	}
-	sentByRate := make(map[int]directUDPRateProbeSample, len(sent))
-	for _, sample := range sent {
-		sentByRate[sample.RateMbps] = sample
-	}
-	cleanLimit := externalDirectUDPSenderProbeRateLimitResult{}
-	lossyLimit := externalDirectUDPSenderProbeRateLimitResult{}
-	lossyScore := 0
-	lowCleanLimit := externalDirectUDPSenderProbeRateLimitResult{}
+	selector := newExternalDirectUDPSenderProbeRateLimitSelector(sent)
 	for _, sample := range received {
-		if sample.RateMbps < externalDirectUDPActiveLaneTwoMaxMbps {
-			continue
-		}
-		goodput, delivery, _, ok := externalDirectUDPProbeMetrics(sample, sentByRate)
-		if !ok || goodput <= 0 {
-			continue
-		}
-		if delivery >= externalDirectUDPRateProbeClean {
-			limit := externalDirectUDPBatchOnlyCleanProbeRateLimit(sample.RateMbps)
-			if sample.RateMbps >= externalDirectUDPRateProbeCollapseMinMbps {
-				if sample.RateMbps > cleanLimit.CeilingMbps {
-					cleanLimit = limit
-				}
-				continue
-			}
-			if sample.RateMbps > lowCleanLimit.CeilingMbps {
-				lowCleanLimit = limit
-			}
-			continue
-		}
-		if sample.RateMbps < externalDirectUDPRateProbeCollapseMinMbps ||
-			delivery < externalDirectUDPRateProbeBufferedCollapse ||
-			goodput < externalDirectUDPRateProbeHighHeadroomMin {
-			continue
-		}
-		limit := externalDirectUDPBatchOnlyLossyProbeRateLimit(sample.RateMbps, goodput, delivery)
-		if limit.StartMbps <= lossyScore {
-			continue
-		}
-		lossyScore = limit.StartMbps
-		lossyLimit = limit
+		selector.observe(sample)
 	}
+	return selector.result()
+}
+
+type externalDirectUDPSenderProbeRateLimitSelector struct {
+	sentByRate    map[int]directUDPRateProbeSample
+	cleanLimit    externalDirectUDPSenderProbeRateLimitResult
+	lossyLimit    externalDirectUDPSenderProbeRateLimitResult
+	lossyScore    int
+	lowCleanLimit externalDirectUDPSenderProbeRateLimitResult
+}
+
+func newExternalDirectUDPSenderProbeRateLimitSelector(sent []directUDPRateProbeSample) *externalDirectUDPSenderProbeRateLimitSelector {
+	return &externalDirectUDPSenderProbeRateLimitSelector{
+		sentByRate: externalDirectUDPProbeSamplesByRate(sent),
+	}
+}
+
+func (s *externalDirectUDPSenderProbeRateLimitSelector) observe(sample directUDPRateProbeSample) {
+	if sample.RateMbps < externalDirectUDPActiveLaneTwoMaxMbps {
+		return
+	}
+	goodput, delivery, _, ok := externalDirectUDPProbeMetrics(sample, s.sentByRate)
+	if !ok || goodput <= 0 {
+		return
+	}
+	if delivery >= externalDirectUDPRateProbeClean {
+		s.observeClean(sample.RateMbps)
+		return
+	}
+	s.observeLossy(sample.RateMbps, goodput, delivery)
+}
+
+func (s *externalDirectUDPSenderProbeRateLimitSelector) observeClean(rateMbps int) {
+	limit := externalDirectUDPBatchOnlyCleanProbeRateLimit(rateMbps)
+	if rateMbps >= externalDirectUDPRateProbeCollapseMinMbps {
+		if rateMbps > s.cleanLimit.CeilingMbps {
+			s.cleanLimit = limit
+		}
+		return
+	}
+	if rateMbps > s.lowCleanLimit.CeilingMbps {
+		s.lowCleanLimit = limit
+	}
+}
+
+func (s *externalDirectUDPSenderProbeRateLimitSelector) observeLossy(rateMbps int, goodput float64, delivery float64) {
+	if rateMbps < externalDirectUDPRateProbeCollapseMinMbps ||
+		delivery < externalDirectUDPRateProbeBufferedCollapse ||
+		goodput < externalDirectUDPRateProbeHighHeadroomMin {
+		return
+	}
+	limit := externalDirectUDPBatchOnlyLossyProbeRateLimit(rateMbps, goodput, delivery)
+	if limit.StartMbps <= s.lossyScore {
+		return
+	}
+	s.lossyScore = limit.StartMbps
+	s.lossyLimit = limit
+}
+
+func (s *externalDirectUDPSenderProbeRateLimitSelector) result() externalDirectUDPSenderProbeRateLimitResult {
 	switch {
-	case cleanLimit.CeilingMbps > 0:
-		return cleanLimit
-	case lossyLimit.CeilingMbps > 0 && lowCleanLimit.CeilingMbps > 0 && lowCleanLimit.StartMbps >= lossyLimit.StartMbps:
-		return lowCleanLimit
-	case lossyLimit.CeilingMbps > 0:
-		return lossyLimit
-	case lowCleanLimit.CeilingMbps > 0:
-		return lowCleanLimit
+	case s.cleanLimit.CeilingMbps > 0:
+		return s.cleanLimit
+	case s.lossyLimit.CeilingMbps > 0 && s.lowCleanLimit.CeilingMbps > 0 && s.lowCleanLimit.StartMbps >= s.lossyLimit.StartMbps:
+		return s.lowCleanLimit
+	case s.lossyLimit.CeilingMbps > 0:
+		return s.lossyLimit
+	case s.lowCleanLimit.CeilingMbps > 0:
+		return s.lowCleanLimit
 	default:
 		return externalDirectUDPSenderProbeRateLimitResult{}
 	}
@@ -1855,293 +2666,450 @@ func externalDirectUDPStaticSenderRateMaxMbps(caps probe.TransportCaps) int {
 
 func sendExternalHandoffDERP(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, spool *externalHandoffSpool, stop <-chan struct{}, metrics *externalTransferMetrics, packetAEAD cipher.AEAD) error {
 	externalTransferTracef("sender-derp-prefix-start")
+	rt, err := newExternalHandoffDERPSendRuntime(ctx, client, peerDERP, spool, stop, metrics, packetAEAD)
+	if err != nil {
+		return err
+	}
+	defer rt.Close()
+	return rt.run()
+}
+
+type externalHandoffDERPSendRuntime struct {
+	ctx              context.Context
+	client           *derpbind.Client
+	peerDERP         key.NodePublic
+	spool            *externalHandoffSpool
+	stop             <-chan struct{}
+	metrics          *externalTransferMetrics
+	packetAEAD       cipher.AEAD
+	ackEvents        chan int64
+	handoffAckEvents chan int64
+	ackErrCh         chan error
+	stopWatchDone    chan struct{}
+	unsubscribe      func()
+}
+
+func newExternalHandoffDERPSendRuntime(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, spool *externalHandoffSpool, stop <-chan struct{}, metrics *externalTransferMetrics, packetAEAD cipher.AEAD) (*externalHandoffDERPSendRuntime, error) {
 	if client == nil {
-		return errors.New("nil DERP client")
+		return nil, errors.New("nil DERP client")
 	}
 	if spool == nil {
-		return errors.New("nil external handoff spool")
+		return nil, errors.New("nil external handoff spool")
 	}
-	if stop != nil {
-		stopWatchDone := make(chan struct{})
-		defer close(stopWatchDone)
-		go func() {
-			select {
-			case <-stop:
-				select {
-				case <-stopWatchDone:
-					return
-				default:
-				}
-				spool.InterruptPendingRead()
-			case <-stopWatchDone:
-			}
-		}()
+	rt := &externalHandoffDERPSendRuntime{
+		ctx:              ctx,
+		client:           client,
+		peerDERP:         peerDERP,
+		spool:            spool,
+		stop:             stop,
+		metrics:          metrics,
+		packetAEAD:       packetAEAD,
+		ackEvents:        make(chan int64, 128),
+		handoffAckEvents: make(chan int64, 16),
+		ackErrCh:         make(chan error, 1),
 	}
+	rt.startStopWatcher()
+	rt.startAckReader()
+	return rt, nil
+}
 
-	ackPackets, unsubscribe := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
-		kind := externalRelayPrefixDERPFrameKindOf(pkt.Payload)
-		return pkt.From == peerDERP && (kind == externalRelayPrefixDERPFrameAck || kind == externalRelayPrefixDERPFrameHandoffAck)
-	})
-	defer unsubscribe()
+func (rt *externalHandoffDERPSendRuntime) Close() {
+	if rt.unsubscribe != nil {
+		rt.unsubscribe()
+	}
+	if rt.stopWatchDone != nil {
+		close(rt.stopWatchDone)
+	}
+}
 
-	ackEvents := make(chan int64, 128)
-	handoffAckEvents := make(chan int64, 16)
-	ackErrCh := make(chan error, 1)
+func (rt *externalHandoffDERPSendRuntime) startStopWatcher() {
+	if rt.stop == nil {
+		return
+	}
+	rt.stopWatchDone = make(chan struct{})
 	go func() {
-		for {
-			pkt, err := receiveSubscribedPacket(ctx, ackPackets)
-			if err != nil {
-				ackErrCh <- err
+		select {
+		case <-rt.stop:
+			select {
+			case <-rt.stopWatchDone:
 				return
+			default:
 			}
-			watermark, err := externalRelayPrefixDERPDecodeAck(pkt.Payload)
-			if err != nil {
-				ackErrCh <- err
-				return
-			}
-			if err := spool.AckTo(watermark); err != nil {
-				ackErrCh <- err
-				return
-			}
-			kind := externalRelayPrefixDERPFrameKindOf(pkt.Payload)
-			if kind == externalRelayPrefixDERPFrameHandoffAck {
-				externalTransferTracef("sender-derp-prefix-handoff-ack watermark=%d", watermark)
-				select {
-				case handoffAckEvents <- watermark:
-				default:
-				}
-			} else {
-				externalTransferTracef("sender-derp-prefix-ack watermark=%d", watermark)
-				select {
-				case ackEvents <- watermark:
-				default:
-				}
-			}
-			if spool.Done() {
-				ackErrCh <- nil
-				return
-			}
+			rt.spool.InterruptPendingRead()
+		case <-rt.stopWatchDone:
 		}
 	}()
+}
 
-	waitForAnyAck := func() error {
-		select {
-		case err := <-ackErrCh:
-			return err
-		case <-ackEvents:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
+func (rt *externalHandoffDERPSendRuntime) startAckReader() {
+	ackPackets, unsubscribe := rt.client.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		kind := externalRelayPrefixDERPFrameKindOf(pkt.Payload)
+		return pkt.From == rt.peerDERP && (kind == externalRelayPrefixDERPFrameAck || kind == externalRelayPrefixDERPFrameHandoffAck)
+	})
+	rt.unsubscribe = unsubscribe
+	go rt.readAcks(ackPackets)
+}
 
-	drainAckEvents := func() {
-		for {
-			select {
-			case <-ackEvents:
-			case <-handoffAckEvents:
-			default:
-				return
-			}
-		}
-	}
-
-	waitForHandoffAck := func(boundary int64) error {
-		timer := time.NewTimer(externalRelayPrefixDERPHandoffAckWait)
-		defer timer.Stop()
-		for {
-			if spool.AckedWatermark() >= boundary {
-				return nil
-			}
-			select {
-			case err := <-ackErrCh:
-				return err
-			case <-handoffAckEvents:
-				return nil
-			case <-ackEvents:
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-timer.C:
-				return ErrPeerDisconnected
-			}
-		}
-	}
-
-	sendHandoffAndWaitForAck := func(boundary int64) error {
-		drainAckEvents()
-		if err := externalRelayPrefixDERPSendHandoff(ctx, client, peerDERP, boundary); err != nil {
-			return err
-		}
-		if spool.AckedWatermark() >= boundary {
-			return nil
-		}
-		return waitForHandoffAck(boundary)
-	}
-
-	waitForCompleteAck := func() error {
-		for {
-			if spool.Done() {
-				return nil
-			}
-			if err := waitForAnyAck(); err != nil {
-				return err
-			}
-		}
-	}
-
-	handoffBoundary := func() (int64, bool) {
-		snapshot := spool.Snapshot()
-		return snapshot.ReadOffset, snapshot.ReadOffset > 0
-	}
-
+func (rt *externalHandoffDERPSendRuntime) readAcks(ackPackets <-chan derpbind.Packet) {
 	for {
-		if stop != nil {
-			select {
-			case <-stop:
-				if !spool.Done() {
-					if boundary, ready := handoffBoundary(); ready {
-						externalTransferTracef("sender-derp-prefix-handoff-fast boundary=%d acked=%d", boundary, spool.AckedWatermark())
-						return sendHandoffAndWaitForAck(boundary)
-					}
-				} else {
-					return nil
-				}
-			default:
-			}
+		pkt, err := receiveSubscribedPacket(rt.ctx, ackPackets)
+		if err != nil {
+			rt.ackErrCh <- err
+			return
 		}
-		if err := externalDirectUDPHandoffRelayPauseWait(ctx, stop); err != nil {
+		if err := rt.handleAckPacket(pkt.Payload); err != nil {
+			rt.ackErrCh <- err
+			return
+		}
+		if rt.spool.Done() {
+			rt.ackErrCh <- nil
+			return
+		}
+	}
+}
+
+func (rt *externalHandoffDERPSendRuntime) handleAckPacket(payload []byte) error {
+	watermark, err := externalRelayPrefixDERPDecodeAck(payload)
+	if err != nil {
+		return err
+	}
+	if err := rt.spool.AckTo(watermark); err != nil {
+		return err
+	}
+	kind := externalRelayPrefixDERPFrameKindOf(payload)
+	if kind == externalRelayPrefixDERPFrameHandoffAck {
+		externalTransferTracef("sender-derp-prefix-handoff-ack watermark=%d", watermark)
+		externalRelayPrefixOfferAck(rt.handoffAckEvents, watermark)
+		return nil
+	}
+	externalTransferTracef("sender-derp-prefix-ack watermark=%d", watermark)
+	externalRelayPrefixOfferAck(rt.ackEvents, watermark)
+	return nil
+}
+
+func externalRelayPrefixOfferAck(events chan<- int64, watermark int64) {
+	select {
+	case events <- watermark:
+	default:
+	}
+}
+
+func (rt *externalHandoffDERPSendRuntime) run() error {
+	for {
+		done, err := rt.handleStopBeforeRead()
+		if done || err != nil {
 			return err
 		}
-
-		if spool.Snapshot().ReadOffset >= externalRelayPrefixDERPStartupBytes {
-			spool.SetMaxUnacked(externalRelayPrefixDERPSustainedMax)
+		if err := externalDirectUDPHandoffRelayPauseWait(rt.ctx, rt.stop); err != nil {
+			return err
 		}
-
-		chunk, err := spool.NextChunk()
-		switch {
-		case err == nil:
-			externalTransferTracef("sender-derp-prefix-data offset=%d bytes=%d", chunk.Offset, len(chunk.Payload))
-			if err := externalRelayPrefixDERPSendChunk(ctx, client, peerDERP, chunk, packetAEAD); err != nil {
-				return err
-			}
-			if metrics != nil {
-				metrics.RecordRelayWrite(int64(len(chunk.Payload)), time.Now())
-			}
-		case errors.Is(err, io.EOF):
-			finalOffset := spool.Snapshot().SourceOffset
-			externalTransferTracef("sender-derp-prefix-eof final=%d acked=%d", finalOffset, spool.AckedWatermark())
-			if err := externalRelayPrefixDERPSendEOF(ctx, client, peerDERP, finalOffset); err != nil {
-				return err
-			}
-			return waitForCompleteAck()
-		case errors.Is(err, errExternalHandoffUnackedWindowFull), errors.Is(err, errExternalHandoffSourcePending):
-			select {
-			case <-stop:
-				if !spool.Done() {
-					if boundary, ready := handoffBoundary(); ready {
-						externalTransferTracef("sender-derp-prefix-handoff boundary=%d acked=%d", boundary, spool.AckedWatermark())
-						return sendHandoffAndWaitForAck(boundary)
-					}
-					continue
-				}
-				return nil
-			case err := <-ackErrCh:
-				return err
-			case <-ackEvents:
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(time.Millisecond):
-			}
-		default:
+		rt.raiseSustainedWindowIfReady()
+		done, err = rt.sendNextChunk()
+		if done || err != nil {
 			return err
 		}
 	}
 }
 
-func receiveExternalHandoffDERP(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, rx *externalHandoffReceiver, packets <-chan derpbind.Packet, metrics *externalTransferMetrics, packetAEAD cipher.AEAD) error {
-	externalTransferTracef("listener-derp-prefix-start")
-	if client == nil {
-		return errors.New("nil DERP client")
-	}
-	if rx == nil {
-		return errors.New("nil external handoff receiver")
-	}
-
-	if packets == nil {
-		var unsubscribe func()
-		packets, unsubscribe = client.SubscribeLossless(func(pkt derpbind.Packet) bool {
-			return pkt.From == peerDERP && externalRelayPrefixDERPFrameKindOf(pkt.Payload) != 0
-		})
-		defer unsubscribe()
-	}
-
-	eofOffset := int64(-1)
-	finishIfBoundaryReached := func() (bool, error) {
-		watermark := rx.Watermark()
-		if eofOffset >= 0 && watermark >= eofOffset {
-			if err := externalRelayPrefixDERPSendAck(ctx, client, peerDERP, watermark); err != nil {
-				return false, err
-			}
-			return true, nil
-		}
+func (rt *externalHandoffDERPSendRuntime) handleStopBeforeRead() (bool, error) {
+	if rt.stop == nil {
 		return false, nil
 	}
+	select {
+	case <-rt.stop:
+		return rt.finishOnStop("sender-derp-prefix-handoff-fast")
+	default:
+		return false, nil
+	}
+}
 
+func (rt *externalHandoffDERPSendRuntime) finishOnStop(traceName string) (bool, error) {
+	if rt.spool.Done() {
+		return true, nil
+	}
+	boundary, ready := rt.handoffBoundary()
+	if !ready {
+		return false, nil
+	}
+	externalTransferTracef("%s boundary=%d acked=%d", traceName, boundary, rt.spool.AckedWatermark())
+	return true, rt.sendHandoffAndWaitForAck(boundary)
+}
+
+func (rt *externalHandoffDERPSendRuntime) raiseSustainedWindowIfReady() {
+	if rt.spool.Snapshot().ReadOffset >= externalRelayPrefixDERPStartupBytes {
+		rt.spool.SetMaxUnacked(externalRelayPrefixDERPSustainedMax)
+	}
+}
+
+func (rt *externalHandoffDERPSendRuntime) sendNextChunk() (bool, error) {
+	chunk, err := rt.spool.NextChunk()
+	switch {
+	case err == nil:
+		return false, rt.sendChunk(chunk)
+	case errors.Is(err, io.EOF):
+		return true, rt.sendEOFAndWait()
+	case externalHandoffDERPShouldWaitForBackpressure(err):
+		return rt.waitForBackpressure()
+	default:
+		return true, err
+	}
+}
+
+func externalHandoffDERPShouldWaitForBackpressure(err error) bool {
+	return errors.Is(err, errExternalHandoffUnackedWindowFull) || errors.Is(err, errExternalHandoffSourcePending)
+}
+
+func (rt *externalHandoffDERPSendRuntime) sendChunk(chunk externalHandoffChunk) error {
+	externalTransferTracef("sender-derp-prefix-data offset=%d bytes=%d", chunk.Offset, len(chunk.Payload))
+	if err := externalRelayPrefixDERPSendChunk(rt.ctx, rt.client, rt.peerDERP, chunk, rt.packetAEAD); err != nil {
+		return err
+	}
+	if rt.metrics != nil {
+		rt.metrics.RecordRelayWrite(int64(len(chunk.Payload)), time.Now())
+	}
+	return nil
+}
+
+func (rt *externalHandoffDERPSendRuntime) sendEOFAndWait() error {
+	finalOffset := rt.spool.Snapshot().SourceOffset
+	externalTransferTracef("sender-derp-prefix-eof final=%d acked=%d", finalOffset, rt.spool.AckedWatermark())
+	if err := externalRelayPrefixDERPSendEOF(rt.ctx, rt.client, rt.peerDERP, finalOffset); err != nil {
+		return err
+	}
+	return rt.waitForCompleteAck()
+}
+
+func (rt *externalHandoffDERPSendRuntime) waitForBackpressure() (bool, error) {
+	timer := time.NewTimer(time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-rt.stop:
+		return rt.finishOnStop("sender-derp-prefix-handoff")
+	case err := <-rt.ackErrCh:
+		return true, err
+	case <-rt.ackEvents:
+		return false, nil
+	case <-rt.ctx.Done():
+		return true, rt.ctx.Err()
+	case <-timer.C:
+		return false, nil
+	}
+}
+
+func (rt *externalHandoffDERPSendRuntime) waitForAnyAck() error {
+	select {
+	case err := <-rt.ackErrCh:
+		return err
+	case <-rt.ackEvents:
+		return nil
+	case <-rt.ctx.Done():
+		return rt.ctx.Err()
+	}
+}
+
+func (rt *externalHandoffDERPSendRuntime) drainAckEvents() {
 	for {
-		pkt, err := receiveSubscribedPacket(ctx, packets)
+		select {
+		case <-rt.ackEvents:
+		case <-rt.handoffAckEvents:
+		default:
+			return
+		}
+	}
+}
+
+func (rt *externalHandoffDERPSendRuntime) waitForHandoffAck(boundary int64) error {
+	timer := time.NewTimer(externalRelayPrefixDERPHandoffAckWait)
+	defer timer.Stop()
+	for {
+		if rt.spool.AckedWatermark() >= boundary {
+			return nil
+		}
+		select {
+		case err := <-rt.ackErrCh:
+			return err
+		case <-rt.handoffAckEvents:
+			return nil
+		case <-rt.ackEvents:
+		case <-rt.ctx.Done():
+			return rt.ctx.Err()
+		case <-timer.C:
+			return ErrPeerDisconnected
+		}
+	}
+}
+
+func (rt *externalHandoffDERPSendRuntime) sendHandoffAndWaitForAck(boundary int64) error {
+	rt.drainAckEvents()
+	if err := externalRelayPrefixDERPSendHandoff(rt.ctx, rt.client, rt.peerDERP, boundary); err != nil {
+		return err
+	}
+	if rt.spool.AckedWatermark() >= boundary {
+		return nil
+	}
+	return rt.waitForHandoffAck(boundary)
+}
+
+func (rt *externalHandoffDERPSendRuntime) waitForCompleteAck() error {
+	for {
+		if rt.spool.Done() {
+			return nil
+		}
+		if err := rt.waitForAnyAck(); err != nil {
+			return err
+		}
+	}
+}
+
+func (rt *externalHandoffDERPSendRuntime) handoffBoundary() (int64, bool) {
+	snapshot := rt.spool.Snapshot()
+	return snapshot.ReadOffset, snapshot.ReadOffset > 0
+}
+
+func receiveExternalHandoffDERP(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, rx *externalHandoffReceiver, packets <-chan derpbind.Packet, metrics *externalTransferMetrics, packetAEAD cipher.AEAD) error {
+	externalTransferTracef("listener-derp-prefix-start")
+	rt, err := newExternalHandoffDERPReceiveRuntime(ctx, client, peerDERP, rx, packets, metrics, packetAEAD)
+	if err != nil {
+		return err
+	}
+	defer rt.Close()
+	return rt.run()
+}
+
+type externalHandoffDERPReceiveRuntime struct {
+	ctx         context.Context
+	client      *derpbind.Client
+	peerDERP    key.NodePublic
+	rx          *externalHandoffReceiver
+	packets     <-chan derpbind.Packet
+	metrics     *externalTransferMetrics
+	packetAEAD  cipher.AEAD
+	eofOffset   int64
+	unsubscribe func()
+}
+
+func newExternalHandoffDERPReceiveRuntime(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, rx *externalHandoffReceiver, packets <-chan derpbind.Packet, metrics *externalTransferMetrics, packetAEAD cipher.AEAD) (*externalHandoffDERPReceiveRuntime, error) {
+	if client == nil {
+		return nil, errors.New("nil DERP client")
+	}
+	if rx == nil {
+		return nil, errors.New("nil external handoff receiver")
+	}
+	rt := &externalHandoffDERPReceiveRuntime{
+		ctx:        ctx,
+		client:     client,
+		peerDERP:   peerDERP,
+		rx:         rx,
+		packets:    packets,
+		metrics:    metrics,
+		packetAEAD: packetAEAD,
+		eofOffset:  -1,
+	}
+	rt.ensureSubscription()
+	return rt, nil
+}
+
+func (rt *externalHandoffDERPReceiveRuntime) ensureSubscription() {
+	if rt.packets != nil {
+		return
+	}
+	packets, unsubscribe := rt.client.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == rt.peerDERP && externalRelayPrefixDERPFrameKindOf(pkt.Payload) != 0
+	})
+	rt.packets = packets
+	rt.unsubscribe = unsubscribe
+}
+
+func (rt *externalHandoffDERPReceiveRuntime) Close() {
+	if rt.unsubscribe != nil {
+		rt.unsubscribe()
+	}
+}
+
+func (rt *externalHandoffDERPReceiveRuntime) run() error {
+	for {
+		pkt, err := receiveSubscribedPacket(rt.ctx, rt.packets)
 		if err != nil {
 			return err
 		}
-		kind := externalRelayPrefixDERPFrameKindOf(pkt.Payload)
-		externalTransferTracef("listener-derp-prefix-frame kind=%d bytes=%d watermark=%d", kind, len(pkt.Payload), rx.Watermark())
-		switch kind {
-		case externalRelayPrefixDERPFrameData:
-			chunk, err := externalRelayPrefixDERPDecodeChunk(pkt.Payload, packetAEAD)
-			if err != nil {
-				return err
-			}
-			prevWatermark := rx.Watermark()
-			if err := rx.AcceptChunk(chunk); err != nil {
-				return err
-			}
-			if metrics != nil {
-				if delivered := rx.Watermark() - prevWatermark; delivered > 0 {
-					metrics.RecordRelayWrite(delivered, time.Now())
-				}
-			}
-			if err := externalRelayPrefixDERPSendAck(ctx, client, peerDERP, rx.Watermark()); err != nil {
-				return err
-			}
-			done, err := finishIfBoundaryReached()
-			if done || err != nil {
-				return err
-			}
-		case externalRelayPrefixDERPFrameEOF:
-			offset, err := externalRelayPrefixDERPDecodeOffset(pkt.Payload)
-			if err != nil {
-				return err
-			}
-			eofOffset = offset
-			done, err := finishIfBoundaryReached()
-			if done || err != nil {
-				return err
-			}
-		case externalRelayPrefixDERPFrameHandoff:
-			offset, err := externalRelayPrefixDERPDecodeOffset(pkt.Payload)
-			if err != nil {
-				return err
-			}
-			externalTransferTracef("listener-derp-prefix-handoff boundary=%d watermark=%d", offset, rx.Watermark())
-			if err := externalRelayPrefixDERPSendHandoffAck(ctx, client, peerDERP, rx.Watermark()); err != nil {
-				return err
-			}
-			return errExternalHandoffCarrierHandoff
-		case externalRelayPrefixDERPFrameAck:
-			continue
-		default:
-			return errors.New("unexpected relay-prefix DERP frame")
+		if done, err := rt.handlePacket(pkt.Payload); done || err != nil {
+			return err
 		}
 	}
+}
+
+func (rt *externalHandoffDERPReceiveRuntime) handlePacket(payload []byte) (bool, error) {
+	kind := externalRelayPrefixDERPFrameKindOf(payload)
+	externalTransferTracef("listener-derp-prefix-frame kind=%d bytes=%d watermark=%d", kind, len(payload), rt.rx.Watermark())
+	switch kind {
+	case externalRelayPrefixDERPFrameData:
+		return rt.handleData(payload)
+	case externalRelayPrefixDERPFrameEOF:
+		return rt.handleEOF(payload)
+	case externalRelayPrefixDERPFrameHandoff:
+		return true, rt.handleHandoff(payload)
+	case externalRelayPrefixDERPFrameAck:
+		return false, nil
+	default:
+		return true, errors.New("unexpected relay-prefix DERP frame")
+	}
+}
+
+func (rt *externalHandoffDERPReceiveRuntime) handleData(payload []byte) (bool, error) {
+	chunk, err := externalRelayPrefixDERPDecodeChunk(payload, rt.packetAEAD)
+	if err != nil {
+		return true, err
+	}
+	prevWatermark := rt.rx.Watermark()
+	if err := rt.rx.AcceptChunk(chunk); err != nil {
+		return true, err
+	}
+	rt.recordRelayDelivery(prevWatermark)
+	if err := externalRelayPrefixDERPSendAck(rt.ctx, rt.client, rt.peerDERP, rt.rx.Watermark()); err != nil {
+		return true, err
+	}
+	return rt.finishIfBoundaryReached()
+}
+
+func (rt *externalHandoffDERPReceiveRuntime) recordRelayDelivery(prevWatermark int64) {
+	if rt.metrics == nil {
+		return
+	}
+	if delivered := rt.rx.Watermark() - prevWatermark; delivered > 0 {
+		rt.metrics.RecordRelayWrite(delivered, time.Now())
+	}
+}
+
+func (rt *externalHandoffDERPReceiveRuntime) handleEOF(payload []byte) (bool, error) {
+	offset, err := externalRelayPrefixDERPDecodeOffset(payload)
+	if err != nil {
+		return true, err
+	}
+	rt.eofOffset = offset
+	return rt.finishIfBoundaryReached()
+}
+
+func (rt *externalHandoffDERPReceiveRuntime) handleHandoff(payload []byte) error {
+	offset, err := externalRelayPrefixDERPDecodeOffset(payload)
+	if err != nil {
+		return err
+	}
+	externalTransferTracef("listener-derp-prefix-handoff boundary=%d watermark=%d", offset, rt.rx.Watermark())
+	if err := externalRelayPrefixDERPSendHandoffAck(rt.ctx, rt.client, rt.peerDERP, rt.rx.Watermark()); err != nil {
+		return err
+	}
+	return errExternalHandoffCarrierHandoff
+}
+
+func (rt *externalHandoffDERPReceiveRuntime) finishIfBoundaryReached() (bool, error) {
+	watermark := rt.rx.Watermark()
+	if rt.eofOffset < 0 || watermark < rt.eofOffset {
+		return false, nil
+	}
+	if err := externalRelayPrefixDERPSendAck(rt.ctx, rt.client, rt.peerDERP, watermark); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func externalRelayPrefixDERPFrameKindOf(payload []byte) externalRelayPrefixDERPFrameKind {
@@ -2339,14 +3307,7 @@ func externalDirectUDPConns(_ net.PacketConn, _ publicPortmap, parallel int, emi
 	for len(conns) < parallel {
 		conn, err := net.ListenPacket(network, address)
 		if err != nil {
-			for _, ownedConn := range owned {
-				_ = ownedConn.Close()
-			}
-			for _, pm := range ownedPMs {
-				if pm != nil {
-					_ = pm.Close()
-				}
-			}
+			externalDirectUDPCloseOwned(owned, ownedPMs)
 			return nil, nil, nil, err
 		}
 		externalDirectUDPPreviewTransportCaps(conn, externalDirectUDPTransportLabel)
@@ -2367,6 +3328,17 @@ func externalDirectUDPConns(_ net.PacketConn, _ publicPortmap, parallel int, emi
 		}
 	}
 	return conns, portmaps, cleanup, nil
+}
+
+func externalDirectUDPCloseOwned(conns []net.PacketConn, portmaps []publicPortmap) {
+	for _, pm := range portmaps {
+		if pm != nil {
+			_ = pm.Close()
+		}
+	}
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
 }
 
 func externalAcceptedDirectUDPSet(baseConn net.PacketConn, basePM publicPortmap, emitter *telemetry.Emitter) (net.PacketConn, []net.PacketConn, []publicPortmap, func(), error) {
@@ -2492,50 +3464,50 @@ func externalDirectUDPHasGlobalCandidate(sets [][]string) bool {
 }
 
 func externalDirectUDPInferWANPerPort(sets [][]string) [][]string {
-	var wan netip.Addr
-	for _, candidates := range sets {
-		for _, candidate := range candidates {
-			addrPort, err := netip.ParseAddrPort(candidate)
-			if err != nil {
-				continue
-			}
-			if externalDirectUDPCandidateRank(candidate) == 0 {
-				wan = addrPort.Addr()
-				break
-			}
-		}
-		if wan.IsValid() {
-			break
-		}
-	}
-	if !wan.IsValid() {
+	wan, ok := externalDirectUDPFirstWANCandidateAddr(sets)
+	if !ok {
 		return sets
 	}
 	out := make([][]string, len(sets))
 	for i, candidates := range sets {
 		out[i] = append([]string(nil), candidates...)
-		hasWAN := false
-		var port uint16
-		for _, candidate := range candidates {
-			addrPort, err := netip.ParseAddrPort(candidate)
-			if err != nil {
-				continue
-			}
-			if externalDirectUDPCandidateRank(candidate) == 0 {
-				hasWAN = true
-				break
-			}
-			if port == 0 && addrPort.Addr().IsPrivate() {
-				port = addrPort.Port()
-			}
-		}
-		if hasWAN || port == 0 {
+		port, ok := externalDirectUDPPrivatePortForWANInference(candidates)
+		if !ok {
 			continue
 		}
 		inferred := netip.AddrPortFrom(wan, port).String()
 		out[i] = append([]string{inferred}, out[i]...)
 	}
 	return out
+}
+
+func externalDirectUDPFirstWANCandidateAddr(sets [][]string) (netip.Addr, bool) {
+	for _, candidates := range sets {
+		for _, candidate := range candidates {
+			addrPort, ok := externalDirectUDPParsedCandidateAddrPort(candidate)
+			if ok && externalDirectUDPCandidateRank(candidate) == 0 {
+				return addrPort.Addr(), true
+			}
+		}
+	}
+	return netip.Addr{}, false
+}
+
+func externalDirectUDPPrivatePortForWANInference(candidates []string) (uint16, bool) {
+	var port uint16
+	for _, candidate := range candidates {
+		addrPort, ok := externalDirectUDPParsedCandidateAddrPort(candidate)
+		if !ok {
+			continue
+		}
+		if externalDirectUDPCandidateRank(candidate) == 0 {
+			return 0, false
+		}
+		if port == 0 && addrPort.Addr().IsPrivate() {
+			port = addrPort.Port()
+		}
+	}
+	return port, port != 0
 }
 
 func externalDirectUDPStartPunching(ctx context.Context, conns []net.PacketConn, remoteCandidates []net.Addr) {
@@ -2680,22 +3652,39 @@ func externalDirectUDPParallelCandidateStringsForPeer(candidates []net.Addr, par
 	if parallel <= 0 {
 		parallel = 1
 	}
-	ordered := probe.CandidateStringsInOrder(candidates)
-	if peerAddr, ok := externalDirectUDPAddrPort(peer); ok {
-		peerCandidate := peerAddr.String()
-		if !slices.Contains(ordered, peerCandidate) {
-			ordered = append(ordered, peerCandidate)
-		}
-	}
+	ordered := externalDirectUDPOrderedCandidateStringsForPeer(candidates, peer)
+	out, seen := externalDirectUDPAppendUniqueEndpointCandidates(nil, ordered, parallel)
+	out, _ = externalDirectUDPAppendUniqueCandidates(out, seen, ordered, parallel)
+	return out
+}
+
+func externalDirectUDPOrderedCandidateStringsForPeer(candidates []net.Addr, peer net.Addr) []string {
+	ordered := externalDirectUDPAppendPeerCandidate(probe.CandidateStringsInOrder(candidates), peer)
 	if fakeTransportEnabled() {
-		ordered = externalDirectUDPPreferLoopbackStrings(ordered)
-	} else {
-		ordered = externalDirectUDPPreferPeerAddrStrings(ordered, peer)
+		return externalDirectUDPPreferLoopbackStrings(ordered)
 	}
-	out := make([]string, 0, parallel)
+	return externalDirectUDPPreferPeerAddrStrings(ordered, peer)
+}
+
+func externalDirectUDPAppendPeerCandidate(ordered []string, peer net.Addr) []string {
+	peerAddr, ok := externalDirectUDPAddrPort(peer)
+	if !ok {
+		return ordered
+	}
+	peerCandidate := peerAddr.String()
+	if slices.Contains(ordered, peerCandidate) {
+		return ordered
+	}
+	return append(ordered, peerCandidate)
+}
+
+func externalDirectUDPAppendUniqueEndpointCandidates(out []string, candidates []string, limit int) ([]string, map[string]bool) {
 	seen := make(map[string]bool)
 	seenEndpoint := make(map[string]bool)
-	for _, candidate := range ordered {
+	if len(out) >= limit {
+		return out, seen
+	}
+	for _, candidate := range candidates {
 		endpoint := externalDirectUDPEndpointKey(candidate)
 		if candidate == "" || seen[candidate] || seenEndpoint[endpoint] {
 			continue
@@ -2703,21 +3692,28 @@ func externalDirectUDPParallelCandidateStringsForPeer(candidates []net.Addr, par
 		out = append(out, candidate)
 		seen[candidate] = true
 		seenEndpoint[endpoint] = true
-		if len(out) == parallel {
-			return out
+		if len(out) >= limit {
+			return out, seen
 		}
 	}
-	for _, candidate := range ordered {
+	return out, seen
+}
+
+func externalDirectUDPAppendUniqueCandidates(out []string, seen map[string]bool, candidates []string, limit int) ([]string, map[string]bool) {
+	if len(out) >= limit {
+		return out, seen
+	}
+	for _, candidate := range candidates {
 		if candidate == "" || seen[candidate] {
 			continue
 		}
 		out = append(out, candidate)
 		seen[candidate] = true
-		if len(out) == parallel {
-			return out
+		if len(out) >= limit {
+			return out, seen
 		}
 	}
-	return out
+	return out, seen
 }
 
 func externalDirectUDPPreferPeerAddrStrings(candidates []string, peer net.Addr) []string {
@@ -2822,11 +3818,26 @@ func externalDirectUDPBetterCandidate(candidate string, existing string) bool {
 }
 
 func externalDirectUDPCandidateRank(candidate string) int {
-	addrPort, err := netip.ParseAddrPort(candidate)
-	if err != nil {
+	addrPort, ok := externalDirectUDPParsedCandidateAddrPort(candidate)
+	if !ok {
 		return 6
 	}
+	return externalDirectUDPAddrCandidateRank(addrPort.Addr())
+}
+
+func externalDirectUDPParsedCandidateAddrPort(candidate string) (netip.AddrPort, bool) {
+	addrPort, err := netip.ParseAddrPort(candidate)
+	if err != nil {
+		return netip.AddrPort{}, false
+	}
 	addr := addrPort.Addr()
+	if !addr.IsValid() || addr.IsUnspecified() {
+		return netip.AddrPort{}, false
+	}
+	return addrPort, true
+}
+
+func externalDirectUDPAddrCandidateRank(addr netip.Addr) int {
 	if !addr.IsValid() || addr.IsUnspecified() {
 		return 6
 	}
@@ -2925,28 +3936,33 @@ func externalDirectUDPRateProbeRates(maxRateMbps int, totalBytes int64) []int {
 	if totalBytes >= 0 && totalBytes < externalDirectUDPRateProbeMinBytes {
 		return nil
 	}
-	probeMaxMbps := maxRateMbps
-	if probeMaxMbps > externalDirectUDPRateProbeDefaultMaxMbps {
-		probeMaxMbps = externalDirectUDPRateProbeDefaultMaxMbps
-	}
+	probeMaxMbps := externalDirectUDPProbeMaxRateMbps(maxRateMbps)
 	bases := []int{8, 25, 75, 150, 350, 700, 1000, 1200, 1800, 2000, 2250}
 	out := make([]int, 0, len(bases))
 	seen := make(map[int]bool)
 	for _, rate := range bases {
-		if rate < externalDirectUDPRateProbeMinMbps || rate > probeMaxMbps || seen[rate] {
-			continue
-		}
-		out = append(out, rate)
-		seen[rate] = true
+		out = externalDirectUDPAppendProbeRate(out, seen, rate, probeMaxMbps)
 	}
-	if probeMaxMbps >= externalDirectUDPRateProbeMinMbps && !seen[probeMaxMbps] {
-		out = append(out, probeMaxMbps)
-		seen[probeMaxMbps] = true
-	}
+	out = externalDirectUDPAppendProbeRate(out, seen, probeMaxMbps, probeMaxMbps)
 	if len(out) == 0 {
 		out = append(out, probeMaxMbps)
 	}
 	return out
+}
+
+func externalDirectUDPProbeMaxRateMbps(maxRateMbps int) int {
+	if maxRateMbps > externalDirectUDPRateProbeDefaultMaxMbps {
+		return externalDirectUDPRateProbeDefaultMaxMbps
+	}
+	return maxRateMbps
+}
+
+func externalDirectUDPAppendProbeRate(out []int, seen map[int]bool, rate int, probeMaxMbps int) []int {
+	if rate < externalDirectUDPRateProbeMinMbps || rate > probeMaxMbps || seen[rate] {
+		return out
+	}
+	seen[rate] = true
+	return append(out, rate)
 }
 
 func externalDirectUDPStreamStart(maxRateMbps int, totalBytes int64) directUDPStart {
@@ -3044,6 +4060,23 @@ func externalDirectUDPSendRateProbesParallel(ctx context.Context, conns []net.Pa
 	if len(rates) == 0 {
 		return nil, nil
 	}
+	sender, err := newExternalDirectUDPRateProbeSender(ctx, conns, remoteAddrs, rates, auth)
+	if err != nil {
+		return nil, err
+	}
+	return sender.run()
+}
+
+type externalDirectUDPRateProbeSender struct {
+	ctx     context.Context
+	conns   []net.PacketConn
+	remotes []*net.UDPAddr
+	rates   []int
+	auth    externalDirectUDPRateProbeAuth
+	samples []directUDPRateProbeSample
+}
+
+func newExternalDirectUDPRateProbeSender(ctx context.Context, conns []net.PacketConn, remoteAddrs []string, rates []int, auth externalDirectUDPRateProbeAuth) (*externalDirectUDPRateProbeSender, error) {
 	if !auth.enabled() {
 		return nil, errors.New("rate probe auth missing")
 	}
@@ -3053,6 +4086,21 @@ func externalDirectUDPSendRateProbesParallel(ctx context.Context, conns []net.Pa
 	if len(conns) != len(remoteAddrs) {
 		return nil, errors.New("rate probe conns and addrs length mismatch")
 	}
+	remotes, err := externalDirectUDPRateProbeResolveRemotes(conns, remoteAddrs)
+	if err != nil {
+		return nil, err
+	}
+	return &externalDirectUDPRateProbeSender{
+		ctx:     ctx,
+		conns:   conns,
+		remotes: remotes,
+		rates:   rates,
+		auth:    auth,
+		samples: make([]directUDPRateProbeSample, len(rates)),
+	}, nil
+}
+
+func externalDirectUDPRateProbeResolveRemotes(conns []net.PacketConn, remoteAddrs []string) ([]*net.UDPAddr, error) {
 	remotes := make([]*net.UDPAddr, len(remoteAddrs))
 	for i, conn := range conns {
 		if conn == nil {
@@ -3067,100 +4115,166 @@ func externalDirectUDPSendRateProbesParallel(ctx context.Context, conns []net.Pa
 		}
 		remotes[i] = remote
 	}
-	samples := make([]directUDPRateProbeSample, len(rates))
-	for i, rate := range rates {
-		if rate <= 0 {
-			return nil, fmt.Errorf("invalid rate probe rate %d", rate)
+	return remotes, nil
+}
+
+func (s *externalDirectUDPRateProbeSender) run() ([]directUDPRateProbeSample, error) {
+	for i, rate := range s.rates {
+		if err := s.sendTier(i, rate); err != nil {
+			return s.samples, err
 		}
-		payload, err := externalDirectUDPRateProbePayload(i, externalDirectUDPChunkSize, auth)
-		if err != nil {
-			return samples, err
-		}
-		samples[i].RateMbps = rate
-		duration := externalDirectUDPRateProbeDurationForRate(rate)
-		samples[i].DurationMillis = duration.Milliseconds()
-		tierStart := time.Now()
-		deadline := tierStart.Add(duration)
-		activeLanes := externalDirectUDPRateProbeActiveLanes(rate, len(conns))
-		laneRate := externalDirectUDPPerLaneRateMbps(rate, activeLanes)
-		sentByLane := make([]int64, len(conns))
-		errCh := make(chan error, activeLanes)
-		tierCtx, cancel := context.WithCancel(ctx)
-		var wg sync.WaitGroup
-		for lane := 0; lane < activeLanes; lane++ {
-			wg.Add(1)
-			go func(lane int) {
-				defer wg.Done()
-				var sent int64
-				defer func() {
-					sentByLane[lane] = sent
-				}()
-				for time.Now().Before(deadline) {
-					if err := tierCtx.Err(); err != nil {
-						if errors.Is(err, context.Canceled) && ctx.Err() == nil {
-							return
-						}
-						errCh <- err
-						return
-					}
-					n, err := conns[lane].WriteTo(payload, remotes[lane])
-					if err != nil {
-						if errors.Is(err, syscall.ENOBUFS) {
-							if err := sleepWithContext(tierCtx, 250*time.Microsecond); err != nil {
-								if errors.Is(err, context.Canceled) && ctx.Err() == nil {
-									return
-								}
-								errCh <- err
-								cancel()
-								return
-							}
-							continue
-						}
-						errCh <- err
-						cancel()
-						return
-					}
-					sent += int64(n)
-					elapsed := time.Since(tierStart)
-					target := int64(float64(laneRate*1000*1000)/8.0*elapsed.Seconds() + 0.5)
-					if sent <= target {
-						continue
-					}
-					sleepFor := time.Duration(float64(sent-target) * 8.0 / float64(laneRate*1000*1000) * float64(time.Second))
-					if sleepFor <= 0 {
-						continue
-					}
-					if untilDeadline := time.Until(deadline); sleepFor > untilDeadline {
-						sleepFor = untilDeadline
-					}
-					if err := sleepWithContext(tierCtx, sleepFor); err != nil {
-						if errors.Is(err, context.Canceled) && ctx.Err() == nil {
-							return
-						}
-						errCh <- err
-						cancel()
-						return
-					}
-				}
-			}(lane)
-		}
-		wg.Wait()
-		cancel()
-		select {
-		case err := <-errCh:
-			return samples, err
-		default:
-		}
-		var sent int64
-		for _, laneSent := range sentByLane {
-			sent += laneSent
-		}
-		samples[i].BytesSent = sent
-		if i > 0 && i+1 < len(rates) && externalDirectUDPRateProbeShouldStopAfterSent(samples[i-1], samples[i]) {
-			return samples[:i+1], nil
+		if i > 0 && i+1 < len(s.rates) && externalDirectUDPRateProbeShouldStopAfterSent(s.samples[i-1], s.samples[i]) {
+			return s.samples[:i+1], nil
 		}
 	}
-	return samples, nil
+	return s.samples, nil
+}
+
+func (s *externalDirectUDPRateProbeSender) sendTier(index int, rate int) error {
+	if rate <= 0 {
+		return fmt.Errorf("invalid rate probe rate %d", rate)
+	}
+	payload, err := externalDirectUDPRateProbePayload(index, externalDirectUDPChunkSize, s.auth)
+	if err != nil {
+		return err
+	}
+	duration := externalDirectUDPRateProbeDurationForRate(rate)
+	s.samples[index].RateMbps = rate
+	s.samples[index].DurationMillis = duration.Milliseconds()
+	s.samples[index].BytesSent, err = s.sendTierPayload(rate, payload, duration)
+	return err
+}
+
+func (s *externalDirectUDPRateProbeSender) sendTierPayload(rate int, payload []byte, duration time.Duration) (int64, error) {
+	tierStart := time.Now()
+	deadline := tierStart.Add(duration)
+	activeLanes := externalDirectUDPRateProbeActiveLanes(rate, len(s.conns))
+	laneRate := externalDirectUDPPerLaneRateMbps(rate, activeLanes)
+	sentByLane := make([]int64, len(s.conns))
+	errCh := make(chan error, activeLanes)
+	tierCtx, cancel := context.WithCancel(s.ctx)
+	var wg sync.WaitGroup
+	for lane := 0; lane < activeLanes; lane++ {
+		wg.Add(1)
+		go s.sendTierLane(&wg, cancel, errCh, externalDirectUDPRateProbeLaneSend{
+			ctx:        tierCtx,
+			lane:       lane,
+			payload:    payload,
+			deadline:   deadline,
+			tierStart:  tierStart,
+			laneRate:   laneRate,
+			sentByLane: sentByLane,
+		})
+	}
+	wg.Wait()
+	cancel()
+	if err := externalDirectUDPRateProbeFirstErr(errCh); err != nil {
+		return 0, err
+	}
+	return externalDirectUDPSumInt64(sentByLane), nil
+}
+
+type externalDirectUDPRateProbeLaneSend struct {
+	ctx        context.Context
+	lane       int
+	payload    []byte
+	deadline   time.Time
+	tierStart  time.Time
+	laneRate   int
+	sentByLane []int64
+}
+
+func (s *externalDirectUDPRateProbeSender) sendTierLane(wg *sync.WaitGroup, cancel context.CancelFunc, errCh chan<- error, laneSend externalDirectUDPRateProbeLaneSend) {
+	defer wg.Done()
+	sent, err := s.runTierLane(laneSend)
+	laneSend.sentByLane[laneSend.lane] = sent
+	if err == nil {
+		return
+	}
+	errCh <- err
+	cancel()
+}
+
+func (s *externalDirectUDPRateProbeSender) runTierLane(laneSend externalDirectUDPRateProbeLaneSend) (int64, error) {
+	var sent int64
+	for time.Now().Before(laneSend.deadline) {
+		if err := externalDirectUDPRateProbeActiveErr(laneSend.ctx, s.ctx); err != nil {
+			return sent, err
+		}
+		n, err := s.conns[laneSend.lane].WriteTo(laneSend.payload, s.remotes[laneSend.lane])
+		if err != nil {
+			if errors.Is(err, syscall.ENOBUFS) {
+				if err := externalDirectUDPRateProbeSleep(laneSend.ctx, s.ctx, 250*time.Microsecond); err != nil {
+					return sent, err
+				}
+				continue
+			}
+			return sent, err
+		}
+		sent += int64(n)
+		if err := externalDirectUDPRateProbeThrottle(laneSend.ctx, s.ctx, sent, laneSend.laneRate, laneSend.tierStart, laneSend.deadline); err != nil {
+			return sent, err
+		}
+	}
+	return sent, nil
+}
+
+func externalDirectUDPRateProbeActiveErr(tierCtx context.Context, parentCtx context.Context) error {
+	if err := tierCtx.Err(); err != nil {
+		return externalDirectUDPRateProbeContextErr(err, parentCtx)
+	}
+	return nil
+}
+
+func externalDirectUDPRateProbeSleep(tierCtx context.Context, parentCtx context.Context, delay time.Duration) error {
+	return externalDirectUDPRateProbeContextErr(sleepWithContext(tierCtx, delay), parentCtx)
+}
+
+func externalDirectUDPRateProbeContextErr(err error, parentCtx context.Context) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) && parentCtx.Err() == nil {
+		return nil
+	}
+	return err
+}
+
+func externalDirectUDPRateProbeThrottle(tierCtx context.Context, parentCtx context.Context, sent int64, laneRate int, tierStart time.Time, deadline time.Time) error {
+	sleepFor := externalDirectUDPRateProbeThrottleDelay(sent, laneRate, tierStart, deadline)
+	if sleepFor <= 0 {
+		return nil
+	}
+	return externalDirectUDPRateProbeSleep(tierCtx, parentCtx, sleepFor)
+}
+
+func externalDirectUDPRateProbeThrottleDelay(sent int64, laneRate int, tierStart time.Time, deadline time.Time) time.Duration {
+	target := int64(float64(laneRate*1000*1000)/8.0*time.Since(tierStart).Seconds() + 0.5)
+	if sent <= target {
+		return 0
+	}
+	sleepFor := time.Duration(float64(sent-target) * 8.0 / float64(laneRate*1000*1000) * float64(time.Second))
+	if untilDeadline := time.Until(deadline); sleepFor > untilDeadline {
+		return untilDeadline
+	}
+	return sleepFor
+}
+
+func externalDirectUDPRateProbeFirstErr(errCh <-chan error) error {
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return nil
+	}
+}
+
+func externalDirectUDPSumInt64(values []int64) int64 {
+	var total int64
+	for _, value := range values {
+		total += value
+	}
+	return total
 }
 
 func externalDirectUDPRateProbeActiveLanes(rateMbps int, maxLanes int) int {
@@ -3251,35 +4365,7 @@ func externalDirectUDPReceiveRateProbes(ctx context.Context, conns []net.PacketC
 			return samples, err
 		}
 		wg.Add(1)
-		go func(conn net.PacketConn) {
-			defer wg.Done()
-			defer conn.SetReadDeadline(time.Time{})
-			buf := make([]byte, externalDirectUDPChunkSize)
-			for {
-				n, addr, err := conn.ReadFrom(buf)
-				if err != nil {
-					if externalDirectUDPIsNetTimeout(err) {
-						return
-					}
-					if ctx.Err() != nil {
-						errCh <- ctx.Err()
-						return
-					}
-					errCh <- err
-					return
-				}
-				if !externalDirectUDPRateProbeSourceAllowed(addr, allowedSources) {
-					continue
-				}
-				index, ok := externalDirectUDPRateProbeIndex(buf[:n], len(samples), auth)
-				if !ok {
-					continue
-				}
-				mu.Lock()
-				samples[index].BytesReceived += int64(n)
-				mu.Unlock()
-			}
-		}(conn)
+		go externalDirectUDPReceiveRateProbePackets(ctx, conn, allowedSources, samples, &mu, auth, errCh, &wg)
 	}
 	wg.Wait()
 	select {
@@ -3288,6 +4374,44 @@ func externalDirectUDPReceiveRateProbes(ctx context.Context, conns []net.PacketC
 	default:
 	}
 	return samples, nil
+}
+
+func externalDirectUDPReceiveRateProbePackets(ctx context.Context, conn net.PacketConn, allowedSources map[string]struct{}, samples []directUDPRateProbeSample, mu *sync.Mutex, auth externalDirectUDPRateProbeAuth, errCh chan<- error, wg *sync.WaitGroup) {
+	defer wg.Done()
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+	buf := make([]byte, externalDirectUDPChunkSize)
+	for {
+		n, addr, err := conn.ReadFrom(buf)
+		if err != nil {
+			externalDirectUDPReportReceiveRateProbeErr(ctx, err, errCh)
+			return
+		}
+		if !externalDirectUDPRateProbeSourceAllowed(addr, allowedSources) {
+			continue
+		}
+		index, ok := externalDirectUDPRateProbeIndex(buf[:n], len(samples), auth)
+		if !ok {
+			continue
+		}
+		externalDirectUDPRecordRateProbeBytes(samples, index, int64(n), mu)
+	}
+}
+
+func externalDirectUDPReportReceiveRateProbeErr(ctx context.Context, err error, errCh chan<- error) {
+	if externalDirectUDPIsNetTimeout(err) {
+		return
+	}
+	if ctx.Err() != nil {
+		errCh <- ctx.Err()
+		return
+	}
+	errCh <- err
+}
+
+func externalDirectUDPRecordRateProbeBytes(samples []directUDPRateProbeSample, index int, bytesReceived int64, mu *sync.Mutex) {
+	mu.Lock()
+	samples[index].BytesReceived += bytesReceived
+	mu.Unlock()
 }
 
 func externalDirectUDPRateProbeAllowedSources(remoteAddrs []string) (map[string]struct{}, error) {
@@ -3342,354 +4466,446 @@ func externalDirectUDPIsNetTimeout(err error) bool {
 	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
+type externalDirectUDPRateProbeCandidate struct {
+	rate     int
+	goodput  float64
+	delivery float64
+	score    float64
+}
+
+type externalDirectUDPRateProbeSelection struct {
+	candidates          []externalDirectUDPRateProbeCandidate
+	bestRate            int
+	bestGoodput         float64
+	bestScore           float64
+	bestDelivery        float64
+	trimmedLeadingZeros bool
+}
+
 func externalDirectUDPSelectRateFromProbeSamples(maxRateMbps int, sent []directUDPRateProbeSample, received []directUDPRateProbeSample) int {
-	if maxRateMbps <= 0 || len(sent) == 0 || len(received) == 0 {
+	if !externalDirectUDPHasUsableRateProbeInput(maxRateMbps, sent, received) {
 		return 0
 	}
-	if !externalDirectUDPHasPositiveProbeProgress(received) {
-		return 0
-	}
-	sentByRate := make(map[int]directUDPRateProbeSample, len(sent))
-	for _, sample := range sent {
-		sentByRate[sample.RateMbps] = sample
-	}
-	type candidate struct {
-		rate     int
-		goodput  float64
-		delivery float64
-		score    float64
-	}
-	candidates := make([]candidate, 0, len(received))
-	bestRate := 0
-	bestGoodput := 0.0
-	bestScore := 0.0
-	bestDelivery := 0.0
-	for _, sample := range received {
-		durationMillis := sample.DurationMillis
-		if durationMillis <= 0 {
-			durationMillis = externalDirectUDPRateProbeDuration.Milliseconds()
-		}
-		goodput := externalDirectUDPSampleGoodputMbps(sample.BytesReceived, durationMillis)
-		delivery := 0.0
-		if sentSample, ok := sentByRate[sample.RateMbps]; ok && sentSample.BytesSent > 0 {
-			delivery = float64(sample.BytesReceived) / float64(sentSample.BytesSent)
-		}
-		score := goodput
-		if delivery > 0 && delivery < 0.90 {
-			score *= delivery / 0.90
-		}
-		candidates = append(candidates, candidate{
-			rate:     sample.RateMbps,
-			goodput:  goodput,
-			delivery: delivery,
-			score:    score,
-		})
-		if score <= bestScore {
-			continue
-		}
-		bestScore = score
-		bestGoodput = goodput
-		bestRate = sample.RateMbps
-		bestDelivery = delivery
-	}
-	if bestRate <= 0 || bestGoodput <= 0 {
+	selection := externalDirectUDPBuildRateProbeSelection(sent, received)
+	if selection.bestRate <= 0 || selection.bestGoodput <= 0 {
 		return maxRateMbps
 	}
-	trimmedLeadingZeroCandidates := false
-	for len(candidates) > 0 && candidates[0].goodput <= 0 && candidates[0].delivery <= 0 {
-		trimmedLeadingZeroCandidates = true
-		candidates = candidates[1:]
-	}
-	if len(candidates) == 0 {
+	selection.trimLeadingZeros()
+	if len(selection.candidates) == 0 {
 		return 0
 	}
 	if conservativeRate, ok := externalDirectUDPProbeConservativeRampCap(sent, received); ok {
 		return conservativeRate
 	}
-	capSenderLimitedProbeRate := func(rate int) int {
-		if rate < externalDirectUDPRateProbeCollapseMinMbps {
-			return rate
-		}
-		var selected candidate
-		selectedOK := false
-		var previous candidate
-		previousOK := false
-		bestEfficient := candidate{}
-		bestEfficientOK := false
-		for _, probe := range candidates {
-			if probe.rate == rate {
-				selected = probe
-				selectedOK = true
-			}
-			if probe.rate > rate {
-				break
-			}
-			if probe.rate < rate {
-				previous = probe
-				previousOK = true
-			}
-			efficiency := 0.0
-			if probe.rate > 0 {
-				efficiency = probe.goodput / float64(probe.rate)
-			}
-			if probe.delivery >= externalDirectUDPRateProbeClean && efficiency >= externalDirectUDPRateProbeEfficient && (!bestEfficientOK || probe.goodput > bestEfficient.goodput) {
-				bestEfficient = probe
-				bestEfficientOK = true
-			}
-		}
-		if !selectedOK || !bestEfficientOK || bestEfficient.rate >= rate {
-			return rate
-		}
-		selectedEfficiency := 0.0
-		if selected.rate > 0 {
-			selectedEfficiency = selected.goodput / float64(selected.rate)
-		}
-		if selected.delivery < externalDirectUDPRateProbeClean || selectedEfficiency >= externalDirectUDPRateProbeEfficient {
-			return rate
-		}
-		if previousOK && previous.goodput > 0 && selected.goodput >= previous.goodput*externalDirectUDPRateProbeModerateGain {
-			return rate
-		}
-		if selected.goodput >= bestEfficient.goodput*externalDirectUDPRateProbeMaterialGain {
-			return rate
-		}
-		return bestEfficient.rate
+	if selected, ok := externalDirectUDPSelectAfterLeadingZeroProbes(selection); ok {
+		return selected
 	}
-	if trimmedLeadingZeroCandidates && len(candidates) >= 2 && candidates[0].goodput > 0 && candidates[0].rate < externalDirectUDPRateProbeCollapseMinMbps {
-		base := candidates[0]
-		for i := 1; i < len(candidates); i++ {
-			current := candidates[i]
-			if current.rate < externalDirectUDPRateProbeCollapseMinMbps {
-				continue
-			}
-			if current.delivery < externalDirectUDPRateProbeLossyDelivery {
-				continue
-			}
-			if current.goodput < base.goodput*externalDirectUDPRateProbeMaterialGain {
-				continue
-			}
-			return capSenderLimitedProbeRate(current.rate)
+	if selected, ok := externalDirectUDPSelectFromProbeTransitions(maxRateMbps, selection); ok {
+		return selected
+	}
+	return externalDirectUDPFinalSelectedProbeRate(maxRateMbps, selection)
+}
+
+func externalDirectUDPHasUsableRateProbeInput(maxRateMbps int, sent []directUDPRateProbeSample, received []directUDPRateProbeSample) bool {
+	return maxRateMbps > 0 &&
+		len(sent) > 0 &&
+		len(received) > 0 &&
+		externalDirectUDPHasPositiveProbeProgress(received)
+}
+
+func externalDirectUDPBuildRateProbeSelection(sent []directUDPRateProbeSample, received []directUDPRateProbeSample) externalDirectUDPRateProbeSelection {
+	sentByRate := make(map[int]directUDPRateProbeSample, len(sent))
+	for _, sample := range sent {
+		sentByRate[sample.RateMbps] = sample
+	}
+	selection := externalDirectUDPRateProbeSelection{
+		candidates: make([]externalDirectUDPRateProbeCandidate, 0, len(received)),
+	}
+	for _, sample := range received {
+		candidate := externalDirectUDPRateProbeCandidateForSample(sample, sentByRate)
+		selection.candidates = append(selection.candidates, candidate)
+		selection.observeCandidate(candidate)
+	}
+	return selection
+}
+
+func externalDirectUDPRateProbeCandidateForSample(sample directUDPRateProbeSample, sentByRate map[int]directUDPRateProbeSample) externalDirectUDPRateProbeCandidate {
+	durationMillis := sample.DurationMillis
+	if durationMillis <= 0 {
+		durationMillis = externalDirectUDPRateProbeDuration.Milliseconds()
+	}
+	goodput := externalDirectUDPSampleGoodputMbps(sample.BytesReceived, durationMillis)
+	delivery := 0.0
+	if sentSample, ok := sentByRate[sample.RateMbps]; ok && sentSample.BytesSent > 0 {
+		delivery = float64(sample.BytesReceived) / float64(sentSample.BytesSent)
+	}
+	score := goodput
+	if delivery > 0 && delivery < 0.90 {
+		score *= delivery / 0.90
+	}
+	return externalDirectUDPRateProbeCandidate{
+		rate:     sample.RateMbps,
+		goodput:  goodput,
+		delivery: delivery,
+		score:    score,
+	}
+}
+
+func (s *externalDirectUDPRateProbeSelection) observeCandidate(candidate externalDirectUDPRateProbeCandidate) {
+	if candidate.score <= s.bestScore {
+		return
+	}
+	s.bestScore = candidate.score
+	s.bestGoodput = candidate.goodput
+	s.bestRate = candidate.rate
+	s.bestDelivery = candidate.delivery
+}
+
+func (s *externalDirectUDPRateProbeSelection) trimLeadingZeros() {
+	for len(s.candidates) > 0 && s.candidates[0].goodput <= 0 && s.candidates[0].delivery <= 0 {
+		s.trimmedLeadingZeros = true
+		s.candidates = s.candidates[1:]
+	}
+}
+
+func externalDirectUDPSelectAfterLeadingZeroProbes(selection externalDirectUDPRateProbeSelection) (int, bool) {
+	candidates := selection.candidates
+	if !selection.trimmedLeadingZeros {
+		return 0, false
+	}
+	if len(candidates) < 2 || candidates[0].goodput <= 0 || candidates[0].rate >= externalDirectUDPRateProbeCollapseMinMbps {
+		return 0, false
+	}
+	base := candidates[0]
+	for i := 1; i < len(candidates); i++ {
+		current := candidates[i]
+		if current.rate < externalDirectUDPRateProbeCollapseMinMbps {
+			continue
+		}
+		if current.delivery < externalDirectUDPRateProbeLossyDelivery {
+			continue
+		}
+		if current.goodput < base.goodput*externalDirectUDPRateProbeMaterialGain {
+			continue
+		}
+		return externalDirectUDPCapSenderLimitedProbeRate(current.rate, candidates), true
+	}
+	return 0, false
+}
+
+func externalDirectUDPCapSenderLimitedProbeRate(rate int, candidates []externalDirectUDPRateProbeCandidate) int {
+	if rate < externalDirectUDPRateProbeCollapseMinMbps {
+		return rate
+	}
+	selected, selectedOK, previous, previousOK, bestEfficient, bestEfficientOK := externalDirectUDPSenderLimitedProbeContext(rate, candidates)
+	if !selectedOK || !bestEfficientOK || bestEfficient.rate >= rate {
+		return rate
+	}
+	if externalDirectUDPShouldKeepSenderLimitedProbeRate(selected, previous, previousOK, bestEfficient) {
+		return rate
+	}
+	return bestEfficient.rate
+}
+
+func externalDirectUDPShouldKeepSenderLimitedProbeRate(selected externalDirectUDPRateProbeCandidate, previous externalDirectUDPRateProbeCandidate, previousOK bool, bestEfficient externalDirectUDPRateProbeCandidate) bool {
+	selectedEfficiency := externalDirectUDPRateProbeEfficiency(selected)
+	if selected.delivery < externalDirectUDPRateProbeClean || selectedEfficiency >= externalDirectUDPRateProbeEfficient {
+		return true
+	}
+	if previousOK && previous.goodput > 0 && selected.goodput >= previous.goodput*externalDirectUDPRateProbeModerateGain {
+		return true
+	}
+	return selected.goodput >= bestEfficient.goodput*externalDirectUDPRateProbeMaterialGain
+}
+
+func externalDirectUDPSenderLimitedProbeContext(rate int, candidates []externalDirectUDPRateProbeCandidate) (externalDirectUDPRateProbeCandidate, bool, externalDirectUDPRateProbeCandidate, bool, externalDirectUDPRateProbeCandidate, bool) {
+	var selected externalDirectUDPRateProbeCandidate
+	selectedOK := false
+	var previous externalDirectUDPRateProbeCandidate
+	previousOK := false
+	bestEfficient := externalDirectUDPRateProbeCandidate{}
+	bestEfficientOK := false
+	for _, probe := range candidates {
+		if probe.rate == rate {
+			selected = probe
+			selectedOK = true
+		}
+		if probe.rate > rate {
+			break
+		}
+		if probe.rate < rate {
+			previous = probe
+			previousOK = true
+		}
+		efficiency := externalDirectUDPRateProbeEfficiency(probe)
+		if probe.delivery >= externalDirectUDPRateProbeClean && efficiency >= externalDirectUDPRateProbeEfficient && (!bestEfficientOK || probe.goodput > bestEfficient.goodput) {
+			bestEfficient = probe
+			bestEfficientOK = true
 		}
 	}
+	return selected, selectedOK, previous, previousOK, bestEfficient, bestEfficientOK
+}
+
+func externalDirectUDPRateProbeEfficiency(candidate externalDirectUDPRateProbeCandidate) float64 {
+	if candidate.rate <= 0 {
+		return 0
+	}
+	return candidate.goodput / float64(candidate.rate)
+}
+
+func externalDirectUDPSelectFromProbeTransitions(maxRateMbps int, selection externalDirectUDPRateProbeSelection) (int, bool) {
+	candidates := selection.candidates
 	highestProbeRate := candidates[len(candidates)-1].rate
 	for i := 1; i < len(candidates); i++ {
-		prev := candidates[i-1]
-		current := candidates[i]
-		efficiency := 0.0
-		if current.rate > 0 {
-			efficiency = current.goodput / float64(current.rate)
+		step := externalDirectUDPTransitionStep{
+			maxRateMbps:      maxRateMbps,
+			highestProbeRate: highestProbeRate,
+			candidates:       candidates,
+			selection:        selection,
+			index:            i,
 		}
-		prevEfficiency := 0.0
-		if prev.rate > 0 {
-			prevEfficiency = prev.goodput / float64(prev.rate)
+		selected, ok := step.selectRate()
+		if ok {
+			return selected, true
 		}
-		topProbe := i == len(candidates)-1 || current.rate == maxRateMbps
-		topProbeCleanGain := topProbe && current.delivery >= externalDirectUDPRateProbeClean && current.goodput > prev.goodput && current.goodput >= bestGoodput
-		if topProbeCleanGain {
-			selected := int(current.goodput*1.15 + 0.5)
-			if selected < externalDirectUDPRateProbeMinMbps {
-				selected = externalDirectUDPRateProbeMinMbps
-			}
-			if selected > maxRateMbps {
-				selected = maxRateMbps
-			}
-			return selected
-		}
-		highThroughputKnee := current.delivery >= externalDirectUDPRateProbeClean && current.goodput >= float64(maxRateMbps)*externalDirectUDPRateProbeHighShare && current.goodput >= prev.goodput*externalDirectUDPRateProbeHighGain
-		if current.delivery >= externalDirectUDPRateProbeClean && current.goodput >= prev.goodput*0.75 && (efficiency >= externalDirectUDPRateProbeEfficient || highThroughputKnee) {
-			continue
-		}
-		nearCleanEfficientGain := !topProbe && current.delivery >= externalDirectUDPRateProbeNearClean && current.goodput >= prev.goodput*0.75 && efficiency >= externalDirectUDPRateProbeEfficient
-		if nearCleanEfficientGain {
-			continue
-		}
-		cleanSenderLimitedRamp := current.delivery >= externalDirectUDPRateProbeClean &&
-			current.goodput >= prev.goodput &&
-			(current.goodput < externalDirectUDPRateProbeHighHeadroomMin ||
-				prevEfficiency < externalDirectUDPRateProbeEfficient)
-		if cleanSenderLimitedRamp {
-			continue
-		}
-		if topProbe && externalDirectUDPHighGoodputCappedTopProbe(maxRateMbps, highestProbeRate, current.rate, current.goodput, current.delivery, prev.goodput) {
-			selected := int(current.goodput*1.15 + 0.5)
-			if selected < externalDirectUDPRateProbeMinMbps {
-				selected = externalDirectUDPRateProbeMinMbps
-			}
-			if selected > current.rate {
-				selected = current.rate
-			}
-			if selected > maxRateMbps {
-				selected = maxRateMbps
-			}
-			return selected
-		}
-		midProbeMaterialGain := !topProbe &&
-			current.rate < maxRateMbps &&
-			(current.delivery >= externalDirectUDPRateProbeClean || current.delivery >= externalDirectUDPRateProbeLossySelect) &&
-			current.goodput >= externalDirectUDPRateProbeHighHeadroomMin &&
-			current.goodput >= prev.goodput*externalDirectUDPRateProbeMaterialGain
-		if midProbeMaterialGain {
-			selected := current.rate
-			if selected < externalDirectUDPRateProbeMinMbps {
-				selected = externalDirectUDPRateProbeMinMbps
-			}
-			if selected > maxRateMbps {
-				selected = maxRateMbps
-			}
-			return capSenderLimitedProbeRate(selected)
-		}
-		midProbeModerateGain := !topProbe &&
-			current.rate < maxRateMbps &&
-			current.delivery >= externalDirectUDPRateProbeCeilingDelivery &&
-			current.goodput >= externalDirectUDPRateProbeHighHeadroomMin &&
-			current.goodput >= prev.goodput*externalDirectUDPRateProbeModerateGain
-		if midProbeModerateGain {
-			selected := current.rate
-			if selected < externalDirectUDPRateProbeMinMbps {
-				selected = externalDirectUDPRateProbeMinMbps
-			}
-			if selected > maxRateMbps {
-				selected = maxRateMbps
-			}
-			return capSenderLimitedProbeRate(selected)
-		}
-		cleanSenderLimitedHighTier := !topProbe &&
-			prev.rate >= externalDirectUDPRateProbeCollapseMinMbps &&
-			current.rate >= externalDirectUDPRateProbeConfirmMinMbps &&
-			current.delivery >= externalDirectUDPRateProbeClean &&
-			current.goodput >= externalDirectUDPRateProbeHighHeadroomMin
-		if cleanSenderLimitedHighTier {
-			continue
-		}
-		topProbeSenderLimitedBelowBest := topProbe &&
-			current.delivery >= externalDirectUDPRateProbeClean &&
-			bestRate > 0 &&
-			bestRate < current.rate &&
-			bestGoodput > prev.goodput*1.10 &&
-			bestGoodput > current.goodput*1.10
-		if topProbeSenderLimitedBelowBest {
-			selected := bestRate
-			if selected < externalDirectUDPRateProbeMinMbps {
-				selected = externalDirectUDPRateProbeMinMbps
-			}
-			if selected > maxRateMbps {
-				selected = maxRateMbps
-			}
-			return selected
-		}
-		midProbeSoftLoss := current.rate < maxRateMbps &&
-			current.rate >= externalDirectUDPRateProbeCollapseMinMbps &&
-			current.delivery >= 0.70 &&
-			current.delivery < externalDirectUDPRateProbeClean &&
-			current.goodput >= prev.goodput
-		if midProbeSoftLoss {
-			selected := prev.rate
-			if selected < externalDirectUDPRateProbeMinMbps {
-				selected = externalDirectUDPRateProbeMinMbps
-			}
-			if selected > maxRateMbps {
-				selected = maxRateMbps
-			}
-			return capSenderLimitedProbeRate(selected)
-		}
-		cleanMidProbeSenderLimitedGain := current.rate < maxRateMbps &&
-			current.rate < externalDirectUDPRateProbeConfirmMinMbps &&
-			current.delivery >= externalDirectUDPRateProbeClean &&
-			efficiency < externalDirectUDPRateProbeEfficient &&
-			prev.rate >= externalDirectUDPActiveLaneTwoMaxMbps &&
-			prevEfficiency >= externalDirectUDPRateProbeEfficient &&
-			current.goodput >= prev.goodput &&
-			current.goodput >= externalDirectUDPRateProbeHighHeadroomMin
-		if cleanMidProbeSenderLimitedGain {
-			selected := prev.rate
-			if selected < externalDirectUDPRateProbeMinMbps {
-				selected = externalDirectUDPRateProbeMinMbps
-			}
-			if selected > maxRateMbps {
-				selected = maxRateMbps
-			}
-			return capSenderLimitedProbeRate(selected)
-		}
-		midProbeCollapseAfterCleanTier := current.rate < maxRateMbps &&
-			current.rate >= externalDirectUDPRateProbeCollapseMinMbps &&
-			prev.delivery >= 0.90 &&
-			(current.delivery < externalDirectUDPRateProbeNearClean ||
-				current.goodput < prev.goodput*externalDirectUDPRateProbeSentGrowth)
-		if midProbeCollapseAfterCleanTier {
-			selected := prev.rate
-			if selected < externalDirectUDPRateProbeMinMbps {
-				selected = externalDirectUDPRateProbeMinMbps
-			}
-			if selected > maxRateMbps {
-				selected = maxRateMbps
-			}
-			return capSenderLimitedProbeRate(selected)
-		}
-		topProbeCleanCollapseAfterMaterialGain := topProbe &&
-			i >= 2 &&
-			current.delivery >= externalDirectUDPRateProbeClean &&
-			prev.delivery >= externalDirectUDPRateProbeClean &&
-			current.goodput < prev.goodput*externalDirectUDPRateProbeSentGrowth &&
-			prev.goodput >= candidates[i-2].goodput*1.10
-		if topProbeCleanCollapseAfterMaterialGain {
-			selected := prev.rate
-			if selected < externalDirectUDPRateProbeMinMbps {
-				selected = externalDirectUDPRateProbeMinMbps
-			}
-			if selected > maxRateMbps {
-				selected = maxRateMbps
-			}
-			return capSenderLimitedProbeRate(selected)
-		}
-		topProbeStillGaining := topProbe && current.delivery >= externalDirectUDPRateProbeClean && current.goodput >= prev.goodput*externalDirectUDPRateProbeHighGain
-		if topProbeStillGaining {
-			selected := int(current.goodput*1.15 + 0.5)
-			if selected < externalDirectUDPRateProbeMinMbps {
-				selected = externalDirectUDPRateProbeMinMbps
-			}
-			if selected > maxRateMbps {
-				selected = maxRateMbps
-			}
-			return selected
-		}
-		if !topProbe && current.rate < externalDirectUDPRateProbeCollapseMinMbps {
-			continue
-		}
-		backoffIndex := i - 2
-		if backoffIndex < 0 {
-			backoffIndex = i - 1
-		}
-		selected := candidates[backoffIndex].rate
-		if backoffIndex >= 0 {
-			backoffCandidate := candidates[backoffIndex]
-			if backoffCandidate.rate < externalDirectUDPRateProbeCollapseMinMbps &&
-				bestRate > 0 &&
-				bestRate < backoffCandidate.rate &&
-				bestDelivery >= externalDirectUDPRateProbeCeilingDelivery &&
-				backoffCandidate.delivery < externalDirectUDPRateProbeCeilingDelivery &&
-				backoffCandidate.goodput < bestGoodput*externalDirectUDPRateProbeLossyGain {
-				selected = bestRate
-			}
-		}
-		if selected < externalDirectUDPRateProbeMinMbps {
-			selected = externalDirectUDPRateProbeMinMbps
-		}
-		if selected > maxRateMbps {
-			selected = maxRateMbps
-		}
-		return capSenderLimitedProbeRate(selected)
 	}
-	selected := int(bestGoodput*1.15 + 0.5)
-	if bestDelivery >= 0.90 {
-		selected = bestRate
+	return 0, false
+}
+
+type externalDirectUDPTransitionStep struct {
+	maxRateMbps      int
+	highestProbeRate int
+	candidates       []externalDirectUDPRateProbeCandidate
+	selection        externalDirectUDPRateProbeSelection
+	index            int
+}
+
+func (s externalDirectUDPTransitionStep) selectRate() (int, bool) {
+	if selected, ok, next := s.selectEarlyRate(); ok || next {
+		return selected, ok
 	}
-	if selected < externalDirectUDPRateProbeMinMbps {
-		selected = externalDirectUDPRateProbeMinMbps
+	if selected, ok, next := s.selectMiddleRate(); ok || next {
+		return selected, ok
 	}
-	if selected > maxRateMbps {
-		selected = maxRateMbps
+	return s.selectLateRate()
+}
+
+func (s externalDirectUDPTransitionStep) prev() externalDirectUDPRateProbeCandidate {
+	return s.candidates[s.index-1]
+}
+
+func (s externalDirectUDPTransitionStep) current() externalDirectUDPRateProbeCandidate {
+	return s.candidates[s.index]
+}
+
+func (s externalDirectUDPTransitionStep) topProbe() bool {
+	return s.index == len(s.candidates)-1 || s.current().rate == s.maxRateMbps
+}
+
+func (s externalDirectUDPTransitionStep) selectEarlyRate() (int, bool, bool) {
+	prev := s.prev()
+	current := s.current()
+	topProbe := s.topProbe()
+	if topProbe && current.delivery >= externalDirectUDPRateProbeClean && current.goodput > prev.goodput && current.goodput >= s.selection.bestGoodput {
+		return externalDirectUDPObservedGoodputRate(current.goodput, s.maxRateMbps), true, false
 	}
-	return capSenderLimitedProbeRate(selected)
+	if externalDirectUDPShouldContinueCleanRamp(s.maxRateMbps, topProbe, prev, current) {
+		return 0, false, true
+	}
+	if topProbe && externalDirectUDPHighGoodputCappedTopProbe(s.maxRateMbps, s.highestProbeRate, current.rate, current.goodput, current.delivery, prev.goodput) {
+		selected := externalDirectUDPObservedGoodputRate(current.goodput, s.maxRateMbps)
+		if selected > current.rate {
+			selected = current.rate
+		}
+		return selected, true, false
+	}
+	if selected, ok := externalDirectUDPSelectMidProbeGain(s.maxRateMbps, s.candidates, topProbe, prev, current); ok {
+		return selected, true, false
+	}
+	return 0, false, false
+}
+
+func externalDirectUDPShouldContinueCleanRamp(maxRateMbps int, topProbe bool, prev externalDirectUDPRateProbeCandidate, current externalDirectUDPRateProbeCandidate) bool {
+	efficiency := externalDirectUDPRateProbeEfficiency(current)
+	prevEfficiency := externalDirectUDPRateProbeEfficiency(prev)
+	return externalDirectUDPCleanEfficientRamp(maxRateMbps, prev, current, efficiency) ||
+		externalDirectUDPNearCleanEfficientGain(topProbe, prev, current, efficiency) ||
+		externalDirectUDPCleanSenderLimitedRamp(prev, current, prevEfficiency)
+}
+
+func externalDirectUDPCleanEfficientRamp(maxRateMbps int, prev externalDirectUDPRateProbeCandidate, current externalDirectUDPRateProbeCandidate, efficiency float64) bool {
+	if current.delivery < externalDirectUDPRateProbeClean || current.goodput < prev.goodput*0.75 {
+		return false
+	}
+	return efficiency >= externalDirectUDPRateProbeEfficient ||
+		externalDirectUDPHighThroughputKnee(maxRateMbps, prev, current)
+}
+
+func externalDirectUDPHighThroughputKnee(maxRateMbps int, prev externalDirectUDPRateProbeCandidate, current externalDirectUDPRateProbeCandidate) bool {
+	return current.goodput >= float64(maxRateMbps)*externalDirectUDPRateProbeHighShare &&
+		current.goodput >= prev.goodput*externalDirectUDPRateProbeHighGain
+}
+
+func externalDirectUDPNearCleanEfficientGain(topProbe bool, prev externalDirectUDPRateProbeCandidate, current externalDirectUDPRateProbeCandidate, efficiency float64) bool {
+	return !topProbe &&
+		current.delivery >= externalDirectUDPRateProbeNearClean &&
+		current.goodput >= prev.goodput*0.75 &&
+		efficiency >= externalDirectUDPRateProbeEfficient
+}
+
+func externalDirectUDPCleanSenderLimitedRamp(prev externalDirectUDPRateProbeCandidate, current externalDirectUDPRateProbeCandidate, prevEfficiency float64) bool {
+	return current.delivery >= externalDirectUDPRateProbeClean &&
+		current.goodput >= prev.goodput &&
+		(current.goodput < externalDirectUDPRateProbeHighHeadroomMin ||
+			prevEfficiency < externalDirectUDPRateProbeEfficient)
+}
+
+func externalDirectUDPSelectMidProbeGain(maxRateMbps int, candidates []externalDirectUDPRateProbeCandidate, topProbe bool, prev externalDirectUDPRateProbeCandidate, current externalDirectUDPRateProbeCandidate) (int, bool) {
+	if topProbe || current.rate >= maxRateMbps || current.goodput < externalDirectUDPRateProbeHighHeadroomMin {
+		return 0, false
+	}
+	materialGain := (current.delivery >= externalDirectUDPRateProbeClean || current.delivery >= externalDirectUDPRateProbeLossySelect) &&
+		current.goodput >= prev.goodput*externalDirectUDPRateProbeMaterialGain
+	moderateGain := current.delivery >= externalDirectUDPRateProbeCeilingDelivery &&
+		current.goodput >= prev.goodput*externalDirectUDPRateProbeModerateGain
+	if !materialGain && !moderateGain {
+		return 0, false
+	}
+	selected := externalDirectUDPClampProbeRate(current.rate, maxRateMbps)
+	return externalDirectUDPCapSenderLimitedProbeRate(selected, candidates), true
+}
+
+func (s externalDirectUDPTransitionStep) selectMiddleRate() (int, bool, bool) {
+	prev := s.prev()
+	current := s.current()
+	topProbe := s.topProbe()
+	if externalDirectUDPShouldContinueCleanHighTier(topProbe, prev, current) {
+		return 0, false, true
+	}
+	if topProbe && externalDirectUDPTopProbeSenderLimitedBelowBest(prev, current, s.selection) {
+		return externalDirectUDPClampProbeRate(s.selection.bestRate, s.maxRateMbps), true, false
+	}
+	if externalDirectUDPMidProbeSoftLoss(s.maxRateMbps, current, prev) {
+		return externalDirectUDPCapSenderLimitedProbeRate(externalDirectUDPClampProbeRate(prev.rate, s.maxRateMbps), s.candidates), true, false
+	}
+	if externalDirectUDPCleanMidProbeSenderLimitedGain(s.maxRateMbps, prev, current) {
+		return externalDirectUDPCapSenderLimitedProbeRate(externalDirectUDPClampProbeRate(prev.rate, s.maxRateMbps), s.candidates), true, false
+	}
+	return 0, false, false
+}
+
+func externalDirectUDPShouldContinueCleanHighTier(topProbe bool, prev externalDirectUDPRateProbeCandidate, current externalDirectUDPRateProbeCandidate) bool {
+	return !topProbe &&
+		prev.rate >= externalDirectUDPRateProbeCollapseMinMbps &&
+		current.rate >= externalDirectUDPRateProbeConfirmMinMbps &&
+		current.delivery >= externalDirectUDPRateProbeClean &&
+		current.goodput >= externalDirectUDPRateProbeHighHeadroomMin
+}
+
+func externalDirectUDPTopProbeSenderLimitedBelowBest(prev externalDirectUDPRateProbeCandidate, current externalDirectUDPRateProbeCandidate, selection externalDirectUDPRateProbeSelection) bool {
+	return current.delivery >= externalDirectUDPRateProbeClean &&
+		selection.bestRate > 0 &&
+		selection.bestRate < current.rate &&
+		selection.bestGoodput > prev.goodput*1.10 &&
+		selection.bestGoodput > current.goodput*1.10
+}
+
+func externalDirectUDPMidProbeSoftLoss(maxRateMbps int, current externalDirectUDPRateProbeCandidate, prev externalDirectUDPRateProbeCandidate) bool {
+	return current.rate < maxRateMbps &&
+		current.rate >= externalDirectUDPRateProbeCollapseMinMbps &&
+		current.delivery >= 0.70 &&
+		current.delivery < externalDirectUDPRateProbeClean &&
+		current.goodput >= prev.goodput
+}
+
+func externalDirectUDPCleanMidProbeSenderLimitedGain(maxRateMbps int, prev externalDirectUDPRateProbeCandidate, current externalDirectUDPRateProbeCandidate) bool {
+	return current.rate < maxRateMbps &&
+		current.rate < externalDirectUDPRateProbeConfirmMinMbps &&
+		current.delivery >= externalDirectUDPRateProbeClean &&
+		externalDirectUDPRateProbeEfficiency(current) < externalDirectUDPRateProbeEfficient &&
+		prev.rate >= externalDirectUDPActiveLaneTwoMaxMbps &&
+		externalDirectUDPRateProbeEfficiency(prev) >= externalDirectUDPRateProbeEfficient &&
+		current.goodput >= prev.goodput &&
+		current.goodput >= externalDirectUDPRateProbeHighHeadroomMin
+}
+
+func (s externalDirectUDPTransitionStep) selectLateRate() (int, bool) {
+	prev := s.prev()
+	current := s.current()
+	topProbe := s.topProbe()
+	if externalDirectUDPMidProbeCollapseAfterCleanTier(s.maxRateMbps, prev, current) {
+		return externalDirectUDPCapSenderLimitedProbeRate(externalDirectUDPClampProbeRate(prev.rate, s.maxRateMbps), s.candidates), true
+	}
+	if topProbe && s.topProbeCleanCollapseAfterMaterialGain(prev, current) {
+		return externalDirectUDPCapSenderLimitedProbeRate(externalDirectUDPClampProbeRate(prev.rate, s.maxRateMbps), s.candidates), true
+	}
+	if topProbe && current.delivery >= externalDirectUDPRateProbeClean && current.goodput >= prev.goodput*externalDirectUDPRateProbeHighGain {
+		return externalDirectUDPObservedGoodputRate(current.goodput, s.maxRateMbps), true
+	}
+	if !topProbe && current.rate < externalDirectUDPRateProbeCollapseMinMbps {
+		return 0, false
+	}
+	return s.backoffProbeRate(), true
+}
+
+func externalDirectUDPMidProbeCollapseAfterCleanTier(maxRateMbps int, prev externalDirectUDPRateProbeCandidate, current externalDirectUDPRateProbeCandidate) bool {
+	return current.rate < maxRateMbps &&
+		current.rate >= externalDirectUDPRateProbeCollapseMinMbps &&
+		prev.delivery >= 0.90 &&
+		(current.delivery < externalDirectUDPRateProbeNearClean ||
+			current.goodput < prev.goodput*externalDirectUDPRateProbeSentGrowth)
+}
+
+func (s externalDirectUDPTransitionStep) topProbeCleanCollapseAfterMaterialGain(prev externalDirectUDPRateProbeCandidate, current externalDirectUDPRateProbeCandidate) bool {
+	return s.index >= 2 &&
+		current.delivery >= externalDirectUDPRateProbeClean &&
+		prev.delivery >= externalDirectUDPRateProbeClean &&
+		current.goodput < prev.goodput*externalDirectUDPRateProbeSentGrowth &&
+		prev.goodput >= s.candidates[s.index-2].goodput*1.10
+}
+
+func (s externalDirectUDPTransitionStep) backoffProbeRate() int {
+	backoffIndex := s.index - 2
+	if backoffIndex < 0 {
+		backoffIndex = s.index - 1
+	}
+	selected := s.candidates[backoffIndex].rate
+	backoffCandidate := s.candidates[backoffIndex]
+	if externalDirectUDPShouldUseBestLossyBackoff(backoffCandidate, s.selection) {
+		selected = s.selection.bestRate
+	}
+	return externalDirectUDPCapSenderLimitedProbeRate(externalDirectUDPClampProbeRate(selected, s.maxRateMbps), s.candidates)
+}
+
+func externalDirectUDPShouldUseBestLossyBackoff(backoffCandidate externalDirectUDPRateProbeCandidate, selection externalDirectUDPRateProbeSelection) bool {
+	return backoffCandidate.rate < externalDirectUDPRateProbeCollapseMinMbps &&
+		selection.bestRate > 0 &&
+		selection.bestRate < backoffCandidate.rate &&
+		selection.bestDelivery >= externalDirectUDPRateProbeCeilingDelivery &&
+		backoffCandidate.delivery < externalDirectUDPRateProbeCeilingDelivery &&
+		backoffCandidate.goodput < selection.bestGoodput*externalDirectUDPRateProbeLossyGain
+}
+
+func externalDirectUDPFinalSelectedProbeRate(maxRateMbps int, selection externalDirectUDPRateProbeSelection) int {
+	selected := externalDirectUDPObservedGoodputRate(selection.bestGoodput, maxRateMbps)
+	if selection.bestDelivery >= 0.90 {
+		selected = selection.bestRate
+	}
+	return externalDirectUDPCapSenderLimitedProbeRate(externalDirectUDPClampProbeRate(selected, maxRateMbps), selection.candidates)
+}
+
+func externalDirectUDPObservedGoodputRate(goodput float64, maxRateMbps int) int {
+	return externalDirectUDPClampProbeRate(int(goodput*1.15+0.5), maxRateMbps)
+}
+
+func externalDirectUDPClampProbeRate(rate int, maxRateMbps int) int {
+	if rate < externalDirectUDPRateProbeMinMbps {
+		return externalDirectUDPRateProbeMinMbps
+	}
+	if rate > maxRateMbps {
+		return maxRateMbps
+	}
+	return rate
 }
 
 func externalDirectUDPSelectInitialRateMbps(maxRateMbps int, sent []directUDPRateProbeSample, received []directUDPRateProbeSample) int {
@@ -3738,193 +4954,319 @@ func externalDirectUDPSelectRateCeilingMbps(maxRateMbps int, selected int, sent 
 		externalDirectUDPProbeLacksCleanWarmupForSelectedRate(selected, sent, received) {
 		return selected
 	}
-	sentByRate := make(map[int]directUDPRateProbeSample, len(sent))
-	for _, sample := range sent {
-		sentByRate[sample.RateMbps] = sample
+	selector := newExternalDirectUDPRateCeilingSelector(maxRateMbps, selected, sent, received)
+	selector.scan()
+	selector.applyPostScanCeilings()
+	return selector.finalCeiling()
+}
+
+type externalDirectUDPRateProbeObservation struct {
+	rate       int
+	goodput    float64
+	delivery   float64
+	efficiency float64
+}
+
+type externalDirectUDPRateCeilingSelector struct {
+	maxRateMbps                int
+	selected                   int
+	sentByRate                 map[int]directUDPRateProbeSample
+	received                   []directUDPRateProbeSample
+	highestProbeRate           int
+	ceiling                    int
+	ceilingGoodput             float64
+	ceilingDelivery            float64
+	ceilingEfficiency          float64
+	previousGoodput            float64
+	selectedGoodput            float64
+	selectedDelivery           float64
+	probedPastSelectedHeadroom bool
+	rejectedHigherProbe        bool
+	lossyImprovingCeiling      bool
+}
+
+func newExternalDirectUDPRateCeilingSelector(maxRateMbps int, selected int, sent []directUDPRateProbeSample, received []directUDPRateProbeSample) *externalDirectUDPRateCeilingSelector {
+	return &externalDirectUDPRateCeilingSelector{
+		maxRateMbps:      maxRateMbps,
+		selected:         selected,
+		sentByRate:       externalDirectUDPProbeSamplesByRate(sent),
+		received:         received,
+		highestProbeRate: externalDirectUDPHighestProbeRate(sent, maxRateMbps),
+		ceiling:          selected,
 	}
-	ceiling := selected
-	ceilingGoodput := 0.0
-	ceilingDelivery := 0.0
-	ceilingEfficiency := 0.0
-	highestProbeRate := externalDirectUDPHighestProbeRate(sent, maxRateMbps)
-	previousGoodput := 0.0
-	selectedGoodput := 0.0
-	selectedDelivery := 0.0
-	probedPastSelectedHeadroom := false
-	rejectedHigherProbe := false
-	lossyImprovingCeiling := false
-	for _, sample := range received {
-		if sample.RateMbps <= 0 || sample.RateMbps > maxRateMbps {
+}
+
+func externalDirectUDPProbeSamplesByRate(samples []directUDPRateProbeSample) map[int]directUDPRateProbeSample {
+	byRate := make(map[int]directUDPRateProbeSample, len(samples))
+	for _, sample := range samples {
+		byRate[sample.RateMbps] = sample
+	}
+	return byRate
+}
+
+func (s *externalDirectUDPRateCeilingSelector) scan() {
+	for _, sample := range s.received {
+		obs, ok := s.observation(sample)
+		if !ok {
 			continue
 		}
-		sentSample, ok := sentByRate[sample.RateMbps]
-		if !ok || sentSample.BytesSent <= 0 {
+		if obs.rate < s.selected {
+			s.previousGoodput = obs.goodput
 			continue
 		}
-		delivery := float64(sample.BytesReceived) / float64(sentSample.BytesSent)
-		durationMillis := sample.DurationMillis
-		if durationMillis <= 0 {
-			durationMillis = externalDirectUDPRateProbeDuration.Milliseconds()
-		}
-		goodput := externalDirectUDPSampleGoodputMbps(sample.BytesReceived, durationMillis)
-		efficiency := 0.0
-		if sample.RateMbps > 0 {
-			efficiency = goodput / float64(sample.RateMbps)
-		}
-		if sample.RateMbps < selected {
-			previousGoodput = goodput
-			continue
-		}
-		if sample.RateMbps == selected {
-			selectedGoodput = goodput
-			selectedDelivery = delivery
-		}
-		priorGoodput := ceilingGoodput
-		if priorGoodput <= 0 {
-			priorGoodput = previousGoodput
-		}
-		cappedTopHighGoodput := externalDirectUDPHighGoodputCappedTopProbe(maxRateMbps, highestProbeRate, sample.RateMbps, goodput, delivery, priorGoodput)
-		highThroughputKnee := goodput >= float64(maxRateMbps)*externalDirectUDPRateProbeHighShare && (ceilingGoodput <= 0 || goodput >= ceilingGoodput*externalDirectUDPRateProbeHighGain)
-		nearCleanCeiling := ceilingDelivery >= externalDirectUDPRateProbeNearClean && ceilingDelivery < externalDirectUDPRateProbeClean
-		highSelectedHeadroom := selected >= externalDirectUDPRateProbeCollapseMinMbps &&
-			sample.RateMbps == highestProbeRate &&
-			goodput >= externalDirectUDPRateProbeCeilingFloorMin &&
-			delivery >= externalDirectUDPRateProbeCeilingDelivery
-		meaningfulNextTier := ceilingGoodput >= externalDirectUDPRateProbeCeilingFloorMin && sample.RateMbps > ceiling && goodput >= ceilingGoodput*externalDirectUDPRateProbeCeilingFloor && (delivery >= externalDirectUDPRateProbeCeilingDelivery || nearCleanCeiling || highSelectedHeadroom)
-		allowLossyImprovingCeiling := selected < externalDirectUDPCeilingHeadroomMinMbps || (selected >= externalDirectUDPRateProbeCollapseMinMbps && sample.RateMbps == highestProbeRate)
-		lossyStillImproving := allowLossyImprovingCeiling && externalDirectUDPLossyProbeStillImproving(sample.RateMbps, goodput, delivery, priorGoodput)
-		boundedLossyObservedGoodputCeiling := selected >= externalDirectUDPRateProbeCollapseMinMbps &&
-			sample.RateMbps == highestProbeRate &&
-			delivery >= externalDirectUDPRateProbeLossyDelivery &&
-			delivery < externalDirectUDPRateProbeCeilingDelivery &&
-			goodput >= float64(selected)*1.10 &&
-			goodput >= priorGoodput*externalDirectUDPRateProbeLossyGain
-		selectedLossyGain := selected >= externalDirectUDPRateProbeHighHeadroomMin &&
-			sample.RateMbps == selected &&
-			delivery >= externalDirectUDPRateProbeLossySelect &&
-			goodput >= externalDirectUDPRateProbeHighHeadroomMin &&
-			goodput >= priorGoodput*externalDirectUDPRateProbeMaterialGain
-		if selectedLossyGain {
-			ceiling = sample.RateMbps
-			ceilingGoodput = goodput
-			ceilingDelivery = delivery
-			ceilingEfficiency = efficiency
-			continue
-		}
-		if delivery < externalDirectUDPRateProbeClean && !(delivery >= externalDirectUDPRateProbeNearClean && efficiency >= externalDirectUDPRateProbeCeilingEfficient) {
-			rejectedHigherProbe = sample.RateMbps > ceiling
-			if cappedTopHighGoodput {
-				ceiling = sample.RateMbps
-				ceilingDelivery = delivery
-				ceilingEfficiency = efficiency
-				break
-			}
-			if meaningfulNextTier {
-				ceiling = sample.RateMbps
-				ceilingDelivery = delivery
-				ceilingEfficiency = efficiency
-			}
-			if boundedLossyObservedGoodputCeiling {
-				ceiling = int(goodput + 0.5)
-				ceilingGoodput = goodput
-				ceilingDelivery = delivery
-				ceilingEfficiency = efficiency
-				lossyImprovingCeiling = true
-			}
-			if lossyStillImproving {
-				ceiling = sample.RateMbps
-				ceilingGoodput = goodput
-				ceilingDelivery = delivery
-				ceilingEfficiency = efficiency
-				lossyImprovingCeiling = true
-				rejectedHigherProbe = false
-				continue
-			}
-			break
-		}
-		if delivery < externalDirectUDPRateProbeClean && sample.RateMbps > selected && efficiency < externalDirectUDPRateProbeCeilingEfficient && !highThroughputKnee && ceilingGoodput > 0 && goodput < ceilingGoodput*externalDirectUDPRateProbeSentGrowth {
-			rejectedHigherProbe = sample.RateMbps > ceiling
-			if cappedTopHighGoodput {
-				ceiling = sample.RateMbps
-				ceilingDelivery = delivery
-				ceilingEfficiency = efficiency
-				break
-			}
-			if meaningfulNextTier {
-				ceiling = sample.RateMbps
-				ceilingDelivery = delivery
-				ceilingEfficiency = efficiency
-			}
-			break
-		}
-		senderLimitedHeadroomProbe := selected > externalDirectUDPActiveLaneTwoMaxMbps &&
-			selected < externalDirectUDPRateProbeConfirmMinMbps &&
-			sample.RateMbps > selected &&
-			sample.RateMbps >= externalDirectUDPRateProbeCollapseMinMbps &&
-			delivery >= externalDirectUDPRateProbeClean &&
-			efficiency > 0 &&
-			efficiency < externalDirectUDPRateProbeEfficient &&
-			ceilingGoodput >= externalDirectUDPRateProbeHighHeadroomMin &&
-			goodput < ceilingGoodput*externalDirectUDPRateProbeMaterialGain
-		if senderLimitedHeadroomProbe {
-			rejectedHigherProbe = sample.RateMbps > ceiling
-			break
-		}
-		cleanHigherThroughputCollapse := selected >= externalDirectUDPRateProbeCollapseMinMbps &&
-			sample.RateMbps > selected &&
-			delivery >= externalDirectUDPRateProbeClean &&
-			efficiency > 0 &&
-			efficiency < externalDirectUDPRateProbeEfficient &&
-			ceilingGoodput >= externalDirectUDPRateProbeHighHeadroomMin &&
-			goodput < ceilingGoodput*externalDirectUDPRateProbeSentGrowth
-		if cleanHigherThroughputCollapse {
-			rejectedHigherProbe = sample.RateMbps > ceiling
-			break
-		}
-		ceiling = sample.RateMbps
-		ceilingGoodput = goodput
-		ceilingDelivery = delivery
-		ceilingEfficiency = efficiency
-		if delivery < externalDirectUDPRateProbeClean && sample.RateMbps > selected && efficiency < externalDirectUDPRateProbeCeilingEfficient && !highThroughputKnee {
-			if selected == externalDirectUDPProbeKneeHeadroom(sample.RateMbps) && !probedPastSelectedHeadroom {
-				probedPastSelectedHeadroom = true
-				continue
-			}
-			rejectedHigherProbe = sample.RateMbps > ceiling
-			break
+		s.recordSelectedObservation(obs)
+		if s.applyObservation(obs) {
+			return
 		}
 	}
-	if recoveryRate, _, recoveryDelivery, recoveryEfficiency, ok := externalDirectUDPFindLossyRecoveryProbe(selected, selectedGoodput, sentByRate, received); ok && recoveryRate > ceiling {
-		ceiling = recoveryRate
-		ceilingDelivery = recoveryDelivery
-		ceilingEfficiency = recoveryEfficiency
+}
+
+func (s *externalDirectUDPRateCeilingSelector) observation(sample directUDPRateProbeSample) (externalDirectUDPRateProbeObservation, bool) {
+	if sample.RateMbps <= 0 || sample.RateMbps > s.maxRateMbps {
+		return externalDirectUDPRateProbeObservation{}, false
 	}
-	if explorationRate, _, explorationDelivery, explorationEfficiency, ok := externalDirectUDPFindLossyHighSelectedExplorationCeiling(selected, selectedGoodput, selectedDelivery, sentByRate, received, maxRateMbps); ok && explorationRate > ceiling {
-		ceiling = explorationRate
-		ceilingDelivery = explorationDelivery
-		ceilingEfficiency = explorationEfficiency
-		lossyImprovingCeiling = true
+	goodput, delivery, efficiency, ok := externalDirectUDPProbeMetrics(sample, s.sentByRate)
+	if !ok {
+		return externalDirectUDPRateProbeObservation{}, false
 	}
-	if explorationRate, _, explorationDelivery, explorationEfficiency, ok := externalDirectUDPFindAdaptiveExplorationCeiling(selected, selectedGoodput, sentByRate, received, maxRateMbps); ok && explorationRate > ceiling {
-		ceiling = explorationRate
-		ceilingDelivery = explorationDelivery
-		ceilingEfficiency = explorationEfficiency
-		lossyImprovingCeiling = true
+	return externalDirectUDPRateProbeObservation{
+		rate:       sample.RateMbps,
+		goodput:    goodput,
+		delivery:   delivery,
+		efficiency: efficiency,
+	}, true
+}
+
+func (s *externalDirectUDPRateCeilingSelector) recordSelectedObservation(obs externalDirectUDPRateProbeObservation) {
+	if obs.rate == s.selected {
+		s.selectedGoodput = obs.goodput
+		s.selectedDelivery = obs.delivery
 	}
-	if ceiling == highestProbeRate && highestProbeRate > 0 && highestProbeRate == maxRateMbps && ceilingDelivery >= externalDirectUDPRateProbeClean && ceilingEfficiency >= externalDirectUDPRateProbeEfficient {
-		return maxRateMbps
+}
+
+func (s *externalDirectUDPRateCeilingSelector) applyObservation(obs externalDirectUDPRateProbeObservation) bool {
+	if s.selectedLossyGain(obs) {
+		s.setCeilingFromObservation(obs)
+		return false
 	}
-	if selected < externalDirectUDPCeilingHeadroomMinMbps && ceiling > externalDirectUDPRateProbeHighHeadroomMin && rejectedHigherProbe {
-		ceiling = externalDirectUDPRateProbeHighHeadroomMin
+	if s.uncleanInefficient(obs) {
+		return s.handleUncleanInefficient(obs)
 	}
-	if !lossyImprovingCeiling {
-		ceiling = externalDirectUDPCapBufferedMediumCeiling(selected, ceiling, ceilingDelivery, ceilingEfficiency)
+	if s.weakUncleanGain(obs) {
+		return s.handleWeakUncleanGain(obs)
 	}
+	if s.senderLimitedHeadroomProbe(obs) || s.cleanHigherThroughputCollapse(obs) {
+		s.rejectedHigherProbe = obs.rate > s.ceiling
+		return true
+	}
+	s.setCeilingFromObservation(obs)
+	return s.stopAfterAcceptedUnclean(obs)
+}
+
+func (s *externalDirectUDPRateCeilingSelector) selectedLossyGain(obs externalDirectUDPRateProbeObservation) bool {
+	return s.selected >= externalDirectUDPRateProbeHighHeadroomMin &&
+		obs.rate == s.selected &&
+		obs.delivery >= externalDirectUDPRateProbeLossySelect &&
+		obs.goodput >= externalDirectUDPRateProbeHighHeadroomMin &&
+		obs.goodput >= s.priorGoodput()*externalDirectUDPRateProbeMaterialGain
+}
+
+func (s *externalDirectUDPRateCeilingSelector) uncleanInefficient(obs externalDirectUDPRateProbeObservation) bool {
+	return obs.delivery < externalDirectUDPRateProbeClean &&
+		!(obs.delivery >= externalDirectUDPRateProbeNearClean && obs.efficiency >= externalDirectUDPRateProbeCeilingEfficient)
+}
+
+func (s *externalDirectUDPRateCeilingSelector) handleUncleanInefficient(obs externalDirectUDPRateProbeObservation) bool {
+	s.rejectedHigherProbe = obs.rate > s.ceiling
+	if s.cappedTopHighGoodput(obs) {
+		s.setCeilingRateDetails(obs)
+		return true
+	}
+	if s.meaningfulNextTier(obs) {
+		s.setCeilingRateDetails(obs)
+	}
+	if s.boundedLossyObservedGoodputCeiling(obs) {
+		s.ceiling = int(obs.goodput + 0.5)
+		s.ceilingDelivery = obs.delivery
+		s.ceilingEfficiency = obs.efficiency
+		s.lossyImprovingCeiling = true
+	}
+	if s.lossyStillImproving(obs) {
+		s.setCeilingFromObservation(obs)
+		s.lossyImprovingCeiling = true
+		s.rejectedHigherProbe = false
+		return false
+	}
+	return true
+}
+
+func (s *externalDirectUDPRateCeilingSelector) weakUncleanGain(obs externalDirectUDPRateProbeObservation) bool {
+	return obs.delivery < externalDirectUDPRateProbeClean &&
+		obs.rate > s.selected &&
+		obs.efficiency < externalDirectUDPRateProbeCeilingEfficient &&
+		!s.highThroughputKnee(obs) &&
+		s.ceilingGoodput > 0 &&
+		obs.goodput < s.ceilingGoodput*externalDirectUDPRateProbeSentGrowth
+}
+
+func (s *externalDirectUDPRateCeilingSelector) handleWeakUncleanGain(obs externalDirectUDPRateProbeObservation) bool {
+	s.rejectedHigherProbe = obs.rate > s.ceiling
+	if s.cappedTopHighGoodput(obs) || s.meaningfulNextTier(obs) {
+		s.setCeilingRateDetails(obs)
+	}
+	return true
+}
+
+func (s *externalDirectUDPRateCeilingSelector) senderLimitedHeadroomProbe(obs externalDirectUDPRateProbeObservation) bool {
+	return s.selected > externalDirectUDPActiveLaneTwoMaxMbps &&
+		s.selected < externalDirectUDPRateProbeConfirmMinMbps &&
+		obs.rate > s.selected &&
+		obs.rate >= externalDirectUDPRateProbeCollapseMinMbps &&
+		obs.delivery >= externalDirectUDPRateProbeClean &&
+		obs.efficiency > 0 &&
+		obs.efficiency < externalDirectUDPRateProbeEfficient &&
+		s.ceilingGoodput >= externalDirectUDPRateProbeHighHeadroomMin &&
+		obs.goodput < s.ceilingGoodput*externalDirectUDPRateProbeMaterialGain
+}
+
+func (s *externalDirectUDPRateCeilingSelector) cleanHigherThroughputCollapse(obs externalDirectUDPRateProbeObservation) bool {
+	return s.selected >= externalDirectUDPRateProbeCollapseMinMbps &&
+		obs.rate > s.selected &&
+		obs.delivery >= externalDirectUDPRateProbeClean &&
+		obs.efficiency > 0 &&
+		obs.efficiency < externalDirectUDPRateProbeEfficient &&
+		s.ceilingGoodput >= externalDirectUDPRateProbeHighHeadroomMin &&
+		obs.goodput < s.ceilingGoodput*externalDirectUDPRateProbeSentGrowth
+}
+
+func (s *externalDirectUDPRateCeilingSelector) stopAfterAcceptedUnclean(obs externalDirectUDPRateProbeObservation) bool {
+	if obs.delivery >= externalDirectUDPRateProbeClean || obs.rate <= s.selected || obs.efficiency >= externalDirectUDPRateProbeCeilingEfficient || s.highThroughputKnee(obs) {
+		return false
+	}
+	if s.selected == externalDirectUDPProbeKneeHeadroom(obs.rate) && !s.probedPastSelectedHeadroom {
+		s.probedPastSelectedHeadroom = true
+		return false
+	}
+	s.rejectedHigherProbe = obs.rate > s.ceiling
+	return true
+}
+
+func (s *externalDirectUDPRateCeilingSelector) priorGoodput() float64 {
+	if s.ceilingGoodput > 0 {
+		return s.ceilingGoodput
+	}
+	return s.previousGoodput
+}
+
+func (s *externalDirectUDPRateCeilingSelector) cappedTopHighGoodput(obs externalDirectUDPRateProbeObservation) bool {
+	return externalDirectUDPHighGoodputCappedTopProbe(s.maxRateMbps, s.highestProbeRate, obs.rate, obs.goodput, obs.delivery, s.priorGoodput())
+}
+
+func (s *externalDirectUDPRateCeilingSelector) highThroughputKnee(obs externalDirectUDPRateProbeObservation) bool {
+	return obs.goodput >= float64(s.maxRateMbps)*externalDirectUDPRateProbeHighShare &&
+		(s.ceilingGoodput <= 0 || obs.goodput >= s.ceilingGoodput*externalDirectUDPRateProbeHighGain)
+}
+
+func (s *externalDirectUDPRateCeilingSelector) meaningfulNextTier(obs externalDirectUDPRateProbeObservation) bool {
+	return s.ceilingGoodput >= externalDirectUDPRateProbeCeilingFloorMin &&
+		obs.rate > s.ceiling &&
+		obs.goodput >= s.ceilingGoodput*externalDirectUDPRateProbeCeilingFloor &&
+		(obs.delivery >= externalDirectUDPRateProbeCeilingDelivery || s.nearCleanCeiling() || s.highSelectedHeadroom(obs))
+}
+
+func (s *externalDirectUDPRateCeilingSelector) nearCleanCeiling() bool {
+	return s.ceilingDelivery >= externalDirectUDPRateProbeNearClean && s.ceilingDelivery < externalDirectUDPRateProbeClean
+}
+
+func (s *externalDirectUDPRateCeilingSelector) highSelectedHeadroom(obs externalDirectUDPRateProbeObservation) bool {
+	return s.selected >= externalDirectUDPRateProbeCollapseMinMbps &&
+		obs.rate == s.highestProbeRate &&
+		obs.goodput >= externalDirectUDPRateProbeCeilingFloorMin &&
+		obs.delivery >= externalDirectUDPRateProbeCeilingDelivery
+}
+
+func (s *externalDirectUDPRateCeilingSelector) boundedLossyObservedGoodputCeiling(obs externalDirectUDPRateProbeObservation) bool {
+	return s.selected >= externalDirectUDPRateProbeCollapseMinMbps &&
+		obs.rate == s.highestProbeRate &&
+		obs.delivery >= externalDirectUDPRateProbeLossyDelivery &&
+		obs.delivery < externalDirectUDPRateProbeCeilingDelivery &&
+		obs.goodput >= float64(s.selected)*1.10 &&
+		obs.goodput >= s.priorGoodput()*externalDirectUDPRateProbeLossyGain
+}
+
+func (s *externalDirectUDPRateCeilingSelector) lossyStillImproving(obs externalDirectUDPRateProbeObservation) bool {
+	allowed := s.selected < externalDirectUDPCeilingHeadroomMinMbps ||
+		(s.selected >= externalDirectUDPRateProbeCollapseMinMbps && obs.rate == s.highestProbeRate)
+	return allowed && externalDirectUDPLossyProbeStillImproving(obs.rate, obs.goodput, obs.delivery, s.priorGoodput())
+}
+
+func (s *externalDirectUDPRateCeilingSelector) setCeilingFromObservation(obs externalDirectUDPRateProbeObservation) {
+	s.ceiling = obs.rate
+	s.ceilingGoodput = obs.goodput
+	s.ceilingDelivery = obs.delivery
+	s.ceilingEfficiency = obs.efficiency
+}
+
+func (s *externalDirectUDPRateCeilingSelector) setCeilingRateDetails(obs externalDirectUDPRateProbeObservation) {
+	s.ceiling = obs.rate
+	s.ceilingDelivery = obs.delivery
+	s.ceilingEfficiency = obs.efficiency
+}
+
+func (s *externalDirectUDPRateCeilingSelector) applyPostScanCeilings() {
+	s.applyLossyRecoveryCeiling()
+	s.applyLossyHighSelectedExplorationCeiling()
+	s.applyAdaptiveExplorationCeiling()
+}
+
+func (s *externalDirectUDPRateCeilingSelector) applyLossyRecoveryCeiling() {
+	rate, _, delivery, efficiency, ok := externalDirectUDPFindLossyRecoveryProbe(s.selected, s.selectedGoodput, s.sentByRate, s.received)
+	if ok && rate > s.ceiling {
+		s.ceiling = rate
+		s.ceilingDelivery = delivery
+		s.ceilingEfficiency = efficiency
+	}
+}
+
+func (s *externalDirectUDPRateCeilingSelector) applyLossyHighSelectedExplorationCeiling() {
+	rate, _, delivery, efficiency, ok := externalDirectUDPFindLossyHighSelectedExplorationCeiling(s.selected, s.selectedGoodput, s.selectedDelivery, s.sentByRate, s.received, s.maxRateMbps)
+	if ok && rate > s.ceiling {
+		s.ceiling = rate
+		s.ceilingDelivery = delivery
+		s.ceilingEfficiency = efficiency
+		s.lossyImprovingCeiling = true
+	}
+}
+
+func (s *externalDirectUDPRateCeilingSelector) applyAdaptiveExplorationCeiling() {
+	rate, _, delivery, efficiency, ok := externalDirectUDPFindAdaptiveExplorationCeiling(s.selected, s.selectedGoodput, s.sentByRate, s.received, s.maxRateMbps)
+	if ok && rate > s.ceiling {
+		s.ceiling = rate
+		s.ceilingDelivery = delivery
+		s.ceilingEfficiency = efficiency
+		s.lossyImprovingCeiling = true
+	}
+}
+
+func (s *externalDirectUDPRateCeilingSelector) finalCeiling() int {
+	if s.ceiling == s.highestProbeRate && s.highestProbeRate > 0 && s.highestProbeRate == s.maxRateMbps && s.ceilingDelivery >= externalDirectUDPRateProbeClean && s.ceilingEfficiency >= externalDirectUDPRateProbeEfficient {
+		return s.maxRateMbps
+	}
+	if s.selected < externalDirectUDPCeilingHeadroomMinMbps && s.ceiling > externalDirectUDPRateProbeHighHeadroomMin && s.rejectedHigherProbe {
+		s.ceiling = externalDirectUDPRateProbeHighHeadroomMin
+	}
+	if !s.lossyImprovingCeiling {
+		s.ceiling = externalDirectUDPCapBufferedMediumCeiling(s.selected, s.ceiling, s.ceilingDelivery, s.ceilingEfficiency)
+	}
+	return externalDirectUDPClampRateCeiling(s.ceiling, s.selected, s.maxRateMbps)
+}
+
+func externalDirectUDPClampRateCeiling(ceiling int, selected int, maxRateMbps int) int {
 	if ceiling < selected {
-		ceiling = selected
+		return selected
 	}
 	if ceiling > maxRateMbps {
-		ceiling = maxRateMbps
+		return maxRateMbps
 	}
 	return ceiling
 }
@@ -3957,78 +5299,152 @@ func externalDirectUDPProbeLacksCleanWarmupForSelectedRate(selected int, sent []
 	if selected < externalDirectUDPActiveLaneTwoMaxMbps {
 		return false
 	}
-	sentByRate := make(map[int]directUDPRateProbeSample, len(sent))
-	for _, sample := range sent {
-		sentByRate[sample.RateMbps] = sample
-	}
-	cleanWarmup := false
-	selectedDelivery := 0.0
-	selectedProgress := false
-	selectedObserved := false
+	warmup := externalDirectUDPProbeWarmupState{selected: selected, sentByRate: externalDirectUDPProbeSamplesByRate(sent)}
 	for _, sample := range received {
-		_, delivery, _, ok := externalDirectUDPProbeMetrics(sample, sentByRate)
-		if !ok {
-			continue
-		}
-		if sample.RateMbps < selected {
-			if sample.BytesReceived > 0 && delivery >= externalDirectUDPRateProbeNearClean {
-				cleanWarmup = true
-			}
-			continue
-		}
-		if sample.RateMbps != selected {
-			continue
-		}
-		selectedObserved = true
-		selectedProgress = sample.BytesReceived > 0
-		selectedDelivery = delivery
+		warmup.observe(sample)
 	}
-	return selectedObserved && selectedProgress && selectedDelivery < externalDirectUDPRateProbeNearClean && !cleanWarmup
+	return warmup.lacksCleanWarmup()
+}
+
+type externalDirectUDPProbeWarmupState struct {
+	selected         int
+	sentByRate       map[int]directUDPRateProbeSample
+	cleanWarmup      bool
+	selectedDelivery float64
+	selectedProgress bool
+	selectedObserved bool
+}
+
+func (s *externalDirectUDPProbeWarmupState) observe(sample directUDPRateProbeSample) {
+	_, delivery, _, ok := externalDirectUDPProbeMetrics(sample, s.sentByRate)
+	if !ok {
+		return
+	}
+	if sample.RateMbps < s.selected {
+		s.observeWarmupSample(sample, delivery)
+		return
+	}
+	if sample.RateMbps != s.selected {
+		return
+	}
+	s.observeSelectedSample(sample, delivery)
+}
+
+func (s *externalDirectUDPProbeWarmupState) observeWarmupSample(sample directUDPRateProbeSample, delivery float64) {
+	if sample.BytesReceived > 0 && delivery >= externalDirectUDPRateProbeNearClean {
+		s.cleanWarmup = true
+	}
+}
+
+func (s *externalDirectUDPProbeWarmupState) observeSelectedSample(sample directUDPRateProbeSample, delivery float64) {
+	s.selectedObserved = true
+	s.selectedProgress = sample.BytesReceived > 0
+	s.selectedDelivery = delivery
+}
+
+func (s externalDirectUDPProbeWarmupState) lacksCleanWarmup() bool {
+	return s.selectedObserved && s.selectedProgress && s.selectedDelivery < externalDirectUDPRateProbeNearClean && !s.cleanWarmup
 }
 
 func externalDirectUDPProbeConservativeRampCap(sent []directUDPRateProbeSample, received []directUDPRateProbeSample) (int, bool) {
-	sentByRate := make(map[int]directUDPRateProbeSample, len(sent))
-	for _, sample := range sent {
-		sentByRate[sample.RateMbps] = sample
-	}
-	cleanLowerRate := 0
-	cleanTwoLaneRamp := false
-	lossyTwoLaneRamp := false
-	lossyIntermediateProbe := false
-	higherNearCleanRecovery := false
+	ramp := externalDirectUDPConservativeRampState{sentByRate: externalDirectUDPProbeSamplesByRate(sent)}
 	for _, sample := range received {
-		goodput, delivery, _, ok := externalDirectUDPProbeMetrics(sample, sentByRate)
-		if !ok || sample.BytesReceived <= 0 {
-			continue
-		}
-		switch {
-		case sample.RateMbps < externalDirectUDPActiveLaneTwoMaxMbps:
-			if delivery >= externalDirectUDPRateProbeNearClean && sample.RateMbps > cleanLowerRate {
-				cleanLowerRate = sample.RateMbps
-			}
-		case sample.RateMbps == externalDirectUDPActiveLaneTwoMaxMbps:
-			if delivery >= externalDirectUDPRateProbeNearClean {
-				cleanTwoLaneRamp = true
-			} else if delivery < externalDirectUDPRateProbeBufferedCollapse {
-				lossyTwoLaneRamp = true
-			}
-		case sample.RateMbps > externalDirectUDPActiveLaneTwoMaxMbps && sample.RateMbps < externalDirectUDPDataStartHighMbps:
-			if delivery < externalDirectUDPRateProbeNearClean {
-				lossyIntermediateProbe = true
-			}
-		case sample.RateMbps >= externalDirectUDPDataStartHighMbps:
-			if delivery >= externalDirectUDPRateProbeNearClean && goodput >= externalDirectUDPRateProbeHighHeadroomMin {
-				higherNearCleanRecovery = true
-			}
-		}
+		ramp.observe(sample)
 	}
-	if (!lossyTwoLaneRamp && !cleanTwoLaneRamp) || !lossyIntermediateProbe || higherNearCleanRecovery {
+	return ramp.cap()
+}
+
+type externalDirectUDPConservativeRampState struct {
+	sentByRate              map[int]directUDPRateProbeSample
+	cleanLowerRate          int
+	cleanTwoLaneRamp        bool
+	lossyTwoLaneRamp        bool
+	lossyIntermediateProbe  bool
+	higherNearCleanRecovery bool
+}
+
+type externalDirectUDPConservativeRampBand uint8
+
+const (
+	externalDirectUDPConservativeRampBandNone externalDirectUDPConservativeRampBand = iota
+	externalDirectUDPConservativeRampBandLower
+	externalDirectUDPConservativeRampBandTwoLane
+	externalDirectUDPConservativeRampBandIntermediate
+	externalDirectUDPConservativeRampBandHigh
+)
+
+func (s *externalDirectUDPConservativeRampState) observe(sample directUDPRateProbeSample) {
+	goodput, delivery, _, ok := externalDirectUDPProbeMetrics(sample, s.sentByRate)
+	if !ok {
+		return
+	}
+	if sample.BytesReceived <= 0 {
+		return
+	}
+	switch externalDirectUDPConservativeRampBandForRate(sample.RateMbps) {
+	case externalDirectUDPConservativeRampBandLower:
+		s.observeLowerRamp(sample.RateMbps, delivery)
+	case externalDirectUDPConservativeRampBandTwoLane:
+		s.observeTwoLaneRamp(delivery)
+	case externalDirectUDPConservativeRampBandIntermediate:
+		s.observeIntermediateRamp(delivery)
+	case externalDirectUDPConservativeRampBandHigh:
+		s.observeHighRamp(goodput, delivery)
+	case externalDirectUDPConservativeRampBandNone:
+	}
+}
+
+func externalDirectUDPConservativeRampBandForRate(rateMbps int) externalDirectUDPConservativeRampBand {
+	switch {
+	case rateMbps < externalDirectUDPActiveLaneTwoMaxMbps:
+		return externalDirectUDPConservativeRampBandLower
+	case rateMbps == externalDirectUDPActiveLaneTwoMaxMbps:
+		return externalDirectUDPConservativeRampBandTwoLane
+	case rateMbps < externalDirectUDPDataStartHighMbps:
+		return externalDirectUDPConservativeRampBandIntermediate
+	case rateMbps >= externalDirectUDPDataStartHighMbps:
+		return externalDirectUDPConservativeRampBandHigh
+	default:
+		return externalDirectUDPConservativeRampBandNone
+	}
+}
+
+func (s *externalDirectUDPConservativeRampState) observeLowerRamp(rateMbps int, delivery float64) {
+	if delivery >= externalDirectUDPRateProbeNearClean && rateMbps > s.cleanLowerRate {
+		s.cleanLowerRate = rateMbps
+	}
+}
+
+func (s *externalDirectUDPConservativeRampState) observeTwoLaneRamp(delivery float64) {
+	if delivery >= externalDirectUDPRateProbeNearClean {
+		s.cleanTwoLaneRamp = true
+		return
+	}
+	if delivery < externalDirectUDPRateProbeBufferedCollapse {
+		s.lossyTwoLaneRamp = true
+	}
+}
+
+func (s *externalDirectUDPConservativeRampState) observeIntermediateRamp(delivery float64) {
+	if delivery < externalDirectUDPRateProbeNearClean {
+		s.lossyIntermediateProbe = true
+	}
+}
+
+func (s *externalDirectUDPConservativeRampState) observeHighRamp(goodput float64, delivery float64) {
+	if delivery >= externalDirectUDPRateProbeNearClean && goodput >= externalDirectUDPRateProbeHighHeadroomMin {
+		s.higherNearCleanRecovery = true
+	}
+}
+
+func (s externalDirectUDPConservativeRampState) cap() (int, bool) {
+	if (!s.lossyTwoLaneRamp && !s.cleanTwoLaneRamp) || !s.lossyIntermediateProbe || s.higherNearCleanRecovery {
 		return 0, false
 	}
-	if cleanLowerRate > 0 {
-		return cleanLowerRate, true
+	if s.cleanLowerRate > 0 {
+		return s.cleanLowerRate, true
 	}
-	if cleanTwoLaneRamp {
+	if s.cleanTwoLaneRamp {
 		return externalDirectUDPActiveLaneTwoMaxMbps, true
 	}
 	return externalDirectUDPDataStartMaxMbps, true
@@ -4089,44 +5505,16 @@ func externalDirectUDPFindAdaptiveExplorationCeiling(selected int, baseGoodput f
 	if selected != externalDirectUDPActiveLaneTwoMaxMbps || baseGoodput < externalDirectUDPRateProbeCeilingFloorMin {
 		return 0, 0, 0, 0, false
 	}
-	threshold := baseGoodput * externalDirectUDPRateProbeLossyGain
-	if threshold < externalDirectUDPRateProbeHighHeadroomMin {
-		threshold = externalDirectUDPRateProbeHighHeadroomMin
+	selection := externalDirectUDPAdaptiveExplorationSelection{
+		selected:    selected,
+		maxRateMbps: maxRateMbps,
+		threshold:   externalDirectUDPProbeThreshold(baseGoodput, externalDirectUDPRateProbeLossyGain),
+		sentByRate:  sentByRate,
 	}
-	bestRate := 0
-	bestGoodput := 0.0
-	bestDelivery := 0.0
-	bestEfficiency := 0.0
-	highestRate := 0
-	highestGoodput := 0.0
-	highestDelivery := 0.0
-	highestEfficiency := 0.0
 	for _, sample := range received {
-		if sample.RateMbps <= selected || sample.RateMbps > maxRateMbps {
-			continue
-		}
-		goodput, delivery, efficiency, ok := externalDirectUDPProbeMetrics(sample, sentByRate)
-		if ok && sample.RateMbps >= highestRate {
-			highestRate = sample.RateMbps
-			highestGoodput = goodput
-			highestDelivery = delivery
-			highestEfficiency = efficiency
-		}
-		if !ok || delivery < externalDirectUDPRateProbeHeadroomDelivery || goodput < threshold {
-			continue
-		}
-		if goodput < bestGoodput || (goodput == bestGoodput && sample.RateMbps < bestRate) {
-			continue
-		}
-		bestRate = sample.RateMbps
-		bestGoodput = goodput
-		bestDelivery = delivery
-		bestEfficiency = efficiency
+		selection.observe(sample)
 	}
-	if bestRate > 0 && highestRate > bestRate && highestDelivery >= externalDirectUDPRateProbeHeadroomDelivery && highestGoodput >= bestGoodput*externalDirectUDPRateProbeLossyGain {
-		return highestRate, highestGoodput, highestDelivery, highestEfficiency, true
-	}
-	return bestRate, bestGoodput, bestDelivery, bestEfficiency, bestRate > 0
+	return selection.result()
 }
 
 func externalDirectUDPFindLossyHighSelectedExplorationCeiling(selected int, baseGoodput float64, selectedDelivery float64, sentByRate map[int]directUDPRateProbeSample, received []directUDPRateProbeSample, maxRateMbps int) (int, float64, float64, float64, bool) {
@@ -4139,31 +5527,107 @@ func externalDirectUDPFindLossyHighSelectedExplorationCeiling(selected int, base
 		(selectedDelivery >= externalDirectUDPRateProbeLossySelect && selectedEfficiency > externalDirectUDPRateProbeEfficient) {
 		return 0, 0, 0, 0, false
 	}
-	threshold := baseGoodput * externalDirectUDPRateProbeLossyGain
-	if threshold < externalDirectUDPRateProbeHighHeadroomMin {
-		threshold = externalDirectUDPRateProbeHighHeadroomMin
+	selection := externalDirectUDPLossyHighSelectedExplorationSelection{
+		selected:    selected,
+		maxRateMbps: maxRateMbps,
+		threshold:   externalDirectUDPProbeThreshold(baseGoodput, externalDirectUDPRateProbeLossyGain),
+		sentByRate:  sentByRate,
 	}
-	bestRate := 0
-	bestGoodput := 0.0
-	bestDelivery := 0.0
-	bestEfficiency := 0.0
 	for _, sample := range received {
-		if sample.RateMbps <= selected || sample.RateMbps > maxRateMbps {
-			continue
-		}
-		goodput, delivery, efficiency, ok := externalDirectUDPProbeMetrics(sample, sentByRate)
-		if !ok || delivery < externalDirectUDPRateProbeLossyDelivery || goodput < threshold {
-			continue
-		}
-		if goodput < bestGoodput || (goodput == bestGoodput && sample.RateMbps > bestRate) {
-			continue
-		}
-		bestRate = sample.RateMbps
-		bestGoodput = goodput
-		bestDelivery = delivery
-		bestEfficiency = efficiency
+		selection.observe(sample)
 	}
-	return bestRate, bestGoodput, bestDelivery, bestEfficiency, bestRate > 0
+	return selection.best.result()
+}
+
+func externalDirectUDPProbeThreshold(baseGoodput float64, gain float64) float64 {
+	threshold := baseGoodput * gain
+	if threshold < externalDirectUDPRateProbeHighHeadroomMin {
+		return externalDirectUDPRateProbeHighHeadroomMin
+	}
+	return threshold
+}
+
+type externalDirectUDPProbeBest struct {
+	rate       int
+	goodput    float64
+	delivery   float64
+	efficiency float64
+}
+
+func (b externalDirectUDPProbeBest) result() (int, float64, float64, float64, bool) {
+	return b.rate, b.goodput, b.delivery, b.efficiency, b.rate > 0
+}
+
+func (b *externalDirectUDPProbeBest) set(rate int, goodput float64, delivery float64, efficiency float64) {
+	b.rate = rate
+	b.goodput = goodput
+	b.delivery = delivery
+	b.efficiency = efficiency
+}
+
+type externalDirectUDPAdaptiveExplorationSelection struct {
+	selected    int
+	maxRateMbps int
+	threshold   float64
+	sentByRate  map[int]directUDPRateProbeSample
+	best        externalDirectUDPProbeBest
+	highest     externalDirectUDPProbeBest
+}
+
+func (s *externalDirectUDPAdaptiveExplorationSelection) observe(sample directUDPRateProbeSample) {
+	if sample.RateMbps <= s.selected || sample.RateMbps > s.maxRateMbps {
+		return
+	}
+	goodput, delivery, efficiency, ok := externalDirectUDPProbeMetrics(sample, s.sentByRate)
+	if !ok {
+		return
+	}
+	if sample.RateMbps >= s.highest.rate {
+		s.highest.set(sample.RateMbps, goodput, delivery, efficiency)
+	}
+	if delivery < externalDirectUDPRateProbeHeadroomDelivery || goodput < s.threshold {
+		return
+	}
+	if goodput < s.best.goodput || (goodput == s.best.goodput && sample.RateMbps < s.best.rate) {
+		return
+	}
+	s.best.set(sample.RateMbps, goodput, delivery, efficiency)
+}
+
+func (s externalDirectUDPAdaptiveExplorationSelection) result() (int, float64, float64, float64, bool) {
+	if s.shouldPreferHighest() {
+		return s.highest.result()
+	}
+	return s.best.result()
+}
+
+func (s externalDirectUDPAdaptiveExplorationSelection) shouldPreferHighest() bool {
+	return s.best.rate > 0 &&
+		s.highest.rate > s.best.rate &&
+		s.highest.delivery >= externalDirectUDPRateProbeHeadroomDelivery &&
+		s.highest.goodput >= s.best.goodput*externalDirectUDPRateProbeLossyGain
+}
+
+type externalDirectUDPLossyHighSelectedExplorationSelection struct {
+	selected    int
+	maxRateMbps int
+	threshold   float64
+	sentByRate  map[int]directUDPRateProbeSample
+	best        externalDirectUDPProbeBest
+}
+
+func (s *externalDirectUDPLossyHighSelectedExplorationSelection) observe(sample directUDPRateProbeSample) {
+	if sample.RateMbps <= s.selected || sample.RateMbps > s.maxRateMbps {
+		return
+	}
+	goodput, delivery, efficiency, ok := externalDirectUDPProbeMetrics(sample, s.sentByRate)
+	if !ok || delivery < externalDirectUDPRateProbeLossyDelivery || goodput < s.threshold {
+		return
+	}
+	if goodput < s.best.goodput || (goodput == s.best.goodput && sample.RateMbps > s.best.rate) {
+		return
+	}
+	s.best.set(sample.RateMbps, goodput, delivery, efficiency)
 }
 
 func externalDirectUDPLossyProbeStillImproving(rateMbps int, goodput float64, delivery float64, previousGoodput float64) bool {
@@ -4178,33 +5642,43 @@ func externalDirectUDPCapBufferedMediumCeiling(selected int, ceiling int, delive
 	if selected <= 0 || ceiling <= selected || selected >= externalDirectUDPRateProbeHighHeadroomMin {
 		return ceiling
 	}
-	if selected >= externalDirectUDPCeilingHeadroomMinMbps && efficiency > 0 && efficiency < externalDirectUDPRateProbeCeilingEfficient {
-		capped := externalDirectUDPRateProbeHighHeadroomMin
-		if ceiling > capped {
-			return capped
-		}
+	if externalDirectUDPShouldCapInefficientMediumCeiling(selected, efficiency) {
+		return externalDirectUDPMinRate(ceiling, externalDirectUDPRateProbeHighHeadroomMin)
+	}
+	if externalDirectUDPBufferedMediumCeilingIsCleanEnough(selected, delivery) {
 		return ceiling
 	}
-	if delivery >= externalDirectUDPRateProbeClean {
-		return ceiling
-	}
-	if selected < externalDirectUDPCeilingHeadroomMinMbps && delivery >= externalDirectUDPRateProbeCeilingDelivery {
-		return ceiling
-	}
+	return externalDirectUDPMinRate(ceiling, externalDirectUDPBufferedMediumCeilingCap(selected))
+}
+
+func externalDirectUDPShouldCapInefficientMediumCeiling(selected int, efficiency float64) bool {
+	return selected >= externalDirectUDPCeilingHeadroomMinMbps && efficiency > 0 && efficiency < externalDirectUDPRateProbeCeilingEfficient
+}
+
+func externalDirectUDPBufferedMediumCeilingIsCleanEnough(selected int, delivery float64) bool {
+	return delivery >= externalDirectUDPRateProbeClean ||
+		(selected < externalDirectUDPCeilingHeadroomMinMbps && delivery >= externalDirectUDPRateProbeCeilingDelivery)
+}
+
+func externalDirectUDPBufferedMediumCeilingCap(selected int) int {
 	capped := selected * 2
 	if selected >= externalDirectUDPDataStartMaxMbps && selected < externalDirectUDPRateProbeHighHeadroomMin {
 		capped = externalDirectUDPRateProbeHighHeadroomMin
 	}
 	if capped < selected {
-		return ceiling
+		return 0
 	}
 	if capped < externalDirectUDPRateProbeMinMbps {
-		capped = externalDirectUDPRateProbeMinMbps
+		return externalDirectUDPRateProbeMinMbps
 	}
-	if ceiling > capped {
-		return capped
+	return capped
+}
+
+func externalDirectUDPMinRate(rate int, max int) int {
+	if max <= 0 || rate <= max {
+		return rate
 	}
-	return ceiling
+	return max
 }
 
 func externalDirectUDPHighestProbeRate(samples []directUDPRateProbeSample, maxRateMbps int) int {
@@ -4224,158 +5698,285 @@ func externalDirectUDPAddProbeKneeHeadroom(maxRateMbps int, selected int, sent [
 	if selected <= 0 {
 		return selected
 	}
-	sentByRate := make(map[int]directUDPRateProbeSample, len(sent))
-	for _, sample := range sent {
-		sentByRate[sample.RateMbps] = sample
+	selector := newExternalDirectUDPProbeKneeHeadroomSelector(maxRateMbps, selected, sent, received)
+	return selector.selectRate()
+}
+
+type externalDirectUDPProbeKneeObservation struct {
+	rate           int
+	goodput        float64
+	delivery       float64
+	efficiency     float64
+	sentEfficiency float64
+	sentOK         bool
+}
+
+type externalDirectUDPProbeKneeHeadroomSelector struct {
+	maxRateMbps           int
+	selected              int
+	sentByRate            map[int]directUDPRateProbeSample
+	received              []directUDPRateProbeSample
+	highestProbeRate      int
+	prevGoodput           float64
+	prevBelowSelectedRate int
+	selectedGoodput       float64
+	selectedProbeViable   bool
+	selectedProbeClean    bool
+}
+
+func newExternalDirectUDPProbeKneeHeadroomSelector(maxRateMbps int, selected int, sent []directUDPRateProbeSample, received []directUDPRateProbeSample) *externalDirectUDPProbeKneeHeadroomSelector {
+	return &externalDirectUDPProbeKneeHeadroomSelector{
+		maxRateMbps:      maxRateMbps,
+		selected:         selected,
+		sentByRate:       externalDirectUDPProbeSamplesByRate(sent),
+		received:         received,
+		highestProbeRate: externalDirectUDPHighestProbeRate(received, maxRateMbps),
 	}
-	highestProbeRate := externalDirectUDPHighestProbeRate(received, maxRateMbps)
-	prevGoodput := 0.0
-	prevBelowSelectedRate := 0
-	selectedGoodput := 0.0
-	selectedProbeViable := false
-	selectedProbeClean := false
-	for _, sample := range received {
-		durationMillis := sample.DurationMillis
-		if durationMillis <= 0 {
-			durationMillis = externalDirectUDPRateProbeDuration.Milliseconds()
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) selectRate() int {
+	for _, sample := range s.received {
+		obs := s.observation(sample)
+		if obs.rate < s.selected {
+			s.prevBelowSelectedRate = obs.rate
 		}
-		goodput := externalDirectUDPSampleGoodputMbps(sample.BytesReceived, durationMillis)
-		if sample.RateMbps < selected {
-			prevBelowSelectedRate = sample.RateMbps
-		}
-		sentSample, ok := sentByRate[sample.RateMbps]
-		sampleMatchesSelectedTier := sample.RateMbps == selected ||
-			(selected >= externalDirectUDPRateProbeCollapseMinMbps &&
-				sample.RateMbps < selected &&
-				sample.RateMbps >= externalDirectUDPRateProbeCollapseMinMbps)
-		if ok && sentSample.BytesSent > 0 && sampleMatchesSelectedTier {
-			delivery := float64(sample.BytesReceived) / float64(sentSample.BytesSent)
-			efficiency := 0.0
-			if sample.RateMbps > 0 {
-				efficiency = goodput / float64(sample.RateMbps)
-			}
-			lossySelectedGain := sample.RateMbps >= externalDirectUDPRateProbeCollapseMinMbps &&
-				delivery >= externalDirectUDPRateProbeLossyDelivery &&
-				goodput >= externalDirectUDPRateProbeHighHeadroomMin &&
-				prevGoodput > 0 &&
-				goodput >= prevGoodput*externalDirectUDPRateProbeMaterialGain
-			selectedGoodput = goodput
-			selectedProbeClean = delivery >= externalDirectUDPRateProbeClean
-			selectedProbeViable = (delivery >= externalDirectUDPRateProbeNearClean && efficiency >= externalDirectUDPRateProbeEfficient) ||
-				(sample.RateMbps >= externalDirectUDPRateProbeHighHeadroomMin &&
-					(delivery >= externalDirectUDPRateProbeClean || delivery >= externalDirectUDPRateProbeLossySelect || delivery >= externalDirectUDPRateProbeCeilingDelivery) &&
-					goodput >= externalDirectUDPRateProbeHighHeadroomMin &&
-					(goodput >= prevGoodput*externalDirectUDPRateProbeMaterialGain || goodput >= prevGoodput*externalDirectUDPRateProbeModerateGain)) ||
-				(sample.RateMbps >= externalDirectUDPRateProbeCollapseMinMbps &&
-					delivery >= externalDirectUDPRateProbeClean &&
-					goodput >= externalDirectUDPRateProbeHighHeadroomMin) ||
-				lossySelectedGain
-		}
-		if sample.RateMbps <= selected {
-			prevGoodput = goodput
+		s.recordSelectedTier(obs)
+		if obs.rate <= s.selected {
+			s.prevGoodput = obs.goodput
 			continue
 		}
-		if !ok || sentSample.BytesSent <= 0 {
+		if !obs.sentOK {
 			continue
 		}
-		sentGoodput := externalDirectUDPSampleGoodputMbps(sentSample.BytesSent, durationMillis)
-		sentEfficiency := 0.0
-		if sample.RateMbps > 0 {
-			sentEfficiency = sentGoodput / float64(sample.RateMbps)
-		}
-		delivery := float64(sample.BytesReceived) / float64(sentSample.BytesSent)
-		efficiency := 0.0
-		if sample.RateMbps > 0 {
-			efficiency = goodput / float64(sample.RateMbps)
-		}
-		highThroughputKnee := maxRateMbps > 0 && goodput >= float64(maxRateMbps)*externalDirectUDPRateProbeHighShare
-		if delivery >= externalDirectUDPRateProbeClean {
-			if efficiency < externalDirectUDPRateProbeEfficient && !highThroughputKnee {
-				if selectedProbeViable &&
-					selected >= externalDirectUDPRateProbeCollapseMinMbps &&
-					sample.RateMbps > selected &&
-					goodput >= externalDirectUDPRateProbeHighHeadroomMin &&
-					sentEfficiency < externalDirectUDPRateProbeEfficient {
-					return selected
-				}
-				if selectedProbeViable && selected >= externalDirectUDPRateProbeCollapseMinMbps && sample.RateMbps == highestProbeRate && goodput <= prevGoodput {
-					return selected
-				}
-				if selected >= externalDirectUDPRateProbeHighHeadroomMin &&
-					goodput >= externalDirectUDPRateProbeHighHeadroomMin &&
-					goodput >= prevGoodput*externalDirectUDPRateProbeSenderLimitGain {
-					return selected
-				}
-				if float64(selected) >= goodput && goodput > prevGoodput {
-					return selected
-				}
-				return externalDirectUDPProbeKneeHeadroom(selected)
-			}
-			return selected
-		}
-		if delivery >= externalDirectUDPRateProbeNearClean && efficiency >= externalDirectUDPRateProbeEfficient {
-			headroom := externalDirectUDPProbeKneeHeadroom(sample.RateMbps)
-			if selected >= externalDirectUDPRateProbeCollapseMinMbps && headroom < selected {
-				return selected
-			}
-			return headroom
-		}
-		if externalDirectUDPHighGoodputCappedTopProbe(maxRateMbps, highestProbeRate, sample.RateMbps, goodput, delivery, prevGoodput) && selected >= externalDirectUDPRateProbeHighHeadroomMin {
-			return selected
-		}
-		if selected == externalDirectUDPActiveLaneTwoMaxMbps &&
-			!selectedProbeViable &&
-			sample.RateMbps >= externalDirectUDPDataStartHighMbps &&
-			delivery >= externalDirectUDPRateProbeBufferedCollapse &&
-			goodput >= externalDirectUDPRateProbeHighHeadroomMin &&
-			selectedGoodput > 0 &&
-			goodput >= selectedGoodput*externalDirectUDPRateProbeMaterialGain {
-			return sample.RateMbps
-		}
-		if selected >= externalDirectUDPActiveLaneTwoMaxMbps &&
-			selectedProbeViable &&
-			delivery >= externalDirectUDPRateProbeLossyDelivery &&
-			goodput >= selectedGoodput*externalDirectUDPRateProbeLossyGain {
-			if selected >= externalDirectUDPRateProbeCollapseMinMbps &&
-				sample.RateMbps >= externalDirectUDPRateProbeConfirmMinMbps &&
-				delivery >= externalDirectUDPRateProbeCeilingDelivery &&
-				goodput >= selectedGoodput*externalDirectUDPRateProbeMaterialGain {
-				return sample.RateMbps
-			}
-			return selected
-		}
-		if selected == externalDirectUDPActiveLaneTwoMaxMbps &&
-			selectedProbeClean &&
-			delivery < externalDirectUDPRateProbeBufferedCollapse &&
-			goodput < selectedGoodput*externalDirectUDPRateProbeLossyGain {
-			return selected
-		}
-		if selected >= externalDirectUDPRateProbeCollapseMinMbps && delivery < externalDirectUDPRateProbeBufferedCollapse && prevBelowSelectedRate > 0 {
-			if selectedProbeViable &&
-				selected >= externalDirectUDPRateProbeConfirmMinMbps &&
-				delivery >= externalDirectUDPRateProbeLossyDelivery {
-				return selected
-			}
-			if selectedProbeViable && sentEfficiency >= externalDirectUDPRateProbeCeilingEfficient {
-				return selected
-			}
-			return externalDirectUDPProbeKneeHeadroom(prevBelowSelectedRate)
-		}
-		if selected >= externalDirectUDPActiveLaneTwoMaxMbps && selectedProbeViable && delivery < externalDirectUDPRateProbeBufferedCollapse && externalDirectUDPHasLossyHigherGoodputProbe(selected, selectedGoodput, sentByRate, received) {
-			return selected
-		}
-		if selected >= externalDirectUDPRateProbeCollapseMinMbps && selectedProbeViable && delivery >= externalDirectUDPRateProbeBufferedCollapse && goodput >= selectedGoodput {
-			return selected
-		}
-		if _, _, _, _, ok := externalDirectUDPFindLossyRecoveryProbe(selected, selectedGoodput, sentByRate, received); ok {
-			return selected
-		}
-		if selected >= externalDirectUDPRateProbeCollapseMinMbps && selectedProbeViable {
-			return selected
-		}
-		return externalDirectUDPProbeKneeHeadroom(selected)
+		return s.rateForHigherProbe(obs)
 	}
-	return selected
+	return s.selected
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) observation(sample directUDPRateProbeSample) externalDirectUDPProbeKneeObservation {
+	durationMillis := sample.DurationMillis
+	if durationMillis <= 0 {
+		durationMillis = externalDirectUDPRateProbeDuration.Milliseconds()
+	}
+	obs := externalDirectUDPProbeKneeObservation{
+		rate:    sample.RateMbps,
+		goodput: externalDirectUDPSampleGoodputMbps(sample.BytesReceived, durationMillis),
+	}
+	sentSample, ok := s.sentByRate[sample.RateMbps]
+	if !ok || sentSample.BytesSent <= 0 {
+		return obs
+	}
+	obs.sentOK = true
+	obs.delivery = float64(sample.BytesReceived) / float64(sentSample.BytesSent)
+	obs.efficiency = externalDirectUDPRateEfficiency(obs.goodput, sample.RateMbps)
+	obs.sentEfficiency = externalDirectUDPRateEfficiency(externalDirectUDPSampleGoodputMbps(sentSample.BytesSent, durationMillis), sample.RateMbps)
+	return obs
+}
+
+func externalDirectUDPRateEfficiency(goodput float64, rateMbps int) float64 {
+	if rateMbps <= 0 {
+		return 0
+	}
+	return goodput / float64(rateMbps)
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) recordSelectedTier(obs externalDirectUDPProbeKneeObservation) {
+	if !obs.sentOK || !s.matchesSelectedTier(obs.rate) {
+		return
+	}
+	lossySelectedGain := obs.rate >= externalDirectUDPRateProbeCollapseMinMbps &&
+		obs.delivery >= externalDirectUDPRateProbeLossyDelivery &&
+		obs.goodput >= externalDirectUDPRateProbeHighHeadroomMin &&
+		s.prevGoodput > 0 &&
+		obs.goodput >= s.prevGoodput*externalDirectUDPRateProbeMaterialGain
+	s.selectedGoodput = obs.goodput
+	s.selectedProbeClean = obs.delivery >= externalDirectUDPRateProbeClean
+	s.selectedProbeViable = s.selectedTierViable(obs, lossySelectedGain)
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) matchesSelectedTier(rate int) bool {
+	return rate == s.selected ||
+		(s.selected >= externalDirectUDPRateProbeCollapseMinMbps &&
+			rate < s.selected &&
+			rate >= externalDirectUDPRateProbeCollapseMinMbps)
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) selectedTierViable(obs externalDirectUDPProbeKneeObservation, lossySelectedGain bool) bool {
+	return (obs.delivery >= externalDirectUDPRateProbeNearClean && obs.efficiency >= externalDirectUDPRateProbeEfficient) ||
+		s.highSelectedTierViable(obs) ||
+		(obs.rate >= externalDirectUDPRateProbeCollapseMinMbps &&
+			obs.delivery >= externalDirectUDPRateProbeClean &&
+			obs.goodput >= externalDirectUDPRateProbeHighHeadroomMin) ||
+		lossySelectedGain
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) highSelectedTierViable(obs externalDirectUDPProbeKneeObservation) bool {
+	return obs.rate >= externalDirectUDPRateProbeHighHeadroomMin &&
+		(obs.delivery >= externalDirectUDPRateProbeClean ||
+			obs.delivery >= externalDirectUDPRateProbeLossySelect ||
+			obs.delivery >= externalDirectUDPRateProbeCeilingDelivery) &&
+		obs.goodput >= externalDirectUDPRateProbeHighHeadroomMin &&
+		(obs.goodput >= s.prevGoodput*externalDirectUDPRateProbeMaterialGain ||
+			obs.goodput >= s.prevGoodput*externalDirectUDPRateProbeModerateGain)
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) rateForHigherProbe(obs externalDirectUDPProbeKneeObservation) int {
+	if obs.delivery >= externalDirectUDPRateProbeClean {
+		return s.rateForCleanHigherProbe(obs)
+	}
+	if obs.delivery >= externalDirectUDPRateProbeNearClean && obs.efficiency >= externalDirectUDPRateProbeEfficient {
+		return s.rateForNearCleanHigherProbe(obs)
+	}
+	if rate, ok := s.rateForLossyHigherProbe(obs); ok {
+		return rate
+	}
+	return externalDirectUDPProbeKneeHeadroom(s.selected)
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) rateForLossyHigherProbe(obs externalDirectUDPProbeKneeObservation) (int, bool) {
+	if s.shouldHoldSelectedForCappedTopProbe(obs) || s.twoLaneCleanRejectsBufferedCollapse(obs) {
+		return s.selected, true
+	}
+	if s.promotesTwoLaneToDataStart(obs) {
+		return obs.rate, true
+	}
+	if rate, ok := s.rateForLossySelectedViable(obs); ok {
+		return rate, true
+	}
+	if rate, ok := s.rateForBufferedCollapse(obs); ok {
+		return rate, true
+	}
+	if s.shouldHoldSelectedForLossyHigherProbe(obs) || s.shouldHoldSelectedForBufferedProgress(obs) || s.hasLossyRecoveryProbe() || s.collapseSelectedProbeViable() {
+		return s.selected, true
+	}
+	return 0, false
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) rateForCleanHigherProbe(obs externalDirectUDPProbeKneeObservation) int {
+	if obs.efficiency >= externalDirectUDPRateProbeEfficient || s.highThroughputKnee(obs) {
+		return s.selected
+	}
+	if s.cleanHigherProbeShouldHoldSelected(obs) {
+		return s.selected
+	}
+	return externalDirectUDPProbeKneeHeadroom(s.selected)
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) cleanHigherProbeShouldHoldSelected(obs externalDirectUDPProbeKneeObservation) bool {
+	return s.selectedViableInefficientHigherProbe(obs) ||
+		s.selectedViableHighestProbeRegression(obs) ||
+		s.selectedHighSenderLimitGain(obs) ||
+		s.selectedCoversGoodputGain(obs)
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) selectedViableInefficientHigherProbe(obs externalDirectUDPProbeKneeObservation) bool {
+	return s.selectedProbeViable &&
+		s.selected >= externalDirectUDPRateProbeCollapseMinMbps &&
+		obs.rate > s.selected &&
+		obs.goodput >= externalDirectUDPRateProbeHighHeadroomMin &&
+		obs.sentEfficiency < externalDirectUDPRateProbeEfficient
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) selectedViableHighestProbeRegression(obs externalDirectUDPProbeKneeObservation) bool {
+	return s.selectedProbeViable &&
+		s.selected >= externalDirectUDPRateProbeCollapseMinMbps &&
+		obs.rate == s.highestProbeRate &&
+		obs.goodput <= s.prevGoodput
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) selectedHighSenderLimitGain(obs externalDirectUDPProbeKneeObservation) bool {
+	return s.selected >= externalDirectUDPRateProbeHighHeadroomMin &&
+		obs.goodput >= externalDirectUDPRateProbeHighHeadroomMin &&
+		obs.goodput >= s.prevGoodput*externalDirectUDPRateProbeSenderLimitGain
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) selectedCoversGoodputGain(obs externalDirectUDPProbeKneeObservation) bool {
+	return float64(s.selected) >= obs.goodput && obs.goodput > s.prevGoodput
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) rateForNearCleanHigherProbe(obs externalDirectUDPProbeKneeObservation) int {
+	headroom := externalDirectUDPProbeKneeHeadroom(obs.rate)
+	if s.selected >= externalDirectUDPRateProbeCollapseMinMbps && headroom < s.selected {
+		return s.selected
+	}
+	return headroom
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) highThroughputKnee(obs externalDirectUDPProbeKneeObservation) bool {
+	return s.maxRateMbps > 0 && obs.goodput >= float64(s.maxRateMbps)*externalDirectUDPRateProbeHighShare
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) shouldHoldSelectedForCappedTopProbe(obs externalDirectUDPProbeKneeObservation) bool {
+	return externalDirectUDPHighGoodputCappedTopProbe(s.maxRateMbps, s.highestProbeRate, obs.rate, obs.goodput, obs.delivery, s.prevGoodput) &&
+		s.selected >= externalDirectUDPRateProbeHighHeadroomMin
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) promotesTwoLaneToDataStart(obs externalDirectUDPProbeKneeObservation) bool {
+	return s.selected == externalDirectUDPActiveLaneTwoMaxMbps &&
+		!s.selectedProbeViable &&
+		obs.rate >= externalDirectUDPDataStartHighMbps &&
+		obs.delivery >= externalDirectUDPRateProbeBufferedCollapse &&
+		obs.goodput >= externalDirectUDPRateProbeHighHeadroomMin &&
+		s.selectedGoodput > 0 &&
+		obs.goodput >= s.selectedGoodput*externalDirectUDPRateProbeMaterialGain
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) rateForLossySelectedViable(obs externalDirectUDPProbeKneeObservation) (int, bool) {
+	if s.selected < externalDirectUDPActiveLaneTwoMaxMbps || !s.selectedProbeViable || obs.delivery < externalDirectUDPRateProbeLossyDelivery || obs.goodput < s.selectedGoodput*externalDirectUDPRateProbeLossyGain {
+		return 0, false
+	}
+	if s.selected >= externalDirectUDPRateProbeCollapseMinMbps &&
+		obs.rate >= externalDirectUDPRateProbeConfirmMinMbps &&
+		obs.delivery >= externalDirectUDPRateProbeCeilingDelivery &&
+		obs.goodput >= s.selectedGoodput*externalDirectUDPRateProbeMaterialGain {
+		return obs.rate, true
+	}
+	return s.selected, true
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) twoLaneCleanRejectsBufferedCollapse(obs externalDirectUDPProbeKneeObservation) bool {
+	return s.selected == externalDirectUDPActiveLaneTwoMaxMbps &&
+		s.selectedProbeClean &&
+		obs.delivery < externalDirectUDPRateProbeBufferedCollapse &&
+		obs.goodput < s.selectedGoodput*externalDirectUDPRateProbeLossyGain
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) rateForBufferedCollapse(obs externalDirectUDPProbeKneeObservation) (int, bool) {
+	if s.selected < externalDirectUDPRateProbeCollapseMinMbps || obs.delivery >= externalDirectUDPRateProbeBufferedCollapse || s.prevBelowSelectedRate <= 0 {
+		return 0, false
+	}
+	if s.selectedProbeViable &&
+		s.selected >= externalDirectUDPRateProbeConfirmMinMbps &&
+		obs.delivery >= externalDirectUDPRateProbeLossyDelivery {
+		return s.selected, true
+	}
+	if s.selectedProbeViable && obs.sentEfficiency >= externalDirectUDPRateProbeCeilingEfficient {
+		return s.selected, true
+	}
+	return externalDirectUDPProbeKneeHeadroom(s.prevBelowSelectedRate), true
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) shouldHoldSelectedForLossyHigherProbe(obs externalDirectUDPProbeKneeObservation) bool {
+	return s.selected >= externalDirectUDPActiveLaneTwoMaxMbps &&
+		s.selectedProbeViable &&
+		obs.delivery < externalDirectUDPRateProbeBufferedCollapse &&
+		externalDirectUDPHasLossyHigherGoodputProbe(s.selected, s.selectedGoodput, s.sentByRate, s.received)
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) shouldHoldSelectedForBufferedProgress(obs externalDirectUDPProbeKneeObservation) bool {
+	return s.selected >= externalDirectUDPRateProbeCollapseMinMbps &&
+		s.selectedProbeViable &&
+		obs.delivery >= externalDirectUDPRateProbeBufferedCollapse &&
+		obs.goodput >= s.selectedGoodput
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) hasLossyRecoveryProbe() bool {
+	_, _, _, _, ok := externalDirectUDPFindLossyRecoveryProbe(s.selected, s.selectedGoodput, s.sentByRate, s.received)
+	return ok
+}
+
+func (s *externalDirectUDPProbeKneeHeadroomSelector) collapseSelectedProbeViable() bool {
+	return s.selected >= externalDirectUDPRateProbeCollapseMinMbps && s.selectedProbeViable
 }
 
 func externalDirectUDPProbeKneeHeadroom(selected int) int {
@@ -4407,49 +6008,52 @@ func externalDirectUDPHasPositiveProbeProgress(samples []directUDPRateProbeSampl
 }
 
 func externalDirectUDPFormatRateProbeSamples(sent []directUDPRateProbeSample, received []directUDPRateProbeSample) string {
-	sentByRate := make(map[int]directUDPRateProbeSample, len(sent))
-	for _, sample := range sent {
-		sentByRate[sample.RateMbps] = sample
-	}
+	sentByRate := externalDirectUDPProbeSamplesByRate(sent)
 	parts := make([]string, 0, len(received))
 	for _, sample := range received {
-		durationMillis := sample.DurationMillis
-		if durationMillis <= 0 {
-			durationMillis = externalDirectUDPRateProbeDuration.Milliseconds()
-		}
-		goodput := externalDirectUDPSampleGoodputMbps(sample.BytesReceived, durationMillis)
-		delivery := 0.0
-		if sentSample, ok := sentByRate[sample.RateMbps]; ok && sentSample.BytesSent > 0 {
-			delivery = float64(sample.BytesReceived) / float64(sentSample.BytesSent)
-		}
-		parts = append(parts, fmt.Sprintf("%d:rx=%d:goodput=%.2f:delivery=%.2f", sample.RateMbps, sample.BytesReceived, goodput, delivery))
+		parts = append(parts, externalDirectUDPFormatRateProbeSample(sample, sentByRate))
 	}
 	return strings.Join(parts, ",")
+}
+
+func externalDirectUDPFormatRateProbeSample(sample directUDPRateProbeSample, sentByRate map[int]directUDPRateProbeSample) string {
+	durationMillis := externalDirectUDPProbeDurationMillis(sample)
+	goodput := externalDirectUDPSampleGoodputMbps(sample.BytesReceived, durationMillis)
+	delivery := externalDirectUDPRateProbeDelivery(sample, sentByRate)
+	return fmt.Sprintf("%d:rx=%d:goodput=%.2f:delivery=%.2f", sample.RateMbps, sample.BytesReceived, goodput, delivery)
+}
+
+func externalDirectUDPProbeDurationMillis(sample directUDPRateProbeSample) int64 {
+	if sample.DurationMillis > 0 {
+		return sample.DurationMillis
+	}
+	return externalDirectUDPRateProbeDuration.Milliseconds()
+}
+
+func externalDirectUDPRateProbeDelivery(sample directUDPRateProbeSample, sentByRate map[int]directUDPRateProbeSample) float64 {
+	sentSample, ok := sentByRate[sample.RateMbps]
+	if !ok || sentSample.BytesSent <= 0 {
+		return 0
+	}
+	return float64(sample.BytesReceived) / float64(sentSample.BytesSent)
 }
 
 func externalDirectUDPOrderConnsForSections(conns []net.PacketConn, localCandidates []string, sectionAddrs []string) ([]net.PacketConn, error) {
 	if len(sectionAddrs) == 0 {
 		return conns, nil
 	}
+	endpointToConn := externalDirectUDPEndpointConnMap(conns, localCandidates)
+	return externalDirectUDPConnsForSectionAddrs(conns, sectionAddrs, endpointToConn)
+}
+
+func externalDirectUDPEndpointConnMap(conns []net.PacketConn, localCandidates []string) map[string]int {
 	endpointToConn := make(map[string]int)
-	addEndpoint := func(endpoint string, index int) {
-		if endpoint == "" || index < 0 || index >= len(conns) {
-			return
-		}
-		if _, ok := endpointToConn[endpoint]; !ok {
-			endpointToConn[endpoint] = index
-		}
-	}
 	nextConn := 0
 	for _, candidate := range localCandidates {
 		endpoint := externalDirectUDPEndpointKey(candidate)
-		if endpoint == "" {
+		if endpoint == "" || externalDirectUDPAddEndpointConn(endpointToConn, endpoint, nextConn, len(conns)) {
 			continue
 		}
-		if _, ok := endpointToConn[endpoint]; ok {
-			continue
-		}
-		addEndpoint(endpoint, nextConn)
 		nextConn++
 		if nextConn == len(conns) {
 			break
@@ -4459,9 +6063,23 @@ func externalDirectUDPOrderConnsForSections(conns []net.PacketConn, localCandida
 		if conn == nil || conn.LocalAddr() == nil {
 			continue
 		}
-		addEndpoint(externalDirectUDPEndpointKey(conn.LocalAddr().String()), i)
+		externalDirectUDPAddEndpointConn(endpointToConn, externalDirectUDPEndpointKey(conn.LocalAddr().String()), i, len(conns))
 	}
+	return endpointToConn
+}
 
+func externalDirectUDPAddEndpointConn(endpointToConn map[string]int, endpoint string, index int, connCount int) bool {
+	if endpoint == "" || index < 0 || index >= connCount {
+		return false
+	}
+	if _, ok := endpointToConn[endpoint]; ok {
+		return true
+	}
+	endpointToConn[endpoint] = index
+	return false
+}
+
+func externalDirectUDPConnsForSectionAddrs(conns []net.PacketConn, sectionAddrs []string, endpointToConn map[string]int) ([]net.PacketConn, error) {
 	ordered := make([]net.PacketConn, 0, len(sectionAddrs))
 	seen := make(map[int]bool)
 	for _, addr := range sectionAddrs {
@@ -4497,14 +6115,29 @@ func waitExternalDirectUDPAddrDefault(ctx context.Context, conn net.PacketConn, 
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if addr, active := manager.DirectAddr(); active && addr != nil {
+		if addr := externalDirectUDPActiveDirectAddr(manager); addr != nil {
 			return addr, nil
 		}
-		select {
-		case <-ticker.C:
-		case <-waitCtx.Done():
-			return nil, waitCtx.Err()
+		if err := waitExternalDirectUDPAddrTick(waitCtx, ticker); err != nil {
+			return nil, err
 		}
+	}
+}
+
+func externalDirectUDPActiveDirectAddr(manager *transport.Manager) net.Addr {
+	addr, active := manager.DirectAddr()
+	if active && addr != nil {
+		return addr
+	}
+	return nil
+}
+
+func waitExternalDirectUDPAddrTick(ctx context.Context, ticker *time.Ticker) error {
+	select {
+	case <-ticker.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -4746,51 +6379,89 @@ func externalDirectUDPSpoolDiscardLanes(ctx context.Context, src io.Reader, lane
 	if chunkSize <= 0 {
 		chunkSize = externalDirectUDPChunkSize
 	}
+	spool, err := externalDirectUDPNewDiscardSpool(lanes)
+	if err != nil {
+		return nil, err
+	}
+	if err := externalDirectUDPWriteDiscardSpool(ctx, src, spool, chunkSize); err != nil {
+		_ = spool.Close()
+		return nil, err
+	}
+	externalDirectUDPAssignDiscardSpoolLaneSections(spool, lanes)
+	return spool, nil
+}
+
+func externalDirectUDPNewDiscardSpool(lanes int) (*externalDirectUDPDiscardSpool, error) {
 	file, err := os.CreateTemp("", "derphole-discard-spool-*")
 	if err != nil {
 		return nil, err
 	}
-	spool := &externalDirectUDPDiscardSpool{
+	return &externalDirectUDPDiscardSpool{
 		File:    file,
 		Path:    file.Name(),
 		Offsets: make([]int64, lanes),
 		Sizes:   make([]int64, lanes),
-	}
+	}, nil
+}
+
+func externalDirectUDPWriteDiscardSpool(ctx context.Context, src io.Reader, spool *externalDirectUDPDiscardSpool, chunkSize int) error {
 	buf := make([]byte, chunkSize*128)
 	for {
-		if err := ctx.Err(); err != nil {
-			_ = spool.Close()
-			return nil, err
+		done, err := externalDirectUDPWriteDiscardSpoolChunk(ctx, src, spool, buf)
+		if err != nil {
+			return err
 		}
-		n, readErr := src.Read(buf)
-		if n > 0 {
-			written, err := spool.File.Write(buf[:n])
-			if err != nil {
-				_ = spool.Close()
-				return nil, err
-			}
-			if written != n {
-				_ = spool.Close()
-				return nil, io.ErrShortWrite
-			}
-			spool.TotalBytes += int64(written)
-		}
-		if errors.Is(readErr, io.EOF) {
+		if done {
 			break
 		}
-		if readErr != nil {
-			_ = spool.Close()
-			return nil, readErr
-		}
-		if n == 0 {
-			select {
-			case <-ctx.Done():
-				_ = spool.Close()
-				return nil, ctx.Err()
-			case <-time.After(time.Millisecond):
-			}
+	}
+	return nil
+}
+
+func externalDirectUDPWriteDiscardSpoolChunk(ctx context.Context, src io.Reader, spool *externalDirectUDPDiscardSpool, buf []byte) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	n, readErr := src.Read(buf)
+	if n > 0 {
+		if err := externalDirectUDPWriteDiscardSpoolBytes(spool, buf[:n]); err != nil {
+			return false, err
 		}
 	}
+	if errors.Is(readErr, io.EOF) {
+		return true, nil
+	}
+	if readErr != nil {
+		return false, readErr
+	}
+	return false, externalDirectUDPWaitForDiscardSpoolProgress(ctx, n)
+}
+
+func externalDirectUDPWriteDiscardSpoolBytes(spool *externalDirectUDPDiscardSpool, data []byte) error {
+	written, err := spool.File.Write(data)
+	if err != nil {
+		return err
+	}
+	if written != len(data) {
+		return io.ErrShortWrite
+	}
+	spool.TotalBytes += int64(written)
+	return nil
+}
+
+func externalDirectUDPWaitForDiscardSpoolProgress(ctx context.Context, bytesRead int) error {
+	if bytesRead > 0 {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(time.Millisecond):
+		return nil
+	}
+}
+
+func externalDirectUDPAssignDiscardSpoolLaneSections(spool *externalDirectUDPDiscardSpool, lanes int) {
 	base := spool.TotalBytes / int64(lanes)
 	extra := spool.TotalBytes % int64(lanes)
 	var offset int64
@@ -4803,48 +6474,87 @@ func externalDirectUDPSpoolDiscardLanes(ctx context.Context, src io.Reader, lane
 		spool.Sizes[i] = size
 		offset += size
 	}
-	return spool, nil
 }
 
 func externalDirectUDPSendDiscardSpoolParallel(ctx context.Context, conns []net.PacketConn, remoteAddrs []string, spool *externalDirectUDPDiscardSpool, cfg probe.SendConfig) (probe.TransferStats, error) {
+	if err := externalDirectUDPValidateDiscardSpoolSend(conns, remoteAddrs, spool); err != nil {
+		return probe.TransferStats{}, err
+	}
+	laneCfg := externalDirectUDPDiscardSendLaneConfigFor(cfg, len(conns))
+	startedAt := time.Now()
+	results := make(chan externalDirectUDPDiscardSendResult, len(conns))
+	for i, conn := range conns {
+		externalDirectUDPStartDiscardSpoolSendLane(ctx, conn, remoteAddrs[i], spool, i, laneCfg.forDiscardLane(i), results)
+	}
+	return externalDirectUDPCollectDiscardSendResults(results, len(conns), startedAt)
+}
+
+func externalDirectUDPValidateDiscardSpoolSend(conns []net.PacketConn, remoteAddrs []string, spool *externalDirectUDPDiscardSpool) error {
 	if spool == nil {
-		return probe.TransferStats{}, errors.New("nil discard spool")
+		return errors.New("nil discard spool")
 	}
 	if len(conns) == 0 {
-		return probe.TransferStats{}, errors.New("no packet conns")
+		return errors.New("no packet conns")
 	}
 	if len(conns) != len(remoteAddrs) {
-		return probe.TransferStats{}, fmt.Errorf("packet conn count %d does not match remote addr count %d", len(conns), len(remoteAddrs))
+		return fmt.Errorf("packet conn count %d does not match remote addr count %d", len(conns), len(remoteAddrs))
 	}
 	if spool.File == nil {
-		return probe.TransferStats{}, errors.New("nil discard spool file")
+		return errors.New("nil discard spool file")
 	}
 	if len(spool.Sizes) < len(conns) || len(spool.Offsets) < len(conns) {
-		return probe.TransferStats{}, fmt.Errorf("discard spool lane count %d is less than packet conn count %d", len(spool.Sizes), len(conns))
+		return fmt.Errorf("discard spool lane count %d is less than packet conn count %d", len(spool.Sizes), len(conns))
 	}
+	return nil
+}
+
+type externalDirectUDPDiscardSendLaneConfig struct {
+	cfg             probe.SendConfig
+	laneRate        int
+	laneRateCeiling int
+}
+
+func externalDirectUDPDiscardSendLaneConfigFor(cfg probe.SendConfig, lanes int) externalDirectUDPDiscardSendLaneConfig {
 	cfg.StripedBlast = false
 	cfg.Parallel = 1
 	if cfg.ChunkSize <= 0 {
 		cfg.ChunkSize = externalDirectUDPChunkSize
 	}
-	laneRate := externalDirectUDPPerLaneRateMbps(cfg.RateMbps, len(conns))
-	laneRateCeiling := externalDirectUDPPerLaneRateMbps(cfg.RateCeilingMbps, len(conns))
-	startedAt := time.Now()
-	results := make(chan externalDirectUDPDiscardSendResult, len(conns))
-	for i, conn := range conns {
-		laneCfg := cfg
-		laneCfg.RunID = externalDirectUDPDiscardLaneRunID(cfg.RunID, i)
-		laneCfg.RateMbps = laneRate
-		laneCfg.RateCeilingMbps = laneRateCeiling
-		src := io.NewSectionReader(spool.File, spool.Offsets[i], spool.Sizes[i])
-		go func(conn net.PacketConn, remoteAddr string, src io.Reader, laneCfg probe.SendConfig) {
-			stats, err := externalDirectUDPProbeSendFn(ctx, conn, remoteAddr, src, laneCfg)
-			results <- externalDirectUDPDiscardSendResult{stats: stats, err: err}
-		}(conn, remoteAddrs[i], src, laneCfg)
+	return externalDirectUDPDiscardSendLaneConfig{
+		cfg:             cfg,
+		laneRate:        externalDirectUDPPerLaneRateMbps(cfg.RateMbps, lanes),
+		laneRateCeiling: externalDirectUDPPerLaneRateMbps(cfg.RateCeilingMbps, lanes),
 	}
-	stats := probe.TransferStats{StartedAt: startedAt, Lanes: len(conns)}
+}
+
+func (c externalDirectUDPDiscardSendLaneConfig) forDiscardLane(lane int) probe.SendConfig {
+	laneCfg := c.cfg
+	laneCfg.RunID = externalDirectUDPDiscardLaneRunID(c.cfg.RunID, lane)
+	laneCfg.RateMbps = c.laneRate
+	laneCfg.RateCeilingMbps = c.laneRateCeiling
+	return laneCfg
+}
+
+func (c externalDirectUDPDiscardSendLaneConfig) forPipeLane(lane int) probe.SendConfig {
+	laneCfg := c.cfg
+	laneCfg.RunID = externalDirectUDPLaneRunID(c.cfg.RunID, lane)
+	laneCfg.RateMbps = c.laneRate
+	laneCfg.RateCeilingMbps = c.laneRateCeiling
+	return laneCfg
+}
+
+func externalDirectUDPStartDiscardSpoolSendLane(ctx context.Context, conn net.PacketConn, remoteAddr string, spool *externalDirectUDPDiscardSpool, lane int, laneCfg probe.SendConfig, results chan<- externalDirectUDPDiscardSendResult) {
+	src := io.NewSectionReader(spool.File, spool.Offsets[lane], spool.Sizes[lane])
+	go func() {
+		stats, err := externalDirectUDPProbeSendFn(ctx, conn, remoteAddr, src, laneCfg)
+		results <- externalDirectUDPDiscardSendResult{stats: stats, err: err}
+	}()
+}
+
+func externalDirectUDPCollectDiscardSendResults(results <-chan externalDirectUDPDiscardSendResult, lanes int, startedAt time.Time) (probe.TransferStats, error) {
+	stats := probe.TransferStats{StartedAt: startedAt, Lanes: lanes}
 	var sendErr error
-	for range conns {
+	for i := 0; i < lanes; i++ {
 		result := <-results
 		if result.err != nil && sendErr == nil {
 			sendErr = result.err
@@ -4882,72 +6592,110 @@ func (w *externalDirectUDPOffsetWriter) Write(p []byte) (int, error) {
 }
 
 func externalDirectUDPReceiveSectionSpoolParallel(ctx context.Context, conns []net.PacketConn, dst io.Writer, cfg probe.ReceiveConfig, totalBytes int64, sectionSizes []int64) (probe.TransferStats, error) {
-	if len(conns) == 0 {
-		return probe.TransferStats{}, errors.New("no packet conns")
-	}
-	if totalBytes < 0 {
-		return probe.TransferStats{}, errors.New("negative expected bytes")
-	}
-	sizes, offsets, err := externalDirectUDPReceiveSectionLayout(totalBytes, len(conns), sectionSizes)
+	prepared, err := externalDirectUDPPrepareReceiveSectionSpool(conns, dst, totalBytes, sectionSizes)
 	if err != nil {
 		return probe.TransferStats{}, err
 	}
-	conns = conns[:len(sizes)]
+	defer prepared.cleanup()
+
+	receiveCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan externalDirectUDPReceiveResult, len(prepared.conns))
+	startedAt := time.Now()
+	for i, conn := range prepared.conns {
+		laneCfg := externalDirectUDPReceiveSectionLaneConfig(cfg, i, len(prepared.conns))
+		writer := &externalDirectUDPOffsetWriter{file: prepared.file, offset: prepared.offsets[i]}
+		externalDirectUDPStartReceiveSectionSpoolLane(receiveCtx, cancel, conn, writer, prepared.sizes[i], laneCfg, results)
+	}
+
+	stats, receiveErr := externalDirectUDPCollectReceiveSectionResults(results, len(prepared.conns), startedAt)
+	if receiveErr != nil {
+		return externalDirectUDPCompleteReceiveSectionStats(stats, startedAt, receiveErr)
+	}
+	if err := externalDirectUDPFinishSectionTarget(prepared.file, prepared.copyToDst, prepared.dst, totalBytes); err != nil {
+		return externalDirectUDPCompleteReceiveSectionStats(stats, startedAt, err)
+	}
+	return externalDirectUDPCompleteReceiveSectionStats(stats, startedAt, nil)
+}
+
+type externalDirectUDPReceiveSectionSpool struct {
+	conns     []net.PacketConn
+	dst       io.Writer
+	file      *os.File
+	copyToDst bool
+	cleanup   func()
+	sizes     []int64
+	offsets   []int64
+}
+
+func externalDirectUDPPrepareReceiveSectionSpool(conns []net.PacketConn, dst io.Writer, totalBytes int64, sectionSizes []int64) (externalDirectUDPReceiveSectionSpool, error) {
+	if len(conns) == 0 {
+		return externalDirectUDPReceiveSectionSpool{}, errors.New("no packet conns")
+	}
+	if totalBytes < 0 {
+		return externalDirectUDPReceiveSectionSpool{}, errors.New("negative expected bytes")
+	}
+	sizes, offsets, err := externalDirectUDPReceiveSectionLayout(totalBytes, len(conns), sectionSizes)
+	if err != nil {
+		return externalDirectUDPReceiveSectionSpool{}, err
+	}
 	if dst == nil {
 		dst = io.Discard
 	}
 	file, copyToDst, cleanup, err := externalDirectUDPReceiveSectionTarget(dst, totalBytes)
 	if err != nil {
-		return probe.TransferStats{}, err
+		return externalDirectUDPReceiveSectionSpool{}, err
 	}
-	defer cleanup()
+	return externalDirectUDPReceiveSectionSpool{
+		conns:     conns[:len(sizes)],
+		dst:       dst,
+		file:      file,
+		copyToDst: copyToDst,
+		cleanup:   cleanup,
+		sizes:     sizes,
+		offsets:   offsets,
+	}, nil
+}
 
-	receiveCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	results := make(chan externalDirectUDPReceiveResult, len(conns))
-	startedAt := time.Now()
-	for i, conn := range conns {
-		laneCfg := cfg
-		if len(laneCfg.ExpectedRunIDs) == len(conns) {
-			laneCfg.ExpectedRunID = laneCfg.ExpectedRunIDs[i]
-			laneCfg.ExpectedRunIDs = nil
-		} else if len(laneCfg.ExpectedRunIDs) == 0 {
-			laneCfg.ExpectedRunID = [16]byte{}
+func externalDirectUDPReceiveSectionLaneConfig(cfg probe.ReceiveConfig, lane int, lanes int) probe.ReceiveConfig {
+	laneCfg := cfg
+	if len(laneCfg.ExpectedRunIDs) == lanes {
+		laneCfg.ExpectedRunID = laneCfg.ExpectedRunIDs[lane]
+		laneCfg.ExpectedRunIDs = nil
+	} else if len(laneCfg.ExpectedRunIDs) == 0 {
+		laneCfg.ExpectedRunID = [16]byte{}
+	}
+	laneCfg.RequireComplete = true
+	return laneCfg
+}
+
+func externalDirectUDPStartReceiveSectionSpoolLane(ctx context.Context, cancel context.CancelFunc, conn net.PacketConn, writer io.Writer, expected int64, laneCfg probe.ReceiveConfig, results chan<- externalDirectUDPReceiveResult) {
+	go func() {
+		stats, err := probe.ReceiveBlastParallelToWriter(ctx, []net.PacketConn{conn}, writer, laneCfg, expected)
+		if err != nil {
+			cancel()
 		}
-		laneCfg.RequireComplete = true
-		writer := &externalDirectUDPOffsetWriter{file: file, offset: offsets[i]}
-		go func(conn net.PacketConn, writer io.Writer, expected int64, laneCfg probe.ReceiveConfig) {
-			stats, err := probe.ReceiveBlastParallelToWriter(receiveCtx, []net.PacketConn{conn}, writer, laneCfg, expected)
-			if err != nil {
-				cancel()
-			}
-			results <- externalDirectUDPReceiveResult{stats: stats, err: err}
-		}(conn, writer, sizes[i], laneCfg)
-	}
+		results <- externalDirectUDPReceiveResult{stats: stats, err: err}
+	}()
+}
 
-	stats := probe.TransferStats{StartedAt: startedAt, Lanes: len(conns)}
+func externalDirectUDPCollectReceiveSectionResults(results <-chan externalDirectUDPReceiveResult, lanes int, startedAt time.Time) (probe.TransferStats, error) {
+	stats := probe.TransferStats{StartedAt: startedAt, Lanes: lanes}
 	var receiveErr error
-	for range conns {
+	for i := 0; i < lanes; i++ {
 		result := <-results
 		receiveErr = externalDirectUDPPreferInformativeError(receiveErr, result.err)
 		externalDirectUDPMergeReceiveStats(&stats, result.stats)
 	}
-	if receiveErr != nil {
-		stats.CompletedAt = time.Now()
-		if stats.FirstByteAt.IsZero() && stats.BytesReceived > 0 {
-			stats.FirstByteAt = startedAt
-		}
-		return stats, receiveErr
-	}
-	if err := externalDirectUDPFinishSectionTarget(file, copyToDst, dst, totalBytes); err != nil {
-		stats.CompletedAt = time.Now()
-		return stats, err
-	}
+	return stats, receiveErr
+}
+
+func externalDirectUDPCompleteReceiveSectionStats(stats probe.TransferStats, startedAt time.Time, err error) (probe.TransferStats, error) {
 	stats.CompletedAt = time.Now()
 	if stats.FirstByteAt.IsZero() && stats.BytesReceived > 0 {
 		stats.FirstByteAt = startedAt
 	}
-	return stats, nil
+	return stats, err
 }
 
 func externalDirectUDPReceiveSectionTarget(dst io.Writer, totalBytes int64) (*os.File, bool, func(), error) {
@@ -5082,67 +6830,26 @@ func externalDirectUDPSectionSizes(totalBytes int64, lanes int) ([]int64, []int6
 }
 
 func externalDirectUDPSendDiscardParallel(ctx context.Context, conns []net.PacketConn, remoteAddrs []string, src io.Reader, cfg probe.SendConfig) (probe.TransferStats, error) {
-	if len(conns) == 0 {
-		return probe.TransferStats{}, errors.New("no packet conns")
+	if err := externalDirectUDPValidateDiscardParallel(conns, remoteAddrs, src); err != nil {
+		return probe.TransferStats{}, err
 	}
-	if len(conns) != len(remoteAddrs) {
-		return probe.TransferStats{}, fmt.Errorf("packet conn count %d does not match remote addr count %d", len(conns), len(remoteAddrs))
-	}
-	if src == nil {
-		return probe.TransferStats{}, errors.New("nil source reader")
-	}
-	cfg.StripedBlast = false
-	cfg.Parallel = 1
-	if cfg.ChunkSize <= 0 {
-		cfg.ChunkSize = externalDirectUDPChunkSize
-	}
+	laneCfg := externalDirectUDPDiscardSendLaneConfigFor(cfg, len(conns))
 	if len(conns) == 1 {
-		cfg.RunID = externalDirectUDPLaneRunID(cfg.RunID, 0)
-		return externalDirectUDPProbeSendFn(ctx, conns[0], remoteAddrs[0], src, cfg)
+		return externalDirectUDPProbeSendFn(ctx, conns[0], remoteAddrs[0], src, laneCfg.forPipeLane(0))
 	}
 
 	sendCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	startedAt := time.Now()
-	laneRate := externalDirectUDPPerLaneRateMbps(cfg.RateMbps, len(conns))
-	laneRateCeiling := externalDirectUDPPerLaneRateMbps(cfg.RateCeilingMbps, len(conns))
 	writers := make([]*io.PipeWriter, len(conns))
 	results := make(chan externalDirectUDPDiscardSendResult, len(conns))
 	for i, conn := range conns {
-		reader, writer := io.Pipe()
-		writers[i] = writer
-		remoteAddr := remoteAddrs[i]
-		laneCfg := cfg
-		laneCfg.RunID = externalDirectUDPLaneRunID(cfg.RunID, i)
-		laneCfg.RateMbps = laneRate
-		laneCfg.RateCeilingMbps = laneRateCeiling
-		go func(conn net.PacketConn, remoteAddr string, reader *io.PipeReader, laneCfg probe.SendConfig) {
-			defer reader.Close()
-			stats, err := externalDirectUDPProbeSendFn(sendCtx, conn, remoteAddr, reader, laneCfg)
-			if err != nil {
-				cancel()
-			}
-			results <- externalDirectUDPDiscardSendResult{stats: stats, err: err}
-		}(conn, remoteAddr, reader, laneCfg)
+		writers[i] = externalDirectUDPStartDiscardPipeSendLane(sendCtx, cancel, conn, remoteAddrs[i], laneCfg.forPipeLane(i), results)
 	}
 
-	dispatchErr := externalDirectUDPDistributeDiscardStream(sendCtx, src, writers, cfg.ChunkSize)
-	for _, writer := range writers {
-		if dispatchErr != nil {
-			_ = writer.CloseWithError(dispatchErr)
-			continue
-		}
-		_ = writer.Close()
-	}
-
-	stats := probe.TransferStats{StartedAt: startedAt, Lanes: len(conns)}
-	var sendErr error
-	for range conns {
-		result := <-results
-		sendErr = externalDirectUDPPreferInformativeError(sendErr, result.err)
-		externalDirectUDPMergeSendStats(&stats, result.stats)
-	}
-	stats.CompletedAt = time.Now()
+	dispatchErr := externalDirectUDPDistributeDiscardStream(sendCtx, src, writers, laneCfg.cfg.ChunkSize)
+	externalDirectUDPCloseDiscardWriters(writers, dispatchErr)
+	stats, sendErr := externalDirectUDPCollectDiscardPipeSendResults(results, len(conns), startedAt)
 	if dispatchErr != nil {
 		return probe.TransferStats{}, externalDirectUDPPreferInformativeError(dispatchErr, sendErr)
 	}
@@ -5153,6 +6860,57 @@ func externalDirectUDPSendDiscardParallel(ctx context.Context, conns []net.Packe
 		stats.FirstByteAt = startedAt
 	}
 	return stats, nil
+}
+
+func externalDirectUDPValidateDiscardParallel(conns []net.PacketConn, remoteAddrs []string, src io.Reader) error {
+	if len(conns) == 0 {
+		return errors.New("no packet conns")
+	}
+	if len(conns) != len(remoteAddrs) {
+		return fmt.Errorf("packet conn count %d does not match remote addr count %d", len(conns), len(remoteAddrs))
+	}
+	if src == nil {
+		return errors.New("nil source reader")
+	}
+	return nil
+}
+
+func externalDirectUDPStartDiscardPipeSendLane(ctx context.Context, cancel context.CancelFunc, conn net.PacketConn, remoteAddr string, laneCfg probe.SendConfig, results chan<- externalDirectUDPDiscardSendResult) *io.PipeWriter {
+	reader, writer := io.Pipe()
+	go func() {
+		defer func() { _ = reader.Close() }()
+		stats, err := externalDirectUDPProbeSendFn(ctx, conn, remoteAddr, reader, laneCfg)
+		if err != nil {
+			cancel()
+		}
+		results <- externalDirectUDPDiscardSendResult{stats: stats, err: err}
+	}()
+	return writer
+}
+
+func externalDirectUDPCloseDiscardWriters(writers []*io.PipeWriter, dispatchErr error) {
+	for _, writer := range writers {
+		if dispatchErr != nil {
+			_ = writer.CloseWithError(dispatchErr)
+			continue
+		}
+		_ = writer.Close()
+	}
+}
+
+func externalDirectUDPCollectDiscardPipeSendResults(results <-chan externalDirectUDPDiscardSendResult, lanes int, startedAt time.Time) (probe.TransferStats, error) {
+	stats := probe.TransferStats{StartedAt: startedAt, Lanes: lanes}
+	var sendErr error
+	for i := 0; i < lanes; i++ {
+		result := <-results
+		sendErr = externalDirectUDPPreferInformativeError(sendErr, result.err)
+		externalDirectUDPMergeSendStats(&stats, result.stats)
+	}
+	stats.CompletedAt = time.Now()
+	if stats.FirstByteAt.IsZero() && stats.BytesSent > 0 {
+		stats.FirstByteAt = startedAt
+	}
+	return stats, sendErr
 }
 
 func externalDirectUDPPreferInformativeError(current, candidate error) error {
@@ -5211,120 +6969,185 @@ func externalDirectUDPDistributeDiscardStream(ctx context.Context, src io.Reader
 	if chunkSize <= 0 {
 		chunkSize = externalDirectUDPChunkSize
 	}
+	distributor := newExternalDirectUDPDiscardDistributor(ctx, src, writers, chunkSize)
+	return distributor.run()
+}
+
+type externalDirectUDPDiscardDistributor struct {
+	ctx             context.Context
+	src             io.Reader
+	writers         []*io.PipeWriter
+	chunkSize       int
+	distCtx         context.Context
+	cancel          context.CancelFunc
+	writerErrMu     sync.Mutex
+	writerErr       error
+	queues          []chan []byte
+	writerDone      chan error
+	closeQueuesOnce sync.Once
+}
+
+func newExternalDirectUDPDiscardDistributor(ctx context.Context, src io.Reader, writers []*io.PipeWriter, chunkSize int) *externalDirectUDPDiscardDistributor {
 	distCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	var writerErrMu sync.Mutex
-	var writerErr error
-	setWriterErr := func(err error) {
-		if err == nil {
+	return &externalDirectUDPDiscardDistributor{
+		ctx:        ctx,
+		src:        src,
+		writers:    writers,
+		chunkSize:  chunkSize,
+		distCtx:    distCtx,
+		cancel:     cancel,
+		queues:     make([]chan []byte, len(writers)),
+		writerDone: make(chan error, len(writers)),
+	}
+}
+
+func (d *externalDirectUDPDiscardDistributor) run() error {
+	defer d.cancel()
+	d.startWriters()
+	return d.readLoop()
+}
+
+func (d *externalDirectUDPDiscardDistributor) startWriters() {
+	for i, writer := range d.writers {
+		queue := make(chan []byte, externalDirectUDPDiscardQueue)
+		d.queues[i] = queue
+		go d.writeQueue(writer, queue)
+	}
+}
+
+func (d *externalDirectUDPDiscardDistributor) writeQueue(writer *io.PipeWriter, queue <-chan []byte) {
+	for chunk := range queue {
+		if len(chunk) == 0 {
+			continue
+		}
+		if _, err := writer.Write(chunk); err != nil {
+			d.setWriterErr(err)
+			d.writerDone <- err
 			return
 		}
-		writerErrMu.Lock()
-		if writerErr == nil {
-			writerErr = err
-		}
-		writerErrMu.Unlock()
-		cancel()
 	}
-	currentWriterErr := func() error {
-		writerErrMu.Lock()
-		defer writerErrMu.Unlock()
-		return writerErr
-	}
-	closeWritersWithError := func(err error) {
-		for _, writer := range writers {
-			if writer != nil {
-				_ = writer.CloseWithError(err)
-			}
-		}
-	}
-	queues := make([]chan []byte, len(writers))
-	writerDone := make(chan error, len(writers))
-	for i, writer := range writers {
-		queue := make(chan []byte, externalDirectUDPDiscardQueue)
-		queues[i] = queue
-		go func(writer *io.PipeWriter, queue <-chan []byte) {
-			for chunk := range queue {
-				if len(chunk) == 0 {
-					continue
-				}
-				if _, err := writer.Write(chunk); err != nil {
-					setWriterErr(err)
-					writerDone <- err
-					return
-				}
-			}
-			writerDone <- nil
-		}(writer, queue)
-	}
-	var closeQueuesOnce sync.Once
-	closeQueues := func() {
-		closeQueuesOnce.Do(func() {
-			for _, queue := range queues {
-				close(queue)
-			}
-		})
-	}
-	waitWriters := func() error {
-		var firstErr error
-		for range writers {
-			if err := <-writerDone; err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
-		if firstErr != nil {
-			return firstErr
-		}
-		return currentWriterErr()
-	}
-	fail := func(err error) error {
-		closeWritersWithError(err)
-		closeQueues()
-		if writerWaitErr := waitWriters(); writerWaitErr != nil && err == nil {
-			return writerWaitErr
-		}
-		return err
-	}
+	d.writerDone <- nil
+}
 
-	buf := make([]byte, chunkSize*128)
+func (d *externalDirectUDPDiscardDistributor) setWriterErr(err error) {
+	if err == nil {
+		return
+	}
+	d.writerErrMu.Lock()
+	if d.writerErr == nil {
+		d.writerErr = err
+	}
+	d.writerErrMu.Unlock()
+	d.cancel()
+}
+
+func (d *externalDirectUDPDiscardDistributor) currentWriterErr() error {
+	d.writerErrMu.Lock()
+	defer d.writerErrMu.Unlock()
+	return d.writerErr
+}
+
+func (d *externalDirectUDPDiscardDistributor) closeWritersWithError(err error) {
+	for _, writer := range d.writers {
+		if writer != nil {
+			_ = writer.CloseWithError(err)
+		}
+	}
+}
+
+func (d *externalDirectUDPDiscardDistributor) closeQueues() {
+	d.closeQueuesOnce.Do(func() {
+		for _, queue := range d.queues {
+			close(queue)
+		}
+	})
+}
+
+func (d *externalDirectUDPDiscardDistributor) waitWriters() error {
+	var firstErr error
+	for range d.writers {
+		if err := <-d.writerDone; err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	return d.currentWriterErr()
+}
+
+func (d *externalDirectUDPDiscardDistributor) fail(err error) error {
+	d.closeWritersWithError(err)
+	d.closeQueues()
+	if writerWaitErr := d.waitWriters(); writerWaitErr != nil && err == nil {
+		return writerWaitErr
+	}
+	return err
+}
+
+func (d *externalDirectUDPDiscardDistributor) readLoop() error {
+	buf := make([]byte, d.chunkSize*128)
 	lane := 0
 	for {
-		if err := distCtx.Err(); err != nil {
-			if writerErr := currentWriterErr(); writerErr != nil {
-				return fail(writerErr)
-			}
-			return fail(err)
+		if err := d.contextFailure(); err != nil {
+			return err
 		}
-		n, readErr := src.Read(buf)
+		n, readErr := d.src.Read(buf)
 		if n > 0 {
-			chunk := append([]byte(nil), buf[:n]...)
-			select {
-			case queues[lane] <- chunk:
-				lane = (lane + 1) % len(writers)
-			case <-distCtx.Done():
-				if writerErr := currentWriterErr(); writerErr != nil {
-					return fail(writerErr)
-				}
-				return fail(distCtx.Err())
+			if err := d.enqueue(buf[:n], &lane); err != nil {
+				return err
 			}
 		}
-		if errors.Is(readErr, io.EOF) {
-			closeQueues()
-			return waitWriters()
-		}
-		if readErr != nil {
-			return fail(readErr)
+		done, err := d.handleReadErr(readErr)
+		if done || err != nil {
+			return err
 		}
 		if n == 0 {
-			select {
-			case <-distCtx.Done():
-				if writerErr := currentWriterErr(); writerErr != nil {
-					return fail(writerErr)
-				}
-				return fail(distCtx.Err())
-			case <-time.After(time.Millisecond):
+			if err := d.waitForProgress(); err != nil {
+				return err
 			}
 		}
+	}
+}
+
+func (d *externalDirectUDPDiscardDistributor) contextFailure() error {
+	if err := d.distCtx.Err(); err != nil {
+		if writerErr := d.currentWriterErr(); writerErr != nil {
+			return d.fail(writerErr)
+		}
+		return d.fail(err)
+	}
+	return nil
+}
+
+func (d *externalDirectUDPDiscardDistributor) enqueue(chunk []byte, lane *int) error {
+	copied := append([]byte(nil), chunk...)
+	select {
+	case d.queues[*lane] <- copied:
+		*lane = (*lane + 1) % len(d.writers)
+		return nil
+	case <-d.distCtx.Done():
+		return d.contextFailure()
+	}
+}
+
+func (d *externalDirectUDPDiscardDistributor) handleReadErr(readErr error) (bool, error) {
+	if errors.Is(readErr, io.EOF) {
+		d.closeQueues()
+		return true, d.waitWriters()
+	}
+	if readErr != nil {
+		return true, d.fail(readErr)
+	}
+	return false, nil
+}
+
+func (d *externalDirectUDPDiscardDistributor) waitForProgress() error {
+	select {
+	case <-d.distCtx.Done():
+		return d.contextFailure()
+	case <-time.After(time.Millisecond):
+		return nil
 	}
 }
 
@@ -5421,32 +7244,50 @@ func externalDirectUDPActiveLaneCapForPolicy(policy ParallelPolicy, available in
 }
 
 func externalDirectUDPDataLaneRateBasisMbps(activeRateMbps int, rateCeilingMbps int, probeRates []int) int {
-	basis := activeRateMbps
-	if rateCeilingMbps > basis {
-		if len(probeRates) > 0 {
-			if rateCeilingMbps >= externalDirectUDPActiveLaneFourMaxMbps && activeRateMbps > 0 && activeRateMbps <= externalDirectUDPActiveLaneFourMaxMbps {
-				return externalDirectUDPActiveLaneFourMaxMbps
-			}
-			if rateCeilingMbps > externalDirectUDPDataStartHighMbps && activeRateMbps > 0 && activeRateMbps < externalDirectUDPActiveLaneFourMaxMbps {
-				return externalDirectUDPDataStartHighMbps
-			}
-		}
-		basis = rateCeilingMbps
-		if rateCeilingMbps > externalDirectUDPRateProbeDefaultMaxMbps {
-			probeMax := 0
-			for _, rate := range probeRates {
-				if rate > probeMax {
-					probeMax = rate
-				}
-			}
-			if probeMax == 0 {
-				basis = activeRateMbps
-			} else if probeMax > basis || probeMax > activeRateMbps {
-				basis = probeMax
-			}
+	if rateCeilingMbps <= activeRateMbps {
+		return activeRateMbps
+	}
+	if basis, ok := externalDirectUDPProbeRateLaneBasisOverride(activeRateMbps, rateCeilingMbps, probeRates); ok {
+		return basis
+	}
+	return externalDirectUDPHighCeilingLaneRateBasis(activeRateMbps, rateCeilingMbps, probeRates)
+}
+
+func externalDirectUDPProbeRateLaneBasisOverride(activeRateMbps int, rateCeilingMbps int, probeRates []int) (int, bool) {
+	if len(probeRates) == 0 || activeRateMbps <= 0 {
+		return 0, false
+	}
+	if rateCeilingMbps >= externalDirectUDPActiveLaneFourMaxMbps && activeRateMbps <= externalDirectUDPActiveLaneFourMaxMbps {
+		return externalDirectUDPActiveLaneFourMaxMbps, true
+	}
+	if rateCeilingMbps > externalDirectUDPDataStartHighMbps && activeRateMbps < externalDirectUDPActiveLaneFourMaxMbps {
+		return externalDirectUDPDataStartHighMbps, true
+	}
+	return 0, false
+}
+
+func externalDirectUDPHighCeilingLaneRateBasis(activeRateMbps int, rateCeilingMbps int, probeRates []int) int {
+	if rateCeilingMbps <= externalDirectUDPRateProbeDefaultMaxMbps {
+		return rateCeilingMbps
+	}
+	probeMax := externalDirectUDPHighestProbeRateValue(probeRates)
+	if probeMax == 0 {
+		return activeRateMbps
+	}
+	if probeMax > rateCeilingMbps || probeMax > activeRateMbps {
+		return probeMax
+	}
+	return rateCeilingMbps
+}
+
+func externalDirectUDPHighestProbeRateValue(probeRates []int) int {
+	probeMax := 0
+	for _, rate := range probeRates {
+		if rate > probeMax {
+			probeMax = rate
 		}
 	}
-	return basis
+	return probeMax
 }
 
 func externalDirectUDPStartBudget(rateCeilingMbps int) externalDirectUDPBudget {
@@ -5613,120 +7454,176 @@ func externalDirectUDPSelectedTierHasBufferedCollapse(selectedRateMbps int, rate
 	if selectedRateMbps < externalDirectUDPDataStartHighMbps {
 		return false
 	}
-	sentByRate := make(map[int]directUDPRateProbeSample, len(sent))
-	for _, sample := range sent {
-		sentByRate[sample.RateMbps] = sample
+	selector := newExternalDirectUDPBufferedCollapseSelector(selectedRateMbps, rateCeilingMbps, sent, received)
+	if !selector.loadSelectedTier() {
+		return false
 	}
-	selectedGoodput := 0.0
-	selectedDelivery := 0.0
-	selectedEfficiency := 0.0
-	for _, sample := range received {
-		if sample.RateMbps != selectedRateMbps {
+	selector.loadStartBudgetTier()
+	return selector.hasBufferedCollapse()
+}
+
+type externalDirectUDPBufferedCollapseSelector struct {
+	selectedRateMbps          int
+	rateCeilingMbps           int
+	sentByRate                map[int]directUDPRateProbeSample
+	received                  []directUDPRateProbeSample
+	selectedGoodput           float64
+	selectedDelivery          float64
+	selectedEfficiency        float64
+	startBudgetRate           int
+	startGoodput              float64
+	startDelivery             float64
+	startEfficiency           float64
+	higherGoodputBeatSelected bool
+}
+
+func newExternalDirectUDPBufferedCollapseSelector(selectedRateMbps int, rateCeilingMbps int, sent []directUDPRateProbeSample, received []directUDPRateProbeSample) *externalDirectUDPBufferedCollapseSelector {
+	return &externalDirectUDPBufferedCollapseSelector{
+		selectedRateMbps: selectedRateMbps,
+		rateCeilingMbps:  rateCeilingMbps,
+		sentByRate:       externalDirectUDPProbeSamplesByRate(sent),
+		received:         received,
+		startBudgetRate:  externalDirectUDPStartBudget(rateCeilingMbps).RateMbps,
+	}
+}
+
+func (s *externalDirectUDPBufferedCollapseSelector) loadSelectedTier() bool {
+	for _, sample := range s.received {
+		if sample.RateMbps != s.selectedRateMbps {
 			continue
 		}
-		goodput, delivery, efficiency, ok := externalDirectUDPProbeMetrics(sample, sentByRate)
+		goodput, delivery, efficiency, ok := externalDirectUDPProbeMetrics(sample, s.sentByRate)
 		if !ok || delivery < externalDirectUDPRateProbeNearClean {
 			return false
 		}
-		selectedGoodput = goodput
-		selectedDelivery = delivery
-		selectedEfficiency = efficiency
-		break
+		s.selectedGoodput = goodput
+		s.selectedDelivery = delivery
+		s.selectedEfficiency = efficiency
+		return true
 	}
-	if selectedGoodput <= 0 {
-		return false
+	return false
+}
+
+func (s *externalDirectUDPBufferedCollapseSelector) loadStartBudgetTier() {
+	if s.startBudgetRate <= externalDirectUDPDataStartMaxMbps || s.startBudgetRate >= s.selectedRateMbps {
+		return
 	}
-	startBudgetRate := externalDirectUDPStartBudget(rateCeilingMbps).RateMbps
-	startGoodput := 0.0
-	startDelivery := 0.0
-	startEfficiency := 0.0
-	if startBudgetRate > externalDirectUDPDataStartMaxMbps && startBudgetRate < selectedRateMbps {
-		for _, sample := range received {
-			if sample.RateMbps <= 0 || sample.RateMbps > startBudgetRate {
-				continue
-			}
-			goodput, delivery, efficiency, ok := externalDirectUDPProbeMetrics(sample, sentByRate)
-			if !ok {
-				continue
-			}
-			startGoodput = goodput
-			startDelivery = delivery
-			startEfficiency = efficiency
-		}
-	}
-	higherGoodputBeatSelected := false
-	for _, sample := range received {
-		if sample.RateMbps <= selectedRateMbps {
+	for _, sample := range s.received {
+		if sample.RateMbps <= 0 || sample.RateMbps > s.startBudgetRate {
 			continue
 		}
-		goodput, delivery, _, ok := externalDirectUDPProbeMetrics(sample, sentByRate)
+		goodput, delivery, efficiency, ok := externalDirectUDPProbeMetrics(sample, s.sentByRate)
 		if !ok {
 			continue
 		}
-		if goodput >= selectedGoodput {
-			higherGoodputBeatSelected = true
+		s.startGoodput = goodput
+		s.startDelivery = delivery
+		s.startEfficiency = efficiency
+	}
+}
+
+func (s *externalDirectUDPBufferedCollapseSelector) hasBufferedCollapse() bool {
+	for _, sample := range s.received {
+		if sample.RateMbps <= s.selectedRateMbps {
 			continue
 		}
-		if selectedRateMbps <= startBudgetRate &&
-			selectedDelivery >= externalDirectUDPRateProbeNearClean &&
-			selectedEfficiency >= externalDirectUDPRateProbeEfficient {
-			// A near-clean, efficient selected tier is already a viable data
-			// start. Collapse above that point should cap further exploration, not
-			// force the sender all the way back to the conservative 350 Mbps
-			// start.
-			if rateCeilingMbps > selectedRateMbps && higherGoodputBeatSelected {
-				continue
-			}
+		goodput, delivery, _, ok := externalDirectUDPProbeMetrics(sample, s.sentByRate)
+		if !ok {
 			continue
 		}
-		if startGoodput > 0 &&
-			startDelivery >= externalDirectUDPRateProbeNearClean &&
-			startEfficiency >= externalDirectUDPRateProbeEfficient &&
-			delivery >= externalDirectUDPRateProbeLossyDelivery {
-			continue
-		}
-		if selectedDelivery < externalDirectUDPRateProbeClean && delivery < externalDirectUDPRateProbeCeilingDelivery {
+		if s.higherProbeShowsCollapse(goodput, delivery) {
 			return true
 		}
 	}
 	return false
 }
 
+func (s *externalDirectUDPBufferedCollapseSelector) higherProbeShowsCollapse(goodput float64, delivery float64) bool {
+	if goodput >= s.selectedGoodput {
+		s.higherGoodputBeatSelected = true
+		return false
+	}
+	if s.selectedTierAlreadyViableStart() || s.startBudgetTierCanAbsorbLossyProbe(delivery) {
+		return false
+	}
+	return s.selectedDelivery < externalDirectUDPRateProbeClean && delivery < externalDirectUDPRateProbeCeilingDelivery
+}
+
+func (s *externalDirectUDPBufferedCollapseSelector) selectedTierAlreadyViableStart() bool {
+	// A near-clean, efficient selected tier is already a viable data start.
+	// Collapse above that point should cap further exploration, not force the
+	// sender all the way back to the conservative 350 Mbps start.
+	return s.selectedRateMbps <= s.startBudgetRate &&
+		s.selectedDelivery >= externalDirectUDPRateProbeNearClean &&
+		s.selectedEfficiency >= externalDirectUDPRateProbeEfficient
+}
+
+func (s *externalDirectUDPBufferedCollapseSelector) startBudgetTierCanAbsorbLossyProbe(delivery float64) bool {
+	return s.startGoodput > 0 &&
+		s.startDelivery >= externalDirectUDPRateProbeNearClean &&
+		s.startEfficiency >= externalDirectUDPRateProbeEfficient &&
+		delivery >= externalDirectUDPRateProbeLossyDelivery
+}
+
 func externalDirectUDPSelectedTierNeedsConservativeHighStart(selectedRateMbps int, sent []directUDPRateProbeSample, received []directUDPRateProbeSample) bool {
 	if selectedRateMbps <= externalDirectUDPDataStartHighMbps {
 		return false
 	}
-	sentByRate := make(map[int]directUDPRateProbeSample, len(sent))
-	for _, sample := range sent {
-		sentByRate[sample.RateMbps] = sample
+	state := externalDirectUDPSelectedTierConservativeStartState{
+		selectedRateMbps: selectedRateMbps,
+		sentByRate:       externalDirectUDPProbeSamplesByRate(sent),
 	}
-	prevGoodput := 0.0
-	prevDelivery := 0.0
 	for _, sample := range received {
-		if sample.RateMbps < selectedRateMbps {
-			goodput, delivery, _, ok := externalDirectUDPProbeMetrics(sample, sentByRate)
-			if ok {
-				prevGoodput = goodput
-				prevDelivery = delivery
-			}
+		if needsConservativeStart, ok := state.observe(sample); ok {
+			return needsConservativeStart
 		}
-		if sample.RateMbps != selectedRateMbps {
-			continue
-		}
-		goodput, delivery, _, ok := externalDirectUDPProbeMetrics(sample, sentByRate)
-		if !ok || delivery < externalDirectUDPRateProbeClean {
-			return false
-		}
-		if selectedRateMbps > externalDirectUDPRateProbeConfirmMinMbps &&
-			prevGoodput > 0 &&
-			prevDelivery >= externalDirectUDPRateProbeClean &&
-			goodput >= prevGoodput*1.10 {
-			return false
-		}
-		efficiency := goodput / float64(selectedRateMbps)
-		return efficiency < externalDirectUDPRateProbeCeilingEfficient
 	}
 	return false
+}
+
+type externalDirectUDPSelectedTierConservativeStartState struct {
+	selectedRateMbps int
+	sentByRate       map[int]directUDPRateProbeSample
+	prevGoodput      float64
+	prevDelivery     float64
+}
+
+func (s *externalDirectUDPSelectedTierConservativeStartState) observe(sample directUDPRateProbeSample) (bool, bool) {
+	if sample.RateMbps < s.selectedRateMbps {
+		s.observePrevious(sample)
+	}
+	if sample.RateMbps != s.selectedRateMbps {
+		return false, false
+	}
+	return s.selectedNeedsConservativeStart(sample), true
+}
+
+func (s *externalDirectUDPSelectedTierConservativeStartState) observePrevious(sample directUDPRateProbeSample) {
+	goodput, delivery, _, ok := externalDirectUDPProbeMetrics(sample, s.sentByRate)
+	if !ok {
+		return
+	}
+	s.prevGoodput = goodput
+	s.prevDelivery = delivery
+}
+
+func (s externalDirectUDPSelectedTierConservativeStartState) selectedNeedsConservativeStart(sample directUDPRateProbeSample) bool {
+	goodput, delivery, _, ok := externalDirectUDPProbeMetrics(sample, s.sentByRate)
+	if !ok || delivery < externalDirectUDPRateProbeClean {
+		return false
+	}
+	if s.selectedTierConfirmedByPreviousProbe(goodput) {
+		return false
+	}
+	efficiency := goodput / float64(s.selectedRateMbps)
+	return efficiency < externalDirectUDPRateProbeCeilingEfficient
+}
+
+func (s externalDirectUDPSelectedTierConservativeStartState) selectedTierConfirmedByPreviousProbe(goodput float64) bool {
+	return s.selectedRateMbps > externalDirectUDPRateProbeConfirmMinMbps &&
+		s.prevGoodput > 0 &&
+		s.prevDelivery >= externalDirectUDPRateProbeClean &&
+		goodput >= s.prevGoodput*1.10
 }
 
 func externalDirectUDPDataExplorationCeilingMbps(maxRateMbps int, selectedRateMbps int, rateCeilingMbps int) int {
@@ -5752,40 +7649,48 @@ func externalDirectUDPDataExplorationCeilingMbps(maxRateMbps int, selectedRateMb
 
 func externalDirectUDPDataExplorationCeilingMbpsForProbeSamples(maxRateMbps int, selectedRateMbps int, rateCeilingMbps int, sent []directUDPRateProbeSample, received []directUDPRateProbeSample) int {
 	explorationCeiling := externalDirectUDPDataExplorationCeilingMbps(maxRateMbps, selectedRateMbps, rateCeilingMbps)
-	if rateCeilingMbps > selectedRateMbps ||
-		selectedRateMbps < externalDirectUDPRateProbeCollapseMinMbps ||
-		len(sent) == 0 ||
-		len(received) == 0 {
+	if !externalDirectUDPShouldInspectExplorationSamples(selectedRateMbps, rateCeilingMbps, sent, received) {
 		return explorationCeiling
 	}
-	sentByRate := make(map[int]directUDPRateProbeSample, len(sent))
-	for _, sample := range sent {
-		sentByRate[sample.RateMbps] = sample
-	}
-	selectedSample := directUDPRateProbeSample{RateMbps: selectedRateMbps}
-	foundSelected := false
-	for _, sample := range received {
-		if sample.RateMbps != selectedRateMbps {
-			continue
-		}
-		selectedSample = sample
-		foundSelected = true
-		break
-	}
-	if !foundSelected {
-		return rateCeilingMbps
-	}
-	selectedGoodput, selectedDelivery, _, ok := externalDirectUDPProbeMetrics(selectedSample, sentByRate)
+	sentByRate := externalDirectUDPProbeSamplesByRate(sent)
+	selectedSample, ok := externalDirectUDPFindRateProbeSample(received, selectedRateMbps)
 	if !ok {
 		return rateCeilingMbps
 	}
-	if selectedDelivery >= externalDirectUDPRateProbeLossySelect {
+	selectedGoodput, selectedDelivery, ok := externalDirectUDPSelectedProbeMetrics(selectedSample, sentByRate)
+	if !ok || selectedDelivery >= externalDirectUDPRateProbeLossySelect {
 		return rateCeilingMbps
 	}
-	if explorationRate, _, _, _, ok := externalDirectUDPFindLossyHighSelectedExplorationCeiling(selectedRateMbps, selectedGoodput, selectedDelivery, sentByRate, received, maxRateMbps); ok && explorationRate > rateCeilingMbps {
-		return explorationRate
+	return externalDirectUDPDataExplorationCeilingFromLossySelection(maxRateMbps, selectedRateMbps, rateCeilingMbps, selectedGoodput, selectedDelivery, sentByRate, received)
+}
+
+func externalDirectUDPShouldInspectExplorationSamples(selectedRateMbps int, rateCeilingMbps int, sent []directUDPRateProbeSample, received []directUDPRateProbeSample) bool {
+	return rateCeilingMbps <= selectedRateMbps &&
+		selectedRateMbps >= externalDirectUDPRateProbeCollapseMinMbps &&
+		len(sent) > 0 &&
+		len(received) > 0
+}
+
+func externalDirectUDPFindRateProbeSample(samples []directUDPRateProbeSample, rateMbps int) (directUDPRateProbeSample, bool) {
+	for _, sample := range samples {
+		if sample.RateMbps == rateMbps {
+			return sample, true
+		}
 	}
-	return rateCeilingMbps
+	return directUDPRateProbeSample{RateMbps: rateMbps}, false
+}
+
+func externalDirectUDPSelectedProbeMetrics(selectedSample directUDPRateProbeSample, sentByRate map[int]directUDPRateProbeSample) (float64, float64, bool) {
+	selectedGoodput, selectedDelivery, _, ok := externalDirectUDPProbeMetrics(selectedSample, sentByRate)
+	return selectedGoodput, selectedDelivery, ok
+}
+
+func externalDirectUDPDataExplorationCeilingFromLossySelection(maxRateMbps int, selectedRateMbps int, rateCeilingMbps int, selectedGoodput float64, selectedDelivery float64, sentByRate map[int]directUDPRateProbeSample, received []directUDPRateProbeSample) int {
+	explorationRate, _, _, _, ok := externalDirectUDPFindLossyHighSelectedExplorationCeiling(selectedRateMbps, selectedGoodput, selectedDelivery, sentByRate, received, maxRateMbps)
+	if !ok || explorationRate <= rateCeilingMbps {
+		return rateCeilingMbps
+	}
+	return explorationRate
 }
 
 func externalDirectUDPDataRateCeilingMbps(probeCeilingMbps int, selectedRateMbps int, activeLanes int) int {
@@ -5834,7 +7739,7 @@ func sendExternalRelayUDP(ctx context.Context, src io.Reader, manager *transport
 	}
 	peerConn := manager.PeerDatagramConn(ctx)
 	packetConn := newExternalPeerDatagramPacketConn(ctx, peerConn)
-	defer packetConn.Close()
+	defer func() { _ = packetConn.Close() }()
 	_, err = externalDirectUDPProbeSendFn(ctx, packetConn, packetConn.remoteAddr.String(), externalDirectUDPBufferedReader(src), probe.SendConfig{
 		Raw:        true,
 		Blast:      true,
@@ -5864,7 +7769,7 @@ func receiveExternalRelayUDP(ctx context.Context, dst io.Writer, manager *transp
 	}
 	peerConn := manager.PeerDatagramConn(ctx)
 	packetConn := newExternalPeerDatagramPacketConn(ctx, peerConn)
-	defer packetConn.Close()
+	defer func() { _ = packetConn.Close() }()
 	receiveDst, flushDst := externalDirectUDPBufferedWriter(dst)
 	_, err = externalRelayUDPProbeReceiveToWriterFn(ctx, packetConn, receiveDst, probe.ReceiveConfig{
 		Raw:             true,
@@ -5933,7 +7838,7 @@ func externalDirectUDPFileIsNullDevice(file *os.File) bool {
 	if err != nil {
 		return false
 	}
-	defer devNull.Close()
+	defer func() { _ = devNull.Close() }()
 	nullInfo, err := devNull.Stat()
 	if err != nil {
 		return false

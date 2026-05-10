@@ -43,44 +43,55 @@ func DescribeTar(srcRoot string) (TarStats, error) {
 		if path == srcRoot {
 			return nil
 		}
-
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-
-		rel, err := filepath.Rel(srcRoot, path)
-		if err != nil {
-			return err
-		}
-		name := filepath.ToSlash(rel)
-
-		switch {
-		case info.IsDir():
-			headerBytes, err := tarHeaderBytes(info, name+"/")
-			if err != nil {
-				return err
-			}
-			stats.TarBytes += headerBytes
-			return nil
-		case info.Mode().IsRegular():
-			headerBytes, err := tarHeaderBytes(info, name)
-			if err != nil {
-				return err
-			}
-			stats.TarBytes += headerBytes + padded512(info.Size())
-			stats.FileCount++
-			stats.UncompressedBytes += info.Size()
-			return nil
-		default:
-			return fmt.Errorf("unsupported directory entry %q with mode %v", path, info.Mode())
-		}
+		return describeTarEntry(&stats, srcRoot, path, d)
 	}); err != nil {
 		return TarStats{}, err
 	}
 
 	stats.TarBytes += 1024
 	return stats, nil
+}
+
+func describeTarEntry(stats *TarStats, srcRoot string, path string, d fs.DirEntry) error {
+	info, err := d.Info()
+	if err != nil {
+		return err
+	}
+
+	rel, err := filepath.Rel(srcRoot, path)
+	if err != nil {
+		return err
+	}
+	name := filepath.ToSlash(rel)
+
+	switch {
+	case info.IsDir():
+		return describeTarDir(stats, info, name)
+	case info.Mode().IsRegular():
+		return describeTarFile(stats, info, name)
+	default:
+		return fmt.Errorf("unsupported directory entry %q with mode %v", path, info.Mode())
+	}
+}
+
+func describeTarDir(stats *TarStats, info fs.FileInfo, name string) error {
+	headerBytes, err := tarHeaderBytes(info, name+"/")
+	if err != nil {
+		return err
+	}
+	stats.TarBytes += headerBytes
+	return nil
+}
+
+func describeTarFile(stats *TarStats, info fs.FileInfo, name string) error {
+	headerBytes, err := tarHeaderBytes(info, name)
+	if err != nil {
+		return err
+	}
+	stats.TarBytes += headerBytes + padded512(info.Size())
+	stats.FileCount++
+	stats.UncompressedBytes += info.Size()
+	return nil
 }
 
 func tarHeaderBytes(info fs.FileInfo, name string) (int64, error) {

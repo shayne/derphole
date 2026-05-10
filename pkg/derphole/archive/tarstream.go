@@ -25,7 +25,7 @@ func StreamTar(w io.Writer, srcRoot string) error {
 	}
 
 	tw := tar.NewWriter(w)
-	defer tw.Close()
+	defer func() { _ = tw.Close() }()
 
 	return filepath.WalkDir(srcRoot, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -34,50 +34,61 @@ func StreamTar(w io.Writer, srcRoot string) error {
 		if path == srcRoot {
 			return nil
 		}
-
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-
-		rel, err := filepath.Rel(srcRoot, path)
-		if err != nil {
-			return err
-		}
-		name := filepath.ToSlash(rel)
-
-		switch {
-		case info.IsDir():
-			hdr, err := tar.FileInfoHeader(info, "")
-			if err != nil {
-				return err
-			}
-			hdr.Name = name + "/"
-			return tw.WriteHeader(hdr)
-		case info.Mode().IsRegular():
-			hdr, err := tar.FileInfoHeader(info, "")
-			if err != nil {
-				return err
-			}
-			hdr.Name = name
-			if err := tw.WriteHeader(hdr); err != nil {
-				return err
-			}
-
-			f, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			_, copyErr := io.Copy(tw, f)
-			closeErr := f.Close()
-			if copyErr != nil {
-				return copyErr
-			}
-			return closeErr
-		default:
-			return fmt.Errorf("unsupported directory entry %q with mode %v", path, info.Mode())
-		}
+		return streamTarEntry(tw, srcRoot, path, d)
 	})
+}
+
+func streamTarEntry(tw *tar.Writer, srcRoot string, path string, d fs.DirEntry) error {
+	info, err := d.Info()
+	if err != nil {
+		return err
+	}
+
+	rel, err := filepath.Rel(srcRoot, path)
+	if err != nil {
+		return err
+	}
+	name := filepath.ToSlash(rel)
+
+	switch {
+	case info.IsDir():
+		return writeTarDir(tw, info, name)
+	case info.Mode().IsRegular():
+		return writeTarFile(tw, info, name, path)
+	default:
+		return fmt.Errorf("unsupported directory entry %q with mode %v", path, info.Mode())
+	}
+}
+
+func writeTarDir(tw *tar.Writer, info fs.FileInfo, name string) error {
+	hdr, err := tar.FileInfoHeader(info, "")
+	if err != nil {
+		return err
+	}
+	hdr.Name = name + "/"
+	return tw.WriteHeader(hdr)
+}
+
+func writeTarFile(tw *tar.Writer, info fs.FileInfo, name string, path string) error {
+	hdr, err := tar.FileInfoHeader(info, "")
+	if err != nil {
+		return err
+	}
+	hdr.Name = name
+	if err := tw.WriteHeader(hdr); err != nil {
+		return err
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(tw, f)
+	closeErr := f.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
 }
 
 func ExtractTar(r io.Reader, destRoot, topLevel string) error {
@@ -96,43 +107,56 @@ func ExtractTar(r io.Reader, destRoot, topLevel string) error {
 			return err
 		}
 
-		clean := filepath.Clean(hdr.Name)
-		if clean == "." || strings.HasPrefix(clean, "..") || filepath.IsAbs(clean) {
-			return fmt.Errorf("unsafe tar path %q", hdr.Name)
-		}
-
-		target := filepath.Join(base, clean)
-		rel, err := filepath.Rel(base, target)
+		target, err := safeTarTarget(base, hdr.Name)
 		if err != nil {
 			return err
 		}
-		if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("unsafe tar target %q", hdr.Name)
-		}
-
-		switch hdr.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, fs.FileMode(hdr.Mode)); err != nil {
-				return err
-			}
-		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
-			}
-			f, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, fs.FileMode(hdr.Mode))
-			if err != nil {
-				return err
-			}
-			_, copyErr := io.CopyN(f, tr, hdr.Size)
-			closeErr := f.Close()
-			if copyErr != nil {
-				return copyErr
-			}
-			if closeErr != nil {
-				return closeErr
-			}
-		default:
-			return fmt.Errorf("unsupported tar entry type %d for %q", hdr.Typeflag, hdr.Name)
+		if err := extractTarEntry(tr, hdr, target); err != nil {
+			return err
 		}
 	}
+}
+
+func safeTarTarget(base string, name string) (string, error) {
+	clean := filepath.Clean(name)
+	if clean == "." || strings.HasPrefix(clean, "..") || filepath.IsAbs(clean) {
+		return "", fmt.Errorf("unsafe tar path %q", name)
+	}
+
+	target := filepath.Join(base, clean)
+	rel, err := filepath.Rel(base, target)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("unsafe tar target %q", name)
+	}
+	return target, nil
+}
+
+func extractTarEntry(tr *tar.Reader, hdr *tar.Header, target string) error {
+	switch hdr.Typeflag {
+	case tar.TypeDir:
+		return os.MkdirAll(target, fs.FileMode(hdr.Mode))
+	case tar.TypeReg:
+		return extractTarFile(tr, hdr, target)
+	default:
+		return fmt.Errorf("unsupported tar entry type %d for %q", hdr.Typeflag, hdr.Name)
+	}
+}
+
+func extractTarFile(tr *tar.Reader, hdr *tar.Header, target string) error {
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, fs.FileMode(hdr.Mode))
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.CopyN(f, tr, hdr.Size)
+	closeErr := f.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
 }

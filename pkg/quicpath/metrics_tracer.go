@@ -86,42 +86,89 @@ func (t *quicMetricsTrace) recordEvent(ev qlogwriter.Event) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.summary.Events++
+	t.recordEventLocked(ev)
+}
 
+func (t *quicMetricsTrace) recordEventLocked(ev qlogwriter.Event) {
+	if t.recordMetricsEventLocked(ev) {
+		return
+	}
+	if t.recordCongestionEventLocked(ev) {
+		return
+	}
+	if t.recordLossEventLocked(ev) {
+		return
+	}
+	t.recordMTUEventLocked(ev)
+}
+
+func (t *quicMetricsTrace) recordMetricsEventLocked(ev qlogwriter.Event) bool {
 	switch event := ev.(type) {
 	case qlog.MetricsUpdated:
 		t.recordMetricsUpdatedLocked(event)
+		return true
 	case *qlog.MetricsUpdated:
 		if event != nil {
 			t.recordMetricsUpdatedLocked(*event)
 		}
+		return true
+	default:
+		return false
+	}
+}
+
+func (t *quicMetricsTrace) recordCongestionEventLocked(ev qlogwriter.Event) bool {
+	switch event := ev.(type) {
 	case qlog.CongestionStateUpdated:
 		t.recordCongestionStateUpdatedLocked(event.State)
+		return true
 	case *qlog.CongestionStateUpdated:
 		if event != nil {
 			t.recordCongestionStateUpdatedLocked(event.State)
 		}
+		return true
+	default:
+		return false
+	}
+}
+
+func (t *quicMetricsTrace) recordLossEventLocked(ev qlogwriter.Event) bool {
+	switch event := ev.(type) {
 	case qlog.PacketLost:
 		t.summary.PacketLostEvents++
+		return true
 	case *qlog.PacketLost:
 		if event != nil {
 			t.summary.PacketLostEvents++
 		}
+		return true
 	case qlog.SpuriousLoss:
 		t.summary.SpuriousLossEvents++
+		return true
 	case *qlog.SpuriousLoss:
 		if event != nil {
 			t.summary.SpuriousLossEvents++
 		}
+		return true
+	default:
+		return false
+	}
+}
+
+func (t *quicMetricsTrace) recordMTUEventLocked(ev qlogwriter.Event) {
+	switch event := ev.(type) {
 	case qlog.MTUUpdated:
-		if v := uint64(event.Value); v > t.summary.MaxMTU {
-			t.summary.MaxMTU = v
-		}
+		t.recordMTULocked(uint64(event.Value))
 	case *qlog.MTUUpdated:
 		if event != nil {
-			if v := uint64(event.Value); v > t.summary.MaxMTU {
-				t.summary.MaxMTU = v
-			}
+			t.recordMTULocked(uint64(event.Value))
 		}
+	}
+}
+
+func (t *quicMetricsTrace) recordMTULocked(value uint64) {
+	if value > t.summary.MaxMTU {
+		t.summary.MaxMTU = value
 	}
 }
 

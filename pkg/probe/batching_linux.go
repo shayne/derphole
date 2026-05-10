@@ -38,17 +38,9 @@ func newPlatformBatcher(conn net.PacketConn, requested string) packetBatcher {
 	if !ok {
 		return nil
 	}
-	addr, _ := udpConn.LocalAddr().(*net.UDPAddr)
-	var xpc xnetBatchReaderWriter
-	if addr != nil && addr.IP != nil && addr.IP.To4() == nil {
-		xpc = ipv6.NewPacketConn(udpConn)
-	} else {
-		xpc = ipv4.NewPacketConn(udpConn)
-	}
-
 	b := &linuxBatcher{
 		conn: udpConn,
-		xpc:  xpc,
+		xpc:  linuxPacketConn(udpConn),
 		caps: tuneSocketCaps(udpConn, TransportCaps{
 			Kind:          probeTransportBatched,
 			RequestedKind: requested,
@@ -69,6 +61,14 @@ func newPlatformBatcher(conn net.PacketConn, requested string) packetBatcher {
 	return b
 }
 
+func linuxPacketConn(udpConn *net.UDPConn) xnetBatchReaderWriter {
+	addr, _ := udpConn.LocalAddr().(*net.UDPAddr)
+	if addr != nil && addr.IP != nil && addr.IP.To4() == nil {
+		return ipv6.NewPacketConn(udpConn)
+	}
+	return ipv4.NewPacketConn(udpConn)
+}
+
 func (b *linuxBatcher) Capabilities() TransportCaps { return b.caps }
 func (b *linuxBatcher) MaxBatch() int               { return probeIdealBatchSize }
 
@@ -76,36 +76,43 @@ func (b *linuxBatcher) WriteBatch(ctx context.Context, peer net.Addr, packets []
 	if len(packets) == 0 {
 		return 0, nil
 	}
-	if b == nil || b.conn == nil || b.xpc == nil {
-		return 0, errors.New("nil packet conn")
-	}
-	deadline, err := batchWriteDeadline(ctx)
-	if err != nil {
+	if err := b.requireReady(); err != nil {
 		return 0, err
 	}
-	if err := b.conn.SetWriteDeadline(deadline); err != nil {
+	if err := b.setWriteDeadline(ctx); err != nil {
 		return 0, err
 	}
-	defer b.conn.SetWriteDeadline(time.Time{})
+	defer b.clearWriteDeadline()
 
 	msgs := b.getMessages()
 	defer b.putMessages(msgs)
 
+	return b.writePackets(msgs, peer, packets)
+}
+
+func (b *linuxBatcher) requireReady() error {
+	if b == nil || b.conn == nil || b.xpc == nil {
+		return errors.New("nil packet conn")
+	}
+	return nil
+}
+
+func (b *linuxBatcher) setWriteDeadline(ctx context.Context) error {
+	deadline, err := batchWriteDeadline(ctx)
+	if err != nil {
+		return err
+	}
+	return b.conn.SetWriteDeadline(deadline)
+}
+
+func (b *linuxBatcher) clearWriteDeadline() {
+	_ = b.conn.SetWriteDeadline(time.Time{})
+}
+
+func (b *linuxBatcher) writePackets(msgs *[]ipv6.Message, peer net.Addr, packets [][]byte) (int, error) {
 	sent := 0
 	for sent < len(packets) {
-		chunk := len(packets) - sent
-		if chunk > len(*msgs) {
-			chunk = len(*msgs)
-		}
-		for i := 0; i < chunk; i++ {
-			(*msgs)[i].Buffers[0] = packets[sent+i]
-			(*msgs)[i].Addr = peer
-			(*msgs)[i].OOB = (*msgs)[i].OOB[:0]
-			(*msgs)[i].N = 0
-			(*msgs)[i].NN = 0
-			(*msgs)[i].Flags = 0
-		}
-
+		chunk := prepareLinuxWriteMessages(msgs, peer, packets[sent:])
 		n, err := b.xpc.WriteBatch((*msgs)[:chunk], 0)
 		sent += n
 		if err != nil {
@@ -118,42 +125,78 @@ func (b *linuxBatcher) WriteBatch(ctx context.Context, peer net.Addr, packets []
 	return sent, nil
 }
 
+func prepareLinuxWriteMessages(msgs *[]ipv6.Message, peer net.Addr, packets [][]byte) int {
+	chunk := linuxBatchChunk(len(packets), len(*msgs))
+	for i := 0; i < chunk; i++ {
+		prepareLinuxWriteMessage(&(*msgs)[i], peer, packets[i])
+	}
+	return chunk
+}
+
+func prepareLinuxWriteMessage(msg *ipv6.Message, peer net.Addr, packet []byte) {
+	msg.Buffers[0] = packet
+	msg.Addr = peer
+	resetLinuxMessage(msg)
+}
+
 func (b *linuxBatcher) ReadBatch(ctx context.Context, timeout time.Duration, bufs []batchReadBuffer) (int, error) {
 	if len(bufs) == 0 {
 		return 0, nil
 	}
-	if b == nil || b.conn == nil || b.xpc == nil {
-		return 0, errors.New("nil packet conn")
-	}
-	deadline, err := batchReadDeadline(ctx, timeout)
-	if err != nil {
+	if err := b.requireReady(); err != nil {
 		return 0, err
 	}
-	if err := b.conn.SetReadDeadline(deadline); err != nil {
+	if err := b.setReadDeadline(ctx, timeout); err != nil {
 		return 0, err
 	}
-	defer b.conn.SetReadDeadline(time.Time{})
+	defer b.clearReadDeadline()
 
 	msgs := b.getMessages()
 	defer b.putMessages(msgs)
 
-	limit := len(bufs)
-	if limit > len(*msgs) {
-		limit = len(*msgs)
-	}
-	for i := 0; i < limit; i++ {
-		(*msgs)[i].Buffers[0] = bufs[i].Bytes
-		(*msgs)[i].Addr = nil
-		(*msgs)[i].OOB = (*msgs)[i].OOB[:0]
-		(*msgs)[i].N = 0
-		(*msgs)[i].NN = 0
-		(*msgs)[i].Flags = 0
-	}
-
+	limit := prepareLinuxReadMessages(msgs, bufs)
 	n, err := b.xpc.ReadBatch((*msgs)[:limit], 0)
 	if err != nil {
 		return 0, err
 	}
+	fillLinuxReadBuffers(msgs, bufs, n)
+	return n, nil
+}
+
+func (b *linuxBatcher) setReadDeadline(ctx context.Context, timeout time.Duration) error {
+	deadline, err := batchReadDeadline(ctx, timeout)
+	if err != nil {
+		return err
+	}
+	return b.conn.SetReadDeadline(deadline)
+}
+
+func (b *linuxBatcher) clearReadDeadline() {
+	_ = b.conn.SetReadDeadline(time.Time{})
+}
+
+func prepareLinuxReadMessages(msgs *[]ipv6.Message, bufs []batchReadBuffer) int {
+	limit := linuxBatchChunk(len(bufs), len(*msgs))
+	for i := 0; i < limit; i++ {
+		prepareLinuxReadMessage(&(*msgs)[i], bufs[i].Bytes)
+	}
+	return limit
+}
+
+func prepareLinuxReadMessage(msg *ipv6.Message, buf []byte) {
+	msg.Buffers[0] = buf
+	msg.Addr = nil
+	resetLinuxMessage(msg)
+}
+
+func resetLinuxMessage(msg *ipv6.Message) {
+	msg.OOB = msg.OOB[:0]
+	msg.N = 0
+	msg.NN = 0
+	msg.Flags = 0
+}
+
+func fillLinuxReadBuffers(msgs *[]ipv6.Message, bufs []batchReadBuffer, n int) {
 	for i := 0; i < n; i++ {
 		bufs[i].N = (*msgs)[i].N
 		bufs[i].Addr = cloneAddr((*msgs)[i].Addr)
@@ -162,7 +205,13 @@ func (b *linuxBatcher) ReadBatch(ctx context.Context, timeout time.Duration, buf
 		bufs[i].N = 0
 		bufs[i].Addr = nil
 	}
-	return n, nil
+}
+
+func linuxBatchChunk(pending int, capacity int) int {
+	if pending > capacity {
+		return capacity
+	}
+	return pending
 }
 
 func (b *linuxBatcher) getMessages() *[]ipv6.Message {
@@ -181,13 +230,23 @@ func platformSetSocketBuffers(conn net.PacketConn, caps *TransportCaps, size int
 	if !ok || udpConn == nil {
 		return
 	}
+	forceSocketBuffers(udpConn, size)
+	setSocketBuffers(conn, size)
+	_ = caps
+}
+
+func forceSocketBuffers(udpConn *net.UDPConn, size int) {
 	rawConn, err := udpConn.SyscallConn()
-	if err == nil {
-		_ = rawConn.Control(func(fd uintptr) {
-			_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUFFORCE, size)
-			_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUFFORCE, size)
-		})
+	if err != nil {
+		return
 	}
+	_ = rawConn.Control(func(fd uintptr) {
+		_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUFFORCE, size)
+		_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUFFORCE, size)
+	})
+}
+
+func setSocketBuffers(conn net.PacketConn, size int) {
 	type readBufferSetter interface {
 		SetReadBuffer(int) error
 	}
@@ -200,7 +259,6 @@ func platformSetSocketBuffers(conn net.PacketConn, caps *TransportCaps, size int
 	if setter, ok := conn.(writeBufferSetter); ok {
 		_ = setter.SetWriteBuffer(size)
 	}
-	_ = caps
 }
 
 func platformSetSocketPacing(conn net.PacketConn, bytesPerSecond uint64) bool {
@@ -220,8 +278,8 @@ func platformSetSocketPacing(conn net.PacketConn, bytesPerSecond uint64) bool {
 }
 
 func platformConnectUDP(conn *net.UDPConn, peer *net.UDPAddr) error {
-	if conn == nil || peer == nil {
-		return errors.New("nil udp conn or peer")
+	if err := validatePlatformConnectUDP(conn, peer); err != nil {
+		return err
 	}
 	sa, err := udpSockaddr(conn.LocalAddr(), peer)
 	if err != nil {
@@ -231,6 +289,17 @@ func platformConnectUDP(conn *net.UDPConn, peer *net.UDPAddr) error {
 	if err != nil {
 		return err
 	}
+	return controlConnectUDP(rawConn, sa)
+}
+
+func validatePlatformConnectUDP(conn *net.UDPConn, peer *net.UDPAddr) error {
+	if conn == nil || peer == nil {
+		return errors.New("nil udp conn or peer")
+	}
+	return nil
+}
+
+func controlConnectUDP(rawConn syscall.RawConn, sa unix.Sockaddr) error {
 	var connectErr error
 	if err := rawConn.Control(func(fd uintptr) {
 		connectErr = unix.Connect(int(fd), sa)

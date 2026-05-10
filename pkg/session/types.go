@@ -153,10 +153,7 @@ func (e *transportPathEmitter) Handle(path transport.Path) {
 	if e.closed || path == e.last {
 		return
 	}
-	if path == transport.PathDirect && e.suppressWatcherDirect {
-		return
-	}
-	if path == transport.PathRelay && e.suppressRelayRegression && e.last == transport.PathDirect {
+	if e.suppressesPathLocked(path) {
 		return
 	}
 	e.last = path
@@ -167,6 +164,13 @@ func (e *transportPathEmitter) Handle(path transport.Path) {
 	case transport.PathRelay:
 		e.emitter.Status(string(StateRelay))
 	}
+}
+
+func (e *transportPathEmitter) suppressesPathLocked(path transport.Path) bool {
+	if path == transport.PathDirect && e.suppressWatcherDirect {
+		return true
+	}
+	return path == transport.PathRelay && e.suppressRelayRegression && e.last == transport.PathDirect
 }
 
 func (e *transportPathEmitter) Watch(ctx context.Context, manager *transport.Manager) {
@@ -272,22 +276,32 @@ func (e *transportPathEmitter) Complete(manager *transport.Manager) {
 		return
 	}
 	if manager != nil {
-		if drops := manager.DroppedPeerDatagrams(); drops > 0 {
-			e.emitter.Debug(fmt.Sprintf("transport-dropped-datagrams=%d", drops))
-		}
-		if rejected := manager.RejectedDirectDatagrams(); rejected > 0 {
-			e.emitter.Debug(fmt.Sprintf("transport-rejected-direct-datagrams=%d", rejected))
-		}
-		if depth := manager.MaxPeerRecvQueueDepth(); depth > 0 {
-			e.emitter.Debug(fmt.Sprintf("transport-max-peer-recv-queue-depth=%d", depth))
-		}
-		if path := manager.PathState(); path == transport.PathDirect && e.last != transport.PathDirect && !e.suppressWatcherDirect {
-			e.last = transport.PathDirect
-			e.emitter.Status(string(StateDirect))
-		}
+		e.emitTransportManagerSummaryLocked(manager)
 	}
 	e.closed = true
 	e.emitter.Status(string(StateComplete))
+}
+
+func (e *transportPathEmitter) emitTransportManagerSummaryLocked(manager *transport.Manager) {
+	emitPositiveUintDebug(e.emitter, "transport-dropped-datagrams", manager.DroppedPeerDatagrams())
+	emitPositiveUintDebug(e.emitter, "transport-rejected-direct-datagrams", manager.RejectedDirectDatagrams())
+	emitPositiveIntDebug(e.emitter, "transport-max-peer-recv-queue-depth", manager.MaxPeerRecvQueueDepth())
+	if path := manager.PathState(); path == transport.PathDirect && e.last != transport.PathDirect && !e.suppressWatcherDirect {
+		e.last = transport.PathDirect
+		e.emitter.Status(string(StateDirect))
+	}
+}
+
+func emitPositiveUintDebug(emitter *telemetry.Emitter, key string, value uint64) {
+	if value > 0 {
+		emitter.Debug(fmt.Sprintf("%s=%d", key, value))
+	}
+}
+
+func emitPositiveIntDebug(emitter *telemetry.Emitter, key string, value int) {
+	if value > 0 {
+		emitter.Debug(fmt.Sprintf("%s=%d", key, value))
+	}
 }
 
 func (e *transportPathEmitter) stopWatching() {

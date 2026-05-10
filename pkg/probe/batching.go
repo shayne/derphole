@@ -141,20 +141,33 @@ func (b *legacyBatcher) WriteBatch(ctx context.Context, peer net.Addr, packets [
 		return 0, err
 	}
 
-	if udpConn, ok := b.conn.(*net.UDPConn); ok {
-		if udpPeer, ok := peer.(*net.UDPAddr); ok {
-			addrPort := udpPeer.AddrPort()
-			for i, packet := range packets {
-				if _, err := udpConn.WriteToUDPAddrPort(packet, addrPort); err != nil {
-					return i, err
-				}
-			}
-			return len(packets), nil
+	if n, ok, err := b.writeUDPBatch(peer, packets); ok {
+		return n, err
+	}
+	return writePacketBatch(b.conn, peer, packets)
+}
+
+func (b *legacyBatcher) writeUDPBatch(peer net.Addr, packets [][]byte) (int, bool, error) {
+	udpConn, ok := b.conn.(*net.UDPConn)
+	if !ok {
+		return 0, false, nil
+	}
+	udpPeer, ok := peer.(*net.UDPAddr)
+	if !ok {
+		return 0, false, nil
+	}
+	addrPort := udpPeer.AddrPort()
+	for i, packet := range packets {
+		if _, err := udpConn.WriteToUDPAddrPort(packet, addrPort); err != nil {
+			return i, true, err
 		}
 	}
+	return len(packets), true, nil
+}
 
+func writePacketBatch(conn net.PacketConn, peer net.Addr, packets [][]byte) (int, error) {
 	for i, packet := range packets {
-		if _, err := b.conn.WriteTo(packet, peer); err != nil {
+		if _, err := conn.WriteTo(packet, peer); err != nil {
 			return i, err
 		}
 	}

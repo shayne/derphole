@@ -24,35 +24,17 @@ func (s *intervalStats) Observe(now time.Time, totalBytes int64) {
 		now = time.Now()
 	}
 	if !s.seen {
-		s.seen = true
-		s.lastAt = now
-		s.lastBytes = totalBytes
+		s.observeFirst(now, totalBytes)
 		return
 	}
-	if totalBytes < s.lastBytes {
-		return
-	}
-	if totalBytes == s.lastBytes {
+	if totalBytes <= s.lastBytes {
 		return
 	}
 	elapsed := now.Sub(s.lastAt)
-	if elapsed <= 0 {
+	if elapsed <= 0 || elapsed < s.effectiveMinWindow() {
 		return
 	}
-	minWindow := intervalStatsMinWindow
-	if s.minWindow > 0 {
-		minWindow = s.minWindow
-	}
-	if elapsed < minWindow {
-		return
-	}
-	bytesDelta := totalBytes - s.lastBytes
-	mbps := float64(bytesDelta*8) / elapsed.Seconds() / 1_000_000
-	if mbps > s.peakMbps {
-		s.peakMbps = mbps
-	}
-	s.lastAt = now
-	s.lastBytes = totalBytes
+	s.observeRate(now, totalBytes, elapsed)
 }
 
 func (s *intervalStats) ObserveCompletion(now time.Time, totalBytes int64) {
@@ -63,9 +45,7 @@ func (s *intervalStats) ObserveCompletion(now time.Time, totalBytes int64) {
 		now = time.Now()
 	}
 	if !s.seen {
-		s.seen = true
-		s.lastAt = now
-		s.lastBytes = totalBytes
+		s.observeFirst(now, totalBytes)
 		return
 	}
 	if totalBytes <= s.lastBytes {
@@ -75,6 +55,23 @@ func (s *intervalStats) ObserveCompletion(now time.Time, totalBytes int64) {
 	if elapsed <= 0 {
 		return
 	}
+	s.observeRate(now, totalBytes, elapsed)
+}
+
+func (s *intervalStats) observeFirst(now time.Time, totalBytes int64) {
+	s.seen = true
+	s.lastAt = now
+	s.lastBytes = totalBytes
+}
+
+func (s *intervalStats) effectiveMinWindow() time.Duration {
+	if s.minWindow > 0 {
+		return s.minWindow
+	}
+	return intervalStatsMinWindow
+}
+
+func (s *intervalStats) observeRate(now time.Time, totalBytes int64, elapsed time.Duration) {
 	bytesDelta := totalBytes - s.lastBytes
 	mbps := float64(bytesDelta*8) / elapsed.Seconds() / 1_000_000
 	if mbps > s.peakMbps {

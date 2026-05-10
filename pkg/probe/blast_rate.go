@@ -187,36 +187,49 @@ func (c *blastSendControl) ObserveReplayPressure(now time.Time, retainedBytes ui
 }
 
 func (c *blastSendControl) ObserveRepairPressure(now time.Time, retransmits int) {
-	if c == nil || c.controller == nil || c.controller.RateMbps() <= blastRateMinMbps {
-		return
-	}
-	if retransmits <= 0 {
+	if !c.canObserveRepairPressure(retransmits) {
 		return
 	}
 	if now.IsZero() {
 		now = time.Now()
 	}
-	if c.repairPressureAt.IsZero() || now.Sub(c.repairPressureAt) >= blastRateRepairPressureEvery {
-		c.repairPressureAt = now
-		c.repairPressurePk = 0
-	}
+	c.rotateRepairPressureWindow(now)
 	c.repairPressurePk += retransmits
 	if c.repairPressurePk < c.repairPressurePackets() {
 		return
 	}
 	if now.Before(c.controller.holdIncrease) {
-		c.repairPressureAt = now
-		c.repairPressurePk = 0
+		c.resetRepairPressure(now)
 		return
 	}
 	before := c.controller.RateMbps()
 	c.controller.decreaseFromRepairPressure(now)
-	after := c.controller.RateMbps()
-	if after != before {
-		c.repairPressureAt = now
-		c.repairPressurePk = 0
-		sessionTracef("blast rate repair pressure rate_mbps=%d previous_mbps=%d retransmits=%d", after, before, retransmits)
+	c.traceRepairPressureChange(now, before, retransmits)
+}
+
+func (c *blastSendControl) canObserveRepairPressure(retransmits int) bool {
+	return c != nil && c.controller != nil && c.controller.RateMbps() > blastRateMinMbps && retransmits > 0
+}
+
+func (c *blastSendControl) rotateRepairPressureWindow(now time.Time) {
+	if !c.repairPressureAt.IsZero() && now.Sub(c.repairPressureAt) < blastRateRepairPressureEvery {
+		return
 	}
+	c.resetRepairPressure(now)
+}
+
+func (c *blastSendControl) resetRepairPressure(now time.Time) {
+	c.repairPressureAt = now
+	c.repairPressurePk = 0
+}
+
+func (c *blastSendControl) traceRepairPressureChange(now time.Time, before int, retransmits int) {
+	after := c.controller.RateMbps()
+	if after == before {
+		return
+	}
+	c.resetRepairPressure(now)
+	sessionTracef("blast rate repair pressure rate_mbps=%d previous_mbps=%d retransmits=%d", after, before, retransmits)
 }
 
 func (c *blastSendControl) repairPressurePackets() int {
@@ -369,52 +382,83 @@ func (c *blastRateController) Observe(now time.Time, feedback blastRateFeedback)
 	if !c.lastFeedbackAt.IsZero() && now.Sub(c.lastFeedbackAt) < blastRateFeedbackInterval {
 		return
 	}
-	sentDelta := deltaUint64(feedback.SentPayloadBytes, c.last.SentPayloadBytes)
-	receivedDelta := deltaUint64(feedback.ReceivedPayloadBytes, c.last.ReceivedPayloadBytes)
-	receivedPacketDelta := deltaUint64(feedback.ReceivedPackets, c.last.ReceivedPackets)
-	missing := feedback.MissingPackets()
-	lastMissing := c.last.MissingPackets()
-	missingDelta := deltaUint64(missing, lastMissing)
-
+	delta := c.feedbackDelta(feedback)
 	c.last = feedback
 	c.lastFeedbackAt = now
-	if feedback.ReceivedPayloadBytes > c.lastProgressBytes {
-		c.lastProgressBytes = feedback.ReceivedPayloadBytes
-		c.lastProgressAt = now
-		c.commitStallAt = time.Time{}
-	}
+	c.observeFeedbackProgress(now, feedback)
 
-	if sentDelta == 0 {
+	if delta.sent == 0 {
 		return
 	}
-	if c.shouldBackOffForCommitStall(now, feedback, receivedDelta) {
+	if c.shouldBackOffForCommitStall(now, feedback, delta.received) {
 		c.decreaseFromCommitStall(now)
 		c.commitStallAt = now
 		return
 	}
-	loss := missing > blastRateLossBudgetPackets(feedback.ReceivedPackets) &&
-		missingDelta > blastRateLossBudgetPackets(receivedPacketDelta)
-	if loss {
-		if c.shouldHoldMediumStartupLoss(now) {
-			c.clearLossCandidate()
-			return
-		}
-		if c.deferModerateLoss(now, missing, missingDelta, receivedPacketDelta, feedback.ReceivedPackets) {
-			return
-		}
-		c.clearLossCandidate()
-		c.decrease(now)
+	if c.handleObservedLoss(now, feedback, delta) {
 		return
 	}
 	c.clearLossCandidate()
-	clean := receivedDelta > 0 && blastRateProbeCleanEnough(missing, missingDelta, receivedPacketDelta, feedback.ReceivedPackets)
-	if !clean || now.Before(c.holdIncrease) {
-		return
-	}
-	if blastRateFeedbackQueueDelay(feedback, c.rateMbps) > blastRateCleanQueueDelayMax {
+	if !c.canIncreaseAfterFeedback(now, feedback, delta) {
 		return
 	}
 	c.increase()
+}
+
+type blastRateFeedbackDelta struct {
+	sent           uint64
+	received       uint64
+	receivedPacket uint64
+	missing        uint64
+}
+
+func (c *blastRateController) feedbackDelta(feedback blastRateFeedback) blastRateFeedbackDelta {
+	missing := feedback.MissingPackets()
+	return blastRateFeedbackDelta{
+		sent:           deltaUint64(feedback.SentPayloadBytes, c.last.SentPayloadBytes),
+		received:       deltaUint64(feedback.ReceivedPayloadBytes, c.last.ReceivedPayloadBytes),
+		receivedPacket: deltaUint64(feedback.ReceivedPackets, c.last.ReceivedPackets),
+		missing:        deltaUint64(missing, c.last.MissingPackets()),
+	}
+}
+
+func (c *blastRateController) observeFeedbackProgress(now time.Time, feedback blastRateFeedback) {
+	if feedback.ReceivedPayloadBytes <= c.lastProgressBytes {
+		return
+	}
+	c.lastProgressBytes = feedback.ReceivedPayloadBytes
+	c.lastProgressAt = now
+	c.commitStallAt = time.Time{}
+}
+
+func (c *blastRateController) handleObservedLoss(now time.Time, feedback blastRateFeedback, delta blastRateFeedbackDelta) bool {
+	missing := feedback.MissingPackets()
+	if missing <= blastRateLossBudgetPackets(feedback.ReceivedPackets) {
+		return false
+	}
+	if delta.missing <= blastRateLossBudgetPackets(delta.receivedPacket) {
+		return false
+	}
+	if c.shouldHoldMediumStartupLoss(now) {
+		c.clearLossCandidate()
+		return true
+	}
+	if c.deferModerateLoss(now, missing, delta.missing, delta.receivedPacket, feedback.ReceivedPackets) {
+		return true
+	}
+	c.clearLossCandidate()
+	c.decrease(now)
+	return true
+}
+
+func (c *blastRateController) canIncreaseAfterFeedback(now time.Time, feedback blastRateFeedback, delta blastRateFeedbackDelta) bool {
+	if delta.received == 0 || now.Before(c.holdIncrease) {
+		return false
+	}
+	if !blastRateProbeCleanEnough(feedback.MissingPackets(), delta.missing, delta.receivedPacket, feedback.ReceivedPackets) {
+		return false
+	}
+	return blastRateFeedbackQueueDelay(feedback, c.rateMbps) <= blastRateCleanQueueDelayMax
 }
 
 func (c *blastRateController) shouldHoldMediumStartupLoss(now time.Time) bool {
@@ -638,35 +682,48 @@ func (c *blastRateController) effectiveCeilingMbps() int {
 }
 
 func (c *blastRateController) rememberLossCeiling(previous int, next int, force bool) {
-	if c == nil || c.ceilingMbps <= 0 || previous <= 0 {
+	if c.invalidLossCeilingObservation(previous) {
 		return
 	}
-	if !force && c.initialLossCeiling && c.lossCeilingMbps > 0 && previous <= c.lossCeilingMbps {
+	if c.shouldIgnoreLossCeilingSample(previous, force) {
 		c.cleanAtLossCeiling = 0
 		return
 	}
 	c.initialLossCeiling = false
-	if c.lossCeilingMbps <= 0 || c.lossCeilingMbps > c.ceilingMbps {
-		c.lossCeilingMbps = c.ceilingMbps
-	}
-	ceilingMultiplier := blastRateLossCeilingMultiplier
-	if force {
-		ceilingMultiplier = blastRatePressureCeilingMultiplier
-	}
-	ceiling := int(float64(previous)*ceilingMultiplier + 0.5)
-	if ceiling < next {
-		ceiling = next
-	}
-	if ceiling < blastRateMinMbps {
-		ceiling = blastRateMinMbps
-	}
-	if ceiling > c.ceilingMbps {
-		ceiling = c.ceilingMbps
-	}
+	c.ensureLossCeilingInitialized()
+	ceiling := c.lossCeilingCandidate(previous, next, force)
 	if force || ceiling < c.lossCeilingMbps {
 		c.lossCeilingMbps = ceiling
 	}
 	c.cleanAtLossCeiling = 0
+}
+
+func (c *blastRateController) invalidLossCeilingObservation(previous int) bool {
+	return c == nil || c.ceilingMbps <= 0 || previous <= 0
+}
+
+func (c *blastRateController) shouldIgnoreLossCeilingSample(previous int, force bool) bool {
+	return !force && c.initialLossCeiling && c.lossCeilingMbps > 0 && previous <= c.lossCeilingMbps
+}
+
+func (c *blastRateController) ensureLossCeilingInitialized() {
+	if c.lossCeilingMbps <= 0 || c.lossCeilingMbps > c.ceilingMbps {
+		c.lossCeilingMbps = c.ceilingMbps
+	}
+}
+
+func (c *blastRateController) lossCeilingCandidate(previous int, next int, force bool) int {
+	ceiling := int(float64(previous)*lossCeilingMultiplier(force) + 0.5)
+	ceiling = max(ceiling, next)
+	ceiling = max(ceiling, blastRateMinMbps)
+	return min(ceiling, c.ceilingMbps)
+}
+
+func lossCeilingMultiplier(force bool) float64 {
+	if force {
+		return blastRatePressureCeilingMultiplier
+	}
+	return blastRateLossCeilingMultiplier
 }
 
 func (c *blastRateController) maybeReopenLossCeiling() (bool, bool) {
@@ -678,29 +735,31 @@ func (c *blastRateController) maybeReopenLossCeiling() (bool, bool) {
 		return false, false
 	}
 	if c.initialLossCeiling && c.ceilingMbps > 1500 {
-		nextRate := int(float64(c.lossCeilingMbps)*1.25 + 0.5)
-		if nextRate <= c.rateMbps {
-			nextRate = c.rateMbps + 1
-		}
-		if nextRate > c.ceilingMbps {
-			nextRate = c.ceilingMbps
-		}
-		c.lossCeilingMbps = c.ceilingMbps
-		c.initialLossCeiling = false
-		c.cleanAtLossCeiling = 0
-		c.rateMbps = nextRate
+		c.reopenInitialLossCeiling()
 		return true, true
 	}
+	c.reopenLossCeilingStep()
+	return true, false
+}
+
+func (c *blastRateController) reopenInitialLossCeiling() {
+	nextRate := int(float64(c.lossCeilingMbps)*1.25 + 0.5)
+	if nextRate <= c.rateMbps {
+		nextRate = c.rateMbps + 1
+	}
+	c.lossCeilingMbps = c.ceilingMbps
+	c.initialLossCeiling = false
+	c.cleanAtLossCeiling = 0
+	c.rateMbps = min(nextRate, c.ceilingMbps)
+}
+
+func (c *blastRateController) reopenLossCeilingStep() {
 	next := int(float64(c.lossCeilingMbps)*blastRateIncreaseMultiplier + 0.5)
 	if next <= c.lossCeilingMbps {
 		next = c.lossCeilingMbps + 1
 	}
-	if next > c.ceilingMbps {
-		next = c.ceilingMbps
-	}
-	c.lossCeilingMbps = next
+	c.lossCeilingMbps = min(next, c.ceilingMbps)
 	c.cleanAtLossCeiling = 0
-	return true, false
 }
 
 func (c *blastRateController) lossCeilingProbeCleanSamples() int {

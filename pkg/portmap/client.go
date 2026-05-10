@@ -146,17 +146,30 @@ func (c *Client) Refresh(now time.Time) bool {
 		return false
 	}
 
-	var (
-		probe portmappertype.ProbeResult
-		err   error
-	)
-	if c.emitter != nil && c.emitter.DebugEnabled() {
-		probe, err = c.mapper.Probe(context.Background())
-	}
+	probe, hasProbe := c.refreshProbe()
 
 	c.mu.Lock()
 	next, ok := c.mapper.GetCachedMappingOrStartCreatingOne()
+	changed := c.applyRefreshMappingLocked(next, ok)
+	c.probe = probe
+	c.hasProbe = hasProbe
+	status, shouldLog := c.refreshStatusLocked()
+	c.mu.Unlock()
 
+	c.logRefreshStatus(status, shouldLog)
+
+	return changed
+}
+
+func (c *Client) refreshProbe() (portmappertype.ProbeResult, bool) {
+	if c.emitter == nil || !c.emitter.DebugEnabled() {
+		return portmappertype.ProbeResult{}, true
+	}
+	probe, err := c.mapper.Probe(context.Background())
+	return probe, err == nil
+}
+
+func (c *Client) applyRefreshMappingLocked(next netip.AddrPort, ok bool) bool {
 	changed := c.have != ok || c.mapped != next
 	if ok {
 		c.have = true
@@ -164,25 +177,27 @@ func (c *Client) Refresh(now time.Time) bool {
 		if c.mapType == "" {
 			c.mapType = "external"
 		}
-	} else {
-		c.have = false
-		c.mapped = netip.AddrPort{}
+		return changed
 	}
-	c.probe = probe
-	c.hasProbe = err == nil
+	c.have = false
+	c.mapped = netip.AddrPort{}
+	return changed
+}
+
+func (c *Client) refreshStatusLocked() (string, bool) {
 	status := c.statusLocked()
 	shouldLog := status != "" && (!c.initial || status != c.lastLog)
 	c.initial = true
 	if shouldLog {
 		c.lastLog = status
 	}
-	c.mu.Unlock()
+	return status, shouldLog
+}
 
+func (c *Client) logRefreshStatus(status string, shouldLog bool) {
 	if shouldLog && c.emitter != nil {
 		c.emitter.Debug(status)
 	}
-
-	return changed
 }
 
 func (c *Client) statusLocked() string {
