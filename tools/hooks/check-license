@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Shayne All rights reserved.
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$repo_root"
+
+if ! command -v mise >/dev/null 2>&1; then
+  echo "mise is required to run addlicense with the repo toolchain." >&2
+  echo "Install and run: mise install" >&2
+  exit 1
+fi
+
+if ! mise exec -- tools/addlicense.sh --check; then
+  echo "" >&2
+  echo "License headers missing or incorrect." >&2
+  echo "Run: tools/addlicense.sh" >&2
+  exit 1
+fi

@@ -1,4 +1,7 @@
 /dist/
+/.tmp/
+/.gomu_history.json
+/mutation-report.json
 *_BENCHMARKS.md
 .DS_Store
 .agents/

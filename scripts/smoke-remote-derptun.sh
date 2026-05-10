@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Shayne All rights reserved.
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
 set -euo pipefail
 
 target="${1:?usage: smoke-remote-derptun.sh HOST}"

@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Shayne All rights reserved.
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$repo_root"
+
+# shellcheck disable=SC1091
+source tools/quality/goals.env
+
+tools/quality/check
+tools/quality/race
+tools/quality/fuzz --fuzztime "${DERPHOLE_GOAL_FUZZTIME:-2s}"
+tools/quality/mutation
+
+coverage=$(awk '/^total:/ {gsub("%", "", $3); print $3}' .tmp/quality/coverage.txt)
+crap_summary=$(
+  go run ./tools/qualitygate \
+    -kind crap \
+    -report .tmp/quality/crap.txt \
+    -baseline tools/quality/baseline/crap.txt
+)
+golangci_summary=$(
+  go run ./tools/qualitygate \
+    -kind golangci-json \
+    -report .tmp/quality/golangci.json \
+    -baseline tools/quality/baseline/golangci.txt
+)
+crap_count=$(printf '%s\n' "$crap_summary" | sed -n 's/.*current=\([0-9][0-9]*\).*/\1/p' | head -n 1)
+golangci_count=$(printf '%s\n' "$golangci_summary" | sed -n 's/.*current=\([0-9][0-9]*\).*/\1/p' | head -n 1)
+mutation_viable=$(awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^viable=/) { sub(/^viable=/, "", $i); total += $i } } END { print total + 0 }' .tmp/quality/mutation/summary.txt)
+mutation_killed=$(awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^killed=/) { sub(/^killed=/, "", $i); total += $i } } END { print total + 0 }' .tmp/quality/mutation/summary.txt)
+mutation_score=$(awk -v killed="$mutation_killed" -v viable="$mutation_viable" 'BEGIN { if (viable == 0) print "0.0"; else printf "%.1f", (killed / viable) * 100 }')
+fuzz_target_count=$(go test -list '^Fuzz' ./... 2>/dev/null | awk '/^Fuzz/ { count++ } END { print count + 0 }')
+
+failed=false
+
+if ! awk -v got="$coverage" -v want="$QUALITY_COVERAGE_MIN" 'BEGIN { exit !(got + 0 >= want + 0) }'; then
+  printf 'coverage goal not met: current=%s target=%s\n' "$coverage" "$QUALITY_COVERAGE_MIN" >&2
+  failed=true
+fi
+
+if ((crap_count > QUALITY_CRAP_MAX)); then
+  printf 'CRAP goal not met: current=%d target=%d\n' "$crap_count" "$QUALITY_CRAP_MAX" >&2
+  failed=true
+fi
+
+if ((golangci_count > QUALITY_GOLANGCI_MAX)); then
+  printf 'golangci goal not met: current=%d target=%d\n' "$golangci_count" "$QUALITY_GOLANGCI_MAX" >&2
+  failed=true
+fi
+
+if ! awk -v got="$mutation_score" -v want="$QUALITY_MUTATION_MIN" 'BEGIN { exit !(got + 0 >= want + 0) }'; then
+  printf 'mutation goal not met: current=%s target=%s\n' "$mutation_score" "$QUALITY_MUTATION_MIN" >&2
+  failed=true
+fi
+
+if ((fuzz_target_count < QUALITY_FUZZ_TARGETS_MIN)); then
+  printf 'fuzz target goal not met: current=%d target=%d\n' "$fuzz_target_count" "$QUALITY_FUZZ_TARGETS_MIN" >&2
+  failed=true
+fi
+
+if [[ "$failed" == "true" ]]; then
+  exit 1
+fi
+
+printf 'quality goals met: coverage=%s CRAP=%d golangci=%d mutation=%s fuzz-targets=%d\n' "$coverage" "$crap_count" "$golangci_count" "$mutation_score" "$fuzz_target_count"

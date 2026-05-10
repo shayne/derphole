@@ -1,4 +1,10 @@
 #!/usr/bin/env node
+/**
+ * Copyright (c) 2026 Shayne All rights reserved.
+ * Use of this source code is governed by a BSD-style
+ * license that can be found in the LICENSE file.
+ */
+
 
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";

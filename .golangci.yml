@@ -1,0 +1,25 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: false
+
+linters:
+  default: standard
+  enable:
+    - cyclop
+    - gocognit
+    - gocyclo
+  disable:
+    # This repo has package-private test helpers that are only referenced from
+    # tests. We still run Go tests, so keep the production lint gate focused on
+    # bug-risk and complexity findings.
+    - unused
+  settings:
+    cyclop:
+      max-complexity: 10
+      package-average: 0.0
+    gocognit:
+      min-complexity: 30
+    gocyclo:
+      min-complexity: 30

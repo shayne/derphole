@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Shayne All rights reserved.
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$repo_root"
+
+check_no_dependency() {
+  local depaware_file="$1"
+  local forbidden_package="$2"
+  local message="$3"
+
+  if [[ ! -f "${depaware_file}" ]]; then
+    echo "missing ${depaware_file}; run tools/hooks/depaware-check" >&2
+    exit 1
+  fi
+
+  if rg -n "(^|[[:space:]])${forbidden_package}([[:space:]]|$)" "${depaware_file}"; then
+    echo "" >&2
+    echo "${message}" >&2
+    exit 1
+  fi
+}
+
+check_no_dependency cmd/derphole/depaware.txt 'github\.com/shayne/derphole/cmd/derptun' "cmd/derphole depends on cmd/derptun (not allowed)."
+check_no_dependency cmd/derphole/depaware.txt 'github\.com/shayne/derphole/cmd/derphole-probe' "cmd/derphole depends on cmd/derphole-probe (not allowed)."
+check_no_dependency cmd/derptun/depaware.txt 'github\.com/shayne/derphole/cmd/derphole' "cmd/derptun depends on cmd/derphole (not allowed)."
+check_no_dependency cmd/derptun/depaware.txt 'github\.com/shayne/derphole/cmd/derphole-probe' "cmd/derptun depends on cmd/derphole-probe (not allowed)."
+check_no_dependency cmd/derphole-probe/depaware.txt 'github\.com/shayne/derphole/cmd/derphole' "cmd/derphole-probe depends on cmd/derphole (not allowed)."
+check_no_dependency cmd/derphole-probe/depaware.txt 'github\.com/shayne/derphole/cmd/derptun' "cmd/derphole-probe depends on cmd/derptun (not allowed)."
+check_no_dependency cmd/derphole-web/depaware.txt 'github\.com/shayne/derphole/cmd/derphole' "cmd/derphole-web depends on cmd/derphole (not allowed)."
+check_no_dependency cmd/derphole-web/depaware.txt 'github\.com/shayne/derphole/cmd/derptun' "cmd/derphole-web depends on cmd/derptun (not allowed)."

@@ -1,6 +1,8 @@
 [tools]
-go = "1.26.1"
+go = "1.26.3"
 node = "24"
+"go:golang.org/x/vuln/cmd/govulncheck" = "latest"
+golangci-lint = "2.12.2"
 pre-commit = "latest"
 staticcheck = "latest"
 
@@ -9,6 +11,51 @@ run = "go test ./..."
 
 [tasks.vet]
 run = "go vet ./..."
+
+[tasks.coverage]
+description = "Run tests and write the quality coverage profile"
+run = """
+set -euo pipefail
+mkdir -p .tmp/quality
+go test -coverprofile=.tmp/quality/coverage.out -covermode=atomic ./...
+go tool cover -func=.tmp/quality/coverage.out | tee .tmp/quality/coverage.txt
+"""
+
+[tasks.quality]
+description = "Run tests, coverage, CRAP, and lint quality gates"
+run = "tools/quality/check"
+
+[tasks.race]
+description = "Run the Go test suite with the race detector"
+run = "tools/quality/race"
+
+[tasks.fuzz]
+description = "Run active Go fuzz targets for a bounded time"
+run = "tools/quality/fuzz"
+
+[tasks.mutation]
+description = "Run bounded mutation testing targets"
+run = "tools/quality/mutation"
+
+[tasks."mutation:baseline"]
+description = "Refresh the bounded mutation testing baseline"
+run = "tools/quality/mutation --update-baseline"
+
+[tasks.hotspots]
+description = "Rank code-quality hotspots by churn, coverage, CRAP, and lint signals"
+run = "go run ./tools/hotspots -write"
+
+[tasks.vuln]
+description = "Run the Go vulnerability scanner"
+run = "govulncheck ./..."
+
+[tasks."quality:goal"]
+description = "Run the heavy quality goal check"
+run = "tools/quality/goal"
+
+[tasks."quality:baseline"]
+description = "Refresh the current CRAP and lint baselines"
+run = "tools/quality/check --update-baseline"
 
 [tasks."check:hooks"]
 run = "pre-commit run --all-files"

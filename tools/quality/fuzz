@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Shayne All rights reserved.
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$repo_root"
+
+fuzztime=${DERPHOLE_FUZZTIME:-5s}
+parallel=${DERPHOLE_FUZZ_PARALLEL:-}
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: tools/quality/fuzz [--fuzztime DURATION] [--parallel N] [package[:FuzzTarget] ...]
+
+Runs active Go fuzzing for bounded, deterministic repo targets. With no args,
+the default parser/normalizer targets are used.
+
+Environment overrides:
+  DERPHOLE_FUZZTIME      fuzz duration per target, default 5s
+  DERPHOLE_FUZZ_PARALLEL fuzz worker count passed to go test -parallel
+USAGE
+}
+
+while (($#)); do
+  case "$1" in
+    --fuzztime)
+      if (($# < 2)); then
+        usage
+        exit 2
+      fi
+      fuzztime=$2
+      shift 2
+      ;;
+    --parallel)
+      if (($# < 2)); then
+        usage
+        exit 2
+      fi
+      parallel=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "unknown option: $1" >&2
+      usage
+      exit 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+targets=("$@")
+if ((${#targets[@]} == 0)); then
+  while IFS= read -r target; do
+    targets+=("$target")
+  done < <(
+    while IFS= read -r package; do
+      go test -list '^Fuzz' "$package" 2>/dev/null |
+        awk -v package="$package" '/^Fuzz/ { print package ":" $1 }'
+    done < <(go list ./...)
+  )
+fi
+
+if ((${#targets[@]} == 0)); then
+  echo "no Go fuzz targets found"
+  exit 0
+fi
+
+go_args=(-run=^$ "-fuzztime=$fuzztime")
+if [[ -n "$parallel" ]]; then
+  go_args+=("-parallel=$parallel")
+fi
+
+for target in "${targets[@]}"; do
+  package=${target%%:*}
+  fuzz=${target#*:}
+  if [[ "$package" == "$fuzz" ]]; then
+    fuzz='Fuzz.*'
+  fi
+
+  echo "==> fuzz $package $fuzz for $fuzztime"
+  go test "${go_args[@]}" -fuzz="^${fuzz}$" "$package"
+done

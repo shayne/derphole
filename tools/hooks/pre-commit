@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Shayne All rights reserved.
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$repo_root"
+
+tools/hooks/check-license
+tools/hooks/gofmt-check
+tools/hooks/go-vet
+tools/hooks/go-mod-tidy-check
+tools/hooks/staticcheck
+tools/hooks/govulncheck
+tools/hooks/private-info-scan
+tools/hooks/quality
+tools/hooks/depaware-check
+tools/hooks/depaware-deps-check

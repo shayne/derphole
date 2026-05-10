@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Shayne All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 //lint:file-ignore U1000 Retired public QUIC handoff helpers pending deletion after the WG cutover settles.
 package session
 

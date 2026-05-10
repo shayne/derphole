@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Shayne All rights reserved.
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$repo_root"
+
+update_baseline=false
+if [[ "${1:-}" == "--update-baseline" ]]; then
+  update_baseline=true
+  shift
+fi
+
+if (($#)); then
+  echo "usage: tools/quality/check [--update-baseline]" >&2
+  exit 2
+fi
+
+if ! command -v golangci-lint >/dev/null 2>&1; then
+  echo "golangci-lint is required. Run through mise: mise run quality" >&2
+  exit 1
+fi
+
+show_report_head() {
+  local path=$1
+  local limit=$2
+
+  if [[ ! -s "$path" ]]; then
+    return
+  fi
+
+  sed -n "1,${limit}p" "$path"
+  local lines
+  lines=$(wc -l <"$path" | tr -d '[:space:]')
+  if ((lines > limit)); then
+    echo "... truncated ${path}; full report has ${lines} lines"
+  fi
+}
+
+quality_dir=".tmp/quality"
+mkdir -p "$quality_dir"
+
+coverage_out="$quality_dir/coverage.out"
+coverage_summary="$quality_dir/coverage.txt"
+crap_report="$quality_dir/crap.txt"
+lint_report="$quality_dir/golangci.json"
+lint_text="$quality_dir/golangci.txt"
+
+echo "==> private info scan"
+tools/hooks/private-info-scan
+
+echo "==> go test with coverage"
+go test -coverprofile="$coverage_out" -covermode=atomic ./...
+go tool cover -func="$coverage_out" >"$coverage_summary"
+tail -n 1 "$coverage_summary"
+
+echo "==> CRAP hotspots"
+set +e
+go run github.com/mfenderov/gocrap@v0.3.0 \
+  -c "$coverage_out" \
+  -exclude '*_test.go' \
+  -max 30 \
+  ./... >"$crap_report" 2>&1
+crap_status=$?
+set -e
+
+show_report_head "$crap_report" 80
+if [[ "$update_baseline" == "true" ]]; then
+  go run ./tools/qualitygate \
+    -kind crap \
+    -report "$crap_report" \
+    -baseline tools/quality/baseline/crap.txt \
+    -write-baseline
+else
+  go run ./tools/qualitygate \
+    -kind crap \
+    -report "$crap_report" \
+    -baseline tools/quality/baseline/crap.txt
+fi
+
+echo "==> golangci-lint"
+rm -f "$lint_report" "$lint_text"
+set +e
+golangci-lint run \
+  --config .golangci.yml \
+  --max-issues-per-linter=0 \
+  --max-same-issues=0 \
+  --output.json.path "$lint_report" \
+  --output.text.path "$lint_text" \
+  ./...
+lint_status=$?
+set -e
+
+show_report_head "$lint_text" 120
+if [[ ! -f "$lint_report" ]]; then
+  echo "golangci-lint did not write $lint_report" >&2
+  exit "$lint_status"
+fi
+if [[ "$update_baseline" == "true" ]]; then
+  go run ./tools/qualitygate \
+    -kind golangci-json \
+    -report "$lint_report" \
+    -baseline tools/quality/baseline/golangci.txt \
+    -write-baseline
+else
+  go run ./tools/qualitygate \
+    -kind golangci-json \
+    -report "$lint_report" \
+    -baseline tools/quality/baseline/golangci.txt
+fi
+
+if [[ "$crap_status" -ne 0 ]]; then
+  echo "CRAP reported existing threshold violations covered by the baseline."
+fi
+if [[ "$lint_status" -ne 0 ]]; then
+  echo "golangci-lint reported existing findings covered by the baseline."
+fi
+
+echo "==> quality hotspot ranking"
+go run ./tools/hotspots -write

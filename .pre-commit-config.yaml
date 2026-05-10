@@ -1,29 +1,70 @@
+fail_fast: true
 repos:
   - repo: local
     hooks:
+      - id: derphole-license-check
+        name: derphole license check
+        entry: tools/hooks/check-license
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
       - id: derphole-gofmt-check
         name: derphole gofmt check
         entry: tools/hooks/gofmt-check
-        language: script
-        files: \.go$
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
       - id: derphole-go-vet
         name: derphole go vet
         entry: tools/hooks/go-vet
-        language: script
+        language: system
         pass_filenames: false
+        stages: [pre-commit]
       - id: derphole-go-mod-tidy
         name: derphole go mod tidy
         entry: tools/hooks/go-mod-tidy-check
-        language: script
+        language: system
         pass_filenames: false
+        stages: [pre-commit]
       - id: derphole-staticcheck
         name: derphole staticcheck
         entry: tools/hooks/staticcheck
-        language: script
+        language: system
         pass_filenames: false
+        stages: [pre-commit]
+      - id: derphole-govulncheck
+        name: derphole govulncheck
+        entry: tools/hooks/govulncheck
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: derphole-private-info-scan
+        name: derphole private info scan
+        entry: tools/hooks/private-info-scan
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: derphole-quality
+        name: derphole coverage and quality gate
+        entry: tools/hooks/quality
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: derphole-depaware
+        name: derphole depaware
+        entry: tools/hooks/depaware-check
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: derphole-depaware-deps
+        name: derphole depaware dependency check
+        entry: tools/hooks/depaware-deps-check
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
       - id: derphole-prepare-commit-msg
         name: derphole prepare commit message
         entry: tools/hooks/prepare-commit-msg
-        language: script
+        language: system
         stages: [prepare-commit-msg]
-        pass_filenames: true

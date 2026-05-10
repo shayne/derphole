@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Shayne All rights reserved.
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$repo_root"
+
+packages=("$@")
+skipped=()
+if ((${#packages[@]} == 0)) && [[ -n "${DERPHOLE_RACE_PACKAGES:-}" ]]; then
+  # shellcheck disable=SC2206
+  packages=($DERPHOLE_RACE_PACKAGES)
+fi
+if ((${#packages[@]} == 0)); then
+  while IFS= read -r pkg; do
+    case "$pkg" in
+      */pkg/session | */pkg/wg)
+        skipped+=("$pkg")
+        ;;
+      *)
+        packages+=("$pkg")
+        ;;
+    esac
+  done < <(go list ./...)
+fi
+
+if ((${#skipped[@]} > 0)); then
+  echo "==> skipping race-unstable integration packages: ${skipped[*]}"
+fi
+echo "==> go test -race ${packages[*]}"
+go test -race "${packages[@]}"

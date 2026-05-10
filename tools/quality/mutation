@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Shayne All rights reserved.
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$repo_root"
+
+update_baseline=false
+workers=${DERPHOLE_MUTATION_WORKERS:-1}
+timeout_seconds=${DERPHOLE_MUTATION_TIMEOUT:-10}
+threshold=${DERPHOLE_MUTATION_THRESHOLD:-0}
+runner=${DERPHOLE_MUTATION_RUNNER:-}
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: tools/quality/mutation [--update-baseline] [--workers N] [--timeout SECONDS] [--threshold PERCENT] [--] [packages...]
+
+Runs bounded Go mutation checks. With no package args, this targets a small
+default package set so the check stays practical outside pre-commit.
+
+Environment overrides:
+  DERPHOLE_MUTATION_RUNNER     command used instead of gomu/go run
+  DERPHOLE_MUTATION_WORKERS    worker count, default 1
+  DERPHOLE_MUTATION_TIMEOUT    per-mutant test timeout in seconds, default 10
+  DERPHOLE_MUTATION_THRESHOLD  gomu threshold, default 0
+USAGE
+}
+
+while (($#)); do
+  case "$1" in
+    --update-baseline)
+      update_baseline=true
+      shift
+      ;;
+    --workers)
+      if (($# < 2)); then
+        usage
+        exit 2
+      fi
+      workers=$2
+      shift 2
+      ;;
+    --timeout)
+      if (($# < 2)); then
+        usage
+        exit 2
+      fi
+      timeout_seconds=$2
+      shift 2
+      ;;
+    --threshold)
+      if (($# < 2)); then
+        usage
+        exit 2
+      fi
+      threshold=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "unknown option: $1" >&2
+      usage
+      exit 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+packages=("$@")
+if ((${#packages[@]} == 0)); then
+  packages=(./pkg/token ./pkg/candidate)
+fi
+
+if [[ -z "$runner" ]]; then
+  if command -v gomu >/dev/null 2>&1; then
+    runner=gomu
+  else
+    runner="go run github.com/sivchari/gomu/cmd/gomu@latest"
+  fi
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required to parse gomu JSON output for mutation summaries/baselines" >&2
+  exit 1
+fi
+
+quality_dir=".tmp/quality/mutation"
+baseline_path="tools/quality/baseline/mutation.txt"
+mkdir -p "$quality_dir"
+
+gomu_history_existed=false
+if [[ -e .gomu_history.json ]]; then
+  gomu_history_existed=true
+fi
+
+cleanup() {
+  rm -f mutation-report.json
+  if [[ "$gomu_history_existed" == "false" ]]; then
+    rm -f .gomu_history.json
+  fi
+}
+trap cleanup EXIT
+
+summary_path="$quality_dir/summary.txt"
+: >"$summary_path"
+
+failed=false
+total_survived=0
+total_errors=0
+
+for package in "${packages[@]}"; do
+  safe_package=${package//[^[:alnum:]._-]/_}
+  report_path="$quality_dir/${safe_package}.json"
+  text_path="$quality_dir/${safe_package}.txt"
+
+  echo "==> mutation $package"
+  rm -f "$report_path" "$text_path" mutation-report.json
+
+  set +e
+  # shellcheck disable=SC2086
+  $runner run "$package" \
+    --threshold "$threshold" \
+    --workers "$workers" \
+    --timeout "$timeout_seconds" \
+    --incremental=false \
+    --output json 2>&1 | tee "$text_path"
+  status=${PIPESTATUS[0]}
+  set -e
+
+  if [[ -f mutation-report.json ]]; then
+    mv mutation-report.json "$report_path"
+  fi
+
+  if [[ "$status" -ne 0 ]]; then
+    echo "mutation tool failed for $package with exit status $status" >&2
+    failed=true
+    continue
+  fi
+  if [[ ! -f "$report_path" ]]; then
+    echo "mutation tool did not write mutation-report.json for $package" >&2
+    failed=true
+    continue
+  fi
+
+  killed=$(jq '[.results[]? | select(.status == "KILLED")] | length' "$report_path")
+  survived=$(jq '[.results[]? | select(.status == "SURVIVED" or .status == "LIVED")] | length' "$report_path")
+  errors=$(jq '[.results[]? | select(.status == "ERROR" or .status == "TIMED_OUT" or .status == "NOT_VIABLE")] | length' "$report_path")
+  total=$(jq '.results | length' "$report_path")
+  viable=$((killed + survived))
+  if ((viable > 0)); then
+    score=$(awk -v killed="$killed" -v viable="$viable" 'BEGIN { printf "%.1f", (killed / viable) * 100 }')
+  else
+    score="0.0"
+  fi
+
+  printf '%s total=%d viable=%d killed=%d survived=%d errors=%d score=%s\n' \
+    "$package" "$total" "$viable" "$killed" "$survived" "$errors" "$score" | tee -a "$summary_path"
+
+  total_survived=$((total_survived + survived))
+  total_errors=$((total_errors + errors))
+done
+
+if [[ "$update_baseline" == "true" ]]; then
+  cp "$summary_path" "$baseline_path"
+  echo "updated mutation baseline: $baseline_path"
+elif [[ -f "$baseline_path" ]]; then
+  baseline_survived=$(awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^survived=/) { sub(/^survived=/, "", $i); total += $i } } END { print total + 0 }' "$baseline_path")
+  baseline_errors=$(awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^errors=/) { sub(/^errors=/, "", $i); total += $i } } END { print total + 0 }' "$baseline_path")
+  if ((total_survived > baseline_survived)); then
+    echo "mutation survived count regressed: current=$total_survived baseline=$baseline_survived" >&2
+    failed=true
+  fi
+  if ((total_errors > baseline_errors)); then
+    echo "mutation error count regressed: current=$total_errors baseline=$baseline_errors" >&2
+    failed=true
+  fi
+else
+  echo "no mutation baseline found; run tools/quality/mutation --update-baseline to create one"
+fi
+
+if [[ "$failed" == "true" ]]; then
+  exit 1
+fi

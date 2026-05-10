@@ -1,0 +1,2 @@
+./pkg/token total=278 viable=148 killed=122 survived=26 errors=130 score=82.4
+./pkg/candidate total=155 viable=105 killed=56 survived=49 errors=50 score=53.3
