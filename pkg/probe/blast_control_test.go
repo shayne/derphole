@@ -90,6 +90,60 @@ func TestReadBlastSendControlEventsPreservesStatsStripeID(t *testing.T) {
 	}
 }
 
+func TestReadBlastParallelSendControlBatchesDoesNotAckReaderLaneForOtherStripeStats(t *testing.T) {
+	runID := [16]byte{1, 2, 3, 6}
+	history, err := newBlastRepairHistory(runID, 4, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	history.streamReplay = newStreamReplayWindow(runID, 4, 1<<20, nil)
+	if _, err := history.streamReplay.AddDataPacket(0, 0, 0, []byte("aaaa")); err != nil {
+		t.Fatalf("AddDataPacket() error = %v", err)
+	}
+	statsPacket, err := MarshalPacket(Packet{
+		Version:  ProtocolVersion,
+		Type:     PacketTypeStats,
+		StripeID: 1,
+		RunID:    runID,
+		Payload: marshalBlastStatsPayload(blastReceiverStats{
+			AckFloor: 1,
+		}),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lane := &blastParallelSendLane{
+		batcher:  &queuedControlBatcher{packets: [][]byte{statsPacket}},
+		history:  history,
+		stripeID: 0,
+	}
+	events := make(chan blastParallelSendControlEvent, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go readBlastParallelSendControlEvents(ctx, lane, runID, events)
+
+	event := receiveBlastParallelSendControlEventForTest(t, events)
+	if event.event.typ != PacketTypeStats || event.event.stripe != 1 {
+		t.Fatalf("event = %+v, want stripe 1 stats", event.event)
+	}
+	if packet := history.streamReplay.Packet(0); packet == nil {
+		t.Fatal("reader lane replay packet was acked by stats for another stripe")
+	}
+}
+
+func receiveBlastParallelSendControlEventForTest(t *testing.T, events <-chan blastParallelSendControlEvent) blastParallelSendControlEvent {
+	t.Helper()
+	select {
+	case event := <-events:
+		return event
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for blast parallel send control event")
+	}
+	return blastParallelSendControlEvent{}
+}
+
 func receiveBlastSendControlEventForTest(t *testing.T, events <-chan blastSendControlEvent) blastSendControlEvent {
 	t.Helper()
 	select {

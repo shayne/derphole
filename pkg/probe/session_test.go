@@ -1066,6 +1066,15 @@ func TestSendBlastParallelMinActiveLanesSpreadsLowRateStripedData(t *testing.T) 
 	}
 }
 
+func TestParallelActiveLanesKeepsStripedLanesActiveAtLowRate(t *testing.T) {
+	if got, want := parallelActiveLanesForRate(100, 4, true), 4; got != want {
+		t.Fatalf("parallelActiveLanesForRate(striped low rate) = %d, want %d", got, want)
+	}
+	if got, want := parallelActiveLanesForConfig(100, 4, true, 0, 2), 2; got != want {
+		t.Fatalf("parallelActiveLanesForConfig(striped max cap) = %d, want %d", got, want)
+	}
+}
+
 func TestSendBlastParallelSkipsUnreachableOptionalLane(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -1529,8 +1538,8 @@ func TestBlastStreamReceiveCoordinatorRequestsFinalTotalStripedSuffixRepairs(t *
 	if err := coordinator.handleRepairTick(context.Background(), time.Now()); err != nil {
 		t.Fatalf("handleRepairTick() error = %v", err)
 	}
-	if got := countPacketsOfType(t, batcher1.writes, PacketTypeRepairRequest); got != 0 {
-		t.Fatalf("stripe 1 repair writes = %d, want 0 because stripe 1 is complete", got)
+	if got := countPacketsOfType(t, batcher1.writes, PacketTypeRepairRequest); got != 1 {
+		t.Fatalf("stripe 0 alternate-lane suffix repair writes = %d, want 1", got)
 	}
 	if got := countPacketsOfType(t, batcher0.writes, PacketTypeRepairRequest); got != 1 {
 		t.Fatalf("stripe 0 suffix repair writes = %d, want 1", got)
@@ -1635,8 +1644,8 @@ func TestBlastStreamReceiveCoordinatorRequestsStripedKnownGapOnLane(t *testing.T
 	if err := coordinator.handleRepairTick(context.Background(), observedAt.Add(stripedBlastKnownGapRepairDelay)); err != nil {
 		t.Fatalf("delayed handleRepairTick() error = %v", err)
 	}
-	if got := countPacketsOfType(t, batcher0.writes, PacketTypeRepairRequest); got != 0 {
-		t.Fatalf("stripe 0 repair writes = %d, want 0", got)
+	if got := countPacketsOfType(t, batcher0.writes, PacketTypeRepairRequest); got != 1 {
+		t.Fatalf("stripe 1 alternate-lane repair writes = %d, want 1", got)
 	}
 	if got := countPacketsOfType(t, batcher1.writes, PacketTypeRepairRequest); got != 1 {
 		t.Fatalf("stripe 1 repair writes = %d, want 1", got)
@@ -1650,6 +1659,70 @@ func TestBlastStreamReceiveCoordinatorRequestsStripedKnownGapOnLane(t *testing.T
 	}
 	if len(packet.Payload) != 8 || binary.BigEndian.Uint64(packet.Payload) != 0 {
 		t.Fatalf("repair payload = %x, want missing seq 0", packet.Payload)
+	}
+}
+
+func TestBlastStreamReceiveCoordinatorRetriesStripedFrontierGap(t *testing.T) {
+	runID := testRunID(0xbf)
+	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+	batcher0 := &capturingBatcher{}
+	batcher1 := &capturingBatcher{}
+	lanes := []*blastStreamReceiveLane{
+		{batcher: batcher0, peer: peer},
+		{batcher: batcher1, peer: peer},
+	}
+	coordinator := newBlastStreamReceiveCoordinator(context.Background(), lanes, io.Discard, ReceiveConfig{
+		Blast:           true,
+		RequireComplete: true,
+		ExpectedRunID:   runID,
+	}, 0, time.Now())
+	repairPackets := func() []Packet {
+		var packets []Packet
+		for _, wire := range batcher1.writes {
+			packet, err := UnmarshalPacket(wire, nil)
+			if err != nil {
+				t.Fatalf("UnmarshalPacket(write) error = %v", err)
+			}
+			if packet.Type == PacketTypeRepairRequest {
+				packets = append(packets, packet)
+			}
+		}
+		return packets
+	}
+
+	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[1], 1, 2, PacketTypeHello, runID, 0, 0, 0, nil, peer); err != nil || complete {
+		t.Fatalf("handlePacketStripe(hello stripe 1) complete=%v err=%v, want false nil", complete, err)
+	}
+	futureSeq := uint64(maxRepairRequestSeqs * 2)
+	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[1], 1, 2, PacketTypeData, runID, futureSeq, futureSeq*2, 0, []byte("bb"), peer); err != nil || complete {
+		t.Fatalf("handlePacketStripe(data stripe 1 seq %d) complete=%v err=%v, want false nil", futureSeq, complete, err)
+	}
+
+	observedAt := time.Now()
+	if err := coordinator.handleRepairTick(context.Background(), observedAt); err != nil {
+		t.Fatalf("first handleRepairTick() error = %v", err)
+	}
+	if err := coordinator.handleRepairTick(context.Background(), observedAt.Add(stripedBlastKnownGapRepairDelay)); err != nil {
+		t.Fatalf("delayed handleRepairTick() error = %v", err)
+	}
+	if err := coordinator.handleRepairTick(context.Background(), observedAt.Add(stripedBlastKnownGapRepairDelay+blastRepairInterval)); err != nil {
+		t.Fatalf("retry handleRepairTick() error = %v", err)
+	}
+
+	repairs := repairPackets()
+	if got := len(repairs); got != 2 {
+		t.Fatalf("primary-lane repair writes = %d, want 2", got)
+	}
+	for i, packet := range repairs {
+		if packet.StripeID != 1 {
+			t.Fatalf("repair packet %d StripeID = %d, want 1", i, packet.StripeID)
+		}
+		if len(packet.Payload) < 8 {
+			t.Fatalf("repair packet %d payload len = %d, want at least 8", i, len(packet.Payload))
+		}
+		if got := binary.BigEndian.Uint64(packet.Payload[:8]); got != 0 {
+			t.Fatalf("repair packet %d first seq = %d, want frontier seq 0", i, got)
+		}
 	}
 }
 
@@ -1689,8 +1762,11 @@ func TestBlastStreamReceiveCoordinatorCanDeferStripedKnownGapRepairs(t *testing.
 	if err := coordinator.handleRepairTick(context.Background(), time.Now()); err != nil {
 		t.Fatalf("handleRepairTick() after DONE error = %v", err)
 	}
+	if got := countPacketsOfType(t, batcher0.writes, PacketTypeRepairRequest); got != 1 {
+		t.Fatalf("DONE-time alternate-lane repair writes = %d, want 1", got)
+	}
 	if got := countPacketsOfType(t, batcher1.writes, PacketTypeRepairRequest); got != 1 {
-		t.Fatalf("DONE-time repair writes = %d, want 1", got)
+		t.Fatalf("DONE-time primary-lane repair writes = %d, want 1", got)
 	}
 	packet := firstPacketOfType(t, batcher1.writes, PacketTypeRepairRequest)
 	if packet.Type != PacketTypeRepairRequest {
@@ -1722,6 +1798,92 @@ func TestBlastRepairDeduperForLaneScopesStripedLaneHistories(t *testing.T) {
 	}
 	if got := blastRepairDeduperForLane(global, &blastParallelSendLane{}); got != global {
 		t.Fatal("non-striped lane did not use global deduper")
+	}
+}
+
+func TestBlastParallelStripedRepairDeduperSuppressesBroadcastDuplicates(t *testing.T) {
+	runID := testRunID(0xbd)
+	chunkSize := 4
+	stripeHistory := &blastRepairHistory{
+		runID:        runID,
+		chunkSize:    chunkSize,
+		streamReplay: newStreamReplayWindow(runID, chunkSize, 16<<10, nil),
+	}
+	if _, err := stripeHistory.streamReplay.AddDataPacket(0, 0, 0, []byte("aaaa")); err != nil {
+		t.Fatalf("AddDataPacket() error = %v", err)
+	}
+
+	primaryBatcher := &capturingBatcher{}
+	alternateBatcher := &capturingBatcher{}
+	lanes := []*blastParallelSendLane{
+		{batcher: primaryBatcher, stripeID: 0, history: stripeHistory},
+		{batcher: alternateBatcher, stripeID: 1, history: &blastRepairHistory{}},
+	}
+	payload := make([]byte, 8)
+	binary.BigEndian.PutUint64(payload, 0)
+	global := newBlastRepairDeduper()
+	now := time.Now()
+
+	for _, eventLane := range lanes {
+		stripeLane := blastParallelStripeLane(lanes, 0)
+		deduper := blastParallelRepairDeduperForEvent(global, eventLane, stripeLane)
+		if _, err := sendBlastRepairs(context.Background(), eventLane.batcher, eventLane.peer, stripeLane.history, payload, &TransferStats{}, deduper, now); err != nil {
+			t.Fatalf("sendBlastRepairs() error = %v", err)
+		}
+	}
+
+	if got := len(primaryBatcher.writes) + len(alternateBatcher.writes); got != 1 {
+		t.Fatalf("broadcast duplicate repair writes = %d, want 1", got)
+	}
+}
+
+func TestBlastParallelStripedRepairRequestUsesRequestedStripeHistory(t *testing.T) {
+	runID := testRunID(0xbe)
+	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+	chunkSize := 4
+	stripeHistory := &blastRepairHistory{
+		runID:        runID,
+		chunkSize:    chunkSize,
+		streamReplay: newStreamReplayWindow(runID, chunkSize, 16<<10, nil),
+	}
+	if _, err := stripeHistory.streamReplay.AddDataPacket(0, 0, 0, []byte("aaaa")); err != nil {
+		t.Fatalf("AddDataPacket() error = %v", err)
+	}
+	alternateBatcher := &capturingBatcher{}
+	lanes := []*blastParallelSendLane{
+		{batcher: &capturingBatcher{}, peer: peer, stripeID: 0, history: stripeHistory},
+		{batcher: alternateBatcher, peer: peer, stripeID: 1, history: &blastRepairHistory{}},
+	}
+	payload := make([]byte, 8)
+	binary.BigEndian.PutUint64(payload, 0)
+
+	stripeLane := blastParallelStripeLane(lanes, 0)
+	if stripeLane == nil || stripeLane.history == nil {
+		t.Fatal("missing stripe lane history")
+	}
+	complete, repaired, err := handleBlastSendControlEvent(context.Background(), lanes[1].batcher, lanes[1].peer, stripeLane.history, &TransferStats{}, newBlastRepairDeduper(), nil, blastSendControlEvent{
+		typ:     PacketTypeRepairRequest,
+		stripe:  0,
+		payload: payload,
+	})
+	if err != nil {
+		t.Fatalf("handleBlastSendControlEvent() error = %v", err)
+	}
+	if complete {
+		t.Fatal("repair request completed transfer")
+	}
+	if !repaired {
+		t.Fatal("repair request was not handled")
+	}
+	if got := len(alternateBatcher.writes); got != 1 {
+		t.Fatalf("alternate lane repair writes = %d, want 1", got)
+	}
+	packet, err := UnmarshalPacket(alternateBatcher.writes[0], nil)
+	if err != nil {
+		t.Fatalf("UnmarshalPacket(repair write) error = %v", err)
+	}
+	if packet.Type != PacketTypeData || packet.StripeID != 0 || packet.Seq != 0 || string(packet.Payload) != "aaaa" {
+		t.Fatalf("repair packet = %+v, want stripe 0 seq 0 payload aaaa", packet)
 	}
 }
 
@@ -1873,6 +2035,9 @@ func TestBlastStreamReceiveCoordinatorReportsAcceptedStripedProgress(t *testing.
 	if stats.ReceivedPayloadBytes != uint64(len("future")) {
 		t.Fatalf("striped stats ReceivedPayloadBytes = %d, want accepted payload bytes %d while output frontier is stalled", stats.ReceivedPayloadBytes, len("future"))
 	}
+	if stats.CommittedPayloadBytes != 0 {
+		t.Fatalf("striped stats CommittedPayloadBytes = %d, want 0 while output frontier is stalled", stats.CommittedPayloadBytes)
+	}
 
 	if complete, err := coordinator.handlePacketStripe(context.Background(), lanes[0], 0, 2, PacketTypeData, runID, 0, 0, 0, []byte("first"), peer); err != nil || complete {
 		t.Fatalf("handlePacketStripe(first data) complete=%v err=%v, want false nil", complete, err)
@@ -1885,11 +2050,14 @@ func TestBlastStreamReceiveCoordinatorReportsAcceptedStripedProgress(t *testing.
 		t.Fatal("failed to unmarshal striped stats payload after commit")
 	}
 	if stats.ReceivedPayloadBytes != uint64(len("future")+len("first")) {
-		t.Fatalf("striped stats ReceivedPayloadBytes = %d, want %d after output frontier advances", stats.ReceivedPayloadBytes, len("future")+len("first"))
+		t.Fatalf("striped stats ReceivedPayloadBytes = %d, want accepted bytes %d after output frontier advances", stats.ReceivedPayloadBytes, len("future")+len("first"))
+	}
+	if stats.CommittedPayloadBytes != uint64(len("first")) {
+		t.Fatalf("striped stats CommittedPayloadBytes = %d, want committed bytes %d after output frontier advances", stats.CommittedPayloadBytes, len("first"))
 	}
 }
 
-func TestBlastStreamReceiveCoordinatorReportsAcceptedStripedProgressForRateControl(t *testing.T) {
+func TestBlastStreamReceiveCoordinatorReportsCommittedStripedProgressSeparatelyFromRateControl(t *testing.T) {
 	runID := testRunID(0xc0)
 	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
 	batcher0 := &capturingBatcher{}
@@ -1918,6 +2086,9 @@ func TestBlastStreamReceiveCoordinatorReportsAcceptedStripedProgressForRateContr
 	}
 	if stats.ReceivedPayloadBytes != uint64(len("future")) {
 		t.Fatalf("striped stats ReceivedPayloadBytes = %d, want accepted payload bytes %d while output frontier is stalled", stats.ReceivedPayloadBytes, len("future"))
+	}
+	if stats.CommittedPayloadBytes != 0 {
+		t.Fatalf("striped stats CommittedPayloadBytes = %d, want 0 while output frontier is stalled", stats.CommittedPayloadBytes)
 	}
 	if stats.AckFloor != 1 {
 		t.Fatalf("striped stats AckFloor = %d, want 1 for stripe-local replay ack", stats.AckFloor)
@@ -1955,6 +2126,9 @@ func TestBlastStreamReceiveCoordinatorReportsBufferedStripedFutureProgressForRat
 	}
 	if stats.ReceivedPayloadBytes != uint64(len("future")) {
 		t.Fatalf("striped stats ReceivedPayloadBytes = %d, want buffered future payload bytes %d", stats.ReceivedPayloadBytes, len("future"))
+	}
+	if stats.CommittedPayloadBytes != 0 {
+		t.Fatalf("striped stats CommittedPayloadBytes = %d, want 0 while stripe-local gap remains", stats.CommittedPayloadBytes)
 	}
 	if stats.AckFloor != 0 {
 		t.Fatalf("striped stats AckFloor = %d, want 0 while stripe-local gap remains", stats.AckFloor)
@@ -4487,8 +4661,8 @@ func TestParallelActiveLanesForRateStartsConservativeAndScales(t *testing.T) {
 		{name: "ktzlxc class uses all lanes", rateMbps: 2250, available: 8, want: 8},
 		{name: "clamps available lanes", rateMbps: 2250, available: 3, want: 3},
 		{name: "higher than ktzlxc class uses all", rateMbps: 5000, available: 8, want: 8},
-		{name: "striped starts conservatively", rateMbps: 350, available: 8, striped: true, want: 1},
-		{name: "striped scales with rate", rateMbps: 1200, available: 8, striped: true, want: 4},
+		{name: "striped keeps lanes active at low rate", rateMbps: 350, available: 8, striped: true, want: 8},
+		{name: "striped keeps lanes active while paced", rateMbps: 1200, available: 8, striped: true, want: 8},
 	}
 
 	for _, tt := range tests {
@@ -4511,6 +4685,135 @@ func TestRecordReplayWindowFullWaitUpdatesStats(t *testing.T) {
 	}
 	if got, want := stats.MaxReplayBytes, uint64(64<<10); got != want {
 		t.Fatalf("MaxReplayBytes = %d, want %d", got, want)
+	}
+}
+
+func TestWaitBlastParallelSendLanesDrainsControlEvents(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	control := newBlastSendControl(700, 700, time.Now())
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-release
+	}()
+
+	var drainCalls atomic.Int32
+	complete, err := waitBlastParallelSendLanes(ctx, &wg, control, nil, func() (bool, error) {
+		if drainCalls.Add(1) == 1 {
+			close(release)
+		}
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("waitBlastParallelSendLanes() error = %v", err)
+	}
+	if !complete {
+		t.Fatal("waitBlastParallelSendLanes() complete = false, want true from drained control event")
+	}
+	if got := drainCalls.Load(); got == 0 {
+		t.Fatal("waitBlastParallelSendLanes() did not drain control events while lanes were active")
+	}
+}
+
+func TestWaitBlastParallelSendLanesReturnsContextError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	control := newBlastSendControl(700, 700, time.Now())
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-release
+	}()
+	defer func() {
+		close(release)
+		wg.Wait()
+	}()
+
+	_, err := waitBlastParallelSendLanes(ctx, &wg, control, nil, func() (bool, error) {
+		return false, nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitBlastParallelSendLanes() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestBlastSendControlReceiverBacklogUsesCommittedProgress(t *testing.T) {
+	control := newBlastSendControl(1200, 2250, time.Now())
+	control.SetSentPayloadBytes(300 << 20)
+	control.ObserveReceiverStatsPayload(blastReceiverStats{
+		ReceivedPayloadBytes:  290 << 20,
+		CommittedPayloadBytes: 16 << 20,
+		ReceivedPackets:       100,
+		MaxSeqPlusOne:         100,
+	}, time.Now().Add(blastRateFeedbackInterval), true)
+
+	if backlog := control.ReceiverBacklogBytes(); backlog != 284<<20 {
+		t.Fatalf("receiver backlog = %d, want %d", backlog, 284<<20)
+	}
+	control.ObserveReceiverBacklogPressure(time.Now().Add(2*blastRateFeedbackInterval), control.ReceiverBacklogBytes(), 64<<20)
+	if got := control.RateMbps(); got >= 1200 {
+		t.Fatalf("RateMbps() = %d, want decrease while committed backlog is over budget", got)
+	}
+}
+
+func TestWaitBlastReceiverBacklogPausesUntilCommittedProgressCatchesUp(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	now := time.Unix(0, 0)
+	control := newBlastSendControl(1200, 2250, now)
+	sent := uint64(300 << 20)
+	control.SetSentPayloadBytes(sent)
+	control.ObserveReceiverStatsPayload(blastReceiverStats{
+		ReceivedPayloadBytes:  290 << 20,
+		CommittedPayloadBytes: 32 << 20,
+		ReceivedPackets:       100,
+		MaxSeqPlusOne:         100,
+	}, now.Add(blastRateFeedbackInterval), true)
+
+	drains := 0
+	waits := 0
+	complete, err := waitBlastReceiverBacklog(ctx, control, 64<<20, func() {
+		control.SetSentPayloadBytes(sent)
+	}, func() (bool, error) {
+		drains++
+		if drains == 3 {
+			control.ObserveReceiverStatsPayload(blastReceiverStats{
+				ReceivedPayloadBytes:  300 << 20,
+				CommittedPayloadBytes: 260 << 20,
+				ReceivedPackets:       110,
+				MaxSeqPlusOne:         110,
+			}, now.Add(time.Duration(drains+1)*blastRateFeedbackInterval), true)
+		}
+		return false, nil
+	}, nil, func() time.Time {
+		now = now.Add(blastRateFeedbackInterval)
+		return now
+	}, func(context.Context) error {
+		waits++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("waitBlastReceiverBacklog() error = %v", err)
+	}
+	if complete {
+		t.Fatal("waitBlastReceiverBacklog() complete = true, want false")
+	}
+	if drains < 3 {
+		t.Fatalf("drains = %d, want at least 3 so control events can advance committed progress", drains)
+	}
+	if waits == 0 {
+		t.Fatal("waits = 0, want pause while receiver committed backlog is over budget")
+	}
+	if backlog := control.ReceiverBacklogBytes(); backlog > 64<<20 {
+		t.Fatalf("receiver backlog after wait = %d, want <= %d", backlog, 64<<20)
 	}
 }
 

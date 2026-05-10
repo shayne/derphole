@@ -509,6 +509,51 @@ func TestSendPeerAbortBestEffortSendsAbortEnvelope(t *testing.T) {
 	}
 }
 
+func TestNotifyPeerAbortOnLocalCancelSendsAbortEnvelope(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	node := srv.Map.Regions[1].Nodes[0]
+	senderDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(sender) error = %v", err)
+	}
+	defer senderDERP.Close()
+	listenerDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(listener) error = %v", err)
+	}
+	defer listenerDERP.Close()
+
+	abortCh, unsubscribe := listenerDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == senderDERP.PublicKey() && isAbortPayload(pkt.Payload)
+	})
+	defer unsubscribe()
+
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	_, _ = listenerDERP.Receive(readyCtx)
+	readyCancel()
+
+	err = context.Canceled
+	notifyPeerAbortOnLocalCancel(&err, context.Background(), senderDERP, listenerDERP.PublicKey(), func() int64 {
+		return 7
+	})
+
+	select {
+	case pkt := <-abortCh:
+		env, err := decodeEnvelope(pkt.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if env.Abort == nil || env.Abort.Reason != "canceled" || env.Abort.BytesTransferred == nil || *env.Abort.BytesTransferred != 7 {
+			t.Fatalf("abort envelope = %#v, want reason and bytes", env.Abort)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
 func TestPeerAbortErrorShouldNotifySkipsLocalContextCancellation(t *testing.T) {
 	if peerAbortErrorShouldNotify(context.Canceled) {
 		t.Fatal("peerAbortErrorShouldNotify(context.Canceled) = true, want false")
@@ -6614,6 +6659,133 @@ func TestExternalDirectUDPSelectInitialRateKeepsLiveHetzBatchedReceiverRecoveryA
 	selected := externalDirectUDPSelectInitialRateMbps(10_000, sent, received)
 	if got, want := selected, 1200; got != want {
 		t.Fatalf("externalDirectUDPSelectInitialRateMbps(live hetz batched receiver recovery) = %d, want %d", got, want)
+	}
+}
+
+func TestExternalDirectUDPSelectRateCapsLivePve1HetzZeroWarmupLossyIntermediateProbe(t *testing.T) {
+	sent := []directUDPRateProbeSample{
+		{RateMbps: 8, BytesSent: 200_000, DurationMillis: 200},
+		{RateMbps: 25, BytesSent: 625_000, DurationMillis: 200},
+		{RateMbps: 75, BytesSent: 1_875_000, DurationMillis: 200},
+		{RateMbps: 150, BytesSent: 3_750_000, DurationMillis: 200},
+		{RateMbps: 350, BytesSent: 8_750_000, DurationMillis: 200},
+		{RateMbps: 700, BytesSent: 17_499_296, DurationMillis: 200},
+		{RateMbps: 1000, BytesSent: 25_000_576, DurationMillis: 200},
+		{RateMbps: 1200, BytesSent: 29_999_584, DurationMillis: 200},
+		{RateMbps: 1800, BytesSent: 112_169_651, DurationMillis: 500},
+		{RateMbps: 2000, BytesSent: 124_839_146, DurationMillis: 500},
+		{RateMbps: 2250, BytesSent: 139_453_378, DurationMillis: 500},
+	}
+	received := []directUDPRateProbeSample{
+		{RateMbps: 8, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 25, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 75, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 150, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 350, BytesReceived: 0, DurationMillis: 200},
+		{RateMbps: 700, BytesReceived: 8_749_648, DurationMillis: 200},
+		{RateMbps: 1000, BytesReceived: 18_750_432, DurationMillis: 200},
+		{RateMbps: 1200, BytesReceived: 22_499_688, DurationMillis: 200},
+		{RateMbps: 1800, BytesReceived: 87_492_328, DurationMillis: 500},
+		{RateMbps: 2000, BytesReceived: 73_655_096, DurationMillis: 500},
+		{RateMbps: 2250, BytesReceived: 75_304_824, DurationMillis: 500},
+	}
+
+	selected := externalDirectUDPSelectRateFromProbeSamples(10_000, sent, received)
+	if got, want := selected, 350; got != want {
+		t.Fatalf("externalDirectUDPSelectRateFromProbeSamples(live pve1->hetz zero-warmup lossy probe) = %d, want %d", got, want)
+	}
+	initial := externalDirectUDPSelectInitialRateMbps(10_000, sent, received)
+	if got, want := initial, 350; got != want {
+		t.Fatalf("externalDirectUDPSelectInitialRateMbps(live pve1->hetz zero-warmup lossy probe) = %d, want %d", got, want)
+	}
+	ceiling := externalDirectUDPSelectRateCeilingMbps(10_000, initial, sent, received)
+	if got, want := ceiling, 350; got != want {
+		t.Fatalf("externalDirectUDPSelectRateCeilingMbps(live pve1->hetz zero-warmup lossy probe) = %d, want %d", got, want)
+	}
+	if got, want := externalDirectUDPDataStartRateMbpsForProbeSamples(initial, ceiling, sent, received), 350; got != want {
+		t.Fatalf("externalDirectUDPDataStartRateMbpsForProbeSamples(live pve1->hetz zero-warmup lossy probe) = %d, want %d", got, want)
+	}
+}
+
+func TestExternalDirectUDPSelectRateCapsLivePve1HetzCleanLowLossyRampProbe(t *testing.T) {
+	sent := []directUDPRateProbeSample{
+		{RateMbps: 8, BytesSent: 199_296, DurationMillis: 200},
+		{RateMbps: 25, BytesSent: 622_800, DurationMillis: 200},
+		{RateMbps: 75, BytesSent: 1_872_552, DurationMillis: 200},
+		{RateMbps: 150, BytesSent: 3_750_640, DurationMillis: 200},
+		{RateMbps: 350, BytesSent: 8_748_264, DurationMillis: 200},
+		{RateMbps: 700, BytesSent: 17_502_064, DurationMillis: 200},
+		{RateMbps: 1000, BytesSent: 24_995_040, DurationMillis: 200},
+		{RateMbps: 1200, BytesSent: 30_039_390, DurationMillis: 200},
+		{RateMbps: 1800, BytesSent: 111_980_978, DurationMillis: 500},
+		{RateMbps: 2000, BytesSent: 124_732_393, DurationMillis: 500},
+		{RateMbps: 2250, BytesSent: 141_614_964, DurationMillis: 500},
+	}
+	received := []directUDPRateProbeSample{
+		{RateMbps: 8, BytesReceived: 199_296, DurationMillis: 200},
+		{RateMbps: 25, BytesReceived: 622_800, DurationMillis: 200},
+		{RateMbps: 75, BytesReceived: 1_872_552, DurationMillis: 200},
+		{RateMbps: 150, BytesReceived: 3_750_640, DurationMillis: 200},
+		{RateMbps: 350, BytesReceived: 8_748_264, DurationMillis: 200},
+		{RateMbps: 700, BytesReceived: 8_751_032, DurationMillis: 200},
+		{RateMbps: 1000, BytesReceived: 18_746_280, DurationMillis: 200},
+		{RateMbps: 1200, BytesReceived: 18_924_816, DurationMillis: 200},
+		{RateMbps: 1800, BytesReceived: 90_704_592, DurationMillis: 500},
+		{RateMbps: 2000, BytesReceived: 71_097_464, DurationMillis: 500},
+		{RateMbps: 2250, BytesReceived: 86_385_128, DurationMillis: 500},
+	}
+
+	selected := externalDirectUDPSelectInitialRateMbps(10_000, sent, received)
+	if got, want := selected, 350; got != want {
+		t.Fatalf("externalDirectUDPSelectInitialRateMbps(live pve1->hetz clean-low lossy ramp) = %d, want %d", got, want)
+	}
+	ceiling := externalDirectUDPSelectRateCeilingMbps(10_000, selected, sent, received)
+	if got, want := ceiling, 350; got != want {
+		t.Fatalf("externalDirectUDPSelectRateCeilingMbps(live pve1->hetz clean-low lossy ramp) = %d, want %d", got, want)
+	}
+	if got, want := externalDirectUDPDataStartRateMbpsForProbeSamples(selected, ceiling, sent, received), 350; got != want {
+		t.Fatalf("externalDirectUDPDataStartRateMbpsForProbeSamples(live pve1->hetz clean-low lossy ramp) = %d, want %d", got, want)
+	}
+}
+
+func TestExternalDirectUDPSelectRateCapsLivePve1HetzClean700LossyIntermediateProbe(t *testing.T) {
+	sent := []directUDPRateProbeSample{
+		{RateMbps: 8, BytesSent: 199_296, DurationMillis: 200},
+		{RateMbps: 25, BytesSent: 624_184, DurationMillis: 200},
+		{RateMbps: 75, BytesSent: 1_875_320, DurationMillis: 200},
+		{RateMbps: 150, BytesSent: 3_750_640, DurationMillis: 200},
+		{RateMbps: 350, BytesSent: 8_751_032, DurationMillis: 200},
+		{RateMbps: 700, BytesSent: 17_497_912, DurationMillis: 200},
+		{RateMbps: 1000, BytesSent: 25_000_576, DurationMillis: 200},
+		{RateMbps: 1200, BytesSent: 29_999_584, DurationMillis: 200},
+		{RateMbps: 1800, BytesSent: 112_326_491, DurationMillis: 500},
+		{RateMbps: 2000, BytesSent: 124_256_698, DurationMillis: 500},
+		{RateMbps: 2250, BytesSent: 142_097_764, DurationMillis: 500},
+	}
+	received := []directUDPRateProbeSample{
+		{RateMbps: 8, BytesReceived: 199_296, DurationMillis: 200},
+		{RateMbps: 25, BytesReceived: 624_184, DurationMillis: 200},
+		{RateMbps: 75, BytesReceived: 1_875_320, DurationMillis: 200},
+		{RateMbps: 150, BytesReceived: 3_750_640, DurationMillis: 200},
+		{RateMbps: 350, BytesReceived: 8_751_032, DurationMillis: 200},
+		{RateMbps: 700, BytesReceived: 17_497_912, DurationMillis: 200},
+		{RateMbps: 1000, BytesReceived: 18_750_432, DurationMillis: 200},
+		{RateMbps: 1200, BytesReceived: 22_499_688, DurationMillis: 200},
+		{RateMbps: 1800, BytesReceived: 88_737_928, DurationMillis: 500},
+		{RateMbps: 2000, BytesReceived: 58_400_648, DurationMillis: 500},
+		{RateMbps: 2250, BytesReceived: 55_418_128, DurationMillis: 500},
+	}
+
+	selected := externalDirectUDPSelectInitialRateMbps(10_000, sent, received)
+	if got, want := selected, 350; got != want {
+		t.Fatalf("externalDirectUDPSelectInitialRateMbps(live pve1->hetz clean 700 lossy intermediate) = %d, want %d", got, want)
+	}
+	ceiling := externalDirectUDPSelectRateCeilingMbps(10_000, selected, sent, received)
+	if got, want := ceiling, 350; got != want {
+		t.Fatalf("externalDirectUDPSelectRateCeilingMbps(live pve1->hetz clean 700 lossy intermediate) = %d, want %d", got, want)
+	}
+	if got, want := externalDirectUDPDataStartRateMbpsForProbeSamples(selected, ceiling, sent, received), 350; got != want {
+		t.Fatalf("externalDirectUDPDataStartRateMbpsForProbeSamples(live pve1->hetz clean 700 lossy intermediate) = %d, want %d", got, want)
 	}
 }
 

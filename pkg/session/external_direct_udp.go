@@ -477,6 +477,9 @@ func sendExternalViaDirectUDP(ctx context.Context, cfg SendConfig) (retErr error
 	defer notifyPeerAbortOnError(&retErr, ctx, derpClient, listenerDERP, func() int64 {
 		return countedSrc.Count()
 	}, auth)
+	defer notifyPeerAbortOnLocalCancel(&retErr, ctx, derpClient, listenerDERP, func() int64 {
+		return countedSrc.Count()
+	}, auth)
 	readyAckCh, unsubscribeReadyAck := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == listenerDERP && isDirectUDPReadyAckPayload(pkt.Payload)
 	})
@@ -3396,6 +3399,9 @@ func externalDirectUDPSelectRateFromProbeSamples(maxRateMbps int, sent []directU
 	if len(candidates) == 0 {
 		return 0
 	}
+	if conservativeRate, ok := externalDirectUDPProbeConservativeRampCap(sent, received); ok {
+		return conservativeRate
+	}
 	capSenderLimitedProbeRate := func(rate int) int {
 		if rate < externalDirectUDPRateProbeCollapseMinMbps {
 			return rate
@@ -3690,6 +3696,17 @@ func externalDirectUDPSelectInitialRateMbps(maxRateMbps int, sent []directUDPRat
 	if !externalDirectUDPHasPositiveProbeProgress(received) {
 		return selected
 	}
+	if conservativeRate, ok := externalDirectUDPProbeConservativeRampCap(sent, received); ok {
+		if selected > conservativeRate {
+			return conservativeRate
+		}
+		return selected
+	}
+	if selected > externalDirectUDPActiveLaneTwoMaxMbps &&
+		selected < externalDirectUDPDataStartHighMbps &&
+		externalDirectUDPProbeLacksCleanWarmupForSelectedRate(selected, sent, received) {
+		return selected
+	}
 	return externalDirectUDPAddProbeKneeHeadroom(maxRateMbps, selected, sent, received)
 }
 
@@ -3704,6 +3721,17 @@ func externalDirectUDPSelectRateCeilingMbps(maxRateMbps int, selected int, sent 
 		selected = maxRateMbps
 	}
 	if !externalDirectUDPHasPositiveProbeProgress(received) {
+		return selected
+	}
+	if conservativeRate, ok := externalDirectUDPProbeConservativeRampCap(sent, received); ok {
+		if selected > conservativeRate {
+			return conservativeRate
+		}
+		return selected
+	}
+	if selected > externalDirectUDPActiveLaneTwoMaxMbps &&
+		selected < externalDirectUDPDataStartHighMbps &&
+		externalDirectUDPProbeLacksCleanWarmupForSelectedRate(selected, sent, received) {
 		return selected
 	}
 	sentByRate := make(map[int]directUDPRateProbeSample, len(sent))
@@ -3919,6 +3947,87 @@ func externalDirectUDPProbeMetrics(sample directUDPRateProbeSample, sentByRate m
 	delivery := float64(sample.BytesReceived) / float64(sentSample.BytesSent)
 	efficiency := goodput / float64(sample.RateMbps)
 	return goodput, delivery, efficiency, true
+}
+
+func externalDirectUDPProbeLacksCleanWarmupForSelectedRate(selected int, sent []directUDPRateProbeSample, received []directUDPRateProbeSample) bool {
+	if selected < externalDirectUDPActiveLaneTwoMaxMbps {
+		return false
+	}
+	sentByRate := make(map[int]directUDPRateProbeSample, len(sent))
+	for _, sample := range sent {
+		sentByRate[sample.RateMbps] = sample
+	}
+	cleanWarmup := false
+	selectedDelivery := 0.0
+	selectedProgress := false
+	selectedObserved := false
+	for _, sample := range received {
+		_, delivery, _, ok := externalDirectUDPProbeMetrics(sample, sentByRate)
+		if !ok {
+			continue
+		}
+		if sample.RateMbps < selected {
+			if sample.BytesReceived > 0 && delivery >= externalDirectUDPRateProbeNearClean {
+				cleanWarmup = true
+			}
+			continue
+		}
+		if sample.RateMbps != selected {
+			continue
+		}
+		selectedObserved = true
+		selectedProgress = sample.BytesReceived > 0
+		selectedDelivery = delivery
+	}
+	return selectedObserved && selectedProgress && selectedDelivery < externalDirectUDPRateProbeNearClean && !cleanWarmup
+}
+
+func externalDirectUDPProbeConservativeRampCap(sent []directUDPRateProbeSample, received []directUDPRateProbeSample) (int, bool) {
+	sentByRate := make(map[int]directUDPRateProbeSample, len(sent))
+	for _, sample := range sent {
+		sentByRate[sample.RateMbps] = sample
+	}
+	cleanLowerRate := 0
+	cleanTwoLaneRamp := false
+	lossyTwoLaneRamp := false
+	lossyIntermediateProbe := false
+	higherNearCleanRecovery := false
+	for _, sample := range received {
+		goodput, delivery, _, ok := externalDirectUDPProbeMetrics(sample, sentByRate)
+		if !ok || sample.BytesReceived <= 0 {
+			continue
+		}
+		switch {
+		case sample.RateMbps < externalDirectUDPActiveLaneTwoMaxMbps:
+			if delivery >= externalDirectUDPRateProbeNearClean && sample.RateMbps > cleanLowerRate {
+				cleanLowerRate = sample.RateMbps
+			}
+		case sample.RateMbps == externalDirectUDPActiveLaneTwoMaxMbps:
+			if delivery >= externalDirectUDPRateProbeNearClean {
+				cleanTwoLaneRamp = true
+			} else if delivery < externalDirectUDPRateProbeBufferedCollapse {
+				lossyTwoLaneRamp = true
+			}
+		case sample.RateMbps > externalDirectUDPActiveLaneTwoMaxMbps && sample.RateMbps < externalDirectUDPDataStartHighMbps:
+			if delivery < externalDirectUDPRateProbeNearClean {
+				lossyIntermediateProbe = true
+			}
+		case sample.RateMbps >= externalDirectUDPDataStartHighMbps:
+			if delivery >= externalDirectUDPRateProbeNearClean && goodput >= externalDirectUDPRateProbeHighHeadroomMin {
+				higherNearCleanRecovery = true
+			}
+		}
+	}
+	if (!lossyTwoLaneRamp && !cleanTwoLaneRamp) || !lossyIntermediateProbe || higherNearCleanRecovery {
+		return 0, false
+	}
+	if cleanLowerRate > 0 {
+		return cleanLowerRate, true
+	}
+	if cleanTwoLaneRamp {
+		return externalDirectUDPActiveLaneTwoMaxMbps, true
+	}
+	return externalDirectUDPDataStartMaxMbps, true
 }
 
 func externalDirectUDPFindLossyRecoveryProbe(selected int, baseGoodput float64, sentByRate map[int]directUDPRateProbeSample, received []directUDPRateProbeSample) (int, float64, float64, float64, bool) {

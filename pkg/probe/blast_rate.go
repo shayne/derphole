@@ -64,12 +64,15 @@ type blastRateController struct {
 }
 
 type blastSendControl struct {
-	adaptive         bool
-	controller       *blastRateController
-	sentPayloadBytes uint64
-	ackFloor         uint64
-	repairPressureAt time.Time
-	repairPressurePk int
+	adaptive                  bool
+	controller                *blastRateController
+	sentPayloadBytes          uint64
+	receiverCommittedBytes    uint64
+	receiverStatsSeen         bool
+	ackFloor                  uint64
+	repairPressureAt          time.Time
+	repairPressurePk          int
+	receiverBacklogPressureAt time.Time
 }
 
 type blastPacer struct {
@@ -140,6 +143,17 @@ func (c *blastSendControl) SetSentPayloadBytes(bytes uint64) {
 		return
 	}
 	c.sentPayloadBytes = bytes
+}
+
+func (c *blastSendControl) ReceiverBacklogBytes() uint64 {
+	if c == nil || !c.receiverStatsSeen || c.sentPayloadBytes <= c.receiverCommittedBytes {
+		return 0
+	}
+	return c.sentPayloadBytes - c.receiverCommittedBytes
+}
+
+func (c *blastSendControl) ReceiverStatsSeen() bool {
+	return c != nil && c.receiverStatsSeen
 }
 
 func (c *blastSendControl) AckFloor() uint64 {
@@ -250,6 +264,10 @@ func (c *blastSendControl) ObserveReceiverStatsPayload(stats blastReceiverStats,
 	if updateAckFloor && stats.AckFloor > c.ackFloor {
 		c.ackFloor = stats.AckFloor
 	}
+	if !c.receiverStatsSeen || stats.CommittedPayloadBytes > c.receiverCommittedBytes {
+		c.receiverCommittedBytes = stats.CommittedPayloadBytes
+	}
+	c.receiverStatsSeen = true
 	before := c.controller.RateMbps()
 	c.controller.Observe(now, blastRateFeedback{
 		SentPayloadBytes:     c.sentPayloadBytes,
@@ -259,8 +277,28 @@ func (c *blastSendControl) ObserveReceiverStatsPayload(stats blastReceiverStats,
 	})
 	after := c.controller.RateMbps()
 	if after != before {
-		sessionTracef("blast rate update rate_mbps=%d previous_mbps=%d rx_bytes=%d rx_packets=%d rx_max_seq=%d sent_bytes=%d",
-			after, before, stats.ReceivedPayloadBytes, stats.ReceivedPackets, stats.MaxSeqPlusOne, c.sentPayloadBytes)
+		sessionTracef("blast rate update rate_mbps=%d previous_mbps=%d rx_bytes=%d rx_committed=%d rx_packets=%d rx_max_seq=%d sent_bytes=%d",
+			after, before, stats.ReceivedPayloadBytes, stats.CommittedPayloadBytes, stats.ReceivedPackets, stats.MaxSeqPlusOne, c.sentPayloadBytes)
+	}
+}
+
+func (c *blastSendControl) ObserveReceiverBacklogPressure(now time.Time, backlogBytes uint64, budgetBytes uint64) {
+	if c == nil || c.controller == nil || c.controller.RateMbps() <= blastRateMinMbps || budgetBytes == 0 || backlogBytes <= budgetBytes {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if !c.receiverBacklogPressureAt.IsZero() && now.Sub(c.receiverBacklogPressureAt) < c.controller.pressureHoldAfterDecrease() {
+		return
+	}
+	before := c.controller.RateMbps()
+	c.controller.decreaseFromReplayPressure(now)
+	after := c.controller.RateMbps()
+	c.receiverBacklogPressureAt = now
+	if after != before {
+		sessionTracef("blast rate receiver backlog pressure rate_mbps=%d previous_mbps=%d backlog_bytes=%d budget_bytes=%d",
+			after, before, backlogBytes, budgetBytes)
 	}
 }
 

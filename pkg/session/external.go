@@ -2266,6 +2266,21 @@ func notifyPeerAbortOnError(errp *error, ctx context.Context, client *derpbind.C
 	sendPeerAbortBestEffort(client, peerDERP, peerAbortReason(*errp), bytes, optionalPeerControlAuth(authOpt))
 }
 
+func notifyPeerAbortOnLocalCancel(errp *error, ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, bytesTransferred func() int64, authOpt ...externalPeerControlAuth) {
+	if errp == nil {
+		return
+	}
+	err := normalizePeerAbortError(ctx, *errp)
+	if !errors.Is(err, context.Canceled) {
+		return
+	}
+	var bytes int64
+	if bytesTransferred != nil {
+		bytes = bytesTransferred()
+	}
+	sendPeerAbortBestEffort(client, peerDERP, peerAbortReason(err), bytes, optionalPeerControlAuth(authOpt))
+}
+
 func peerAbortErrorShouldNotify(err error) bool {
 	return err != nil &&
 		!errors.Is(err, ErrPeerAborted) &&
