@@ -18,13 +18,13 @@ fi
 sender_target="${1:?missing sender host}"
 receiver_target="${2:?missing receiver host}"
 size_mib="${3:-1024}"
-sample_interval_sec="${DERPHOLE_STALL_SAMPLE_INTERVAL_SEC:-1}"
+sample_interval_sec="${DERPHOLE_STALL_SAMPLE_INTERVAL_SEC:-0.5}"
 stall_timeout_sec="${DERPHOLE_STALL_TIMEOUT_SEC:-20}"
 start_timeout_sec="${DERPHOLE_STALL_START_TIMEOUT_SEC:-60}"
 total_timeout_sec="${DERPHOLE_STALL_TOTAL_TIMEOUT_SEC:-900}"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 log_dir="${DERPHOLE_STALL_LOG_DIR:-/tmp/derphole-stall-${stamp}}"
-samples_file="${log_dir}/samples.tsv"
+samples_file="${log_dir}/samples.csv"
 sender_dir=""
 receiver_dir=""
 sender_payload=""
@@ -40,6 +40,41 @@ mkdir -p "${log_dir}/sender" "${log_dir}/receiver"
 
 quote() {
   printf "%q" "$1"
+}
+
+csv_escape() {
+  local value="$1"
+  value="${value//$'\r'/ }"
+  value="${value//$'\n'/ }"
+  value="${value//\"/\"\"}"
+  printf '"%s"' "${value}"
+}
+
+append_sample_row() {
+  local timestamp_ms="$1"
+  local elapsed_ms="$2"
+  local sender_status="$3"
+  local receiver_status="$4"
+  local sender_alive="$5"
+  local receiver_alive="$6"
+  local sender_log_bytes="$7"
+  local receiver_log_bytes="$8"
+  local sender_state="$9"
+  local receiver_state="${10}"
+  local sent_bytes="${11}"
+  local received_bytes="${12}"
+  local delta_sent="${13}"
+  local delta_received="${14}"
+  local send_mbps="${15}"
+  local receive_mbps="${16}"
+
+  {
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,' "${timestamp_ms}" "${elapsed_ms}" "${sender_status}" "${receiver_status}" "${sender_alive}" "${receiver_alive}" "${sender_log_bytes}" "${receiver_log_bytes}"
+    csv_escape "${sender_state}"
+    printf ','
+    csv_escape "${receiver_state}"
+    printf ',%s,%s,%s,%s,%s,%s\n' "${sent_bytes}" "${received_bytes}" "${delta_sent}" "${delta_received}" "${send_mbps}" "${receive_mbps}"
+  } >>"${samples_file}"
 }
 
 now_ms() {
@@ -62,10 +97,18 @@ normalize_target() {
 sender_target="$(normalize_target "${sender_target}")"
 receiver_target="$(normalize_target "${receiver_target}")"
 
+clean_ssh() {
+  LC_ALL=C LANG=C ssh "$@"
+}
+
+clean_scp() {
+  LC_ALL=C LANG=C scp "$@"
+}
+
 remote_sh() {
   local target="$1"
   local script="$2"
-  ssh "${target}" 'bash -se' <<<"${script}"
+  clean_ssh "${target}" 'bash -se' <<<"${script}"
 }
 
 remote_mktemp() {
@@ -138,7 +181,7 @@ fetch_remote_dir() {
     return 0
   fi
   mkdir -p "${local_dir}"
-  ssh "${target}" "tar -C $(quote "${remote_dir}") --exclude=payload.bin --exclude=received.bin -cf - ." | tar -C "${local_dir}" -xf -
+  clean_ssh "${target}" "tar -C $(quote "${remote_dir}") --exclude=payload.bin --exclude=received.bin -cf - ." | tar -C "${local_dir}" -xf -
 }
 
 cleanup_remote() {
@@ -187,17 +230,75 @@ remote_state() {
   local target="$1"
   local out_file="$2"
   local pid_file="$3"
-  remote_sh "${target}" "
+  local status_file="$4"
+  local log_file="$5"
+  clean_ssh "${target}" 'bash -se' -- "${out_file}" "${pid_file}" "${status_file}" "${log_file}" <<'REMOTE_SAMPLE_STATE'
+out_file="$1"
+pid_file="$2"
+status_file="$3"
+log_file="$4"
+
 size=0
-if [[ -f $(quote "${out_file}") ]]; then
-  size=\$(stat -c %s $(quote "${out_file}") 2>/dev/null || echo 0)
+if [[ -f "${out_file}" ]]; then
+  size=$(stat -c %s "${out_file}" 2>/dev/null || echo 0)
 fi
 alive=0
-if [[ -f $(quote "${pid_file}") ]] && kill -0 \$(cat $(quote "${pid_file}")) 2>/dev/null; then
+if [[ -f "${pid_file}" ]] && kill -0 "$(cat "${pid_file}")" 2>/dev/null; then
   alive=1
 fi
-printf '%s %s\n' \"\${size}\" \"\${alive}\"
-"
+status="running"
+if [[ -f "${status_file}" ]]; then
+  status=$(cat "${status_file}" 2>/dev/null || echo 127)
+elif [[ "${alive}" != "1" ]]; then
+  status="missing"
+fi
+
+log_bytes=0
+progress_bytes=0
+progress_total=0
+state=""
+if [[ -f "${log_file}" ]]; then
+  log_bytes=$(stat -c %s "${log_file}" 2>/dev/null || echo 0)
+  progress=$(tr '\r' '\n' <"${log_file}" | awk '
+function unitmul(unit) {
+  if (unit == "B") return 1
+  if (unit == "KiB") return 1024
+  if (unit == "MiB") return 1048576
+  if (unit == "GiB") return 1073741824
+  if (unit == "TiB") return 1099511627776
+  return 0
+}
+function tobytes(text, parts) {
+  if (match(text, /^[0-9.]+/)) {
+    number = substr(text, RSTART, RLENGTH)
+    unit = substr(text, RSTART + RLENGTH)
+    return int(number * unitmul(unit) + 0.5)
+  }
+  return 0
+}
+{
+  if (match($0, /[0-9.]+[KMGT]?i?B\/[0-9.]+[KMGT]?i?B/)) {
+    field = substr($0, RSTART, RLENGTH)
+    split(field, parts, "/")
+    current = tobytes(parts[1])
+    total = tobytes(parts[2])
+  }
+}
+END { printf "%d %d\n", current + 0, total + 0 }
+')
+  read -r progress_bytes progress_total <<<"${progress}"
+  state=$(tr '\r' '\n' <"${log_file}" | awk '
+/^(waiting-for-claim|claimed|probing-direct|connected-direct|connected-relay|stream-complete)$/ { line = $0 }
+/^(udp-|direct-udp-|relay-prefix-)/ { line = $0 }
+/peer disconnected|context canceled|message too long|write udp/ { line = $0 }
+END {
+  gsub(/[[:cntrl:]\t,]/, " ", line)
+  print substr(line, 1, 240)
+}')
+fi
+
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${size}" "${alive}" "${status}" "${log_bytes}" "${progress_bytes}" "${progress_total}" "${state}"
+REMOTE_SAMPLE_STATE
 }
 
 sender_dir="$(remote_mktemp "${sender_target}")"
@@ -206,8 +307,8 @@ receiver_out="${receiver_dir}/received.bin"
 
 if [[ -z "${DERPHOLE_STALL_REMOTE_CMD:-}" ]]; then
   mise run build-linux-amd64
-  scp "dist/derphole-linux-amd64" "${sender_target}:${sender_dir}/derphole" >/dev/null
-  scp "dist/derphole-linux-amd64" "${receiver_target}:${receiver_dir}/derphole" >/dev/null
+  clean_scp "dist/derphole-linux-amd64" "${sender_target}:${sender_dir}/derphole" >/dev/null
+  clean_scp "dist/derphole-linux-amd64" "${receiver_target}:${receiver_dir}/derphole" >/dev/null
   remote_sh "${sender_target}" "chmod +x $(quote "${sender_dir}/derphole")"
   remote_sh "${receiver_target}" "chmod +x $(quote "${receiver_dir}/derphole")"
   sender_cmd="$(quote "${sender_dir}/derphole")"
@@ -232,14 +333,18 @@ collect_counters "${sender_target}" "${sender_dir}" "before"
 collect_counters "${receiver_target}" "${receiver_dir}" "before"
 
 env_prefix="$(remote_env_prefix)"
+sender_progress_flag="--hide-progress"
+if [[ "${DERPHOLE_STALL_CAPTURE_SENDER_PROGRESS:-1}" == "1" ]]; then
+  sender_progress_flag=""
+fi
 remote_sh "${sender_target}" "
-	rm -f $(quote "${sender_dir}/send.out") $(quote "${sender_dir}/send.err") $(quote "${sender_dir}/send.pid") $(quote "${sender_dir}/send.status")
-(
-  set +e
-  ${env_prefix}${sender_cmd} --verbose send --hide-progress $(quote "${sender_payload}") >$(quote "${sender_dir}/send.out") 2>$(quote "${sender_dir}/send.err") </dev/null &
-  child=\$!
-  echo \"\${child}\" >$(quote "${sender_dir}/send.pid")
-  wait \"\${child}\"
+		rm -f $(quote "${sender_dir}/send.out") $(quote "${sender_dir}/send.err") $(quote "${sender_dir}/send.pid") $(quote "${sender_dir}/send.status")
+	(
+	  set +e
+	  ${env_prefix}${sender_cmd} --verbose send ${sender_progress_flag} $(quote "${sender_payload}") >$(quote "${sender_dir}/send.out") 2>$(quote "${sender_dir}/send.err") </dev/null &
+	  child=\$!
+	  echo \"\${child}\" >$(quote "${sender_dir}/send.pid")
+	  wait \"\${child}\"
   echo \$? >$(quote "${sender_dir}/send.status")
 ) </dev/null >/dev/null 2>/dev/null &
 "
@@ -269,12 +374,13 @@ remote_sh "${receiver_target}" "
 "
 
 {
-  echo -e "timestamp_ms\telapsed_ms\treceived_bytes\tdelta_bytes\tmbps\tsender_alive\treceiver_alive"
+  echo "timestamp_ms,elapsed_ms,sender_status,receiver_status,sender_alive,receiver_alive,sender_log_bytes,receiver_log_bytes,sender_state,receiver_state,bytes_sent,bytes_received,delta_sent,delta_received,send_mbps,receive_mbps"
 } >"${samples_file}"
 
 start_ms="$(now_ms)"
 last_ms="${start_ms}"
 last_progress_ms="${start_ms}"
+last_sent_bytes=0
 last_bytes=0
 
 while true; do
@@ -284,16 +390,21 @@ while true; do
     abort_with_dumps "total-timeout-sec=${total_timeout_sec}"
   fi
 
-  read -r received_bytes receiver_alive < <(remote_state "${receiver_target}" "${receiver_out}" "${receiver_dir}/receive.pid")
-  read -r _ sender_alive < <(remote_state "${sender_target}" "/dev/null" "${sender_dir}/send.pid")
+  IFS=$'\t' read -r received_bytes receiver_alive receiver_sample_status receiver_log_bytes receiver_progress_bytes receiver_progress_total receiver_state < <(remote_state "${receiver_target}" "${receiver_out}" "${receiver_dir}/receive.pid" "${receiver_dir}/receive.status" "${receiver_dir}/receive.err")
+  IFS=$'\t' read -r _ sender_alive sender_sample_status sender_log_bytes sent_bytes sender_progress_total sender_state < <(remote_state "${sender_target}" "/dev/null" "${sender_dir}/send.pid" "${sender_dir}/send.status" "${sender_dir}/send.err")
 
+  if (( sent_bytes < last_sent_bytes )); then
+    sent_bytes="${last_sent_bytes}"
+  fi
+  delta_sent=$((sent_bytes - last_sent_bytes))
   delta_bytes=$((received_bytes - last_bytes))
   delta_ms=$((now - last_ms))
   if (( delta_ms <= 0 )); then
     delta_ms=1
   fi
-  mbps="$(awk -v bytes="${delta_bytes}" -v ms="${delta_ms}" 'BEGIN { printf "%.2f", (bytes * 8) / (ms * 1000) }')"
-  echo -e "${now}\t${elapsed_ms}\t${received_bytes}\t${delta_bytes}\t${mbps}\t${sender_alive}\t${receiver_alive}" >>"${samples_file}"
+  send_mbps="$(awk -v bytes="${delta_sent}" -v ms="${delta_ms}" 'BEGIN { printf "%.2f", (bytes * 8) / (ms * 1000) }')"
+  receive_mbps="$(awk -v bytes="${delta_bytes}" -v ms="${delta_ms}" 'BEGIN { printf "%.2f", (bytes * 8) / (ms * 1000) }')"
+  append_sample_row "${now}" "${elapsed_ms}" "${sender_sample_status}" "${receiver_sample_status}" "${sender_alive}" "${receiver_alive}" "${sender_log_bytes}" "${receiver_log_bytes}" "${sender_state}" "${receiver_state}" "${sent_bytes}" "${received_bytes}" "${delta_sent}" "${delta_bytes}" "${send_mbps}" "${receive_mbps}"
 
   if (( received_bytes > last_bytes )); then
     last_progress_ms="${now}"
@@ -311,6 +422,7 @@ while true; do
     abort_with_dumps "stall-timeout-sec=${stall_timeout_sec}"
   fi
 
+  last_sent_bytes="${sent_bytes}"
   last_bytes="${received_bytes}"
   last_ms="${now}"
   sleep "${sample_interval_sec}"

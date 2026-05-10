@@ -42,7 +42,10 @@ import (
 const (
 	externalDirectUDPTransportLabel                = "batched"
 	externalDirectUDPParallelism                   = 8
-	externalDirectUDPChunkSize                     = 1384 // 52-byte probe header + 16-byte GCM tag keeps UDP payload at 1452 bytes.
+	externalDirectUDPDataWireSize                  = 1384
+	externalDirectUDPPacketHeaderSize              = 52
+	externalDirectUDPPacketAEADOverhead            = 16
+	externalDirectUDPChunkSize                     = externalDirectUDPDataWireSize - externalDirectUDPPacketHeaderSize - externalDirectUDPPacketAEADOverhead
 	externalDirectUDPMaxRateMbps                   = 10_000
 	externalDirectUDPInitialProbeFallbackMbps      = 150
 	externalDirectUDPWait                          = 5 * time.Second
@@ -4134,7 +4137,7 @@ func (s *externalDirectUDPRateProbeSender) sendTier(index int, rate int) error {
 	if rate <= 0 {
 		return fmt.Errorf("invalid rate probe rate %d", rate)
 	}
-	payload, err := externalDirectUDPRateProbePayload(index, externalDirectUDPChunkSize, s.auth)
+	payload, err := externalDirectUDPRateProbePayload(index, externalDirectUDPDataWireSize, s.auth)
 	if err != nil {
 		return err
 	}
@@ -4379,7 +4382,7 @@ func externalDirectUDPReceiveRateProbes(ctx context.Context, conns []net.PacketC
 func externalDirectUDPReceiveRateProbePackets(ctx context.Context, conn net.PacketConn, allowedSources map[string]struct{}, samples []directUDPRateProbeSample, mu *sync.Mutex, auth externalDirectUDPRateProbeAuth, errCh chan<- error, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
-	buf := make([]byte, externalDirectUDPChunkSize)
+	buf := make([]byte, externalDirectUDPDataWireSize)
 	for {
 		n, addr, err := conn.ReadFrom(buf)
 		if err != nil {

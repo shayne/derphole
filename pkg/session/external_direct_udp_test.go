@@ -5614,6 +5614,70 @@ func TestExternalDirectUDPRateProbePayloadEncodesIndex(t *testing.T) {
 	}
 }
 
+func TestExternalDirectUDPSendRateProbesUsesEncryptedDataPacketWireSize(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	tok := testExternalSessionToken(0x91)
+	aead, err := externalSessionPacketAEAD(tok)
+	if err != nil {
+		t.Fatalf("externalSessionPacketAEAD() error = %v", err)
+	}
+	dataPacket, err := probe.MarshalPacket(probe.Packet{
+		Version: probe.ProtocolVersion,
+		Type:    probe.PacketTypeData,
+		RunID:   tok.SessionID,
+		Payload: make([]byte, externalDirectUDPChunkSize),
+	}, aead)
+	if err != nil {
+		t.Fatalf("MarshalPacket() error = %v", err)
+	}
+
+	auth := testExternalDirectUDPRateProbeAuth()
+	seenSize := make(chan int, 1)
+	go func() {
+		defer close(seenSize)
+		buf := make([]byte, 4096)
+		_ = server.SetReadDeadline(time.Now().Add(time.Second))
+		for {
+			n, _, err := server.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if _, ok := externalDirectUDPRateProbeIndex(buf[:n], 1, auth); ok {
+				seenSize <- n
+				return
+			}
+		}
+	}()
+
+	sent, err := externalDirectUDPSendRateProbesParallel(ctx, []net.PacketConn{client}, []string{server.LocalAddr().String()}, []int{8}, auth)
+	if err != nil {
+		t.Fatalf("externalDirectUDPSendRateProbesParallel() error = %v", err)
+	}
+	if len(sent) != 1 || sent[0].BytesSent <= 0 {
+		t.Fatalf("sent samples = %#v, want one sample with bytes", sent)
+	}
+	gotSize := <-seenSize
+	if gotSize == 0 {
+		t.Fatal("server did not receive a rate probe packet")
+	}
+	if gotSize != len(dataPacket) {
+		t.Fatalf("rate probe wire size = %d, want encrypted data wire size %d", gotSize, len(dataPacket))
+	}
+}
+
 func TestExternalDirectUDPRateProbeAuthFromStartValidatesNonce(t *testing.T) {
 	tok := token.Token{}
 	if auth, err := externalDirectUDPRateProbeAuthFromStart(tok, directUDPStart{}); err != nil || auth.enabled() {

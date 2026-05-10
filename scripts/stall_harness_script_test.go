@@ -22,9 +22,16 @@ func TestTransferStallHarnessCapturesProgressAndCounters(t *testing.T) {
 
 	required := []string{
 		"mktemp -d",
-		"samples.tsv",
-		"send --hide-progress",
+		"clean_ssh",
+		"LC_ALL=C LANG=C ssh",
+		"samples.csv",
+		"DERPHOLE_STALL_CAPTURE_SENDER_PROGRESS",
+		"sender_progress_flag",
 		"receive --hide-progress",
+		"bytes_sent",
+		"bytes_received",
+		"sender_state",
+		"receiver_state",
 		"kill -QUIT",
 		"DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES",
 		"DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES",

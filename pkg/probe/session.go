@@ -4296,6 +4296,9 @@ func (s *blastParallelReceiveState) wait() {
 func (s *blastParallelReceiveState) result(ctx context.Context) (TransferStats, error) {
 	select {
 	case err := <-s.errCh:
+		if s.completionCanceledAfterExpectedBytes(ctx, err) {
+			return s.currentStats(time.Now()), nil
+		}
 		if incomplete := s.contextIncompleteError(ctx, err); incomplete != nil {
 			return s.currentStats(time.Now()), incomplete
 		}
@@ -4306,6 +4309,16 @@ func (s *blastParallelReceiveState) result(ctx context.Context) (TransferStats, 
 		return s.currentStats(time.Now()), err
 	}
 	return s.currentStats(time.Now()), nil
+}
+
+func (s *blastParallelReceiveState) completionCanceledAfterExpectedBytes(ctx context.Context, err error) bool {
+	if s.expectedBytes <= 0 || s.bytesReceived.Load() < s.expectedBytes {
+		return false
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	return errors.Is(err, context.Canceled)
 }
 
 func (s *blastParallelReceiveState) completionError(ctx context.Context) error {

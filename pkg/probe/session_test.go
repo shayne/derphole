@@ -825,6 +825,43 @@ func TestBlastStreamReceiveCompletionCancelIsBenignOnlyAfterComplete(t *testing.
 	}
 }
 
+func TestBlastParallelReceiveResultIgnoresCompletionCancelAfterExpectedBytes(t *testing.T) {
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	state, err := newBlastParallelReceiveState([]net.PacketConn{conn}, io.Discard, ReceiveConfig{RequireComplete: true}, 12)
+	if err != nil {
+		t.Fatalf("newBlastParallelReceiveState() error = %v", err)
+	}
+	state.bytesReceived.Store(12)
+	state.errCh <- context.Canceled
+
+	stats, err := state.result(context.Background())
+	if err != nil {
+		t.Fatalf("result() error = %v, want nil after expected bytes arrived", err)
+	}
+	if stats.BytesReceived != 12 {
+		t.Fatalf("BytesReceived = %d, want 12", stats.BytesReceived)
+	}
+
+	parent, cancel := context.WithCancel(context.Background())
+	cancel()
+	state, err = newBlastParallelReceiveState([]net.PacketConn{conn}, io.Discard, ReceiveConfig{RequireComplete: true}, 12)
+	if err != nil {
+		t.Fatalf("newBlastParallelReceiveState() error = %v", err)
+	}
+	state.bytesReceived.Store(12)
+	state.errCh <- context.Canceled
+
+	_, err = state.result(parent)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("parent-canceled result() error = %v, want context.Canceled", err)
+	}
+}
+
 func TestBlastParallelStreamPreservesOrderWithStripedLanesAcrossLoopback(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
