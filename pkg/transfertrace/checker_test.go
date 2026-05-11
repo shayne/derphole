@@ -24,6 +24,18 @@ func TestCheckPassesSmoothCompleteTransfer(t *testing.T) {
 	}
 }
 
+func TestCheckAcceptsTimestampMSAlias(t *testing.T) {
+	csvText := "timestamp_ms,role,phase,app_bytes,last_error\n" +
+		"1000,receive,complete,4096,\n"
+	result, err := Check(strings.NewReader(csvText), Options{Role: RoleReceive, ExpectedBytes: 4096})
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if result.Rows != 1 || result.FinalAppBytes != 4096 || result.FinalPhase != PhaseComplete {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
 func TestCheckFailsApplicationFlatline(t *testing.T) {
 	csvText := HeaderLine + "\n" +
 		"1000,0,receive,relay,1024,0,1024,1024,0.00,,,,,,,,,,,connected-relay,\n" +

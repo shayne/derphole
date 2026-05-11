@@ -26,11 +26,12 @@ type Result struct {
 }
 
 type checkerIndexes struct {
-	timestamp int
-	role      int
-	phase     int
-	appBytes  int
-	lastError int
+	timestamp     int
+	timestampName string
+	role          int
+	phase         int
+	appBytes      int
+	lastError     int
 }
 
 type checkerRow struct {
@@ -158,7 +159,7 @@ func checkerHeaderIndexes(header []string) (checkerIndexes, error) {
 		return i, nil
 	}
 
-	timestamp, err := lookup("timestamp_unix_ms")
+	timestamp, timestampName, err := lookupTimestamp(positions)
 	if err != nil {
 		return checkerIndexes{}, err
 	}
@@ -179,16 +180,27 @@ func checkerHeaderIndexes(header []string) (checkerIndexes, error) {
 		return checkerIndexes{}, err
 	}
 	return checkerIndexes{
-		timestamp: timestamp,
-		role:      role,
-		phase:     phase,
-		appBytes:  appBytes,
-		lastError: lastError,
+		timestamp:     timestamp,
+		timestampName: timestampName,
+		role:          role,
+		phase:         phase,
+		appBytes:      appBytes,
+		lastError:     lastError,
 	}, nil
 }
 
+func lookupTimestamp(positions map[string]int) (int, string, error) {
+	if i, ok := positions["timestamp_unix_ms"]; ok {
+		return i, "timestamp_unix_ms", nil
+	}
+	if i, ok := positions["timestamp_ms"]; ok {
+		return i, "timestamp_ms", nil
+	}
+	return 0, "", fmt.Errorf("missing required header %q", "timestamp_unix_ms")
+}
+
 func parseCheckerRow(record []string, indexes checkerIndexes) (checkerRow, error) {
-	timestampMS, err := parseIntField(record, indexes.timestamp, "timestamp_unix_ms")
+	timestampMS, err := parseIntField(record, indexes.timestamp, indexes.timestampName)
 	if err != nil {
 		return checkerRow{}, err
 	}
