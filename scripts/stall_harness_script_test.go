@@ -58,6 +58,8 @@ func TestTransferStallHarnessCapturesProgressAndCounters(t *testing.T) {
 		"DERPHOLE_TRANSFER_TRACE_INTEGRITY_STALL_WINDOW",
 		"trace_integrity_stall_window",
 		"876000h",
+		"Trace app_bytes are session stream bytes",
+		"Payload size and SHA verification above validate file bytes",
 	}
 	for _, want := range required {
 		if !strings.Contains(body, want) {
