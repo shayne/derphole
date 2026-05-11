@@ -26,6 +26,7 @@ type Result struct {
 }
 
 type checkerIndexes struct {
+	fields        int
 	timestamp     int
 	timestampName string
 	role          int
@@ -208,6 +209,7 @@ func checkerHeaderIndexes(header []string) (checkerIndexes, error) {
 		return checkerIndexes{}, err
 	}
 	return checkerIndexes{
+		fields:        len(header),
 		timestamp:     timestamp,
 		timestampName: timestampName,
 		role:          role,
@@ -228,6 +230,9 @@ func lookupTimestamp(positions map[string]int) (int, string, error) {
 }
 
 func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int, role Role) (checkerRow, error) {
+	if len(record) != indexes.fields {
+		return checkerRow{}, fmt.Errorf("row %d: wrong number of fields: got %d, want %d", rowNo, len(record), indexes.fields)
+	}
 	if err := requireField(record, indexes.timestamp, indexes.timestampName, rowNo); err != nil {
 		return checkerRow{}, err
 	}
