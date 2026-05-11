@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/transfertrace"
 )
 
 type failingOfferReader struct {
@@ -99,5 +100,31 @@ func TestStreamLocalOfferClosesWriterWithCopyError(t *testing.T) {
 	}
 	if _, err := reader.Read(make([]byte, 1)); !errors.Is(err, wantErr) {
 		t.Fatalf("offer session reader error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestExternalOfferSendConfigPreservesTrace(t *testing.T) {
+	var out bytes.Buffer
+	trace, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer trace.Close()
+
+	cfg := externalOfferSendConfig(OfferConfig{
+		Emitter:            telemetry.New(io.Discard, telemetry.LevelSilent),
+		StdioIn:            strings.NewReader("payload"),
+		StdioExpectedBytes: 7,
+		ForceRelay:         true,
+		UsePublicDERP:      true,
+		ParallelPolicy:     FixedParallelPolicy(2),
+		Trace:              trace,
+	})
+
+	if cfg.Trace != trace {
+		t.Fatal("external offer send config dropped trace recorder")
+	}
+	if cfg.StdioExpectedBytes != 7 || !cfg.ForceRelay || !cfg.UsePublicDERP || cfg.ParallelPolicy != FixedParallelPolicy(2) {
+		t.Fatalf("external offer send config did not preserve transport settings: %+v", cfg)
 	}
 }

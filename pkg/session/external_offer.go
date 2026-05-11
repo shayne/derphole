@@ -345,15 +345,20 @@ func sendExternalOfferPayload(ctx context.Context, session *relaySession, counte
 		readyAckCh:       channels.readyAckCh,
 		startAckCh:       channels.startAckCh,
 		rateProbeCh:      channels.rateProbeCh,
-		cfg: SendConfig{
-			Emitter:            cfg.Emitter,
-			StdioIn:            cfg.StdioIn,
-			StdioExpectedBytes: cfg.StdioExpectedBytes,
-			ForceRelay:         cfg.ForceRelay,
-			UsePublicDERP:      cfg.UsePublicDERP,
-			ParallelPolicy:     cfg.ParallelPolicy,
-		},
+		cfg:              externalOfferSendConfig(cfg),
 	})
+}
+
+func externalOfferSendConfig(cfg OfferConfig) SendConfig {
+	return SendConfig{
+		Emitter:            cfg.Emitter,
+		StdioIn:            cfg.StdioIn,
+		StdioExpectedBytes: cfg.StdioExpectedBytes,
+		ForceRelay:         cfg.ForceRelay,
+		UsePublicDERP:      cfg.UsePublicDERP,
+		ParallelPolicy:     cfg.ParallelPolicy,
+		Trace:              cfg.Trace,
+	}
 }
 
 func emitExternalOfferDebug(cfg OfferConfig, msg string) {
