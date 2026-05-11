@@ -51,6 +51,10 @@ func TestTransferStallHarnessCapturesProgressAndCounters(t *testing.T) {
 		"receive.trace.csv",
 		"transfertracecheck",
 		"-stall-window",
+		"receive_checker_output",
+		"receive_checker_status",
+		"app bytes stalled",
+		"stall-proof-error=unexpected-checker-failure",
 	}
 	for _, want := range required {
 		if !strings.Contains(body, want) {

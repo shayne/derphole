@@ -457,8 +457,26 @@ fetch_remote_dir "${receiver_target}" "${receiver_dir}" "${log_dir}/receiver"
 
 mise exec -- go run ./tools/transfertracecheck -role send -expected-bytes "${expected_size}" -stall-window "${trace_stall_window}" "${log_dir}/sender/send.trace.csv"
 if [[ "${DERPHOLE_TRANSFER_TRACE_EXPECT_STALL:-0}" == "1" ]]; then
-  if mise exec -- go run ./tools/transfertracecheck -role receive -expected-bytes "${expected_size}" -stall-window "${trace_stall_window}" "${log_dir}/receiver/receive.trace.csv"; then
+  receive_checker_output=""
+  receive_checker_status=0
+  set +e
+  receive_checker_output="$(mise exec -- go run ./tools/transfertracecheck -role receive -expected-bytes "${expected_size}" -stall-window "${trace_stall_window}" "${log_dir}/receiver/receive.trace.csv" 2>&1)"
+  receive_checker_status=$?
+  set -e
+  if [[ "${receive_checker_status}" == "0" ]]; then
+    if [[ -n "${receive_checker_output}" ]]; then
+      printf '%s\n' "${receive_checker_output}" >&2
+    fi
     echo "stall-proof-error=expected-stall-but-checker-passed" >&2
+    exit 1
+  fi
+  if [[ "${receive_checker_output}" == *"app bytes stalled"* ]]; then
+    printf '%s\n' "${receive_checker_output}" >&2
+  else
+    echo "stall-proof-error=unexpected-checker-failure" >&2
+    if [[ -n "${receive_checker_output}" ]]; then
+      printf '%s\n' "${receive_checker_output}" >&2
+    fi
     exit 1
   fi
 else
