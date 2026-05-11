@@ -205,3 +205,24 @@ func TestCheckFailsExpectedByteMismatch(t *testing.T) {
 		t.Fatalf("Check() error = %v, want byte mismatch", err)
 	}
 }
+
+func TestCheckValidatesExplicitExpectedZeroBytes(t *testing.T) {
+	csvText := "timestamp_unix_ms,role,phase,app_bytes,last_error\n" +
+		"1000,receive,complete,1024,\n"
+	_, err := Check(strings.NewReader(csvText), Options{Role: RoleReceive, ExpectedBytes: 0, ExpectedBytesSet: true})
+	if err == nil || !strings.Contains(err.Error(), "final app bytes") {
+		t.Fatalf("Check() error = %v, want zero-byte mismatch", err)
+	}
+}
+
+func TestCheckAllowsOmittedExpectedZeroBytes(t *testing.T) {
+	csvText := "timestamp_unix_ms,role,phase,app_bytes,last_error\n" +
+		"1000,receive,complete,1024,\n"
+	result, err := Check(strings.NewReader(csvText), Options{Role: RoleReceive})
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if result.FinalAppBytes != 1024 {
+		t.Fatalf("result = %#v", result)
+	}
+}

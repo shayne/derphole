@@ -13,9 +13,10 @@ import (
 )
 
 type Options struct {
-	Role          Role
-	StallWindow   time.Duration
-	ExpectedBytes int64
+	Role             Role
+	StallWindow      time.Duration
+	ExpectedBytes    int64
+	ExpectedBytesSet bool
 }
 
 type Result struct {
@@ -38,7 +39,6 @@ type checkerIndexes struct {
 type checkerRow struct {
 	rowNo     int
 	timestamp time.Time
-	role      Role
 	phase     Phase
 	appBytes  int64
 	lastError string
@@ -89,7 +89,7 @@ func (c *checker) scanRows(cr *csv.Reader, indexes checkerIndexes) error {
 		if c.opts.Role != "" && role != c.opts.Role {
 			continue
 		}
-		row, err := parseCheckerRow(record, indexes, rowNo, role)
+		row, err := parseCheckerRow(record, indexes, rowNo)
 		if err != nil {
 			return err
 		}
@@ -159,13 +159,17 @@ func (c *checker) finish() (Result, error) {
 	if c.result.Rows == 0 {
 		return c.result, c.noRowsError()
 	}
-	if c.opts.ExpectedBytes > 0 && c.result.FinalAppBytes != c.opts.ExpectedBytes {
+	if c.expectedBytesSet() && c.result.FinalAppBytes != c.opts.ExpectedBytes {
 		return c.result, fmt.Errorf("final app bytes = %d, want %d", c.result.FinalAppBytes, c.opts.ExpectedBytes)
 	}
 	if c.result.FinalPhase != PhaseComplete {
 		return c.result, fmt.Errorf("final phase = %s, want %s", c.result.FinalPhase, PhaseComplete)
 	}
 	return c.result, nil
+}
+
+func (c *checker) expectedBytesSet() bool {
+	return c.opts.ExpectedBytesSet || c.opts.ExpectedBytes > 0
 }
 
 func (c *checker) noRowsError() error {
@@ -229,7 +233,7 @@ func lookupTimestamp(positions map[string]int) (int, string, error) {
 	return 0, "", fmt.Errorf("missing required timestamp header %q or %q", "timestamp_unix_ms", "timestamp_ms")
 }
 
-func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int, role Role) (checkerRow, error) {
+func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int) (checkerRow, error) {
 	if len(record) != indexes.fields {
 		return checkerRow{}, fmt.Errorf("row %d: wrong number of fields: got %d, want %d", rowNo, len(record), indexes.fields)
 	}
@@ -253,7 +257,6 @@ func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int, role Ro
 	return checkerRow{
 		rowNo:     rowNo,
 		timestamp: time.UnixMilli(timestampMS),
-		role:      role,
 		phase:     Phase(field(record, indexes.phase)),
 		appBytes:  appBytes,
 		lastError: field(record, indexes.lastError),

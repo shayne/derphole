@@ -60,6 +60,38 @@ func TestRunReturnsFailureForCheckError(t *testing.T) {
 	}
 }
 
+func TestRunValidatesExplicitExpectedZeroBytes(t *testing.T) {
+	path := writeTrace(t, "timestamp_unix_ms,role,phase,app_bytes,last_error\n"+
+		"1000,receive,complete,1024,\n")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-role", "receive", "-expected-bytes", "0", path}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run() exit = %d, want 1", code)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "final app bytes") {
+		t.Fatalf("stderr = %q, want byte mismatch", stderr.String())
+	}
+}
+
+func TestRunRejectsNegativeExpectedBytes(t *testing.T) {
+	path := writeTrace(t, "timestamp_unix_ms,role,phase,app_bytes,last_error\n"+
+		"1000,receive,complete,0,\n")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-role", "receive", "-expected-bytes", "-1", path}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("run() exit = %d, want 2", code)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "expected-bytes must be non-negative") {
+		t.Fatalf("stderr = %q, want expected-bytes validation", stderr.String())
+	}
+}
+
 func TestRunRejectsInvalidRole(t *testing.T) {
 	path := writeTrace(t, "timestamp_unix_ms,role,phase,app_bytes,last_error\n"+
 		"1000,receive,complete,4096,\n")

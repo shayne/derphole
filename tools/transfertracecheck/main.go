@@ -18,10 +18,11 @@ import (
 var errUsage = errors.New("usage")
 
 type options struct {
-	Role          string
-	ExpectedBytes int64
-	StallWindow   time.Duration
-	Path          string
+	Role             string
+	ExpectedBytes    int64
+	ExpectedBytesSet bool
+	StallWindow      time.Duration
+	Path             string
 }
 
 func main() {
@@ -73,12 +74,29 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 		flags.Usage()
 		return options{}, errUsage
 	}
+	expectedBytesSet := flagProvided(flags, "expected-bytes")
+	if expectedBytes < 0 {
+		_, _ = fmt.Fprintln(stderr, "expected-bytes must be non-negative")
+		flags.Usage()
+		return options{}, errUsage
+	}
 	return options{
-		Role:          role,
-		ExpectedBytes: expectedBytes,
-		StallWindow:   stallWindow,
-		Path:          flags.Arg(0),
+		Role:             role,
+		ExpectedBytes:    expectedBytes,
+		ExpectedBytesSet: expectedBytesSet,
+		StallWindow:      stallWindow,
+		Path:             flags.Arg(0),
 	}, nil
+}
+
+func flagProvided(flags *flag.FlagSet, name string) bool {
+	provided := false
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			provided = true
+		}
+	})
+	return provided
 }
 
 func checkPath(opts options) (transfertrace.Result, error) {
@@ -91,8 +109,9 @@ func checkPath(opts options) (transfertrace.Result, error) {
 	}()
 
 	return transfertrace.Check(f, transfertrace.Options{
-		Role:          transfertrace.Role(opts.Role),
-		ExpectedBytes: opts.ExpectedBytes,
-		StallWindow:   opts.StallWindow,
+		Role:             transfertrace.Role(opts.Role),
+		ExpectedBytes:    opts.ExpectedBytes,
+		ExpectedBytesSet: opts.ExpectedBytesSet,
+		StallWindow:      opts.StallWindow,
 	})
 }
