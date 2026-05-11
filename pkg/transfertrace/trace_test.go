@@ -6,6 +6,8 @@ package transfertrace
 
 import (
 	"bytes"
+	"encoding/csv"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -85,4 +87,126 @@ func TestRecorderErrorAndCompleteRows(t *testing.T) {
 	if !strings.Contains(body, ",complete,") {
 		t.Fatalf("missing complete row:\n%s", body)
 	}
+}
+
+func TestRecorderHeaderUnaffectedByExportedHeaderMutation(t *testing.T) {
+	original := Header[0]
+	Header[0] = "mutated_header"
+	defer func() {
+		Header[0] = original
+	}()
+
+	var out bytes.Buffer
+	rec, err := NewRecorder(&out, RoleSend, time.Unix(400, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if got, want := lines[0], HeaderLine; got != want {
+		t.Fatalf("header = %q, want %q", got, want)
+	}
+}
+
+func TestRecorderRowsParseByHeaderAndBlankZeroOptionalFields(t *testing.T) {
+	var out bytes.Buffer
+	rec, err := NewRecorder(&out, RoleReceive, time.Unix(500, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	rec.Observe(Snapshot{
+		At:          time.Unix(500, int64(750*time.Millisecond)),
+		Phase:       PhaseRelay,
+		RelayBytes:  11,
+		DirectBytes: 22,
+		AppBytes:    33,
+		LastState:   "relay-only",
+	})
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	records, indexes := readTraceCSV(t, out.String())
+	row := records[1]
+	assertColumn(t, row, indexes, "role", "receive")
+	assertColumn(t, row, indexes, "phase", "relay")
+	assertColumn(t, row, indexes, "relay_bytes", "11")
+	assertColumn(t, row, indexes, "direct_bytes", "22")
+	assertColumn(t, row, indexes, "app_bytes", "33")
+	assertColumn(t, row, indexes, "elapsed_ms", "750")
+	assertColumn(t, row, indexes, "last_state", "relay-only")
+	assertColumn(t, row, indexes, "direct_rate_selected_mbps", "")
+	assertColumn(t, row, indexes, "direct_rate_active_mbps", "")
+	assertColumn(t, row, indexes, "direct_lanes_active", "")
+	assertColumn(t, row, indexes, "direct_lanes_available", "")
+	assertColumn(t, row, indexes, "replay_window_bytes", "")
+	assertColumn(t, row, indexes, "repair_queue_bytes", "")
+	assertColumn(t, row, indexes, "retransmit_count", "")
+	assertColumn(t, row, indexes, "out_of_order_bytes", "")
+}
+
+func TestUpdateSkipsCallbackWhenClosedOrFailed(t *testing.T) {
+	var out bytes.Buffer
+	rec, err := NewRecorder(&out, RoleSend, time.Unix(600, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	rec.Update(func(*Snapshot) {
+		t.Fatal("Update callback ran after Close")
+	})
+
+	writer := &failAfterWrites{remaining: 1}
+	failed, err := NewRecorder(writer, RoleSend, time.Unix(700, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	failed.Observe(Snapshot{At: time.Unix(700, 0), Phase: PhaseRelay})
+	failed.Update(func(*Snapshot) {
+		t.Fatal("Update callback ran after writer failure")
+	})
+}
+
+func readTraceCSV(t *testing.T, body string) ([][]string, map[string]int) {
+	t.Helper()
+	records, err := csv.NewReader(strings.NewReader(body)).ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if len(records) < 2 {
+		t.Fatalf("records length = %d, want at least 2", len(records))
+	}
+	indexes := make(map[string]int, len(records[0]))
+	for i, name := range records[0] {
+		indexes[name] = i
+	}
+	return records, indexes
+}
+
+func assertColumn(t *testing.T, row []string, indexes map[string]int, column string, want string) {
+	t.Helper()
+	index, ok := indexes[column]
+	if !ok {
+		t.Fatalf("missing header column %q", column)
+	}
+	if got := row[index]; got != want {
+		t.Fatalf("%s = %q, want %q", column, got, want)
+	}
+}
+
+type failAfterWrites struct {
+	remaining int
+}
+
+func (w *failAfterWrites) Write(p []byte) (int, error) {
+	if w.remaining <= 0 {
+		return 0, io.ErrClosedPipe
+	}
+	w.remaining--
+	return len(p), nil
 }

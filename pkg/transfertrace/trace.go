@@ -35,7 +35,7 @@ const (
 	PhaseError         Phase = "error"
 )
 
-var Header = []string{
+var header = [...]string{
 	"timestamp_unix_ms",
 	"elapsed_ms",
 	"role",
@@ -58,6 +58,8 @@ var Header = []string{
 	"last_state",
 	"last_error",
 }
+
+var Header = append([]string(nil), header[:]...)
 
 const HeaderLine = "timestamp_unix_ms,elapsed_ms,role,phase,relay_bytes,direct_bytes,app_bytes,delta_app_bytes,app_mbps,direct_rate_selected_mbps,direct_rate_active_mbps,direct_lanes_active,direct_lanes_available,direct_probe_state,direct_probe_summary,replay_window_bytes,repair_queue_bytes,retransmit_count,out_of_order_bytes,last_state,last_error"
 
@@ -101,7 +103,7 @@ func NewRecorder(out io.Writer, role Role, start time.Time) (*Recorder, error) {
 		start = time.Now()
 	}
 	w := csv.NewWriter(out)
-	if err := w.Write(Header); err != nil {
+	if err := w.Write(headerCopy()); err != nil {
 		return nil, err
 	}
 	w.Flush()
@@ -115,11 +117,18 @@ func NewRecorder(out io.Writer, role Role, start time.Time) (*Recorder, error) {
 	}, nil
 }
 
+// Update copies the current snapshot, calls update while holding Recorder.mu,
+// and records the mutated snapshot. The callback must be fast, non-blocking,
+// and must not call Recorder methods.
 func (r *Recorder) Update(update func(*Snapshot)) {
 	if update == nil {
 		return
 	}
 	r.mu.Lock()
+	if r.closed || r.err != nil {
+		r.mu.Unlock()
+		return
+	}
 	snap := r.current
 	update(&snap)
 	r.observeLocked(snap)
@@ -159,6 +168,8 @@ func (r *Recorder) Complete(at time.Time) {
 	r.mu.Unlock()
 }
 
+// Run records ticks until ctxDone is closed. Close flushes and prevents future
+// writes, but it does not stop a running Run loop.
 func (r *Recorder) Run(ctxDone <-chan struct{}, interval time.Duration, now func() time.Time) {
 	ticker := time.NewTicker(runInterval(interval))
 	defer ticker.Stop()
@@ -294,8 +305,12 @@ func formatOptionalUint64(value uint64) string {
 	return strconv.FormatUint(value, 10)
 }
 
+func headerCopy() []string {
+	return append([]string(nil), header[:]...)
+}
+
 func init() {
-	if strings.Join(Header, ",") != HeaderLine {
+	if strings.Join(header[:], ",") != HeaderLine {
 		panic("transfertrace: header mismatch")
 	}
 }
