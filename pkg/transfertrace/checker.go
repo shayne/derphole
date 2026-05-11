@@ -93,13 +93,13 @@ func (c *checker) consume(row checkerRow) error {
 	if c.opts.Role != "" && row.role != c.opts.Role {
 		return nil
 	}
+	c.result.Rows++
+	c.result.FinalAppBytes = row.appBytes
+	c.result.FinalPhase = row.phase
 	if row.lastError != "" {
 		return fmt.Errorf("terminal error: %s", row.lastError)
 	}
 
-	c.result.Rows++
-	c.result.FinalAppBytes = row.appBytes
-	c.result.FinalPhase = row.phase
 	if c.result.Rows == 1 || row.appBytes > c.lastAppBytes {
 		c.recordProgress(row)
 		return nil
@@ -196,7 +196,7 @@ func lookupTimestamp(positions map[string]int) (int, string, error) {
 	if i, ok := positions["timestamp_ms"]; ok {
 		return i, "timestamp_ms", nil
 	}
-	return 0, "", fmt.Errorf("missing required header %q", "timestamp_unix_ms")
+	return 0, "", fmt.Errorf("missing required timestamp header %q or %q", "timestamp_unix_ms", "timestamp_ms")
 }
 
 func parseCheckerRow(record []string, indexes checkerIndexes) (checkerRow, error) {

@@ -1,0 +1,86 @@
+// Copyright (c) 2026 Shayne All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package main
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/shayne/derphole/pkg/transfertrace"
+)
+
+func TestRunPrintsUsageForBadArgs(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run(nil, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("run() exit = %d, want 2", code)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "usage: transfertracecheck") {
+		t.Fatalf("stderr = %q, want usage", stderr.String())
+	}
+}
+
+func TestRunPrintsSuccess(t *testing.T) {
+	path := writeTrace(t, "timestamp_unix_ms,role,phase,app_bytes,last_error\n"+
+		"1000,receive,complete,4096,\n")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-role", "receive", "-expected-bytes", "4096", path}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() exit = %d, stderr = %q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "trace-ok rows=1 final_app_bytes=4096") {
+		t.Fatalf("stdout = %q, want trace-ok", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestRunReturnsFailureForCheckError(t *testing.T) {
+	path := writeTrace(t, transfertrace.HeaderLine+"\n"+
+		"1000,0,receive,error,0,0,0,0,0.00,,,,,,,,,,,connected-direct,message too long\n")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-role", "receive", path}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run() exit = %d, want 1", code)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "message too long") {
+		t.Fatalf("stderr = %q, want check error", stderr.String())
+	}
+}
+
+func TestRunRejectsInvalidRole(t *testing.T) {
+	path := writeTrace(t, "timestamp_unix_ms,role,phase,app_bytes,last_error\n"+
+		"1000,receive,complete,4096,\n")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-role", "both", path}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("run() exit = %d, want 2", code)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "role must be send or receive") {
+		t.Fatalf("stderr = %q, want role validation", stderr.String())
+	}
+}
+
+func writeTrace(t *testing.T, text string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "trace.csv")
+	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+		t.Fatalf("write trace: %v", err)
+	}
+	return path
+}

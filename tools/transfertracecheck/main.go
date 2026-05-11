@@ -68,6 +68,11 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 		flags.Usage()
 		return options{}, errUsage
 	}
+	if role != string(transfertrace.RoleSend) && role != string(transfertrace.RoleReceive) {
+		_, _ = fmt.Fprintln(stderr, "role must be send or receive")
+		flags.Usage()
+		return options{}, errUsage
+	}
 	return options{
 		Role:          role,
 		ExpectedBytes: expectedBytes,
