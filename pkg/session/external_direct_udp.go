@@ -33,6 +33,7 @@ import (
 	"github.com/shayne/derphole/pkg/rendezvous"
 	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/token"
+	"github.com/shayne/derphole/pkg/transfertrace"
 	"github.com/shayne/derphole/pkg/transport"
 	"go4.org/mem"
 	"tailscale.com/tailcfg"
@@ -760,23 +761,30 @@ func externalDirectUDPActivateDirectPath(pathEmitter *transportPathEmitter, tran
 
 func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClient *derpbind.Client, listenerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, readyAckCh <-chan derpbind.Packet, startAckCh <-chan derpbind.Packet, rateProbeCh <-chan derpbind.Packet, cfg SendConfig) (externalDirectUDPSendPlan, error) {
 	plan := externalDirectUDPSendPlan{}
+	metrics := externalTransferMetricsFromContext(ctx)
+	metrics.SetPhase(transfertrace.PhaseDirectPrepare, "direct-prepare")
 	auth := externalPeerControlAuthForToken(tok)
 	readyAck, err := externalDirectUDPSendReadyHandshake(ctx, derpClient, listenerDERP, peerAddr, readyAckCh, auth)
 	if err != nil {
+		metrics.SetError(err)
 		return plan, err
 	}
 	probeConns, remoteAddrs, effectiveTransportCaps, receiverConstrained, err := externalDirectUDPSendRemoteSetup(ctx, probeConns, remoteCandidates, peerAddr, readyAck, cfg.Emitter)
 	if err != nil {
+		metrics.SetError(err)
 		return plan, err
 	}
+	availableLanes := len(probeConns)
 	rateState := externalDirectUDPInitialSendRateState()
 	emitExternalDirectUDPSendInitialDebug(cfg.Emitter, peerAddr, remoteAddrs, len(probeConns), rateState.maxRateMbps, readyAck, receiverConstrained)
 	directExpectedBytes, err := externalDirectUDPSendWaitHandoffExpectedBytes(ctx, peerAddr, cfg.StdioExpectedBytes)
 	if err != nil {
+		metrics.SetError(err)
 		return plan, err
 	}
 	packetAEAD, err := externalSessionPacketAEAD(tok)
 	if err != nil {
+		metrics.SetError(err)
 		return plan, err
 	}
 	policyActiveLaneCap := externalDirectUDPActiveLaneCapForPolicy(cfg.ParallelPolicy, len(probeConns))
@@ -785,18 +793,25 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 	emitExternalDirectUDPReceiveStartDebug(cfg.Emitter, directExpectedBytes)
 	start, rateProbeAuth, err := externalDirectUDPSendStart(ctx, tok, cfg, directExpectedBytes, sendCfg.StripedBlast, &rateState)
 	if err != nil {
+		metrics.SetError(err)
 		return plan, err
 	}
 	if err := externalDirectUDPSendStartHandshake(ctx, derpClient, listenerDERP, peerAddr, startAckCh, start, auth); err != nil {
+		metrics.SetError(err)
 		return plan, err
 	}
+	setExternalTransferMetricsProbePhase(metrics, len(rateState.probeRates))
 	rateState, sendCfg, err = externalDirectUDPResolveSendRates(ctx, probeConns, remoteAddrs, rateProbeCh, auth, rateProbeAuth, readyAck, effectiveTransportCaps, sendCfg, rateState)
 	if err != nil {
+		metrics.SetError(err)
 		return plan, err
 	}
+	setExternalTransferMetricsProbeSummary(metrics, rateState.sentProbeSamples, rateState.probeResult.Samples)
 	retainedLanes := externalDirectUDPSendRetainedLanes(rateState, sendCfg, policyActiveLaneCap, len(probeConns), effectiveTransportCaps)
 	if retainedLanes == 0 {
-		return plan, errors.New("direct UDP established without active send lanes")
+		err := errors.New("direct UDP established without active send lanes")
+		metrics.SetError(err)
+		return plan, err
 	}
 	if retainedLanes < len(probeConns) {
 		probeConns = probeConns[:retainedLanes]
@@ -804,6 +819,8 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 	}
 	rateState, sendCfg = externalDirectUDPFinalizeSendRates(rateState, sendCfg, len(probeConns))
 	emitExternalDirectUDPSendFinalDebug(cfg.Emitter, probeConns, sendCfg, rateState)
+	metrics.SetDirectPlan(rateState.selectedRateMbps, rateState.activeRateMbps, len(probeConns), availableLanes)
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct-execute")
 
 	plan.probeConns = probeConns
 	plan.remoteAddrs = remoteAddrs
@@ -991,6 +1008,20 @@ func externalDirectUDPResolveSendRates(ctx context.Context, probeConns []net.Pac
 	return rateState, sendCfg, nil
 }
 
+func setExternalTransferMetricsProbePhase(metrics *externalTransferMetrics, probeRates int) {
+	if probeRates == 0 {
+		return
+	}
+	metrics.SetPhase(transfertrace.PhaseDirectProbe, "direct-probe")
+}
+
+func setExternalTransferMetricsProbeSummary(metrics *externalTransferMetrics, sent []directUDPRateProbeSample, received []directUDPRateProbeSample) {
+	if len(sent) == 0 && len(received) == 0 {
+		return
+	}
+	metrics.SetProbeSummary("done", externalDirectUDPFormatRateProbeSamples(sent, received))
+}
+
 func externalDirectUDPResolveProbedSendRates(ctx context.Context, probeConns []net.PacketConn, remoteAddrs []string, rateProbeCh <-chan derpbind.Packet, auth externalPeerControlAuth, rateProbeAuth externalDirectUDPRateProbeAuth, readyAck directUDPReadyAck, effectiveTransportCaps probe.TransportCaps, sendCfg probe.SendConfig, rateState externalDirectUDPSendRateState) (externalDirectUDPSendRateState, probe.SendConfig, error) {
 	sentProbeSamples, probeResult, err := externalDirectUDPSendRunRateProbes(ctx, probeConns, remoteAddrs, rateState.probeRates, rateProbeCh, auth, rateProbeAuth)
 	if err != nil {
@@ -1146,11 +1177,16 @@ func externalExecutePreparedDirectUDPSend(ctx context.Context, src io.Reader, pl
 		metrics = externalTransferMetricsFromContext(ctx)
 	}
 	if metrics == nil {
-		metrics = newExternalTransferMetrics(time.Now())
+		metrics = newExternalTransferMetricsWithTrace(time.Now(), cfg.Trace, transfertrace.RoleSend)
 	}
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct-execute")
+	metrics.SetDirectPlan(plan.selectedRateMbps, plan.startRateMbps, len(plan.probeConns), len(plan.probeConns))
 	externalTransferTracef("direct-udp-send-execute-start lanes=%d addrs=%s rate=%d ceiling=%d", len(plan.probeConns), strings.Join(plan.remoteAddrs, ","), plan.sendCfg.RateMbps, plan.sendCfg.RateCeilingMbps)
 	stats, err := probe.SendBlastParallel(ctx, plan.probeConns, plan.remoteAddrs, externalDirectUDPBufferedReader(src), plan.sendCfg)
 	externalTransferTracef("direct-udp-send-execute-done err=%v bytes=%d lanes=%d first-byte-zero=%v complete-zero=%v", err, stats.BytesSent, stats.Lanes, stats.FirstByteAt.IsZero(), stats.CompletedAt.IsZero())
+	if stats.Lanes > 0 {
+		metrics.SetDirectPlan(plan.selectedRateMbps, plan.startRateMbps, stats.Lanes, len(plan.probeConns))
+	}
 	if cfg.Emitter != nil {
 		cfg.Emitter.Debug("udp-send-transport=" + stats.Transport.Summary())
 		cfg.Emitter.Debug("udp-send-active-lanes=" + strconv.Itoa(stats.Lanes))
@@ -1166,45 +1202,61 @@ func externalExecutePreparedDirectUDPSend(ctx context.Context, src io.Reader, pl
 		metrics.RecordDirectWrite(stats.BytesSent, directFirstByteAt)
 	}
 	emitExternalTransferMetricsComplete(metrics, cfg.Emitter, "udp-send", stats, stats.CompletedAt)
+	if err != nil {
+		metrics.SetError(err)
+	}
 	return err
 }
 
 func externalPrepareDirectUDPReceive(ctx context.Context, dst io.Writer, tok token.Token, derpClient *derpbind.Client, peerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, decision rendezvous.Decision, readyCh <-chan derpbind.Packet, startCh <-chan derpbind.Packet, cfg ListenConfig) (externalDirectUDPReceivePlan, error) {
 	plan := externalDirectUDPReceivePlan{decision: decision, peerAddr: peerAddr}
+	metrics := externalTransferMetricsFromContext(ctx)
+	metrics.SetPhase(transfertrace.PhaseDirectPrepare, "direct-prepare")
 	auth := externalPeerControlAuthForToken(tok)
 	if err := externalDirectUDPReceiveReadyWait(ctx, peerAddr, readyCh, auth); err != nil {
+		metrics.SetError(err)
 		return plan, err
 	}
 	probeConns, remoteAddrs, err := externalDirectUDPReceiveRemotePairs(probeConns, remoteCandidates, peerAddr)
 	if err != nil {
+		metrics.SetError(err)
 		return plan, err
 	}
+	availableLanes := len(probeConns)
 	localTransportCaps := externalDirectUDPPreviewTransportCaps(probeConns[0], externalDirectUDPTransportLabel)
 	receiveDst, flushDst := externalDirectUDPBufferedWriter(dst)
 	receiveDst, flushDst, fastDiscard := externalDirectUDPReceiveWriter(dst, receiveDst, flushDst)
 	if err := externalDirectUDPReceiveReadyAck(ctx, derpClient, peerDERP, peerAddr, fastDiscard, localTransportCaps, auth); err != nil {
+		metrics.SetError(err)
 		return plan, err
 	}
 	emitExternalDirectUDPReceiveInitialDebug(cfg.Emitter, peerAddr, remoteAddrs, len(probeConns), fastDiscard)
 	packetAEAD, err := externalSessionPacketAEAD(tok)
 	if err != nil {
+		metrics.SetError(err)
 		return plan, err
 	}
 	receiveCfg := externalDirectUDPFastDiscardReceiveConfig()
 	receiveCfg.PacketAEAD = packetAEAD
 	start, rateProbeAuth, err := externalDirectUDPReceiveStart(ctx, tok, peerAddr, startCh, auth)
 	if err != nil {
+		metrics.SetError(err)
 		return plan, err
 	}
 	emitExternalDirectUDPReceiveStartModeDebug(cfg.Emitter, start)
 	emitExternalDirectUDPReceiveStartDebug(cfg.Emitter, start.ExpectedBytes)
 	if err := externalDirectUDPReceiveStartAck(ctx, derpClient, peerDERP, peerAddr, auth); err != nil {
+		metrics.SetError(err)
 		return plan, err
 	}
 	signalExternalDirectUDPDirectReady(ctx)
+	setExternalTransferMetricsProbePhase(metrics, len(start.ProbeRates))
 	if err := externalDirectUDPReceiveRateProbeResult(ctx, derpClient, peerDERP, probeConns, remoteAddrs, start, rateProbeAuth, cfg.Emitter, auth); err != nil {
+		metrics.SetError(err)
 		return plan, err
 	}
+	metrics.SetDirectPlan(0, 0, len(probeConns), availableLanes)
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct-execute")
 	plan.probeConns = probeConns
 	plan.remoteAddrs = remoteAddrs
 	plan.receiveDst = receiveDst
@@ -1316,6 +1368,7 @@ func externalDirectUDPReceiveRateProbeResult(ctx context.Context, derpClient *de
 	if err != nil {
 		return err
 	}
+	externalTransferMetricsFromContext(ctx).SetProbeSummary("done", externalDirectUDPFormatRateProbeSamples(nil, probeSamples))
 	if emitter != nil {
 		emitter.Debug("udp-rate-probe-samples=" + externalDirectUDPFormatRateProbeSamples(nil, probeSamples))
 	}
@@ -1329,12 +1382,20 @@ func externalDirectUDPReceiveRateProbeResult(ctx context.Context, derpClient *de
 
 func externalExecutePreparedDirectUDPReceive(ctx context.Context, plan externalDirectUDPReceivePlan, tok token.Token, cfg ListenConfig, metrics *externalTransferMetrics) error {
 	metrics = externalTransferMetricsOrNew(ctx, metrics)
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct-execute")
+	metrics.SetDirectPlan(0, 0, len(plan.probeConns), len(plan.probeConns))
 	receiveCfg := plan.receiveCfg
 	stats, err := externalDirectUDPExecuteReceivePlan(ctx, plan, tok, receiveCfg)
 	externalTransferTracef("direct-udp-recv-execute-done err=%v bytes=%d lanes=%d first-byte-zero=%v complete-zero=%v", err, stats.BytesReceived, stats.Lanes, stats.FirstByteAt.IsZero(), stats.CompletedAt.IsZero())
+	if stats.Lanes > 0 {
+		metrics.SetDirectPlan(0, 0, stats.Lanes, len(plan.probeConns))
+	}
 	emitExternalDirectUDPReceiveDebug(cfg.Emitter, stats, err)
 	err = externalDirectUDPFlushReceivePlan(plan, err)
 	externalDirectUDPRecordReceiveMetrics(metrics, cfg.Emitter, stats)
+	if err != nil {
+		metrics.SetError(err)
+	}
 	return err
 }
 
@@ -1406,7 +1467,7 @@ func externalDirectUDPRecordReceiveMetrics(metrics *externalTransferMetrics, emi
 }
 
 func sendExternalViaDirectUDPOnly(ctx context.Context, src io.Reader, tok token.Token, derpClient *derpbind.Client, listenerDERP key.NodePublic, transportManager *transport.Manager, pathEmitter *transportPathEmitter, punchCancel context.CancelFunc, probeConn net.PacketConn, probeConns []net.PacketConn, remoteCandidates []net.Addr, readyAckCh <-chan derpbind.Packet, startAckCh <-chan derpbind.Packet, rateProbeCh <-chan derpbind.Packet, cfg SendConfig) error {
-	ctx = withExternalTransferMetrics(ctx, newExternalTransferMetrics(time.Now()))
+	ctx = withExternalTransferMetrics(ctx, newExternalTransferMetricsWithTrace(time.Now(), cfg.Trace, transfertrace.RoleSend))
 	var peerAddr net.Addr
 	if transportManager != nil {
 		peerAddr, _ = transportManager.DirectAddr()
@@ -1856,7 +1917,8 @@ type externalRelayPrefixSendRuntime struct {
 }
 
 func newExternalRelayPrefixSendRuntime(ctx context.Context, rcfg externalRelayPrefixSendConfig) (*externalRelayPrefixSendRuntime, error) {
-	metrics := newExternalTransferMetrics(time.Now())
+	metrics := newExternalTransferMetricsWithTrace(time.Now(), rcfg.cfg.Trace, transfertrace.RoleSend)
+	metrics.SetPhase(transfertrace.PhaseRelay, "connected-relay")
 	ctx = withExternalTransferMetrics(ctx, metrics)
 	packetAEAD, err := externalSessionPacketAEAD(rcfg.tok)
 	if err != nil {
@@ -2194,6 +2256,7 @@ type externalRelayPrefixReceiveRuntime struct {
 
 func newExternalRelayPrefixReceiveRuntime(ctx context.Context, rcfg externalRelayPrefixReceiveConfig) (*externalRelayPrefixReceiveRuntime, error) {
 	metrics := newExternalTransferMetrics(time.Now())
+	metrics.SetPhase(transfertrace.PhaseRelay, "connected-relay")
 	ctx = withExternalTransferMetrics(ctx, metrics)
 	packetAEAD, err := externalSessionPacketAEAD(rcfg.tok)
 	if err != nil {

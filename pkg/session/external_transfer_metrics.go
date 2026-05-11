@@ -13,21 +13,44 @@ import (
 
 	"github.com/shayne/derphole/pkg/probe"
 	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/transfertrace"
 )
 
 type externalTransferMetrics struct {
-	mu          sync.Mutex
-	startedAt   time.Time
-	completedAt time.Time
-	firstByteAt time.Time
-	relayBytes  int64
-	directBytes int64
+	mu                     sync.Mutex
+	startedAt              time.Time
+	completedAt            time.Time
+	firstByteAt            time.Time
+	relayBytes             int64
+	directBytes            int64
+	trace                  *transfertrace.Recorder
+	role                   transfertrace.Role
+	phase                  transfertrace.Phase
+	lastState              string
+	lastError              string
+	directRateSelectedMbps int
+	directRateActiveMbps   int
+	directLanesActive      int
+	directLanesAvailable   int
+	directProbeState       string
+	directProbeSummary     string
+	replayWindowBytes      uint64
+	repairQueueBytes       uint64
+	retransmitCount        int64
+	outOfOrderBytes        uint64
 }
 
 type externalTransferMetricsContextKey struct{}
 
 func newExternalTransferMetrics(startedAt time.Time) *externalTransferMetrics {
 	return &externalTransferMetrics{startedAt: startedAt}
+}
+
+func newExternalTransferMetricsWithTrace(startedAt time.Time, trace *transfertrace.Recorder, role transfertrace.Role) *externalTransferMetrics {
+	metrics := newExternalTransferMetrics(startedAt)
+	metrics.trace = trace
+	metrics.role = role
+	return metrics
 }
 
 func (m *externalTransferMetrics) RecordRelayWrite(n int64, at time.Time) {
@@ -40,11 +63,76 @@ func (m *externalTransferMetrics) RecordDirectWrite(n int64, at time.Time) {
 
 func (m *externalTransferMetrics) Complete(at time.Time) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if at.IsZero() {
+		m.mu.Unlock()
 		return
 	}
 	m.completedAt = at
+	m.phase = transfertrace.PhaseComplete
+	m.lastState = string(StateComplete)
+	trace, snap, ok := m.updateTraceLocked(at)
+	m.mu.Unlock()
+	observeExternalTransferTrace(trace, snap, ok)
+}
+
+func (m *externalTransferMetrics) SetPhase(phase transfertrace.Phase, state string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.phase = phase
+	m.lastState = state
+	trace, snap, ok := m.updateTraceLocked(time.Now())
+	m.mu.Unlock()
+	observeExternalTransferTrace(trace, snap, ok)
+}
+
+func (m *externalTransferMetrics) SetError(err error) {
+	if m == nil || err == nil {
+		return
+	}
+	m.mu.Lock()
+	m.phase = transfertrace.PhaseError
+	m.lastError = err.Error()
+	trace, snap, ok := m.updateTraceLocked(time.Now())
+	m.mu.Unlock()
+	observeExternalTransferTrace(trace, snap, ok)
+}
+
+func (m *externalTransferMetrics) SetDirectPlan(selectedRate int, activeRate int, activeLanes int, availableLanes int) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.directRateSelectedMbps = selectedRate
+	m.directRateActiveMbps = activeRate
+	m.directLanesActive = activeLanes
+	m.directLanesAvailable = availableLanes
+	trace, snap, ok := m.updateTraceLocked(time.Now())
+	m.mu.Unlock()
+	observeExternalTransferTrace(trace, snap, ok)
+}
+
+func (m *externalTransferMetrics) SetProbeSummary(state string, summary string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.directProbeState = state
+	m.directProbeSummary = summary
+	trace, snap, ok := m.updateTraceLocked(time.Now())
+	m.mu.Unlock()
+	observeExternalTransferTrace(trace, snap, ok)
+}
+
+func (m *externalTransferMetrics) Tick(at time.Time) {
+	if m == nil || at.IsZero() {
+		return
+	}
+	m.mu.Lock()
+	trace, snap, ok := m.updateTraceLocked(at)
+	m.mu.Unlock()
+	observeExternalTransferTrace(trace, snap, ok)
 }
 
 func (m *externalTransferMetrics) TotalDurationMS() int64 {
@@ -132,12 +220,47 @@ func (m *externalTransferMetrics) recordWrite(totalBytes *int64, n int64, at tim
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	*totalBytes += n
 	if at.IsZero() {
+		m.mu.Unlock()
 		return
 	}
 	if m.firstByteAt.IsZero() || at.Before(m.firstByteAt) {
 		m.firstByteAt = at
 	}
+	trace, snap, ok := m.updateTraceLocked(at)
+	m.mu.Unlock()
+	observeExternalTransferTrace(trace, snap, ok)
+}
+
+func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrace.Recorder, transfertrace.Snapshot, bool) {
+	if m.trace == nil || at.IsZero() {
+		return nil, transfertrace.Snapshot{}, false
+	}
+	return m.trace, transfertrace.Snapshot{
+		At:                     at,
+		Phase:                  m.phase,
+		RelayBytes:             m.relayBytes,
+		DirectBytes:            m.directBytes,
+		AppBytes:               m.relayBytes + m.directBytes,
+		DirectRateSelectedMbps: m.directRateSelectedMbps,
+		DirectRateActiveMbps:   m.directRateActiveMbps,
+		DirectLanesActive:      m.directLanesActive,
+		DirectLanesAvailable:   m.directLanesAvailable,
+		DirectProbeState:       m.directProbeState,
+		DirectProbeSummary:     m.directProbeSummary,
+		ReplayWindowBytes:      m.replayWindowBytes,
+		RepairQueueBytes:       m.repairQueueBytes,
+		RetransmitCount:        m.retransmitCount,
+		OutOfOrderBytes:        m.outOfOrderBytes,
+		LastState:              m.lastState,
+		LastError:              m.lastError,
+	}, true
+}
+
+func observeExternalTransferTrace(trace *transfertrace.Recorder, snap transfertrace.Snapshot, ok bool) {
+	if !ok {
+		return
+	}
+	trace.Observe(snap)
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/shayne/derphole/pkg/probe"
 	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/transfertrace"
 )
 
 func TestExternalTransferMetricsTrackRelayAndDirectBytes(t *testing.T) {
@@ -54,5 +55,24 @@ func TestEmitExternalTransferMetricsIncludesWallAndPeakValues(t *testing.T) {
 		if !strings.Contains(got, needle) {
 			t.Fatalf("metrics output missing %q in %q", needle, got)
 		}
+	}
+}
+
+func TestExternalTransferMetricsUpdatesTrace(t *testing.T) {
+	var out bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(10, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(10, 0), rec, transfertrace.RoleSend)
+	metrics.SetPhase(transfertrace.PhaseRelay, "connected-relay")
+	metrics.RecordRelayWrite(1024, time.Unix(10, int64(500*time.Millisecond)))
+	metrics.Tick(time.Unix(10, int64(500*time.Millisecond)))
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+	body := out.String()
+	if !strings.Contains(body, ",send,relay,1024,0,1024,1024,") {
+		t.Fatalf("trace body missing relay progress:\n%s", body)
 	}
 }
