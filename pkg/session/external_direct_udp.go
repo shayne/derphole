@@ -110,6 +110,7 @@ const (
 	externalRelayPrefixDERPMaxUnacked              = 64 << 10
 	externalRelayPrefixDERPSustainedMax            = 64 << 10
 	externalRelayPrefixDERPHandoffMaxUnacked       = externalRelayPrefixDERPSustainedMax
+	externalRelayPrefixOverlapMaxBuffered          = 1 << 40
 	externalRelayPrefixDERPStartupBytes            = 4 << 20
 	externalRelayPrefixDERPHandoffAckWait          = 5 * time.Second
 	externalRelayPrefixDirectPrepStallWait         = 250 * time.Millisecond
@@ -364,15 +365,16 @@ type externalDirectUDPBudget struct {
 }
 
 type externalDirectUDPReceivePlan struct {
-	probeConns  []net.PacketConn
-	remoteAddrs []string
-	receiveDst  io.Writer
-	flushDst    func() error
-	receiveCfg  probe.ReceiveConfig
-	fastDiscard bool
-	start       directUDPStart
-	decision    rendezvous.Decision
-	peerAddr    net.Addr
+	probeConns                     []net.PacketConn
+	remoteAddrs                    []string
+	receiveDst                     io.Writer
+	flushDst                       func() error
+	receiveCfg                     probe.ReceiveConfig
+	receiveDstRecordsDirectMetrics bool
+	fastDiscard                    bool
+	start                          directUDPStart
+	decision                       rendezvous.Decision
+	peerAddr                       net.Addr
 }
 
 var waitExternalDirectUDPAddr = waitExternalDirectUDPAddrDefault
@@ -780,7 +782,7 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 	availableLanes := len(probeConns)
 	rateState := externalDirectUDPInitialSendRateState()
 	emitExternalDirectUDPSendInitialDebug(cfg.Emitter, peerAddr, remoteAddrs, len(probeConns), rateState.maxRateMbps, readyAck, receiverConstrained)
-	directExpectedBytes, err := externalDirectUDPSendWaitHandoffExpectedBytes(ctx, peerAddr, cfg.StdioExpectedBytes)
+	directExpectedBytes, relayPrefixOffset, err := externalDirectUDPSendWaitHandoffExpectedBytes(ctx, peerAddr, cfg.StdioExpectedBytes)
 	if err != nil {
 		metrics.SetError(err)
 		return plan, err
@@ -794,7 +796,7 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 	policyActiveLaneCap = externalDirectUDPConstrainedReceiverLaneCap(readyAck, policyActiveLaneCap, len(probeConns))
 	sendCfg := externalDirectUDPNewSendConfig(tok, packetAEAD, readyAck, policyActiveLaneCap, len(probeConns), rateState)
 	emitExternalDirectUDPReceiveStartDebug(cfg.Emitter, directExpectedBytes)
-	start, rateProbeAuth, err := externalDirectUDPSendStart(ctx, tok, cfg, directExpectedBytes, sendCfg.StripedBlast, &rateState)
+	start, rateProbeAuth, err := externalDirectUDPSendStart(ctx, tok, cfg, directExpectedBytes, relayPrefixOffset, sendCfg.StripedBlast, &rateState)
 	if err != nil {
 		metrics.SetError(err)
 		return plan, err
@@ -908,19 +910,19 @@ func emitExternalDirectUDPSendInitialDebug(emitter *telemetry.Emitter, peerAddr 
 	emitter.Debug("udp-direct-addrs=" + strings.Join(remoteAddrs, ","))
 }
 
-func externalDirectUDPSendWaitHandoffExpectedBytes(ctx context.Context, peerAddr net.Addr, expectedBytes int64) (int64, error) {
+func externalDirectUDPSendWaitHandoffExpectedBytes(ctx context.Context, peerAddr net.Addr, expectedBytes int64) (int64, int64, error) {
 	externalTransferTracef("direct-udp-send-handoff-ready-signal addr=%v", peerAddr)
 	signalExternalDirectUDPHandoffReady(ctx)
 	externalTransferTracef("direct-udp-send-handoff-proceed-wait addr=%v", peerAddr)
 	if err := waitExternalDirectUDPHandoffProceed(ctx); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	externalTransferTracef("direct-udp-send-handoff-proceed addr=%v", peerAddr)
 	handoffWatermark := int64(0)
 	if watermark, ok := externalDirectUDPHandoffProceedWatermark(ctx); ok {
 		handoffWatermark = watermark
 	}
-	return externalDirectUDPRemainingExpectedBytes(expectedBytes, handoffWatermark), nil
+	return externalDirectUDPRemainingExpectedBytes(expectedBytes, handoffWatermark), handoffWatermark, nil
 }
 
 func externalDirectUDPNewSendConfig(tok token.Token, packetAEAD cipher.AEAD, readyAck directUDPReadyAck, policyActiveLaneCap int, lanes int, rateState externalDirectUDPSendRateState) probe.SendConfig {
@@ -952,8 +954,11 @@ func externalDirectUDPStripedDecisionLanes(lanes int, policyActiveLaneCap int) i
 	return lanes
 }
 
-func externalDirectUDPSendStart(ctx context.Context, tok token.Token, cfg SendConfig, directExpectedBytes int64, stripedBlast bool, rateState *externalDirectUDPSendRateState) (directUDPStart, externalDirectUDPRateProbeAuth, error) {
+func externalDirectUDPSendStart(ctx context.Context, tok token.Token, cfg SendConfig, directExpectedBytes int64, relayPrefixOffset int64, stripedBlast bool, rateState *externalDirectUDPSendRateState) (directUDPStart, externalDirectUDPRateProbeAuth, error) {
 	start := externalDirectUDPStreamStart(rateState.maxRateMbps, directExpectedBytes)
+	if relayPrefixOffset > 0 {
+		start.RelayPrefixOffset = relayPrefixOffset
+	}
 	rateState.probeRates = append([]int(nil), start.ProbeRates...)
 	rateState.useRelayPrefixNoProbePath = externalDirectUDPUseRelayPrefixNoProbePath(ctx, cfg.skipDirectUDPRateProbes, rateState.probeRates)
 	if rateState.useRelayPrefixNoProbePath {
@@ -1189,9 +1194,7 @@ func externalExecutePreparedDirectUDPSend(ctx context.Context, src io.Reader, pl
 	}
 	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct-execute")
 	metrics.SetDirectPlan(plan.selectedRateMbps, plan.startRateMbps, len(plan.probeConns), availableLanes)
-	plan.sendCfg.Progress = func(stats probe.TransferStats) {
-		metrics.SetProbeStats(stats)
-	}
+	plan.sendCfg.Progress = externalDirectUDPSendProgressRecorder(plan.sendCfg.Progress, metrics)
 	externalTransferTracef("direct-udp-send-execute-start lanes=%d addrs=%s rate=%d ceiling=%d", len(plan.probeConns), strings.Join(plan.remoteAddrs, ","), plan.sendCfg.RateMbps, plan.sendCfg.RateCeilingMbps)
 	stats, err := probe.SendBlastParallel(ctx, plan.probeConns, plan.remoteAddrs, externalDirectUDPBufferedReader(src), plan.sendCfg)
 	externalTransferTracef("direct-udp-send-execute-done err=%v bytes=%d lanes=%d first-byte-zero=%v complete-zero=%v", err, stats.BytesSent, stats.Lanes, stats.FirstByteAt.IsZero(), stats.CompletedAt.IsZero())
@@ -1219,6 +1222,15 @@ func externalExecutePreparedDirectUDPSend(ctx context.Context, src io.Reader, pl
 		metrics.SetError(err)
 	}
 	return err
+}
+
+func externalDirectUDPSendProgressRecorder(progress func(probe.TransferStats), metrics *externalTransferMetrics) func(probe.TransferStats) {
+	return func(stats probe.TransferStats) {
+		if progress != nil {
+			progress(stats)
+		}
+		metrics.SetProbeStats(stats)
+	}
 }
 
 func externalPrepareDirectUDPReceive(ctx context.Context, dst io.Writer, tok token.Token, derpClient *derpbind.Client, peerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, decision rendezvous.Decision, readyCh <-chan derpbind.Packet, startCh <-chan derpbind.Packet, cfg ListenConfig) (externalDirectUDPReceivePlan, error) {
@@ -1405,7 +1417,7 @@ func externalExecutePreparedDirectUDPReceive(ctx context.Context, plan externalD
 	}
 	emitExternalDirectUDPReceiveDebug(cfg.Emitter, stats, err)
 	err = externalDirectUDPFlushReceivePlan(plan, err)
-	externalDirectUDPRecordReceiveMetrics(metrics, cfg.Emitter, stats)
+	externalDirectUDPRecordReceiveMetrics(metrics, cfg.Emitter, stats, !plan.receiveDstRecordsDirectMetrics)
 	if err != nil {
 		metrics.SetError(err)
 	}
@@ -1427,7 +1439,7 @@ func externalDirectUDPExecuteReceivePlan(ctx context.Context, plan externalDirec
 	if metrics == nil {
 		metrics = externalTransferMetricsFromContext(ctx)
 	}
-	if metrics != nil {
+	if metrics != nil && !plan.receiveDstRecordsDirectMetrics {
 		plan.receiveDst = externalTransferMetricsWriter{w: plan.receiveDst, record: metrics.RecordDirectWrite}
 	}
 	if plan.start.Stream {
@@ -1474,8 +1486,8 @@ func externalDirectUDPFlushReceivePlan(plan externalDirectUDPReceivePlan, err er
 	return err
 }
 
-func externalDirectUDPRecordReceiveMetrics(metrics *externalTransferMetrics, emitter *telemetry.Emitter, stats probe.TransferStats) {
-	if stats.BytesReceived > 0 {
+func externalDirectUDPRecordReceiveMetrics(metrics *externalTransferMetrics, emitter *telemetry.Emitter, stats probe.TransferStats, backfillDirectBytes bool) {
+	if backfillDirectBytes && stats.BytesReceived > 0 {
 		directFirstByteAt := stats.FirstByteAt
 		if directFirstByteAt.IsZero() {
 			directFirstByteAt = stats.StartedAt
@@ -1932,6 +1944,10 @@ type externalRelayPrefixSendRuntime struct {
 	directReadyCh        <-chan struct{}
 	prepCh               chan externalRelayPrefixSendPrepResult
 	stallTimer           *time.Timer
+	directProgressCh     chan struct{}
+	directProgressOnce   sync.Once
+	overlapBoundary      int64
+	overlapStarted       bool
 	stallFired           bool
 	handoffReady         bool
 	directActivated      bool
@@ -1952,14 +1968,15 @@ func newExternalRelayPrefixSendRuntime(ctx context.Context, rcfg externalRelayPr
 	keepaliveCtx, keepaliveCancel := context.WithCancel(ctx)
 	go externalRelayPrefixTransportKeepalive(keepaliveCtx, rcfg.transportManager)
 	rt := &externalRelayPrefixSendRuntime{
-		ctx:             ctx,
-		rcfg:            rcfg,
-		metrics:         metrics,
-		spool:           spool,
-		keepaliveCancel: keepaliveCancel,
-		relayStopCh:     make(chan struct{}),
-		relayErrCh:      make(chan error, 1),
-		stallTimer:      time.NewTimer(externalRelayPrefixDirectPrepStallWait),
+		ctx:              ctx,
+		rcfg:             rcfg,
+		metrics:          metrics,
+		spool:            spool,
+		keepaliveCancel:  keepaliveCancel,
+		relayStopCh:      make(chan struct{}),
+		relayErrCh:       make(chan error, 1),
+		stallTimer:       time.NewTimer(externalRelayPrefixDirectPrepStallWait),
+		directProgressCh: make(chan struct{}),
 	}
 	relayErrCh := make(chan error, 1)
 	rt.relayErrCh = relayErrCh
@@ -2061,22 +2078,22 @@ func (rt *externalRelayPrefixSendRuntime) waitRelayErr() error {
 	}
 }
 
-func (rt *externalRelayPrefixSendRuntime) handoffRelay() (bool, int64, error) {
-	rt.spool.SetMaxUnacked(externalRelayPrefixDERPHandoffMaxUnacked)
-	if err := rt.spool.WaitForUnackedAtMost(rt.ctx, externalRelayPrefixDERPHandoffMaxUnacked); err != nil {
-		rt.stopRelay()
-		return false, 0, err
+func (rt *externalRelayPrefixSendRuntime) beginDirectOverlap() (bool, int64, error) {
+	if rt.overlapStarted {
+		return false, rt.overlapBoundary, nil
 	}
-	rt.stopRelay()
-	if err := rt.waitRelayErr(); err != nil {
-		return false, 0, err
-	}
+	rt.spool.SetMaxBuffered(externalRelayPrefixOverlapMaxBuffered)
 	watermark := rt.spool.AckedWatermark()
 	if rt.spool.Done() {
 		rt.finishOnRelay()
 		return true, watermark, nil
 	}
-	return false, watermark, rt.spool.RewindTo(watermark)
+	rt.overlapBoundary = watermark
+	rt.overlapStarted = true
+	recordExternalDirectUDPHandoffProceedWatermark(rt.prepCtx, watermark)
+	rt.signalHandoffProceed()
+	externalTransferTracef("relay-prefix-send-overlap-start boundary=%d", watermark)
+	return false, watermark, nil
 }
 
 func (rt *externalRelayPrefixSendRuntime) finishOnRelay() {
@@ -2125,7 +2142,7 @@ func (rt *externalRelayPrefixSendRuntime) handlePrep(prep externalRelayPrefixSen
 		return rt.finishAfterRelayWait()
 	}
 	externalTransferTracef("relay-prefix-send-prepare-complete")
-	done, watermark, err := rt.handoffRelay()
+	done, watermark, err := rt.beginDirectOverlap()
 	if err != nil {
 		return err
 	}
@@ -2133,7 +2150,7 @@ func (rt *externalRelayPrefixSendRuntime) handlePrep(prep externalRelayPrefixSen
 		externalTransferTracef("relay-prefix-send-prepare-complete-done-on-relay")
 		return nil
 	}
-	recordExternalDirectUDPHandoffProceedWatermark(rt.prepCtx, watermark)
+	externalTransferTracef("relay-prefix-send-prepare-overlap boundary=%d", watermark)
 	rt.activateDirect()
 	return rt.executePrepared(prep.plan)
 }
@@ -2182,7 +2199,7 @@ func (rt *externalRelayPrefixSendRuntime) handleHandoffReady() (error, bool) {
 
 func (rt *externalRelayPrefixSendRuntime) postHandoff() error {
 	externalTransferTracef("relay-prefix-send-post-handoff-start")
-	done, watermark, err := rt.handoffRelay()
+	done, watermark, err := rt.beginDirectOverlap()
 	if err != nil {
 		return err
 	}
@@ -2190,9 +2207,7 @@ func (rt *externalRelayPrefixSendRuntime) postHandoff() error {
 		externalTransferTracef("relay-prefix-send-post-handoff-done-on-relay")
 		return nil
 	}
-	externalTransferTracef("relay-prefix-send-post-handoff-proceed")
-	recordExternalDirectUDPHandoffProceedWatermark(rt.prepCtx, watermark)
-	rt.signalHandoffProceed()
+	externalTransferTracef("relay-prefix-send-post-handoff-overlap boundary=%d", watermark)
 	return rt.waitPreparedAfterHandoff()
 }
 
@@ -2220,7 +2235,95 @@ func (rt *externalRelayPrefixSendRuntime) waitPreparedAfterHandoff() error {
 }
 
 func (rt *externalRelayPrefixSendRuntime) executePrepared(plan externalDirectUDPSendPlan) error {
-	return externalExecutePreparedDirectUDPSendFn(rt.ctx, newExternalHandoffSpoolReader(rt.spool), plan, rt.rcfg.cfg, rt.metrics)
+	boundary := rt.overlapBoundary
+	progress := plan.sendCfg.Progress
+	plan.sendCfg.Progress = func(stats probe.TransferStats) {
+		if progress != nil {
+			progress(stats)
+		}
+		if stats.BytesSent > 0 {
+			rt.directProgressOnce.Do(func() {
+				close(rt.directProgressCh)
+				rt.stopRelay()
+			})
+		}
+	}
+	directCtx, directCancel := context.WithCancel(rt.ctx)
+	defer directCancel()
+	directErrCh := make(chan error, 1)
+	go func() {
+		directErrCh <- externalExecutePreparedDirectUDPSendFn(directCtx, newExternalHandoffSpoolCursor(directCtx, rt.spool, boundary), plan, rt.rcfg.cfg, rt.metrics)
+	}()
+
+	select {
+	case relayErr := <-rt.relayErrCh:
+		return rt.handleRelayDoneDuringDirect(directCancel, directErrCh, relayErr)
+	case directErr := <-directErrCh:
+		return rt.handleDirectDoneBeforeRelay(directErr)
+	case <-rt.ctx.Done():
+		directCancel()
+		return rt.cancelWithPeerError()
+	}
+}
+
+func (rt *externalRelayPrefixSendRuntime) handleRelayDoneDuringDirect(directCancel context.CancelFunc, directErrCh <-chan error, relayErr error) error {
+	if rt.hasDirectProgress() {
+		directErr := <-directErrCh
+		if directErr != nil {
+			if rt.relayCompletedAfterDirectProgress(relayErr, directErr) {
+				rt.finishOnRelay()
+				return nil
+			}
+			return directErr
+		}
+		return relayErr
+	}
+	if relayErr == nil && rt.spool.Done() {
+		directCancel()
+		rt.finishOnRelay()
+		return nil
+	}
+	directCancel()
+	if relayErr != nil {
+		return relayErr
+	}
+	rt.finishOnRelay()
+	return nil
+}
+
+func (rt *externalRelayPrefixSendRuntime) relayCompletedAfterDirectProgress(relayErr error, directErr error) bool {
+	return relayErr == nil &&
+		rt.spool != nil &&
+		rt.spool.Done() &&
+		errors.Is(directErr, context.Canceled)
+}
+
+func (rt *externalRelayPrefixSendRuntime) handleDirectDoneBeforeRelay(directErr error) error {
+	if !rt.hasDirectProgress() {
+		if directErr != nil && rt.rcfg.cfg.Emitter != nil {
+			rt.rcfg.cfg.Emitter.Debug("udp-handoff-send-direct-before-progress-error=" + directErr.Error())
+		}
+		if relayErr := rt.waitRelayErr(); relayErr != nil {
+			return relayErr
+		}
+		rt.finishOnRelay()
+		return nil
+	}
+	rt.stopRelay()
+	relayErr := rt.waitRelayErr()
+	if directErr != nil {
+		return directErr
+	}
+	return relayErr
+}
+
+func (rt *externalRelayPrefixSendRuntime) hasDirectProgress() bool {
+	select {
+	case <-rt.directProgressCh:
+		return true
+	default:
+		return false
+	}
 }
 
 func (rt *externalRelayPrefixSendRuntime) cancelWithPeerError() error {
@@ -2265,6 +2368,7 @@ type externalRelayPrefixReceiveRuntime struct {
 	ctx             context.Context
 	rcfg            externalRelayPrefixReceiveConfig
 	metrics         *externalTransferMetrics
+	rx              *externalHandoffReceiver
 	keepaliveCancel context.CancelFunc
 	relayErrCh      chan error
 	prepCtx         context.Context
@@ -2283,12 +2387,12 @@ func newExternalRelayPrefixReceiveRuntime(ctx context.Context, rcfg externalRela
 	if err != nil {
 		return nil, err
 	}
-	rx := newExternalHandoffReceiver(externalTransferMetricsWriter{w: rcfg.dst, record: metrics.RecordRelayWrite}, externalHandoffMaxUnackedBytes)
+	rx := newExternalHandoffReceiver(rcfg.dst, externalHandoffMaxUnackedBytes)
 	keepaliveCtx, keepaliveCancel := context.WithCancel(ctx)
 	go externalRelayPrefixTransportKeepalive(keepaliveCtx, rcfg.transportManager)
 	relayErrCh := make(chan error, 1)
 	go func() {
-		relayErrCh <- externalReceiveExternalHandoffDERPFn(ctx, rcfg.derpClient, rcfg.peerDERP, rx, rcfg.relayPackets, nil, packetAEAD)
+		relayErrCh <- externalReceiveExternalHandoffDERPFn(ctx, rcfg.derpClient, rcfg.peerDERP, rx, rcfg.relayPackets, metrics, packetAEAD)
 	}()
 	prepCtx, prepCancel := context.WithCancel(ctx)
 	prepCtx, directReadyCh := withExternalDirectUDPDirectReadySignal(prepCtx)
@@ -2296,6 +2400,7 @@ func newExternalRelayPrefixReceiveRuntime(ctx context.Context, rcfg externalRela
 		ctx:             ctx,
 		rcfg:            rcfg,
 		metrics:         metrics,
+		rx:              rx,
 		keepaliveCancel: keepaliveCancel,
 		relayErrCh:      relayErrCh,
 		prepCtx:         prepCtx,
@@ -2391,13 +2496,62 @@ func (rt *externalRelayPrefixReceiveRuntime) handlePrep(prep externalRelayPrefix
 	if prep.err != nil {
 		return rt.handlePrepErr(prep.err)
 	}
-	if !rt.relayHandedOff {
-		if err, done := rt.waitRelayBeforeDirect(); done {
-			return err
-		}
-	}
+	prep.plan.receiveDst = newExternalHandoffOffsetWriter(rt.rx, prep.plan.start.RelayPrefixOffset, func(delivery externalHandoffDelivery) {
+		rt.recordReceiveDelivery(delivery)
+	})
+	prep.plan.receiveDstRecordsDirectMetrics = true
 	rt.activateDirect()
-	return externalExecutePreparedDirectUDPReceiveFn(rt.ctx, prep.plan, rt.rcfg.tok, rt.rcfg.cfg, rt.metrics)
+	return rt.executePreparedDirectReceive(prep.plan)
+}
+
+func (rt *externalRelayPrefixReceiveRuntime) executePreparedDirectReceive(plan externalDirectUDPReceivePlan) error {
+	directCtx, directCancel := context.WithCancel(rt.ctx)
+	defer directCancel()
+	directErrCh := make(chan error, 1)
+	go func() {
+		directErrCh <- externalExecutePreparedDirectUDPReceiveFn(directCtx, plan, rt.rcfg.tok, rt.rcfg.cfg, rt.metrics)
+	}()
+
+	if rt.relayHandedOff {
+		return <-directErrCh
+	}
+
+	select {
+	case relayErr := <-rt.relayErrCh:
+		return rt.handleRelayDoneDuringDirectReceive(directCancel, directErrCh, relayErr)
+	case directErr := <-directErrCh:
+		return rt.waitRelayOrReturnDirectError(directErr)
+	case <-rt.ctx.Done():
+		directCancel()
+		return normalizePeerAbortError(rt.ctx, rt.ctx.Err())
+	}
+}
+
+func (rt *externalRelayPrefixReceiveRuntime) handleRelayDoneDuringDirectReceive(directCancel context.CancelFunc, directErrCh <-chan error, relayErr error) error {
+	if relayErr == nil {
+		directCancel()
+		rt.finishOnRelay()
+		return nil
+	}
+	if !errors.Is(relayErr, errExternalHandoffCarrierHandoff) {
+		directCancel()
+		return relayErr
+	}
+	rt.relayHandedOff = true
+	return <-directErrCh
+}
+
+func (rt *externalRelayPrefixReceiveRuntime) recordReceiveDelivery(delivery externalHandoffDelivery) {
+	if rt.metrics == nil {
+		return
+	}
+	now := time.Now()
+	if delivery.Relay > 0 {
+		rt.metrics.RecordRelayWrite(delivery.Relay, now)
+	}
+	if delivery.Direct > 0 {
+		rt.metrics.RecordDirectWrite(delivery.Direct, now)
+	}
 }
 
 func (rt *externalRelayPrefixReceiveRuntime) handlePrepErr(prepErr error) error {
@@ -2410,19 +2564,10 @@ func (rt *externalRelayPrefixReceiveRuntime) handlePrepErr(prepErr error) error 
 	return rt.waitRelayOrReturnDirectError(prepErr)
 }
 
-func (rt *externalRelayPrefixReceiveRuntime) waitRelayBeforeDirect() (error, bool) {
-	relayErr := <-rt.relayErrCh
-	if relayErr == nil {
-		rt.finishOnRelay()
-		return nil, true
-	}
-	if !errors.Is(relayErr, errExternalHandoffCarrierHandoff) {
-		return relayErr, true
-	}
-	return nil, false
-}
-
 func (rt *externalRelayPrefixReceiveRuntime) waitRelayOrReturnDirectError(directErr error) error {
+	if rt.relayHandedOff {
+		return directErr
+	}
 	relayErr := <-rt.relayErrCh
 	switch {
 	case relayErr == nil:
@@ -2914,6 +3059,10 @@ func (rt *externalHandoffDERPSendRuntime) finishOnStop(traceName string) (bool, 
 	if rt.spool.Done() {
 		return true, nil
 	}
+	if rt.spool.AllSourceBytesSent() {
+		externalTransferTracef("%s-finish-eof final=%d acked=%d", traceName, rt.spool.Snapshot().SourceOffset, rt.spool.AckedWatermark())
+		return true, rt.sendEOFAndWait()
+	}
 	boundary, ready := rt.handoffBoundary()
 	if !ready {
 		return false, nil
@@ -3147,23 +3296,27 @@ func (rt *externalHandoffDERPReceiveRuntime) handleData(payload []byte) (bool, e
 	if err != nil {
 		return true, err
 	}
-	prevWatermark := rt.rx.Watermark()
-	if err := rt.rx.AcceptChunk(chunk); err != nil {
+	delivery, err := rt.rx.AcceptChunkFrom(chunk, externalHandoffChunkSourceRelay)
+	if err != nil {
 		return true, err
 	}
-	rt.recordRelayDelivery(prevWatermark)
+	rt.recordDelivery(delivery)
 	if err := externalRelayPrefixDERPSendAck(rt.ctx, rt.client, rt.peerDERP, rt.rx.Watermark()); err != nil {
 		return true, err
 	}
 	return rt.finishIfBoundaryReached()
 }
 
-func (rt *externalHandoffDERPReceiveRuntime) recordRelayDelivery(prevWatermark int64) {
+func (rt *externalHandoffDERPReceiveRuntime) recordDelivery(delivery externalHandoffDelivery) {
 	if rt.metrics == nil {
 		return
 	}
-	if delivered := rt.rx.Watermark() - prevWatermark; delivered > 0 {
-		rt.metrics.RecordRelayWrite(delivered, time.Now())
+	now := time.Now()
+	if delivery.Relay > 0 {
+		rt.metrics.RecordRelayWrite(delivery.Relay, now)
+	}
+	if delivery.Direct > 0 {
+		rt.metrics.RecordDirectWrite(delivery.Direct, now)
 	}
 }
 

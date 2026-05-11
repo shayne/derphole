@@ -158,13 +158,14 @@ type directUDPReadyAck struct {
 }
 
 type directUDPStart struct {
-	ExpectedBytes int64    `json:"expected_bytes,omitempty"`
-	SectionSizes  []int64  `json:"section_sizes,omitempty"`
-	SectionAddrs  []string `json:"section_addrs,omitempty"`
-	ProbeRates    []int    `json:"probe_rates,omitempty"`
-	ProbeNonce    string   `json:"probe_nonce,omitempty"`
-	Stream        bool     `json:"stream,omitempty"`
-	StripedBlast  bool     `json:"striped_blast,omitempty"`
+	ExpectedBytes     int64    `json:"expected_bytes,omitempty"`
+	RelayPrefixOffset int64    `json:"relay_prefix_offset,omitempty"`
+	SectionSizes      []int64  `json:"section_sizes,omitempty"`
+	SectionAddrs      []string `json:"section_addrs,omitempty"`
+	ProbeRates        []int    `json:"probe_rates,omitempty"`
+	ProbeNonce        string   `json:"probe_nonce,omitempty"`
+	Stream            bool     `json:"stream,omitempty"`
+	StripedBlast      bool     `json:"striped_blast,omitempty"`
 }
 
 type directUDPRateProbeResult struct {

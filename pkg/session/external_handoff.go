@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -50,7 +51,7 @@ type externalHandoffReceiver struct {
 	out       io.Writer
 	maxWindow int64
 	watermark int64
-	pending   map[int64][]byte
+	pending   map[int64]externalHandoffPendingChunk
 	buffered  int64
 }
 
@@ -58,8 +59,47 @@ func newExternalHandoffReceiver(out io.Writer, maxWindow int64) *externalHandoff
 	return &externalHandoffReceiver{
 		out:       out,
 		maxWindow: maxWindow,
-		pending:   make(map[int64][]byte),
+		pending:   make(map[int64]externalHandoffPendingChunk),
 	}
+}
+
+type externalHandoffChunkSource uint8
+
+const (
+	externalHandoffChunkSourceUnknown externalHandoffChunkSource = iota
+	externalHandoffChunkSourceRelay
+	externalHandoffChunkSourceDirect
+)
+
+type externalHandoffDelivery struct {
+	Relay   int64
+	Direct  int64
+	Unknown int64
+}
+
+func (d *externalHandoffDelivery) add(source externalHandoffChunkSource, n int64) {
+	if n <= 0 {
+		return
+	}
+	switch source {
+	case externalHandoffChunkSourceRelay:
+		d.Relay += n
+	case externalHandoffChunkSourceDirect:
+		d.Direct += n
+	default:
+		d.Unknown += n
+	}
+}
+
+type externalHandoffPendingChunk struct {
+	payload []byte
+	source  externalHandoffChunkSource
+}
+
+type externalHandoffBufferSegment struct {
+	offset  int64
+	payload []byte
+	source  externalHandoffChunkSource
 }
 
 func (r *externalHandoffReceiver) Watermark() int64 {
@@ -70,15 +110,20 @@ func (r *externalHandoffReceiver) Watermark() int64 {
 }
 
 func (r *externalHandoffReceiver) AcceptChunk(chunk externalHandoffChunk) error {
+	_, err := r.AcceptChunkFrom(chunk, externalHandoffChunkSourceUnknown)
+	return err
+}
+
+func (r *externalHandoffReceiver) AcceptChunkFrom(chunk externalHandoffChunk, source externalHandoffChunkSource) (externalHandoffDelivery, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	offset, payload, ignored, err := normalizeExternalHandoffChunk(r.watermark, chunk)
 	if err != nil || ignored {
-		return err
+		return externalHandoffDelivery{}, err
 	}
-	if err := r.bufferChunkLocked(offset, payload); err != nil {
-		return err
+	if err := r.bufferChunkLocked(offset, payload, source); err != nil {
+		return externalHandoffDelivery{}, err
 	}
 	return r.flushBufferedChunksLocked()
 }
@@ -103,39 +148,138 @@ func normalizeExternalHandoffChunk(watermark int64, chunk externalHandoffChunk) 
 	return offset, payload, false, nil
 }
 
-func (r *externalHandoffReceiver) bufferChunkLocked(offset int64, payload []byte) error {
+func (r *externalHandoffReceiver) bufferChunkLocked(offset int64, payload []byte, source externalHandoffChunkSource) error {
 	if offset > r.watermark+r.maxWindow {
 		return errExternalHandoffWindowOverflow
 	}
-	if pending, ok := r.pending[offset]; ok {
-		if !bytes.Equal(pending, payload) {
-			return fmt.Errorf("external handoff duplicate chunk at offset %d does not match buffered payload", offset)
-		}
-		return nil
+	segments, err := r.newExternalHandoffBufferSegmentsLocked(offset, payload, source)
+	if err != nil {
+		return err
 	}
-	if r.buffered+int64(len(payload)) > r.maxWindow {
+	newBytes := externalHandoffBufferSegmentBytes(segments)
+	if r.buffered+newBytes > r.maxWindow {
 		return errExternalHandoffWindowOverflow
 	}
 
-	copied := append([]byte(nil), payload...)
-	r.pending[offset] = copied
-	r.buffered += int64(len(copied))
+	for _, segment := range segments {
+		if len(segment.payload) == 0 {
+			continue
+		}
+		copied := append([]byte(nil), segment.payload...)
+		r.pending[segment.offset] = externalHandoffPendingChunk{payload: copied, source: segment.source}
+		r.buffered += int64(len(copied))
+	}
 	return nil
 }
 
-func (r *externalHandoffReceiver) flushBufferedChunksLocked() error {
+func (r *externalHandoffReceiver) newExternalHandoffBufferSegmentsLocked(offset int64, payload []byte, source externalHandoffChunkSource) ([]externalHandoffBufferSegment, error) {
+	segments := []externalHandoffBufferSegment{{
+		offset:  offset,
+		payload: payload,
+		source:  source,
+	}}
+	for _, pendingOffset := range r.pendingOffsetsLocked() {
+		pending := r.pending[pendingOffset]
+		next := segments[:0]
+		for _, segment := range segments {
+			split, err := splitExternalHandoffSegmentAroundPending(segment, pendingOffset, pending)
+			if err != nil {
+				return nil, err
+			}
+			next = append(next, split...)
+		}
+		segments = next
+		if len(segments) == 0 {
+			return nil, nil
+		}
+	}
+	return segments, nil
+}
+
+func (r *externalHandoffReceiver) pendingOffsetsLocked() []int64 {
+	offsets := make([]int64, 0, len(r.pending))
+	for offset := range r.pending {
+		offsets = append(offsets, offset)
+	}
+	sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
+	return offsets
+}
+
+func splitExternalHandoffSegmentAroundPending(segment externalHandoffBufferSegment, pendingOffset int64, pending externalHandoffPendingChunk) ([]externalHandoffBufferSegment, error) {
+	segmentEnd := segment.offset + int64(len(segment.payload))
+	pendingEnd := pendingOffset + int64(len(pending.payload))
+	if segmentEnd <= pendingOffset || pendingEnd <= segment.offset {
+		return []externalHandoffBufferSegment{segment}, nil
+	}
+
+	overlapStart := maxInt64(segment.offset, pendingOffset)
+	overlapEnd := minInt64(segmentEnd, pendingEnd)
+	segmentOverlapStart := overlapStart - segment.offset
+	pendingOverlapStart := overlapStart - pendingOffset
+	overlapLen := overlapEnd - overlapStart
+	segmentOverlap := segment.payload[segmentOverlapStart : segmentOverlapStart+overlapLen]
+	pendingOverlap := pending.payload[pendingOverlapStart : pendingOverlapStart+overlapLen]
+	if !bytes.Equal(segmentOverlap, pendingOverlap) {
+		return nil, fmt.Errorf("external handoff duplicate chunk at offset %d does not match buffered payload", overlapStart)
+	}
+
+	split := make([]externalHandoffBufferSegment, 0, 2)
+	if segment.offset < overlapStart {
+		split = append(split, externalHandoffBufferSegment{
+			offset:  segment.offset,
+			payload: segment.payload[:segmentOverlapStart],
+			source:  segment.source,
+		})
+	}
+	if overlapEnd < segmentEnd {
+		rightStart := segmentOverlapStart + overlapLen
+		split = append(split, externalHandoffBufferSegment{
+			offset:  overlapEnd,
+			payload: segment.payload[rightStart:],
+			source:  segment.source,
+		})
+	}
+	return split, nil
+}
+
+func externalHandoffBufferSegmentBytes(segments []externalHandoffBufferSegment) int64 {
+	var total int64
+	for _, segment := range segments {
+		total += int64(len(segment.payload))
+	}
+	return total
+}
+
+func (r *externalHandoffReceiver) flushBufferedChunksLocked() (externalHandoffDelivery, error) {
+	var delivery externalHandoffDelivery
 	for {
 		next, ok := r.pending[r.watermark]
 		if !ok {
-			return nil
+			return delivery, nil
 		}
-		if _, err := r.out.Write(next); err != nil {
-			return err
+		if _, err := r.out.Write(next.payload); err != nil {
+			return delivery, err
 		}
 		delete(r.pending, r.watermark)
-		r.buffered -= int64(len(next))
-		r.watermark += int64(len(next))
+		delivered := int64(len(next.payload))
+		r.buffered -= delivered
+		r.watermark += delivered
+		delivery.add(next.source, delivered)
 	}
+}
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 type externalHandoffSpool struct {
@@ -147,6 +291,7 @@ type externalHandoffSpool struct {
 	filePath        string
 	chunkSize       int
 	maxUnacked      int64
+	maxBuffered     int64
 	readOffset      int64
 	sourceOffset    int64
 	ackedWatermark  int64
@@ -179,13 +324,14 @@ func newExternalHandoffSpool(src io.Reader, chunkSize int, maxUnackedBytes int64
 		return nil, err
 	}
 	spool := &externalHandoffSpool{
-		src:        src,
-		srcCloser:  externalHandoffSourceCloser(src),
-		file:       file,
-		filePath:   file.Name(),
-		chunkSize:  chunkSize,
-		maxUnacked: maxUnackedBytes,
-		pumpDone:   make(chan struct{}),
+		src:         src,
+		srcCloser:   externalHandoffSourceCloser(src),
+		file:        file,
+		filePath:    file.Name(),
+		chunkSize:   chunkSize,
+		maxUnacked:  maxUnackedBytes,
+		maxBuffered: maxUnackedBytes,
+		pumpDone:    make(chan struct{}),
 	}
 	spool.cond = sync.NewCond(&spool.mu)
 	go spool.pumpSource()
@@ -321,6 +467,20 @@ func (s *externalHandoffSpool) SetMaxUnacked(maxUnacked int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maxUnacked = maxUnacked
+	if s.maxBuffered < maxUnacked {
+		s.maxBuffered = maxUnacked
+	}
+	s.cond.Broadcast()
+}
+
+func (s *externalHandoffSpool) SetMaxBuffered(maxBuffered int64) {
+	if maxBuffered <= 0 {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.maxBuffered = maxBuffered
 	s.cond.Broadcast()
 }
 
@@ -343,6 +503,13 @@ func (s *externalHandoffSpool) Done() bool {
 	return s.eof && s.ackedWatermark >= s.sourceOffset
 }
 
+func (s *externalHandoffSpool) AllSourceBytesSent() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.eof && s.readOffset >= s.sourceOffset
+}
+
 func (s *externalHandoffSpool) RewindTo(offset int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -357,6 +524,97 @@ func (s *externalHandoffSpool) RewindTo(offset int64) error {
 	s.readInterrupted = false
 	s.cond.Broadcast()
 	return nil
+}
+
+type externalHandoffSpoolCursor struct {
+	ctx    context.Context
+	spool  *externalHandoffSpool
+	offset int64
+}
+
+func newExternalHandoffSpoolCursor(ctx context.Context, spool *externalHandoffSpool, offset int64) io.Reader {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return &externalHandoffSpoolCursor{
+		ctx:    ctx,
+		spool:  spool,
+		offset: offset,
+	}
+}
+
+func (c *externalHandoffSpoolCursor) Read(p []byte) (int, error) {
+	if c == nil || c.spool == nil {
+		return 0, io.EOF
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if c.offset < 0 {
+		return 0, fmt.Errorf("external handoff cursor offset %d is negative", c.offset)
+	}
+	for {
+		if err := c.ctx.Err(); err != nil {
+			return 0, err
+		}
+
+		n, err, wait := c.readAvailable(p)
+		if !wait {
+			return n, err
+		}
+		if err := c.waitForData(); err != nil {
+			return 0, err
+		}
+	}
+}
+
+func (c *externalHandoffSpoolCursor) waitForData() error {
+	timer := time.NewTimer(time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-c.ctx.Done():
+		return c.ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (c *externalHandoffSpoolCursor) readAvailable(p []byte) (int, error, bool) {
+	s := c.spool
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed || s.file == nil {
+		return 0, net.ErrClosed, false
+	}
+	if c.offset < s.sourceOffset {
+		return c.readAvailablePayloadLocked(s, p)
+	}
+	return externalHandoffSpoolCursorBlockedRead(s)
+}
+
+func (c *externalHandoffSpoolCursor) readAvailablePayloadLocked(s *externalHandoffSpool, p []byte) (int, error, bool) {
+	readLen := s.sourceOffset - c.offset
+	if readLen > int64(len(p)) {
+		readLen = int64(len(p))
+	}
+	n, err := s.file.ReadAt(p[:readLen], c.offset)
+	if err != nil && errors.Is(err, io.EOF) {
+		err = nil
+	}
+	c.offset += int64(n)
+	return n, err, false
+}
+
+func externalHandoffSpoolCursorBlockedRead(s *externalHandoffSpool) (int, error, bool) {
+	switch {
+	case s.readErr != nil:
+		return 0, s.readErr, false
+	case s.eof:
+		return 0, io.EOF, false
+	default:
+		return 0, nil, true
+	}
 }
 
 func (s *externalHandoffSpool) InterruptPendingRead() {
@@ -422,13 +680,13 @@ func (s *externalHandoffSpool) nextPumpReadSize() (int, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for !s.closed && s.readErr == nil && !s.eof && s.sourceOffset-s.ackedWatermark >= s.maxUnacked {
+	for !s.closed && s.readErr == nil && !s.eof && s.sourceOffset-s.ackedWatermark >= s.maxBuffered {
 		s.cond.Wait()
 	}
 	if s.closed || s.readErr != nil || s.eof {
 		return 0, true
 	}
-	headroom := s.maxUnacked - (s.sourceOffset - s.ackedWatermark)
+	headroom := s.maxBuffered - (s.sourceOffset - s.ackedWatermark)
 	readSize := s.chunkSize
 	if headroom < int64(readSize) {
 		readSize = int(headroom)
@@ -680,6 +938,34 @@ func traceExternalHandoffReceiverChunk(carrier io.ReadWriteCloser, chunk externa
 		return false
 	}
 	return firstChunk
+}
+
+type externalHandoffOffsetWriter struct {
+	rx      *externalHandoffReceiver
+	offset  int64
+	deliver func(externalHandoffDelivery)
+}
+
+func newExternalHandoffOffsetWriter(rx *externalHandoffReceiver, offset int64, deliver func(externalHandoffDelivery)) io.Writer {
+	return &externalHandoffOffsetWriter{rx: rx, offset: offset, deliver: deliver}
+}
+
+func (w *externalHandoffOffsetWriter) Write(p []byte) (int, error) {
+	if w == nil || w.rx == nil {
+		return 0, errors.New("nil external handoff offset writer")
+	}
+	if w.offset < 0 {
+		return 0, fmt.Errorf("external handoff offset writer offset %d is negative", w.offset)
+	}
+	delivery, err := w.rx.AcceptChunkFrom(externalHandoffChunk{Offset: w.offset, Payload: p}, externalHandoffChunkSourceDirect)
+	if err != nil {
+		return 0, err
+	}
+	w.offset += int64(len(p))
+	if w.deliver != nil {
+		w.deliver(delivery)
+	}
+	return len(p), nil
 }
 
 type externalHandoffSpoolReader struct {

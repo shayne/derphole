@@ -40,6 +40,30 @@ func TestExternalHandoffReceiverWritesContiguousChunksInOrderAndDedupes(t *testi
 	}
 }
 
+func TestExternalHandoffReceiverAttributesBufferedOverlapBySource(t *testing.T) {
+	var out bytes.Buffer
+	rx := newExternalHandoffReceiver(&out, 32)
+
+	directDelivery, err := rx.AcceptChunkFrom(externalHandoffChunk{Offset: 4, Payload: []byte("efgh")}, externalHandoffChunkSourceDirect)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if directDelivery != (externalHandoffDelivery{}) {
+		t.Fatalf("direct delivery before gap filled = %+v, want zero", directDelivery)
+	}
+
+	relayDelivery, err := rx.AcceptChunkFrom(externalHandoffChunk{Offset: 0, Payload: []byte("abcd")}, externalHandoffChunkSourceRelay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); got != "abcdefgh" {
+		t.Fatalf("output = %q, want %q", got, "abcdefgh")
+	}
+	if relayDelivery.Relay != 4 || relayDelivery.Direct != 4 {
+		t.Fatalf("relay delivery = %+v, want relay=4 direct=4", relayDelivery)
+	}
+}
+
 func TestExternalHandoffReceiverRejectsWindowOverflow(t *testing.T) {
 	var out bytes.Buffer
 	rx := newExternalHandoffReceiver(&out, 8)
@@ -110,6 +134,76 @@ func TestExternalHandoffSenderBackpressuresWhenUnackedWindowExceedsLimit(t *test
 	}
 }
 
+func TestExternalHandoffSpoolWaitForUnackedAtMostBlocksUntilAckAdvances(t *testing.T) {
+	spool, err := newExternalHandoffSpool(strings.NewReader("abcdefgh"), 4, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	if _, err := spool.NextChunk(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := spool.NextChunk(); err != nil {
+		t.Fatal(err)
+	}
+
+	waitErr := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go func() {
+		waitErr <- spool.WaitForUnackedAtMost(ctx, 4)
+	}()
+
+	select {
+	case err := <-waitErr:
+		t.Fatalf("WaitForUnackedAtMost returned before ack advanced: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if err := spool.AckTo(4); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-waitErr:
+		if err != nil {
+			t.Fatalf("WaitForUnackedAtMost() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitForUnackedAtMost did not return after ack advanced")
+	}
+}
+
+func TestExternalHandoffSpoolWaitForUnackedAtMostReturnsContextError(t *testing.T) {
+	spool, err := newExternalHandoffSpool(strings.NewReader("abcdefgh"), 4, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	if _, err := spool.NextChunk(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := spool.NextChunk(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = spool.WaitForUnackedAtMost(ctx, 4)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("WaitForUnackedAtMost() error = %v, want context.Canceled", err)
+	}
+}
+
 func TestExternalHandoffSpoolDoesNotReadAheadPastAckWindow(t *testing.T) {
 	sourceReader := newBlockingSecondReadSource([]byte("abcd"), []byte("efgh"))
 	spool, err := newExternalHandoffSpool(sourceReader, 4, 4)
@@ -157,6 +251,81 @@ func TestExternalHandoffSpoolDoesNotReadAheadPastAckWindow(t *testing.T) {
 	}
 }
 
+func TestExternalHandoffSpoolReaderReadsAndAcknowledgesSource(t *testing.T) {
+	spool, err := newExternalHandoffSpool(strings.NewReader("abcdefghijkl"), 4, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	reader := newExternalHandoffSpoolReader(spool)
+	buf := make([]byte, 5)
+	n, err := io.ReadFull(reader, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "abcde" {
+		t.Fatalf("first read = %q, want %q", got, "abcde")
+	}
+	if got := spool.AckedWatermark(); got != 5 {
+		t.Fatalf("acked watermark after first read = %d, want 5", got)
+	}
+
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(rest); got != "fghijkl" {
+		t.Fatalf("remaining read = %q, want %q", got, "fghijkl")
+	}
+	if got := spool.AckedWatermark(); got != 12 {
+		t.Fatalf("acked watermark after EOF = %d, want 12", got)
+	}
+}
+
+func TestExternalHandoffSpoolBufferedWindowCanGrowWithoutRaisingRelayWindow(t *testing.T) {
+	spool, err := newExternalHandoffSpool(strings.NewReader("abcdefghijklmnop"), 4, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	first, err := spool.NextChunk()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first.Payload) != "abcd" {
+		t.Fatalf("first payload = %q, want %q", first.Payload, "abcd")
+	}
+	if _, err := spool.NextChunk(); !errors.Is(err, errExternalHandoffUnackedWindowFull) {
+		t.Fatalf("NextChunk() before buffered growth error = %v, want %v", err, errExternalHandoffUnackedWindowFull)
+	}
+
+	spool.SetMaxBuffered(16)
+	waitExternalHandoffSpoolSourceOffset(t, spool, 16)
+
+	cursor := newExternalHandoffSpoolCursor(context.Background(), spool, 4)
+	buf := make([]byte, 4)
+	n, err := io.ReadFull(cursor, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "efgh" {
+		t.Fatalf("cursor read = %q, want %q", got, "efgh")
+	}
+	if _, err := spool.NextChunk(); !errors.Is(err, errExternalHandoffUnackedWindowFull) {
+		t.Fatalf("NextChunk() after buffered growth error = %v, want %v", err, errExternalHandoffUnackedWindowFull)
+	}
+}
+
 func TestExternalHandoffSenderReturnsEOFAfterSourceDrainedAndAcked(t *testing.T) {
 	spool, err := newExternalHandoffSpool(strings.NewReader("abc"), 8, 16)
 	if err != nil {
@@ -180,6 +349,87 @@ func TestExternalHandoffSenderReturnsEOFAfterSourceDrainedAndAcked(t *testing.T)
 	}
 	if _, err := spool.NextChunk(); !errors.Is(err, io.EOF) {
 		t.Fatalf("NextChunk() error = %v, want EOF", err)
+	}
+}
+
+func TestExternalHandoffSpoolReportsAllSourceBytesSentBeforeFinalAck(t *testing.T) {
+	spool, err := newExternalHandoffSpool(strings.NewReader("abc"), 8, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	if _, err := spool.NextChunk(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := spool.NextChunk(); !errors.Is(err, io.EOF) {
+		t.Fatalf("NextChunk() error = %v, want EOF", err)
+	}
+	if !spool.AllSourceBytesSent() {
+		t.Fatal("AllSourceBytesSent() = false, want true before final ack")
+	}
+	if spool.Done() {
+		t.Fatal("Done() = true before final ack")
+	}
+}
+
+func TestExternalHandoffSpoolCursorDoesNotAdvanceRelayReadOffset(t *testing.T) {
+	spool, err := newExternalHandoffSpool(strings.NewReader("abcdefghijklmnop"), 4, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	waitExternalHandoffSpoolSourceOffset(t, spool, 16)
+
+	first, err := spool.NextChunk()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := spool.NextChunk()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first.Payload)+string(second.Payload) != "abcdefgh" {
+		t.Fatalf("relay chunks = %q%q, want %q", first.Payload, second.Payload, "abcdefgh")
+	}
+	if got := spool.Snapshot().ReadOffset; got != 8 {
+		t.Fatalf("relay read offset before cursor = %d, want 8", got)
+	}
+
+	cursor := newExternalHandoffSpoolCursor(context.Background(), spool, 4)
+	buf := make([]byte, 5)
+	n, err := io.ReadFull(cursor, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "efghi" {
+		t.Fatalf("cursor first read = %q, want %q", got, "efghi")
+	}
+	if got := spool.Snapshot().ReadOffset; got != 8 {
+		t.Fatalf("relay read offset after cursor read = %d, want 8", got)
+	}
+
+	rest, err := io.ReadAll(cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(rest); got != "jklmnop" {
+		t.Fatalf("cursor rest = %q, want %q", got, "jklmnop")
+	}
+	n, err = cursor.Read(buf)
+	if n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("cursor final Read() = (%d, %v), want (0, EOF)", n, err)
+	}
+	if got := spool.Snapshot().ReadOffset; got != 8 {
+		t.Fatalf("relay read offset after cursor EOF = %d, want 8", got)
 	}
 }
 
@@ -209,6 +459,49 @@ func TestExternalHandoffSenderIgnoresStaleAckWatermarks(t *testing.T) {
 	}
 	if got := spool.AckedWatermark(); got != 8 {
 		t.Fatalf("AckedWatermark() = %d, want 8", got)
+	}
+}
+
+func TestExternalHandoffOffsetWriterDeduplicatesOverlap(t *testing.T) {
+	var out bytes.Buffer
+	rx := newExternalHandoffReceiver(&out, 32)
+	if err := rx.AcceptChunk(externalHandoffChunk{Offset: 0, Payload: []byte("abcdefgh")}); err != nil {
+		t.Fatal(err)
+	}
+
+	var deliveredBytes int64
+	var deliveredCalls int
+	writer := newExternalHandoffOffsetWriter(rx, 4, func(delivery externalHandoffDelivery) {
+		deliveredBytes += delivery.Direct
+		deliveredCalls++
+	})
+
+	n, err := writer.Write([]byte("efghijkl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len("efghijkl") {
+		t.Fatalf("first Write() n = %d, want %d", n, len("efghijkl"))
+	}
+	n, err = writer.Write([]byte("mnop"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len("mnop") {
+		t.Fatalf("second Write() n = %d, want %d", n, len("mnop"))
+	}
+
+	if got := out.String(); got != "abcdefghijklmnop" {
+		t.Fatalf("output = %q, want %q", got, "abcdefghijklmnop")
+	}
+	if got := rx.Watermark(); got != 16 {
+		t.Fatalf("watermark = %d, want 16", got)
+	}
+	if deliveredBytes != 8 {
+		t.Fatalf("direct delivered bytes = %d, want 8", deliveredBytes)
+	}
+	if deliveredCalls != 2 {
+		t.Fatalf("direct delivered callback calls = %d, want 2", deliveredCalls)
 	}
 }
 
@@ -440,6 +733,24 @@ func (s *blockingSecondReadSource) Release() {
 	case <-s.releaseSecondRead:
 	default:
 		close(s.releaseSecondRead)
+	}
+}
+
+func waitExternalHandoffSpoolSourceOffset(t *testing.T, spool *externalHandoffSpool, want int64) {
+	t.Helper()
+
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if got := spool.Snapshot().SourceOffset; got >= want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("spool source offset did not reach %d", want)
+		case <-ticker.C:
+		}
 	}
 }
 
