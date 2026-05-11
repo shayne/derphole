@@ -278,7 +278,7 @@ func TestWaitForBlastReplayWindowFlushesDrainsAndCancelsWhenStillFull(t *testing
 	}, newBlastSendControl(100, 200, time.Now()), func() (bool, error) {
 		drained++
 		return false, nil
-	}, runID, &TransferStats{})
+	}, runID, &TransferStats{}, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("waitForBlastReplayWindow() error = %v, want context.Canceled", err)
 	}
@@ -290,7 +290,7 @@ func TestWaitForBlastReplayWindowFlushesDrainsAndCancelsWhenStillFull(t *testing
 	if err := waitForBlastReplayWindow(context.Background(), history, func() error {
 		flushed++
 		return nil
-	}, newBlastSendControl(0, 0, time.Now()), nil, runID, &TransferStats{}); err != nil {
+	}, newBlastSendControl(0, 0, time.Now()), nil, runID, &TransferStats{}, nil); err != nil {
 		t.Fatalf("waitForBlastReplayWindow(non-full) error = %v", err)
 	}
 }
@@ -355,7 +355,7 @@ func TestReceiveBlastDataBatchedProcessesDataAndDone(t *testing.T) {
 		addrs:   []net.Addr{peer, peer},
 	}
 	var dst bytes.Buffer
-	stats, err := receiveBlastDataBatched(context.Background(), nil, batcher, peer, runID, &dst, &TransferStats{}, make([]byte, 1500), nil)
+	stats, err := receiveBlastDataBatched(context.Background(), nil, batcher, peer, runID, &dst, &TransferStats{}, make([]byte, 1500), nil, nil)
 	if err != nil {
 		t.Fatalf("receiveBlastDataBatched() error = %v", err)
 	}
@@ -380,7 +380,7 @@ func TestReceiveBlastDataBatchIgnoresMismatchedPacketsAndSurfacesClosed(t *testi
 		t.Fatalf("marshal mismatched packet error = %v", err)
 	}
 	readBufs := []batchReadBuffer{{Bytes: append([]byte(nil), mismatched...), N: len(mismatched), Addr: otherPeer}}
-	complete, err := processBlastReceiveBatch(context.Background(), nil, &scriptedBlastBatcher{}, peer, runID, io.Discard, &TransferStats{}, readBufs, nil)
+	complete, err := processBlastReceiveBatch(context.Background(), nil, &scriptedBlastBatcher{}, peer, runID, io.Discard, &TransferStats{}, readBufs, nil, nil)
 	if err != nil || complete {
 		t.Fatalf("processBlastReceiveBatch(mismatch) = (%t, %v), want ignored", complete, err)
 	}
@@ -388,7 +388,7 @@ func TestReceiveBlastDataBatchIgnoresMismatchedPacketsAndSurfacesClosed(t *testi
 	closedBatcher := &scriptedBlastBatcher{}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err = receiveBlastDataBatch(ctx, nil, closedBatcher, peer, runID, io.Discard, &TransferStats{}, []batchReadBuffer{{Bytes: make([]byte, 1500)}}, nil)
+	_, err = receiveBlastDataBatch(ctx, nil, closedBatcher, peer, runID, io.Discard, &TransferStats{}, []batchReadBuffer{{Bytes: make([]byte, 1500)}}, nil, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("receiveBlastDataBatch(canceled) error = %v, want context.Canceled", err)
 	}

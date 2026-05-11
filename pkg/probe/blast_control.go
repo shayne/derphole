@@ -124,12 +124,12 @@ func isBlastSendControlPacket(packetType PacketType) bool {
 	return packetType == PacketTypeRepairComplete || packetType == PacketTypeRepairRequest || packetType == PacketTypeStats
 }
 
-func drainBlastSendControlEvents(ctx context.Context, batcher packetBatcher, peer net.Addr, history *blastRepairHistory, stats *TransferStats, deduper *blastRepairDeduper, control *blastSendControl, events <-chan blastSendControlEvent) (bool, error) {
+func drainBlastSendControlEvents(ctx context.Context, batcher packetBatcher, peer net.Addr, history *blastRepairHistory, stats *TransferStats, deduper *blastRepairDeduper, control *blastSendControl, events <-chan blastSendControlEvent, progress func(TransferStats)) (bool, error) {
 	complete := false
 	for {
 		select {
 		case event := <-events:
-			eventComplete, _, err := handleBlastSendControlEvent(ctx, batcher, peer, history, stats, deduper, control, event)
+			eventComplete, _, err := handleBlastSendControlEvent(ctx, batcher, peer, history, stats, deduper, control, event, progress)
 			if err != nil {
 				return complete, err
 			}
@@ -140,7 +140,7 @@ func drainBlastSendControlEvents(ctx context.Context, batcher packetBatcher, pee
 	}
 }
 
-func handleBlastSendControlEvent(ctx context.Context, batcher packetBatcher, peer net.Addr, history *blastRepairHistory, stats *TransferStats, deduper *blastRepairDeduper, control *blastSendControl, event blastSendControlEvent) (bool, bool, error) {
+func handleBlastSendControlEvent(ctx context.Context, batcher packetBatcher, peer net.Addr, history *blastRepairHistory, stats *TransferStats, deduper *blastRepairDeduper, control *blastSendControl, event blastSendControlEvent, progress func(TransferStats)) (bool, bool, error) {
 	if event.err != nil {
 		return false, false, event.err
 	}
@@ -151,18 +151,18 @@ func handleBlastSendControlEvent(ctx context.Context, batcher packetBatcher, pee
 	case PacketTypeRepairComplete:
 		return true, false, nil
 	case PacketTypeRepairRequest:
-		return handleBlastRepairRequestEvent(ctx, batcher, peer, history, stats, deduper, control, event)
+		return handleBlastRepairRequestEvent(ctx, batcher, peer, history, stats, deduper, control, event, progress)
 	case PacketTypeStats:
 		handleBlastStatsEvent(stats, control, event)
 	}
 	return false, false, nil
 }
 
-func handleBlastRepairRequestEvent(ctx context.Context, batcher packetBatcher, peer net.Addr, history *blastRepairHistory, stats *TransferStats, deduper *blastRepairDeduper, control *blastSendControl, event blastSendControlEvent) (bool, bool, error) {
+func handleBlastRepairRequestEvent(ctx context.Context, batcher packetBatcher, peer net.Addr, history *blastRepairHistory, stats *TransferStats, deduper *blastRepairDeduper, control *blastSendControl, event blastSendControlEvent, progress func(TransferStats)) (bool, bool, error) {
 	if batcher == nil || stats == nil {
 		return false, false, nil
 	}
-	retransmits, err := sendBlastRepairs(ctx, batcher, peer, history, event.payload, stats, deduper, event.receivedAt)
+	retransmits, err := sendBlastRepairs(ctx, batcher, peer, history, event.payload, stats, deduper, event.receivedAt, progress)
 	if err != nil {
 		return false, false, err
 	}

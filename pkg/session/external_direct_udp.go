@@ -1187,6 +1187,9 @@ func externalExecutePreparedDirectUDPSend(ctx context.Context, src io.Reader, pl
 	}
 	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct-execute")
 	metrics.SetDirectPlan(plan.selectedRateMbps, plan.startRateMbps, len(plan.probeConns), availableLanes)
+	plan.sendCfg.Progress = func(stats probe.TransferStats) {
+		metrics.SetProbeStats(stats)
+	}
 	externalTransferTracef("direct-udp-send-execute-start lanes=%d addrs=%s rate=%d ceiling=%d", len(plan.probeConns), strings.Join(plan.remoteAddrs, ","), plan.sendCfg.RateMbps, plan.sendCfg.RateCeilingMbps)
 	stats, err := probe.SendBlastParallel(ctx, plan.probeConns, plan.remoteAddrs, externalDirectUDPBufferedReader(src), plan.sendCfg)
 	externalTransferTracef("direct-udp-send-execute-done err=%v bytes=%d lanes=%d first-byte-zero=%v complete-zero=%v", err, stats.BytesSent, stats.Lanes, stats.FirstByteAt.IsZero(), stats.CompletedAt.IsZero())
@@ -1205,7 +1208,9 @@ func externalExecutePreparedDirectUDPSend(ctx context.Context, src io.Reader, pl
 		if directFirstByteAt.IsZero() {
 			directFirstByteAt = stats.StartedAt
 		}
-		metrics.RecordDirectWrite(stats.BytesSent, directFirstByteAt)
+		if remaining := stats.BytesSent - metrics.DirectBytes(); remaining > 0 {
+			metrics.RecordDirectWrite(remaining, directFirstByteAt)
+		}
 	}
 	emitExternalTransferMetricsComplete(metrics, cfg.Emitter, "udp-send", stats, stats.CompletedAt)
 	if err != nil {
@@ -1417,6 +1422,9 @@ func externalTransferMetricsOrNew(ctx context.Context, metrics *externalTransfer
 }
 
 func externalDirectUDPExecuteReceivePlan(ctx context.Context, plan externalDirectUDPReceivePlan, tok token.Token, receiveCfg probe.ReceiveConfig) (probe.TransferStats, error) {
+	if metrics := externalTransferMetricsFromContext(ctx); metrics != nil {
+		plan.receiveDst = externalTransferMetricsWriter{w: plan.receiveDst, record: metrics.RecordDirectWrite}
+	}
 	if plan.start.Stream {
 		receiveCfg.RequireComplete = true
 		receiveCfg.FECGroupSize = externalDirectUDPStreamFECGroupSize
@@ -1467,7 +1475,9 @@ func externalDirectUDPRecordReceiveMetrics(metrics *externalTransferMetrics, emi
 		if directFirstByteAt.IsZero() {
 			directFirstByteAt = stats.StartedAt
 		}
-		metrics.RecordDirectWrite(stats.BytesReceived, directFirstByteAt)
+		if remaining := stats.BytesReceived - metrics.DirectBytes(); remaining > 0 {
+			metrics.RecordDirectWrite(remaining, directFirstByteAt)
+		}
 	}
 	emitExternalTransferMetricsComplete(metrics, emitter, "udp-receive", stats, time.Now())
 }

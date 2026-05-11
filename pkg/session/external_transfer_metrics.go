@@ -134,6 +134,27 @@ func (m *externalTransferMetrics) SetProbeSummary(state string, summary string) 
 	observeExternalTransferTrace(trace, snap, ok)
 }
 
+func (m *externalTransferMetrics) SetProbeStats(stats probe.TransferStats) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	if stats.BytesSent > m.directBytes {
+		m.directBytes = stats.BytesSent
+	}
+	if stats.BytesReceived > m.directBytes {
+		m.directBytes = stats.BytesReceived
+	}
+	if m.directBytes > 0 && m.firstByteAt.IsZero() {
+		m.firstByteAt = time.Now()
+	}
+	m.retransmitCount = stats.Retransmits
+	m.replayWindowBytes = stats.MaxReplayBytes
+	trace, snap, ok := m.updateTraceLocked(time.Now())
+	m.mu.Unlock()
+	observeExternalTransferTrace(trace, snap, ok)
+}
+
 func (m *externalTransferMetrics) Tick(at time.Time) {
 	if m == nil || at.IsZero() {
 		return

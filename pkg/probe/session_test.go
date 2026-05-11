@@ -1868,7 +1868,7 @@ func TestBlastParallelStripedRepairDeduperSuppressesBroadcastDuplicates(t *testi
 	for _, eventLane := range lanes {
 		stripeLane := blastParallelStripeLane(lanes, 0)
 		deduper := blastParallelRepairDeduperForEvent(global, eventLane, stripeLane)
-		if _, err := sendBlastRepairs(context.Background(), eventLane.batcher, eventLane.peer, stripeLane.history, payload, &TransferStats{}, deduper, now); err != nil {
+		if _, err := sendBlastRepairs(context.Background(), eventLane.batcher, eventLane.peer, stripeLane.history, payload, &TransferStats{}, deduper, now, nil); err != nil {
 			t.Fatalf("sendBlastRepairs() error = %v", err)
 		}
 	}
@@ -1906,7 +1906,7 @@ func TestBlastParallelStripedRepairRequestUsesRequestedStripeHistory(t *testing.
 		typ:     PacketTypeRepairRequest,
 		stripe:  0,
 		payload: payload,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("handleBlastSendControlEvent() error = %v", err)
 	}
@@ -2639,6 +2639,73 @@ func TestSendBlastParallelSingleLaneReportsLaneCount(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatalf("timed out waiting for single-lane receive: %v", ctx.Err())
+	}
+}
+
+func TestSendBlastParallelReportsProgress(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	src := bytes.Repeat([]byte("parallel-progress"), 1<<12)
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastStreamParallelToWriter(ctx, []net.PacketConn{server}, io.Discard, ReceiveConfig{Blast: true}, int64(len(src)))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	var progressBytes atomic.Int64
+	var progressCalls atomic.Int64
+	sendStats, err := SendBlastParallel(ctx, []net.PacketConn{client}, []string{server.LocalAddr().String()}, bytes.NewReader(src), SendConfig{
+		Blast: true,
+		Progress: func(stats TransferStats) {
+			progressCalls.Add(1)
+			for {
+				seen := progressBytes.Load()
+				if stats.BytesSent <= seen || progressBytes.CompareAndSwap(seen, stats.BytesSent) {
+					return
+				}
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("SendBlastParallel() error = %v", err)
+	}
+	if sendStats.BytesSent != int64(len(src)) {
+		t.Fatalf("BytesSent = %d, want %d", sendStats.BytesSent, len(src))
+	}
+	if progressCalls.Load() == 0 {
+		t.Fatal("progress callback was not called")
+	}
+	if progressBytes.Load() <= 0 {
+		t.Fatal("progress callback did not observe sent bytes")
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ReceiveBlastStreamParallelToWriter() error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(src)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(src))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for progress receive: %v", ctx.Err())
 	}
 }
 
@@ -4556,10 +4623,10 @@ func TestSendBlastRepairsSuppressesImmediateDuplicateSeqs(t *testing.T) {
 	binary.BigEndian.PutUint64(payload, 0)
 	now := time.Now()
 
-	if _, err := sendBlastRepairs(context.Background(), batcher, nil, history, payload, &stats, deduper, now); err != nil {
+	if _, err := sendBlastRepairs(context.Background(), batcher, nil, history, payload, &stats, deduper, now, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := sendBlastRepairs(context.Background(), batcher, nil, history, payload, &stats, deduper, now.Add(blastRepairResendInterval/2)); err != nil {
+	if _, err := sendBlastRepairs(context.Background(), batcher, nil, history, payload, &stats, deduper, now.Add(blastRepairResendInterval/2), nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := len(batcher.writes); got != 1 {
@@ -4569,7 +4636,7 @@ func TestSendBlastRepairsSuppressesImmediateDuplicateSeqs(t *testing.T) {
 		t.Fatalf("Retransmits after immediate duplicate = %d, want 1", stats.Retransmits)
 	}
 
-	if _, err := sendBlastRepairs(context.Background(), batcher, nil, history, payload, &stats, deduper, now.Add(blastRepairResendInterval+time.Millisecond)); err != nil {
+	if _, err := sendBlastRepairs(context.Background(), batcher, nil, history, payload, &stats, deduper, now.Add(blastRepairResendInterval+time.Millisecond), nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := len(batcher.writes); got != 2 {
@@ -4588,7 +4655,7 @@ func TestSendBlastServicesRepairRequestsDuringDataPhase(t *testing.T) {
 	batcher := &inflightRepairBatcher{runID: runID, repairSeq: 0}
 	src := bytes.Repeat([]byte("abcd"), 160)
 
-	if _, err := sendBlast(ctx, batcher, nil, nil, runID, bytes.NewReader(src), 4, 0, 0, true, 0, 0, nil, 0, TransferStats{}); err != nil {
+	if _, err := sendBlast(ctx, batcher, nil, nil, runID, bytes.NewReader(src), 4, 0, 0, true, 0, 0, nil, 0, nil, TransferStats{}); err != nil {
 		t.Fatalf("sendBlast() error = %v", err)
 	}
 
@@ -6122,7 +6189,7 @@ func TestServeBlastRepairsParallelUsesRepairPayloadQuietGrace(t *testing.T) {
 		batcher: batcher,
 		peer:    &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345},
 	}
-	stats, err := serveBlastRepairsParallel(ctx, []*blastParallelSendLane{lane}, runID, history, TransferStats{BytesSent: 1 << 30}, nil)
+	stats, err := serveBlastRepairsParallel(ctx, []*blastParallelSendLane{lane}, runID, history, TransferStats{BytesSent: 1 << 30}, nil, nil)
 	if err != nil {
 		t.Fatalf("serveBlastRepairsParallel() error = %v", err)
 	}
@@ -6153,7 +6220,7 @@ func TestServeBlastRepairsParallelDuplicateRequestsDoNotDelayCompletion(t *testi
 		peer:    &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345},
 	}
 	start := time.Now()
-	stats, err := serveBlastRepairsParallel(ctx, []*blastParallelSendLane{lane}, runID, history, TransferStats{BytesSent: 1 << 30}, nil)
+	stats, err := serveBlastRepairsParallel(ctx, []*blastParallelSendLane{lane}, runID, history, TransferStats{BytesSent: 1 << 30}, nil, nil)
 	if err != nil {
 		t.Fatalf("serveBlastRepairsParallel() error = %v", err)
 	}

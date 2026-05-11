@@ -128,6 +128,7 @@ type SendConfig struct {
 	StreamReplayWindowBytes    uint64
 	MaxActiveLanes             int
 	MinActiveLanes             int
+	Progress                   func(TransferStats)
 }
 
 type ReceiveConfig struct {
@@ -141,6 +142,7 @@ type ReceiveConfig struct {
 	FECGroupSize         int
 	SpoolOutput          bool
 	PacketAEAD           cipher.AEAD
+	Progress             func(TransferStats)
 }
 
 type TransferStats struct {
@@ -188,6 +190,13 @@ func (s *TransferStats) markComplete(now time.Time) {
 	s.CompletedAt = now
 }
 
+func emitProbeProgress(cb func(TransferStats), stats TransferStats) {
+	if cb == nil {
+		return
+	}
+	cb(stats)
+}
+
 func recordReplayWindowFullWait(stats *TransferStats, retainedBytes uint64, waited time.Duration) {
 	if stats == nil {
 		return
@@ -226,7 +235,7 @@ func Send(ctx context.Context, conn net.PacketConn, remoteAddr string, src io.Re
 	}
 	if cfg.Blast {
 		batcher = maybeConnectedBlastSendBatcher(conn, peer, batcher, cfg)
-		return sendBlast(ctx, batcher, conn, peer, runID, src, cfg.ChunkSize, cfg.RateMbps, cfg.RateCeilingMbps, cfg.RepairPayloads, cfg.TailReplayBytes, cfg.FECGroupSize, cfg.PacketAEAD, cfg.StreamReplayWindowBytes, stats)
+		return sendBlast(ctx, batcher, conn, peer, runID, src, cfg.ChunkSize, cfg.RateMbps, cfg.RateCeilingMbps, cfg.RepairPayloads, cfg.TailReplayBytes, cfg.FECGroupSize, cfg.PacketAEAD, cfg.StreamReplayWindowBytes, cfg.Progress, stats)
 	}
 	readBufs := newSizedBlastBatchReadBuffers(batcher.MaxBatch(), 64<<10)
 	return runReliableSendLoop(ctx, batcher, peer, &state, &stats, readBufs, retryInterval)
@@ -523,7 +532,7 @@ func (r *receiveLoop) handleFirstPacket(ctx context.Context, addr net.Addr, pack
 		return TransferStats{}, true, err
 	}
 	if r.cfg.Blast {
-		stats, err := receiveBlastData(ctx, r.conn, cloneAddr(addr), r.runID, r.dst, &r.stats, r.buf, r.cfg.PacketAEAD)
+		stats, err := receiveBlastData(ctx, r.conn, cloneAddr(addr), r.runID, r.dst, &r.stats, r.buf, r.cfg.PacketAEAD, r.cfg.Progress)
 		return stats, true, err
 	}
 	return TransferStats{}, false, nil
@@ -556,7 +565,7 @@ func (r *receiveLoop) handleEstablishedPacket(ctx context.Context, addr net.Addr
 
 func (r *receiveLoop) handleDataPacket(ctx context.Context, addr net.Addr, packet Packet) (TransferStats, bool, error) {
 	if r.cfg.Blast {
-		if err := writeBlastReceivePayload(r.dst, &r.stats, packet.Payload); err != nil {
+		if err := writeBlastReceivePayload(r.dst, &r.stats, packet.Payload, r.cfg.Progress); err != nil {
 			return TransferStats{}, true, err
 		}
 		return TransferStats{}, false, nil
@@ -573,7 +582,7 @@ func (r *receiveLoop) handleDataPacket(ctx context.Context, addr net.Addr, packe
 
 func (r *receiveLoop) acceptOrderedDataPacket(packet Packet) error {
 	if packet.Seq == r.expectedSeq {
-		if err := writeBlastReceivePayload(r.dst, &r.stats, packet.Payload); err != nil {
+		if err := writeBlastReceivePayload(r.dst, &r.stats, packet.Payload, r.cfg.Progress); err != nil {
 			return err
 		}
 		r.expectedSeq++
@@ -664,8 +673,8 @@ func (r *receiveLoop) sendPendingAck(ctx context.Context, addr net.Addr) error {
 	return nil
 }
 
-func sendBlast(ctx context.Context, batcher packetBatcher, conn net.PacketConn, peer net.Addr, runID [16]byte, src io.Reader, chunkSize int, rateMbps int, rateCeilingMbps int, repairPayloads bool, tailReplayBytes int, fecGroupSize int, packetAEAD cipher.AEAD, streamReplayWindowBytes uint64, stats TransferStats) (TransferStats, error) {
-	state, err := newBlastSendState(ctx, batcher, conn, peer, runID, chunkSize, rateMbps, rateCeilingMbps, repairPayloads, tailReplayBytes, fecGroupSize, packetAEAD, streamReplayWindowBytes, stats)
+func sendBlast(ctx context.Context, batcher packetBatcher, conn net.PacketConn, peer net.Addr, runID [16]byte, src io.Reader, chunkSize int, rateMbps int, rateCeilingMbps int, repairPayloads bool, tailReplayBytes int, fecGroupSize int, packetAEAD cipher.AEAD, streamReplayWindowBytes uint64, progress func(TransferStats), stats TransferStats) (TransferStats, error) {
+	state, err := newBlastSendState(ctx, batcher, conn, peer, runID, chunkSize, rateMbps, rateCeilingMbps, repairPayloads, tailReplayBytes, fecGroupSize, packetAEAD, streamReplayWindowBytes, progress, stats)
 	if err != nil {
 		return TransferStats{}, err
 	}
@@ -703,10 +712,11 @@ type blastSendState struct {
 	wireIndex         int
 	batchPayloadBytes uint64
 	backlogBudget     uint64
+	progress          func(TransferStats)
 	stats             TransferStats
 }
 
-func newBlastSendState(ctx context.Context, batcher packetBatcher, conn net.PacketConn, peer net.Addr, runID [16]byte, chunkSize int, rateMbps int, rateCeilingMbps int, repairPayloads bool, tailReplayBytes int, fecGroupSize int, packetAEAD cipher.AEAD, streamReplayWindowBytes uint64, stats TransferStats) (*blastSendState, error) {
+func newBlastSendState(ctx context.Context, batcher packetBatcher, conn net.PacketConn, peer net.Addr, runID [16]byte, chunkSize int, rateMbps int, rateCeilingMbps int, repairPayloads bool, tailReplayBytes int, fecGroupSize int, packetAEAD cipher.AEAD, streamReplayWindowBytes uint64, progress func(TransferStats), stats TransferStats) (*blastSendState, error) {
 	if chunkSize <= 0 {
 		chunkSize = defaultChunkSize
 	}
@@ -741,7 +751,8 @@ func newBlastSendState(ctx context.Context, batcher packetBatcher, conn net.Pack
 			RateCeilingMbps:         rateCeilingMbps,
 			StreamReplayWindowBytes: streamReplayWindowBytes,
 		}),
-		stats: stats,
+		progress: progress,
+		stats:    stats,
 	}
 	state.initBuffers(pacedBatchLimit(normalizedBlastSendBatchLimit(batcher), chunkSize, control.RateMbps()))
 	state.startControlReader(ctx)
@@ -883,6 +894,7 @@ func (s *blastSendState) appendPayload(ctx context.Context, payload []byte) erro
 	s.batchPayloadBytes += uint64(len(payload))
 	s.stats.PacketsSent++
 	s.stats.BytesSent += int64(len(payload))
+	emitProbeProgress(s.progress, s.stats)
 	if parity := s.fec.Record(s.seq, s.offset, payloadBuf); parity != nil {
 		s.packetBatch = append(s.packetBatch, parity)
 		s.stats.PacketsSent++
@@ -947,7 +959,7 @@ func (s *blastSendState) flushPacketBatch(ctx context.Context) error {
 	drainControl := func() (bool, error) {
 		return s.drainControlWithContext(ctx)
 	}
-	return flushBlastPacketBatch(ctx, s.batcher, s.peer, &s.packetBatch, s.control, s.pacer, s.batchPayloadBytes, s.offset, s.rateMbps, s.startedAt, &s.stats, drainControl, s.runID, s.history, s.repairDeduper, s.repairReadBufs, &s.wireIndex, &s.batchPayloadBytes)
+	return flushBlastPacketBatch(ctx, s.batcher, s.peer, &s.packetBatch, s.control, s.pacer, s.batchPayloadBytes, s.offset, s.rateMbps, s.startedAt, &s.stats, drainControl, s.runID, s.history, s.repairDeduper, s.repairReadBufs, &s.wireIndex, &s.batchPayloadBytes, s.progress)
 }
 
 func (s *blastSendState) addReplayPacket(ctx context.Context, payload []byte) ([]byte, error) {
@@ -957,7 +969,7 @@ func (s *blastSendState) addReplayPacket(ctx context.Context, payload []byte) ([
 	flushPacketBatch := func() error {
 		return s.flushPacketBatch(ctx)
 	}
-	return addBlastReplayPacket(ctx, s.history, s.seq, s.offset, payload, flushPacketBatch, s.control, drainControl, s.runID, &s.stats)
+	return addBlastReplayPacket(ctx, s.history, s.seq, s.offset, payload, flushPacketBatch, s.control, drainControl, s.runID, &s.stats, s.progress)
 }
 
 func (s *blastSendState) observeReceiverBacklog() {
@@ -1000,7 +1012,7 @@ func (s *blastSendState) finish(ctx context.Context) (TransferStats, error) {
 		return s.stats, nil
 	}
 	s.stopControlReader()
-	return serveBlastRepairs(ctx, s.batcher, s.peer, s.runID, s.history, s.stats)
+	return serveBlastRepairs(ctx, s.batcher, s.peer, s.runID, s.history, s.stats, s.progress)
 }
 
 func (s *blastSendState) flushFEC(ctx context.Context) error {
@@ -1025,6 +1037,7 @@ func (s *blastSendState) sendTailReplay(ctx context.Context) error {
 	}
 	s.stats.PacketsSent += int64(len(packets))
 	s.stats.Retransmits += int64(len(packets))
+	emitProbeProgress(s.progress, s.stats)
 	return nil
 }
 
@@ -1051,17 +1064,21 @@ func (s *blastSendState) drainDoneControl(ctx context.Context) (bool, error) {
 }
 
 func (s *blastSendState) drainControlWithContext(ctx context.Context) (bool, error) {
-	complete, err := drainBlastSendControlEvents(ctx, s.batcher, s.peer, s.history, &s.stats, s.repairDeduper, s.control, s.controlEvents)
+	complete, err := drainBlastSendControlEvents(ctx, s.batcher, s.peer, s.history, &s.stats, s.repairDeduper, s.control, s.controlEvents, s.progress)
 	if err != nil {
 		return complete, err
 	}
+	beforeReplayBytes := s.stats.MaxReplayBytes
 	s.history.AckFloor(s.control.AckFloor())
 	s.stats.MaxReplayBytes = max(s.stats.MaxReplayBytes, s.history.MaxReplayBytes())
+	if s.stats.MaxReplayBytes != beforeReplayBytes {
+		emitProbeProgress(s.progress, s.stats)
+	}
 	s.observeReceiverBacklog()
 	return complete, nil
 }
 
-func flushBlastPacketBatch(ctx context.Context, batcher packetBatcher, peer net.Addr, packetBatch *[][]byte, control *blastSendControl, pacer *blastPacer, batchPayloadBytes uint64, offset uint64, rateMbps int, startedAt time.Time, stats *TransferStats, drainControl func() (bool, error), runID [16]byte, history *blastRepairHistory, repairDeduper *blastRepairDeduper, repairReadBufs []batchReadBuffer, wireIndex *int, batchPayloadBytesOut *uint64) error {
+func flushBlastPacketBatch(ctx context.Context, batcher packetBatcher, peer net.Addr, packetBatch *[][]byte, control *blastSendControl, pacer *blastPacer, batchPayloadBytes uint64, offset uint64, rateMbps int, startedAt time.Time, stats *TransferStats, drainControl func() (bool, error), runID [16]byte, history *blastRepairHistory, repairDeduper *blastRepairDeduper, repairReadBufs []batchReadBuffer, wireIndex *int, batchPayloadBytesOut *uint64, progress func(TransferStats)) error {
 	if len(*packetBatch) == 0 {
 		return nil
 	}
@@ -1087,7 +1104,7 @@ func flushBlastPacketBatch(ctx context.Context, batcher packetBatcher, peer net.
 		if complete {
 			sessionTracef("blast repair complete received before sender EOF run=%x", runID[:4])
 		}
-	} else if _, err := serviceBlastRepairRequests(ctx, batcher, peer, runID, history, stats, repairDeduper, repairReadBufs, 0, nil); err != nil {
+	} else if _, err := serviceBlastRepairRequests(ctx, batcher, peer, runID, history, stats, repairDeduper, repairReadBufs, 0, nil, progress); err != nil {
 		return err
 	}
 	*packetBatch = (*packetBatch)[:0]
@@ -1096,26 +1113,26 @@ func flushBlastPacketBatch(ctx context.Context, batcher packetBatcher, peer net.
 	return nil
 }
 
-func addBlastReplayPacket(ctx context.Context, history *blastRepairHistory, seq uint64, offset uint64, payload []byte, flushPacketBatch func() error, control *blastSendControl, drainControl func() (bool, error), runID [16]byte, stats *TransferStats) ([]byte, error) {
+func addBlastReplayPacket(ctx context.Context, history *blastRepairHistory, seq uint64, offset uint64, payload []byte, flushPacketBatch func() error, control *blastSendControl, drainControl func() (bool, error), runID [16]byte, stats *TransferStats, progress func(TransferStats)) ([]byte, error) {
 	for {
 		wire, err := history.streamReplay.AddDataPacket(0, seq, offset, payload)
 		if !errors.Is(err, errStreamReplayWindowFull) {
 			return wire, err
 		}
-		if err := waitForBlastReplayWindow(ctx, history, flushPacketBatch, control, drainControl, runID, stats); err != nil {
+		if err := waitForBlastReplayWindow(ctx, history, flushPacketBatch, control, drainControl, runID, stats, progress); err != nil {
 			return nil, err
 		}
 	}
 }
 
-func waitForBlastReplayWindow(ctx context.Context, history *blastRepairHistory, flushPacketBatch func() error, control *blastSendControl, drainControl func() (bool, error), runID [16]byte, stats *TransferStats) error {
+func waitForBlastReplayWindow(ctx context.Context, history *blastRepairHistory, flushPacketBatch func() error, control *blastSendControl, drainControl func() (bool, error), runID [16]byte, stats *TransferStats, progress func(TransferStats)) error {
 	if err := flushAndDrainBlastReplayWindow(flushPacketBatch, control, drainControl, runID); err != nil {
 		return err
 	}
 	if !blastReplayWindowFull(history) {
 		return nil
 	}
-	return pauseForBlastReplayWindow(ctx, history, control, stats)
+	return pauseForBlastReplayWindow(ctx, history, control, stats, progress)
 }
 
 func flushAndDrainBlastReplayWindow(flushPacketBatch func() error, control *blastSendControl, drainControl func() (bool, error), runID [16]byte) error {
@@ -1129,13 +1146,14 @@ func blastReplayWindowFull(history *blastRepairHistory) bool {
 	return history.streamReplay != nil && history.streamReplay.RetainedBytes() >= history.streamReplay.MaxBytes()
 }
 
-func pauseForBlastReplayWindow(ctx context.Context, history *blastRepairHistory, control *blastSendControl, stats *TransferStats) error {
+func pauseForBlastReplayWindow(ctx context.Context, history *blastRepairHistory, control *blastSendControl, stats *TransferStats, progress func(TransferStats)) error {
 	waitStart := time.Now()
 	observeBlastReplayWindowPressure(control, history, waitStart)
 	if err := sleepWithContext(ctx, blastRepairInterval); err != nil {
 		return err
 	}
 	recordReplayWindowFullWait(stats, history.streamReplay.RetainedBytes(), time.Since(waitStart))
+	emitProbeProgress(progress, *stats)
 	return nil
 }
 
@@ -1159,7 +1177,7 @@ func drainBlastReplayControl(control *blastSendControl, drainControl func() (boo
 	return nil
 }
 
-func serviceBlastRepairRequests(ctx context.Context, batcher packetBatcher, peer net.Addr, runID [16]byte, history *blastRepairHistory, stats *TransferStats, deduper *blastRepairDeduper, readBufs []batchReadBuffer, timeout time.Duration, control *blastSendControl) (bool, error) {
+func serviceBlastRepairRequests(ctx context.Context, batcher packetBatcher, peer net.Addr, runID [16]byte, history *blastRepairHistory, stats *TransferStats, deduper *blastRepairDeduper, readBufs []batchReadBuffer, timeout time.Duration, control *blastSendControl, progress func(TransferStats)) (bool, error) {
 	if batcher == nil || history == nil || len(readBufs) == 0 {
 		return false, nil
 	}
@@ -1170,7 +1188,7 @@ func serviceBlastRepairRequests(ctx context.Context, batcher packetBatcher, peer
 	repaired := false
 	now := time.Now()
 	for i := 0; i < n; i++ {
-		repairHandled, err := serviceBlastRepairPacket(ctx, batcher, peer, runID, history, stats, deduper, control, now, readBufs[i].Bytes[:readBufs[i].N])
+		repairHandled, err := serviceBlastRepairPacket(ctx, batcher, peer, runID, history, stats, deduper, control, now, readBufs[i].Bytes[:readBufs[i].N], progress)
 		if err != nil {
 			return repaired, err
 		}
@@ -1192,14 +1210,14 @@ func serviceBlastRepairReadError(ctx context.Context, err error) error {
 	return nil
 }
 
-func serviceBlastRepairPacket(ctx context.Context, batcher packetBatcher, peer net.Addr, runID [16]byte, history *blastRepairHistory, stats *TransferStats, deduper *blastRepairDeduper, control *blastSendControl, now time.Time, packet []byte) (bool, error) {
+func serviceBlastRepairPacket(ctx context.Context, batcher packetBatcher, peer net.Addr, runID [16]byte, history *blastRepairHistory, stats *TransferStats, deduper *blastRepairDeduper, control *blastSendControl, now time.Time, packet []byte, progress func(TransferStats)) (bool, error) {
 	packetType, payload, packetRunID, _, _, ok := decodeBlastPacketFull(packet)
 	if !ok || packetRunID != runID {
 		return false, nil
 	}
 	switch packetType {
 	case PacketTypeRepairRequest:
-		retransmits, err := sendBlastRepairs(ctx, batcher, peer, history, payload, stats, deduper, now)
+		retransmits, err := sendBlastRepairs(ctx, batcher, peer, history, payload, stats, deduper, now, progress)
 		if err != nil {
 			return true, err
 		}
@@ -1447,6 +1465,7 @@ func SendBlastParallel(ctx context.Context, conns []net.PacketConn, remoteAddrs 
 		activeLanes:           &activeLanes,
 		offset:                &offset,
 		receiverBacklogBudget: receiverBacklogBudget,
+		progress:              cfg.Progress,
 	}
 	readErr = (&blastParallelSendReadLoop{
 		ctx:                    ctx,
@@ -1469,6 +1488,7 @@ func SendBlastParallel(ctx context.Context, conns []net.PacketConn, remoteAddrs 
 		waitForReceiverBacklog: controlRuntime.waitForReceiverBacklog,
 		updateLaneRates:        controlRuntime.updateLaneRates,
 		addParallelPacket:      controlRuntime.addParallelPacket,
+		progress:               cfg.Progress,
 	}).run()
 	return (&blastParallelSendCompletion{
 		ctx:               ctx,
@@ -1489,6 +1509,7 @@ func SendBlastParallel(ctx context.Context, conns []net.PacketConn, remoteAddrs 
 		seq:               seq,
 		offset:            offset,
 		stopControlReader: stopControlReader,
+		progress:          cfg.Progress,
 	}).finish(readErr)
 }
 
@@ -1511,6 +1532,7 @@ type blastParallelSendCompletion struct {
 	seq               uint64
 	offset            uint64
 	stopControlReader func()
+	progress          func(TransferStats)
 }
 
 func (c *blastParallelSendCompletion) finish(readErr error) (TransferStats, error) {
@@ -1651,6 +1673,7 @@ func (c *blastParallelSendCompletion) replayTailPackets() error {
 	}
 	c.stats.PacketsSent += int64(len(packets))
 	c.stats.Retransmits += int64(len(packets))
+	emitProbeProgress(c.progress, *c.stats)
 	return nil
 }
 
@@ -1670,7 +1693,7 @@ func (c *blastParallelSendCompletion) lingerDoneAndServeRepairs() (TransferStats
 		return c.completedStats(true), nil
 	}
 	c.stopControlReader()
-	return serveBlastRepairsParallel(c.ctx, c.lanes, c.runID, c.history, *c.stats, c.resendTerminal)
+	return serveBlastRepairsParallel(c.ctx, c.lanes, c.runID, c.history, *c.stats, c.resendTerminal, c.progress)
 }
 
 func (c *blastParallelSendCompletion) lingerDonePackets() (bool, error) {
@@ -2031,6 +2054,7 @@ type blastParallelSendControlRuntime struct {
 	activeLanes           *int
 	offset                *uint64
 	receiverBacklogBudget uint64
+	progress              func(TransferStats)
 }
 
 func (r *blastParallelSendControlRuntime) setSentPayloadBytes() {
@@ -2050,10 +2074,14 @@ func (r *blastParallelSendControlRuntime) updateLaneRates() {
 }
 
 func (r *blastParallelSendControlRuntime) applyControlAck() {
+	beforeReplayBytes := r.stats.MaxReplayBytes
 	r.history.AckFloor(r.control.AckFloor())
 	r.stats.MaxReplayBytes = max(r.stats.MaxReplayBytes, r.history.MaxReplayBytes())
 	if r.stripedBlast {
 		r.applyStripedControlAck()
+	}
+	if r.stats.MaxReplayBytes != beforeReplayBytes {
+		emitProbeProgress(r.progress, *r.stats)
 	}
 }
 
@@ -2099,7 +2127,7 @@ func (r *blastParallelSendControlRuntime) handleControlEvent(event blastParallel
 	if r.handleStripedStatsEvent(event, eventHistory) {
 		return false, nil
 	}
-	eventComplete, _, err := handleBlastSendControlEvent(r.ctx, event.lane.batcher, event.lane.peer, eventHistory, r.stats, blastParallelRepairDeduperForEvent(r.repairDeduper, event.lane, repairLane), r.control, event.event)
+	eventComplete, _, err := handleBlastSendControlEvent(r.ctx, event.lane.batcher, event.lane.peer, eventHistory, r.stats, blastParallelRepairDeduperForEvent(r.repairDeduper, event.lane, repairLane), r.control, event.event, r.progress)
 	return eventComplete, err
 }
 
@@ -2121,7 +2149,11 @@ func (r *blastParallelSendControlRuntime) handleStripedStatsEvent(event blastPar
 		return false
 	}
 	sessionTracef("blast stats receive stripe=%d rx_payload_len=%d", event.event.stripe, len(event.event.payload))
+	beforeReplayBytes := r.stats.MaxReplayBytes
 	observeStripedBlastStatsEvent(r.stats, eventHistory, r.control, event.event)
+	if r.stats.MaxReplayBytes != beforeReplayBytes {
+		emitProbeProgress(r.progress, *r.stats)
+	}
 	return true
 }
 
@@ -2189,6 +2221,7 @@ func (r *blastParallelSendControlRuntime) sleepForReplayWindow(packetHistory *bl
 		return err
 	}
 	recordReplayWindowFullWait(r.stats, packetHistory.streamReplay.RetainedBytes(), time.Since(waitStart))
+	emitProbeProgress(r.progress, *r.stats)
 	return nil
 }
 
@@ -2213,6 +2246,7 @@ type blastParallelSendReadLoop struct {
 	waitForReceiverBacklog func() (bool, error)
 	updateLaneRates        func()
 	addParallelPacket      func(*blastRepairHistory, uint16, uint64, uint64, []byte) ([]byte, error)
+	progress               func(TransferStats)
 }
 
 type blastParallelSendChunkTarget struct {
@@ -2365,6 +2399,7 @@ func (r *blastParallelSendReadLoop) observeQueueReplayPressure(packetHistory *bl
 func (r *blastParallelSendReadLoop) recordPayloadStats(payloadLen int) {
 	r.stats.PacketsSent++
 	r.stats.BytesSent += int64(payloadLen)
+	emitProbeProgress(r.progress, *r.stats)
 }
 
 func (r *blastParallelSendReadLoop) recordPayloadFEC(target blastParallelSendChunkTarget, payload []byte) error {
@@ -3017,7 +3052,7 @@ type blastParallelRepairEvent struct {
 	err     error
 }
 
-func serveBlastRepairsParallel(ctx context.Context, lanes []*blastParallelSendLane, runID [16]byte, history *blastRepairHistory, stats TransferStats, resendTerminal func()) (TransferStats, error) {
+func serveBlastRepairsParallel(ctx context.Context, lanes []*blastParallelSendLane, runID [16]byte, history *blastRepairHistory, stats TransferStats, resendTerminal func(), progress func(TransferStats)) (TransferStats, error) {
 	if len(lanes) == 0 {
 		stats.markComplete(time.Now())
 		return stats, nil
@@ -3029,7 +3064,7 @@ func serveBlastRepairsParallel(ctx context.Context, lanes []*blastParallelSendLa
 	defer waitReaders()
 	state := newBlastParallelRepairServeState()
 	defer state.Close()
-	return state.run(ctx, cancel, lanes, history, stats, resendTerminal, events)
+	return state.run(ctx, cancel, lanes, history, stats, resendTerminal, events, progress)
 }
 
 func startBlastParallelRepairReaders(ctx context.Context, lanes []*blastParallelSendLane, runID [16]byte, events chan<- blastParallelRepairEvent) func() {
@@ -3073,7 +3108,7 @@ func (s *blastParallelRepairServeState) Close() {
 	s.doneTicker.Stop()
 }
 
-func (s *blastParallelRepairServeState) run(ctx context.Context, cancel context.CancelFunc, lanes []*blastParallelSendLane, history *blastRepairHistory, stats TransferStats, resendTerminal func(), events <-chan blastParallelRepairEvent) (TransferStats, error) {
+func (s *blastParallelRepairServeState) run(ctx context.Context, cancel context.CancelFunc, lanes []*blastParallelSendLane, history *blastRepairHistory, stats TransferStats, resendTerminal func(), events <-chan blastParallelRepairEvent, progress func(TransferStats)) (TransferStats, error) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -3083,7 +3118,7 @@ func (s *blastParallelRepairServeState) run(ctx context.Context, cancel context.
 		case <-s.doneTicker.C:
 			resendBlastTerminal(resendTerminal)
 		case event := <-events:
-			nextStats, done, err := s.handleEvent(ctx, cancel, lanes, history, stats, event)
+			nextStats, done, err := s.handleEvent(ctx, cancel, lanes, history, stats, event, progress)
 			if err != nil || done {
 				return nextStats, err
 			}
@@ -3104,7 +3139,7 @@ func (s *blastParallelRepairServeState) complete(stats TransferStats, cancel con
 	return stats
 }
 
-func (s *blastParallelRepairServeState) handleEvent(ctx context.Context, cancel context.CancelFunc, lanes []*blastParallelSendLane, history *blastRepairHistory, stats TransferStats, event blastParallelRepairEvent) (TransferStats, bool, error) {
+func (s *blastParallelRepairServeState) handleEvent(ctx context.Context, cancel context.CancelFunc, lanes []*blastParallelSendLane, history *blastRepairHistory, stats TransferStats, event blastParallelRepairEvent, progress func(TransferStats)) (TransferStats, bool, error) {
 	if event.err != nil {
 		return TransferStats{}, true, event.err
 	}
@@ -3112,13 +3147,13 @@ func (s *blastParallelRepairServeState) handleEvent(ctx context.Context, cancel 
 	case PacketTypeRepairComplete:
 		return s.complete(stats, cancel), true, nil
 	case PacketTypeRepairRequest:
-		return s.handleRepairRequest(ctx, cancel, lanes, history, stats, event)
+		return s.handleRepairRequest(ctx, cancel, lanes, history, stats, event, progress)
 	default:
 		return stats, false, nil
 	}
 }
 
-func (s *blastParallelRepairServeState) handleRepairRequest(ctx context.Context, cancel context.CancelFunc, lanes []*blastParallelSendLane, history *blastRepairHistory, stats TransferStats, event blastParallelRepairEvent) (TransferStats, bool, error) {
+func (s *blastParallelRepairServeState) handleRepairRequest(ctx context.Context, cancel context.CancelFunc, lanes []*blastParallelSendLane, history *blastRepairHistory, stats TransferStats, event blastParallelRepairEvent, progress func(TransferStats)) (TransferStats, bool, error) {
 	now := time.Now()
 	if now.After(s.quietDeadline) {
 		return s.completeAt(stats, cancel, now), true, nil
@@ -3129,7 +3164,7 @@ func (s *blastParallelRepairServeState) handleRepairRequest(ctx context.Context,
 	}
 	repairHistory, repairLane := blastParallelRepairEventHistory(lanes, history, event)
 	s.hadRepair = s.hadRepair || repairHistory.CanRepair()
-	retransmits, err := sendBlastRepairs(ctx, event.lane.batcher, event.lane.peer, repairHistory, event.payload, &stats, blastParallelRepairDeduperForEvent(s.deduper, event.lane, repairLane), now)
+	retransmits, err := sendBlastRepairs(ctx, event.lane.batcher, event.lane.peer, repairHistory, event.payload, &stats, blastParallelRepairDeduperForEvent(s.deduper, event.lane, repairLane), now, progress)
 	if err != nil {
 		return TransferStats{}, true, err
 	}
@@ -3787,7 +3822,7 @@ func (h *blastRepairHistory) readPayloadAt(dst []byte, offset uint64) {
 	}
 }
 
-func serveBlastRepairs(ctx context.Context, batcher packetBatcher, peer net.Addr, runID [16]byte, history *blastRepairHistory, stats TransferStats) (TransferStats, error) {
+func serveBlastRepairs(ctx context.Context, batcher packetBatcher, peer net.Addr, runID [16]byte, history *blastRepairHistory, stats TransferStats, progress func(TransferStats)) (TransferStats, error) {
 	if batcher == nil {
 		stats.markComplete(time.Now())
 		return stats, nil
@@ -3807,7 +3842,7 @@ func serveBlastRepairs(ctx context.Context, batcher packetBatcher, peer net.Addr
 			}
 			continue
 		}
-		done, err := state.processBatch(ctx, batcher, peer, runID, history, &stats, readBufs[:n])
+		done, err := state.processBatch(ctx, batcher, peer, runID, history, &stats, readBufs[:n], progress)
 		if err != nil {
 			return TransferStats{}, err
 		}
@@ -3842,9 +3877,9 @@ func (s *blastRepairServeState) nextReadWait(history *blastRepairHistory) (time.
 	return wait, complete && wait <= 0
 }
 
-func (s *blastRepairServeState) processBatch(ctx context.Context, batcher packetBatcher, peer net.Addr, runID [16]byte, history *blastRepairHistory, stats *TransferStats, readBufs []batchReadBuffer) (bool, error) {
+func (s *blastRepairServeState) processBatch(ctx context.Context, batcher packetBatcher, peer net.Addr, runID [16]byte, history *blastRepairHistory, stats *TransferStats, readBufs []batchReadBuffer, progress func(TransferStats)) (bool, error) {
 	for i := range readBufs {
-		done, err := s.processBuffer(ctx, batcher, peer, runID, history, stats, readBufs[i])
+		done, err := s.processBuffer(ctx, batcher, peer, runID, history, stats, readBufs[i], progress)
 		if err != nil || done {
 			return done, err
 		}
@@ -3852,7 +3887,7 @@ func (s *blastRepairServeState) processBatch(ctx context.Context, batcher packet
 	return false, nil
 }
 
-func (s *blastRepairServeState) processBuffer(ctx context.Context, batcher packetBatcher, peer net.Addr, runID [16]byte, history *blastRepairHistory, stats *TransferStats, readBuf batchReadBuffer) (bool, error) {
+func (s *blastRepairServeState) processBuffer(ctx context.Context, batcher packetBatcher, peer net.Addr, runID [16]byte, history *blastRepairHistory, stats *TransferStats, readBuf batchReadBuffer, progress func(TransferStats)) (bool, error) {
 	packetType, payload, packetRunID, _, _, ok := decodeBlastPacketFull(readBuf.Bytes[:readBuf.N])
 	if !ok || packetRunID != runID {
 		return false, nil
@@ -3862,18 +3897,18 @@ func (s *blastRepairServeState) processBuffer(ctx context.Context, batcher packe
 		stats.markComplete(time.Now())
 		return true, nil
 	case PacketTypeRepairRequest:
-		return false, s.handleRepairRequest(ctx, batcher, peer, history, stats, payload)
+		return false, s.handleRepairRequest(ctx, batcher, peer, history, stats, payload, progress)
 	default:
 		return false, nil
 	}
 }
 
-func (s *blastRepairServeState) handleRepairRequest(ctx context.Context, batcher packetBatcher, peer net.Addr, history *blastRepairHistory, stats *TransferStats, payload []byte) error {
+func (s *blastRepairServeState) handleRepairRequest(ctx context.Context, batcher packetBatcher, peer net.Addr, history *blastRepairHistory, stats *TransferStats, payload []byte, progress func(TransferStats)) error {
 	s.hadRepair = s.hadRepair || history.CanRepair()
 	if history.Complete() {
 		s.quietDeadline = time.Now().Add(blastRepairQuietGraceForExpectedBytes(history.TotalBytes(), s.hadRepair))
 	}
-	_, err := sendBlastRepairs(ctx, batcher, peer, history, payload, stats, s.deduper, time.Now())
+	_, err := sendBlastRepairs(ctx, batcher, peer, history, payload, stats, s.deduper, time.Now(), progress)
 	return err
 }
 
@@ -3899,7 +3934,7 @@ func (d *blastRepairDeduper) ShouldSend(seq uint64, now time.Time) bool {
 	return true
 }
 
-func sendBlastRepairs(ctx context.Context, batcher packetBatcher, peer net.Addr, history *blastRepairHistory, payload []byte, stats *TransferStats, deduper *blastRepairDeduper, now time.Time) (int, error) {
+func sendBlastRepairs(ctx context.Context, batcher packetBatcher, peer net.Addr, history *blastRepairHistory, payload []byte, stats *TransferStats, deduper *blastRepairDeduper, now time.Time, progress func(TransferStats)) (int, error) {
 	if len(payload) < 8 {
 		return 0, nil
 	}
@@ -3916,7 +3951,7 @@ func sendBlastRepairs(ctx context.Context, batcher packetBatcher, peer net.Addr,
 		}
 		pending = append(pending, packet)
 		if len(pending) == batcher.MaxBatch() {
-			written, err := flushBlastRepairPackets(ctx, batcher, peer, pending, stats)
+			written, err := flushBlastRepairPackets(ctx, batcher, peer, pending, stats, progress)
 			if err != nil {
 				return retransmits, err
 			}
@@ -3928,7 +3963,7 @@ func sendBlastRepairs(ctx context.Context, batcher packetBatcher, peer net.Addr,
 		traceBlastRepairRequest(repairStats, retransmits)
 		return retransmits, nil
 	}
-	written, err := flushBlastRepairPackets(ctx, batcher, peer, pending, stats)
+	written, err := flushBlastRepairPackets(ctx, batcher, peer, pending, stats, progress)
 	if err != nil {
 		return retransmits, err
 	}
@@ -3956,13 +3991,14 @@ func blastRepairPacketForRequest(seq uint64, history *blastRepairHistory, dedupe
 	return packet, true
 }
 
-func flushBlastRepairPackets(ctx context.Context, batcher packetBatcher, peer net.Addr, pending [][]byte, stats *TransferStats) (int, error) {
+func flushBlastRepairPackets(ctx context.Context, batcher packetBatcher, peer net.Addr, pending [][]byte, stats *TransferStats, progress func(TransferStats)) (int, error) {
 	if err := writeBlastBatch(ctx, batcher, peer, pending); err != nil {
 		return 0, err
 	}
 	if stats != nil {
 		stats.Retransmits += int64(len(pending))
 		stats.PacketsSent += int64(len(pending))
+		emitProbeProgress(progress, *stats)
 	}
 	return len(pending), nil
 }
@@ -3986,13 +4022,13 @@ func paceBlastSend(ctx context.Context, startedAt time.Time, bytesSent uint64, r
 	return sleepWithContext(ctx, sleepFor)
 }
 
-func receiveBlastData(ctx context.Context, conn net.PacketConn, peer net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, buf []byte, packetAEAD cipher.AEAD) (TransferStats, error) {
+func receiveBlastData(ctx context.Context, conn net.PacketConn, peer net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, buf []byte, packetAEAD cipher.AEAD, progress func(TransferStats)) (TransferStats, error) {
 	batcher := newPacketBatcher(conn, stats.Transport.RequestedKind)
 	stats.Transport = batcher.Capabilities()
 	if udpConn, ok := blastUDPReceiveFastPath(conn, batcher); ok {
-		return receiveBlastDataUDP(ctx, udpConn, peer, runID, dst, stats, buf, packetAEAD)
+		return receiveBlastDataUDP(ctx, udpConn, peer, runID, dst, stats, buf, packetAEAD, progress)
 	}
-	return receiveBlastDataBatched(ctx, conn, batcher, peer, runID, dst, stats, buf, packetAEAD)
+	return receiveBlastDataBatched(ctx, conn, batcher, peer, runID, dst, stats, buf, packetAEAD, progress)
 }
 
 func blastUDPReceiveFastPath(conn net.PacketConn, batcher packetBatcher) (*net.UDPConn, bool) {
@@ -4006,10 +4042,10 @@ func blastUDPReceiveFastPath(conn net.PacketConn, batcher packetBatcher) (*net.U
 	return udpConn, true
 }
 
-func receiveBlastDataBatched(ctx context.Context, conn net.PacketConn, batcher packetBatcher, peer net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, buf []byte, packetAEAD cipher.AEAD) (TransferStats, error) {
+func receiveBlastDataBatched(ctx context.Context, conn net.PacketConn, batcher packetBatcher, peer net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, buf []byte, packetAEAD cipher.AEAD, progress func(TransferStats)) (TransferStats, error) {
 	readBufs := newSizedBlastBatchReadBuffers(batcher.MaxBatch(), len(buf))
 	for {
-		complete, err := receiveBlastDataBatch(ctx, conn, batcher, peer, runID, dst, stats, readBufs, packetAEAD)
+		complete, err := receiveBlastDataBatch(ctx, conn, batcher, peer, runID, dst, stats, readBufs, packetAEAD, progress)
 		if err != nil {
 			return TransferStats{}, err
 		}
@@ -4019,12 +4055,12 @@ func receiveBlastDataBatched(ctx context.Context, conn net.PacketConn, batcher p
 	}
 }
 
-func receiveBlastDataBatch(ctx context.Context, conn net.PacketConn, batcher packetBatcher, peer net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, readBufs []batchReadBuffer, packetAEAD cipher.AEAD) (bool, error) {
+func receiveBlastDataBatch(ctx context.Context, conn net.PacketConn, batcher packetBatcher, peer net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, readBufs []batchReadBuffer, packetAEAD cipher.AEAD, progress func(TransferStats)) (bool, error) {
 	n, err := batcher.ReadBatch(ctx, blastReadPoll, readBufs)
 	if err != nil {
 		return false, ignoredBlastReceiveReadError(ctx, err)
 	}
-	return processBlastReceiveBatch(ctx, conn, batcher, peer, runID, dst, stats, readBufs[:n], packetAEAD)
+	return processBlastReceiveBatch(ctx, conn, batcher, peer, runID, dst, stats, readBufs[:n], packetAEAD, progress)
 }
 
 func ignoredBlastReceiveReadError(ctx context.Context, err error) error {
@@ -4055,9 +4091,9 @@ func handleBlastReceiveReadError(ctx context.Context, err error) (bool, error) {
 	return false, nil
 }
 
-func processBlastReceiveBatch(ctx context.Context, helloConn net.PacketConn, batcher packetBatcher, peer net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, readBufs []batchReadBuffer, packetAEAD cipher.AEAD) (bool, error) {
+func processBlastReceiveBatch(ctx context.Context, helloConn net.PacketConn, batcher packetBatcher, peer net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, readBufs []batchReadBuffer, packetAEAD cipher.AEAD, progress func(TransferStats)) (bool, error) {
 	for i := range readBufs {
-		complete, err := processBlastReceiveBuffer(ctx, helloConn, batcher, peer, runID, dst, stats, readBufs[i], packetAEAD)
+		complete, err := processBlastReceiveBuffer(ctx, helloConn, batcher, peer, runID, dst, stats, readBufs[i], packetAEAD, progress)
 		if err != nil || complete {
 			return complete, err
 		}
@@ -4065,7 +4101,7 @@ func processBlastReceiveBatch(ctx context.Context, helloConn net.PacketConn, bat
 	return false, nil
 }
 
-func processBlastReceiveBuffer(ctx context.Context, helloConn net.PacketConn, batcher packetBatcher, peer net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, readBuf batchReadBuffer, packetAEAD cipher.AEAD) (bool, error) {
+func processBlastReceiveBuffer(ctx context.Context, helloConn net.PacketConn, batcher packetBatcher, peer net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, readBuf batchReadBuffer, packetAEAD cipher.AEAD, progress func(TransferStats)) (bool, error) {
 	if peer != nil && !sameAddr(readBuf.Addr, peer) {
 		return false, nil
 	}
@@ -4073,15 +4109,15 @@ func processBlastReceiveBuffer(ctx context.Context, helloConn net.PacketConn, ba
 	if !ok || packetRunID != runID {
 		return false, nil
 	}
-	return processBlastReceivePacket(ctx, helloConn, batcher, readBuf.Addr, runID, dst, stats, packetType, payload)
+	return processBlastReceivePacket(ctx, helloConn, batcher, readBuf.Addr, runID, dst, stats, packetType, payload, progress)
 }
 
-func processBlastReceivePacket(ctx context.Context, helloConn net.PacketConn, batcher packetBatcher, addr net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, packetType PacketType, payload []byte) (bool, error) {
+func processBlastReceivePacket(ctx context.Context, helloConn net.PacketConn, batcher packetBatcher, addr net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, packetType PacketType, payload []byte, progress func(TransferStats)) (bool, error) {
 	switch packetType {
 	case PacketTypeHello:
 		return false, sendHelloAck(ctx, helloConn, addr, runID, 0, 1)
 	case PacketTypeData:
-		return false, writeBlastReceivePayload(dst, stats, payload)
+		return false, writeBlastReceivePayload(dst, stats, payload, progress)
 	case PacketTypeDone:
 		if err := sendRepairComplete(ctx, batcher, addr, runID); err != nil {
 			return false, err
@@ -4093,7 +4129,7 @@ func processBlastReceivePacket(ctx context.Context, helloConn net.PacketConn, ba
 	}
 }
 
-func writeBlastReceivePayload(dst io.Writer, stats *TransferStats, payload []byte) error {
+func writeBlastReceivePayload(dst io.Writer, stats *TransferStats, payload []byte, progress func(TransferStats)) error {
 	if stats.FirstByteAt.IsZero() && len(payload) > 0 {
 		stats.FirstByteAt = time.Now()
 	}
@@ -4106,10 +4142,11 @@ func writeBlastReceivePayload(dst io.Writer, stats *TransferStats, payload []byt
 	}
 	stats.BytesReceived += int64(written)
 	stats.observePeakGoodput(time.Now(), stats.BytesReceived)
+	emitProbeProgress(progress, *stats)
 	return nil
 }
 
-func receiveBlastDataUDP(ctx context.Context, conn *net.UDPConn, peer net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, buf []byte, packetAEAD cipher.AEAD) (TransferStats, error) {
+func receiveBlastDataUDP(ctx context.Context, conn *net.UDPConn, peer net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, buf []byte, packetAEAD cipher.AEAD, progress func(TransferStats)) (TransferStats, error) {
 	if cleanup, err := configureBlastUDPReadDeadline(ctx, conn); err != nil {
 		return TransferStats{}, err
 	} else {
@@ -4132,7 +4169,7 @@ func receiveBlastDataUDP(ctx context.Context, conn *net.UDPConn, peer net.Addr, 
 		if !ok || packetRunID != runID {
 			continue
 		}
-		complete, err := processBlastReceivePacket(ctx, conn, batcher, addr, runID, dst, stats, packetType, payload)
+		complete, err := processBlastReceivePacket(ctx, conn, batcher, addr, runID, dst, stats, packetType, payload, progress)
 		if err != nil {
 			return TransferStats{}, err
 		}
@@ -4688,15 +4725,40 @@ func (c *blastStreamReceiveCoordinator) handlePacket(ctx context.Context, lane *
 
 func (c *blastStreamReceiveCoordinator) handlePacketStripe(ctx context.Context, lane *blastStreamReceiveLane, stripeID uint16, totalStripes int, packetType PacketType, runID [16]byte, seq uint64, offset uint64, count uint64, payload []byte, addr net.Addr) (bool, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	beforeBytes := c.bytesReceived
 	if lane != nil && lane.peer == nil && addr != nil {
 		lane.peer = cloneAddr(addr)
 	}
 	state := c.runs[runID]
+	var complete bool
+	var err error
 	if stripeID != 0 || totalStripes > 1 || (state != nil && state.striped) {
-		return c.handleStripedPacketLocked(ctx, lane, stripeID, totalStripes, packetType, runID, seq, offset, count, payload, addr)
+		complete, err = c.handleStripedPacketLocked(ctx, lane, stripeID, totalStripes, packetType, runID, seq, offset, count, payload, addr)
+	} else {
+		complete, err = c.handleGlobalPacketLocked(ctx, lane, packetType, runID, seq, offset, count, payload, addr)
 	}
-	return c.handleGlobalPacketLocked(ctx, lane, packetType, runID, seq, offset, count, payload, addr)
+	progress := TransferStats{}
+	if c.bytesReceived > beforeBytes {
+		progress = c.progressStatsLocked()
+	}
+	c.mu.Unlock()
+	if progress.BytesReceived > 0 {
+		emitProbeProgress(c.cfg.Progress, progress)
+	}
+	return complete, err
+}
+
+func (c *blastStreamReceiveCoordinator) progressStatsLocked() TransferStats {
+	firstByteAt := c.firstByteAt
+	if firstByteAt.IsZero() && c.bytesReceived > 0 {
+		firstByteAt = time.Now()
+	}
+	return TransferStats{
+		BytesReceived:   c.bytesReceived,
+		StartedAt:       c.startedAt,
+		FirstByteAt:     firstByteAt,
+		PeakGoodputMbps: c.peakMbps(),
+	}
 }
 
 func (c *blastStreamReceiveCoordinator) handleGlobalPacketLocked(ctx context.Context, lane *blastStreamReceiveLane, packetType PacketType, runID [16]byte, seq uint64, offset uint64, count uint64, payload []byte, addr net.Addr) (bool, error) {
@@ -7214,6 +7276,9 @@ func (s *blastParallelConnReceiveState) afterDataWrite(packet blastParallelConnP
 		state.receivedBytes += uint64(written)
 	}
 	totalReceived := s.bytesReceived.Add(int64(written))
+	if written > 0 {
+		s.emitProgress(totalReceived, packet.now)
+	}
 	if err := s.recoverFECIfNeeded(packet.runID, state); err != nil {
 		return err
 	}
@@ -7228,6 +7293,19 @@ func (s *blastParallelConnReceiveState) afterDataWrite(packet blastParallelConnP
 		return blastParallelDoneOrError(done, err)
 	}
 	return s.maybeFinishRun(packet.runID, state)
+}
+
+func (s *blastParallelConnReceiveState) emitProgress(totalReceived int64, at time.Time) {
+	if s == nil || totalReceived <= 0 {
+		return
+	}
+	if at.IsZero() {
+		at = time.Now()
+	}
+	emitProbeProgress(s.cfg.Progress, TransferStats{
+		BytesReceived: totalReceived,
+		FirstByteAt:   at,
+	})
 }
 
 func blastParallelDoneOrError(done bool, err error) error {
@@ -7540,7 +7618,11 @@ func (s *blastParallelConnReceiveState) writeRecoveredFEC(runID [16]byte, state 
 		if err != nil {
 			return err
 		}
-		if s.bytesReceived.Add(int64(written)) >= s.expectedBytes && s.expectedBytes > 0 {
+		totalReceived := s.bytesReceived.Add(int64(written))
+		if written > 0 {
+			s.emitProgress(totalReceived, time.Now())
+		}
+		if totalReceived >= s.expectedBytes && s.expectedBytes > 0 {
 			return s.finishRecoveredFEC(runID, state)
 		}
 	}

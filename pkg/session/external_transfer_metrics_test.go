@@ -85,6 +85,31 @@ func TestExternalTransferMetricsUpdatesTrace(t *testing.T) {
 	}
 }
 
+func TestExternalTransferMetricsSetProbeStatsUpdatesTrace(t *testing.T) {
+	var out bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(30, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(30, 0), rec, transfertrace.RoleSend)
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct")
+	metrics.SetProbeStats(probe.TransferStats{
+		BytesSent:      4096,
+		Retransmits:    3,
+		MaxReplayBytes: 8192,
+	})
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+	body := out.String()
+	if !strings.Contains(body, ",send,direct_execute,0,4096,4096,4096,") {
+		t.Fatalf("trace body missing direct probe progress:\n%s", body)
+	}
+	if !strings.Contains(body, ",8192,,3,") {
+		t.Fatalf("trace body missing probe counters:\n%s", body)
+	}
+}
+
 func TestListenConfigTraceUpdatesReceiveRelayPrefixTrace(t *testing.T) {
 	var out bytes.Buffer
 	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleReceive, time.Unix(20, 0))

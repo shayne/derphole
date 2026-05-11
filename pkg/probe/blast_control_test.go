@@ -216,7 +216,7 @@ func TestHandleBlastSendControlEventUpdatesAdaptiveRate(t *testing.T) {
 		receivedAt: now.Add(blastRateHoldAfterDecrease + blastRateFeedbackInterval),
 	}
 
-	complete, repaired, err := handleBlastSendControlEvent(context.Background(), nil, controlTestAddr("peer"), history, &stats, deduper, control, event)
+	complete, repaired, err := handleBlastSendControlEvent(context.Background(), nil, controlTestAddr("peer"), history, &stats, deduper, control, event, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,10 +247,10 @@ func TestHandleBlastSendControlEventTracksPeakGoodput(t *testing.T) {
 		receivedAt: now.Add(200 * time.Millisecond),
 	}
 
-	if _, _, err := handleBlastSendControlEvent(context.Background(), nil, controlTestAddr("peer"), nil, &stats, newBlastRepairDeduper(), control, first); err != nil {
+	if _, _, err := handleBlastSendControlEvent(context.Background(), nil, controlTestAddr("peer"), nil, &stats, newBlastRepairDeduper(), control, first, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := handleBlastSendControlEvent(context.Background(), nil, controlTestAddr("peer"), nil, &stats, newBlastRepairDeduper(), control, second); err != nil {
+	if _, _, err := handleBlastSendControlEvent(context.Background(), nil, controlTestAddr("peer"), nil, &stats, newBlastRepairDeduper(), control, second, nil); err != nil {
 		t.Fatal(err)
 	}
 	if stats.PeakGoodputMbps <= 0 {
@@ -301,7 +301,7 @@ func TestHandleBlastSendControlEventRepairRequestBacksOffAdaptiveRate(t *testing
 		receivedAt: now.Add(blastRateFeedbackInterval),
 	}
 
-	complete, repaired, err := handleBlastSendControlEvent(context.Background(), &queuedControlBatcher{}, controlTestAddr("peer"), history, &stats, deduper, control, event)
+	complete, repaired, err := handleBlastSendControlEvent(context.Background(), &queuedControlBatcher{}, controlTestAddr("peer"), history, &stats, deduper, control, event, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +320,7 @@ func TestHandleBlastSendControlEventRepairRequestBacksOffAdaptiveRate(t *testing
 	heldRate := control.RateMbps()
 
 	event.receivedAt = event.receivedAt.Add(blastRateFeedbackInterval)
-	_, _, err = handleBlastSendControlEvent(context.Background(), &queuedControlBatcher{}, controlTestAddr("peer"), history, &stats, deduper, control, event)
+	_, _, err = handleBlastSendControlEvent(context.Background(), &queuedControlBatcher{}, controlTestAddr("peer"), history, &stats, deduper, control, event, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +329,7 @@ func TestHandleBlastSendControlEventRepairRequestBacksOffAdaptiveRate(t *testing
 	}
 
 	event.receivedAt = event.receivedAt.Add(blastRateRepairPressureEvery)
-	_, _, err = handleBlastSendControlEvent(context.Background(), &queuedControlBatcher{}, controlTestAddr("peer"), history, &stats, deduper, control, event)
+	_, _, err = handleBlastSendControlEvent(context.Background(), &queuedControlBatcher{}, controlTestAddr("peer"), history, &stats, deduper, control, event, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +342,7 @@ func TestHandleBlastSendControlEventRepairRequestBacksOffAdaptiveRate(t *testing
 
 	binary.BigEndian.PutUint64(event.payload, 1)
 	event.receivedAt = event.receivedAt.Add(blastRateRepairPressureEvery)
-	_, _, err = handleBlastSendControlEvent(context.Background(), &queuedControlBatcher{}, controlTestAddr("peer"), history, &stats, deduper, control, event)
+	_, _, err = handleBlastSendControlEvent(context.Background(), &queuedControlBatcher{}, controlTestAddr("peer"), history, &stats, deduper, control, event, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +363,7 @@ func TestHandleBlastSendControlEventRecordsReceiverAckFloor(t *testing.T) {
 		receivedAt: now.Add(blastRateFeedbackInterval),
 	}
 
-	_, _, err := handleBlastSendControlEvent(context.Background(), nil, controlTestAddr("peer"), nil, &TransferStats{}, newBlastRepairDeduper(), control, event)
+	_, _, err := handleBlastSendControlEvent(context.Background(), nil, controlTestAddr("peer"), nil, &TransferStats{}, newBlastRepairDeduper(), control, event, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,7 +410,7 @@ func TestDrainBlastSendControlEventsReportsRepairComplete(t *testing.T) {
 	events := make(chan blastSendControlEvent, 1)
 	events <- blastSendControlEvent{typ: PacketTypeRepairComplete, receivedAt: time.Now()}
 
-	complete, err := drainBlastSendControlEvents(context.Background(), nil, controlTestAddr("peer"), history, &stats, deduper, nil, events)
+	complete, err := drainBlastSendControlEvents(context.Background(), nil, controlTestAddr("peer"), history, &stats, deduper, nil, events, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
