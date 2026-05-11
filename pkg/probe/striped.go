@@ -46,7 +46,7 @@ func sendStriped(ctx context.Context, conn net.PacketConn, peer net.Addr, src io
 
 	source := &stripedSourceState{src: src}
 	readBufs := newBatchReadBuffers(batcher.MaxBatch(), 64<<10)
-	return runStripedSendLoop(ctx, batcher, peer, runID, states, source, readBufs, retryInterval, &stats)
+	return runStripedSendLoop(ctx, batcher, peer, runID, states, source, readBufs, retryInterval, &stats, cfg.Progress)
 }
 
 func normalizeStripedSendConfig(cfg SendConfig) (SendConfig, int) {
@@ -99,12 +99,12 @@ func newBatchReadBuffers(count int, size int) []batchReadBuffer {
 	return readBufs
 }
 
-func runStripedSendLoop(ctx context.Context, batcher packetBatcher, peer net.Addr, runID [16]byte, states []*senderState, source *stripedSourceState, readBufs []batchReadBuffer, retryInterval time.Duration, stats *TransferStats) (TransferStats, error) {
+func runStripedSendLoop(ctx context.Context, batcher packetBatcher, peer net.Addr, runID [16]byte, states []*senderState, source *stripedSourceState, readBufs []batchReadBuffer, retryInterval time.Duration, stats *TransferStats, progress func(TransferStats)) (TransferStats, error) {
 	for {
 		if source.pendingErr != nil && stripedInFlightEmpty(states) {
 			return TransferStats{}, source.pendingErr
 		}
-		if err := fillStripedSendWindows(ctx, batcher, peer, states, source, stats); err != nil {
+		if err := fillStripedSendWindows(ctx, batcher, peer, states, source, stats, progress); err != nil {
 			return TransferStats{}, err
 		}
 		if stripedSendComplete(states) {
@@ -117,7 +117,7 @@ func runStripedSendLoop(ctx context.Context, batcher packetBatcher, peer net.Add
 			}
 			continue
 		}
-		if err := readStripedSenderAcks(ctx, batcher, peer, runID, states, readBufs, retryInterval, stats); err != nil {
+		if err := readStripedSenderAcks(ctx, batcher, peer, runID, states, readBufs, retryInterval, stats, progress); err != nil {
 			return TransferStats{}, err
 		}
 	}
@@ -130,7 +130,7 @@ func stripedSendComplete(states []*senderState) bool {
 	return stripedInFlightEmpty(states) || stripedDonePacketsSettled(states)
 }
 
-func readStripedSenderAcks(ctx context.Context, batcher packetBatcher, peer net.Addr, runID [16]byte, states []*senderState, readBufs []batchReadBuffer, retryInterval time.Duration, stats *TransferStats) error {
+func readStripedSenderAcks(ctx context.Context, batcher packetBatcher, peer net.Addr, runID [16]byte, states []*senderState, readBufs []batchReadBuffer, retryInterval time.Duration, stats *TransferStats, progress func(TransferStats)) error {
 	n, err := batcher.ReadBatch(ctx, stripedNextRetransmitDeadline(ctx, states, retryInterval), readBufs)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -139,7 +139,7 @@ func readStripedSenderAcks(ctx context.Context, batcher packetBatcher, peer net.
 		if !isNetTimeout(err) {
 			return err
 		}
-		if err := retransmitExpiredStripes(ctx, batcher, peer, states, retryInterval, stats); err != nil {
+		if err := retransmitExpiredStripes(ctx, batcher, peer, states, retryInterval, stats, progress); err != nil {
 			return err
 		}
 		return nil
@@ -172,7 +172,7 @@ func applyStripedSenderAck(peer net.Addr, runID [16]byte, states []*senderState,
 	stats.PacketsAcked += int64(applyAck(state.inFlight, packet.AckFloor, packet.AckMask, packet.Payload))
 }
 
-func fillStripedSendWindows(ctx context.Context, batcher packetBatcher, peer net.Addr, states []*senderState, source *stripedSourceState, stats *TransferStats) error {
+func fillStripedSendWindows(ctx context.Context, batcher packetBatcher, peer net.Addr, states []*senderState, source *stripedSourceState, stats *TransferStats, progress func(TransferStats)) error {
 	pending, err := collectStripedPendingPackets(states, source)
 	if err != nil {
 		return err
@@ -180,7 +180,7 @@ func fillStripedSendWindows(ctx context.Context, batcher packetBatcher, peer net
 	if len(pending) == 0 {
 		return nil
 	}
-	return sendStripedPendingPackets(ctx, batcher, peer, pending, stats)
+	return sendStripedPendingPackets(ctx, batcher, peer, pending, stats, progress)
 }
 
 func collectStripedPendingPackets(states []*senderState, source *stripedSourceState) ([]*outboundPacket, error) {
@@ -208,7 +208,7 @@ func collectStripedPendingPackets(states []*senderState, source *stripedSourceSt
 	}
 }
 
-func sendStripedPendingPackets(ctx context.Context, batcher packetBatcher, peer net.Addr, pending []*outboundPacket, stats *TransferStats) error {
+func sendStripedPendingPackets(ctx context.Context, batcher packetBatcher, peer net.Addr, pending []*outboundPacket, stats *TransferStats, progress func(TransferStats)) error {
 	wires := make([][]byte, len(pending))
 	for i, packet := range pending {
 		wires[i] = packet.wire
@@ -220,6 +220,7 @@ func sendStripedPendingPackets(ctx context.Context, batcher packetBatcher, peer 
 	for _, packet := range pending {
 		markStripedPacketSent(packet, now, stats)
 	}
+	emitProbeProgress(progress, *stats)
 	return nil
 }
 
@@ -315,12 +316,12 @@ func rememberStripedReadErr(source *stripedSourceState, readErr error) {
 	}
 }
 
-func retransmitExpiredStripes(ctx context.Context, batcher packetBatcher, peer net.Addr, states []*senderState, retryInterval time.Duration, stats *TransferStats) error {
+func retransmitExpiredStripes(ctx context.Context, batcher packetBatcher, peer net.Addr, states []*senderState, retryInterval time.Duration, stats *TransferStats, progress func(TransferStats)) error {
 	for _, state := range states {
 		if state == nil {
 			continue
 		}
-		if err := retransmitExpired(ctx, batcher, peer, state.inFlight, retryInterval, stats); err != nil {
+		if err := retransmitExpired(ctx, batcher, peer, state.inFlight, retryInterval, stats, progress); err != nil {
 			return err
 		}
 	}
@@ -368,7 +369,7 @@ func stripedDonePacketsSettled(states []*senderState) bool {
 	return true
 }
 
-func receiveStripedFromFirstHello(ctx context.Context, conn net.PacketConn, batcher packetBatcher, peer net.Addr, runID [16]byte, firstHello Packet, dst io.Writer, stats *TransferStats, buf []byte) (TransferStats, error) {
+func receiveStripedFromFirstHello(ctx context.Context, conn net.PacketConn, batcher packetBatcher, peer net.Addr, runID [16]byte, firstHello Packet, dst io.Writer, stats *TransferStats, buf []byte, progress func(TransferStats)) (TransferStats, error) {
 	totalStripes, err := validateStripedFirstHello(firstHello)
 	if err != nil {
 		return TransferStats{}, err
@@ -380,7 +381,7 @@ func receiveStripedFromFirstHello(ctx context.Context, conn net.PacketConn, batc
 	if err := sendHelloAck(ctx, conn, peer, runID, firstHello.StripeID, uint16(totalStripes)); err != nil {
 		return TransferStats{}, err
 	}
-	run := newStripedReceiveRun(ctx, conn, batcher, peer, runID, dst, stats, len(buf), totalStripes)
+	run := newStripedReceiveRun(ctx, conn, batcher, peer, runID, dst, stats, len(buf), totalStripes, progress)
 	return run.loop()
 }
 
@@ -414,9 +415,10 @@ type stripedReceiveRun struct {
 	finalTotalSet    bool
 	completedStripes int
 	totalStripes     int
+	progress         func(TransferStats)
 }
 
-func newStripedReceiveRun(ctx context.Context, conn net.PacketConn, batcher packetBatcher, peer net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, readSize int, totalStripes int) *stripedReceiveRun {
+func newStripedReceiveRun(ctx context.Context, conn net.PacketConn, batcher packetBatcher, peer net.Addr, runID [16]byte, dst io.Writer, stats *TransferStats, readSize int, totalStripes int, progress func(TransferStats)) *stripedReceiveRun {
 	states := make([]*receiveStripeState, totalStripes)
 	for i := range states {
 		states[i] = &receiveStripeState{buffered: make(map[uint64]Packet)}
@@ -433,6 +435,7 @@ func newStripedReceiveRun(ctx context.Context, conn net.PacketConn, batcher pack
 		states:        states,
 		pendingOutput: make(map[uint64][]byte),
 		totalStripes:  totalStripes,
+		progress:      progress,
 	}
 }
 
@@ -517,6 +520,7 @@ func (r *stripedReceiveRun) processDataOrDone(addr net.Addr, packet Packet) (boo
 		&r.completedStripes,
 		r.totalStripes,
 		r.stats,
+		r.progress,
 	)
 	if err != nil {
 		return false, err
@@ -537,13 +541,13 @@ func (r *stripedReceiveRun) flushAckIfNeeded(addr net.Addr, stripeID uint16, sta
 	return sendStripedPendingAck(r.ctx, r.conn, addr, r.runID, stripeID, state)
 }
 
-func processStripedReceivePacket(dst io.Writer, state *receiveStripeState, packet Packet, pendingOutput map[uint64][]byte, nextOffset *uint64, finalTotal *uint64, finalTotalSet *bool, completedStripes *int, totalStripes int, stats *TransferStats) (bool, error) {
+func processStripedReceivePacket(dst io.Writer, state *receiveStripeState, packet Packet, pendingOutput map[uint64][]byte, nextOffset *uint64, finalTotal *uint64, finalTotalSet *bool, completedStripes *int, totalStripes int, stats *TransferStats, progress func(TransferStats)) (bool, error) {
 	markAck := func() {
 		state.ackDirty = true
 		state.packetsSinceAck++
 	}
 	if packet.Seq == state.expectedSeq {
-		complete, err := acceptStripedReceivePacket(dst, state, packet, pendingOutput, nextOffset, finalTotal, finalTotalSet, completedStripes, totalStripes, stats)
+		complete, err := acceptStripedReceivePacket(dst, state, packet, pendingOutput, nextOffset, finalTotal, finalTotalSet, completedStripes, totalStripes, stats, progress)
 		if err != nil {
 			return false, err
 		}
@@ -557,7 +561,7 @@ func processStripedReceivePacket(dst io.Writer, state *receiveStripeState, packe
 				break
 			}
 			delete(state.buffered, state.expectedSeq)
-			complete, err = acceptStripedReceivePacket(dst, state, buffered, pendingOutput, nextOffset, finalTotal, finalTotalSet, completedStripes, totalStripes, stats)
+			complete, err = acceptStripedReceivePacket(dst, state, buffered, pendingOutput, nextOffset, finalTotal, finalTotalSet, completedStripes, totalStripes, stats, progress)
 			if err != nil {
 				return false, err
 			}
@@ -573,10 +577,10 @@ func processStripedReceivePacket(dst io.Writer, state *receiveStripeState, packe
 	return stripedReceiveComplete(*finalTotalSet, *finalTotal, *nextOffset, *completedStripes, totalStripes), nil
 }
 
-func acceptStripedReceivePacket(dst io.Writer, state *receiveStripeState, packet Packet, pendingOutput map[uint64][]byte, nextOffset *uint64, finalTotal *uint64, finalTotalSet *bool, completedStripes *int, totalStripes int, stats *TransferStats) (bool, error) {
+func acceptStripedReceivePacket(dst io.Writer, state *receiveStripeState, packet Packet, pendingOutput map[uint64][]byte, nextOffset *uint64, finalTotal *uint64, finalTotalSet *bool, completedStripes *int, totalStripes int, stats *TransferStats, progress func(TransferStats)) (bool, error) {
 	switch packet.Type {
 	case PacketTypeData:
-		if err := acceptStripedDataPacket(dst, packet, pendingOutput, nextOffset, stats); err != nil {
+		if err := acceptStripedDataPacket(dst, packet, pendingOutput, nextOffset, stats, progress); err != nil {
 			return false, err
 		}
 		state.expectedSeq++
@@ -588,7 +592,7 @@ func acceptStripedReceivePacket(dst io.Writer, state *receiveStripeState, packet
 	return stripedReceiveComplete(*finalTotalSet, *finalTotal, *nextOffset, *completedStripes, totalStripes), nil
 }
 
-func acceptStripedDataPacket(dst io.Writer, packet Packet, pendingOutput map[uint64][]byte, nextOffset *uint64, stats *TransferStats) error {
+func acceptStripedDataPacket(dst io.Writer, packet Packet, pendingOutput map[uint64][]byte, nextOffset *uint64, stats *TransferStats, progress func(TransferStats)) error {
 	if len(packet.Payload) == 0 {
 		return nil
 	}
@@ -596,10 +600,10 @@ func acceptStripedDataPacket(dst io.Writer, packet Packet, pendingOutput map[uin
 		stats.FirstByteAt = time.Now()
 	}
 	if packet.Offset == *nextOffset {
-		if err := writeStripedPayload(dst, packet.Payload, nextOffset, stats); err != nil {
+		if err := writeStripedPayload(dst, packet.Payload, nextOffset, stats, progress); err != nil {
 			return err
 		}
-		return flushStripedPendingPayloads(dst, pendingOutput, nextOffset, stats)
+		return flushStripedPendingPayloads(dst, pendingOutput, nextOffset, stats, progress)
 	}
 	if packet.Offset > *nextOffset {
 		storeStripedPendingPayload(packet, pendingOutput)
@@ -629,7 +633,7 @@ func acceptStripedDonePacket(state *receiveStripeState, packet Packet, finalTota
 	return nil
 }
 
-func writeStripedPayload(dst io.Writer, payload []byte, nextOffset *uint64, stats *TransferStats) error {
+func writeStripedPayload(dst io.Writer, payload []byte, nextOffset *uint64, stats *TransferStats, progress func(TransferStats)) error {
 	n, err := dst.Write(payload)
 	if err != nil {
 		return err
@@ -639,17 +643,18 @@ func writeStripedPayload(dst io.Writer, payload []byte, nextOffset *uint64, stat
 	}
 	*nextOffset += uint64(n)
 	stats.BytesReceived += int64(n)
+	emitProbeProgress(progress, *stats)
 	return nil
 }
 
-func flushStripedPendingPayloads(dst io.Writer, pendingOutput map[uint64][]byte, nextOffset *uint64, stats *TransferStats) error {
+func flushStripedPendingPayloads(dst io.Writer, pendingOutput map[uint64][]byte, nextOffset *uint64, stats *TransferStats, progress func(TransferStats)) error {
 	for {
 		payload, ok := pendingOutput[*nextOffset]
 		if !ok {
 			return nil
 		}
 		delete(pendingOutput, *nextOffset)
-		if err := writeStripedPayload(dst, payload, nextOffset, stats); err != nil {
+		if err := writeStripedPayload(dst, payload, nextOffset, stats, progress); err != nil {
 			return err
 		}
 	}

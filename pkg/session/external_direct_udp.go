@@ -154,6 +154,8 @@ var externalDirectUDPProbeSendFn = probe.Send
 var externalRelayUDPProbeReceiveToWriterFn = func(ctx context.Context, conn net.PacketConn, dst io.Writer, cfg probe.ReceiveConfig) (probe.TransferStats, error) {
 	return probe.ReceiveBlastParallelToWriter(ctx, []net.PacketConn{conn}, dst, cfg, 0)
 }
+var externalDirectUDPReceiveBlastParallelToWriterFn = probe.ReceiveBlastParallelToWriter
+var externalDirectUDPReceiveBlastStreamParallelToWriterFn = probe.ReceiveBlastStreamParallelToWriter
 var externalSendDirectUDPOnlyFn = sendExternalViaDirectUDPOnly
 var externalPrepareDirectUDPSendFn = externalPrepareDirectUDPSend
 var externalExecutePreparedDirectUDPSendFn = externalExecutePreparedDirectUDPSend
@@ -1396,7 +1398,7 @@ func externalExecutePreparedDirectUDPReceive(ctx context.Context, plan externalD
 	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct-execute")
 	metrics.SetDirectPlan(0, 0, len(plan.probeConns), len(plan.probeConns))
 	receiveCfg := plan.receiveCfg
-	stats, err := externalDirectUDPExecuteReceivePlan(ctx, plan, tok, receiveCfg)
+	stats, err := externalDirectUDPExecuteReceivePlan(ctx, plan, tok, receiveCfg, metrics)
 	externalTransferTracef("direct-udp-recv-execute-done err=%v bytes=%d lanes=%d first-byte-zero=%v complete-zero=%v", err, stats.BytesReceived, stats.Lanes, stats.FirstByteAt.IsZero(), stats.CompletedAt.IsZero())
 	if stats.Lanes > 0 {
 		metrics.SetDirectPlan(0, 0, stats.Lanes, len(plan.probeConns))
@@ -1421,8 +1423,11 @@ func externalTransferMetricsOrNew(ctx context.Context, metrics *externalTransfer
 	return newExternalTransferMetricsWithTrace(time.Now(), trace, role)
 }
 
-func externalDirectUDPExecuteReceivePlan(ctx context.Context, plan externalDirectUDPReceivePlan, tok token.Token, receiveCfg probe.ReceiveConfig) (probe.TransferStats, error) {
-	if metrics := externalTransferMetricsFromContext(ctx); metrics != nil {
+func externalDirectUDPExecuteReceivePlan(ctx context.Context, plan externalDirectUDPReceivePlan, tok token.Token, receiveCfg probe.ReceiveConfig, metrics *externalTransferMetrics) (probe.TransferStats, error) {
+	if metrics == nil {
+		metrics = externalTransferMetricsFromContext(ctx)
+	}
+	if metrics != nil {
 		plan.receiveDst = externalTransferMetricsWriter{w: plan.receiveDst, record: metrics.RecordDirectWrite}
 	}
 	if plan.start.Stream {
@@ -1430,11 +1435,11 @@ func externalDirectUDPExecuteReceivePlan(ctx context.Context, plan externalDirec
 		receiveCfg.FECGroupSize = externalDirectUDPStreamFECGroupSize
 		receiveCfg.ExpectedRunID = tok.SessionID
 		externalTransferTracef("direct-udp-recv-execute-start stream=true lanes=%d expected=%d", len(plan.probeConns), plan.start.ExpectedBytes)
-		return probe.ReceiveBlastStreamParallelToWriter(ctx, plan.probeConns, plan.receiveDst, receiveCfg, plan.start.ExpectedBytes)
+		return externalDirectUDPReceiveBlastStreamParallelToWriterFn(ctx, plan.probeConns, plan.receiveDst, receiveCfg, plan.start.ExpectedBytes)
 	}
 	if plan.fastDiscard {
 		externalTransferTracef("direct-udp-recv-execute-start fast-discard=true lanes=%d expected=%d", len(plan.probeConns), plan.start.ExpectedBytes)
-		return probe.ReceiveBlastParallelToWriter(ctx, plan.probeConns, plan.receiveDst, receiveCfg, plan.start.ExpectedBytes)
+		return externalDirectUDPReceiveBlastParallelToWriterFn(ctx, plan.probeConns, plan.receiveDst, receiveCfg, plan.start.ExpectedBytes)
 	}
 	return externalDirectUDPExecuteSectionReceivePlan(ctx, plan, tok, receiveCfg)
 }

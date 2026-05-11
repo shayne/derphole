@@ -221,6 +221,115 @@ func TestStripedRawTransferCompletesAcrossLoopback(t *testing.T) {
 	}
 }
 
+func TestReliableTransferReportsProgress(t *testing.T) {
+	src := bytes.Repeat([]byte("reliable-progress"), 1<<12)
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var receiveProgress atomic.Int64
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := ReceiveToWriter(ctx, b, a.LocalAddr().String(), io.Discard, ReceiveConfig{
+			Raw: true,
+			Progress: func(stats TransferStats) {
+				receiveProgress.Store(stats.BytesReceived)
+			},
+		})
+		errCh <- err
+	}()
+
+	var sendProgress atomic.Int64
+	stats, err := Send(ctx, a, b.LocalAddr().String(), bytes.NewReader(src), SendConfig{
+		Raw: true,
+		Progress: func(stats TransferStats) {
+			sendProgress.Store(stats.BytesSent)
+		},
+	})
+	if err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if stats.BytesSent != int64(len(src)) {
+		t.Fatalf("BytesSent = %d, want %d", stats.BytesSent, len(src))
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("ReceiveToWriter() error = %v", err)
+	}
+	if sendProgress.Load() <= 0 {
+		t.Fatal("send progress callback did not observe sent bytes")
+	}
+	if receiveProgress.Load() <= 0 {
+		t.Fatal("receive progress callback did not observe received bytes")
+	}
+}
+
+func TestStripedRawTransferReportsProgress(t *testing.T) {
+	src := bytes.Repeat([]byte("striped-progress"), 1<<12)
+	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var receiveProgress atomic.Int64
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := ReceiveToWriter(ctx, b, a.LocalAddr().String(), io.Discard, ReceiveConfig{
+			Raw: true,
+			Progress: func(stats TransferStats) {
+				receiveProgress.Store(stats.BytesReceived)
+			},
+		})
+		errCh <- err
+	}()
+
+	var sendProgress atomic.Int64
+	stats, err := Send(ctx, a, b.LocalAddr().String(), bytes.NewReader(src), SendConfig{
+		Raw:        true,
+		ChunkSize:  512,
+		WindowSize: 8,
+		Parallel:   2,
+		Progress: func(stats TransferStats) {
+			sendProgress.Store(stats.BytesSent)
+		},
+	})
+	if err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if stats.BytesSent != int64(len(src)) {
+		t.Fatalf("BytesSent = %d, want %d", stats.BytesSent, len(src))
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("ReceiveToWriter() error = %v", err)
+	}
+	if sendProgress.Load() <= 0 {
+		t.Fatal("striped send progress callback did not observe sent bytes")
+	}
+	if receiveProgress.Load() <= 0 {
+		t.Fatal("striped receive progress callback did not observe received bytes")
+	}
+}
+
 func TestReceiveBlastStreamParallelToWriterRejectsShortStripedFinalTotal(t *testing.T) {
 	server0, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
@@ -6029,7 +6138,7 @@ func TestFillSendWindowRespectsAckFloorSpanAfterSACK(t *testing.T) {
 	stats := TransferStats{}
 	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
 
-	if err := fillSendWindow(context.Background(), batcher, peer, &state, &stats); err != nil {
+	if err := fillSendWindow(context.Background(), batcher, peer, &state, &stats, nil); err != nil {
 		t.Fatalf("fillSendWindow() error = %v", err)
 	}
 	if state.nextSeq != 4 {
@@ -6039,7 +6148,7 @@ func TestFillSendWindowRespectsAckFloorSpanAfterSACK(t *testing.T) {
 	if got := applyAck(state.inFlight, 0, 0b111, nil); got != 3 {
 		t.Fatalf("applyAck() = %d, want 3 SACKed packets", got)
 	}
-	if err := fillSendWindow(context.Background(), batcher, peer, &state, &stats); err != nil {
+	if err := fillSendWindow(context.Background(), batcher, peer, &state, &stats, nil); err != nil {
 		t.Fatalf("fillSendWindow() after SACK error = %v", err)
 	}
 	if state.nextSeq != 4 {
@@ -6047,7 +6156,7 @@ func TestFillSendWindowRespectsAckFloorSpanAfterSACK(t *testing.T) {
 	}
 
 	state.ackFloor = 4
-	if err := fillSendWindow(context.Background(), batcher, peer, &state, &stats); err != nil {
+	if err := fillSendWindow(context.Background(), batcher, peer, &state, &stats, nil); err != nil {
 		t.Fatalf("fillSendWindow() after ACK floor advance error = %v", err)
 	}
 	if state.nextSeq != 8 {
@@ -6069,7 +6178,7 @@ func TestFillSendWindowPacesReliableWrites(t *testing.T) {
 	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
 
 	startedAt := time.Now()
-	if err := fillSendWindow(context.Background(), batcher, peer, &state, &stats); err != nil {
+	if err := fillSendWindow(context.Background(), batcher, peer, &state, &stats, nil); err != nil {
 		t.Fatalf("fillSendWindow() error = %v", err)
 	}
 	if elapsed := time.Since(startedAt); elapsed < 2*time.Millisecond {

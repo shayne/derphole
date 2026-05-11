@@ -238,7 +238,7 @@ func Send(ctx context.Context, conn net.PacketConn, remoteAddr string, src io.Re
 		return sendBlast(ctx, batcher, conn, peer, runID, src, cfg.ChunkSize, cfg.RateMbps, cfg.RateCeilingMbps, cfg.RepairPayloads, cfg.TailReplayBytes, cfg.FECGroupSize, cfg.PacketAEAD, cfg.StreamReplayWindowBytes, cfg.Progress, stats)
 	}
 	readBufs := newSizedBlastBatchReadBuffers(batcher.MaxBatch(), 64<<10)
-	return runReliableSendLoop(ctx, batcher, peer, &state, &stats, readBufs, retryInterval)
+	return runReliableSendLoop(ctx, batcher, peer, &state, &stats, readBufs, retryInterval, cfg.Progress)
 }
 
 func normalizeSendConfig(cfg SendConfig) SendConfig {
@@ -289,12 +289,12 @@ func maybeConnectedBlastSendBatcher(conn net.PacketConn, peer net.Addr, batcher 
 	return batcher
 }
 
-func runReliableSendLoop(ctx context.Context, batcher packetBatcher, peer net.Addr, state *senderState, stats *TransferStats, readBufs []batchReadBuffer, retryInterval time.Duration) (TransferStats, error) {
+func runReliableSendLoop(ctx context.Context, batcher packetBatcher, peer net.Addr, state *senderState, stats *TransferStats, readBufs []batchReadBuffer, retryInterval time.Duration, progress func(TransferStats)) (TransferStats, error) {
 	for {
-		if err := fillSendWindow(ctx, batcher, peer, state, stats); err != nil {
+		if err := fillSendWindow(ctx, batcher, peer, state, stats, progress); err != nil {
 			return TransferStats{}, err
 		}
-		done, skipRead, err := handleReliableSendState(ctx, batcher, peer, state, stats, readBufs, retryInterval)
+		done, skipRead, err := handleReliableSendState(ctx, batcher, peer, state, stats, readBufs, retryInterval, progress)
 		if err != nil || done {
 			if err != nil {
 				return TransferStats{}, err
@@ -304,15 +304,15 @@ func runReliableSendLoop(ctx context.Context, batcher packetBatcher, peer net.Ad
 		if skipRead {
 			continue
 		}
-		if err := readReliableSendAcks(ctx, batcher, peer, state, stats, readBufs, retryInterval); err != nil {
+		if err := readReliableSendAcks(ctx, batcher, peer, state, stats, readBufs, retryInterval, progress); err != nil {
 			return TransferStats{}, err
 		}
 	}
 }
 
-func handleReliableSendState(ctx context.Context, batcher packetBatcher, peer net.Addr, state *senderState, stats *TransferStats, readBufs []batchReadBuffer, retryInterval time.Duration) (bool, bool, error) {
+func handleReliableSendState(ctx context.Context, batcher packetBatcher, peer net.Addr, state *senderState, stats *TransferStats, readBufs []batchReadBuffer, retryInterval time.Duration, progress func(TransferStats)) (bool, bool, error) {
 	if len(state.inFlight) == 0 && !state.doneQueued {
-		return false, true, waitReliableSendIdle(ctx, batcher, peer, state, stats, readBufs, retryInterval)
+		return false, true, waitReliableSendIdle(ctx, batcher, peer, state, stats, readBufs, retryInterval, progress)
 	}
 	if state.doneQueued && (len(state.inFlight) == 0 || donePacketSettled(state.inFlight)) {
 		stats.markComplete(time.Now())
@@ -321,9 +321,9 @@ func handleReliableSendState(ctx context.Context, batcher packetBatcher, peer ne
 	return false, false, nil
 }
 
-func waitReliableSendIdle(ctx context.Context, batcher packetBatcher, peer net.Addr, state *senderState, stats *TransferStats, readBufs []batchReadBuffer, retryInterval time.Duration) error {
+func waitReliableSendIdle(ctx context.Context, batcher packetBatcher, peer net.Addr, state *senderState, stats *TransferStats, readBufs []batchReadBuffer, retryInterval time.Duration, progress func(TransferStats)) error {
 	if !sendWindowHasCapacity(state) {
-		return waitForAckProgress(ctx, batcher, state, stats, readBufs, retryInterval, peer)
+		return waitForAckProgress(ctx, batcher, state, stats, readBufs, retryInterval, peer, progress)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -331,26 +331,26 @@ func waitReliableSendIdle(ctx context.Context, batcher packetBatcher, peer net.A
 	return waitZeroReadRetry(ctx, state.zeroReads)
 }
 
-func readReliableSendAcks(ctx context.Context, batcher packetBatcher, peer net.Addr, state *senderState, stats *TransferStats, readBufs []batchReadBuffer, retryInterval time.Duration) error {
+func readReliableSendAcks(ctx context.Context, batcher packetBatcher, peer net.Addr, state *senderState, stats *TransferStats, readBufs []batchReadBuffer, retryInterval time.Duration, progress func(TransferStats)) error {
 	n, err := batcher.ReadBatch(ctx, nextRetransmitDeadline(ctx, state.inFlight, retryInterval), readBufs)
 	if err != nil {
-		return handleReliableSendAckReadError(ctx, batcher, peer, state, stats, retryInterval, err)
+		return handleReliableSendAckReadError(ctx, batcher, peer, state, stats, retryInterval, err, progress)
 	}
 	applyAckBatch(readBufs[:n], peer, state, stats)
 	return nil
 }
 
-func handleReliableSendAckReadError(ctx context.Context, batcher packetBatcher, peer net.Addr, state *senderState, stats *TransferStats, retryInterval time.Duration, err error) error {
+func handleReliableSendAckReadError(ctx context.Context, batcher packetBatcher, peer net.Addr, state *senderState, stats *TransferStats, retryInterval time.Duration, err error, progress func(TransferStats)) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 	if isNetTimeout(err) {
-		return retransmitExpired(ctx, batcher, peer, state.inFlight, retryInterval, stats)
+		return retransmitExpired(ctx, batcher, peer, state.inFlight, retryInterval, stats, progress)
 	}
 	return err
 }
 
-func waitForAckProgress(ctx context.Context, batcher packetBatcher, state *senderState, stats *TransferStats, readBufs []batchReadBuffer, retryInterval time.Duration, peer net.Addr) error {
+func waitForAckProgress(ctx context.Context, batcher packetBatcher, state *senderState, stats *TransferStats, readBufs []batchReadBuffer, retryInterval time.Duration, peer net.Addr, progress func(TransferStats)) error {
 	n, err := batcher.ReadBatch(ctx, retryInterval, readBufs)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -525,7 +525,7 @@ func (r *receiveLoop) handleFirstPacket(ctx context.Context, addr net.Addr, pack
 		r.peer = cloneAddr(addr)
 	}
 	if r.shouldReceiveStripedFromFirstHello(packet) {
-		stats, err := receiveStripedFromFirstHello(ctx, r.conn, r.batcher, addr, r.runID, packet, r.dst, &r.stats, r.buf)
+		stats, err := receiveStripedFromFirstHello(ctx, r.conn, r.batcher, addr, r.runID, packet, r.dst, &r.stats, r.buf, r.cfg.Progress)
 		return stats, true, err
 	}
 	if err := sendHelloAck(ctx, r.conn, addr, r.runID, 0, 1); err != nil {
@@ -597,7 +597,7 @@ func (r *receiveLoop) acceptOrderedDataPacket(packet Packet) error {
 func (r *receiveLoop) advanceAndMaybeAck(ctx context.Context, addr net.Addr) (bool, error) {
 	var complete bool
 	var err error
-	r.expectedSeq, complete, err = advanceReceiveWindow(r.dst, r.buffered, r.expectedSeq, &r.stats)
+	r.expectedSeq, complete, err = advanceReceiveWindow(r.dst, r.buffered, r.expectedSeq, &r.stats, r.cfg.Progress)
 	if err != nil {
 		return false, err
 	}
@@ -640,7 +640,7 @@ func (r *receiveLoop) acceptDonePacket(packet Packet) (bool, error) {
 		return true, nil
 	}
 	var err error
-	r.expectedSeq, complete, err = advanceReceiveWindow(r.dst, r.buffered, r.expectedSeq, &r.stats)
+	r.expectedSeq, complete, err = advanceReceiveWindow(r.dst, r.buffered, r.expectedSeq, &r.stats, r.cfg.Progress)
 	return complete, err
 }
 
@@ -8310,7 +8310,7 @@ type senderState struct {
 	zeroReads  int
 }
 
-func fillSendWindow(ctx context.Context, batcher packetBatcher, peer net.Addr, state *senderState, stats *TransferStats) error {
+func fillSendWindow(ctx context.Context, batcher packetBatcher, peer net.Addr, state *senderState, stats *TransferStats, progress func(TransferStats)) error {
 	if len(state.inFlight) == 0 && state.pendingErr != nil {
 		return state.pendingErr
 	}
@@ -8324,7 +8324,7 @@ func fillSendWindow(ctx context.Context, batcher packetBatcher, peer net.Addr, s
 	if err := writeOutboundPackets(ctx, batcher, peer, pending); err != nil {
 		return err
 	}
-	recordOutboundPackets(pending, stats)
+	recordOutboundPackets(pending, stats, progress)
 	return paceSendWindow(ctx, state, stats)
 }
 
@@ -8353,7 +8353,7 @@ func writeOutboundPackets(ctx context.Context, batcher packetBatcher, peer net.A
 	return err
 }
 
-func recordOutboundPackets(pending []*outboundPacket, stats *TransferStats) {
+func recordOutboundPackets(pending []*outboundPacket, stats *TransferStats, progress func(TransferStats)) {
 	now := time.Now()
 	for _, packet := range pending {
 		packet.attempts++
@@ -8365,6 +8365,7 @@ func recordOutboundPackets(pending []*outboundPacket, stats *TransferStats) {
 		stats.BytesSent += int64(packet.payload)
 		stats.observePeakGoodput(now, stats.BytesSent)
 	}
+	emitProbeProgress(progress, *stats)
 }
 
 func paceSendWindow(ctx context.Context, state *senderState, stats *TransferStats) error {
@@ -8468,7 +8469,7 @@ func handleEmptyOutboundRead(state *senderState, readErr error) (*outboundPacket
 	return nil, nil
 }
 
-func retransmitExpired(ctx context.Context, batcher packetBatcher, peer net.Addr, packets map[uint64]*outboundPacket, retryInterval time.Duration, stats *TransferStats) error {
+func retransmitExpired(ctx context.Context, batcher packetBatcher, peer net.Addr, packets map[uint64]*outboundPacket, retryInterval time.Duration, stats *TransferStats, progress func(TransferStats)) error {
 	now := time.Now()
 	var expired []*outboundPacket
 	for _, packet := range packets {
@@ -8497,6 +8498,7 @@ func retransmitExpired(ctx context.Context, batcher packetBatcher, peer net.Addr
 		stats.PacketsSent++
 		stats.Retransmits++
 	}
+	emitProbeProgress(progress, *stats)
 	return nil
 }
 
@@ -8612,7 +8614,7 @@ func applyAckPayload(packets map[uint64]*outboundPacket, ackFloor uint64, ackPay
 	return acked
 }
 
-func advanceReceiveWindow(dst io.Writer, buffered map[uint64]Packet, expectedSeq uint64, stats *TransferStats) (uint64, bool, error) {
+func advanceReceiveWindow(dst io.Writer, buffered map[uint64]Packet, expectedSeq uint64, stats *TransferStats, progress func(TransferStats)) (uint64, bool, error) {
 	for {
 		packet, ok := buffered[expectedSeq]
 		if !ok {
@@ -8625,14 +8627,14 @@ func advanceReceiveWindow(dst io.Writer, buffered map[uint64]Packet, expectedSeq
 		if packet.Type != PacketTypeData {
 			return expectedSeq, false, nil
 		}
-		if err := writeReceiveWindowPacket(dst, packet, stats); err != nil {
+		if err := writeReceiveWindowPacket(dst, packet, stats, progress); err != nil {
 			return expectedSeq, false, err
 		}
 		expectedSeq++
 	}
 }
 
-func writeReceiveWindowPacket(dst io.Writer, packet Packet, stats *TransferStats) error {
+func writeReceiveWindowPacket(dst io.Writer, packet Packet, stats *TransferStats, progress func(TransferStats)) error {
 	if stats != nil && stats.FirstByteAt.IsZero() && len(packet.Payload) > 0 {
 		stats.FirstByteAt = time.Now()
 	}
@@ -8646,6 +8648,7 @@ func writeReceiveWindowPacket(dst io.Writer, packet Packet, stats *TransferStats
 	if stats != nil {
 		stats.BytesReceived += int64(n)
 		stats.observePeakGoodput(time.Now(), stats.BytesReceived)
+		emitProbeProgress(progress, *stats)
 	}
 	return nil
 }

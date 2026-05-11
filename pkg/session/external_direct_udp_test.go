@@ -3341,6 +3341,44 @@ func TestExternalExecutePreparedDirectUDPReceiveEmitsSessionMetrics(t *testing.T
 	}
 }
 
+func TestExternalExecutePreparedDirectUDPReceiveUsesDirectMetricsForLiveWrites(t *testing.T) {
+	origReceive := externalDirectUDPReceiveBlastParallelToWriterFn
+	defer func() {
+		externalDirectUDPReceiveBlastParallelToWriterFn = origReceive
+	}()
+
+	metrics := newExternalTransferMetrics(time.Now())
+	payload := []byte("live-direct-progress")
+	externalDirectUDPReceiveBlastParallelToWriterFn = func(_ context.Context, _ []net.PacketConn, dst io.Writer, _ probe.ReceiveConfig, _ int64) (probe.TransferStats, error) {
+		n, err := dst.Write(payload)
+		if err != nil {
+			return probe.TransferStats{}, err
+		}
+		if n != len(payload) {
+			return probe.TransferStats{}, io.ErrShortWrite
+		}
+		if got := metrics.DirectBytes(); got != int64(len(payload)) {
+			return probe.TransferStats{}, fmt.Errorf("live DirectBytes = %d, want %d", got, len(payload))
+		}
+		return probe.TransferStats{BytesReceived: int64(len(payload)), StartedAt: time.Now(), FirstByteAt: time.Now(), CompletedAt: time.Now(), Lanes: 1}, nil
+	}
+
+	err := externalExecutePreparedDirectUDPReceive(context.Background(), externalDirectUDPReceivePlan{
+		probeConns:  []net.PacketConn{nil},
+		receiveDst:  io.Discard,
+		flushDst:    func() error { return nil },
+		receiveCfg:  externalDirectUDPFastDiscardReceiveConfig(),
+		fastDiscard: true,
+		start:       directUDPStart{ExpectedBytes: int64(len(payload))},
+	}, token.Token{SessionID: [16]byte{0x93}}, ListenConfig{}, metrics)
+	if err != nil {
+		t.Fatalf("externalExecutePreparedDirectUDPReceive() error = %v", err)
+	}
+	if got := metrics.DirectBytes(); got != int64(len(payload)) {
+		t.Fatalf("DirectBytes() = %d, want %d", got, len(payload))
+	}
+}
+
 func TestExternalDirectUDPConnsUseDedicatedBlastSockets(t *testing.T) {
 	base, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
