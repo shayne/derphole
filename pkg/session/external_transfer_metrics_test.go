@@ -33,6 +33,14 @@ func TestExternalTransferMetricsTrackRelayAndDirectBytes(t *testing.T) {
 	}
 }
 
+func TestExternalTransferMetricsNilReceiverWriteAndCompleteNoop(t *testing.T) {
+	var m *externalTransferMetrics
+
+	m.RecordRelayWrite(1024, time.Unix(1, 0))
+	m.RecordDirectWrite(2048, time.Unix(2, 0))
+	m.Complete(time.Unix(3, 0))
+}
+
 func TestEmitExternalTransferMetricsIncludesWallAndPeakValues(t *testing.T) {
 	start := time.Unix(0, 0)
 	m := newExternalTransferMetrics(start)

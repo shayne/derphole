@@ -54,14 +54,23 @@ func newExternalTransferMetricsWithTrace(startedAt time.Time, trace *transfertra
 }
 
 func (m *externalTransferMetrics) RecordRelayWrite(n int64, at time.Time) {
+	if m == nil {
+		return
+	}
 	m.recordWrite(&m.relayBytes, n, at)
 }
 
 func (m *externalTransferMetrics) RecordDirectWrite(n int64, at time.Time) {
+	if m == nil {
+		return
+	}
 	m.recordWrite(&m.directBytes, n, at)
 }
 
 func (m *externalTransferMetrics) Complete(at time.Time) {
+	if m == nil {
+		return
+	}
 	m.mu.Lock()
 	if at.IsZero() {
 		m.mu.Unlock()

@@ -29,6 +29,7 @@ import (
 	"github.com/shayne/derphole/pkg/rendezvous"
 	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/token"
+	"github.com/shayne/derphole/pkg/transfertrace"
 	"github.com/shayne/derphole/pkg/transport"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -1232,21 +1233,50 @@ func TestReceiveExternalViaDirectUDPOnlyLetsPrepareConsumeReady(t *testing.T) {
 	waitReadyCalled := false
 	prepareCalled := false
 	executeCalled := false
+	var traceOut bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&traceOut, transfertrace.RoleReceive, time.Unix(50, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := rec.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
 	externalDirectUDPWaitReadyFn = func(context.Context, <-chan derpbind.Packet, ...externalPeerControlAuth) error {
 		waitReadyCalled = true
 		return errors.New("unexpected direct UDP ready wait")
 	}
 	externalPrepareDirectUDPReceiveFn = func(ctx context.Context, dst io.Writer, tok token.Token, derpClient *derpbind.Client, peerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, decision rendezvous.Decision, readyCh <-chan derpbind.Packet, startCh <-chan derpbind.Packet, cfg ListenConfig) (externalDirectUDPReceivePlan, error) {
 		prepareCalled = true
+		metrics := externalTransferMetricsFromContext(ctx)
+		if metrics == nil {
+			t.Fatal("prepare context metrics = nil, want configured trace metrics")
+		}
+		if metrics.trace != rec {
+			t.Fatal("prepare context metrics trace recorder not preserved from ListenConfig")
+		}
+		if metrics.role != transfertrace.RoleReceive {
+			t.Fatalf("prepare context metrics role = %q, want receive", metrics.role)
+		}
 		return externalDirectUDPReceivePlan{}, nil
 	}
 	externalExecutePreparedDirectUDPReceiveFn = func(ctx context.Context, plan externalDirectUDPReceivePlan, tok token.Token, cfg ListenConfig, metrics *externalTransferMetrics) error {
 		executeCalled = true
+		if metrics == nil {
+			t.Fatal("execute metrics = nil, want configured trace metrics")
+		}
+		if metrics.trace != rec {
+			t.Fatal("execute metrics trace recorder not preserved from ListenConfig")
+		}
+		if metrics.role != transfertrace.RoleReceive {
+			t.Fatalf("execute metrics role = %q, want receive", metrics.role)
+		}
 		return nil
 	}
 
 	manager := transport.NewManager(transport.ManagerConfig{})
-	if err := receiveExternalViaDirectUDPOnly(context.Background(), io.Discard, token.Token{}, nil, key.NodePublic{}, manager, nil, nil, nil, nil, nil, rendezvous.Decision{}, nil, nil, ListenConfig{}); err != nil {
+	if err := receiveExternalViaDirectUDPOnly(context.Background(), io.Discard, token.Token{}, nil, key.NodePublic{}, manager, nil, nil, nil, nil, nil, rendezvous.Decision{}, nil, nil, ListenConfig{Trace: rec}); err != nil {
 		t.Fatalf("receiveExternalViaDirectUDPOnly() error = %v", err)
 	}
 	if waitReadyCalled {
@@ -1257,6 +1287,36 @@ func TestReceiveExternalViaDirectUDPOnlyLetsPrepareConsumeReady(t *testing.T) {
 	}
 	if !executeCalled {
 		t.Fatal("receiveExternalViaDirectUDPOnly() did not call externalExecutePreparedDirectUDPReceiveFn")
+	}
+}
+
+func TestExternalExecutePreparedDirectUDPReceiveFallbackMetricsUseListenTrace(t *testing.T) {
+	var traceOut bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&traceOut, transfertrace.RoleReceive, time.Unix(60, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := rec.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	err = externalExecutePreparedDirectUDPReceive(context.Background(), externalDirectUDPReceivePlan{
+		receiveDst:  io.Discard,
+		flushDst:    func() error { return nil },
+		receiveCfg:  externalDirectUDPFastDiscardReceiveConfig(),
+		fastDiscard: true,
+	}, token.Token{}, ListenConfig{Trace: rec}, nil)
+	if err == nil || !strings.Contains(err.Error(), "no packet conns") {
+		t.Fatalf("externalExecutePreparedDirectUDPReceive() error = %v, want no packet conns", err)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+	body := traceOut.String()
+	if !strings.Contains(body, ",receive,direct_execute,") {
+		t.Fatalf("trace body missing direct receive execution row:\n%s", body)
 	}
 }
 
@@ -3159,10 +3219,18 @@ func TestExternalExecutePreparedDirectUDPSendEmitsSessionMetrics(t *testing.T) {
 
 	var buf bytes.Buffer
 	emitter := telemetry.New(&buf, telemetry.LevelVerbose)
-	metrics := newExternalTransferMetrics(time.Now())
+	var traceOut bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&traceOut, transfertrace.RoleSend, time.Unix(70, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Now(), rec, transfertrace.RoleSend)
 	err = externalExecutePreparedDirectUDPSend(ctx, bytes.NewReader(payload), externalDirectUDPSendPlan{
-		probeConns:  []net.PacketConn{clientConn},
-		remoteAddrs: []string{serverConn.LocalAddr().String()},
+		probeConns:       []net.PacketConn{clientConn},
+		remoteAddrs:      []string{serverConn.LocalAddr().String()},
+		selectedRateMbps: 700,
+		startRateMbps:    350,
+		availableLanes:   4,
 		sendCfg: probe.SendConfig{
 			Blast:          true,
 			Transport:      externalDirectUDPTransportLabel,
@@ -3171,7 +3239,7 @@ func TestExternalExecutePreparedDirectUDPSendEmitsSessionMetrics(t *testing.T) {
 			RunID:          runID,
 			RepairPayloads: true,
 		},
-	}, SendConfig{Emitter: emitter}, metrics)
+	}, SendConfig{Emitter: emitter, Trace: rec}, metrics)
 	if err != nil {
 		t.Fatalf("externalExecutePreparedDirectUDPSend() error = %v", err)
 	}
@@ -3195,6 +3263,13 @@ func TestExternalExecutePreparedDirectUDPSendEmitsSessionMetrics(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("emitted metrics missing %q in %q", want, got)
 		}
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+	traceBody := traceOut.String()
+	if !strings.Contains(traceBody, ",send,direct_execute,0,0,0,0,0.00,700,350,1,4,") {
+		t.Fatalf("trace body missing preserved available lanes:\n%s", traceBody)
 	}
 }
 
