@@ -326,6 +326,39 @@ func TestExternalHandoffSpoolBufferedWindowCanGrowWithoutRaisingRelayWindow(t *t
 	}
 }
 
+func TestExternalHandoffSpoolCursorReadReleasesBufferedWindow(t *testing.T) {
+	spool, err := newExternalHandoffSpool(strings.NewReader("abcdefghijklmnop"), 4, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := spool.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	if _, err := spool.NextChunk(); err != nil {
+		t.Fatal(err)
+	}
+	spool.SetMaxBuffered(8)
+	waitExternalHandoffSpoolSourceOffset(t, spool, 8)
+	time.Sleep(50 * time.Millisecond)
+	if got := spool.Snapshot().SourceOffset; got != 8 {
+		t.Fatalf("source offset before cursor read = %d, want bounded read-ahead at 8", got)
+	}
+
+	cursor := newExternalHandoffSpoolCursor(context.Background(), spool, 4)
+	buf := make([]byte, 4)
+	n, err := io.ReadFull(cursor, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "efgh" {
+		t.Fatalf("cursor read = %q, want %q", got, "efgh")
+	}
+	waitExternalHandoffSpoolSourceOffset(t, spool, 12)
+}
+
 func TestExternalHandoffSenderReturnsEOFAfterSourceDrainedAndAcked(t *testing.T) {
 	spool, err := newExternalHandoffSpool(strings.NewReader("abc"), 8, 16)
 	if err != nil {

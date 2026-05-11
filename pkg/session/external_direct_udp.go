@@ -110,7 +110,7 @@ const (
 	externalRelayPrefixDERPMaxUnacked              = 64 << 10
 	externalRelayPrefixDERPSustainedMax            = 64 << 10
 	externalRelayPrefixDERPHandoffMaxUnacked       = externalRelayPrefixDERPSustainedMax
-	externalRelayPrefixOverlapMaxBuffered          = 1 << 40
+	externalRelayPrefixOverlapMaxBuffered          = 8 << 20
 	externalRelayPrefixDERPStartupBytes            = 4 << 20
 	externalRelayPrefixDERPHandoffAckWait          = 5 * time.Second
 	externalRelayPrefixDirectPrepStallWait         = 250 * time.Millisecond
@@ -177,16 +177,17 @@ var externalRelayPrefixDERPDataNonceDomain = []byte("derphole-relay-prefix-derp-
 var externalDirectUDPObservePunchAddrsByConn = probe.ObservePunchAddrsByConn
 
 type externalDirectUDPSendPlan struct {
-	probeConns           []net.PacketConn
-	remoteAddrs          []string
-	sendCfg              probe.SendConfig
-	selectedRateMbps     int
-	startRateMbps        int
-	rateCeilingMbps      int
-	availableLanes       int
-	probeRates           []int
-	sentProbeSamples     []directUDPRateProbeSample
-	receivedProbeSamples []directUDPRateProbeSample
+	probeConns                  []net.PacketConn
+	remoteAddrs                 []string
+	sendCfg                     probe.SendConfig
+	sendSrcRecordsDirectMetrics bool
+	selectedRateMbps            int
+	startRateMbps               int
+	rateCeilingMbps             int
+	availableLanes              int
+	probeRates                  []int
+	sentProbeSamples            []directUDPRateProbeSample
+	receivedProbeSamples        []directUDPRateProbeSample
 }
 
 type externalDirectUDPSenderProbeRateLimitResult struct {
@@ -1194,7 +1195,7 @@ func externalExecutePreparedDirectUDPSend(ctx context.Context, src io.Reader, pl
 	}
 	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct-execute")
 	metrics.SetDirectPlan(plan.selectedRateMbps, plan.startRateMbps, len(plan.probeConns), availableLanes)
-	plan.sendCfg.Progress = externalDirectUDPSendProgressRecorder(plan.sendCfg.Progress, metrics)
+	plan.sendCfg.Progress = externalDirectUDPSendProgressRecorder(plan.sendCfg.Progress, metrics, !plan.sendSrcRecordsDirectMetrics)
 	externalTransferTracef("direct-udp-send-execute-start lanes=%d addrs=%s rate=%d ceiling=%d", len(plan.probeConns), strings.Join(plan.remoteAddrs, ","), plan.sendCfg.RateMbps, plan.sendCfg.RateCeilingMbps)
 	stats, err := probe.SendBlastParallel(ctx, plan.probeConns, plan.remoteAddrs, externalDirectUDPBufferedReader(src), plan.sendCfg)
 	externalTransferTracef("direct-udp-send-execute-done err=%v bytes=%d lanes=%d first-byte-zero=%v complete-zero=%v", err, stats.BytesSent, stats.Lanes, stats.FirstByteAt.IsZero(), stats.CompletedAt.IsZero())
@@ -1208,15 +1209,7 @@ func externalExecutePreparedDirectUDPSend(ctx context.Context, src io.Reader, pl
 		emitExternalDirectUDPSendReplayStats(cfg.Emitter, stats)
 		emitExternalDirectUDPStats(cfg.Emitter, "udp-send", stats.BytesSent, stats.StartedAt, stats.FirstByteAt, stats.CompletedAt)
 	}
-	if stats.BytesSent > 0 {
-		directFirstByteAt := stats.FirstByteAt
-		if directFirstByteAt.IsZero() {
-			directFirstByteAt = stats.StartedAt
-		}
-		if remaining := stats.BytesSent - metrics.DirectBytes(); remaining > 0 {
-			metrics.RecordDirectWrite(remaining, directFirstByteAt)
-		}
-	}
+	externalDirectUDPSendRecordMetrics(metrics, stats, !plan.sendSrcRecordsDirectMetrics)
 	emitExternalTransferMetricsComplete(metrics, cfg.Emitter, "udp-send", stats, stats.CompletedAt)
 	if err != nil {
 		metrics.SetError(err)
@@ -1224,12 +1217,29 @@ func externalExecutePreparedDirectUDPSend(ctx context.Context, src io.Reader, pl
 	return err
 }
 
-func externalDirectUDPSendProgressRecorder(progress func(probe.TransferStats), metrics *externalTransferMetrics) func(probe.TransferStats) {
+func externalDirectUDPSendRecordMetrics(metrics *externalTransferMetrics, stats probe.TransferStats, backfillDirectBytes bool) {
+	if !backfillDirectBytes || stats.BytesSent <= 0 {
+		return
+	}
+	directFirstByteAt := stats.FirstByteAt
+	if directFirstByteAt.IsZero() {
+		directFirstByteAt = stats.StartedAt
+	}
+	if remaining := stats.BytesSent - metrics.DirectBytes(); remaining > 0 {
+		metrics.RecordDirectWrite(remaining, directFirstByteAt)
+	}
+}
+
+func externalDirectUDPSendProgressRecorder(progress func(probe.TransferStats), metrics *externalTransferMetrics, updateDirectBytes bool) func(probe.TransferStats) {
 	return func(stats probe.TransferStats) {
 		if progress != nil {
 			progress(stats)
 		}
-		metrics.SetProbeStats(stats)
+		if updateDirectBytes {
+			metrics.SetProbeStats(stats)
+			return
+		}
+		metrics.SetProbeStatsWithoutByteProgress(stats)
 	}
 }
 
@@ -2236,6 +2246,10 @@ func (rt *externalRelayPrefixSendRuntime) waitPreparedAfterHandoff() error {
 
 func (rt *externalRelayPrefixSendRuntime) executePrepared(plan externalDirectUDPSendPlan) error {
 	boundary := rt.overlapBoundary
+	if rt.metrics != nil {
+		rt.metrics.SetDirectAppProgressBase(boundary)
+		plan.sendSrcRecordsDirectMetrics = true
+	}
 	progress := plan.sendCfg.Progress
 	plan.sendCfg.Progress = func(stats probe.TransferStats) {
 		if progress != nil {
@@ -2252,7 +2266,11 @@ func (rt *externalRelayPrefixSendRuntime) executePrepared(plan externalDirectUDP
 	defer directCancel()
 	directErrCh := make(chan error, 1)
 	go func() {
-		directErrCh <- externalExecutePreparedDirectUDPSendFn(directCtx, newExternalHandoffSpoolCursor(directCtx, rt.spool, boundary), plan, rt.rcfg.cfg, rt.metrics)
+		src := newExternalHandoffSpoolCursor(directCtx, rt.spool, boundary)
+		if rt.metrics != nil {
+			src = externalTransferMetricsReader{r: src, record: rt.metrics.RecordDirectWrite}
+		}
+		directErrCh <- externalExecutePreparedDirectUDPSendFn(directCtx, src, plan, rt.rcfg.cfg, rt.metrics)
 	}()
 
 	select {

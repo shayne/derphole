@@ -23,6 +23,8 @@ type externalTransferMetrics struct {
 	firstByteAt            time.Time
 	relayBytes             int64
 	directBytes            int64
+	directAppProgressBase  int64
+	directAppProgressSet   bool
 	trace                  *transfertrace.Recorder
 	role                   transfertrace.Role
 	phase                  transfertrace.Phase
@@ -65,6 +67,19 @@ func (m *externalTransferMetrics) RecordDirectWrite(n int64, at time.Time) {
 		return
 	}
 	m.recordWrite(&m.directBytes, n, at)
+}
+
+func (m *externalTransferMetrics) SetDirectAppProgressBase(offset int64) {
+	if m == nil {
+		return
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	m.mu.Lock()
+	m.directAppProgressBase = offset
+	m.directAppProgressSet = true
+	m.mu.Unlock()
 }
 
 func (m *externalTransferMetrics) Complete(at time.Time) {
@@ -135,15 +150,25 @@ func (m *externalTransferMetrics) SetProbeSummary(state string, summary string) 
 }
 
 func (m *externalTransferMetrics) SetProbeStats(stats probe.TransferStats) {
+	m.setProbeStats(stats, true)
+}
+
+func (m *externalTransferMetrics) SetProbeStatsWithoutByteProgress(stats probe.TransferStats) {
+	m.setProbeStats(stats, false)
+}
+
+func (m *externalTransferMetrics) setProbeStats(stats probe.TransferStats, updateDirectBytes bool) {
 	if m == nil {
 		return
 	}
 	m.mu.Lock()
-	if stats.BytesSent > m.directBytes {
-		m.directBytes = stats.BytesSent
-	}
-	if stats.BytesReceived > m.directBytes {
-		m.directBytes = stats.BytesReceived
+	if updateDirectBytes {
+		if stats.BytesSent > m.directBytes {
+			m.directBytes = stats.BytesSent
+		}
+		if stats.BytesReceived > m.directBytes {
+			m.directBytes = stats.BytesReceived
+		}
 	}
 	if m.directBytes > 0 && m.firstByteAt.IsZero() {
 		m.firstByteAt = time.Now()
@@ -245,6 +270,19 @@ func (w externalTransferMetricsWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+type externalTransferMetricsReader struct {
+	r      io.Reader
+	record func(int64, time.Time)
+}
+
+func (r externalTransferMetricsReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 && r.record != nil {
+		r.record(int64(n), time.Now())
+	}
+	return n, err
+}
+
 func (m *externalTransferMetrics) recordWrite(totalBytes *int64, n int64, at time.Time) {
 	if m == nil || n <= 0 {
 		return
@@ -272,7 +310,7 @@ func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrac
 		Phase:                  m.phase,
 		RelayBytes:             m.relayBytes,
 		DirectBytes:            m.directBytes,
-		AppBytes:               m.relayBytes + m.directBytes,
+		AppBytes:               m.appBytesLocked(),
 		DirectRateSelectedMbps: m.directRateSelectedMbps,
 		DirectRateActiveMbps:   m.directRateActiveMbps,
 		DirectLanesActive:      m.directLanesActive,
@@ -286,6 +324,17 @@ func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrac
 		LastState:              m.lastState,
 		LastError:              m.lastError,
 	}, true
+}
+
+func (m *externalTransferMetrics) appBytesLocked() int64 {
+	if !m.directAppProgressSet {
+		return m.relayBytes + m.directBytes
+	}
+	directProgress := m.directAppProgressBase + m.directBytes
+	if directProgress > m.relayBytes {
+		return directProgress
+	}
+	return m.relayBytes
 }
 
 func observeExternalTransferTrace(trace *transfertrace.Recorder, snap transfertrace.Snapshot, ok bool) {

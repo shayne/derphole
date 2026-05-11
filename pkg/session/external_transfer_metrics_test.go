@@ -110,6 +110,52 @@ func TestExternalTransferMetricsSetProbeStatsUpdatesTrace(t *testing.T) {
 	}
 }
 
+func TestExternalTransferMetricsTraceUsesDirectStreamOffsetForOverlap(t *testing.T) {
+	var out bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(40, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(40, 0), rec, transfertrace.RoleSend)
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct")
+	metrics.RecordRelayWrite(10, time.Unix(40, int64(100*time.Millisecond)))
+	metrics.SetDirectAppProgressBase(6)
+	metrics.RecordDirectWrite(100, time.Unix(40, int64(200*time.Millisecond)))
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+	body := out.String()
+	if strings.Contains(body, ",send,direct_execute,10,100,110,") {
+		t.Fatalf("trace body double-counted relay/direct overlap:\n%s", body)
+	}
+	if !strings.Contains(body, ",send,direct_execute,10,100,106,96,") {
+		t.Fatalf("trace body missing offset-based app progress:\n%s", body)
+	}
+}
+
+func TestExternalDirectUDPSendProgressRecorderCanSkipProbeByteProgress(t *testing.T) {
+	start := time.Unix(50, 0)
+	metrics := newExternalTransferMetrics(start)
+	metrics.RecordDirectWrite(123, start.Add(100*time.Millisecond))
+	progressCalled := false
+	recorder := externalDirectUDPSendProgressRecorder(func(probe.TransferStats) {
+		progressCalled = true
+	}, metrics, false)
+
+	recorder(probe.TransferStats{
+		BytesSent:      999,
+		Retransmits:    3,
+		MaxReplayBytes: 4096,
+	})
+
+	if !progressCalled {
+		t.Fatal("progress callback was not preserved")
+	}
+	if got := metrics.DirectBytes(); got != 123 {
+		t.Fatalf("DirectBytes() = %d, want source-tracked value 123", got)
+	}
+}
+
 func TestListenConfigTraceUpdatesReceiveRelayPrefixTrace(t *testing.T) {
 	var out bytes.Buffer
 	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleReceive, time.Unix(20, 0))

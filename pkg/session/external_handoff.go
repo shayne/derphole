@@ -283,23 +283,24 @@ func maxInt64(a, b int64) int64 {
 }
 
 type externalHandoffSpool struct {
-	mu              sync.Mutex
-	cond            *sync.Cond
-	src             io.Reader
-	srcCloser       io.Closer
-	file            *os.File
-	filePath        string
-	chunkSize       int
-	maxUnacked      int64
-	maxBuffered     int64
-	readOffset      int64
-	sourceOffset    int64
-	ackedWatermark  int64
-	eof             bool
-	readErr         error
-	readInterrupted bool
-	closed          bool
-	pumpDone        chan struct{}
+	mu                sync.Mutex
+	cond              *sync.Cond
+	src               io.Reader
+	srcCloser         io.Closer
+	file              *os.File
+	filePath          string
+	chunkSize         int
+	maxUnacked        int64
+	maxBuffered       int64
+	readOffset        int64
+	sourceOffset      int64
+	ackedWatermark    int64
+	bufferedWatermark int64
+	eof               bool
+	readErr           error
+	readInterrupted   bool
+	closed            bool
+	pumpDone          chan struct{}
 }
 
 type externalHandoffSpoolSnapshot struct {
@@ -603,7 +604,16 @@ func (c *externalHandoffSpoolCursor) readAvailablePayloadLocked(s *externalHando
 		err = nil
 	}
 	c.offset += int64(n)
+	s.advanceBufferedWatermarkLocked(c.offset)
 	return n, err, false
+}
+
+func (s *externalHandoffSpool) advanceBufferedWatermarkLocked(offset int64) {
+	if offset <= s.bufferedWatermark {
+		return
+	}
+	s.bufferedWatermark = offset
+	s.cond.Broadcast()
 }
 
 func externalHandoffSpoolCursorBlockedRead(s *externalHandoffSpool) (int, error, bool) {
@@ -680,18 +690,25 @@ func (s *externalHandoffSpool) nextPumpReadSize() (int, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for !s.closed && s.readErr == nil && !s.eof && s.sourceOffset-s.ackedWatermark >= s.maxBuffered {
+	for !s.closed && s.readErr == nil && !s.eof && s.sourceOffset-s.bufferedWindowWatermarkLocked() >= s.maxBuffered {
 		s.cond.Wait()
 	}
 	if s.closed || s.readErr != nil || s.eof {
 		return 0, true
 	}
-	headroom := s.maxBuffered - (s.sourceOffset - s.ackedWatermark)
+	headroom := s.maxBuffered - (s.sourceOffset - s.bufferedWindowWatermarkLocked())
 	readSize := s.chunkSize
 	if headroom < int64(readSize) {
 		readSize = int(headroom)
 	}
 	return readSize, false
+}
+
+func (s *externalHandoffSpool) bufferedWindowWatermarkLocked() int64 {
+	if s.bufferedWatermark > s.ackedWatermark {
+		return s.bufferedWatermark
+	}
+	return s.ackedWatermark
 }
 
 func (s *externalHandoffSpool) readAndStorePumpPayload(readSize int) bool {
