@@ -27,6 +27,19 @@ Measure raw network capacity separately before blaming tunnel overhead.
 
 Keep source payload size, host pair, and direction fixed when comparing variants. Record duration, throughput, final path state, and whether the session upgraded from `connected-relay` to `connected-direct`.
 
+### Transfer Stall Traces
+
+Use in-process transfer traces when proving stalls. SSH polling in `samples.csv` is useful as an outer process watchdog, but application-byte progress should come from the sender and receiver trace files.
+
+```bash
+DERPHOLE_TRANSFER_TRACE_CSV=/tmp/send.csv derphole send payload.bin
+DERPHOLE_TRANSFER_TRACE_CSV=/tmp/receive.csv derphole receive -o received.bin '<token>'
+mise exec -- go run ./tools/transfertracecheck -role send -expected-bytes <bytes> -stall-window 1s /tmp/send.csv
+mise exec -- go run ./tools/transfertracecheck -role receive -expected-bytes <bytes> -stall-window 1s /tmp/receive.csv
+```
+
+`scripts/transfer-stall-harness.sh` enables sender and receiver traces automatically, copies them back as `sender/send.trace.csv` and `receiver/receive.trace.csv`, and runs `tools/transfertracecheck` after payload SHA verification.
+
 For no-Tailscale route verification, run 3x averaged 1 GiB transfers in both directions for:
 
 - Mac -> `ktzlxc`

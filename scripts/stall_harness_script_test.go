@@ -46,6 +46,11 @@ func TestTransferStallHarnessCapturesProgressAndCounters(t *testing.T) {
 		"wait \\\"\\${child}\\\"",
 		"--exclude=payload.bin",
 		"--exclude=received.bin",
+		"DERPHOLE_TRANSFER_TRACE_CSV",
+		"send.trace.csv",
+		"receive.trace.csv",
+		"transfertracecheck",
+		"-stall-window",
 	}
 	for _, want := range required {
 		if !strings.Contains(body, want) {

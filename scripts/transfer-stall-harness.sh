@@ -22,11 +22,14 @@ sample_interval_sec="${DERPHOLE_STALL_SAMPLE_INTERVAL_SEC:-0.5}"
 stall_timeout_sec="${DERPHOLE_STALL_TIMEOUT_SEC:-20}"
 start_timeout_sec="${DERPHOLE_STALL_START_TIMEOUT_SEC:-60}"
 total_timeout_sec="${DERPHOLE_STALL_TOTAL_TIMEOUT_SEC:-900}"
+trace_stall_window="${DERPHOLE_TRANSFER_TRACE_STALL_WINDOW:-1s}"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 log_dir="${DERPHOLE_STALL_LOG_DIR:-/tmp/derphole-stall-${stamp}}"
 samples_file="${log_dir}/samples.csv"
 sender_dir=""
 receiver_dir=""
+sender_trace=""
+receiver_trace=""
 sender_payload=""
 receiver_out=""
 sender_cmd=""
@@ -303,6 +306,8 @@ REMOTE_SAMPLE_STATE
 
 sender_dir="$(remote_mktemp "${sender_target}")"
 receiver_dir="$(remote_mktemp "${receiver_target}")"
+sender_trace="${sender_dir}/send.trace.csv"
+receiver_trace="${receiver_dir}/receive.trace.csv"
 receiver_out="${receiver_dir}/received.bin"
 
 if [[ -z "${DERPHOLE_STALL_REMOTE_CMD:-}" ]]; then
@@ -338,10 +343,10 @@ if [[ "${DERPHOLE_STALL_CAPTURE_SENDER_PROGRESS:-1}" == "1" ]]; then
   sender_progress_flag=""
 fi
 remote_sh "${sender_target}" "
-		rm -f $(quote "${sender_dir}/send.out") $(quote "${sender_dir}/send.err") $(quote "${sender_dir}/send.pid") $(quote "${sender_dir}/send.status")
+		rm -f $(quote "${sender_dir}/send.out") $(quote "${sender_dir}/send.err") $(quote "${sender_dir}/send.pid") $(quote "${sender_dir}/send.status") $(quote "${sender_trace}")
 	(
 	  set +e
-	  ${env_prefix}${sender_cmd} --verbose send ${sender_progress_flag} $(quote "${sender_payload}") >$(quote "${sender_dir}/send.out") 2>$(quote "${sender_dir}/send.err") </dev/null &
+	  ${env_prefix}DERPHOLE_TRANSFER_TRACE_CSV=$(quote "${sender_trace}") ${sender_cmd} --verbose send ${sender_progress_flag} $(quote "${sender_payload}") >$(quote "${sender_dir}/send.out") 2>$(quote "${sender_dir}/send.err") </dev/null &
 	  child=\$!
 	  echo \"\${child}\" >$(quote "${sender_dir}/send.pid")
 	  wait \"\${child}\"
@@ -362,10 +367,10 @@ if [[ -z "${token}" ]]; then
 fi
 
 remote_sh "${receiver_target}" "
-	rm -f $(quote "${receiver_out}") $(quote "${receiver_dir}/receive.out") $(quote "${receiver_dir}/receive.err") $(quote "${receiver_dir}/receive.pid") $(quote "${receiver_dir}/receive.status")
+	rm -f $(quote "${receiver_out}") $(quote "${receiver_dir}/receive.out") $(quote "${receiver_dir}/receive.err") $(quote "${receiver_dir}/receive.pid") $(quote "${receiver_dir}/receive.status") $(quote "${receiver_trace}")
 (
   set +e
-  ${env_prefix}${receiver_cmd} --verbose receive --hide-progress -o $(quote "${receiver_out}") $(quote "${token}") >$(quote "${receiver_dir}/receive.out") 2>$(quote "${receiver_dir}/receive.err") </dev/null &
+  ${env_prefix}DERPHOLE_TRANSFER_TRACE_CSV=$(quote "${receiver_trace}") ${receiver_cmd} --verbose receive --hide-progress -o $(quote "${receiver_out}") $(quote "${token}") >$(quote "${receiver_dir}/receive.out") 2>$(quote "${receiver_dir}/receive.err") </dev/null &
   child=\$!
   echo \"\${child}\" >$(quote "${receiver_dir}/receive.pid")
   wait \"\${child}\"
@@ -445,6 +450,19 @@ if [[ "${sender_status}" != "0" || "${receiver_status}" != "0" ]]; then
 fi
 if [[ "${sink_size}" != "${expected_size}" || "${sink_sha}" != "${source_sha}" ]]; then
   abort_with_dumps "verification-failed"
+fi
+
+fetch_remote_dir "${sender_target}" "${sender_dir}" "${log_dir}/sender"
+fetch_remote_dir "${receiver_target}" "${receiver_dir}" "${log_dir}/receiver"
+
+mise exec -- go run ./tools/transfertracecheck -role send -expected-bytes "${expected_size}" -stall-window "${trace_stall_window}" "${log_dir}/sender/send.trace.csv"
+if [[ "${DERPHOLE_TRANSFER_TRACE_EXPECT_STALL:-0}" == "1" ]]; then
+  if mise exec -- go run ./tools/transfertracecheck -role receive -expected-bytes "${expected_size}" -stall-window "${trace_stall_window}" "${log_dir}/receiver/receive.trace.csv"; then
+    echo "stall-proof-error=expected-stall-but-checker-passed" >&2
+    exit 1
+  fi
+else
+  mise exec -- go run ./tools/transfertracecheck -role receive -expected-bytes "${expected_size}" -stall-window "${trace_stall_window}" "${log_dir}/receiver/receive.trace.csv"
 fi
 
 echo "stall-harness-success=true"
