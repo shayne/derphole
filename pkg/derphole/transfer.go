@@ -24,6 +24,7 @@ import (
 	"github.com/shayne/derphole/pkg/session"
 	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/token"
+	"github.com/shayne/derphole/pkg/transfertrace"
 )
 
 type SendConfig struct {
@@ -39,6 +40,7 @@ type SendConfig struct {
 	ForceRelay     bool
 	QR             bool
 	ParallelPolicy session.ParallelPolicy
+	Trace          *transfertrace.Recorder
 }
 
 type ReceiveConfig struct {
@@ -55,6 +57,7 @@ type ReceiveConfig struct {
 	ForceRelay     bool
 	ParallelPolicy session.ParallelPolicy
 	Progress       func(current, total int64)
+	Trace          *transfertrace.Recorder
 }
 
 type directorySummary struct {
@@ -264,6 +267,7 @@ func receiveViaStdioOffer(ctx context.Context, cfg ReceiveConfig, receiveToken s
 			StdioOut:      pipeWriter,
 			UsePublicDERP: cfg.UsePublicDERP,
 			ForceRelay:    cfg.ForceRelay,
+			Trace:         cfg.Trace,
 		})
 		if err != nil {
 			_ = pipeWriter.CloseWithError(err)
@@ -469,6 +473,7 @@ func offerTransfer(ctx context.Context, cfg SendConfig, tx sendTransfer) error {
 			UsePublicDERP:      cfg.UsePublicDERP,
 			ForceRelay:         cfg.ForceRelay,
 			ParallelPolicy:     cfg.ParallelPolicy,
+			Trace:              cfg.Trace,
 		})
 		offerErrCh <- err
 	}()
@@ -512,6 +517,7 @@ func sendViaSession(ctx context.Context, cfg SendConfig, tx sendTransfer) error 
 			UsePublicDERP:      cfg.UsePublicDERP,
 			ForceRelay:         cfg.ForceRelay,
 			ParallelPolicy:     cfg.ParallelPolicy,
+			Trace:              cfg.Trace,
 		})
 	}()
 

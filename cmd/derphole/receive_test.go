@@ -7,11 +7,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	pkgderphole "github.com/shayne/derphole/pkg/derphole"
 	"github.com/shayne/derphole/pkg/session"
+	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/transfertrace"
 )
 
 func TestRunHelpReceiveAliasesShowReceiveHelp(t *testing.T) {
@@ -32,6 +36,23 @@ func TestRunHelpReceiveAliasesShowReceiveHelp(t *testing.T) {
 func TestReceiveHelpIncludesHideProgress(t *testing.T) {
 	if !strings.Contains(receiveHelpText(), "--hide-progress") {
 		t.Fatalf("receiveHelpText() missing --hide-progress:\n%s", receiveHelpText())
+	}
+}
+
+func TestRunReceivePassesTransferTraceFromEnvironment(t *testing.T) {
+	t.Setenv("DERPHOLE_TRANSFER_TRACE_CSV", filepath.Join(t.TempDir(), "receive.csv"))
+	prev := runReceiveTransfer
+	defer func() { runReceiveTransfer = prev }()
+	var got *transfertrace.Recorder
+	runReceiveTransfer = func(_ context.Context, cfg pkgderphole.ReceiveConfig) error {
+		got = cfg.Trace
+		return nil
+	}
+	if code := runReceive([]string{"abc", "--hide-progress"}, telemetry.LevelQuiet, strings.NewReader(""), io.Discard, io.Discard); code != 0 {
+		t.Fatalf("runReceive() code = %d, want 0", code)
+	}
+	if got == nil {
+		t.Fatal("Trace was nil")
 	}
 }
 

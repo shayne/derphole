@@ -7,11 +7,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	pkgderphole "github.com/shayne/derphole/pkg/derphole"
 	"github.com/shayne/derphole/pkg/session"
+	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/transfertrace"
 )
 
 func TestRunHelpSendShowsSendHelp(t *testing.T) {
@@ -66,6 +70,23 @@ func TestRunSendPassesQRFlag(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("runSendTransfer was not called")
+	}
+}
+
+func TestRunSendPassesTransferTraceFromEnvironment(t *testing.T) {
+	t.Setenv("DERPHOLE_TRANSFER_TRACE_CSV", filepath.Join(t.TempDir(), "send.csv"))
+	prev := runSendTransfer
+	defer func() { runSendTransfer = prev }()
+	var got *transfertrace.Recorder
+	runSendTransfer = func(_ context.Context, cfg pkgderphole.SendConfig) error {
+		got = cfg.Trace
+		return nil
+	}
+	if code := runSend([]string{"hello", "--hide-progress"}, telemetry.LevelQuiet, strings.NewReader(""), io.Discard, io.Discard); code != 0 {
+		t.Fatalf("runSend() code = %d, want 0", code)
+	}
+	if got == nil {
+		t.Fatal("Trace was nil")
 	}
 }
 

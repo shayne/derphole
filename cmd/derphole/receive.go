@@ -11,6 +11,7 @@ import (
 	pkgderphole "github.com/shayne/derphole/pkg/derphole"
 	"github.com/shayne/derphole/pkg/session"
 	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/transfertrace"
 	"github.com/shayne/yargs"
 )
 
@@ -63,6 +64,11 @@ func runReceive(args []string, level telemetry.Level, stdin io.Reader, stdout, s
 	token := parsed.Args.Code
 	ctx, stop := commandContext()
 	defer stop()
+	trace, closeTrace, ok := openTransferTraceFromEnv(transfertrace.RoleReceive, stderr)
+	if !ok {
+		return 1
+	}
+	defer closeTrace()
 	if err := runReceiveTransfer(ctx, pkgderphole.ReceiveConfig{
 		Token:      token,
 		Allocate:   token == "",
@@ -80,6 +86,7 @@ func runReceive(args []string, level telemetry.Level, stdin io.Reader, stdout, s
 		UsePublicDERP:  usePublicDERPTransport(),
 		ForceRelay:     parsed.SubCommandFlags.ForceRelay,
 		ParallelPolicy: session.DefaultParallelPolicy(),
+		Trace:          trace,
 	}); err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1

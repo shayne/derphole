@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/transfertrace"
 	"github.com/shayne/derphole/pkg/transport"
 )
 
@@ -37,6 +38,7 @@ type SendConfig struct {
 	ForceRelay         bool
 	UsePublicDERP      bool
 	ParallelPolicy     ParallelPolicy
+	Trace              *transfertrace.Recorder
 
 	// Relay-prefix upgrades already have a live payload path. Blocking pre-data
 	// UDP probes would create an app-visible stall, so the data path ramps using
@@ -52,6 +54,7 @@ type OfferConfig struct {
 	ForceRelay         bool
 	UsePublicDERP      bool
 	ParallelPolicy     ParallelPolicy
+	Trace              *transfertrace.Recorder
 }
 
 type ReceiveConfig struct {
@@ -60,6 +63,7 @@ type ReceiveConfig struct {
 	StdioOut      io.Writer
 	ForceRelay    bool
 	UsePublicDERP bool
+	Trace         *transfertrace.Recorder
 }
 
 type AttachDialConfig struct {
