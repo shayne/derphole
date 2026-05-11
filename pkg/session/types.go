@@ -22,6 +22,7 @@ type ListenConfig struct {
 	StdioOut      io.Writer
 	ForceRelay    bool
 	UsePublicDERP bool
+	Trace         *transfertrace.Recorder
 }
 
 type AttachListenConfig struct {

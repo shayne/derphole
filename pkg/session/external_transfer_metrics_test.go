@@ -76,3 +76,23 @@ func TestExternalTransferMetricsUpdatesTrace(t *testing.T) {
 		t.Fatalf("trace body missing relay progress:\n%s", body)
 	}
 }
+
+func TestListenConfigTraceUpdatesReceiveRelayPrefixTrace(t *testing.T) {
+	var out bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleReceive, time.Unix(20, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := ListenConfig{Trace: rec}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(20, 0), cfg.Trace, transfertrace.RoleReceive)
+	metrics.SetPhase(transfertrace.PhaseRelay, "connected-relay")
+	metrics.RecordRelayWrite(2048, time.Unix(20, int64(250*time.Millisecond)))
+	metrics.Tick(time.Unix(20, int64(250*time.Millisecond)))
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+	body := out.String()
+	if !strings.Contains(body, ",receive,relay,2048,0,2048,2048,") {
+		t.Fatalf("trace body missing receive relay progress:\n%s", body)
+	}
+}

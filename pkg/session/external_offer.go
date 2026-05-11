@@ -673,6 +673,7 @@ func receiveExternalOfferPayload(ctx context.Context, cfg ReceiveConfig, runtime
 			StdioOut:      cfg.StdioOut,
 			ForceRelay:    cfg.ForceRelay,
 			UsePublicDERP: cfg.UsePublicDERP,
+			Trace:         cfg.Trace,
 		},
 	})
 }

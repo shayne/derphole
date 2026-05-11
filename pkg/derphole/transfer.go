@@ -195,6 +195,7 @@ func receiveAllocated(ctx context.Context, cfg ReceiveConfig) error {
 			StdioOut:      pipeWriter,
 			UsePublicDERP: cfg.UsePublicDERP,
 			ForceRelay:    cfg.ForceRelay,
+			Trace:         cfg.Trace,
 		})
 		if err != nil {
 			_ = pipeWriter.CloseWithError(err)

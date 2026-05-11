@@ -2255,7 +2255,7 @@ type externalRelayPrefixReceiveRuntime struct {
 }
 
 func newExternalRelayPrefixReceiveRuntime(ctx context.Context, rcfg externalRelayPrefixReceiveConfig) (*externalRelayPrefixReceiveRuntime, error) {
-	metrics := newExternalTransferMetrics(time.Now())
+	metrics := newExternalTransferMetricsWithTrace(time.Now(), rcfg.cfg.Trace, transfertrace.RoleReceive)
 	metrics.SetPhase(transfertrace.PhaseRelay, "connected-relay")
 	ctx = withExternalTransferMetrics(ctx, metrics)
 	packetAEAD, err := externalSessionPacketAEAD(rcfg.tok)
