@@ -23,6 +23,7 @@ stall_timeout_sec="${DERPHOLE_STALL_TIMEOUT_SEC:-20}"
 start_timeout_sec="${DERPHOLE_STALL_START_TIMEOUT_SEC:-60}"
 total_timeout_sec="${DERPHOLE_STALL_TOTAL_TIMEOUT_SEC:-900}"
 trace_stall_window="${DERPHOLE_TRANSFER_TRACE_STALL_WINDOW:-1s}"
+trace_integrity_stall_window="${DERPHOLE_TRANSFER_TRACE_INTEGRITY_STALL_WINDOW:-876000h}"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 log_dir="${DERPHOLE_STALL_LOG_DIR:-/tmp/derphole-stall-${stamp}}"
 samples_file="${log_dir}/samples.csv"
@@ -472,6 +473,7 @@ if [[ "${DERPHOLE_TRANSFER_TRACE_EXPECT_STALL:-0}" == "1" ]]; then
   fi
   if [[ "${receive_checker_output}" == *"app bytes stalled"* ]]; then
     printf '%s\n' "${receive_checker_output}" >&2
+    mise exec -- go run ./tools/transfertracecheck -role receive -expected-bytes "${expected_size}" -stall-window "${trace_integrity_stall_window}" "${log_dir}/receiver/receive.trace.csv"
   else
     echo "stall-proof-error=unexpected-checker-failure" >&2
     if [[ -n "${receive_checker_output}" ]]; then
