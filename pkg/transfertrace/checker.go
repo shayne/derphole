@@ -35,6 +35,7 @@ type checkerIndexes struct {
 }
 
 type checkerRow struct {
+	rowNo     int
 	timestamp time.Time
 	role      Role
 	phase     Phase
@@ -43,10 +44,11 @@ type checkerRow struct {
 }
 
 type checker struct {
-	opts           Options
-	result         Result
-	lastAppBytes   int64
-	lastProgressAt time.Time
+	opts         Options
+	result       Result
+	lastAppBytes int64
+	active       bool
+	activeSince  time.Time
 }
 
 func Check(r io.Reader, opts Options) (Result, error) {
@@ -71,15 +73,21 @@ func Check(r io.Reader, opts Options) (Result, error) {
 }
 
 func (c *checker) scanRows(cr *csv.Reader, indexes checkerIndexes) error {
+	rowNo := 1
 	for {
 		record, err := cr.Read()
+		rowNo++
 		if err == io.EOF {
 			return nil
 		}
 		if err != nil {
-			return fmt.Errorf("read row: %w", err)
+			return fmt.Errorf("row %d: read row: %w", rowNo, err)
 		}
-		row, err := parseCheckerRow(record, indexes)
+		role := Role(field(record, indexes.role))
+		if c.opts.Role != "" && role != c.opts.Role {
+			continue
+		}
+		row, err := parseCheckerRow(record, indexes, rowNo, role)
 		if err != nil {
 			return err
 		}
@@ -90,40 +98,59 @@ func (c *checker) scanRows(cr *csv.Reader, indexes checkerIndexes) error {
 }
 
 func (c *checker) consume(row checkerRow) error {
-	if c.opts.Role != "" && row.role != c.opts.Role {
-		return nil
-	}
 	c.result.Rows++
 	c.result.FinalAppBytes = row.appBytes
 	c.result.FinalPhase = row.phase
 	if row.lastError != "" {
-		return fmt.Errorf("terminal error: %s", row.lastError)
+		return fmt.Errorf("row %d: terminal error: %s", row.rowNo, row.lastError)
 	}
 
-	if c.result.Rows == 1 || row.appBytes > c.lastAppBytes {
-		c.recordProgress(row)
+	active := isActivePhase(row.phase)
+	if c.result.Rows == 1 {
+		c.recordFirstRow(row, active)
 		return nil
 	}
-	if isActivePhase(row.phase) {
-		return c.checkFlatline(row)
+	if !active {
+		c.recordInactive(row)
+		return nil
 	}
-	return nil
-}
-
-func (c *checker) recordProgress(row checkerRow) {
-	c.lastAppBytes = row.appBytes
-	c.lastProgressAt = row.timestamp
+	if !c.active || row.appBytes > c.lastAppBytes {
+		c.recordActiveProgress(row)
+		return nil
+	}
+	return c.checkFlatline(row)
 }
 
 func (c *checker) checkFlatline(row checkerRow) error {
-	flatline := row.timestamp.Sub(c.lastProgressAt)
+	flatline := row.timestamp.Sub(c.activeSince)
 	if flatline > c.result.MaxFlatline {
 		c.result.MaxFlatline = flatline
 	}
 	if flatline > c.opts.StallWindow {
-		return fmt.Errorf("app bytes stalled for %s in phase %s", flatline, row.phase)
+		return fmt.Errorf("row %d: app bytes stalled for %s in phase %s", row.rowNo, flatline, row.phase)
 	}
 	return nil
+}
+
+func (c *checker) recordFirstRow(row checkerRow, active bool) {
+	c.lastAppBytes = row.appBytes
+	c.active = active
+	if active {
+		c.activeSince = row.timestamp
+	}
+}
+
+func (c *checker) recordInactive(row checkerRow) {
+	if row.appBytes > c.lastAppBytes {
+		c.lastAppBytes = row.appBytes
+	}
+	c.active = false
+}
+
+func (c *checker) recordActiveProgress(row checkerRow) {
+	c.lastAppBytes = row.appBytes
+	c.active = true
+	c.activeSince = row.timestamp
 }
 
 func (c *checker) finish() (Result, error) {
@@ -199,29 +226,30 @@ func lookupTimestamp(positions map[string]int) (int, string, error) {
 	return 0, "", fmt.Errorf("missing required timestamp header %q or %q", "timestamp_unix_ms", "timestamp_ms")
 }
 
-func parseCheckerRow(record []string, indexes checkerIndexes) (checkerRow, error) {
-	timestampMS, err := parseIntField(record, indexes.timestamp, indexes.timestampName)
+func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int, role Role) (checkerRow, error) {
+	timestampMS, err := parseIntField(record, indexes.timestamp, indexes.timestampName, rowNo)
 	if err != nil {
 		return checkerRow{}, err
 	}
-	appBytes, err := parseIntField(record, indexes.appBytes, "app_bytes")
+	appBytes, err := parseIntField(record, indexes.appBytes, "app_bytes", rowNo)
 	if err != nil {
 		return checkerRow{}, err
 	}
 	return checkerRow{
+		rowNo:     rowNo,
 		timestamp: time.UnixMilli(timestampMS),
-		role:      Role(field(record, indexes.role)),
+		role:      role,
 		phase:     Phase(field(record, indexes.phase)),
 		appBytes:  appBytes,
 		lastError: field(record, indexes.lastError),
 	}, nil
 }
 
-func parseIntField(record []string, index int, name string) (int64, error) {
+func parseIntField(record []string, index int, name string, rowNo int) (int64, error) {
 	value := field(record, index)
 	n, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("parse %s %q: %w", name, value, err)
+		return 0, fmt.Errorf("row %d: parse %s %q: %w", rowNo, name, value, err)
 	}
 	return n, nil
 }
