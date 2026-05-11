@@ -197,6 +197,18 @@ func emitProbeProgress(cb func(TransferStats), stats TransferStats) {
 	cb(stats)
 }
 
+func serializeProbeProgress(cb func(TransferStats)) func(TransferStats) {
+	if cb == nil {
+		return nil
+	}
+	var mu sync.Mutex
+	return func(stats TransferStats) {
+		mu.Lock()
+		defer mu.Unlock()
+		cb(stats)
+	}
+}
+
 func recordReplayWindowFullWait(stats *TransferStats, retainedBytes uint64, waited time.Duration) {
 	if stats == nil {
 		return
@@ -213,6 +225,7 @@ func Send(ctx context.Context, conn net.PacketConn, remoteAddr string, src io.Re
 	if src == nil {
 		return TransferStats{}, errors.New("nil source reader")
 	}
+	cfg.Progress = serializeProbeProgress(cfg.Progress)
 	cfg = normalizeSendConfig(cfg)
 	peer, err := net.ResolveUDPAddr("udp", remoteAddr)
 	if err != nil {
@@ -409,6 +422,7 @@ func ReceiveToWriter(ctx context.Context, conn net.PacketConn, remoteAddr string
 	if dst == nil {
 		return TransferStats{}, errors.New("nil destination writer")
 	}
+	cfg.Progress = serializeProbeProgress(cfg.Progress)
 
 	peer, err := resolveRemoteAddr(remoteAddr)
 	if err != nil {
@@ -1406,6 +1420,7 @@ func blastParallelRepairHistoryForLane(global *blastRepairHistory, lane *blastPa
 }
 
 func SendBlastParallel(ctx context.Context, conns []net.PacketConn, remoteAddrs []string, src io.Reader, cfg SendConfig) (TransferStats, error) {
+	cfg.Progress = serializeProbeProgress(cfg.Progress)
 	if singleStats, handled, err := sendBlastParallelEarlyResult(ctx, conns, remoteAddrs, src, cfg); handled {
 		return singleStats, err
 	}
@@ -4198,6 +4213,7 @@ func configureBlastUDPReadDeadline(ctx context.Context, conn *net.UDPConn) (func
 }
 
 func ReceiveBlastParallelToWriter(ctx context.Context, conns []net.PacketConn, dst io.Writer, cfg ReceiveConfig, expectedBytes int64) (TransferStats, error) {
+	cfg.Progress = serializeProbeProgress(cfg.Progress)
 	state, err := newBlastParallelReceiveState(conns, dst, cfg, expectedBytes)
 	if err != nil {
 		return TransferStats{}, err
@@ -5672,6 +5688,7 @@ func ReceiveBlastStreamParallelToWriter(ctx context.Context, conns []net.PacketC
 	if len(conns) == 0 {
 		return TransferStats{}, errors.New("no packet conns")
 	}
+	cfg.Progress = serializeProbeProgress(cfg.Progress)
 	if len(conns) == 1 {
 		return ReceiveBlastParallelToWriter(ctx, conns, dst, cfg, expectedBytes)
 	}
@@ -5996,6 +6013,7 @@ func ReceiveReliableParallelToWriter(ctx context.Context, conns []net.PacketConn
 	if len(conns) == 0 {
 		return TransferStats{}, errors.New("no packet conns")
 	}
+	cfg.Progress = serializeProbeProgress(cfg.Progress)
 	if dst == nil {
 		dst = io.Discard
 	}

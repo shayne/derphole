@@ -913,6 +913,98 @@ func TestBlastParallelStreamPreservesOrderAcrossLoopback(t *testing.T) {
 	}
 }
 
+func TestReceiveBlastParallelProgressCallbacksAreSerialized(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverA.Close()
+	serverB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverB.Close()
+
+	clientA, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientA.Close()
+	clientB, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientB.Close()
+
+	srcA := bytes.Repeat([]byte("a"), 1<<16)
+	srcB := bytes.Repeat([]byte("b"), 1<<16)
+	total := int64(len(srcA) + len(srcB))
+	var inCallback atomic.Int32
+	var concurrent atomic.Bool
+	var calls atomic.Int64
+	progress := func(stats TransferStats) {
+		if stats.BytesReceived <= 0 {
+			return
+		}
+		calls.Add(1)
+		if inCallback.Add(1) != 1 {
+			concurrent.Store(true)
+		}
+		time.Sleep(10 * time.Millisecond)
+		inCallback.Add(-1)
+	}
+
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 3)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{serverA, serverB}, io.Discard, ReceiveConfig{
+			Blast:    true,
+			Progress: progress,
+		}, total)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if _, err := Send(ctx, clientA, serverA.LocalAddr().String(), bytes.NewReader(srcA), SendConfig{Blast: true}); err != nil {
+			errCh <- err
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if _, err := Send(ctx, clientB, serverB.LocalAddr().String(), bytes.NewReader(srcB), SendConfig{Blast: true}); err != nil {
+			errCh <- err
+		}
+	}()
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("parallel blast error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != total {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, total)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for parallel receive: %v", ctx.Err())
+	}
+	if calls.Load() == 0 {
+		t.Fatal("progress callback was not called")
+	}
+	if concurrent.Load() {
+		t.Fatal("progress callback was invoked concurrently")
+	}
+}
+
 func TestBlastStreamReceiveCompletionCancelIsBenignOnlyAfterComplete(t *testing.T) {
 	var complete atomic.Bool
 	if blastStreamReceiveCompletionCanceled(context.Canceled, context.Background(), &complete) {
