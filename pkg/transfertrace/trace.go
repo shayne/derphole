@@ -118,21 +118,20 @@ func NewRecorder(out io.Writer, role Role, start time.Time) (*Recorder, error) {
 }
 
 // Update copies the current snapshot, calls update while holding Recorder.mu,
-// and records the mutated snapshot. The callback must be fast, non-blocking,
-// and must not call Recorder methods.
+// and stores the mutated snapshot without recording a CSV row. The callback
+// must be fast, non-blocking, and must not call Recorder methods.
 func (r *Recorder) Update(update func(*Snapshot)) {
 	if update == nil {
 		return
 	}
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.closed || r.err != nil {
-		r.mu.Unlock()
 		return
 	}
 	snap := r.current
 	update(&snap)
-	r.observeLocked(snap)
-	r.mu.Unlock()
+	r.current = snap
 }
 
 func (r *Recorder) Observe(snap Snapshot) {

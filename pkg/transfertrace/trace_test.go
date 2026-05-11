@@ -14,6 +14,7 @@ import (
 )
 
 func TestRecorderWritesHeaderAndEscapedRows(t *testing.T) {
+	lastError := "quoted \" value, comma"
 	var out bytes.Buffer
 	rec, err := NewRecorder(&out, RoleSend, time.Unix(100, 0))
 	if err != nil {
@@ -32,24 +33,29 @@ func TestRecorderWritesHeaderAndEscapedRows(t *testing.T) {
 		DirectProbeState:       "running",
 		DirectProbeSummary:     "8:rx=199296,350:rx=8749648",
 		LastState:              "connected-direct",
-		LastError:              "quoted \" value, comma",
+		LastError:              lastError,
 	})
 	if err := rec.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
-	if got, want := lines[0], HeaderLine; got != want {
-		t.Fatalf("header = %q, want %q", got, want)
-	}
-	if !strings.Contains(lines[1], `"quoted "" value, comma"`) {
-		t.Fatalf("row did not CSV-escape quoted error: %q", lines[1])
-	}
-	if !strings.Contains(lines[1], ",send,direct_probe,") {
-		t.Fatalf("row missing role/phase: %q", lines[1])
-	}
-	if !strings.Contains(lines[1], ",500,") {
-		t.Fatalf("row missing elapsed ms: %q", lines[1])
-	}
+	records, indexes := readTraceCSV(t, out.String())
+	assertRecordCount(t, records, 2)
+	assertHeaderLine(t, records[0])
+	row := records[1]
+	assertColumn(t, row, indexes, "role", "send")
+	assertColumn(t, row, indexes, "phase", "direct_probe")
+	assertColumn(t, row, indexes, "elapsed_ms", "500")
+	assertColumn(t, row, indexes, "relay_bytes", "1024")
+	assertColumn(t, row, indexes, "direct_bytes", "2048")
+	assertColumn(t, row, indexes, "app_bytes", "3072")
+	assertColumn(t, row, indexes, "direct_rate_selected_mbps", "350")
+	assertColumn(t, row, indexes, "direct_rate_active_mbps", "100")
+	assertColumn(t, row, indexes, "direct_lanes_active", "2")
+	assertColumn(t, row, indexes, "direct_lanes_available", "8")
+	assertColumn(t, row, indexes, "direct_probe_state", "running")
+	assertColumn(t, row, indexes, "direct_probe_summary", "8:rx=199296,350:rx=8749648")
+	assertColumn(t, row, indexes, "last_state", "connected-direct")
+	assertColumn(t, row, indexes, "last_error", lastError)
 }
 
 func TestRecorderComputesDeltaAndMbps(t *testing.T) {
@@ -63,10 +69,14 @@ func TestRecorderComputesDeltaAndMbps(t *testing.T) {
 	if err := rec.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	rows := strings.Split(strings.TrimSpace(out.String()), "\n")
-	if !strings.Contains(rows[2], ",1048576,8.39,") {
-		t.Fatalf("second row missing delta/rate: %q", rows[2])
-	}
+	records, indexes := readTraceCSV(t, out.String())
+	assertRecordCount(t, records, 3)
+	row := records[2]
+	assertColumn(t, row, indexes, "role", "receive")
+	assertColumn(t, row, indexes, "phase", "relay")
+	assertColumn(t, row, indexes, "app_bytes", "2097152")
+	assertColumn(t, row, indexes, "delta_app_bytes", "1048576")
+	assertColumn(t, row, indexes, "app_mbps", "8.39")
 }
 
 func TestRecorderErrorAndCompleteRows(t *testing.T) {
@@ -80,13 +90,14 @@ func TestRecorderErrorAndCompleteRows(t *testing.T) {
 	if err := rec.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	body := out.String()
-	if !strings.Contains(body, ",error,") || !strings.Contains(body, "message too long") {
-		t.Fatalf("missing terminal error row:\n%s", body)
-	}
-	if !strings.Contains(body, ",complete,") {
-		t.Fatalf("missing complete row:\n%s", body)
-	}
+	records, indexes := readTraceCSV(t, out.String())
+	assertRecordCount(t, records, 3)
+	assertColumn(t, records[1], indexes, "phase", "error")
+	assertColumn(t, records[1], indexes, "elapsed_ms", "250")
+	assertColumn(t, records[1], indexes, "last_error", "write udp: message too long")
+	assertColumn(t, records[2], indexes, "phase", "complete")
+	assertColumn(t, records[2], indexes, "elapsed_ms", "1000")
+	assertColumn(t, records[2], indexes, "last_error", "write udp: message too long")
 }
 
 func TestRecorderHeaderUnaffectedByExportedHeaderMutation(t *testing.T) {
@@ -172,6 +183,34 @@ func TestUpdateSkipsCallbackWhenClosedOrFailed(t *testing.T) {
 	})
 }
 
+func TestUpdateMutatesCurrentSnapshotWithoutRecordingRow(t *testing.T) {
+	var out bytes.Buffer
+	rec, err := NewRecorder(&out, RoleSend, time.Unix(800, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	rec.Observe(Snapshot{At: time.Unix(800, 0), Phase: PhaseRelay, AppBytes: 1 << 20})
+	rec.Update(func(snap *Snapshot) {
+		snap.AppBytes = 2 << 20
+		snap.DirectBytes = 99
+		snap.LastState = "updated-only"
+	})
+	rec.Tick(time.Unix(801, 0))
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	records, indexes := readTraceCSV(t, out.String())
+	assertRecordCount(t, records, 3)
+	row := records[2]
+	assertColumn(t, row, indexes, "phase", "relay")
+	assertColumn(t, row, indexes, "direct_bytes", "99")
+	assertColumn(t, row, indexes, "app_bytes", "2097152")
+	assertColumn(t, row, indexes, "delta_app_bytes", "1048576")
+	assertColumn(t, row, indexes, "app_mbps", "8.39")
+	assertColumn(t, row, indexes, "last_state", "updated-only")
+}
+
 func readTraceCSV(t *testing.T, body string) ([][]string, map[string]int) {
 	t.Helper()
 	records, err := csv.NewReader(strings.NewReader(body)).ReadAll()
@@ -186,6 +225,20 @@ func readTraceCSV(t *testing.T, body string) ([][]string, map[string]int) {
 		indexes[name] = i
 	}
 	return records, indexes
+}
+
+func assertHeaderLine(t *testing.T, header []string) {
+	t.Helper()
+	if got := strings.Join(header, ","); got != HeaderLine {
+		t.Fatalf("header = %q, want %q", got, HeaderLine)
+	}
+}
+
+func assertRecordCount(t *testing.T, records [][]string, want int) {
+	t.Helper()
+	if got := len(records); got != want {
+		t.Fatalf("record count = %d, want %d; records = %#v", got, want, records)
+	}
 }
 
 func assertColumn(t *testing.T, row []string, indexes map[string]int, column string, want string) {
