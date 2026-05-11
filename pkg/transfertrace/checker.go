@@ -56,6 +56,7 @@ func Check(r io.Reader, opts Options) (Result, error) {
 		opts.StallWindow = time.Second
 	}
 	cr := csv.NewReader(r)
+	cr.FieldsPerRecord = -1
 	header, err := cr.Read()
 	if err != nil {
 		return Result{}, fmt.Errorf("read header: %w", err)
@@ -227,6 +228,15 @@ func lookupTimestamp(positions map[string]int) (int, string, error) {
 }
 
 func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int, role Role) (checkerRow, error) {
+	if err := requireField(record, indexes.timestamp, indexes.timestampName, rowNo); err != nil {
+		return checkerRow{}, err
+	}
+	if err := requireField(record, indexes.phase, "phase", rowNo); err != nil {
+		return checkerRow{}, err
+	}
+	if err := requireField(record, indexes.appBytes, "app_bytes", rowNo); err != nil {
+		return checkerRow{}, err
+	}
 	timestampMS, err := parseIntField(record, indexes.timestamp, indexes.timestampName, rowNo)
 	if err != nil {
 		return checkerRow{}, err
@@ -243,6 +253,13 @@ func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int, role Ro
 		appBytes:  appBytes,
 		lastError: field(record, indexes.lastError),
 	}, nil
+}
+
+func requireField(record []string, index int, name string, rowNo int) error {
+	if index < 0 || index >= len(record) {
+		return fmt.Errorf("row %d: missing required field %q", rowNo, name)
+	}
+	return nil
 }
 
 func parseIntField(record []string, index int, name string, rowNo int) (int64, error) {

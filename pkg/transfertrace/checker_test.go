@@ -62,6 +62,19 @@ func TestCheckIgnoresMalformedNonMatchingRows(t *testing.T) {
 	}
 }
 
+func TestCheckIgnoresShortNonMatchingRows(t *testing.T) {
+	csvText := "timestamp_unix_ms,role,phase,app_bytes,last_error\n" +
+		"1000,send,error,0\n" +
+		"1500,receive,complete,4096,\n"
+	result, err := Check(strings.NewReader(csvText), Options{Role: RoleReceive, ExpectedBytes: 4096})
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if result.Rows != 1 || result.FinalAppBytes != 4096 || result.FinalPhase != PhaseComplete {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
 func TestCheckResetsFlatlineClockWhenEnteringActivePhase(t *testing.T) {
 	csvText := "timestamp_unix_ms,role,phase,app_bytes,last_error\n" +
 		"1000,receive,claim,1024,\n" +
@@ -141,6 +154,15 @@ func TestCheckFailsMalformedMatchingRowWithRowNumber(t *testing.T) {
 	_, err := Check(strings.NewReader(csvText), Options{Role: RoleReceive})
 	if err == nil || !strings.Contains(err.Error(), "parse timestamp_unix_ms") || !strings.Contains(err.Error(), "row 2") {
 		t.Fatalf("Check() error = %v, want malformed row 2", err)
+	}
+}
+
+func TestCheckFailsShortMatchingRowWithRowNumber(t *testing.T) {
+	csvText := "timestamp_unix_ms,role,phase,app_bytes,last_error\n" +
+		"1000,receive,complete\n"
+	_, err := Check(strings.NewReader(csvText), Options{Role: RoleReceive})
+	if err == nil || !strings.Contains(err.Error(), "row 2") || !strings.Contains(err.Error(), "app_bytes") {
+		t.Fatalf("Check() error = %v, want short matching row 2", err)
 	}
 }
 
