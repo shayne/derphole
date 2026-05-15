@@ -47,6 +47,32 @@ func TestVerifyPeerProgressPacketAuthenticatedAccepted(t *testing.T) {
 	}
 }
 
+func TestVerifyPeerProgressPacketAcceptsUnsequencedProgress(t *testing.T) {
+	auth := testPeerProgressAuth()
+	payload, err := marshalAuthenticatedEnvelope(envelope{
+		Type:     envelopeProgress,
+		Progress: newPeerProgress(1234, 567, 0),
+	}, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var lastSequence uint64
+	got, handled, err := verifyPeerProgressPacket(derpbind.Packet{Payload: payload}, auth, &lastSequence)
+	if err != nil {
+		t.Fatalf("verifyPeerProgressPacket() error = %v", err)
+	}
+	if handled {
+		t.Fatal("verifyPeerProgressPacket() handled = true, want false")
+	}
+	if got.BytesReceived != 1234 || got.TransferElapsedMS != 567 || got.Sequence != 0 {
+		t.Fatalf("progress = %+v, want bytes=1234 elapsed=567 sequence=0", got)
+	}
+	if lastSequence != 0 {
+		t.Fatalf("lastSequence = %d, want 0", lastSequence)
+	}
+}
+
 func TestVerifyPeerProgressPacketUnauthenticatedHandledWhenAuthEnabled(t *testing.T) {
 	auth := testPeerProgressAuth()
 	payload, err := json.Marshal(envelope{
@@ -63,6 +89,16 @@ func TestVerifyPeerProgressPacketUnauthenticatedHandledWhenAuthEnabled(t *testin
 	}
 	if !handled {
 		t.Fatal("verifyPeerProgressPacket() handled = false, want true")
+	}
+}
+
+func TestPeerProgressReplayedAllowsUnsequencedProgress(t *testing.T) {
+	var lastSequence uint64
+	if peerProgressReplayed(newPeerProgress(1, 2, 0), &lastSequence) {
+		t.Fatal("zero sequence was replayed")
+	}
+	if lastSequence != 0 {
+		t.Fatalf("lastSequence = %d, want 0", lastSequence)
 	}
 }
 

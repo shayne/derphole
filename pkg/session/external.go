@@ -2004,6 +2004,9 @@ func peerProgressReplayed(progress *peerProgress, lastSequence *uint64) bool {
 	if progress == nil || lastSequence == nil {
 		return false
 	}
+	if progress.Sequence == 0 {
+		return false
+	}
 	if progress.Sequence <= *lastSequence {
 		return true
 	}
