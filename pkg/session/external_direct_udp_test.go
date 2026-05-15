@@ -2335,11 +2335,14 @@ func TestSendExternalViaRelayPrefixThenDirectUDPFallsBackToRelayWhenPostHandoffP
 	payload := bytes.Repeat([]byte("post-handoff-prepare-error-relay-fallback"), (16<<20)/len("post-handoff-prepare-error-relay-fallback")+1)
 	payload = payload[:16<<20]
 	var status bytes.Buffer
+	pathEmitter := newTransportPathEmitter(telemetry.New(&status, telemetry.LevelVerbose))
+	pathEmitter.Emit(StateRelay)
 	err := sendExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixSendConfig{
 		src:          bytes.NewReader(payload),
 		decision:     rendezvous.Decision{Accept: &rendezvous.AcceptInfo{}},
 		derpClient:   nil,
 		listenerDERP: key.NodePublic{},
+		pathEmitter:  pathEmitter,
 		cfg:          SendConfig{Emitter: telemetry.New(&status, telemetry.LevelVerbose)},
 	})
 	if err != nil {
@@ -2351,10 +2354,15 @@ func TestSendExternalViaRelayPrefixThenDirectUDPFallsBackToRelayWhenPostHandoffP
 	for _, needle := range []string{
 		"udp-handoff-send-prepare-error=direct UDP rate probes received no packets",
 		"udp-handoff-finished-on-relay=true",
+		string(StateTryingDirect),
+		string(StateDirectFallbackRelay),
 	} {
 		if !strings.Contains(status.String(), needle) {
 			t.Fatalf("status output missing %q in %q", needle, status.String())
 		}
+	}
+	if strings.Contains(status.String(), string(StateDirect)+"\n") {
+		t.Fatalf("status output = %q, want no connected-direct on direct prepare fallback", status.String())
 	}
 }
 

@@ -104,12 +104,14 @@ type AttachListener struct {
 type State string
 
 const (
-	StateWaiting  State = "waiting-for-claim"
-	StateClaimed  State = "claimed"
-	StateProbing  State = "probing-direct"
-	StateDirect   State = "connected-direct"
-	StateRelay    State = "connected-relay"
-	StateComplete State = "stream-complete"
+	StateWaiting             State = "waiting-for-claim"
+	StateClaimed             State = "claimed"
+	StateProbing             State = "probing-direct"
+	StateDirect              State = "connected-direct"
+	StateTryingDirect        State = "trying-direct"
+	StateDirectFallbackRelay State = "direct-fallback-relay"
+	StateRelay               State = "connected-relay"
+	StateComplete            State = "stream-complete"
 )
 
 func emitStatus(emitter *telemetry.Emitter, state State) {
@@ -136,6 +138,7 @@ type transportPathEmitter struct {
 	mu                      sync.Mutex
 	emitter                 *telemetry.Emitter
 	last                    transport.Path
+	lastState               State
 	closed                  bool
 	suppressRelayRegression bool
 	suppressWatcherDirect   bool
@@ -167,8 +170,10 @@ func (e *transportPathEmitter) Handle(path transport.Path) {
 
 	switch path {
 	case transport.PathDirect:
+		e.lastState = StateDirect
 		e.emitter.Status(string(StateDirect))
 	case transport.PathRelay:
+		e.lastState = StateRelay
 		e.emitter.Status(string(StateRelay))
 	}
 }
@@ -215,25 +220,47 @@ func (e *transportPathEmitter) Emit(state State) {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.closed {
+	if e.closed || !e.prepareEmitLocked(state) {
 		return
 	}
+	e.lastState = state
+	e.emitter.Status(string(state))
+}
+
+func (e *transportPathEmitter) prepareEmitLocked(state State) bool {
 	switch state {
 	case StateDirect:
-		if e.last == transport.PathDirect {
-			return
-		}
-		e.last = transport.PathDirect
+		return e.prepareDirectEmitLocked()
 	case StateRelay:
-		if e.suppressRelayRegression && e.last == transport.PathDirect {
-			return
-		}
-		if e.last == transport.PathRelay {
-			return
+		return e.prepareRelayEmitLocked()
+	case StateTryingDirect:
+		return e.lastState != StateTryingDirect
+	case StateDirectFallbackRelay:
+		if e.lastState == StateDirectFallbackRelay {
+			return false
 		}
 		e.last = transport.PathRelay
 	}
-	e.emitter.Status(string(state))
+	return true
+}
+
+func (e *transportPathEmitter) prepareDirectEmitLocked() bool {
+	if e.last == transport.PathDirect {
+		return false
+	}
+	e.last = transport.PathDirect
+	return true
+}
+
+func (e *transportPathEmitter) prepareRelayEmitLocked() bool {
+	if e.suppressRelayRegression && e.last == transport.PathDirect {
+		return false
+	}
+	if e.last == transport.PathRelay {
+		return false
+	}
+	e.last = transport.PathRelay
+	return true
 }
 
 func (e *transportPathEmitter) SuppressRelayRegression() {
@@ -295,6 +322,7 @@ func (e *transportPathEmitter) emitTransportManagerSummaryLocked(manager *transp
 	emitPositiveIntDebug(e.emitter, "transport-max-peer-recv-queue-depth", manager.MaxPeerRecvQueueDepth())
 	if path := manager.PathState(); path == transport.PathDirect && e.last != transport.PathDirect && !e.suppressWatcherDirect {
 		e.last = transport.PathDirect
+		e.lastState = StateDirect
 		e.emitter.Status(string(StateDirect))
 	}
 }

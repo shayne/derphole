@@ -1331,11 +1331,11 @@ func TestExternalListenSendPromotesToDirectUDPWhenBothSidesAreDirectReady(t *tes
 	if !bytes.Equal(listenerOut.Bytes(), payload) {
 		t.Fatalf("listener output length = %d, want %d", listenerOut.Len(), len(payload))
 	}
-	if got := senderStatus.String(); !strings.Contains(got, string(StateDirect)) || !strings.Contains(got, "udp-blast=true") || !strings.Contains(got, "udp-repair-payloads=true") || !strings.Contains(got, "udp-fec-group-size=0") || strings.Contains(got, "sender-tcp-direct") {
-		t.Fatalf("sender status = %q, want direct UDP promotion", got)
+	if got := senderStatus.String(); !strings.Contains(got, string(StateTryingDirect)) || !strings.Contains(got, string(StateDirect)) || !strings.Contains(got, "udp-blast=true") || !strings.Contains(got, "udp-repair-payloads=true") || !strings.Contains(got, "udp-fec-group-size=0") || strings.Contains(got, "sender-tcp-direct") {
+		t.Fatalf("sender status = %q, want validated direct UDP promotion", got)
 	}
-	if got := listenerStatus.String(); !strings.Contains(got, string(StateDirect)) || !strings.Contains(got, "udp-blast=true") || !strings.Contains(got, "udp-stream=true") || !strings.Contains(got, "udp-fec-group-size=0") || strings.Contains(got, "listener-tcp-direct") {
-		t.Fatalf("listener status = %q, want direct UDP promotion", got)
+	if got := listenerStatus.String(); !strings.Contains(got, string(StateTryingDirect)) || !strings.Contains(got, string(StateDirect)) || !strings.Contains(got, "udp-blast=true") || !strings.Contains(got, "udp-stream=true") || !strings.Contains(got, "udp-fec-group-size=0") || strings.Contains(got, "listener-tcp-direct") {
+		t.Fatalf("listener status = %q, want validated direct UDP promotion", got)
 	}
 	if got := countSessionStatus(sessionStatusLines(senderStatus.String()), StateComplete); got != 1 {
 		t.Fatalf("sender stream-complete count = %d, want 1; sender=%q", got, senderStatus.String())
@@ -1393,11 +1393,11 @@ func TestExternalListenSendDirectUDPPromotionDoesNotEmitRelayRegression(t *testi
 	stdinReader := &sessionTestGatedReader{payload: payload, gateAt: midpoint, gate: func() error {
 		gateCtx, gateCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer gateCancel()
-		if err := waitForSessionTestStatusContains(gateCtx, &senderStatus, string(StateDirect)); err != nil {
-			return fmt.Errorf("waiting for sender direct UDP promotion: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+		if err := waitForSessionTestStatusContains(gateCtx, &senderStatus, string(StateTryingDirect)); err != nil {
+			return fmt.Errorf("waiting for sender direct UDP attempt: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
 		}
-		if err := waitForSessionTestStatusContains(gateCtx, &listenerStatus, string(StateDirect)); err != nil {
-			return fmt.Errorf("waiting for listener direct UDP promotion: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+		if err := waitForSessionTestStatusContains(gateCtx, &listenerStatus, string(StateTryingDirect)); err != nil {
+			return fmt.Errorf("waiting for listener direct UDP attempt: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
 		}
 		return nil
 	}}
@@ -1482,9 +1482,9 @@ func TestExternalListenSendIgnoresLegacyParallelPolicyForDirectUDP(t *testing.T)
 			needle string
 		}{
 			{status: &senderStatus, needle: "udp-blast=true"},
-			{status: &senderStatus, needle: string(StateDirect)},
+			{status: &senderStatus, needle: string(StateTryingDirect)},
 			{status: &listenerStatus, needle: "udp-blast=true"},
-			{status: &listenerStatus, needle: string(StateDirect)},
+			{status: &listenerStatus, needle: string(StateTryingDirect)},
 		} {
 			if err := waitForSessionTestStatusContains(ctx, wait.status, wait.needle); err != nil {
 				return fmt.Errorf("waiting for %q: %w; listener=%q sender=%q", wait.needle, err, listenerStatus.String(), senderStatus.String())
@@ -1575,8 +1575,8 @@ func TestExternalListenSendCompletesWhenDirectUDPSetupOverlapsTransfer(t *testin
 	token := <-tokenSink
 	payload := bytes.Repeat(payloadChunk, chunkCount)
 	stdinReader := &sessionTestGatedReader{payload: payload, gateAt: len(payloadChunk), gate: func() error {
-		if err := waitForSessionTestStatusContains(ctx, &senderStatus, string(StateDirect)); err != nil {
-			return fmt.Errorf("waiting for sender direct state: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+		if err := waitForSessionTestStatusContains(ctx, &senderStatus, string(StateTryingDirect)); err != nil {
+			return fmt.Errorf("waiting for sender direct attempt: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
 		}
 		return nil
 	}}
@@ -1710,9 +1710,9 @@ func TestExternalListenSendUsesDirectUDPEvenWhenNativeTCPWouldBeAllowed(t *testi
 			needle string
 		}{
 			{status: &senderStatus, needle: "udp-blast=true"},
-			{status: &senderStatus, needle: string(StateDirect)},
+			{status: &senderStatus, needle: string(StateTryingDirect)},
 			{status: &listenerStatus, needle: "udp-blast=true"},
-			{status: &listenerStatus, needle: string(StateDirect)},
+			{status: &listenerStatus, needle: string(StateTryingDirect)},
 		} {
 			if err := waitForSessionTestStatusContains(ctx, wait.status, wait.needle); err != nil {
 				writerErr <- fmt.Errorf("waiting for %q: %w; listener=%q sender=%q", wait.needle, err, listenerStatus.String(), senderStatus.String())
@@ -1745,11 +1745,11 @@ func TestExternalListenSendUsesDirectUDPEvenWhenNativeTCPWouldBeAllowed(t *testi
 	if !bytes.Equal(listenerOut.Bytes(), payload) {
 		t.Fatalf("listener output length = %d, want %d", listenerOut.Len(), len(payload))
 	}
-	if got := senderStatus.String(); !strings.Contains(got, string(StateDirect)) || !strings.Contains(got, "udp-blast=true") || strings.Contains(got, "sender-tcp-direct") {
-		t.Fatalf("sender status = %q, want direct UDP without native TCP direct", got)
+	if got := senderStatus.String(); !strings.Contains(got, string(StateTryingDirect)) || !strings.Contains(got, "udp-blast=true") || strings.Contains(got, "sender-tcp-direct") {
+		t.Fatalf("sender status = %q, want attempted direct UDP without native TCP direct", got)
 	}
-	if got := listenerStatus.String(); !strings.Contains(got, string(StateDirect)) || !strings.Contains(got, "udp-blast=true") || strings.Contains(got, "listener-tcp-direct") {
-		t.Fatalf("listener status = %q, want direct UDP without native TCP direct", got)
+	if got := listenerStatus.String(); !strings.Contains(got, string(StateTryingDirect)) || !strings.Contains(got, "udp-blast=true") || strings.Contains(got, "listener-tcp-direct") {
+		t.Fatalf("listener status = %q, want attempted direct UDP without native TCP direct", got)
 	}
 }
 
@@ -1810,9 +1810,9 @@ func TestExternalListenSendIgnoresRequestedParallelPolicyForDirectUDP(t *testing
 			needle string
 		}{
 			{status: &senderStatus, needle: "udp-blast=true"},
-			{status: &senderStatus, needle: string(StateDirect)},
+			{status: &senderStatus, needle: string(StateTryingDirect)},
 			{status: &listenerStatus, needle: "udp-blast=true"},
-			{status: &listenerStatus, needle: string(StateDirect)},
+			{status: &listenerStatus, needle: string(StateTryingDirect)},
 		} {
 			if err := waitForSessionTestStatusContains(ctx, wait.status, wait.needle); err != nil {
 				writerErr <- fmt.Errorf("waiting for %q: %w; listener=%q sender=%q", wait.needle, err, listenerStatus.String(), senderStatus.String())
@@ -1991,6 +1991,46 @@ func TestTransportPathEmitterCompletionIsTerminal(t *testing.T) {
 	if got := sessionStatusLines(status.String()); len(got) != 2 || got[0] != string(StateRelay) || got[1] != string(StateComplete) {
 		t.Fatalf("status lines = %q, want [%q %q]", got, StateRelay, StateComplete)
 	}
+}
+
+func TestDirectFallbackDoesNotEmitConnectedDirect(t *testing.T) {
+	t.Run("explicit fallback statuses", func(t *testing.T) {
+		var status bytes.Buffer
+		pathEmitter := newTransportPathEmitter(telemetry.New(&status, telemetry.LevelVerbose))
+
+		pathEmitter.Emit(StateRelay)
+		pathEmitter.Emit(StateTryingDirect)
+		pathEmitter.Emit(StateDirectFallbackRelay)
+
+		got := status.String()
+		if strings.Contains(got, string(StateDirect)+"\n") {
+			t.Fatalf("status = %q, want no connected-direct", got)
+		}
+		if !strings.Contains(got, string(StateTryingDirect)+"\n") || !strings.Contains(got, string(StateDirectFallbackRelay)+"\n") {
+			t.Fatalf("status = %q, want trying-direct and direct-fallback-relay", got)
+		}
+	})
+
+	t.Run("activation and completion stay suppressed before validation", func(t *testing.T) {
+		var status bytes.Buffer
+		pathEmitter := newTransportPathEmitter(telemetry.New(&status, telemetry.LevelVerbose))
+		manager := transport.NewManager(transport.ManagerConfig{})
+
+		pathEmitter.Emit(StateRelay)
+		pathEmitter.SuppressWatcherDirect()
+		externalDirectUDPActivateDirectPath(pathEmitter, manager, nil)
+		pathEmitter.Emit(StateDirectFallbackRelay)
+		forceTransportManagerPathState(t, manager, transport.PathDirect)
+		pathEmitter.Complete(manager)
+
+		got := status.String()
+		if strings.Contains(got, string(StateDirect)+"\n") {
+			t.Fatalf("status = %q, want no connected-direct before direct validation", got)
+		}
+		if !strings.Contains(got, string(StateTryingDirect)+"\n") || !strings.Contains(got, string(StateDirectFallbackRelay)+"\n") {
+			t.Fatalf("status = %q, want trying-direct and direct-fallback-relay", got)
+		}
+	})
 }
 
 func TestTransportPathEmitterCanSuppressTemporaryRelayRegression(t *testing.T) {

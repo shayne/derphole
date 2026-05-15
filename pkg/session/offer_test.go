@@ -431,11 +431,11 @@ func TestExternalOfferReceiveDirectUDPPromotionDoesNotEmitRelayRegression(t *tes
 	stdinReader := &sessionTestGatedReader{payload: payload, gateAt: midpoint, gate: func() error {
 		gateCtx, gateCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer gateCancel()
-		if err := waitForSessionTestStatusContains(gateCtx, &senderStatus, string(StateDirect)); err != nil {
-			return fmt.Errorf("waiting for offered sender direct UDP promotion: %w; receiver=%q sender=%q", err, receiverStatus.String(), senderStatus.String())
+		if err := waitForSessionTestStatusContains(gateCtx, &senderStatus, string(StateTryingDirect)); err != nil {
+			return fmt.Errorf("waiting for offered sender direct UDP attempt: %w; receiver=%q sender=%q", err, receiverStatus.String(), senderStatus.String())
 		}
-		if err := waitForSessionTestStatusContains(gateCtx, &receiverStatus, string(StateDirect)); err != nil {
-			return fmt.Errorf("waiting for offered receiver direct UDP promotion: %w; receiver=%q sender=%q", err, receiverStatus.String(), senderStatus.String())
+		if err := waitForSessionTestStatusContains(gateCtx, &receiverStatus, string(StateTryingDirect)); err != nil {
+			return fmt.Errorf("waiting for offered receiver direct UDP attempt: %w; receiver=%q sender=%q", err, receiverStatus.String(), senderStatus.String())
 		}
 		return nil
 	}}
@@ -534,8 +534,8 @@ func TestExternalOfferReceiveDirectUDPPromotionWithPipeSourceDoesNotStall(t *tes
 		}
 		gateCtx, gateCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer gateCancel()
-		if err := waitForSessionTestStatusContains(gateCtx, &senderStatus, string(StateDirect)); err != nil {
-			writeErr <- fmt.Errorf("waiting for offered pipe sender direct UDP promotion: %w; receiver=%q sender=%q", err, receiverStatus.String(), senderStatus.String())
+		if err := waitForSessionTestStatusContains(gateCtx, &senderStatus, string(StateTryingDirect)); err != nil {
+			writeErr <- fmt.Errorf("waiting for offered pipe sender direct UDP attempt: %w; receiver=%q sender=%q", err, receiverStatus.String(), senderStatus.String())
 			return
 		}
 		if _, err := pipeWriter.Write(payload[midpoint:]); err != nil {
@@ -564,10 +564,10 @@ func TestExternalOfferReceiveDirectUDPPromotionWithPipeSourceDoesNotStall(t *tes
 	if !bytes.Equal(receiverOut.Bytes(), payload) {
 		t.Fatalf("receiver output length = %d, want %d", receiverOut.Len(), len(payload))
 	}
-	if !strings.Contains(senderStatus.String(), string(StateDirect)) {
-		t.Fatalf("sender statuses = %q, want %q", senderStatus.String(), StateDirect)
+	if !strings.Contains(senderStatus.String(), string(StateTryingDirect)) {
+		t.Fatalf("sender statuses = %q, want %q", senderStatus.String(), StateTryingDirect)
 	}
-	if !strings.Contains(receiverStatus.String(), string(StateDirect)) {
-		t.Fatalf("receiver statuses = %q, want %q", receiverStatus.String(), StateDirect)
+	if !strings.Contains(receiverStatus.String(), string(StateTryingDirect)) {
+		t.Fatalf("receiver statuses = %q, want %q", receiverStatus.String(), StateTryingDirect)
 	}
 }
