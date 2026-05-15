@@ -122,6 +122,7 @@ const (
 
 var externalDirectUDPRateProbeMagic = [16]byte{0, 'd', 'e', 'r', 'p', 'h', 'o', 'l', 'e', '-', 'r', 'a', 't', 'e', 'v', '1'}
 var externalRelayPrefixDERPMagic = [16]byte{0, 'd', 'e', 'r', 'p', 'h', 'o', 'l', 'e', '-', 'p', 'r', 'e', 'f', 'v', '1'}
+var peerProgressInterval = 500 * time.Millisecond
 
 const (
 	externalDirectUDPRateProbeIndexOffset = len(externalDirectUDPRateProbeMagic)
@@ -685,6 +686,41 @@ func externalPeerProgressConsumer(metrics *externalTransferMetrics, callback fun
 	}
 }
 
+func peerProgressForTransfer(bytesReceived int64, firstByteAt time.Time, now time.Time, sequence uint64) peerProgress {
+	var elapsedMS int64
+	if !firstByteAt.IsZero() && now.After(firstByteAt) {
+		elapsedMS = now.Sub(firstByteAt).Milliseconds()
+	}
+	return *newPeerProgress(bytesReceived, elapsedMS, sequence)
+}
+
+func sendPeerProgressLoop(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, bytesReceived func() int64, firstByteAt func() time.Time, auth externalPeerControlAuth) {
+	ticker := time.NewTicker(peerProgressInterval)
+	defer ticker.Stop()
+	var sequence uint64
+	for {
+		select {
+		case now := <-ticker.C:
+			if firstByteAt == nil {
+				continue
+			}
+			firstByte := firstByteAt()
+			if firstByte.IsZero() {
+				continue
+			}
+			sequence++
+			var received int64
+			if bytesReceived != nil {
+				received = bytesReceived()
+			}
+			progress := peerProgressForTransfer(received, firstByte, now, sequence)
+			_ = sendPeerProgress(ctx, client, peerDERP, progress.BytesReceived, progress.TransferElapsedMS, progress.Sequence, auth)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 func watchPeerProgress(ctx context.Context, ch <-chan derpbind.Packet, auth externalPeerControlAuth, consume func(peerProgress, time.Time)) error {
 	var lastSequence uint64
 	for {
@@ -824,7 +860,7 @@ func (tr externalDirectUDPSendTransport) Close() {
 
 func (rt *externalDirectUDPSendRuntime) send(ctx context.Context, tr externalDirectUDPSendTransport) error {
 	if tr.relayOnly {
-		return sendExternalRelayUDP(ctx, rt.countedSrc, tr.manager, rt.tok, rt.cfg.Emitter)
+		return sendExternalRelayUDPWithPeerProgress(ctx, rt.countedSrc, tr.manager, rt.tok, rt.subs.progressCh, rt.cfg)
 	}
 	return sendExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixSendConfig{
 		src:              rt.countedSrc,
@@ -1639,6 +1675,14 @@ func sendExternalViaDirectUDPOnly(ctx context.Context, src io.Reader, tok token.
 	return externalExecutePreparedDirectUDPSendFn(ctx, src, plan, cfg, metrics)
 }
 
+func sendExternalRelayUDPWithPeerProgress(ctx context.Context, src io.Reader, manager *transport.Manager, tok token.Token, progressCh <-chan derpbind.Packet, cfg SendConfig) error {
+	metrics := newExternalTransferMetricsWithTrace(time.Now(), cfg.Trace, transfertrace.RoleSend)
+	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
+	stopPeerProgress := startPeerProgressWatcher(ctx, progressCh, externalPeerControlAuthForToken(tok), metrics, cfg.Progress, cfg.Emitter)
+	defer stopPeerProgress()
+	return sendExternalRelayUDP(ctx, src, manager, tok, cfg.Emitter)
+}
+
 func listenExternalViaDirectUDP(ctx context.Context, cfg ListenConfig) (retTok string, retErr error) {
 	rt, err := newExternalDirectUDPListenRuntime(ctx, cfg)
 	if err != nil {
@@ -1873,6 +1917,9 @@ func (rt *externalDirectUDPListenRuntime) receiveAccepted(ctx context.Context, a
 		return err
 	}
 	emitExternalDirectUDPDecisionSent(rt.cfg.Emitter)
+	progressCtx, stopPeerProgress := context.WithCancel(ctx)
+	defer stopPeerProgress()
+	go sendPeerProgressLoop(progressCtx, rt.session.derp, accepted.peerDERP, countedDst.Count, countedDst.FirstByteAt, rt.auth)
 	if err := rt.receivePayload(ctx, accepted, tr, countedDst, peerSubs, relayPrefixPackets); err != nil {
 		return err
 	}

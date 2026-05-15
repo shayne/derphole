@@ -20,6 +20,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -369,6 +370,145 @@ func TestSenderProgressCallbackReceivesPeerProgress(t *testing.T) {
 	}
 }
 
+func TestByteCountingWriteCloserFirstByteAt(t *testing.T) {
+	var nilWriter *byteCountingWriteCloser
+	if got := nilWriter.FirstByteAt(); !got.IsZero() {
+		t.Fatalf("nil FirstByteAt() = %v, want zero", got)
+	}
+
+	var dst bytes.Buffer
+	counted := newByteCountingWriteCloser(nopWriteCloser{Writer: &dst})
+	if got := counted.FirstByteAt(); !got.IsZero() {
+		t.Fatalf("FirstByteAt() before write = %v, want zero", got)
+	}
+	if n, err := counted.Write(nil); err != nil || n != 0 {
+		t.Fatalf("empty Write() = (%d, %v), want (0, nil)", n, err)
+	}
+	if got := counted.FirstByteAt(); !got.IsZero() {
+		t.Fatalf("FirstByteAt() after empty write = %v, want zero", got)
+	}
+
+	before := time.Now()
+	if n, err := counted.Write([]byte("abc")); err != nil || n != 3 {
+		t.Fatalf("Write() = (%d, %v), want (3, nil)", n, err)
+	}
+	after := time.Now()
+	first := counted.FirstByteAt()
+	if first.IsZero() {
+		t.Fatal("FirstByteAt() after data write is zero")
+	}
+	if first.Before(before) || first.After(after) {
+		t.Fatalf("FirstByteAt() = %v, want between %v and %v", first, before, after)
+	}
+	if got := counted.Count(); got != 3 {
+		t.Fatalf("Count() = %d, want 3", got)
+	}
+
+	if _, err := counted.Write([]byte("def")); err != nil {
+		t.Fatalf("second Write() error = %v", err)
+	}
+	if got := counted.FirstByteAt(); !got.Equal(first) {
+		t.Fatalf("FirstByteAt() after second write = %v, want %v", got, first)
+	}
+}
+
+func TestPeerProgressTickerPayloadUsesFirstByteElapsed(t *testing.T) {
+	firstByteAt := time.Unix(100, int64(250*time.Millisecond))
+	now := firstByteAt.Add(1500 * time.Millisecond)
+
+	progress := peerProgressForTransfer(4096, firstByteAt, now, 7)
+	if progress.BytesReceived != 4096 {
+		t.Fatalf("BytesReceived = %d, want 4096", progress.BytesReceived)
+	}
+	if progress.TransferElapsedMS != 1500 {
+		t.Fatalf("TransferElapsedMS = %d, want 1500", progress.TransferElapsedMS)
+	}
+	if progress.Sequence != 7 {
+		t.Fatalf("Sequence = %d, want 7", progress.Sequence)
+	}
+
+	noFirstByte := peerProgressForTransfer(4096, time.Time{}, now, 8)
+	if noFirstByte.TransferElapsedMS != 0 {
+		t.Fatalf("elapsed without first byte = %d, want 0", noFirstByte.TransferElapsedMS)
+	}
+	beforeFirstByte := peerProgressForTransfer(4096, firstByteAt, firstByteAt.Add(-time.Millisecond), 9)
+	if beforeFirstByte.TransferElapsedMS != 0 {
+		t.Fatalf("elapsed before first byte = %d, want 0", beforeFirstByte.TransferElapsedMS)
+	}
+}
+
+func TestSendPeerProgressLoopEmitsAuthenticatedProgressAfterFirstByte(t *testing.T) {
+	origInterval := peerProgressInterval
+	peerProgressInterval = 10 * time.Millisecond
+	t.Cleanup(func() { peerProgressInterval = origInterval })
+
+	srv := newSessionTestDERPServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	node := srv.Map.Regions[1].Nodes[0]
+
+	receiverDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(receiver) error = %v", err)
+	}
+	defer receiverDERP.Close()
+	senderDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(sender) error = %v", err)
+	}
+	defer senderDERP.Close()
+
+	progressCh, unsubscribe := senderDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == receiverDERP.PublicKey() && isProgressPayload(pkt.Payload)
+	})
+	defer unsubscribe()
+
+	var bytesReceived atomic.Int64
+	var firstByteUnixNano atomic.Int64
+	auth := externalPeerControlAuthForToken(testExternalSessionToken(0x94))
+	loopCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go sendPeerProgressLoop(loopCtx, receiverDERP, senderDERP.PublicKey(), bytesReceived.Load, func() time.Time {
+		n := firstByteUnixNano.Load()
+		if n == 0 {
+			return time.Time{}
+		}
+		return time.Unix(0, n)
+	}, auth)
+
+	select {
+	case pkt := <-progressCh:
+		t.Fatalf("received progress before first byte: %q", pkt.Payload)
+	case <-time.After(3 * peerProgressInterval):
+	}
+
+	bytesReceived.Store(2048)
+	firstByteUnixNano.Store(time.Now().Add(-125 * time.Millisecond).UnixNano())
+
+	var pkt derpbind.Packet
+	select {
+	case pkt = <-progressCh:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	progress, handled, err := verifyPeerProgressPacket(pkt, auth, new(uint64))
+	if err != nil {
+		t.Fatalf("verifyPeerProgressPacket() error = %v", err)
+	}
+	if handled {
+		t.Fatal("progress packet was unexpectedly handled as ignorable")
+	}
+	if progress.BytesReceived != 2048 {
+		t.Fatalf("BytesReceived = %d, want 2048", progress.BytesReceived)
+	}
+	if progress.TransferElapsedMS <= 0 {
+		t.Fatalf("TransferElapsedMS = %d, want positive", progress.TransferElapsedMS)
+	}
+	if progress.Sequence != 1 {
+		t.Fatalf("Sequence = %d, want 1", progress.Sequence)
+	}
+}
+
 func TestPeerProgressWatcherUsesExplicitMetrics(t *testing.T) {
 	var out bytes.Buffer
 	trace, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(100, 0))
@@ -408,6 +548,62 @@ func TestPeerProgressWatcherUsesExplicitMetrics(t *testing.T) {
 	row := rows[len(rows)-1]
 	if row["peer_received_bytes"] != "4096" || row["app_bytes"] != "4096" {
 		t.Fatalf("trace row = %#v, want explicit metrics to record peer progress", row)
+	}
+}
+
+func TestRelayOnlySendPeerProgressWatcherUsesExplicitMetrics(t *testing.T) {
+	origProbeSend := externalDirectUDPProbeSendFn
+	t.Cleanup(func() { externalDirectUDPProbeSendFn = origProbeSend })
+
+	var out bytes.Buffer
+	trace, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(120, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	tok := testExternalSessionToken(0x95)
+	auth := externalPeerControlAuthForToken(tok)
+	payload, err := marshalAuthenticatedEnvelope(envelope{
+		Type:     envelopeProgress,
+		Progress: newPeerProgress(16384, 450, 1),
+	}, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	progressCh := make(chan derpbind.Packet, 1)
+	progressCh <- derpbind.Packet{Payload: payload}
+	progressCalled := make(chan struct{}, 1)
+
+	externalDirectUDPProbeSendFn = func(ctx context.Context, conn net.PacketConn, remoteAddr string, src io.Reader, cfg probe.SendConfig) (probe.TransferStats, error) {
+		select {
+		case <-progressCalled:
+			return probe.TransferStats{}, nil
+		case <-ctx.Done():
+			return probe.TransferStats{}, ctx.Err()
+		case <-time.After(time.Second):
+			return probe.TransferStats{}, errors.New("timed out waiting for relay-only peer progress")
+		}
+	}
+	manager := transport.NewManager(transport.ManagerConfig{
+		RelaySend: func(context.Context, []byte) error { return nil },
+	})
+
+	err = sendExternalRelayUDPWithPeerProgress(context.Background(), bytes.NewReader([]byte("relay-only-progress")), manager, tok, progressCh, SendConfig{
+		Trace: trace,
+		Progress: func(int64, int64) {
+			progressCalled <- struct{}{}
+		},
+	})
+	if err != nil {
+		t.Fatalf("sendExternalRelayUDPWithPeerProgress() error = %v", err)
+	}
+	if err := trace.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	rows := readTransferTraceRows(t, out.String())
+	row := rows[len(rows)-1]
+	if row["peer_received_bytes"] != "16384" || row["app_bytes"] != "16384" {
+		t.Fatalf("trace row = %#v, want relay-only explicit metrics to record peer progress", row)
 	}
 }
 

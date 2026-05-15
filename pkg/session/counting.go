@@ -7,6 +7,7 @@ package session
 import (
 	"io"
 	"sync/atomic"
+	"time"
 )
 
 type byteCountingReadCloser struct {
@@ -38,8 +39,9 @@ func (r *byteCountingReadCloser) Count() int64 {
 }
 
 type byteCountingWriteCloser struct {
-	dst io.WriteCloser
-	n   atomic.Int64
+	dst               io.WriteCloser
+	n                 atomic.Int64
+	firstByteUnixNano atomic.Int64
 }
 
 func newByteCountingWriteCloser(dst io.WriteCloser) *byteCountingWriteCloser {
@@ -50,6 +52,7 @@ func (w *byteCountingWriteCloser) Write(p []byte) (int, error) {
 	n, err := w.dst.Write(p)
 	if n > 0 {
 		w.n.Add(int64(n))
+		w.firstByteUnixNano.CompareAndSwap(0, time.Now().UnixNano())
 	}
 	return n, err
 }
@@ -63,4 +66,15 @@ func (w *byteCountingWriteCloser) Count() int64 {
 		return 0
 	}
 	return w.n.Load()
+}
+
+func (w *byteCountingWriteCloser) FirstByteAt() time.Time {
+	if w == nil {
+		return time.Time{}
+	}
+	n := w.firstByteUnixNano.Load()
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
 }

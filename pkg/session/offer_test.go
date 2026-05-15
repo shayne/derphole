@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/shayne/derphole/pkg/derpbind"
+	"github.com/shayne/derphole/pkg/probe"
 	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/token"
 	"github.com/shayne/derphole/pkg/transport"
@@ -175,6 +176,58 @@ func TestExternalOfferPayloadPassesProgressToRelayPrefixSend(t *testing.T) {
 		}
 	default:
 		t.Fatal("progress callback was not invoked")
+	}
+}
+
+func TestRelayOnlyOfferSendPeerProgressWatcherPreservesProgressCallback(t *testing.T) {
+	origProbeSend := externalDirectUDPProbeSendFn
+	t.Cleanup(func() { externalDirectUDPProbeSendFn = origProbeSend })
+
+	tok := testExternalSessionToken(0x96)
+	auth := externalPeerControlAuthForToken(tok)
+	payload, err := marshalAuthenticatedEnvelope(envelope{
+		Type:     envelopeProgress,
+		Progress: newPeerProgress(32768, 550, 1),
+	}, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	progressCh := make(chan derpbind.Packet, 1)
+	progressCh <- derpbind.Packet{Payload: payload}
+	progressCalled := make(chan [2]int64, 1)
+
+	externalDirectUDPProbeSendFn = func(ctx context.Context, conn net.PacketConn, remoteAddr string, src io.Reader, cfg probe.SendConfig) (probe.TransferStats, error) {
+		select {
+		case got := <-progressCalled:
+			if got != [2]int64{32768, 550} {
+				t.Fatalf("progress callback got %v, want [32768 550]", got)
+			}
+			return probe.TransferStats{}, nil
+		case <-ctx.Done():
+			return probe.TransferStats{}, ctx.Err()
+		case <-time.After(time.Second):
+			return probe.TransferStats{}, fmt.Errorf("timed out waiting for relay-only offer peer progress")
+		}
+	}
+	manager := transport.NewManager(transport.ManagerConfig{
+		RelaySend: func(context.Context, []byte) error { return nil },
+	})
+
+	err = sendExternalOfferPayload(
+		context.Background(),
+		&relaySession{token: tok},
+		newByteCountingReadCloser(nopReadCloser{Reader: bytes.NewReader([]byte("relay-only-offer-progress"))}),
+		externalOfferDirectRuntime{relayOnly: true},
+		externalOfferPeerChannels{progressCh: progressCh},
+		&externalOfferTransportRuntime{ctx: context.Background(), manager: manager},
+		key.NodePublic{},
+		nil,
+		OfferConfig{Progress: func(bytesReceived int64, transferElapsedMS int64) {
+			progressCalled <- [2]int64{bytesReceived, transferElapsedMS}
+		}},
+	)
+	if err != nil {
+		t.Fatalf("sendExternalOfferPayload() error = %v", err)
 	}
 }
 

@@ -333,7 +333,7 @@ func sendExternalOfferDecision(ctx context.Context, session *relaySession, peerD
 
 func sendExternalOfferPayload(ctx context.Context, session *relaySession, countedSrc *byteCountingReadCloser, direct externalOfferDirectRuntime, channels externalOfferPeerChannels, transportRuntime *externalOfferTransportRuntime, peerDERP key.NodePublic, pathEmitter *transportPathEmitter, cfg OfferConfig) error {
 	if direct.relayOnly {
-		return sendExternalRelayUDP(ctx, countedSrc, transportRuntime.manager, session.token, cfg.Emitter)
+		return sendExternalRelayUDPWithPeerProgress(ctx, countedSrc, transportRuntime.manager, session.token, channels.progressCh, externalOfferSendConfig(cfg))
 	}
 	return sendExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixSendConfig{
 		src:              countedSrc,
@@ -643,6 +643,9 @@ func receiveExternalAcceptedOffer(ctx context.Context, cfg ReceiveConfig, runtim
 	if err := runtime.openReceiveSink(ctx, cfg); err != nil {
 		return err
 	}
+	progressCtx, stopPeerProgress := context.WithCancel(ctx)
+	defer stopPeerProgress()
+	go sendPeerProgressLoop(progressCtx, runtime.derpClient, runtime.listenerDERP, runtime.countedDst.Count, runtime.countedDst.FirstByteAt, runtime.auth)
 	if err := receiveExternalOfferPayload(ctx, cfg, runtime, transportManager, pathEmitter, punchCancel); err != nil {
 		return err
 	}
