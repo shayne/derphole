@@ -5,6 +5,7 @@
 package transfertrace
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -13,7 +14,7 @@ import (
 func TestCheckPassesSmoothCompleteTransfer(t *testing.T) {
 	csvText := HeaderLine + "\n" +
 		"1000,0,receive,relay,1024,0,1024,1024,0.00,0,0,,,false,,,,,,,,,,,,connected-relay,\n" +
-		"1500,500,receive,overlap,2048,1024,2048,1024,16.38,0,0,,,false,,,,,,,,,,,,connected-direct,\n" +
+		"1500,500,receive,overlap,2048,1024,2048,1024,16.38,0,0,,,true,,,,,,,,,,,,connected-direct,\n" +
 		"2000,1000,receive,complete,2048,4096,4096,2048,32.77,0,0,,,false,,,,,,,,,,,,stream-complete,\n"
 	result, err := Check(strings.NewReader(csvText), Options{Role: RoleReceive, StallWindow: time.Second, ExpectedBytes: 4096})
 	if err != nil {
@@ -105,8 +106,8 @@ func TestCheckResetsFlatlineClockWhenEnteringActivePhase(t *testing.T) {
 func TestCheckFailsApplicationFlatline(t *testing.T) {
 	csvText := HeaderLine + "\n" +
 		"1000,0,receive,relay,1024,0,1024,1024,0.00,0,0,,,false,,,,,,,,,,,,connected-relay,\n" +
-		"1500,500,receive,direct_probe,1024,0,1024,0,0.00,0,0,,,false,,,,,,,,,,,,connected-direct,\n" +
-		"2501,1501,receive,direct_probe,1024,0,1024,0,0.00,0,0,,,false,,,,,,,,,,,,connected-direct,\n"
+		"1500,500,receive,direct_probe,1024,0,1024,0,0.00,0,0,,,true,,,,,,,,,,,,connected-direct,\n" +
+		"2501,1501,receive,direct_probe,1024,0,1024,0,0.00,0,0,,,true,,,,,,,,,,,,connected-direct,\n"
 	_, err := Check(strings.NewReader(csvText), Options{Role: RoleReceive, StallWindow: time.Second})
 	if err == nil || !strings.Contains(err.Error(), "app bytes stalled") || !strings.Contains(err.Error(), "row 4") {
 		t.Fatalf("Check() error = %v, want app bytes stalled at row 4", err)
@@ -146,6 +147,145 @@ func TestCheckFailsTerminalError(t *testing.T) {
 	_, err := Check(strings.NewReader(csvText), Options{Role: RoleSend, StallWindow: time.Second})
 	if err == nil || !strings.Contains(err.Error(), "message too long") || !strings.Contains(err.Error(), "row 2") {
 		t.Fatalf("Check() error = %v, want terminal error at row 2", err)
+	}
+}
+
+func TestCheckFailsConnectedDirectWithoutValidation(t *testing.T) {
+	csvText := HeaderLine + "\n" +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:     1000,
+			role:            RoleSend,
+			phase:           PhaseComplete,
+			appBytes:        1024,
+			deltaAppBytes:   1024,
+			directValidated: false,
+			lastState:       "connected-direct",
+		})
+	_, err := Check(strings.NewReader(csvText), Options{Role: RoleSend, ExpectedBytes: 1024})
+	if err == nil || !strings.Contains(err.Error(), "connected-direct without direct validation") {
+		t.Fatalf("Check() error = %v, want direct validation failure", err)
+	}
+}
+
+func TestCheckFailsDirectFallbackRelayWithoutReason(t *testing.T) {
+	csvText := HeaderLine + "\n" +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:     1000,
+			role:            RoleSend,
+			phase:           PhaseComplete,
+			appBytes:        1024,
+			deltaAppBytes:   1024,
+			directValidated: false,
+			lastState:       "direct-fallback-relay",
+		})
+	_, err := Check(strings.NewReader(csvText), Options{Role: RoleSend, ExpectedBytes: 1024})
+	if err == nil || !strings.Contains(err.Error(), "direct-fallback-relay missing fallback reason") {
+		t.Fatalf("Check() error = %v, want fallback reason failure", err)
+	}
+}
+
+func TestCheckAllowsDirectFallbackRelayReason(t *testing.T) {
+	csvText := HeaderLine + "\n" +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:     1000,
+			role:            RoleSend,
+			phase:           PhaseComplete,
+			appBytes:        1024,
+			deltaAppBytes:   1024,
+			directValidated: false,
+			fallbackReason:  "direct UDP rate probes received no packets",
+			lastState:       "stream-complete",
+		})
+	_, err := Check(strings.NewReader(csvText), Options{Role: RoleSend, ExpectedBytes: 1024})
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+}
+
+func TestCheckPairAllowsSynchronizedSenderReceiverProgress(t *testing.T) {
+	sendTrace := HeaderLine + "\n" +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:       1000,
+			role:              RoleSend,
+			phase:             PhaseComplete,
+			appBytes:          1024,
+			deltaAppBytes:     1024,
+			peerReceivedBytes: 1024,
+			transferElapsedMS: 500,
+			lastState:         "stream-complete",
+		})
+	receiveTrace := HeaderLine + "\n" +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:       1000,
+			role:              RoleReceive,
+			phase:             PhaseComplete,
+			appBytes:          1024,
+			deltaAppBytes:     1024,
+			transferElapsedMS: 500,
+			lastState:         "stream-complete",
+		})
+	result, err := CheckPair(strings.NewReader(sendTrace), strings.NewReader(receiveTrace), PairOptions{Role: RoleSend})
+	if err != nil {
+		t.Fatalf("CheckPair() error = %v", err)
+	}
+	if result.PrimaryRows != 1 || result.PeerRows != 1 || result.ProgressDeltaBytes != 0 {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestCheckPairFailsSenderPeerProgressDivergence(t *testing.T) {
+	sendTrace := HeaderLine + "\n" +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:       1000,
+			role:              RoleSend,
+			phase:             PhaseComplete,
+			appBytes:          2048,
+			deltaAppBytes:     2048,
+			peerReceivedBytes: 2048,
+			transferElapsedMS: 500,
+			lastState:         "stream-complete",
+		})
+	receiveTrace := HeaderLine + "\n" +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:       1000,
+			role:              RoleReceive,
+			phase:             PhaseComplete,
+			appBytes:          1024,
+			deltaAppBytes:     1024,
+			transferElapsedMS: 500,
+			lastState:         "stream-complete",
+		})
+	_, err := CheckPair(strings.NewReader(sendTrace), strings.NewReader(receiveTrace), PairOptions{Role: RoleSend})
+	if err == nil || !strings.Contains(err.Error(), "sender peer_received_bytes") {
+		t.Fatalf("CheckPair() error = %v, want peer progress divergence", err)
+	}
+}
+
+func TestCheckPairFailsTransferRateDivergence(t *testing.T) {
+	sendTrace := HeaderLine + "\n" +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:       1000,
+			role:              RoleSend,
+			phase:             PhaseComplete,
+			appBytes:          1024,
+			deltaAppBytes:     1024,
+			peerReceivedBytes: 1024,
+			transferElapsedMS: 500,
+			lastState:         "stream-complete",
+		})
+	receiveTrace := HeaderLine + "\n" +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:       1000,
+			role:              RoleReceive,
+			phase:             PhaseComplete,
+			appBytes:          1024,
+			deltaAppBytes:     1024,
+			transferElapsedMS: 1000,
+			lastState:         "stream-complete",
+		})
+	_, err := CheckPair(strings.NewReader(sendTrace), strings.NewReader(receiveTrace), PairOptions{Role: RoleSend, RateTolerance: 0.10})
+	if err == nil || !strings.Contains(err.Error(), "transfer rate diverged") {
+		t.Fatalf("CheckPair() error = %v, want rate divergence", err)
 	}
 }
 
@@ -225,4 +365,50 @@ func TestCheckAllowsOmittedExpectedZeroBytes(t *testing.T) {
 	if result.FinalAppBytes != 1024 {
 		t.Fatalf("result = %#v", result)
 	}
+}
+
+type testTraceRowConfig struct {
+	timestampMS       int64
+	elapsedMS         int64
+	role              Role
+	phase             Phase
+	relayBytes        int64
+	directBytes       int64
+	appBytes          int64
+	deltaAppBytes     int64
+	localSentBytes    int64
+	peerReceivedBytes int64
+	transferElapsedMS int64
+	directValidated   bool
+	fallbackReason    string
+	lastState         string
+	lastError         string
+}
+
+func testTraceRow(cfg testTraceRowConfig) string {
+	fields := make([]string, len(Header))
+	fields[0] = strconv.FormatInt(cfg.timestampMS, 10)
+	fields[1] = strconv.FormatInt(cfg.elapsedMS, 10)
+	fields[2] = string(cfg.role)
+	fields[3] = string(cfg.phase)
+	fields[4] = strconv.FormatInt(cfg.relayBytes, 10)
+	fields[5] = strconv.FormatInt(cfg.directBytes, 10)
+	fields[6] = strconv.FormatInt(cfg.appBytes, 10)
+	fields[7] = strconv.FormatInt(cfg.deltaAppBytes, 10)
+	fields[8] = "0.00"
+	fields[9] = strconv.FormatInt(cfg.localSentBytes, 10)
+	fields[10] = strconv.FormatInt(cfg.peerReceivedBytes, 10)
+	fields[12] = formatTestOptionalInt64(cfg.transferElapsedMS)
+	fields[13] = strconv.FormatBool(cfg.directValidated)
+	fields[14] = cfg.fallbackReason
+	fields[25] = cfg.lastState
+	fields[26] = cfg.lastError
+	return strings.Join(fields, ",") + "\n"
+}
+
+func formatTestOptionalInt64(value int64) string {
+	if value == 0 {
+		return ""
+	}
+	return strconv.FormatInt(value, 10)
 }

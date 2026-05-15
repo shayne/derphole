@@ -44,6 +44,39 @@ func TestRunPrintsSuccess(t *testing.T) {
 	}
 }
 
+func TestRunChecksPeerTraceSuccess(t *testing.T) {
+	sendPath := writeTrace(t, transfertrace.HeaderLine+"\n"+
+		"1000,0,send,complete,1024,0,1024,1024,0.00,1024,1024,,500,false,,,,,,,,,,,,stream-complete,\n")
+	receivePath := writeTrace(t, transfertrace.HeaderLine+"\n"+
+		"1000,0,receive,complete,1024,0,1024,1024,0.00,0,0,,500,false,,,,,,,,,,,,stream-complete,\n")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-role", "send", "-expected-bytes", "1024", "-peer-trace", receivePath, sendPath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() exit = %d, stderr = %q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "peer_delta_bytes=0") {
+		t.Fatalf("stdout = %q, want peer pair summary", stdout.String())
+	}
+}
+
+func TestRunChecksPeerTraceFailure(t *testing.T) {
+	sendPath := writeTrace(t, transfertrace.HeaderLine+"\n"+
+		"1000,0,send,complete,2048,0,2048,2048,0.00,2048,2048,,500,false,,,,,,,,,,,,stream-complete,\n")
+	receivePath := writeTrace(t, transfertrace.HeaderLine+"\n"+
+		"1000,0,receive,complete,1024,0,1024,1024,0.00,0,0,,500,false,,,,,,,,,,,,stream-complete,\n")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-role", "send", "-expected-bytes", "2048", "-peer-trace", receivePath, sendPath}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run() exit = %d, want 1", code)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "sender peer_received_bytes") {
+		t.Fatalf("stderr = %q, want peer progress error", stderr.String())
+	}
+}
+
 func TestRunReturnsFailureForCheckError(t *testing.T) {
 	path := writeTrace(t, transfertrace.HeaderLine+"\n"+
 		"1000,0,receive,error,0,0,0,0,0.00,0,0,,,false,,,,,,,,,,,,connected-direct,message too long\n")
