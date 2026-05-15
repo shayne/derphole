@@ -54,6 +54,7 @@ const (
 	externalDirectUDPHandshakeWait                 = 1500 * time.Millisecond
 	externalDirectUDPStartWait                     = 30 * time.Second
 	externalDirectUDPAckWait                       = 60 * time.Second
+	externalDirectUDPProgressWatcherStopWait       = time.Second
 	externalDirectUDPBufferSize                    = 4 << 20
 	externalDirectUDPRepairPayloads                = true
 	externalDirectUDPTailReplayBytes               = 32 << 20
@@ -596,12 +597,14 @@ type externalDirectUDPSendSubscriptions struct {
 	ackCh                <-chan derpbind.Packet
 	abortCh              <-chan derpbind.Packet
 	heartbeatCh          <-chan derpbind.Packet
+	progressCh           <-chan derpbind.Packet
 	readyAckCh           <-chan derpbind.Packet
 	startAckCh           <-chan derpbind.Packet
 	rateProbeCh          <-chan derpbind.Packet
 	unsubscribeAck       func()
 	unsubscribeAbort     func()
 	unsubscribeHeartbeat func()
+	unsubscribeProgress  func()
 	unsubscribeReadyAck  func()
 	unsubscribeStartAck  func()
 	unsubscribeRateProbe func()
@@ -616,6 +619,9 @@ func (s externalDirectUDPSendSubscriptions) Close() {
 	}
 	if s.unsubscribeHeartbeat != nil {
 		s.unsubscribeHeartbeat()
+	}
+	if s.unsubscribeProgress != nil {
+		s.unsubscribeProgress()
 	}
 	if s.unsubscribeReadyAck != nil {
 		s.unsubscribeReadyAck()
@@ -638,6 +644,9 @@ func subscribeExternalDirectUDPSend(client *derpbind.Client, listenerDERP key.No
 	heartbeatCh, unsubscribeHeartbeat := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == listenerDERP && isHeartbeatPayload(pkt.Payload)
 	})
+	progressCh, unsubscribeProgress := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == listenerDERP && isProgressPayload(pkt.Payload)
+	})
 	readyAckCh, unsubscribeReadyAck := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == listenerDERP && isDirectUDPReadyAckPayload(pkt.Payload)
 	})
@@ -651,15 +660,52 @@ func subscribeExternalDirectUDPSend(client *derpbind.Client, listenerDERP key.No
 		ackCh:                ackCh,
 		abortCh:              abortCh,
 		heartbeatCh:          heartbeatCh,
+		progressCh:           progressCh,
 		readyAckCh:           readyAckCh,
 		startAckCh:           startAckCh,
 		rateProbeCh:          rateProbeCh,
 		unsubscribeAck:       unsubscribeAck,
 		unsubscribeAbort:     unsubscribeAbort,
 		unsubscribeHeartbeat: unsubscribeHeartbeat,
+		unsubscribeProgress:  unsubscribeProgress,
 		unsubscribeReadyAck:  unsubscribeReadyAck,
 		unsubscribeStartAck:  unsubscribeStartAck,
 		unsubscribeRateProbe: unsubscribeRateProbe,
+	}
+}
+
+func externalPeerProgressConsumer(metrics *externalTransferMetrics, callback func(int64, int64)) func(peerProgress, time.Time) {
+	return func(progress peerProgress, at time.Time) {
+		if metrics != nil {
+			metrics.RecordPeerProgress(progress.BytesReceived, progress.TransferElapsedMS, at)
+		}
+		if callback != nil {
+			callback(progress.BytesReceived, progress.TransferElapsedMS)
+		}
+	}
+}
+
+func watchPeerProgress(ctx context.Context, ch <-chan derpbind.Packet, auth externalPeerControlAuth, consume func(peerProgress, time.Time)) error {
+	var lastSequence uint64
+	for {
+		select {
+		case pkt, ok := <-ch:
+			if !ok {
+				return net.ErrClosed
+			}
+			progress, handled, err := verifyPeerProgressPacket(pkt, auth, &lastSequence)
+			if handled {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if consume != nil {
+				consume(progress, time.Now())
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }
 
@@ -679,6 +725,8 @@ func (rt *externalDirectUDPSendRuntime) run(ctx context.Context) error {
 	pathEmitter := newTransportPathEmitter(rt.cfg.Emitter)
 	pathEmitter.Emit(StateProbing)
 	pathEmitter.SuppressWatcherDirect()
+	stopPeerProgress := rt.startPeerProgressWatcher(ctx)
+	defer stopPeerProgress()
 	tr, err := rt.startTransport(ctx, pathEmitter)
 	if err != nil {
 		return err
@@ -694,6 +742,22 @@ func (rt *externalDirectUDPSendRuntime) run(ctx context.Context) error {
 	}
 	pathEmitter.Complete(tr.manager)
 	return nil
+}
+
+func (rt *externalDirectUDPSendRuntime) startPeerProgressWatcher(ctx context.Context) func() {
+	progressCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	consume := externalPeerProgressConsumer(externalTransferMetricsFromContext(ctx), rt.cfg.Progress)
+	go func() {
+		done <- watchPeerProgress(progressCtx, rt.subs.progressCh, rt.auth, consume)
+	}()
+	return func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(externalDirectUDPProgressWatcherStopWait):
+		}
+	}
 }
 
 type externalDirectUDPSendTransport struct {

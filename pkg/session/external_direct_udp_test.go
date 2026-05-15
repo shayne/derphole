@@ -296,6 +296,138 @@ func TestWaitForPeerAckIgnoresUnsignedAckWhenAuthConfigured(t *testing.T) {
 	}
 }
 
+func TestSendSubscriptionsIncludeProgressPackets(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	node := srv.Map.Regions[1].Nodes[0]
+
+	senderDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer senderDERP.Close()
+	listenerDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listenerDERP.Close()
+
+	subs := subscribeExternalDirectUDPSend(senderDERP, listenerDERP.PublicKey())
+	defer subs.Close()
+	payload, err := json.Marshal(envelope{
+		Type:     envelopeProgress,
+		Progress: newPeerProgress(1234, 567, 8),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isProgressPayload(payload) {
+		t.Fatal("progress payload was not recognized")
+	}
+	if err := sendPeerProgress(ctx, listenerDERP, senderDERP.PublicKey(), 1234, 567, 8, externalPeerControlAuth{}); err != nil {
+		t.Fatalf("sendPeerProgress() error = %v", err)
+	}
+
+	select {
+	case pkt := <-subs.progressCh:
+		if pkt.From != listenerDERP.PublicKey() {
+			t.Fatalf("progress From = %v, want %v", pkt.From, listenerDERP.PublicKey())
+		}
+		if !isProgressPayload(pkt.Payload) {
+			t.Fatalf("subscription delivered non-progress payload %q", pkt.Payload)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
+func TestSenderProgressCallbackReceivesPeerProgress(t *testing.T) {
+	metrics := newExternalTransferMetrics(time.Unix(100, 0))
+	var callbackBytes int64
+	var callbackElapsed int64
+	consumer := externalPeerProgressConsumer(metrics, func(bytesReceived int64, transferElapsedMS int64) {
+		callbackBytes = bytesReceived
+		callbackElapsed = transferElapsedMS
+	})
+
+	consumer(peerProgress{BytesReceived: 4096, TransferElapsedMS: 250}, time.Unix(101, 0))
+
+	if callbackBytes != 4096 || callbackElapsed != 250 {
+		t.Fatalf("callback got bytes=%d elapsed=%d, want bytes=4096 elapsed=250", callbackBytes, callbackElapsed)
+	}
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	if !metrics.peerProgressSet {
+		t.Fatal("metrics peer progress was not set")
+	}
+	if metrics.peerReceivedBytes != 4096 {
+		t.Fatalf("metrics peerReceivedBytes = %d, want 4096", metrics.peerReceivedBytes)
+	}
+	if metrics.receiverTransferMS != 250 {
+		t.Fatalf("metrics receiverTransferMS = %d, want 250", metrics.receiverTransferMS)
+	}
+}
+
+func TestWatchPeerProgressIgnoresUnauthenticatedAndReplayProgress(t *testing.T) {
+	auth := externalPeerControlAuthForToken(token.Token{
+		SessionID:    [16]byte{1, 2, 3},
+		BearerSecret: [32]byte{4, 5, 6},
+	})
+	unsignedPayload, err := json.Marshal(envelope{
+		Type:     envelopeProgress,
+		Progress: newPeerProgress(100, 10, 1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPayload, err := marshalAuthenticatedEnvelope(envelope{
+		Type:     envelopeProgress,
+		Progress: newPeerProgress(200, 20, 2),
+	}, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayPayload, err := marshalAuthenticatedEnvelope(envelope{
+		Type:     envelopeProgress,
+		Progress: newPeerProgress(150, 15, 2),
+	}, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextPayload, err := marshalAuthenticatedEnvelope(envelope{
+		Type:     envelopeProgress,
+		Progress: newPeerProgress(300, 30, 3),
+	}, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ch := make(chan derpbind.Packet, 4)
+	ch <- derpbind.Packet{Payload: unsignedPayload}
+	ch <- derpbind.Packet{Payload: firstPayload}
+	ch <- derpbind.Packet{Payload: replayPayload}
+	ch <- derpbind.Packet{Payload: nextPayload}
+	close(ch)
+
+	var got []peerProgress
+	err = watchPeerProgress(context.Background(), ch, auth, func(progress peerProgress, _ time.Time) {
+		got = append(got, progress)
+	})
+	if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("watchPeerProgress() error = %v, want %v", err, net.ErrClosed)
+	}
+	if len(got) != 2 {
+		t.Fatalf("consumed %d progress packets, want 2: %+v", len(got), got)
+	}
+	if got[0].BytesReceived != 200 || got[0].TransferElapsedMS != 20 {
+		t.Fatalf("first consumed progress = %+v, want bytes=200 elapsed=20", got[0])
+	}
+	if got[1].BytesReceived != 300 || got[1].TransferElapsedMS != 30 {
+		t.Fatalf("second consumed progress = %+v, want bytes=300 elapsed=30", got[1])
+	}
+}
+
 func TestWaitForDirectUDPStartIgnoresUnsignedStartWhenAuthConfigured(t *testing.T) {
 	auth := externalPeerControlAuthForToken(token.Token{
 		SessionID:    [16]byte{1, 2, 3},
