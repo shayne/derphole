@@ -36,6 +36,73 @@ func TestProgressReporterUsesRecentSmoothedRate(t *testing.T) {
 	}
 }
 
+func TestProgressReporterSetUsesExternalElapsedForRate(t *testing.T) {
+	start := time.Unix(0, 0)
+	now := start
+	prevProgressNow := progressNow
+	progressNow = func() time.Time { return now }
+	t.Cleanup(func() { progressNow = prevProgressNow })
+
+	var out bytes.Buffer
+	progress := NewProgressReporter(&out, 1000*1024*1024)
+
+	progress.SetWithElapsed(100*1024*1024, 10*time.Second)
+
+	got := out.String()
+	if !strings.Contains(got, "10.0MiB/s") {
+		t.Fatalf("progress output = %q, want externally elapsed rate 10.0MiB/s", got)
+	}
+}
+
+func TestProgressReporterSetWithElapsedRunsCallbackWithThrottle(t *testing.T) {
+	start := time.Unix(0, 0)
+	now := start
+	prevProgressNow := progressNow
+	progressNow = func() time.Time { return now }
+	t.Cleanup(func() { progressNow = prevProgressNow })
+
+	var events [][2]int64
+	progress := NewProgressReporterWithCallback(nil, 10, func(current, total int64) {
+		events = append(events, [2]int64{current, total})
+	})
+
+	progress.SetWithElapsed(4, time.Second)
+	now = start.Add(50 * time.Millisecond)
+	progress.SetWithElapsed(5, time.Second)
+	now = start.Add(100 * time.Millisecond)
+	progress.SetWithElapsed(6, time.Second)
+
+	want := [][2]int64{{4, 10}, {6, 10}}
+	if len(events) != len(want) {
+		t.Fatalf("events = %v, want %v", events, want)
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Fatalf("events[%d] = %v, want %v; all events = %v", i, events[i], want, events)
+		}
+	}
+}
+
+func TestProgressReporterFinishIgnoresStalePartialExternalElapsed(t *testing.T) {
+	start := time.Unix(0, 0)
+	now := start
+	prevProgressNow := progressNow
+	progressNow = func() time.Time { return now }
+	t.Cleanup(func() { progressNow = prevProgressNow })
+
+	var out bytes.Buffer
+	progress := NewProgressReporter(&out, 1000*1024*1024)
+	progress.SetWithElapsed(100*1024*1024, 10*time.Second)
+
+	now = start.Add(20 * time.Second)
+	progress.Finish()
+
+	finalLine := lastRawProgressLine(out.String())
+	if !strings.Contains(finalLine, "50.0MiB/s") {
+		t.Fatalf("final progress line = %q, want final rate from completed elapsed, not stale partial external elapsed", finalLine)
+	}
+}
+
 func TestProgressReporterClearsStaleTrailingCharacters(t *testing.T) {
 	start := time.Unix(0, 0)
 	now := start

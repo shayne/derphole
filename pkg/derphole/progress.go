@@ -21,20 +21,22 @@ const (
 var progressNow = time.Now
 
 type ProgressReporter struct {
-	out           io.Writer
-	total         int64
-	start         time.Time
-	lastRender    time.Time
-	lastRateTime  time.Time
-	lastRateBytes int64
-	rateBytes     progressEMA
-	rateSeconds   progressEMA
-	wroteLine     bool
-	lastLineLen   int
-	onProgress    func(current, total int64)
-	lastCallback  time.Time
-	mu            sync.Mutex
-	current       int64
+	out             io.Writer
+	total           int64
+	start           time.Time
+	lastRender      time.Time
+	lastRateTime    time.Time
+	lastRateBytes   int64
+	rateBytes       progressEMA
+	rateSeconds     progressEMA
+	wroteLine       bool
+	lastLineLen     int
+	onProgress      func(current, total int64)
+	lastCallback    time.Time
+	mu              sync.Mutex
+	current         int64
+	externalElapsed time.Duration
+	externalRate    bool
 }
 
 type progressCallback struct {
@@ -88,6 +90,8 @@ func (p *ProgressReporter) addLocked(n int) progressCallback {
 	defer p.mu.Unlock()
 
 	p.current += int64(n)
+	p.externalElapsed = 0
+	p.externalRate = false
 	if p.current >= p.total {
 		return p.callbackLocked(time.Time{})
 	}
@@ -99,6 +103,34 @@ func (p *ProgressReporter) addLocked(n int) progressCallback {
 		p.renderLocked(false, now)
 	}
 	return callback
+}
+
+func (p *ProgressReporter) SetWithElapsed(current int64, elapsed time.Duration) {
+	if p == nil {
+		return
+	}
+
+	p.mu.Lock()
+
+	if current < 0 {
+		current = 0
+	}
+	if current > p.total {
+		current = p.total
+	}
+	p.current = current
+	p.externalElapsed = elapsed
+	p.externalRate = elapsed > 0
+	p.lastRateBytes = current
+	now := progressNow()
+	p.lastRateTime = now
+	callback := p.callbackLocked(now)
+	if !p.wroteLine || p.shouldRenderLocked(now) {
+		p.lastRender = now
+		p.renderLocked(false, now)
+	}
+	p.mu.Unlock()
+	callback.emit()
 }
 
 func (p *ProgressReporter) Finish() {
@@ -113,6 +145,8 @@ func (p *ProgressReporter) Finish() {
 
 	if p.current < p.total {
 		p.current = p.total
+		p.externalElapsed = 0
+		p.externalRate = false
 	}
 	onProgress = p.onProgress
 	callbackCurrent = p.current
@@ -265,6 +299,9 @@ func (p *ProgressReporter) shouldCallbackLocked(now time.Time) bool {
 }
 
 func (p *ProgressReporter) rateLocked(final bool, now time.Time, elapsed time.Duration) float64 {
+	if p.externalRate && p.externalElapsed > 0 {
+		return float64(p.current) / p.externalElapsed.Seconds()
+	}
 	if final {
 		return float64(p.current) / elapsed.Seconds()
 	}

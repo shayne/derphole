@@ -858,6 +858,115 @@ func TestSendDoesNotFinishProgressWhenSessionFailsAfterDrainingInput(t *testing.
 	}
 }
 
+func TestSendSessionProgressFollowsPeerReceivedPayloadBytes(t *testing.T) {
+	prev := derpholeSessionSend
+	t.Cleanup(func() {
+		derpholeSessionSend = prev
+	})
+
+	derpholeSessionSend = func(_ context.Context, cfg session.SendConfig) error {
+		if cfg.Progress == nil {
+			t.Error("session SendConfig.Progress = nil, want peer progress callback")
+		}
+		var wire bytes.Buffer
+		if _, err := io.Copy(&wire, cfg.StdioIn); err != nil {
+			return err
+		}
+		header, err := protocol.ReadHeader(bufio.NewReader(bytes.NewReader(wire.Bytes())))
+		if err != nil {
+			return err
+		}
+		headerBytes, err := protocol.HeaderWireSize(header)
+		if err != nil {
+			return err
+		}
+		if cfg.Progress != nil {
+			cfg.Progress(headerBytes+512*1024, 1000)
+		}
+		return context.DeadlineExceeded
+	}
+
+	srcDir := t.TempDir()
+	srcPath := filepath.Join(srcDir, "payload.bin")
+	if err := os.WriteFile(srcPath, bytes.Repeat([]byte("z"), 1024*1024), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	tok, err := token.Encode(token.Token{
+		Version:      token.SupportedVersion,
+		ExpiresUnix:  time.Now().Add(time.Hour).Unix(),
+		Capabilities: token.CapabilityStdio,
+	})
+	if err != nil {
+		t.Fatalf("token.Encode() error = %v", err)
+	}
+
+	var stderr bytes.Buffer
+	err = Send(context.Background(), SendConfig{
+		Token:          tok,
+		What:           srcPath,
+		Stderr:         &stderr,
+		ProgressOutput: &stderr,
+		UsePublicDERP:  true,
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Send() error = %v, want %v", err, context.DeadlineExceeded)
+	}
+	if strings.Contains(stderr.String(), "100%|") {
+		t.Fatalf("send stderr = %q, want no local-drain 100%% progress on failed session", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), " 50%|") {
+		t.Fatalf("send stderr = %q, want peer-confirmed 50%% progress", stderr.String())
+	}
+}
+
+func TestLocalSessionSendKeepsLocalDrainProgress(t *testing.T) {
+	prev := derpholeSessionSend
+	t.Cleanup(func() {
+		derpholeSessionSend = prev
+	})
+
+	var progressConfigured bool
+	derpholeSessionSend = func(_ context.Context, cfg session.SendConfig) error {
+		if cfg.Progress != nil {
+			progressConfigured = true
+		}
+		if _, err := io.Copy(io.Discard, cfg.StdioIn); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	srcDir := t.TempDir()
+	srcPath := filepath.Join(srcDir, "payload.bin")
+	if err := os.WriteFile(srcPath, bytes.Repeat([]byte("z"), 1024*1024), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	tok, err := token.Encode(token.Token{
+		Version:      token.SupportedVersion,
+		ExpiresUnix:  time.Now().Add(time.Hour).Unix(),
+		Capabilities: token.CapabilityStdio,
+	})
+	if err != nil {
+		t.Fatalf("token.Encode() error = %v", err)
+	}
+
+	var stderr bytes.Buffer
+	if err := Send(context.Background(), SendConfig{
+		Token:          tok,
+		What:           srcPath,
+		Stderr:         &stderr,
+		ProgressOutput: &stderr,
+	}); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if progressConfigured {
+		t.Fatal("local session SendConfig.Progress configured, want local drain progress")
+	}
+	if !strings.Contains(stderr.String(), "100%|") {
+		t.Fatalf("send stderr = %q, want local progress to finish", stderr.String())
+	}
+}
+
 func TestSendPassesKnownFileWireSizeToSession(t *testing.T) {
 	prev := derpholeSessionSend
 	t.Cleanup(func() {

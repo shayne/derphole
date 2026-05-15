@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	dharchive "github.com/shayne/derphole/pkg/derphole/archive"
@@ -74,6 +75,7 @@ type sendTransfer struct {
 }
 
 const verificationPlaceholder = "0000-0000-0000"
+const unknownSessionProgressHeaderBytes int64 = 1<<63 - 1
 
 var (
 	derpholeSessionDialAttach          = session.DialAttach
@@ -415,20 +417,36 @@ func transferSessionExpectedBytes(tx sendTransfer) int64 {
 }
 
 func writeTransferWithProgress(w io.Writer, tx sendTransfer, progressOut, stderr io.Writer) (*ProgressReporter, error) {
+	progress := NewProgressReporter(progressOut, tx.progressTotal)
+	err := writeTransferWithReporter(w, tx, progress, stderr)
+	return progress, err
+}
+
+func writeTransferWithReporter(w io.Writer, tx sendTransfer, progress *ProgressReporter, stderr io.Writer) error {
 	if tx.summary != "" && stderr != nil {
 		_, _ = fmt.Fprintln(stderr, tx.summary)
 	}
 	body := tx.body
-	progress := NewProgressReporter(progressOut, tx.progressTotal)
 	if progress != nil {
 		body = progress.Wrap(body)
 	}
 
 	if err := protocol.WriteHeader(w, tx.header); err != nil {
-		return progress, err
+		return err
 	}
 	_, err := io.Copy(w, body)
-	return progress, err
+	return err
+}
+
+func writeTransferWithoutProgress(w io.Writer, tx sendTransfer, stderr io.Writer) error {
+	if tx.summary != "" && stderr != nil {
+		_, _ = fmt.Fprintln(stderr, tx.summary)
+	}
+	if err := protocol.WriteHeader(w, tx.header); err != nil {
+		return err
+	}
+	_, err := io.Copy(w, tx.body)
+	return err
 }
 
 func finishTransferProgress(progress *ProgressReporter, err error) {
@@ -459,18 +477,51 @@ func closePipeReaderOnContext(ctx context.Context, r *io.PipeReader) func() {
 	}
 }
 
+func senderPeerPayloadProgress(progress *ProgressReporter, headerBytes, total int64) func(sessionBytes int64, transferElapsedMS int64) {
+	if progress == nil || total < 0 {
+		return nil
+	}
+	return func(sessionBytes int64, transferElapsedMS int64) {
+		setSenderPeerPayloadProgress(progress, headerBytes, total, sessionBytes, transferElapsedMS)
+	}
+}
+
+func setSenderPeerPayloadProgress(progress *ProgressReporter, headerBytes, total, sessionBytes, transferElapsedMS int64) {
+	payloadBytes := sessionBytes - headerBytes
+	if payloadBytes < 0 {
+		payloadBytes = 0
+	}
+	if payloadBytes > total {
+		payloadBytes = total
+	}
+	progress.SetWithElapsed(payloadBytes, time.Duration(transferElapsedMS)*time.Millisecond)
+}
+
 func offerTransfer(ctx context.Context, cfg SendConfig, tx sendTransfer) error {
 	pipeReader, pipeWriter := io.Pipe()
 	stopPipeCancel := closePipeReaderOnContext(ctx, pipeReader)
 	defer stopPipeCancel()
 	tokenSink := make(chan string, 1)
 	offerErrCh := make(chan error, 1)
+	progress := NewProgressReporter(cfg.ProgressOutput, tx.progressTotal)
+	var headerBytes atomic.Int64
+	headerBytes.Store(unknownSessionProgressHeaderBytes)
+	var progressCallback func(int64, int64)
+	if cfg.UsePublicDERP {
+		progressCallback = func(sessionBytes int64, transferElapsedMS int64) {
+			if progress == nil || tx.progressTotal < 0 {
+				return
+			}
+			setSenderPeerPayloadProgress(progress, headerBytes.Load(), tx.progressTotal, sessionBytes, transferElapsedMS)
+		}
+	}
 	go func() {
 		_, err := derpholeSessionOffer(ctx, session.OfferConfig{
 			Emitter:            cfg.Emitter,
 			TokenSink:          tokenSink,
 			StdioIn:            pipeReader,
 			StdioExpectedBytes: transferSessionExpectedBytes(tx),
+			Progress:           progressCallback,
 			UsePublicDERP:      cfg.UsePublicDERP,
 			ForceRelay:         cfg.ForceRelay,
 			ParallelPolicy:     cfg.ParallelPolicy,
@@ -489,16 +540,30 @@ func offerTransfer(ctx context.Context, cfg SendConfig, tx sendTransfer) error {
 	}
 
 	tx.header.Verify = VerificationString(token)
+	realHeaderBytes, err := protocol.HeaderWireSize(tx.header)
+	if err != nil {
+		_ = pipeWriter.CloseWithError(err)
+		offerErr := <-offerErrCh
+		err = preferSessionPipeError(err, offerErr)
+		finishTransferProgress(progress, err)
+		return err
+	}
+	headerBytes.Store(realHeaderBytes)
 	if cfg.QR {
 		WriteSendQRInstruction(cfg.Stderr, token)
 	} else {
 		WriteSendInstruction(cfg.Stderr, token)
 	}
 
-	progress, writeErr := writeTransferWithProgress(pipeWriter, tx, cfg.ProgressOutput, cfg.Stderr)
+	var writeErr error
+	if cfg.UsePublicDERP {
+		writeErr = writeTransferWithoutProgress(pipeWriter, tx, cfg.Stderr)
+	} else {
+		writeErr = writeTransferWithReporter(pipeWriter, tx, progress, cfg.Stderr)
+	}
 	_ = pipeWriter.CloseWithError(writeErr)
 	offerErr := <-offerErrCh
-	err := preferSessionPipeError(writeErr, offerErr)
+	err = preferSessionPipeError(writeErr, offerErr)
 	finishTransferProgress(progress, err)
 	return err
 }
@@ -509,12 +574,22 @@ func sendViaSession(ctx context.Context, cfg SendConfig, tx sendTransfer) error 
 	defer stopPipeCancel()
 	sendErrCh := make(chan error, 1)
 	tx.header.Verify = VerificationString(cfg.Token)
+	headerBytes, err := protocol.HeaderWireSize(tx.header)
+	if err != nil {
+		return err
+	}
+	progress := NewProgressReporter(cfg.ProgressOutput, tx.progressTotal)
 	go func() {
+		var progressCallback func(int64, int64)
+		if cfg.UsePublicDERP {
+			progressCallback = senderPeerPayloadProgress(progress, headerBytes, tx.progressTotal)
+		}
 		sendErrCh <- derpholeSessionSend(ctx, session.SendConfig{
 			Token:              cfg.Token,
 			Emitter:            cfg.Emitter,
 			StdioIn:            pipeReader,
 			StdioExpectedBytes: transferSessionExpectedBytes(tx),
+			Progress:           progressCallback,
 			UsePublicDERP:      cfg.UsePublicDERP,
 			ForceRelay:         cfg.ForceRelay,
 			ParallelPolicy:     cfg.ParallelPolicy,
@@ -522,10 +597,15 @@ func sendViaSession(ctx context.Context, cfg SendConfig, tx sendTransfer) error 
 		})
 	}()
 
-	progress, writeErr := writeTransferWithProgress(pipeWriter, tx, cfg.ProgressOutput, cfg.Stderr)
+	var writeErr error
+	if cfg.UsePublicDERP {
+		writeErr = writeTransferWithoutProgress(pipeWriter, tx, cfg.Stderr)
+	} else {
+		writeErr = writeTransferWithReporter(pipeWriter, tx, progress, cfg.Stderr)
+	}
 	_ = pipeWriter.CloseWithError(writeErr)
 	sendErr := <-sendErrCh
-	err := preferSessionPipeError(writeErr, sendErr)
+	err = preferSessionPipeError(writeErr, sendErr)
 	finishTransferProgress(progress, err)
 	return err
 }
