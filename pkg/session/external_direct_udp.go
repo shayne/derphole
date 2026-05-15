@@ -176,6 +176,8 @@ var externalSessionPacketAEADDomain = []byte("derphole-session-packet-aead-v1")
 var externalRelayPrefixDERPDataNonceDomain = []byte("derphole-relay-prefix-derp-data-nonce-v1")
 var externalDirectUDPObservePunchAddrsByConn = probe.ObservePunchAddrsByConn
 
+var errExternalDirectUDPNoRateProbePackets = errors.New("direct UDP rate probes received no packets")
+
 type externalDirectUDPSendPlan struct {
 	probeConns                  []net.PacketConn
 	remoteAddrs                 []string
@@ -200,6 +202,8 @@ type externalDirectUDPHandoffReadyContextKey struct{}
 type externalDirectUDPHandoffProceedContextKey struct{}
 type externalDirectUDPHandoffRelayPauseContextKey struct{}
 type externalDirectUDPDirectReadyContextKey struct{}
+type externalDirectUDPStartWaitContextKey struct{}
+type externalDirectUDPAllowUnverifiedFallbackContextKey struct{}
 
 type externalDirectUDPHandoffReadySignal struct {
 	ch   chan struct{}
@@ -357,6 +361,35 @@ func signalExternalDirectUDPDirectReady(ctx context.Context) {
 	signal.once.Do(func() {
 		close(signal.ch)
 	})
+}
+
+func withExternalDirectUDPStartWait(ctx context.Context, wait time.Duration) context.Context {
+	return context.WithValue(ctx, externalDirectUDPStartWaitContextKey{}, wait)
+}
+
+func externalDirectUDPStartWaitOverride(ctx context.Context) (time.Duration, bool) {
+	wait, ok := ctx.Value(externalDirectUDPStartWaitContextKey{}).(time.Duration)
+	return wait, ok
+}
+
+func externalDirectUDPStartWaitContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	wait, ok := externalDirectUDPStartWaitOverride(ctx)
+	if !ok {
+		return context.WithTimeout(ctx, externalDirectUDPStartWait)
+	}
+	if wait <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, wait)
+}
+
+func withExternalDirectUDPAllowUnverifiedFallback(ctx context.Context) context.Context {
+	return context.WithValue(ctx, externalDirectUDPAllowUnverifiedFallbackContextKey{}, true)
+}
+
+func externalDirectUDPAllowUnverifiedFallback(ctx context.Context) bool {
+	allow, _ := ctx.Value(externalDirectUDPAllowUnverifiedFallbackContextKey{}).(bool)
+	return allow
 }
 
 type externalDirectUDPBudget struct {
@@ -1039,6 +1072,9 @@ func externalDirectUDPResolveProbedSendRates(ctx context.Context, probeConns []n
 	}
 	rateState.sentProbeSamples = sentProbeSamples
 	rateState.probeResult = probeResult
+	if !externalDirectUDPHasPositiveProbeProgress(probeResult.Samples) {
+		return rateState, sendCfg, errExternalDirectUDPNoRateProbePackets
+	}
 	rateState.selectedRateMbps = externalDirectUDPSelectInitialRateMbps(rateState.maxRateMbps, sentProbeSamples, probeResult.Samples)
 	rateState.rateCeilingMbps = externalDirectUDPSelectRateCeilingMbps(rateState.maxRateMbps, rateState.selectedRateMbps, sentProbeSamples, probeResult.Samples)
 	probeLimit := externalDirectUDPSenderProbeRateLimit(effectiveTransportCaps, sentProbeSamples, probeResult.Samples)
@@ -2028,7 +2064,11 @@ func (rt *externalRelayPrefixSendRuntime) startPrepare() {
 	go func() {
 		sendCfg := rt.rcfg.cfg
 		sendCfg.skipDirectUDPRateProbes = externalRelayPrefixShouldSkipDirectUDPRateProbes(sendCfg.StdioExpectedBytes)
-		plan, err := externalPrepareDirectUDPSendFn(rt.prepCtx, rt.rcfg.tok, rt.rcfg.derpClient, rt.rcfg.listenerDERP, peerAddr, rt.rcfg.probeConns, rt.rcfg.remoteCandidates, rt.rcfg.readyAckCh, rt.rcfg.startAckCh, rt.rcfg.rateProbeCh, sendCfg)
+		prepCtx := rt.prepCtx
+		if !sendCfg.skipDirectUDPRateProbes {
+			prepCtx = withExternalDirectUDPAllowUnverifiedFallback(prepCtx)
+		}
+		plan, err := externalPrepareDirectUDPSendFn(prepCtx, rt.rcfg.tok, rt.rcfg.derpClient, rt.rcfg.listenerDERP, peerAddr, rt.rcfg.probeConns, rt.rcfg.remoteCandidates, rt.rcfg.readyAckCh, rt.rcfg.startAckCh, rt.rcfg.rateProbeCh, sendCfg)
 		rt.prepCh <- externalRelayPrefixSendPrepResult{plan: plan, err: err}
 	}()
 }
@@ -2233,7 +2273,7 @@ func (rt *externalRelayPrefixSendRuntime) waitPreparedAfterHandoff() error {
 			rt.activateDirect()
 		case prep := <-rt.prepCh:
 			if prep.err != nil {
-				return prep.err
+				return rt.handlePrepError(prep.err)
 			}
 			externalTransferTracef("relay-prefix-send-post-handoff-prepared")
 			rt.activateDirect()
@@ -2414,6 +2454,7 @@ func newExternalRelayPrefixReceiveRuntime(ctx context.Context, rcfg externalRela
 	}()
 	prepCtx, prepCancel := context.WithCancel(ctx)
 	prepCtx, directReadyCh := withExternalDirectUDPDirectReadySignal(prepCtx)
+	prepCtx = withExternalDirectUDPStartWait(prepCtx, 0)
 	rt := &externalRelayPrefixReceiveRuntime{
 		ctx:             ctx,
 		rcfg:            rcfg,
@@ -3800,7 +3841,7 @@ func externalDirectUDPSelectRemoteAddrs(ctx context.Context, conns []net.PacketC
 	if emitter != nil {
 		emitter.Debug("udp-selected-addrs=" + strings.Join(selected, ","))
 	}
-	if externalDirectUDPSelectedAddrCount(selected) == 0 && peer == nil {
+	if externalDirectUDPShouldKeepObservedSelection(ctx, selected, peer) {
 		if emitter != nil {
 			emitter.Debug("udp-final-addrs=" + strings.Join(selected, ","))
 		}
@@ -3811,6 +3852,13 @@ func externalDirectUDPSelectRemoteAddrs(ctx context.Context, conns []net.PacketC
 		emitter.Debug("udp-final-addrs=" + strings.Join(final, ","))
 	}
 	return final
+}
+
+func externalDirectUDPShouldKeepObservedSelection(ctx context.Context, selected []string, peer net.Addr) bool {
+	if peer != nil || externalDirectUDPAllowUnverifiedFallback(ctx) {
+		return false
+	}
+	return externalDirectUDPSelectedAddrCount(selected) == 0
 }
 
 func externalDirectUDPFormatObservedAddrsByConn(observedByConn [][]net.Addr) string {
@@ -6400,7 +6448,7 @@ func waitExternalDirectUDPAddrTick(ctx context.Context, ticker *time.Ticker) err
 }
 
 func externalDirectUDPWaitCanFallback(ctx context.Context, err error) bool {
-	return err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded)
+	return err != nil && ctx.Err() == nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errExternalDirectUDPNoRateProbePackets))
 }
 
 func emitExternalDirectUDPStats(emitter *telemetry.Emitter, prefix string, bytes int64, startedAt time.Time, firstByteAt time.Time, completedAt time.Time) {
@@ -6494,7 +6542,7 @@ func waitForDirectUDPReadyAck(ctx context.Context, readyAckCh <-chan derpbind.Pa
 }
 
 func waitForDirectUDPStart(ctx context.Context, startCh <-chan derpbind.Packet, authOpt ...externalPeerControlAuth) (directUDPStart, error) {
-	waitCtx, cancel := context.WithTimeout(ctx, externalDirectUDPStartWait)
+	waitCtx, cancel := externalDirectUDPStartWaitContext(ctx)
 	defer cancel()
 	auth := optionalPeerControlAuth(authOpt)
 	for {

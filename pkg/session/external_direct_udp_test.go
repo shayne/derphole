@@ -1847,6 +1847,81 @@ func TestSendExternalViaRelayPrefixThenDirectUDPContinuesRelayWhileDirectPrepPen
 	}
 }
 
+func TestSendExternalViaRelayPrefixThenDirectUDPFallsBackToRelayWhenPostHandoffPrepareFails(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	prevSendRelay := externalSendExternalHandoffDERPFn
+	externalSendExternalHandoffDERPFn = func(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, spool *externalHandoffSpool, stop <-chan struct{}, metrics *externalTransferMetrics, packetAEAD cipher.AEAD) error {
+		for {
+			select {
+			case <-stop:
+				return nil
+			default:
+			}
+			chunk, err := spool.NextChunk()
+			switch {
+			case err == nil:
+				if err := spool.AckTo(chunk.Offset + int64(len(chunk.Payload))); err != nil {
+					return err
+				}
+				time.Sleep(5 * time.Millisecond)
+			case errors.Is(err, errExternalHandoffSourcePending):
+				time.Sleep(time.Millisecond)
+			case errors.Is(err, io.EOF):
+				return nil
+			default:
+				return err
+			}
+		}
+	}
+	t.Cleanup(func() { externalSendExternalHandoffDERPFn = prevSendRelay })
+
+	prevPrepareDirectUDPSend := externalPrepareDirectUDPSendFn
+	externalPrepareDirectUDPSendFn = func(ctx context.Context, tok token.Token, derpClient *derpbind.Client, listenerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, readyAckCh <-chan derpbind.Packet, startAckCh <-chan derpbind.Packet, rateProbeCh <-chan derpbind.Packet, cfg SendConfig) (externalDirectUDPSendPlan, error) {
+		signalExternalDirectUDPHandoffReady(ctx)
+		if err := waitExternalDirectUDPHandoffProceed(ctx); err != nil {
+			return externalDirectUDPSendPlan{}, err
+		}
+		time.Sleep(100 * time.Millisecond)
+		return externalDirectUDPSendPlan{}, errExternalDirectUDPNoRateProbePackets
+	}
+	t.Cleanup(func() { externalPrepareDirectUDPSendFn = prevPrepareDirectUDPSend })
+
+	prevExecutePreparedDirectUDPSend := externalExecutePreparedDirectUDPSendFn
+	directInvoked := false
+	externalExecutePreparedDirectUDPSendFn = func(ctx context.Context, src io.Reader, plan externalDirectUDPSendPlan, cfg SendConfig, metrics *externalTransferMetrics) error {
+		directInvoked = true
+		return errors.New("prepared direct send should not run after post-handoff prepare error")
+	}
+	t.Cleanup(func() { externalExecutePreparedDirectUDPSendFn = prevExecutePreparedDirectUDPSend })
+
+	payload := bytes.Repeat([]byte("post-handoff-prepare-error-relay-fallback"), (16<<20)/len("post-handoff-prepare-error-relay-fallback")+1)
+	payload = payload[:16<<20]
+	var status bytes.Buffer
+	err := sendExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixSendConfig{
+		src:          bytes.NewReader(payload),
+		decision:     rendezvous.Decision{Accept: &rendezvous.AcceptInfo{}},
+		derpClient:   nil,
+		listenerDERP: key.NodePublic{},
+		cfg:          SendConfig{Emitter: telemetry.New(&status, telemetry.LevelVerbose)},
+	})
+	if err != nil {
+		t.Fatalf("sendExternalViaRelayPrefixThenDirectUDP() error = %v", err)
+	}
+	if directInvoked {
+		t.Fatal("sendExternalViaRelayPrefixThenDirectUDP() executed direct send after post-handoff prepare error")
+	}
+	for _, needle := range []string{
+		"udp-handoff-send-prepare-error=direct UDP rate probes received no packets",
+		"udp-handoff-finished-on-relay=true",
+	} {
+		if !strings.Contains(status.String(), needle) {
+			t.Fatalf("status output missing %q in %q", needle, status.String())
+		}
+	}
+}
+
 func TestExternalRelayPrefixStartupWindowFitsHandoffWindow(t *testing.T) {
 	if externalRelayPrefixDERPMaxUnacked > externalRelayPrefixDERPHandoffMaxUnacked {
 		t.Fatalf("relay-prefix startup unacked window = %d, want <= handoff window %d", externalRelayPrefixDERPMaxUnacked, externalRelayPrefixDERPHandoffMaxUnacked)
@@ -2468,10 +2543,11 @@ func TestSendExternalViaRelayPrefixThenDirectUDPOnlySkipsRateProbesForUnknownOrS
 		name          string
 		expectedBytes int64
 		wantSkip      bool
+		wantFallback  bool
 	}{
-		{name: "unknown", expectedBytes: 0, wantSkip: true},
-		{name: "small", expectedBytes: 64 << 20, wantSkip: true},
-		{name: "large", expectedBytes: 1 << 30, wantSkip: false},
+		{name: "unknown", expectedBytes: 0, wantSkip: true, wantFallback: false},
+		{name: "small", expectedBytes: 64 << 20, wantSkip: true, wantFallback: false},
+		{name: "large", expectedBytes: 1 << 30, wantSkip: false, wantFallback: true},
 	}
 
 	for _, tt := range tests {
@@ -2500,9 +2576,11 @@ func TestSendExternalViaRelayPrefixThenDirectUDPOnlySkipsRateProbesForUnknownOrS
 			prevPrepareDirectUDPSend := externalPrepareDirectUDPSendFn
 			var gotSkip bool
 			var gotExpectedBytes int64
+			var gotFallback bool
 			externalPrepareDirectUDPSendFn = func(ctx context.Context, tok token.Token, derpClient *derpbind.Client, listenerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, readyAckCh <-chan derpbind.Packet, startAckCh <-chan derpbind.Packet, rateProbeCh <-chan derpbind.Packet, cfg SendConfig) (externalDirectUDPSendPlan, error) {
 				gotSkip = cfg.skipDirectUDPRateProbes
 				gotExpectedBytes = cfg.StdioExpectedBytes
+				gotFallback = externalDirectUDPAllowUnverifiedFallback(ctx)
 				return externalDirectUDPSendPlan{}, errors.New("direct unavailable")
 			}
 			t.Cleanup(func() { externalPrepareDirectUDPSendFn = prevPrepareDirectUDPSend })
@@ -2524,6 +2602,9 @@ func TestSendExternalViaRelayPrefixThenDirectUDPOnlySkipsRateProbesForUnknownOrS
 			}
 			if gotExpectedBytes != tt.expectedBytes {
 				t.Fatalf("StdioExpectedBytes = %d, want %d", gotExpectedBytes, tt.expectedBytes)
+			}
+			if gotFallback != tt.wantFallback {
+				t.Fatalf("allow unverified fallback = %v, want %v", gotFallback, tt.wantFallback)
 			}
 		})
 	}
@@ -2960,13 +3041,13 @@ func TestExternalPrepareDirectUDPSendWaitsForHandoffProceedBeforeSendingStart(t 
 
 	prevSendRateProbes := externalDirectUDPSendRateProbesParallelFn
 	externalDirectUDPSendRateProbesParallelFn = func(context.Context, []net.PacketConn, []string, []int, externalDirectUDPRateProbeAuth) ([]directUDPRateProbeSample, error) {
-		return nil, nil
+		return []directUDPRateProbeSample{{RateMbps: externalDirectUDPInitialProbeFallbackMbps, BytesSent: 3_750_000, DurationMillis: 200}}, nil
 	}
 	t.Cleanup(func() { externalDirectUDPSendRateProbesParallelFn = prevSendRateProbes })
 
 	prevWaitRateProbe := externalDirectUDPWaitRateProbeFn
 	externalDirectUDPWaitRateProbeFn = func(context.Context, <-chan derpbind.Packet, ...externalPeerControlAuth) (directUDPRateProbeResult, error) {
-		return directUDPRateProbeResult{}, nil
+		return directUDPRateProbeResult{Samples: []directUDPRateProbeSample{{RateMbps: externalDirectUDPInitialProbeFallbackMbps, BytesReceived: 3_750_000, DurationMillis: 200}}}, nil
 	}
 	t.Cleanup(func() { externalDirectUDPWaitRateProbeFn = prevWaitRateProbe })
 
@@ -3036,6 +3117,48 @@ func TestExternalPrepareDirectUDPSendWaitsForHandoffProceedBeforeSendingStart(t 
 		}
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for externalPrepareDirectUDPSend() to finish after proceed gate")
+	}
+}
+
+func TestExternalDirectUDPResolveProbedSendRatesRejectsZeroDelivery(t *testing.T) {
+	prevSendRateProbes := externalDirectUDPSendRateProbesParallelFn
+	externalDirectUDPSendRateProbesParallelFn = func(context.Context, []net.PacketConn, []string, []int, externalDirectUDPRateProbeAuth) ([]directUDPRateProbeSample, error) {
+		return []directUDPRateProbeSample{
+			{RateMbps: 8, BytesSent: 200_000, DurationMillis: 200},
+			{RateMbps: 25, BytesSent: 625_000, DurationMillis: 200},
+		}, nil
+	}
+	t.Cleanup(func() { externalDirectUDPSendRateProbesParallelFn = prevSendRateProbes })
+
+	prevWaitRateProbe := externalDirectUDPWaitRateProbeFn
+	externalDirectUDPWaitRateProbeFn = func(context.Context, <-chan derpbind.Packet, ...externalPeerControlAuth) (directUDPRateProbeResult, error) {
+		return directUDPRateProbeResult{Samples: []directUDPRateProbeSample{
+			{RateMbps: 8, BytesReceived: 0, DurationMillis: 200},
+			{RateMbps: 25, BytesReceived: 0, DurationMillis: 200},
+		}}, nil
+	}
+	t.Cleanup(func() { externalDirectUDPWaitRateProbeFn = prevWaitRateProbe })
+
+	_, _, err := externalDirectUDPResolveProbedSendRates(
+		context.Background(),
+		make([]net.PacketConn, 2),
+		[]string{"198.51.100.10:40000", "198.51.100.10:40001"},
+		nil,
+		externalPeerControlAuth{},
+		externalDirectUDPRateProbeAuth{},
+		directUDPReadyAck{},
+		probe.TransportCaps{},
+		probe.SendConfig{},
+		externalDirectUDPSendRateState{
+			maxRateMbps:      externalDirectUDPMaxRateMbps,
+			activeRateMbps:   externalDirectUDPInitialProbeFallbackMbps,
+			selectedRateMbps: externalDirectUDPInitialProbeFallbackMbps,
+			rateCeilingMbps:  externalDirectUDPMaxRateMbps,
+			probeRates:       []int{8, 25},
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "direct UDP rate probes received no packets") {
+		t.Fatalf("externalDirectUDPResolveProbedSendRates() error = %v, want no-packet probe error", err)
 	}
 }
 
@@ -3406,6 +3529,66 @@ func TestReceiveExternalViaRelayPrefixThenDirectUDPStartsPrepareBeforeTransportM
 	cancel()
 	if err := <-errCh; err == nil {
 		t.Fatal("receiveExternalViaRelayPrefixThenDirectUDP() error = nil, want canceled context after test shutdown")
+	}
+}
+
+func TestReceiveExternalViaRelayPrefixThenDirectUDPDisablesStandaloneStartTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	prevReceiveRelay := externalReceiveExternalHandoffDERPFn
+	externalReceiveExternalHandoffDERPFn = func(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, rx *externalHandoffReceiver, packets <-chan derpbind.Packet, metrics *externalTransferMetrics, packetAEAD cipher.AEAD) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	t.Cleanup(func() { externalReceiveExternalHandoffDERPFn = prevReceiveRelay })
+
+	prevPrepareDirectUDPReceive := externalPrepareDirectUDPReceiveFn
+	checked := make(chan struct{})
+	externalPrepareDirectUDPReceiveFn = func(ctx context.Context, dst io.Writer, tok token.Token, derpClient *derpbind.Client, peerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, decision rendezvous.Decision, readyCh <-chan derpbind.Packet, startCh <-chan derpbind.Packet, cfg ListenConfig) (externalDirectUDPReceivePlan, error) {
+		wait, overridden := externalDirectUDPStartWaitOverride(ctx)
+		if !overridden {
+			t.Error("relay-prefix receive prepare context did not override direct UDP start wait")
+		}
+		if wait != 0 {
+			t.Errorf("relay-prefix receive direct UDP start wait override = %s, want disabled timeout", wait)
+		}
+		close(checked)
+		<-ctx.Done()
+		return externalDirectUDPReceivePlan{}, ctx.Err()
+	}
+	t.Cleanup(func() { externalPrepareDirectUDPReceiveFn = prevPrepareDirectUDPReceive })
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- receiveExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixReceiveConfig{
+			dst:        io.Discard,
+			derpClient: nil,
+			peerDERP:   key.NodePublic{},
+			cfg:        ListenConfig{},
+		})
+	}()
+
+	select {
+	case <-checked:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("receiveExternalViaRelayPrefixThenDirectUDP() did not start direct preparation")
+	}
+
+	cancel()
+	<-errCh
+}
+
+func TestWaitForDirectUDPStartHonorsStartWaitOverride(t *testing.T) {
+	ctx := withExternalDirectUDPStartWait(context.Background(), 25*time.Millisecond)
+
+	startedAt := time.Now()
+	_, err := waitForDirectUDPStart(ctx, make(chan derpbind.Packet))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitForDirectUDPStart() error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed >= time.Second {
+		t.Fatalf("waitForDirectUDPStart() elapsed = %s, want custom start wait override instead of default timeout", elapsed)
 	}
 }
 
@@ -4498,6 +4681,28 @@ func TestExternalDirectUDPSelectRemoteAddrsLeavesAllLanesBlankWithoutObservation
 	want := []string{"", ""}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("externalDirectUDPSelectRemoteAddrs(unverified fallback) = %v, want %v", got, want)
+	}
+}
+
+func TestExternalDirectUDPSelectRemoteAddrsAllowsUnverifiedFallbackWhenContextAllowsProbeValidation(t *testing.T) {
+	origObserve := externalDirectUDPObservePunchAddrsByConn
+	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = origObserve })
+
+	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+		return [][]net.Addr{{}, {}}
+	}
+
+	ctx := withExternalDirectUDPAllowUnverifiedFallback(context.Background())
+	got := externalDirectUDPSelectRemoteAddrs(
+		ctx,
+		make([]net.PacketConn, 2),
+		parseCandidateStrings([]string{"98.238.217.49:60709", "98.238.217.49:60710"}),
+		nil,
+		nil,
+	)
+	want := []string{"98.238.217.49:60709", "98.238.217.49:60710"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("externalDirectUDPSelectRemoteAddrs(allowed unverified fallback) = %v, want %v", got, want)
 	}
 }
 

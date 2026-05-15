@@ -67,6 +67,48 @@ func TestDirectUDPReadyAckPayloadIsControl(t *testing.T) {
 	}
 }
 
+func TestDirectUDPHandshakePayloadsAreControl(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     envelope
+		matches func([]byte) bool
+	}{
+		{
+			name:    "ready",
+			env:     envelope{Type: envelopeDirectUDPReady},
+			matches: isDirectUDPReadyPayload,
+		},
+		{
+			name: "start",
+			env: envelope{
+				Type:           envelopeDirectUDPStart,
+				DirectUDPStart: &directUDPStart{ExpectedBytes: 123},
+			},
+			matches: isDirectUDPStartPayload,
+		},
+		{
+			name:    "start_ack",
+			env:     envelope{Type: envelopeDirectUDPStartAck},
+			matches: isDirectUDPStartAckPayload,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload, err := json.Marshal(tt.env)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tt.matches(payload) {
+				t.Fatalf("direct UDP %s matcher = false, want true", tt.name)
+			}
+			if isTransportDataPayload(payload) {
+				t.Fatalf("isTransportDataPayload(%s) = true, want false for direct UDP %s", payload, tt.name)
+			}
+		})
+	}
+}
+
 func TestDirectUDPRateProbePayloadIsControl(t *testing.T) {
 	payload, err := json.Marshal(envelope{
 		Type: envelopeDirectUDPRateProbe,
