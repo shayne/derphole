@@ -41,6 +41,7 @@ const (
 	envelopeDecision           = "decision"
 	envelopeControl            = "control"
 	envelopeAck                = "ack"
+	envelopeProgress           = "progress"
 	envelopeAbort              = "abort"
 	envelopeHeartbeat          = "heartbeat"
 	envelopeDirectUDPReady     = "direct_udp_ready"
@@ -103,6 +104,7 @@ type envelope struct {
 	Decision           *rendezvous.Decision      `json:"decision,omitempty"`
 	Control            *transport.ControlMessage `json:"control,omitempty"`
 	Ack                *peerAck                  `json:"ack,omitempty"`
+	Progress           *peerProgress             `json:"progress,omitempty"`
 	Abort              *peerAbort                `json:"abort,omitempty"`
 	Heartbeat          *peerHeartbeat            `json:"heartbeat,omitempty"`
 	DirectUDPReadyAck  *directUDPReadyAck        `json:"direct_udp_ready_ack,omitempty"`
@@ -123,6 +125,26 @@ type peerAck struct {
 
 func newPeerAck(bytesReceived int64) *peerAck {
 	return &peerAck{BytesReceived: &bytesReceived}
+}
+
+type peerProgress struct {
+	BytesReceived     int64  `json:"bytes_received"`
+	TransferElapsedMS int64  `json:"transfer_elapsed_ms"`
+	Sequence          uint64 `json:"sequence,omitempty"`
+}
+
+func newPeerProgress(bytesReceived int64, transferElapsedMS int64, sequence uint64) *peerProgress {
+	if bytesReceived < 0 {
+		bytesReceived = 0
+	}
+	if transferElapsedMS < 0 {
+		transferElapsedMS = 0
+	}
+	return &peerProgress{
+		BytesReceived:     bytesReceived,
+		TransferElapsedMS: transferElapsedMS,
+		Sequence:          sequence,
+	}
 }
 
 type peerAbort struct {
@@ -1669,6 +1691,16 @@ func sendPeerAck(ctx context.Context, client *derpbind.Client, peerDERP key.Node
 	return sendAuthenticatedEnvelope(ctx, client, peerDERP, envelope{Type: envelopeAck, Ack: newPeerAck(bytesReceived)}, auth)
 }
 
+func sendPeerProgress(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, bytesReceived, transferElapsedMS int64, sequence uint64, auth externalPeerControlAuth) error {
+	if client == nil || peerDERP.IsZero() {
+		return nil
+	}
+	return sendAuthenticatedEnvelope(ctx, client, peerDERP, envelope{
+		Type:     envelopeProgress,
+		Progress: newPeerProgress(bytesReceived, transferElapsedMS, sequence),
+	}, auth)
+}
+
 func sendPeerAbortBestEffort(client *derpbind.Client, peerDERP key.NodePublic, reason string, bytesTransferred int64, authOpt ...externalPeerControlAuth) {
 	if client == nil || peerDERP.IsZero() {
 		return
@@ -1946,6 +1978,37 @@ func verifyPeerAckPacket(pkt derpbind.Packet, auth externalPeerControlAuth, byte
 		return false, fmt.Errorf("peer received %d bytes, sent %d", *env.Ack.BytesReceived, bytesSent)
 	}
 	return false, nil
+}
+
+func verifyPeerProgressPacket(pkt derpbind.Packet, auth externalPeerControlAuth, lastSequence *uint64) (peerProgress, bool, error) {
+	env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
+	if ignoreAuthenticatedEnvelopeError(err, auth) {
+		return peerProgress{}, true, nil
+	}
+	if err == nil && env.Type == envelopeAbort {
+		return peerProgress{}, false, ErrPeerAborted
+	}
+	if err != nil || env.Type != envelopeProgress {
+		return peerProgress{}, false, errors.New("unexpected peer progress payload")
+	}
+	if env.Progress == nil {
+		return peerProgress{}, false, errors.New("peer progress missing progress body")
+	}
+	if peerProgressReplayed(env.Progress, lastSequence) {
+		return peerProgress{}, true, nil
+	}
+	return *env.Progress, false, nil
+}
+
+func peerProgressReplayed(progress *peerProgress, lastSequence *uint64) bool {
+	if progress == nil || lastSequence == nil {
+		return false
+	}
+	if progress.Sequence <= *lastSequence {
+		return true
+	}
+	*lastSequence = progress.Sequence
+	return false
 }
 
 func waitForPeerAckWithTimeout(ctx context.Context, ch <-chan derpbind.Packet, bytesSent int64, timeout time.Duration, authOpt ...externalPeerControlAuth) error {
@@ -2555,6 +2618,14 @@ func isAckPayload(payload []byte) bool {
 	return err == nil && env.Type == envelopeAck
 }
 
+func isProgressPayload(payload []byte) bool {
+	if len(payload) == 0 || payload[0] != '{' {
+		return false
+	}
+	env, err := decodeEnvelope(payload)
+	return err == nil && env.Type == envelopeProgress
+}
+
 func isAckOrAbortPayload(payload []byte) bool {
 	if len(payload) == 0 || payload[0] != '{' {
 		return false
@@ -2685,6 +2756,7 @@ func isTransportDataPayload(payload []byte) bool {
 
 var transportDataPayloadExclusions = []func([]byte) bool{
 	isAckPayload,
+	isProgressPayload,
 	isAbortPayload,
 	isHeartbeatPayload,
 	isDirectUDPReadyPayload,
