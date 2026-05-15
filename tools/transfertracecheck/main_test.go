@@ -46,7 +46,7 @@ func TestRunPrintsSuccess(t *testing.T) {
 
 func TestRunReturnsFailureForCheckError(t *testing.T) {
 	path := writeTrace(t, transfertrace.HeaderLine+"\n"+
-		"1000,0,receive,error,0,0,0,0,0.00,,,,,,,,,,,connected-direct,message too long\n")
+		"1000,0,receive,error,0,0,0,0,0.00,0,0,,,false,,,,,,,,,,,,connected-direct,message too long\n")
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"-role", "receive", path}, &stdout, &stderr)
 	if code != 1 {

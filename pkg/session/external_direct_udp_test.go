@@ -3884,7 +3884,7 @@ func TestExternalExecutePreparedDirectUDPSendEmitsSessionMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	traceBody := traceOut.String()
-	if !strings.Contains(traceBody, ",send,direct_execute,0,0,0,0,0.00,700,350,1,4,") {
+	if !strings.Contains(traceBody, ",send,direct_execute,0,0,0,0,0.00,0,0,,,false,,700,350,1,4,") {
 		t.Fatalf("trace body missing preserved available lanes:\n%s", traceBody)
 	}
 }

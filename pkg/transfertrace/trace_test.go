@@ -122,6 +122,37 @@ func TestRecorderHeaderUnaffectedByExportedHeaderMutation(t *testing.T) {
 	}
 }
 
+func TestRecorderWritesReceiverAnchoredProgressColumns(t *testing.T) {
+	var out bytes.Buffer
+	rec, err := NewRecorder(&out, RoleSend, time.Unix(900, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	rec.Observe(Snapshot{
+		At:                time.Unix(900, int64(500*time.Millisecond)),
+		Phase:             PhaseRelay,
+		AppBytes:          1024,
+		LocalSentBytes:    4096,
+		PeerReceivedBytes: 1024,
+		SetupElapsedMS:    250,
+		TransferElapsedMS: 250,
+		DirectValidated:   false,
+		FallbackReason:    "direct UDP rate probes received no packets",
+		LastState:         "direct-fallback-relay",
+	})
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	records, indexes := readTraceCSV(t, out.String())
+	row := records[1]
+	assertColumn(t, row, indexes, "local_sent_bytes", "4096")
+	assertColumn(t, row, indexes, "peer_received_bytes", "1024")
+	assertColumn(t, row, indexes, "setup_elapsed_ms", "250")
+	assertColumn(t, row, indexes, "transfer_elapsed_ms", "250")
+	assertColumn(t, row, indexes, "direct_validated", "false")
+	assertColumn(t, row, indexes, "fallback_reason", "direct UDP rate probes received no packets")
+}
+
 func TestRecorderRowsParseByHeaderAndBlankZeroOptionalFields(t *testing.T) {
 	var out bytes.Buffer
 	rec, err := NewRecorder(&out, RoleReceive, time.Unix(500, 0))

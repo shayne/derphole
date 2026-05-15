@@ -45,6 +45,12 @@ var header = [...]string{
 	"app_bytes",
 	"delta_app_bytes",
 	"app_mbps",
+	"local_sent_bytes",
+	"peer_received_bytes",
+	"setup_elapsed_ms",
+	"transfer_elapsed_ms",
+	"direct_validated",
+	"fallback_reason",
 	"direct_rate_selected_mbps",
 	"direct_rate_active_mbps",
 	"direct_lanes_active",
@@ -61,7 +67,7 @@ var header = [...]string{
 
 var Header = append([]string(nil), header[:]...)
 
-const HeaderLine = "timestamp_unix_ms,elapsed_ms,role,phase,relay_bytes,direct_bytes,app_bytes,delta_app_bytes,app_mbps,direct_rate_selected_mbps,direct_rate_active_mbps,direct_lanes_active,direct_lanes_available,direct_probe_state,direct_probe_summary,replay_window_bytes,repair_queue_bytes,retransmit_count,out_of_order_bytes,last_state,last_error"
+var HeaderLine = strings.Join(header[:], ",")
 
 type Snapshot struct {
 	At                     time.Time
@@ -69,6 +75,12 @@ type Snapshot struct {
 	RelayBytes             int64
 	DirectBytes            int64
 	AppBytes               int64
+	LocalSentBytes         int64
+	PeerReceivedBytes      int64
+	SetupElapsedMS         int64
+	TransferElapsedMS      int64
+	DirectValidated        bool
+	FallbackReason         string
 	DirectRateSelectedMbps int
 	DirectRateActiveMbps   int
 	DirectLanesActive      int
@@ -261,6 +273,12 @@ func (r *Recorder) row(snap Snapshot, deltaBytes int64, deltaMS int64) []string 
 		strconv.FormatInt(snap.AppBytes, 10),
 		strconv.FormatInt(deltaBytes, 10),
 		formatMbps(deltaBytes, deltaMS),
+		strconv.FormatInt(snap.LocalSentBytes, 10),
+		strconv.FormatInt(snap.PeerReceivedBytes, 10),
+		formatOptionalInt64(snap.SetupElapsedMS),
+		formatOptionalInt64(snap.TransferElapsedMS),
+		strconv.FormatBool(snap.DirectValidated),
+		snap.FallbackReason,
 		formatOptionalInt(snap.DirectRateSelectedMbps),
 		formatOptionalInt(snap.DirectRateActiveMbps),
 		formatOptionalInt(snap.DirectLanesActive),
