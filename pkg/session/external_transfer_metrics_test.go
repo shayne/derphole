@@ -92,6 +92,38 @@ func TestExternalTransferMetricsUpdatesTrace(t *testing.T) {
 	}
 }
 
+func TestExternalTransferMetricsSamplesTraceUntilTick(t *testing.T) {
+	var out bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleReceive, time.Unix(15, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(15, 0), rec, transfertrace.RoleReceive)
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, "connected-direct")
+	metrics.RecordDirectWrite(64<<10, time.Unix(15, int64(100*time.Millisecond)))
+
+	records, err := csv.NewReader(strings.NewReader(out.String())).ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v\n%s", err, out.String())
+	}
+	if len(records) != 1 {
+		t.Fatalf("trace records before tick = %d, want header only\n%s", len(records), out.String())
+	}
+
+	metrics.Tick(time.Unix(15, int64(500*time.Millisecond)))
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rows := readTransferTraceRows(t, out.String())
+	row := rows[len(rows)-1]
+	if row["phase"] != string(transfertrace.PhaseDirectExecute) ||
+		row["direct_bytes"] != "65536" ||
+		row["app_bytes"] != "65536" ||
+		row["last_state"] != "connected-direct" {
+		t.Fatalf("sampled trace row = %#v, want current metrics snapshot", row)
+	}
+}
+
 func TestExternalTransferMetricsSetProbeStatsUpdatesTrace(t *testing.T) {
 	var out bytes.Buffer
 	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(30, 0))
@@ -105,6 +137,7 @@ func TestExternalTransferMetricsSetProbeStatsUpdatesTrace(t *testing.T) {
 		Retransmits:    3,
 		MaxReplayBytes: 8192,
 	})
+	metrics.Tick(time.Unix(30, int64(100*time.Millisecond)))
 	if err := rec.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -134,6 +167,7 @@ func TestExternalTransferMetricsTraceUsesDirectStreamOffsetForOverlap(t *testing
 	metrics.RecordRelayWrite(10, time.Unix(40, int64(100*time.Millisecond)))
 	metrics.SetDirectAppProgressBase(6)
 	metrics.RecordDirectWrite(100, time.Unix(40, int64(200*time.Millisecond)))
+	metrics.Tick(time.Unix(40, int64(300*time.Millisecond)))
 	if err := rec.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +175,7 @@ func TestExternalTransferMetricsTraceUsesDirectStreamOffsetForOverlap(t *testing
 	if strings.Contains(body, ",receive,direct_execute,10,100,110,") {
 		t.Fatalf("trace body double-counted relay/direct overlap:\n%s", body)
 	}
-	if !strings.Contains(body, ",receive,direct_execute,10,100,106,96,") {
+	if !strings.Contains(body, ",receive,direct_execute,10,100,106,106,") {
 		t.Fatalf("trace body missing offset-based app progress:\n%s", body)
 	}
 }
@@ -156,6 +190,7 @@ func TestExternalTransferMetricsUsesPeerProgressForSenderAppBytes(t *testing.T) 
 	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
 	metrics.RecordLocalSent(10<<20, time.Unix(50, int64(100*time.Millisecond)))
 	metrics.RecordPeerProgress(1<<20, 500, time.Unix(51, 0))
+	metrics.Tick(time.Unix(51, int64(100*time.Millisecond)))
 	if err := trace.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
@@ -173,6 +208,38 @@ func TestExternalTransferMetricsUsesPeerProgressForSenderAppBytes(t *testing.T) 
 		if row[column] != value {
 			t.Fatalf("trace row[%q] = %q, want %q; row = %#v", column, row[column], value, row)
 		}
+	}
+}
+
+func TestExternalTransferMetricsDefersSenderCompleteUntilPeerAck(t *testing.T) {
+	var out bytes.Buffer
+	trace, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(55, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(55, 0), trace, transfertrace.RoleSend)
+	metrics.DeferSendCompleteUntilPeerAck()
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct-execute")
+	metrics.RecordLocalSent(16<<20, time.Unix(55, int64(100*time.Millisecond)))
+	metrics.RecordPeerProgress(2<<20, 500, time.Unix(55, int64(500*time.Millisecond)))
+	metrics.Complete(time.Unix(55, int64(600*time.Millisecond)))
+	metrics.Tick(time.Unix(55, int64(700*time.Millisecond)))
+	metrics.RecordPeerProgress(16<<20, 900, time.Unix(55, int64(900*time.Millisecond)))
+	metrics.CompleteAfterPeerAck(time.Unix(56, 0))
+	if err := trace.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	rows := readTransferTraceRows(t, out.String())
+	if rows[len(rows)-2]["phase"] == string(transfertrace.PhaseComplete) {
+		t.Fatalf("local send completion wrote terminal complete before ACK: %#v", rows)
+	}
+	row := rows[len(rows)-1]
+	if row["phase"] != string(transfertrace.PhaseComplete) ||
+		row["app_bytes"] != "16777216" ||
+		row["peer_received_bytes"] != "16777216" ||
+		row["transfer_elapsed_ms"] != "900" {
+		t.Fatalf("final trace row = %#v, want ACK-anchored complete with peer bytes", row)
 	}
 }
 
@@ -210,6 +277,7 @@ func TestExternalTransferMetricsSenderZeroPeerProgressSetsReceiverAnchoredState(
 	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
 	metrics.RecordRelayWrite(4<<20, time.Unix(70, int64(100*time.Millisecond)))
 	metrics.RecordPeerProgress(0, 250, time.Unix(71, 0))
+	metrics.Tick(time.Unix(71, int64(100*time.Millisecond)))
 	if err := trace.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}

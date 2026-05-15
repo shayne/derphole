@@ -75,6 +75,7 @@ type checker struct {
 	lastAppBytes int64
 	active       bool
 	activeSince  time.Time
+	lastPhase    Phase
 }
 
 func Check(r io.Reader, opts Options) (Result, error) {
@@ -172,6 +173,10 @@ func (c *checker) consume(row checkerRow) error {
 		c.recordActiveProgress(row)
 		return nil
 	}
+	if row.phase != c.lastPhase {
+		c.recordActivePhaseChange(row)
+		return nil
+	}
 	return c.checkFlatline(row)
 }
 
@@ -189,6 +194,7 @@ func (c *checker) checkFlatline(row checkerRow) error {
 func (c *checker) recordFirstRow(row checkerRow, active bool) {
 	c.lastAppBytes = row.appBytes
 	c.active = active
+	c.lastPhase = row.phase
 	if active {
 		c.activeSince = row.timestamp
 	}
@@ -199,12 +205,20 @@ func (c *checker) recordInactive(row checkerRow) {
 		c.lastAppBytes = row.appBytes
 	}
 	c.active = false
+	c.lastPhase = row.phase
 }
 
 func (c *checker) recordActiveProgress(row checkerRow) {
 	c.lastAppBytes = row.appBytes
 	c.active = true
 	c.activeSince = row.timestamp
+	c.lastPhase = row.phase
+}
+
+func (c *checker) recordActivePhaseChange(row checkerRow) {
+	c.active = true
+	c.activeSince = row.timestamp
+	c.lastPhase = row.phase
 }
 
 func (c *checker) finish() (Result, error) {

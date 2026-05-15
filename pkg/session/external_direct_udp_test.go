@@ -509,6 +509,64 @@ func TestSendPeerProgressLoopEmitsAuthenticatedProgressAfterFirstByte(t *testing
 	}
 }
 
+func TestSendPeerProgressLoopEmitsFinalProgressOnCancel(t *testing.T) {
+	origInterval := peerProgressInterval
+	peerProgressInterval = time.Hour
+	t.Cleanup(func() { peerProgressInterval = origInterval })
+
+	srv := newSessionTestDERPServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	node := srv.Map.Regions[1].Nodes[0]
+
+	receiverDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(receiver) error = %v", err)
+	}
+	defer receiverDERP.Close()
+	senderDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(sender) error = %v", err)
+	}
+	defer senderDERP.Close()
+
+	progressCh, unsubscribe := senderDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == receiverDERP.PublicKey() && isProgressPayload(pkt.Payload)
+	})
+	defer unsubscribe()
+
+	var bytesReceived atomic.Int64
+	bytesReceived.Store(8192)
+	firstByteAt := time.Now().Add(-time.Second)
+	auth := externalPeerControlAuthForToken(testExternalSessionToken(0x97))
+	loopCtx, stop := context.WithCancel(ctx)
+	go sendPeerProgressLoop(loopCtx, receiverDERP, senderDERP.PublicKey(), bytesReceived.Load, func() time.Time {
+		return firstByteAt
+	}, auth)
+	time.Sleep(10 * time.Millisecond)
+	stop()
+
+	var pkt derpbind.Packet
+	select {
+	case pkt = <-progressCh:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	progress, handled, err := verifyPeerProgressPacket(pkt, auth, new(uint64))
+	if err != nil {
+		t.Fatalf("verifyPeerProgressPacket() error = %v", err)
+	}
+	if handled {
+		t.Fatal("final progress packet was unexpectedly handled as ignorable")
+	}
+	if progress.BytesReceived != 8192 {
+		t.Fatalf("BytesReceived = %d, want 8192", progress.BytesReceived)
+	}
+	if progress.Sequence != 1 {
+		t.Fatalf("Sequence = %d, want 1", progress.Sequence)
+	}
+}
+
 func TestPeerProgressWatcherUsesExplicitMetrics(t *testing.T) {
 	var out bytes.Buffer
 	trace, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(100, 0))
@@ -540,6 +598,7 @@ func TestPeerProgressWatcherUsesExplicitMetrics(t *testing.T) {
 	}
 	cancel()
 	stop()
+	metrics.Tick(time.Unix(100, int64(500*time.Millisecond)))
 	if err := trace.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
@@ -596,6 +655,7 @@ func TestRelayOnlySendPeerProgressWatcherUsesExplicitMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sendExternalRelayUDPWithPeerProgress() error = %v", err)
 	}
+	trace.Tick(time.Now())
 	if err := trace.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
@@ -662,6 +722,7 @@ func TestRelayPrefixSendRuntimePeerProgressWatcherUsesRuntimeMetrics(t *testing.
 		t.Fatal("timed out waiting for relay-prefix peer progress watcher")
 	}
 	rt.Close()
+	trace.Tick(time.Now())
 	if err := trace.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
@@ -1751,8 +1812,11 @@ func TestExternalExecutePreparedDirectUDPReceiveFallbackMetricsUseListenTrace(t 
 		t.Fatal(err)
 	}
 	body := traceOut.String()
-	if !strings.Contains(body, ",receive,direct_execute,") {
-		t.Fatalf("trace body missing direct receive execution row:\n%s", body)
+	if strings.Contains(body, ",receive,complete,") {
+		t.Fatalf("trace body marked failed receive complete:\n%s", body)
+	}
+	if !strings.Contains(body, ",receive,error,") || !strings.Contains(body, "no packet conns") {
+		t.Fatalf("trace body missing receive error row:\n%s", body)
 	}
 }
 
@@ -4328,7 +4392,7 @@ func TestExternalExecutePreparedDirectUDPSendEmitsSessionMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	traceBody := traceOut.String()
-	if !strings.Contains(traceBody, ",send,direct_execute,0,0,0,0,0.00,0,0,,,false,,700,350,1,4,") {
+	if !strings.Contains(traceBody, ",send,complete,") || !strings.Contains(traceBody, ",700,350,1,4,") {
 		t.Fatalf("trace body missing preserved available lanes:\n%s", traceBody)
 	}
 }

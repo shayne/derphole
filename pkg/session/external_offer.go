@@ -16,6 +16,7 @@ import (
 	"github.com/shayne/derphole/pkg/quicpath"
 	"github.com/shayne/derphole/pkg/rendezvous"
 	"github.com/shayne/derphole/pkg/token"
+	"github.com/shayne/derphole/pkg/transfertrace"
 	"github.com/shayne/derphole/pkg/transport"
 	"go4.org/mem"
 	"tailscale.com/tailcfg"
@@ -172,16 +173,23 @@ func sendExternalAcceptedOffer(ctx context.Context, session *relaySession, claim
 		return err
 	}
 	defer func() { _ = countedSrc.Close() }()
+	metrics := newExternalTransferMetricsWithTrace(time.Now(), cfg.Trace, transfertrace.RoleSend)
+	metrics.DeferSendCompleteUntilPeerAck()
+	ctx = withExternalTransferMetrics(ctx, metrics)
 
 	if err := sendExternalOfferDecision(ctx, session, peerDERP, direct.decision, auth, cfg); err != nil {
+		metrics.SetError(err)
 		return err
 	}
 	if err := sendExternalOfferPayload(ctx, session, countedSrc, direct, channels, transportRuntime, peerDERP, pathEmitter, cfg); err != nil {
+		metrics.SetError(err)
 		return err
 	}
 	if err := waitForPeerAckWithTimeout(ctx, channels.ackCh, countedSrc.Count(), externalDirectUDPAckWait, auth); err != nil {
+		metrics.SetError(err)
 		return err
 	}
+	completeExternalSendMetricsAfterPeerAck(metrics, countedSrc.Count(), time.Now())
 	pathEmitter.Complete(transportRuntime.manager)
 	return nil
 }

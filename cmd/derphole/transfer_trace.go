@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/shayne/derphole/pkg/transfertrace"
 )
 
 const transferTraceCSVEnv = "DERPHOLE_TRANSFER_TRACE_CSV"
+
+var transferTraceSampleInterval = 500 * time.Millisecond
 
 func openTransferTraceFromEnv(role transfertrace.Role, stderr io.Writer) (*transfertrace.Recorder, func(), bool) {
 	path := os.Getenv(transferTraceCSVEnv)
@@ -31,7 +34,16 @@ func openTransferTraceFromEnv(role transfertrace.Role, stderr io.Writer) (*trans
 		_, _ = fmt.Fprintf(stderr, "initialize %s: %v\n", transferTraceCSVEnv, err)
 		return nil, func() {}, false
 	}
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		rec.Run(done, transferTraceSampleInterval, time.Now)
+	}()
 	return rec, func() {
+		close(done)
+		wg.Wait()
 		_ = rec.Close()
 		_ = f.Close()
 	}, true

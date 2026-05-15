@@ -123,6 +123,7 @@ const (
 var externalDirectUDPRateProbeMagic = [16]byte{0, 'd', 'e', 'r', 'p', 'h', 'o', 'l', 'e', '-', 'r', 'a', 't', 'e', 'v', '1'}
 var externalRelayPrefixDERPMagic = [16]byte{0, 'd', 'e', 'r', 'p', 'h', 'o', 'l', 'e', '-', 'p', 'r', 'e', 'f', 'v', '1'}
 var peerProgressInterval = 500 * time.Millisecond
+var peerProgressFinalTimeout = 2 * time.Second
 
 const (
 	externalDirectUDPRateProbeIndexOffset = len(externalDirectUDPRateProbeMagic)
@@ -455,6 +456,7 @@ type externalDirectUDPSendRuntime struct {
 	auth         externalPeerControlAuth
 	decision     rendezvous.Decision
 	subs         externalDirectUDPSendSubscriptions
+	metrics      *externalTransferMetrics
 	cleanupConns func()
 }
 
@@ -702,24 +704,32 @@ func sendPeerProgressLoop(ctx context.Context, client *derpbind.Client, peerDERP
 	for {
 		select {
 		case now := <-ticker.C:
-			if firstByteAt == nil {
-				continue
-			}
-			firstByte := firstByteAt()
-			if firstByte.IsZero() {
-				continue
-			}
-			sequence++
-			var received int64
-			if bytesReceived != nil {
-				received = bytesReceived()
-			}
-			progress := peerProgressForTransfer(received, firstByte, now, sequence)
-			_ = sendPeerProgress(ctx, client, peerDERP, progress.BytesReceived, progress.TransferElapsedMS, progress.Sequence, auth)
+			sequence = sendPeerProgressSnapshot(ctx, client, peerDERP, bytesReceived, firstByteAt, auth, sequence, now)
 		case <-ctx.Done():
+			finalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), peerProgressFinalTimeout)
+			_ = sendPeerProgressSnapshot(finalCtx, client, peerDERP, bytesReceived, firstByteAt, auth, sequence, time.Now())
+			cancel()
 			return
 		}
 	}
+}
+
+func sendPeerProgressSnapshot(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, bytesReceived func() int64, firstByteAt func() time.Time, auth externalPeerControlAuth, sequence uint64, now time.Time) uint64 {
+	if firstByteAt == nil {
+		return sequence
+	}
+	firstByte := firstByteAt()
+	if firstByte.IsZero() {
+		return sequence
+	}
+	sequence++
+	var received int64
+	if bytesReceived != nil {
+		received = bytesReceived()
+	}
+	progress := peerProgressForTransfer(received, firstByte, now, sequence)
+	_ = sendPeerProgress(ctx, client, peerDERP, progress.BytesReceived, progress.TransferElapsedMS, progress.Sequence, auth)
+	return sequence
 }
 
 func watchPeerProgress(ctx context.Context, ch <-chan derpbind.Packet, auth externalPeerControlAuth, consume func(peerProgress, time.Time)) error {
@@ -786,11 +796,15 @@ func (rt *externalDirectUDPSendRuntime) notifyPeerAbortOnLocalCancel(retErr *err
 }
 
 func (rt *externalDirectUDPSendRuntime) run(ctx context.Context) error {
+	rt.metrics = newExternalTransferMetricsWithTrace(time.Now(), rt.cfg.Trace, transfertrace.RoleSend)
+	rt.metrics.DeferSendCompleteUntilPeerAck()
+	ctx = withExternalTransferMetrics(ctx, rt.metrics)
 	pathEmitter := newTransportPathEmitter(rt.cfg.Emitter)
 	pathEmitter.Emit(StateProbing)
 	pathEmitter.SuppressWatcherDirect()
 	tr, err := rt.startTransport(ctx, pathEmitter)
 	if err != nil {
+		rt.metrics.SetError(err)
 		return err
 	}
 	defer tr.Close()
@@ -800,8 +814,10 @@ func (rt *externalDirectUDPSendRuntime) run(ctx context.Context) error {
 		return sendErr
 	}
 	if err := waitForPeerAckWithTimeout(ctx, rt.subs.ackCh, rt.countedSrc.Count(), externalDirectUDPAckWait, rt.auth); err != nil {
+		rt.metrics.SetError(err)
 		return err
 	}
+	completeExternalSendMetricsAfterPeerAck(rt.metrics, rt.countedSrc.Count(), time.Now())
 	pathEmitter.Complete(tr.manager)
 	return nil
 }
@@ -1437,9 +1453,10 @@ func externalExecutePreparedDirectUDPSend(ctx context.Context, src io.Reader, pl
 	}
 	externalDirectUDPValidateDirectProgress(nil, metrics, stats)
 	externalDirectUDPSendRecordMetrics(metrics, stats, !plan.sendSrcRecordsDirectMetrics)
-	emitExternalTransferMetricsComplete(metrics, cfg.Emitter, "udp-send", stats, stats.CompletedAt)
 	if err != nil {
 		metrics.SetError(err)
+	} else {
+		emitExternalTransferMetricsComplete(metrics, cfg.Emitter, "udp-send", stats, stats.CompletedAt)
 	}
 	return err
 }
@@ -1661,9 +1678,11 @@ func externalExecutePreparedDirectUDPReceive(ctx context.Context, plan externalD
 	emitExternalDirectUDPReceiveDebug(cfg.Emitter, stats, err)
 	err = externalDirectUDPFlushReceivePlan(plan, err)
 	externalDirectUDPValidateDirectProgress(nil, metrics, stats)
-	externalDirectUDPRecordReceiveMetrics(metrics, cfg.Emitter, stats, !plan.receiveDstRecordsDirectMetrics)
 	if err != nil {
+		externalDirectUDPBackfillReceiveMetrics(metrics, stats, !plan.receiveDstRecordsDirectMetrics)
 		metrics.SetError(err)
+	} else {
+		externalDirectUDPRecordReceiveMetrics(metrics, cfg.Emitter, stats, !plan.receiveDstRecordsDirectMetrics)
 	}
 	return err
 }
@@ -1731,6 +1750,11 @@ func externalDirectUDPFlushReceivePlan(plan externalDirectUDPReceivePlan, err er
 }
 
 func externalDirectUDPRecordReceiveMetrics(metrics *externalTransferMetrics, emitter *telemetry.Emitter, stats probe.TransferStats, backfillDirectBytes bool) {
+	externalDirectUDPBackfillReceiveMetrics(metrics, stats, backfillDirectBytes)
+	emitExternalTransferMetricsComplete(metrics, emitter, "udp-receive", stats, time.Now())
+}
+
+func externalDirectUDPBackfillReceiveMetrics(metrics *externalTransferMetrics, stats probe.TransferStats, backfillDirectBytes bool) {
 	if backfillDirectBytes && stats.BytesReceived > 0 {
 		directFirstByteAt := stats.FirstByteAt
 		if directFirstByteAt.IsZero() {
@@ -1740,12 +1764,14 @@ func externalDirectUDPRecordReceiveMetrics(metrics *externalTransferMetrics, emi
 			metrics.RecordDirectWrite(remaining, directFirstByteAt)
 		}
 	}
-	emitExternalTransferMetricsComplete(metrics, emitter, "udp-receive", stats, time.Now())
 }
 
 func sendExternalViaDirectUDPOnly(ctx context.Context, src io.Reader, tok token.Token, derpClient *derpbind.Client, listenerDERP key.NodePublic, transportManager *transport.Manager, pathEmitter *transportPathEmitter, punchCancel context.CancelFunc, probeConn net.PacketConn, probeConns []net.PacketConn, remoteCandidates []net.Addr, readyAckCh <-chan derpbind.Packet, startAckCh <-chan derpbind.Packet, rateProbeCh <-chan derpbind.Packet, progressCh <-chan derpbind.Packet, cfg SendConfig) error {
-	ctx = withExternalTransferMetrics(ctx, newExternalTransferMetricsWithTrace(time.Now(), cfg.Trace, transfertrace.RoleSend))
 	metrics := externalTransferMetricsFromContext(ctx)
+	if metrics == nil {
+		metrics = newExternalTransferMetricsWithTrace(time.Now(), cfg.Trace, transfertrace.RoleSend)
+		ctx = withExternalTransferMetrics(ctx, metrics)
+	}
 	stopPeerProgress := startPeerProgressWatcher(ctx, progressCh, externalPeerControlAuthForToken(tok), metrics, cfg.Progress, cfg.Emitter)
 	defer stopPeerProgress()
 	var peerAddr net.Addr
@@ -1770,7 +1796,7 @@ func sendExternalViaDirectUDPOnly(ctx context.Context, src io.Reader, tok token.
 }
 
 func sendExternalRelayUDPWithPeerProgress(ctx context.Context, src io.Reader, manager *transport.Manager, tok token.Token, progressCh <-chan derpbind.Packet, cfg SendConfig) error {
-	metrics := newExternalTransferMetricsWithTrace(time.Now(), cfg.Trace, transfertrace.RoleSend)
+	metrics := externalTransferMetricsOrNew(ctx, nil, cfg.Trace, transfertrace.RoleSend)
 	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
 	stopPeerProgress := startPeerProgressWatcher(ctx, progressCh, externalPeerControlAuthForToken(tok), metrics, cfg.Progress, cfg.Emitter)
 	defer stopPeerProgress()
@@ -2225,7 +2251,7 @@ type externalRelayPrefixSendRuntime struct {
 }
 
 func newExternalRelayPrefixSendRuntime(ctx context.Context, rcfg externalRelayPrefixSendConfig) (*externalRelayPrefixSendRuntime, error) {
-	metrics := newExternalTransferMetricsWithTrace(time.Now(), rcfg.cfg.Trace, transfertrace.RoleSend)
+	metrics := externalTransferMetricsOrNew(ctx, nil, rcfg.cfg.Trace, transfertrace.RoleSend)
 	metrics.SetPhase(transfertrace.PhaseRelay, "connected-relay")
 	ctx = withExternalTransferMetrics(ctx, metrics)
 	packetAEAD, err := externalSessionPacketAEAD(rcfg.tok)

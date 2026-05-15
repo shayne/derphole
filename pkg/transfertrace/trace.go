@@ -96,15 +96,16 @@ type Snapshot struct {
 }
 
 type Recorder struct {
-	mu      sync.Mutex
-	role    Role
-	start   time.Time
-	w       *csv.Writer
-	lastAt  time.Time
-	lastApp int64
-	current Snapshot
-	closed  bool
-	err     error
+	mu       sync.Mutex
+	role     Role
+	start    time.Time
+	w        *csv.Writer
+	lastAt   time.Time
+	lastApp  int64
+	current  Snapshot
+	closed   bool
+	terminal bool
+	err      error
 }
 
 func NewRecorder(out io.Writer, role Role, start time.Time) (*Recorder, error) {
@@ -138,7 +139,7 @@ func (r *Recorder) Update(update func(*Snapshot)) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.closed || r.err != nil {
+	if r.closed || r.terminal || r.err != nil {
 		return
 	}
 	snap := r.current
@@ -162,21 +163,33 @@ func (r *Recorder) Tick(at time.Time) {
 
 func (r *Recorder) Error(at time.Time, message string) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || r.terminal || r.err != nil {
+		return
+	}
 	snap := r.current
 	snap.At = at
 	snap.Phase = PhaseError
 	snap.LastError = message
 	r.observeLocked(snap)
-	r.mu.Unlock()
+	if r.err == nil {
+		r.terminal = true
+	}
 }
 
 func (r *Recorder) Complete(at time.Time) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || r.terminal || r.err != nil {
+		return
+	}
 	snap := r.current
 	snap.At = at
 	snap.Phase = PhaseComplete
 	r.observeLocked(snap)
-	r.mu.Unlock()
+	if r.err == nil {
+		r.terminal = true
+	}
 }
 
 // Run records ticks until ctxDone is closed. Close flushes and prevents future
@@ -229,7 +242,7 @@ func (r *Recorder) Close() error {
 }
 
 func (r *Recorder) observeLocked(snap Snapshot) {
-	if r.closed || r.err != nil {
+	if r.closed || r.terminal || r.err != nil {
 		return
 	}
 	if snap.At.IsZero() {

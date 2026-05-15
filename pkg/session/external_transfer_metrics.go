@@ -37,6 +37,7 @@ type externalTransferMetrics struct {
 	phase                  transfertrace.Phase
 	lastState              string
 	lastError              string
+	deferSendComplete      bool
 	directRateSelectedMbps int
 	directRateActiveMbps   int
 	directLanesActive      int
@@ -84,7 +85,7 @@ func (m *externalTransferMetrics) RecordLocalSent(n int64, at time.Time) {
 	m.localSentBytes += n
 	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
 	m.mu.Unlock()
-	observeExternalTransferTrace(trace, snap, ok)
+	sampleExternalTransferTrace(trace, snap, ok)
 }
 
 func (m *externalTransferMetrics) RecordPeerProgress(bytesReceived int64, transferElapsedMS int64, at time.Time) {
@@ -105,7 +106,7 @@ func (m *externalTransferMetrics) RecordPeerProgress(bytesReceived int64, transf
 	}
 	trace, snap, ok := m.updateTraceLocked(at)
 	m.mu.Unlock()
-	observeExternalTransferTrace(trace, snap, ok)
+	sampleExternalTransferTrace(trace, snap, ok)
 }
 
 func (m *externalTransferMetrics) MarkDirectValidated(at time.Time) {
@@ -116,7 +117,7 @@ func (m *externalTransferMetrics) MarkDirectValidated(at time.Time) {
 	m.directValidated = true
 	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
 	m.mu.Unlock()
-	observeExternalTransferTrace(trace, snap, ok)
+	sampleExternalTransferTrace(trace, snap, ok)
 }
 
 func (m *externalTransferMetrics) SetFallbackReason(reason string, at time.Time) {
@@ -127,7 +128,7 @@ func (m *externalTransferMetrics) SetFallbackReason(reason string, at time.Time)
 	m.fallbackReason = reason
 	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
 	m.mu.Unlock()
-	observeExternalTransferTrace(trace, snap, ok)
+	sampleExternalTransferTrace(trace, snap, ok)
 }
 
 func (m *externalTransferMetrics) SetDirectAppProgressBase(offset int64) {
@@ -153,11 +154,36 @@ func (m *externalTransferMetrics) Complete(at time.Time) {
 		return
 	}
 	m.completedAt = at
+	if m.deferSendComplete {
+		trace, snap, ok := m.updateTraceLocked(at)
+		m.mu.Unlock()
+		sampleExternalTransferTrace(trace, snap, ok)
+		return
+	}
 	m.phase = transfertrace.PhaseComplete
 	m.lastState = string(StateComplete)
 	trace, snap, ok := m.updateTraceLocked(at)
 	m.mu.Unlock()
-	observeExternalTransferTrace(trace, snap, ok)
+	completeExternalTransferTrace(trace, snap, ok, at)
+}
+
+func (m *externalTransferMetrics) DeferSendCompleteUntilPeerAck() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.deferSendComplete = true
+	m.mu.Unlock()
+}
+
+func (m *externalTransferMetrics) CompleteAfterPeerAck(at time.Time) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.deferSendComplete = false
+	m.mu.Unlock()
+	m.Complete(at)
 }
 
 func (m *externalTransferMetrics) SetPhase(phase transfertrace.Phase, state string) {
@@ -169,7 +195,7 @@ func (m *externalTransferMetrics) SetPhase(phase transfertrace.Phase, state stri
 	m.lastState = state
 	trace, snap, ok := m.updateTraceLocked(time.Now())
 	m.mu.Unlock()
-	observeExternalTransferTrace(trace, snap, ok)
+	sampleExternalTransferTrace(trace, snap, ok)
 }
 
 func (m *externalTransferMetrics) SetError(err error) {
@@ -181,7 +207,7 @@ func (m *externalTransferMetrics) SetError(err error) {
 	m.lastError = err.Error()
 	trace, snap, ok := m.updateTraceLocked(time.Now())
 	m.mu.Unlock()
-	observeExternalTransferTrace(trace, snap, ok)
+	errorExternalTransferTrace(trace, snap, ok, err)
 }
 
 func (m *externalTransferMetrics) SetDirectPlan(selectedRate int, activeRate int, activeLanes int, availableLanes int) {
@@ -195,7 +221,7 @@ func (m *externalTransferMetrics) SetDirectPlan(selectedRate int, activeRate int
 	m.directLanesAvailable = availableLanes
 	trace, snap, ok := m.updateTraceLocked(time.Now())
 	m.mu.Unlock()
-	observeExternalTransferTrace(trace, snap, ok)
+	sampleExternalTransferTrace(trace, snap, ok)
 }
 
 func (m *externalTransferMetrics) SetProbeSummary(state string, summary string) {
@@ -207,7 +233,7 @@ func (m *externalTransferMetrics) SetProbeSummary(state string, summary string) 
 	m.directProbeSummary = summary
 	trace, snap, ok := m.updateTraceLocked(time.Now())
 	m.mu.Unlock()
-	observeExternalTransferTrace(trace, snap, ok)
+	sampleExternalTransferTrace(trace, snap, ok)
 }
 
 func (m *externalTransferMetrics) SetProbeStats(stats probe.TransferStats) {
@@ -238,7 +264,7 @@ func (m *externalTransferMetrics) setProbeStats(stats probe.TransferStats, updat
 	m.replayWindowBytes = stats.MaxReplayBytes
 	trace, snap, ok := m.updateTraceLocked(time.Now())
 	m.mu.Unlock()
-	observeExternalTransferTrace(trace, snap, ok)
+	sampleExternalTransferTrace(trace, snap, ok)
 }
 
 func (m *externalTransferMetrics) Tick(at time.Time) {
@@ -248,7 +274,7 @@ func (m *externalTransferMetrics) Tick(at time.Time) {
 	m.mu.Lock()
 	trace, snap, ok := m.updateTraceLocked(at)
 	m.mu.Unlock()
-	observeExternalTransferTrace(trace, snap, ok)
+	recordExternalTransferTrace(trace, snap, ok)
 }
 
 func (m *externalTransferMetrics) TotalDurationMS() int64 {
@@ -318,6 +344,17 @@ func emitExternalTransferMetricsComplete(metrics *externalTransferMetrics, emitt
 	metrics.Emit(emitter, prefix, stats)
 }
 
+func completeExternalSendMetricsAfterPeerAck(metrics *externalTransferMetrics, bytesReceived int64, at time.Time) {
+	if metrics == nil {
+		return
+	}
+	if at.IsZero() {
+		at = time.Now()
+	}
+	metrics.RecordPeerProgress(bytesReceived, 0, at)
+	metrics.CompleteAfterPeerAck(at)
+}
+
 type externalTransferMetricsWriter struct {
 	w      io.Writer
 	record func(int64, time.Time)
@@ -359,7 +396,7 @@ func (m *externalTransferMetrics) recordWrite(totalBytes *int64, n int64, at tim
 	}
 	trace, snap, ok := m.updateTraceLocked(at)
 	m.mu.Unlock()
-	observeExternalTransferTrace(trace, snap, ok)
+	sampleExternalTransferTrace(trace, snap, ok)
 }
 
 func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrace.Recorder, transfertrace.Snapshot, bool) {
@@ -428,9 +465,34 @@ func nonZeroTime(at time.Time) time.Time {
 	return at
 }
 
-func observeExternalTransferTrace(trace *transfertrace.Recorder, snap transfertrace.Snapshot, ok bool) {
+func sampleExternalTransferTrace(trace *transfertrace.Recorder, snap transfertrace.Snapshot, ok bool) {
+	if !ok {
+		return
+	}
+	trace.Update(func(current *transfertrace.Snapshot) {
+		*current = snap
+	})
+}
+
+func recordExternalTransferTrace(trace *transfertrace.Recorder, snap transfertrace.Snapshot, ok bool) {
 	if !ok {
 		return
 	}
 	trace.Observe(snap)
+}
+
+func completeExternalTransferTrace(trace *transfertrace.Recorder, snap transfertrace.Snapshot, ok bool, at time.Time) {
+	if !ok {
+		return
+	}
+	sampleExternalTransferTrace(trace, snap, ok)
+	trace.Complete(at)
+}
+
+func errorExternalTransferTrace(trace *transfertrace.Recorder, snap transfertrace.Snapshot, ok bool, err error) {
+	if !ok {
+		return
+	}
+	sampleExternalTransferTrace(trace, snap, ok)
+	trace.Error(snap.At, err.Error())
 }

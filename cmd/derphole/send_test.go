@@ -8,9 +8,11 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	pkgderphole "github.com/shayne/derphole/pkg/derphole"
 	"github.com/shayne/derphole/pkg/session"
@@ -87,6 +89,39 @@ func TestRunSendPassesTransferTraceFromEnvironment(t *testing.T) {
 	}
 	if got == nil {
 		t.Fatal("Trace was nil")
+	}
+}
+
+func TestRunSendTransferTraceSamplesAtInterval(t *testing.T) {
+	tracePath := filepath.Join(t.TempDir(), "send.csv")
+	t.Setenv("DERPHOLE_TRANSFER_TRACE_CSV", tracePath)
+	prevRun := runSendTransfer
+	prevInterval := transferTraceSampleInterval
+	t.Cleanup(func() {
+		runSendTransfer = prevRun
+		transferTraceSampleInterval = prevInterval
+	})
+	transferTraceSampleInterval = 10 * time.Millisecond
+	runSendTransfer = func(_ context.Context, cfg pkgderphole.SendConfig) error {
+		cfg.Trace.Update(func(snap *transfertrace.Snapshot) {
+			snap.Phase = transfertrace.PhaseRelay
+			snap.LocalSentBytes = 4096
+			snap.LastState = "connected-relay"
+		})
+		time.Sleep(30 * time.Millisecond)
+		return nil
+	}
+
+	if code := runSend([]string{"hello", "--hide-progress"}, telemetry.LevelQuiet, strings.NewReader(""), io.Discard, io.Discard); code != 0 {
+		t.Fatalf("runSend() code = %d, want 0", code)
+	}
+	body, err := os.ReadFile(tracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), ",send,relay,") ||
+		!strings.Contains(string(body), ",4096,") {
+		t.Fatalf("sampled transfer trace missing current snapshot:\n%s", body)
 	}
 }
 

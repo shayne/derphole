@@ -79,7 +79,7 @@ func TestRecorderComputesDeltaAndMbps(t *testing.T) {
 	assertColumn(t, row, indexes, "app_mbps", "8.39")
 }
 
-func TestRecorderErrorAndCompleteRows(t *testing.T) {
+func TestRecorderErrorRowIsTerminal(t *testing.T) {
 	var out bytes.Buffer
 	rec, err := NewRecorder(&out, RoleSend, time.Unix(300, 0))
 	if err != nil {
@@ -91,13 +91,33 @@ func TestRecorderErrorAndCompleteRows(t *testing.T) {
 		t.Fatalf("Close() error = %v", err)
 	}
 	records, indexes := readTraceCSV(t, out.String())
-	assertRecordCount(t, records, 3)
+	assertRecordCount(t, records, 2)
 	assertColumn(t, records[1], indexes, "phase", "error")
 	assertColumn(t, records[1], indexes, "elapsed_ms", "250")
 	assertColumn(t, records[1], indexes, "last_error", "write udp: message too long")
-	assertColumn(t, records[2], indexes, "phase", "complete")
-	assertColumn(t, records[2], indexes, "elapsed_ms", "1000")
-	assertColumn(t, records[2], indexes, "last_error", "write udp: message too long")
+}
+
+func TestRecorderTerminalRowsAreFinal(t *testing.T) {
+	var out bytes.Buffer
+	rec, err := NewRecorder(&out, RoleSend, time.Unix(350, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	rec.Complete(time.Unix(351, 0))
+	rec.Update(func(snap *Snapshot) {
+		snap.At = time.Unix(351, int64(100*time.Millisecond))
+		snap.Phase = PhaseDirectExecute
+		snap.LastState = "connected-direct"
+	})
+	rec.Tick(time.Unix(351, int64(500*time.Millisecond)))
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	records, indexes := readTraceCSV(t, out.String())
+	assertRecordCount(t, records, 2)
+	assertColumn(t, records[1], indexes, "phase", "complete")
+	assertColumn(t, records[1], indexes, "elapsed_ms", "1000")
 }
 
 func TestRecorderHeaderUnaffectedByExportedHeaderMutation(t *testing.T) {

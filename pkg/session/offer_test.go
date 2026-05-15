@@ -20,6 +20,7 @@ import (
 	"github.com/shayne/derphole/pkg/probe"
 	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/token"
+	"github.com/shayne/derphole/pkg/transfertrace"
 	"github.com/shayne/derphole/pkg/transport"
 	"tailscale.com/types/key"
 )
@@ -62,6 +63,61 @@ func TestPublicRelayOnlyOfferedStdioRoundTrip(t *testing.T) {
 	}
 	if got := receiverOut.String(); got != "public offered payload" {
 		t.Fatalf("receiver output = %q, want %q", got, "public offered payload")
+	}
+}
+
+func TestPublicRelayOnlyOfferedTraceCompletesAfterPeerAck(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var traceOut bytes.Buffer
+	trace, err := transfertrace.NewRecorder(&traceOut, transfertrace.RoleSend, time.Unix(100, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	payload := "public offered trace payload"
+	tokenSink := make(chan string, 1)
+	offerErr := make(chan error, 1)
+	go func() {
+		_, err := Offer(ctx, OfferConfig{
+			Emitter:       telemetry.New(&bytes.Buffer{}, telemetry.LevelSilent),
+			TokenSink:     tokenSink,
+			StdioIn:       strings.NewReader(payload),
+			ForceRelay:    true,
+			UsePublicDERP: true,
+			Trace:         trace,
+		})
+		offerErr <- err
+	}()
+
+	token := <-tokenSink
+	var receiverOut bytes.Buffer
+	if err := Receive(ctx, ReceiveConfig{
+		Token:         token,
+		Emitter:       telemetry.New(&bytes.Buffer{}, telemetry.LevelSilent),
+		StdioOut:      &receiverOut,
+		ForceRelay:    true,
+		UsePublicDERP: true,
+	}); err != nil {
+		t.Fatalf("Receive() error = %v", err)
+	}
+	if err := <-offerErr; err != nil {
+		t.Fatalf("Offer() error = %v", err)
+	}
+	if err := trace.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	rows := readTransferTraceRows(t, traceOut.String())
+	row := rows[len(rows)-1]
+	if row["phase"] != string(transfertrace.PhaseComplete) ||
+		row["app_bytes"] != strconv.Itoa(len(payload)) ||
+		row["peer_received_bytes"] != strconv.Itoa(len(payload)) {
+		t.Fatalf("final trace row = %#v, want receiver-ACK anchored complete", row)
 	}
 }
 
