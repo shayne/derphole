@@ -6,6 +6,7 @@ package session
 
 import (
 	"bytes"
+	"encoding/csv"
 	"strings"
 	"testing"
 	"time"
@@ -80,8 +81,14 @@ func TestExternalTransferMetricsUpdatesTrace(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := out.String()
-	if !strings.Contains(body, ",send,relay,1024,0,1024,1024,") {
-		t.Fatalf("trace body missing relay progress:\n%s", body)
+	rows := readTransferTraceRows(t, body)
+	row := rows[len(rows)-1]
+	if row["role"] != string(transfertrace.RoleSend) ||
+		row["phase"] != string(transfertrace.PhaseRelay) ||
+		row["relay_bytes"] != "1024" ||
+		row["direct_bytes"] != "0" ||
+		row["app_bytes"] != "0" {
+		t.Fatalf("trace row = %#v, want send relay bytes with receiver-anchored app_bytes=0", row)
 	}
 }
 
@@ -102,8 +109,14 @@ func TestExternalTransferMetricsSetProbeStatsUpdatesTrace(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := out.String()
-	if !strings.Contains(body, ",send,direct_execute,0,4096,4096,4096,") {
-		t.Fatalf("trace body missing direct probe progress:\n%s", body)
+	rows := readTransferTraceRows(t, body)
+	row := rows[len(rows)-1]
+	if row["role"] != string(transfertrace.RoleSend) ||
+		row["phase"] != string(transfertrace.PhaseDirectExecute) ||
+		row["relay_bytes"] != "0" ||
+		row["direct_bytes"] != "4096" ||
+		row["app_bytes"] != "0" {
+		t.Fatalf("trace row = %#v, want send direct bytes with receiver-anchored app_bytes=0", row)
 	}
 	if !strings.Contains(body, ",8192,,3,") {
 		t.Fatalf("trace body missing probe counters:\n%s", body)
@@ -112,11 +125,11 @@ func TestExternalTransferMetricsSetProbeStatsUpdatesTrace(t *testing.T) {
 
 func TestExternalTransferMetricsTraceUsesDirectStreamOffsetForOverlap(t *testing.T) {
 	var out bytes.Buffer
-	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(40, 0))
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleReceive, time.Unix(40, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	metrics := newExternalTransferMetricsWithTrace(time.Unix(40, 0), rec, transfertrace.RoleSend)
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(40, 0), rec, transfertrace.RoleReceive)
 	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct")
 	metrics.RecordRelayWrite(10, time.Unix(40, int64(100*time.Millisecond)))
 	metrics.SetDirectAppProgressBase(6)
@@ -125,10 +138,10 @@ func TestExternalTransferMetricsTraceUsesDirectStreamOffsetForOverlap(t *testing
 		t.Fatal(err)
 	}
 	body := out.String()
-	if strings.Contains(body, ",send,direct_execute,10,100,110,") {
+	if strings.Contains(body, ",receive,direct_execute,10,100,110,") {
 		t.Fatalf("trace body double-counted relay/direct overlap:\n%s", body)
 	}
-	if !strings.Contains(body, ",send,direct_execute,10,100,106,96,") {
+	if !strings.Contains(body, ",receive,direct_execute,10,100,106,96,") {
 		t.Fatalf("trace body missing offset-based app progress:\n%s", body)
 	}
 }
@@ -152,6 +165,54 @@ func TestExternalTransferMetricsUsesPeerProgressForSenderAppBytes(t *testing.T) 
 	}
 	if strings.Contains(body, ",10485760,10485760,") {
 		t.Fatalf("trace body = %q, sender app_bytes should not follow local sent bytes", body)
+	}
+}
+
+func TestExternalTransferMetricsSenderAppBytesStayZeroBeforePeerProgress(t *testing.T) {
+	var out bytes.Buffer
+	trace, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(60, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(60, 0), trace, transfertrace.RoleSend)
+	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
+	metrics.RecordRelayWrite(2<<20, time.Unix(60, int64(100*time.Millisecond)))
+	metrics.RecordDirectWrite(3<<20, time.Unix(60, int64(200*time.Millisecond)))
+	metrics.Tick(time.Unix(60, int64(300*time.Millisecond)))
+	if err := trace.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	rows := readTransferTraceRows(t, out.String())
+	row := rows[len(rows)-1]
+	if row["relay_bytes"] != "2097152" ||
+		row["direct_bytes"] != "3145728" ||
+		row["app_bytes"] != "0" ||
+		row["peer_received_bytes"] != "0" {
+		t.Fatalf("trace row = %#v, want local byte counters with sender app_bytes=0 before peer progress", row)
+	}
+}
+
+func TestExternalTransferMetricsSenderZeroPeerProgressSetsReceiverAnchoredState(t *testing.T) {
+	var out bytes.Buffer
+	trace, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(70, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(70, 0), trace, transfertrace.RoleSend)
+	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
+	metrics.RecordRelayWrite(4<<20, time.Unix(70, int64(100*time.Millisecond)))
+	metrics.RecordPeerProgress(0, 250, time.Unix(71, 0))
+	if err := trace.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	rows := readTransferTraceRows(t, out.String())
+	row := rows[len(rows)-1]
+	if row["relay_bytes"] != "4194304" ||
+		row["app_bytes"] != "0" ||
+		row["peer_received_bytes"] != "0" ||
+		row["setup_elapsed_ms"] != "750" ||
+		row["transfer_elapsed_ms"] != "250" {
+		t.Fatalf("trace row = %#v, want zero peer progress ACK to anchor app_bytes and timing", row)
 	}
 }
 
@@ -196,4 +257,28 @@ func TestListenConfigTraceUpdatesReceiveRelayPrefixTrace(t *testing.T) {
 	if !strings.Contains(body, ",receive,relay,2048,0,2048,2048,") {
 		t.Fatalf("trace body missing receive relay progress:\n%s", body)
 	}
+}
+
+func readTransferTraceRows(t *testing.T, body string) []map[string]string {
+	t.Helper()
+	records, err := csv.NewReader(strings.NewReader(body)).ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v\nbody:\n%s", err, body)
+	}
+	if len(records) < 2 {
+		t.Fatalf("trace rows = %d, want header and at least one row\nbody:\n%s", len(records), body)
+	}
+	header := records[0]
+	var rows []map[string]string
+	for _, record := range records[1:] {
+		if len(record) != len(header) {
+			t.Fatalf("trace row has %d columns, want %d: %#v", len(record), len(header), record)
+		}
+		row := make(map[string]string, len(header))
+		for i, name := range header {
+			row[name] = record[i]
+		}
+		rows = append(rows, row)
+	}
+	return rows
 }

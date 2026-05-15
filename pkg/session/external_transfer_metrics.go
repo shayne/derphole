@@ -25,6 +25,7 @@ type externalTransferMetrics struct {
 	directBytes            int64
 	localSentBytes         int64
 	peerReceivedBytes      int64
+	peerProgressSet        bool
 	transferStartedAt      time.Time
 	receiverTransferMS     int64
 	directValidated        bool
@@ -90,17 +91,19 @@ func (m *externalTransferMetrics) RecordPeerProgress(bytesReceived int64, transf
 	if m == nil || bytesReceived < 0 {
 		return
 	}
+	at = nonZeroTime(at)
 	m.mu.Lock()
+	m.peerProgressSet = true
 	if bytesReceived > m.peerReceivedBytes {
 		m.peerReceivedBytes = bytesReceived
 	}
 	if transferElapsedMS > m.receiverTransferMS {
 		m.receiverTransferMS = transferElapsedMS
 	}
-	if m.transferStartedAt.IsZero() && !at.IsZero() && transferElapsedMS >= 0 {
+	if m.transferStartedAt.IsZero() && transferElapsedMS >= 0 {
 		m.transferStartedAt = at.Add(-time.Duration(transferElapsedMS) * time.Millisecond)
 	}
-	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
+	trace, snap, ok := m.updateTraceLocked(at)
 	m.mu.Unlock()
 	observeExternalTransferTrace(trace, snap, ok)
 }
@@ -402,8 +405,11 @@ func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrac
 }
 
 func (m *externalTransferMetrics) appBytesLocked() int64 {
-	if m.role == transfertrace.RoleSend && m.peerReceivedBytes > 0 {
-		return m.peerReceivedBytes
+	if m.role == transfertrace.RoleSend {
+		if m.peerProgressSet {
+			return m.peerReceivedBytes
+		}
+		return 0
 	}
 	if !m.directAppProgressSet {
 		return m.relayBytes + m.directBytes
