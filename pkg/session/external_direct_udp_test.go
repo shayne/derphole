@@ -369,6 +369,114 @@ func TestSenderProgressCallbackReceivesPeerProgress(t *testing.T) {
 	}
 }
 
+func TestPeerProgressWatcherUsesExplicitMetrics(t *testing.T) {
+	var out bytes.Buffer
+	trace, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(100, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(100, 0), trace, transfertrace.RoleSend)
+	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
+
+	payload, err := json.Marshal(envelope{
+		Type:     envelopeProgress,
+		Progress: newPeerProgress(4096, 250, 1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	progressCh := make(chan derpbind.Packet, 1)
+	progressCh <- derpbind.Packet{Payload: payload}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	progressCalled := make(chan struct{}, 1)
+	stop := startPeerProgressWatcher(ctx, progressCh, externalPeerControlAuth{}, metrics, func(int64, int64) {
+		progressCalled <- struct{}{}
+	}, nil)
+	select {
+	case <-progressCalled:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for peer progress watcher")
+	}
+	cancel()
+	stop()
+	if err := trace.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	rows := readTransferTraceRows(t, out.String())
+	row := rows[len(rows)-1]
+	if row["peer_received_bytes"] != "4096" || row["app_bytes"] != "4096" {
+		t.Fatalf("trace row = %#v, want explicit metrics to record peer progress", row)
+	}
+}
+
+func TestRelayPrefixSendRuntimePeerProgressWatcherUsesRuntimeMetrics(t *testing.T) {
+	origSendRelay := externalSendExternalHandoffDERPFn
+	origPrepareDirect := externalPrepareDirectUDPSendFn
+	t.Cleanup(func() {
+		externalSendExternalHandoffDERPFn = origSendRelay
+		externalPrepareDirectUDPSendFn = origPrepareDirect
+	})
+
+	externalSendExternalHandoffDERPFn = func(ctx context.Context, derpClient *derpbind.Client, peerDERP key.NodePublic, spool *externalHandoffSpool, stopCh <-chan struct{}, metrics *externalTransferMetrics, aead cipher.AEAD) error {
+		<-stopCh
+		return nil
+	}
+	externalPrepareDirectUDPSendFn = func(ctx context.Context, tok token.Token, derpClient *derpbind.Client, listenerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, readyAckCh <-chan derpbind.Packet, startAckCh <-chan derpbind.Packet, rateProbeCh <-chan derpbind.Packet, cfg SendConfig) (externalDirectUDPSendPlan, error) {
+		<-ctx.Done()
+		return externalDirectUDPSendPlan{}, ctx.Err()
+	}
+
+	var out bytes.Buffer
+	trace, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(110, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	tok := testExternalSessionToken(0x72)
+	auth := externalPeerControlAuthForToken(tok)
+	payload, err := marshalAuthenticatedEnvelope(envelope{
+		Type:     envelopeProgress,
+		Progress: newPeerProgress(8192, 300, 1),
+	}, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	progressCh := make(chan derpbind.Packet, 1)
+	progressCh <- derpbind.Packet{Payload: payload}
+	progressCalled := make(chan struct{}, 1)
+
+	rt, err := newExternalRelayPrefixSendRuntime(context.Background(), externalRelayPrefixSendConfig{
+		src:        bytes.NewReader([]byte("relay-prefix-progress")),
+		tok:        tok,
+		progressCh: progressCh,
+		cfg: SendConfig{
+			Trace: trace,
+			Progress: func(int64, int64) {
+				progressCalled <- struct{}{}
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("newExternalRelayPrefixSendRuntime() error = %v", err)
+	}
+	select {
+	case <-progressCalled:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for relay-prefix peer progress watcher")
+	}
+	rt.Close()
+	if err := trace.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	rows := readTransferTraceRows(t, out.String())
+	row := rows[len(rows)-1]
+	if row["peer_received_bytes"] != "8192" || row["app_bytes"] != "8192" {
+		t.Fatalf("trace row = %#v, want relay-prefix runtime metrics to record peer progress", row)
+	}
+}
+
 func TestWatchPeerProgressIgnoresUnauthenticatedAndReplayProgress(t *testing.T) {
 	auth := externalPeerControlAuthForToken(token.Token{
 		SessionID:    [16]byte{1, 2, 3},

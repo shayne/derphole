@@ -709,6 +709,33 @@ func watchPeerProgress(ctx context.Context, ch <-chan derpbind.Packet, auth exte
 	}
 }
 
+func startPeerProgressWatcher(ctx context.Context, progressCh <-chan derpbind.Packet, auth externalPeerControlAuth, metrics *externalTransferMetrics, progress func(int64, int64), emitter *telemetry.Emitter) func() {
+	progressCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	consume := externalPeerProgressConsumer(metrics, progress)
+	go func() {
+		done <- watchPeerProgress(progressCtx, progressCh, auth, consume)
+	}()
+	return func() {
+		cancel()
+		select {
+		case err := <-done:
+			emitPeerProgressWatcherStopDebug(emitter, err)
+		case <-time.After(externalDirectUDPProgressWatcherStopWait):
+			if emitter != nil {
+				emitter.Debug("udp-peer-progress-watch-stop-timeout")
+			}
+		}
+	}
+}
+
+func emitPeerProgressWatcherStopDebug(emitter *telemetry.Emitter, err error) {
+	if emitter == nil || err == nil || errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
+		return
+	}
+	emitter.Debug("udp-peer-progress-watch-error=" + err.Error())
+}
+
 func (rt *externalDirectUDPSendRuntime) withPeerControl(ctx context.Context) (context.Context, func()) {
 	return withPeerControlContext(ctx, rt.derpClient, rt.listenerDERP, rt.subs.abortCh, rt.subs.heartbeatCh, rt.countedSrc.Count, rt.auth)
 }
@@ -725,8 +752,6 @@ func (rt *externalDirectUDPSendRuntime) run(ctx context.Context) error {
 	pathEmitter := newTransportPathEmitter(rt.cfg.Emitter)
 	pathEmitter.Emit(StateProbing)
 	pathEmitter.SuppressWatcherDirect()
-	stopPeerProgress := rt.startPeerProgressWatcher(ctx)
-	defer stopPeerProgress()
 	tr, err := rt.startTransport(ctx, pathEmitter)
 	if err != nil {
 		return err
@@ -742,22 +767,6 @@ func (rt *externalDirectUDPSendRuntime) run(ctx context.Context) error {
 	}
 	pathEmitter.Complete(tr.manager)
 	return nil
-}
-
-func (rt *externalDirectUDPSendRuntime) startPeerProgressWatcher(ctx context.Context) func() {
-	progressCtx, cancel := context.WithCancel(ctx)
-	done := make(chan error, 1)
-	consume := externalPeerProgressConsumer(externalTransferMetricsFromContext(ctx), rt.cfg.Progress)
-	go func() {
-		done <- watchPeerProgress(progressCtx, rt.subs.progressCh, rt.auth, consume)
-	}()
-	return func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(externalDirectUDPProgressWatcherStopWait):
-		}
-	}
 }
 
 type externalDirectUDPSendTransport struct {
@@ -833,6 +842,7 @@ func (rt *externalDirectUDPSendRuntime) send(ctx context.Context, tr externalDir
 		readyAckCh:       rt.subs.readyAckCh,
 		startAckCh:       rt.subs.startAckCh,
 		rateProbeCh:      rt.subs.rateProbeCh,
+		progressCh:       rt.subs.progressCh,
 		cfg:              rt.cfg,
 	})
 }
@@ -1609,8 +1619,11 @@ func externalDirectUDPRecordReceiveMetrics(metrics *externalTransferMetrics, emi
 	emitExternalTransferMetricsComplete(metrics, emitter, "udp-receive", stats, time.Now())
 }
 
-func sendExternalViaDirectUDPOnly(ctx context.Context, src io.Reader, tok token.Token, derpClient *derpbind.Client, listenerDERP key.NodePublic, transportManager *transport.Manager, pathEmitter *transportPathEmitter, punchCancel context.CancelFunc, probeConn net.PacketConn, probeConns []net.PacketConn, remoteCandidates []net.Addr, readyAckCh <-chan derpbind.Packet, startAckCh <-chan derpbind.Packet, rateProbeCh <-chan derpbind.Packet, cfg SendConfig) error {
+func sendExternalViaDirectUDPOnly(ctx context.Context, src io.Reader, tok token.Token, derpClient *derpbind.Client, listenerDERP key.NodePublic, transportManager *transport.Manager, pathEmitter *transportPathEmitter, punchCancel context.CancelFunc, probeConn net.PacketConn, probeConns []net.PacketConn, remoteCandidates []net.Addr, readyAckCh <-chan derpbind.Packet, startAckCh <-chan derpbind.Packet, rateProbeCh <-chan derpbind.Packet, progressCh <-chan derpbind.Packet, cfg SendConfig) error {
 	ctx = withExternalTransferMetrics(ctx, newExternalTransferMetricsWithTrace(time.Now(), cfg.Trace, transfertrace.RoleSend))
+	metrics := externalTransferMetricsFromContext(ctx)
+	stopPeerProgress := startPeerProgressWatcher(ctx, progressCh, externalPeerControlAuthForToken(tok), metrics, cfg.Progress, cfg.Emitter)
+	defer stopPeerProgress()
 	var peerAddr net.Addr
 	if transportManager != nil {
 		peerAddr, _ = transportManager.DirectAddr()
@@ -1623,7 +1636,6 @@ func sendExternalViaDirectUDPOnly(ctx context.Context, src io.Reader, tok token.
 		return err
 	}
 	externalDirectUDPActivateDirectPath(pathEmitter, transportManager, punchCancel)
-	metrics := externalTransferMetricsFromContext(ctx)
 	return externalExecutePreparedDirectUDPSendFn(ctx, src, plan, cfg, metrics)
 }
 
@@ -2018,12 +2030,13 @@ type externalRelayPrefixSendConfig struct {
 	readyAckCh       <-chan derpbind.Packet
 	startAckCh       <-chan derpbind.Packet
 	rateProbeCh      <-chan derpbind.Packet
+	progressCh       <-chan derpbind.Packet
 	cfg              SendConfig
 }
 
 func sendExternalViaRelayPrefixThenDirectUDP(ctx context.Context, rcfg externalRelayPrefixSendConfig) error {
 	if rcfg.decision.Accept == nil {
-		return externalSendDirectUDPOnlyFn(ctx, rcfg.src, rcfg.tok, rcfg.derpClient, rcfg.listenerDERP, rcfg.transportManager, rcfg.pathEmitter, rcfg.punchCancel, rcfg.probeConn, rcfg.probeConns, rcfg.remoteCandidates, rcfg.readyAckCh, rcfg.startAckCh, rcfg.rateProbeCh, rcfg.cfg)
+		return externalSendDirectUDPOnlyFn(ctx, rcfg.src, rcfg.tok, rcfg.derpClient, rcfg.listenerDERP, rcfg.transportManager, rcfg.pathEmitter, rcfg.punchCancel, rcfg.probeConn, rcfg.probeConns, rcfg.remoteCandidates, rcfg.readyAckCh, rcfg.startAckCh, rcfg.rateProbeCh, rcfg.progressCh, rcfg.cfg)
 	}
 	rt, err := newExternalRelayPrefixSendRuntime(ctx, rcfg)
 	if err != nil {
@@ -2056,6 +2069,7 @@ type externalRelayPrefixSendRuntime struct {
 	stallTimer           *time.Timer
 	directProgressCh     chan struct{}
 	directProgressOnce   sync.Once
+	peerProgressStop     func()
 	overlapBoundary      int64
 	overlapStarted       bool
 	stallFired           bool
@@ -2088,6 +2102,7 @@ func newExternalRelayPrefixSendRuntime(ctx context.Context, rcfg externalRelayPr
 		stallTimer:       time.NewTimer(externalRelayPrefixDirectPrepStallWait),
 		directProgressCh: make(chan struct{}),
 	}
+	rt.peerProgressStop = startPeerProgressWatcher(ctx, rcfg.progressCh, externalPeerControlAuthForToken(rcfg.tok), rt.metrics, rcfg.cfg.Progress, rcfg.cfg.Emitter)
 	relayErrCh := make(chan error, 1)
 	rt.relayErrCh = relayErrCh
 	go func() {
@@ -2108,6 +2123,9 @@ func newExternalRelayPrefixSendRuntime(ctx context.Context, rcfg externalRelayPr
 }
 
 func (rt *externalRelayPrefixSendRuntime) Close() {
+	if rt.peerProgressStop != nil {
+		rt.peerProgressStop()
+	}
 	rt.stopRelay()
 	if rt.stallTimer != nil {
 		rt.stallTimer.Stop()
