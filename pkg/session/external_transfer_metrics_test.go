@@ -159,12 +159,20 @@ func TestExternalTransferMetricsUsesPeerProgressForSenderAppBytes(t *testing.T) 
 	if err := trace.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	body := out.String()
-	if !strings.Contains(body, ",10485760,1048576,500,500,false,") {
-		t.Fatalf("trace body = %q, want local_sent=10MiB peer_received=1MiB setup/transfer elapsed", body)
+	rows := readTransferTraceRows(t, out.String())
+	row := rows[len(rows)-1]
+	want := map[string]string{
+		"app_bytes":           "1048576",
+		"local_sent_bytes":    "10485760",
+		"peer_received_bytes": "1048576",
+		"setup_elapsed_ms":    "500",
+		"transfer_elapsed_ms": "500",
+		"direct_validated":    "false",
 	}
-	if strings.Contains(body, ",10485760,10485760,") {
-		t.Fatalf("trace body = %q, sender app_bytes should not follow local sent bytes", body)
+	for column, value := range want {
+		if row[column] != value {
+			t.Fatalf("trace row[%q] = %q, want %q; row = %#v", column, row[column], value, row)
+		}
 	}
 }
 
