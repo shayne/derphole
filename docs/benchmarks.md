@@ -34,12 +34,16 @@ Use in-process transfer traces when proving stalls. SSH polling in `samples.csv`
 ```bash
 DERPHOLE_TRANSFER_TRACE_CSV=/tmp/send.csv derphole send payload.bin
 DERPHOLE_TRANSFER_TRACE_CSV=/tmp/receive.csv derphole receive -o received.bin '<token>'
-mise exec -- go run ./tools/transfertracecheck -role send -stall-window 1s /tmp/send.csv
+mise exec -- go run ./tools/transfertracecheck -role send -stall-window 1s -peer-trace /tmp/receive.csv /tmp/send.csv
 mise exec -- go run ./tools/transfertracecheck -role receive -stall-window 1s /tmp/receive.csv
 ```
 
 `scripts/transfer-stall-harness.sh` enables sender and receiver traces automatically, copies them back as `sender/send.trace.csv` and `receiver/receive.trace.csv`, and runs `tools/transfertracecheck` after payload SHA verification.
 Trace `app_bytes` are session stream bytes and include derphole framing, so payload byte counts should be verified with the transferred file size and SHA. Use `-expected-bytes` only when checking an exact session stream byte count.
+
+Sender `app_bytes` are receiver-confirmed session stream bytes once progress ACKs start. `local_sent_bytes` records sender-side enqueue/spool progress and can be ahead of receiver progress. Use `transfer_elapsed_ms` for throughput comparisons; `elapsed_ms` includes setup and direct probing time.
+
+`connected-direct` means direct UDP has delivered probe or payload bytes. A run that attempts direct but falls back to relay records `direct-fallback-relay` and a non-empty `fallback_reason`.
 
 For no-Tailscale route verification, run 3x averaged 1 GiB transfers in both directions for:
 

@@ -49,8 +49,11 @@ func TestTransferStallHarnessCapturesProgressAndCounters(t *testing.T) {
 		"DERPHOLE_TRANSFER_TRACE_CSV",
 		"send.trace.csv",
 		"receive.trace.csv",
+		"sender_trace_local",
+		"receiver_trace_local",
 		"transfertracecheck",
 		"-stall-window",
+		"-peer-trace",
 		"receive_checker_output",
 		"receive_checker_status",
 		"sender_checker_output",
@@ -71,7 +74,7 @@ func TestTransferStallHarnessCapturesProgressAndCounters(t *testing.T) {
 	}
 
 	stallProof := `if [[ "${receive_checker_output}" == *"app bytes stalled"* ]]; then`
-	integrityCheck := `-stall-window "${trace_integrity_stall_window}" "${log_dir}/receiver/receive.trace.csv"`
+	integrityCheck := `-stall-window "${trace_integrity_stall_window}" "${receiver_trace_local}"`
 	stallProofIndex := strings.Index(body, stallProof)
 	if stallProofIndex < 0 {
 		t.Fatalf("transfer-stall-harness.sh missing expected-stall proof match")

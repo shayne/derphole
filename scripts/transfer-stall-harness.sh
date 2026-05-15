@@ -456,6 +456,9 @@ fi
 fetch_remote_dir "${sender_target}" "${sender_dir}" "${log_dir}/sender"
 fetch_remote_dir "${receiver_target}" "${receiver_dir}" "${log_dir}/receiver"
 
+sender_trace_local="${log_dir}/sender/send.trace.csv"
+receiver_trace_local="${log_dir}/receiver/receive.trace.csv"
+
 # Trace app_bytes are session stream bytes and include derphole framing.
 # Payload size and SHA verification above validate file bytes.
 if [[ "${DERPHOLE_TRANSFER_TRACE_EXPECT_STALL:-0}" == "1" ]]; then
@@ -511,11 +514,18 @@ if [[ "${DERPHOLE_TRANSFER_TRACE_EXPECT_STALL:-0}" == "1" ]]; then
     echo "stall-proof-error=expected-stall-but-checker-passed" >&2
     exit 1
   fi
-  mise exec -- go run ./tools/transfertracecheck -role send -stall-window "${trace_integrity_stall_window}" "${log_dir}/sender/send.trace.csv"
-  mise exec -- go run ./tools/transfertracecheck -role receive -stall-window "${trace_integrity_stall_window}" "${log_dir}/receiver/receive.trace.csv"
+  mise exec -- go run ./tools/transfertracecheck -role send -stall-window "${trace_integrity_stall_window}" -peer-trace "${receiver_trace_local}" "${sender_trace_local}"
+  mise exec -- go run ./tools/transfertracecheck -role receive -stall-window "${trace_integrity_stall_window}" "${receiver_trace_local}"
 else
-  mise exec -- go run ./tools/transfertracecheck -role send -stall-window "${trace_stall_window}" "${log_dir}/sender/send.trace.csv"
-  mise exec -- go run ./tools/transfertracecheck -role receive -stall-window "${trace_stall_window}" "${log_dir}/receiver/receive.trace.csv"
+  mise exec -- go run ./tools/transfertracecheck -role send -stall-window "${trace_stall_window}" -peer-trace "${receiver_trace_local}" "${sender_trace_local}"
+  mise exec -- go run ./tools/transfertracecheck -role receive -stall-window "${trace_stall_window}" "${receiver_trace_local}"
+fi
+
+sender_direct_validated="$(awk -F, 'NR>1 && $0 ~ /connected-direct/ && $14 == "true" { found=1 } END { print found+0 }' "${sender_trace_local}")"
+sender_fallback_reason="$(awk -F, 'NR>1 && $0 ~ /direct-fallback-relay/ { print; exit }' "${sender_trace_local}")"
+echo "sender-direct-validated=${sender_direct_validated}"
+if [[ -n "${sender_fallback_reason}" ]]; then
+  echo "sender-direct-fallback-seen=true"
 fi
 
 echo "stall-harness-success=true"
