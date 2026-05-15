@@ -23,6 +23,12 @@ type externalTransferMetrics struct {
 	firstByteAt            time.Time
 	relayBytes             int64
 	directBytes            int64
+	localSentBytes         int64
+	peerReceivedBytes      int64
+	transferStartedAt      time.Time
+	receiverTransferMS     int64
+	directValidated        bool
+	fallbackReason         string
 	directAppProgressBase  int64
 	directAppProgressSet   bool
 	trace                  *transfertrace.Recorder
@@ -67,6 +73,58 @@ func (m *externalTransferMetrics) RecordDirectWrite(n int64, at time.Time) {
 		return
 	}
 	m.recordWrite(&m.directBytes, n, at)
+}
+
+func (m *externalTransferMetrics) RecordLocalSent(n int64, at time.Time) {
+	if m == nil || n <= 0 {
+		return
+	}
+	m.mu.Lock()
+	m.localSentBytes += n
+	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
+	m.mu.Unlock()
+	observeExternalTransferTrace(trace, snap, ok)
+}
+
+func (m *externalTransferMetrics) RecordPeerProgress(bytesReceived int64, transferElapsedMS int64, at time.Time) {
+	if m == nil || bytesReceived < 0 {
+		return
+	}
+	m.mu.Lock()
+	if bytesReceived > m.peerReceivedBytes {
+		m.peerReceivedBytes = bytesReceived
+	}
+	if transferElapsedMS > m.receiverTransferMS {
+		m.receiverTransferMS = transferElapsedMS
+	}
+	if m.transferStartedAt.IsZero() && !at.IsZero() && transferElapsedMS >= 0 {
+		m.transferStartedAt = at.Add(-time.Duration(transferElapsedMS) * time.Millisecond)
+	}
+	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
+	m.mu.Unlock()
+	observeExternalTransferTrace(trace, snap, ok)
+}
+
+func (m *externalTransferMetrics) MarkDirectValidated(at time.Time) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.directValidated = true
+	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
+	m.mu.Unlock()
+	observeExternalTransferTrace(trace, snap, ok)
+}
+
+func (m *externalTransferMetrics) SetFallbackReason(reason string, at time.Time) {
+	if m == nil || reason == "" {
+		return
+	}
+	m.mu.Lock()
+	m.fallbackReason = reason
+	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
+	m.mu.Unlock()
+	observeExternalTransferTrace(trace, snap, ok)
 }
 
 func (m *externalTransferMetrics) SetDirectAppProgressBase(offset int64) {
@@ -305,12 +363,29 @@ func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrac
 	if m.trace == nil || at.IsZero() {
 		return nil, transfertrace.Snapshot{}, false
 	}
+	setupMS := int64(0)
+	transferMS := m.receiverTransferMS
+	if !m.transferStartedAt.IsZero() {
+		setupMS = m.transferStartedAt.Sub(m.startedAt).Milliseconds()
+		if setupMS < 0 {
+			setupMS = 0
+		}
+		if transferMS == 0 && at.After(m.transferStartedAt) {
+			transferMS = at.Sub(m.transferStartedAt).Milliseconds()
+		}
+	}
 	return m.trace, transfertrace.Snapshot{
 		At:                     at,
 		Phase:                  m.phase,
 		RelayBytes:             m.relayBytes,
 		DirectBytes:            m.directBytes,
 		AppBytes:               m.appBytesLocked(),
+		LocalSentBytes:         m.localSentBytes,
+		PeerReceivedBytes:      m.peerReceivedBytes,
+		SetupElapsedMS:         setupMS,
+		TransferElapsedMS:      transferMS,
+		DirectValidated:        m.directValidated,
+		FallbackReason:         m.fallbackReason,
 		DirectRateSelectedMbps: m.directRateSelectedMbps,
 		DirectRateActiveMbps:   m.directRateActiveMbps,
 		DirectLanesActive:      m.directLanesActive,
@@ -327,6 +402,9 @@ func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrac
 }
 
 func (m *externalTransferMetrics) appBytesLocked() int64 {
+	if m.role == transfertrace.RoleSend && m.peerReceivedBytes > 0 {
+		return m.peerReceivedBytes
+	}
 	if !m.directAppProgressSet {
 		return m.relayBytes + m.directBytes
 	}
@@ -335,6 +413,13 @@ func (m *externalTransferMetrics) appBytesLocked() int64 {
 		return directProgress
 	}
 	return m.relayBytes
+}
+
+func nonZeroTime(at time.Time) time.Time {
+	if at.IsZero() {
+		return time.Now()
+	}
+	return at
 }
 
 func observeExternalTransferTrace(trace *transfertrace.Recorder, snap transfertrace.Snapshot, ok bool) {

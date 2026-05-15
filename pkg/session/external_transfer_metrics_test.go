@@ -133,6 +133,28 @@ func TestExternalTransferMetricsTraceUsesDirectStreamOffsetForOverlap(t *testing
 	}
 }
 
+func TestExternalTransferMetricsUsesPeerProgressForSenderAppBytes(t *testing.T) {
+	var out bytes.Buffer
+	trace, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(50, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(50, 0), trace, transfertrace.RoleSend)
+	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
+	metrics.RecordLocalSent(10<<20, time.Unix(50, int64(100*time.Millisecond)))
+	metrics.RecordPeerProgress(1<<20, 500, time.Unix(51, 0))
+	if err := trace.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	body := out.String()
+	if !strings.Contains(body, ",10485760,1048576,500,500,false,") {
+		t.Fatalf("trace body = %q, want local_sent=10MiB peer_received=1MiB setup/transfer elapsed", body)
+	}
+	if strings.Contains(body, ",10485760,10485760,") {
+		t.Fatalf("trace body = %q, sender app_bytes should not follow local sent bytes", body)
+	}
+}
+
 func TestExternalDirectUDPSendProgressRecorderCanSkipProbeByteProgress(t *testing.T) {
 	start := time.Unix(50, 0)
 	metrics := newExternalTransferMetrics(start)
