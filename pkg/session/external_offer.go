@@ -94,6 +94,7 @@ type externalOfferPeerChannels struct {
 	readyAckCh  <-chan derpbind.Packet
 	startAckCh  <-chan derpbind.Packet
 	rateProbeCh <-chan derpbind.Packet
+	progressCh  <-chan derpbind.Packet
 	cleanup     func()
 }
 
@@ -254,16 +255,21 @@ func subscribeExternalOfferPeerChannels(session *relaySession, peerDERP key.Node
 	rateProbeCh, unsubscribeRateProbe := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == peerDERP && isDirectUDPRateProbePayload(pkt.Payload)
 	})
+	progressCh, unsubscribeProgress := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == peerDERP && isProgressPayload(pkt.Payload)
+	})
 	return externalOfferPeerChannels{
 		ackCh:       ackCh,
 		readyAckCh:  readyAckCh,
 		startAckCh:  startAckCh,
 		rateProbeCh: rateProbeCh,
+		progressCh:  progressCh,
 		cleanup: func() {
 			unsubscribeAck()
 			unsubscribeReadyAck()
 			unsubscribeStartAck()
 			unsubscribeRateProbe()
+			unsubscribeProgress()
 		},
 	}
 }
@@ -345,6 +351,7 @@ func sendExternalOfferPayload(ctx context.Context, session *relaySession, counte
 		readyAckCh:       channels.readyAckCh,
 		startAckCh:       channels.startAckCh,
 		rateProbeCh:      channels.rateProbeCh,
+		progressCh:       channels.progressCh,
 		cfg:              externalOfferSendConfig(cfg),
 	})
 }
@@ -358,6 +365,7 @@ func externalOfferSendConfig(cfg OfferConfig) SendConfig {
 		UsePublicDERP:      cfg.UsePublicDERP,
 		ParallelPolicy:     cfg.ParallelPolicy,
 		Trace:              cfg.Trace,
+		Progress:           cfg.Progress,
 	}
 }
 

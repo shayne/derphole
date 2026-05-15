@@ -7,6 +7,7 @@ package session
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -15,7 +16,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shayne/derphole/pkg/derpbind"
 	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/token"
+	"github.com/shayne/derphole/pkg/transport"
+	"tailscale.com/types/key"
 )
 
 func TestPublicRelayOnlyOfferedStdioRoundTrip(t *testing.T) {
@@ -56,6 +61,120 @@ func TestPublicRelayOnlyOfferedStdioRoundTrip(t *testing.T) {
 	}
 	if got := receiverOut.String(); got != "public offered payload" {
 		t.Fatalf("receiver output = %q, want %q", got, "public offered payload")
+	}
+}
+
+func TestExternalOfferSendConfigPreservesProgress(t *testing.T) {
+	progressCalled := make(chan [2]int64, 1)
+	cfg := externalOfferSendConfig(OfferConfig{
+		Progress: func(bytesReceived int64, transferElapsedMS int64) {
+			progressCalled <- [2]int64{bytesReceived, transferElapsedMS}
+		},
+	})
+
+	if cfg.Progress == nil {
+		t.Fatal("external offer send config dropped progress callback")
+	}
+	cfg.Progress(1234, 567)
+	select {
+	case got := <-progressCalled:
+		if got != [2]int64{1234, 567} {
+			t.Fatalf("progress callback got %v, want [1234 567]", got)
+		}
+	default:
+		t.Fatal("progress callback was not invoked")
+	}
+}
+
+func TestExternalOfferPeerChannelsReceiveProgressPackets(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	node := srv.Map.Regions[1].Nodes[0]
+
+	offerDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(offer) error = %v", err)
+	}
+	defer offerDERP.Close()
+	peerDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(peer) error = %v", err)
+	}
+	defer peerDERP.Close()
+
+	channels := subscribeExternalOfferPeerChannels(&relaySession{derp: offerDERP}, peerDERP.PublicKey())
+	defer channels.cleanup()
+	payload, err := json.Marshal(envelope{
+		Type:     envelopeProgress,
+		Progress: newPeerProgress(1234, 567, 8),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isProgressPayload(payload) {
+		t.Fatal("progress payload was not recognized")
+	}
+	if err := sendPeerProgress(ctx, peerDERP, offerDERP.PublicKey(), 1234, 567, 8, externalPeerControlAuth{}); err != nil {
+		t.Fatalf("sendPeerProgress() error = %v", err)
+	}
+
+	select {
+	case pkt := <-channels.progressCh:
+		if pkt.From != peerDERP.PublicKey() {
+			t.Fatalf("progress From = %v, want %v", pkt.From, peerDERP.PublicKey())
+		}
+		if !isProgressPayload(pkt.Payload) {
+			t.Fatalf("subscription delivered non-progress payload %q", pkt.Payload)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
+func TestExternalOfferPayloadPassesProgressToRelayPrefixSend(t *testing.T) {
+	origSendDirect := externalSendDirectUDPOnlyFn
+	t.Cleanup(func() {
+		externalSendDirectUDPOnlyFn = origSendDirect
+	})
+
+	progressCh := make(chan derpbind.Packet)
+	progressCalled := make(chan [2]int64, 1)
+	externalSendDirectUDPOnlyFn = func(ctx context.Context, src io.Reader, tok token.Token, derpClient *derpbind.Client, listenerDERP key.NodePublic, transportManager *transport.Manager, pathEmitter *transportPathEmitter, punchCancel context.CancelFunc, probeConn net.PacketConn, probeConns []net.PacketConn, remoteCandidates []net.Addr, readyAckCh <-chan derpbind.Packet, startAckCh <-chan derpbind.Packet, rateProbeCh <-chan derpbind.Packet, gotProgressCh <-chan derpbind.Packet, cfg SendConfig) error {
+		if gotProgressCh != (<-chan derpbind.Packet)(progressCh) {
+			t.Fatalf("progress channel = %v, want offer peer progress channel", gotProgressCh)
+		}
+		if cfg.Progress == nil {
+			t.Fatal("relay-prefix send config dropped offer progress callback")
+		}
+		cfg.Progress(4321, 765)
+		return nil
+	}
+
+	err := sendExternalOfferPayload(
+		context.Background(),
+		&relaySession{},
+		nil,
+		externalOfferDirectRuntime{},
+		externalOfferPeerChannels{progressCh: progressCh},
+		&externalOfferTransportRuntime{ctx: context.Background()},
+		key.NodePublic{},
+		nil,
+		OfferConfig{Progress: func(bytesReceived int64, transferElapsedMS int64) {
+			progressCalled <- [2]int64{bytesReceived, transferElapsedMS}
+		}},
+	)
+	if err != nil {
+		t.Fatalf("sendExternalOfferPayload() error = %v", err)
+	}
+
+	select {
+	case got := <-progressCalled:
+		if got != [2]int64{4321, 765} {
+			t.Fatalf("progress callback got %v, want [4321 765]", got)
+		}
+	default:
+		t.Fatal("progress callback was not invoked")
 	}
 }
 
