@@ -49,6 +49,23 @@ crap_report="$quality_dir/crap.txt"
 lint_report="$quality_dir/golangci.json"
 lint_text="$quality_dir/golangci.txt"
 
+crap_excludes_file="$quality_dir/crap-excludes.txt"
+crap_active_go_files="$quality_dir/go-active-files.txt"
+crap_all_go_files="$quality_dir/go-all-files.txt"
+crap_exclude_args=(-exclude '*_test.go')
+
+git ls-files '*.go' | LC_ALL=C sort >"$crap_all_go_files"
+go list -f '{{ $dir := .Dir }}{{ range .GoFiles }}{{ $dir }}/{{ . }}{{ "\n" }}{{ end }}{{ range .CgoFiles }}{{ $dir }}/{{ . }}{{ "\n" }}{{ end }}' ./... |
+  sed "s#^${repo_root}/##" |
+  LC_ALL=C sort >"$crap_active_go_files"
+comm -23 "$crap_all_go_files" "$crap_active_go_files" >"$crap_excludes_file"
+while IFS= read -r inactive_go_file; do
+  case "$inactive_go_file" in
+  "" | *_test.go) continue ;;
+  esac
+  crap_exclude_args+=(-exclude "$inactive_go_file")
+done <"$crap_excludes_file"
+
 echo "==> private info scan"
 tools/hooks/private-info-scan
 
@@ -61,7 +78,7 @@ echo "==> CRAP hotspots"
 set +e
 go run github.com/mfenderov/gocrap@v0.3.0 \
   -c "$coverage_out" \
-  -exclude '*_test.go' \
+  "${crap_exclude_args[@]}" \
   -max 30 \
   ./... >"$crap_report" 2>&1
 crap_status=$?
