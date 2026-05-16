@@ -18,13 +18,14 @@ import (
 var errUsage = errors.New("usage")
 
 type options struct {
-	Role             string
-	ExpectedBytes    int64
-	ExpectedBytesSet bool
-	StallWindow      time.Duration
-	PeerTrace        string
-	RateTolerance    float64
-	Path             string
+	Role                       string
+	ExpectedBytes              int64
+	ExpectedBytesSet           bool
+	StallWindow                time.Duration
+	PeerTrace                  string
+	RateTolerance              float64
+	ProgressLeadToleranceBytes int64
+	Path                       string
 }
 
 func main() {
@@ -67,6 +68,7 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 	var stallWindow time.Duration
 	var peerTrace string
 	var rateTolerance float64
+	var progressLeadToleranceBytes int64
 	flags := flag.NewFlagSet("transfertracecheck", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.StringVar(&role, "role", "", "trace role to check")
@@ -74,6 +76,7 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 	flags.DurationVar(&stallWindow, "stall-window", time.Second, "maximum active-phase app byte stall")
 	flags.StringVar(&peerTrace, "peer-trace", "", "optional peer trace CSV for sender peer_received_bytes to receiver app_bytes comparison")
 	flags.Float64Var(&rateTolerance, "rate-tolerance", 0.10, "allowed sender/receiver transfer rate divergence")
+	flags.Int64Var(&progressLeadToleranceBytes, "progress-lead-tolerance", 0, "allowed sender peer progress lead over receiver app bytes")
 	flags.Usage = func() {
 		_, _ = fmt.Fprintln(stderr, "usage: transfertracecheck -role receive [-expected-bytes N] [-peer-trace peer.csv] trace.csv")
 		flags.PrintDefaults()
@@ -101,14 +104,20 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 		flags.Usage()
 		return options{}, errUsage
 	}
+	if progressLeadToleranceBytes < 0 {
+		_, _ = fmt.Fprintln(stderr, "progress-lead-tolerance must be non-negative")
+		flags.Usage()
+		return options{}, errUsage
+	}
 	return options{
-		Role:             role,
-		ExpectedBytes:    expectedBytes,
-		ExpectedBytesSet: expectedBytesSet,
-		StallWindow:      stallWindow,
-		PeerTrace:        peerTrace,
-		RateTolerance:    rateTolerance,
-		Path:             flags.Arg(0),
+		Role:                       role,
+		ExpectedBytes:              expectedBytes,
+		ExpectedBytesSet:           expectedBytesSet,
+		StallWindow:                stallWindow,
+		PeerTrace:                  peerTrace,
+		RateTolerance:              rateTolerance,
+		ProgressLeadToleranceBytes: progressLeadToleranceBytes,
+		Path:                       flags.Arg(0),
 	}, nil
 }
 
@@ -155,7 +164,8 @@ func checkPairPaths(opts options) (transfertrace.PairResult, error) {
 		_ = peer.Close()
 	}()
 	return transfertrace.CheckPair(primary, peer, transfertrace.PairOptions{
-		Role:          transfertrace.Role(opts.Role),
-		RateTolerance: opts.RateTolerance,
+		Role:                       transfertrace.Role(opts.Role),
+		RateTolerance:              opts.RateTolerance,
+		ProgressLeadToleranceBytes: opts.ProgressLeadToleranceBytes,
 	})
 }

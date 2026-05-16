@@ -28,17 +28,19 @@ type Result struct {
 }
 
 type PairOptions struct {
-	Role          Role
-	PeerRole      Role
-	RateTolerance float64
+	Role                       Role
+	PeerRole                   Role
+	RateTolerance              float64
+	ProgressLeadToleranceBytes int64
 }
 
 type PairResult struct {
-	PrimaryRows        int
-	PeerRows           int
-	ProgressDeltaBytes int64
-	SenderRateMbps     float64
-	ReceiverRateMbps   float64
+	PrimaryRows          int
+	PeerRows             int
+	ProgressDeltaBytes   int64
+	MaxProgressLeadBytes int64
+	SenderRateMbps       float64
+	ReceiverRateMbps     float64
 }
 
 type checkerIndexes struct {
@@ -291,15 +293,20 @@ func compareCheckerPair(primaryRows []checkerRow, peerRows []checkerRow, opts Pa
 		return PairResult{PrimaryRows: len(primaryRows), PeerRows: len(peerRows)}, fmt.Errorf("receiver final phase = %s, want %s", receiverFinal.phase, PhaseComplete)
 	}
 	delta := absInt64(senderFinal.peerReceivedBytes - receiverFinal.appBytes)
+	maxLead := maxSenderProgressLead(senderRows, receiverRows)
 	result := PairResult{
-		PrimaryRows:        len(primaryRows),
-		PeerRows:           len(peerRows),
-		ProgressDeltaBytes: delta,
-		SenderRateMbps:     mbps(senderFinal.peerReceivedBytes, senderFinal.transferElapsedMS),
-		ReceiverRateMbps:   mbps(receiverFinal.appBytes, receiverFinal.transferElapsedMS),
+		PrimaryRows:          len(primaryRows),
+		PeerRows:             len(peerRows),
+		ProgressDeltaBytes:   delta,
+		MaxProgressLeadBytes: maxLead,
+		SenderRateMbps:       mbps(senderFinal.peerReceivedBytes, senderFinal.transferElapsedMS),
+		ReceiverRateMbps:     mbps(receiverFinal.appBytes, receiverFinal.transferElapsedMS),
 	}
 	if delta != 0 {
 		return result, fmt.Errorf("sender peer_received_bytes = %d, receiver app_bytes = %d", senderFinal.peerReceivedBytes, receiverFinal.appBytes)
+	}
+	if maxLead > opts.ProgressLeadToleranceBytes {
+		return result, fmt.Errorf("sender progress leads receiver by %d bytes, tolerance=%d", maxLead, opts.ProgressLeadToleranceBytes)
 	}
 	if rateDiverged(result.SenderRateMbps, result.ReceiverRateMbps, opts.RateTolerance) {
 		return result, fmt.Errorf("transfer rate diverged: sender_peer_mbps=%.2f receiver_mbps=%.2f tolerance=%.2f", result.SenderRateMbps, result.ReceiverRateMbps, normalizedRateTolerance(opts.RateTolerance))
@@ -312,6 +319,30 @@ func senderReceiverRows(primaryRows []checkerRow, peerRows []checkerRow, role Ro
 		return primaryRows, peerRows
 	}
 	return peerRows, primaryRows
+}
+
+func maxSenderProgressLead(senderRows []checkerRow, receiverRows []checkerRow) int64 {
+	var maxLead int64
+	receiverIndex := 0
+	var receiverBytes int64
+	for _, sender := range senderRows {
+		senderElapsed := comparableElapsed(sender)
+		for receiverIndex < len(receiverRows) && comparableElapsed(receiverRows[receiverIndex]) <= senderElapsed {
+			if receiverRows[receiverIndex].appBytes > receiverBytes {
+				receiverBytes = receiverRows[receiverIndex].appBytes
+			}
+			receiverIndex++
+		}
+		lead := sender.peerReceivedBytes - receiverBytes
+		if lead > maxLead {
+			maxLead = lead
+		}
+	}
+	return maxLead
+}
+
+func comparableElapsed(row checkerRow) int64 {
+	return row.timestamp.UnixMilli()
 }
 
 func oppositeRole(role Role) Role {

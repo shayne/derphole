@@ -50,7 +50,7 @@ func TestRunChecksPeerTraceSuccess(t *testing.T) {
 	receivePath := writeTrace(t, transfertrace.HeaderLine+"\n"+
 		"1000,0,receive,complete,1024,0,1024,1024,0.00,0,0,,500,false,,,,,,,,,,,,stream-complete,\n")
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"-role", "send", "-expected-bytes", "1024", "-peer-trace", receivePath, sendPath}, &stdout, &stderr)
+	code := run([]string{"-role", "send", "-expected-bytes", "1024", "-progress-lead-tolerance", "0", "-peer-trace", receivePath, sendPath}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("run() exit = %d, stderr = %q", code, stderr.String())
 	}
@@ -122,6 +122,22 @@ func TestRunRejectsNegativeExpectedBytes(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "expected-bytes must be non-negative") {
 		t.Fatalf("stderr = %q, want expected-bytes validation", stderr.String())
+	}
+}
+
+func TestRunRejectsNegativeProgressLeadTolerance(t *testing.T) {
+	path := writeTrace(t, "timestamp_unix_ms,role,phase,app_bytes,last_error\n"+
+		"1000,receive,complete,0,\n")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-role", "receive", "-progress-lead-tolerance", "-1", path}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("run() exit = %d, want 2", code)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "progress-lead-tolerance must be non-negative") {
+		t.Fatalf("stderr = %q, want progress-lead-tolerance validation", stderr.String())
 	}
 }
 

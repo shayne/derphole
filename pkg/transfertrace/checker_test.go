@@ -304,6 +304,103 @@ func TestCheckPairFailsTransferRateDivergence(t *testing.T) {
 	}
 }
 
+func TestCheckPairFailsSenderProgressLeadDuringRun(t *testing.T) {
+	sendTrace := HeaderLine + "\n" +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:       1000,
+			role:              RoleSend,
+			phase:             PhaseRelay,
+			appBytes:          8192,
+			deltaAppBytes:     8192,
+			peerReceivedBytes: 8192,
+			transferElapsedMS: 500,
+			lastState:         "connected-relay",
+		}) +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:       2000,
+			role:              RoleSend,
+			phase:             PhaseComplete,
+			appBytes:          8192,
+			deltaAppBytes:     0,
+			peerReceivedBytes: 8192,
+			transferElapsedMS: 1500,
+			lastState:         "stream-complete",
+		})
+	receiveTrace := HeaderLine + "\n" +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:       1000,
+			role:              RoleReceive,
+			phase:             PhaseRelay,
+			appBytes:          1024,
+			deltaAppBytes:     1024,
+			transferElapsedMS: 500,
+			lastState:         "connected-relay",
+		}) +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:       2000,
+			role:              RoleReceive,
+			phase:             PhaseComplete,
+			appBytes:          8192,
+			deltaAppBytes:     7168,
+			transferElapsedMS: 1500,
+			lastState:         "stream-complete",
+		})
+	_, err := CheckPair(strings.NewReader(sendTrace), strings.NewReader(receiveTrace), PairOptions{Role: RoleSend})
+	if err == nil || !strings.Contains(err.Error(), "sender progress leads receiver") {
+		t.Fatalf("CheckPair() error = %v, want sender progress lead", err)
+	}
+}
+
+func TestCheckPairAllowsConfiguredProgressLeadTolerance(t *testing.T) {
+	sendTrace := HeaderLine + "\n" +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:       1000,
+			role:              RoleSend,
+			phase:             PhaseRelay,
+			appBytes:          4096,
+			deltaAppBytes:     4096,
+			peerReceivedBytes: 4096,
+			transferElapsedMS: 500,
+			lastState:         "connected-relay",
+		}) +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:       2000,
+			role:              RoleSend,
+			phase:             PhaseComplete,
+			appBytes:          8192,
+			deltaAppBytes:     4096,
+			peerReceivedBytes: 8192,
+			transferElapsedMS: 1500,
+			lastState:         "stream-complete",
+		})
+	receiveTrace := HeaderLine + "\n" +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:       1000,
+			role:              RoleReceive,
+			phase:             PhaseRelay,
+			appBytes:          1024,
+			deltaAppBytes:     1024,
+			transferElapsedMS: 500,
+			lastState:         "connected-relay",
+		}) +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:       2000,
+			role:              RoleReceive,
+			phase:             PhaseComplete,
+			appBytes:          8192,
+			deltaAppBytes:     7168,
+			transferElapsedMS: 1500,
+			lastState:         "stream-complete",
+		})
+	_, err := CheckPair(strings.NewReader(sendTrace), strings.NewReader(receiveTrace), PairOptions{
+		Role:                       RoleSend,
+		ProgressLeadToleranceBytes: 4096,
+	})
+	if err != nil {
+		t.Fatalf("CheckPair() error = %v", err)
+	}
+}
+
 func TestCheckReturnsTerminalErrorResultMetadata(t *testing.T) {
 	csvText := "timestamp_unix_ms,role,phase,app_bytes,last_error\n" +
 		"1000,send,error,2048,message too long\n"
