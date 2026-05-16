@@ -27,6 +27,29 @@ Measure raw network capacity separately before blaming tunnel overhead.
 
 Keep source payload size, host pair, and direction fixed when comparing variants. Record duration, throughput, final path state, and whether the session upgraded from `connected-relay` to `connected-direct`.
 
+## Phase 1 Public Transport Gate
+
+Before changing the public transport protocol, capture a baseline for each host pair and direction:
+
+```bash
+DERPHOLE_IPERF_PORT=8123 DERPHOLE_IPERF_SERVER_HOST="${DERPHOLE_IPERF_SERVER_HOST:?set forwarded Mac iperf host}" ./scripts/iperf-benchmark.sh canlxc 1024
+DERPHOLE_IPERF_PORT=8123 DERPHOLE_IPERF_SERVER_HOST="${DERPHOLE_IPERF_SERVER_HOST:?set forwarded Mac iperf host}" ./scripts/iperf-benchmark-reverse.sh canlxc 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/transfer-stall-harness.sh canlxc pouffe-rasp.exe.xyz 1024
+```
+
+Use `DERPHOLE_IPERF_PORT=8123` when testing through the Mac port-forwarded iperf endpoint. Use the default `8321` only when both endpoints can reach the local iperf server directly on that port.
+
+Every accepted result must include:
+
+- `stall-harness-success=true`
+- matching source and sink SHA-256
+- sender and receiver `send.trace.csv` / `receive.trace.csv`
+- `transfertracecheck` success for sender and receiver traces
+- `leak-check ... processes=0 udp_sockets=0` for preflight and postrun checks
+- iperf TCP baseline in both directions, when routing allows it
+
+Do not report a derphole throughput number if any leak check, trace check, or integrity check fails.
+
 ### Transfer Stall Traces
 
 Use in-process transfer traces when proving stalls. SSH polling in `samples.csv` is useful as an outer process watchdog, but application-byte progress should come from the sender and receiver trace files.
