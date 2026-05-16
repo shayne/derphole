@@ -93,7 +93,7 @@ cleanup() {
 trap 'status=$?; if [[ ${status} -ne 0 ]]; then if [[ ${start_ms} -gt 0 && ${duration_ms} -eq 0 ]]; then end_ms="$(now_ms)"; duration_ms="$((end_ms - start_ms))"; fi; dump_failure; emit_benchmark_footer 2 false "iperf-benchmark-reverse-exit-${status}"; cleanup; fi; exit ${status}' EXIT
 
 server_host="$(discover_public_ip)"
-nix run nixpkgs#iperf3 -- -s -p "${iperf_port}" -1 >"${tmp}/server.log" 2>&1 &
+nix run nixpkgs#iperf3 -- -s -4 -p "${iperf_port}" -1 >"${tmp}/server.log" 2>&1 &
 server_pid="$!"
 sleep 1
 
@@ -101,7 +101,7 @@ start_ms="$(now_ms)"
 remote "
 set -euo pipefail
 iperf_bin=\"\$(command -v /usr/bin/iperf3 >/dev/null 2>&1 && printf /usr/bin/iperf3 || command -v iperf3)\"
-\"\${iperf_bin}\" -J -c '${server_host}' -p '${iperf_port}' -n '${expected_size}' -P '${iperf_parallel}'
+\"\${iperf_bin}\" -4 -J -c '${server_host}' -p '${iperf_port}' -n '${expected_size}' -P '${iperf_parallel}'
 " >"${tmp}/client.json"
 wait "${server_pid}"
 server_pid=""
