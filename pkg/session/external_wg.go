@@ -253,6 +253,7 @@ func sendExternalViaWGTunnel(ctx context.Context, cfg SendConfig) (retErr error)
 	ctx, stopPeerAbort := withPeerControlContext(ctx, runtime.derpClient, runtime.listenerDERP, abortCh, heartbeatCh, runtime.countedSrc.Count, runtime.auth)
 	defer stopPeerAbort()
 	defer notifyPeerAbortOnError(&retErr, ctx, runtime.derpClient, runtime.listenerDERP, runtime.countedSrc.Count, runtime.auth)
+	defer notifyPeerAbortOnLocalCancel(&retErr, ctx, runtime.derpClient, runtime.listenerDERP, runtime.countedSrc.Count, runtime.auth)
 
 	return sendExternalWGRuntime(ctx, cfg, runtime, ackCh)
 }
@@ -544,7 +545,7 @@ func handleExternalWGClaim(ctx context.Context, session *relaySession, claim ren
 	return true, receiveExternalWGAcceptedClaim(ctx, session, claim, decision, peerDERP, auth, pathEmitter, cfg, retErr)
 }
 
-func receiveExternalWGAcceptedClaim(ctx context.Context, session *relaySession, claim rendezvous.Claim, decision rendezvous.Decision, peerDERP key.NodePublic, auth externalPeerControlAuth, pathEmitter *transportPathEmitter, cfg ListenConfig, retErr *error) error {
+func receiveExternalWGAcceptedClaim(ctx context.Context, session *relaySession, claim rendezvous.Claim, decision rendezvous.Decision, peerDERP key.NodePublic, auth externalPeerControlAuth, pathEmitter *transportPathEmitter, cfg ListenConfig, callerRetErr *error) (retErr error) {
 	var countedDst *byteCountingWriteCloser
 	abortCh, heartbeatCh, cleanupPeerSubs := subscribeExternalWGListenPeer(session, peerDERP)
 	defer cleanupPeerSubs()
@@ -552,7 +553,15 @@ func receiveExternalWGAcceptedClaim(ctx context.Context, session *relaySession, 
 		return externalWGCountedDstCount(countedDst)
 	}, auth)
 	defer stopPeerAbort()
-	defer notifyPeerAbortOnError(retErr, ctx, session.derp, peerDERP, func() int64 {
+	defer func() {
+		if callerRetErr != nil {
+			*callerRetErr = retErr
+		}
+	}()
+	defer notifyPeerAbortOnError(&retErr, ctx, session.derp, peerDERP, func() int64 {
+		return externalWGCountedDstCount(countedDst)
+	}, auth)
+	defer notifyPeerAbortOnLocalCancel(&retErr, ctx, session.derp, peerDERP, func() int64 {
 		return externalWGCountedDstCount(countedDst)
 	}, auth)
 

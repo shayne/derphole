@@ -2003,6 +2003,9 @@ func (rt *externalDirectUDPListenRuntime) receiveAccepted(ctx context.Context, a
 	defer notifyPeerAbortOnError(&retErr, ctx, rt.session.derp, accepted.peerDERP, func() int64 {
 		return externalDirectUDPCountedDstBytes(countedDst)
 	}, rt.auth)
+	defer notifyPeerAbortOnLocalCancel(&retErr, ctx, rt.session.derp, accepted.peerDERP, func() int64 {
+		return externalDirectUDPCountedDstBytes(countedDst)
+	}, rt.auth)
 
 	emitExternalDirectUDPClaimAccepted(rt.cfg.Emitter)
 	tr, decision, err := rt.prepareTransfer(ctx, accepted)

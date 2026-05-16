@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -63,6 +64,104 @@ func TestPublicRelayOnlyOfferedStdioRoundTrip(t *testing.T) {
 	}
 	if got := receiverOut.String(); got != "public offered payload" {
 		t.Fatalf("receiver output = %q, want %q", got, "public offered payload")
+	}
+}
+
+func TestPublicRelayOnlyOfferExitsWhenReceiverCancels(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var senderStatus syncBuffer
+	var receiverStatus syncBuffer
+	pipeReader, pipeWriter := io.Pipe()
+	writeDone := make(chan error, 1)
+	go func() {
+		chunk := bytes.Repeat([]byte("receiver-cancel-offer:"), 32*1024/len("receiver-cancel-offer:"))
+		for {
+			if _, err := pipeWriter.Write(chunk); err != nil {
+				if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, context.Canceled) {
+					writeDone <- nil
+					return
+				}
+				writeDone <- err
+				return
+			}
+		}
+	}()
+	defer func() {
+		_ = pipeWriter.CloseWithError(context.Canceled)
+		_ = pipeReader.Close()
+		select {
+		case err := <-writeDone:
+			if err != nil {
+				t.Errorf("pipe writer error = %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Errorf("pipe writer did not exit")
+		}
+	}()
+
+	tokenSink := make(chan string, 1)
+	offerErr := make(chan error, 1)
+	go func() {
+		_, err := Offer(ctx, OfferConfig{
+			Emitter:       telemetry.New(&senderStatus, telemetry.LevelVerbose),
+			TokenSink:     tokenSink,
+			StdioIn:       pipeReader,
+			ForceRelay:    true,
+			UsePublicDERP: true,
+		})
+		offerErr <- err
+	}()
+
+	var tok string
+	select {
+	case tok = <-tokenSink:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for offered token: %v; sender=%q receiver=%q", ctx.Err(), senderStatus.String(), receiverStatus.String())
+	}
+
+	receiveCtx, cancelReceive := context.WithCancel(ctx)
+	receiveErr := make(chan error, 1)
+	go func() {
+		receiveErr <- Receive(receiveCtx, ReceiveConfig{
+			Token:         tok,
+			Emitter:       telemetry.New(&receiverStatus, telemetry.LevelVerbose),
+			StdioOut:      io.Discard,
+			ForceRelay:    true,
+			UsePublicDERP: true,
+		})
+	}()
+
+	waitCtx, waitCancel := context.WithTimeout(ctx, 3*time.Second)
+	if err := waitForSessionTestStatusContains(waitCtx, &receiverStatus, string(StateRelay)); err != nil {
+		waitCancel()
+		t.Fatalf("receiver did not reach relay before cancellation: %v; sender=%q receiver=%q", err, senderStatus.String(), receiverStatus.String())
+	}
+	waitCancel()
+
+	cancelReceive()
+
+	select {
+	case err := <-receiveErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Receive() error = %v, want %v; sender=%q receiver=%q", err, context.Canceled, senderStatus.String(), receiverStatus.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Receive() did not exit after cancellation; sender=%q receiver=%q", senderStatus.String(), receiverStatus.String())
+	}
+
+	select {
+	case err := <-offerErr:
+		if !errors.Is(err, ErrPeerAborted) {
+			t.Fatalf("Offer() error = %v, want %v; sender=%q receiver=%q", err, ErrPeerAborted, senderStatus.String(), receiverStatus.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Offer() did not exit after receiver cancellation; sender=%q receiver=%q", senderStatus.String(), receiverStatus.String())
 	}
 }
 

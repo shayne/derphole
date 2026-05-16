@@ -143,7 +143,7 @@ func handleExternalOfferClaim(ctx context.Context, session *relaySession, claim 
 	return true, sendExternalAcceptedOffer(ctx, session, claim, decision, peerDERP, auth, pathEmitter, cfg, retErr)
 }
 
-func sendExternalAcceptedOffer(ctx context.Context, session *relaySession, claim rendezvous.Claim, decision rendezvous.Decision, peerDERP key.NodePublic, auth externalPeerControlAuth, pathEmitter *transportPathEmitter, cfg OfferConfig, retErr *error) error {
+func sendExternalAcceptedOffer(ctx context.Context, session *relaySession, claim rendezvous.Claim, decision rendezvous.Decision, peerDERP key.NodePublic, auth externalPeerControlAuth, pathEmitter *transportPathEmitter, cfg OfferConfig, callerRetErr *error) (retErr error) {
 	var countedSrc *byteCountingReadCloser
 	abortCh, heartbeatCh, cleanupPeerSubs := subscribeExternalOfferPeerControl(session, peerDERP)
 	defer cleanupPeerSubs()
@@ -151,7 +151,15 @@ func sendExternalAcceptedOffer(ctx context.Context, session *relaySession, claim
 		return externalOfferCountedSrcCount(countedSrc)
 	}, auth)
 	defer stopPeerAbort()
-	defer notifyPeerAbortOnError(retErr, ctx, session.derp, peerDERP, func() int64 {
+	defer func() {
+		if callerRetErr != nil {
+			*callerRetErr = retErr
+		}
+	}()
+	defer notifyPeerAbortOnError(&retErr, ctx, session.derp, peerDERP, func() int64 {
+		return externalOfferCountedSrcCount(countedSrc)
+	}, auth)
+	defer notifyPeerAbortOnLocalCancel(&retErr, ctx, session.derp, peerDERP, func() int64 {
 		return externalOfferCountedSrcCount(countedSrc)
 	}, auth)
 
@@ -440,6 +448,7 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) (retErr error) {
 	ctx, stopPeerAbort := withPeerControlContext(ctx, runtime.derpClient, runtime.listenerDERP, abortCh, heartbeatCh, runtime.countedDstCount, runtime.auth)
 	defer stopPeerAbort()
 	defer notifyPeerAbortOnError(&retErr, ctx, runtime.derpClient, runtime.listenerDERP, runtime.countedDstCount, runtime.auth)
+	defer notifyPeerAbortOnLocalCancel(&retErr, ctx, runtime.derpClient, runtime.listenerDERP, runtime.countedDstCount, runtime.auth)
 
 	return receiveExternalAcceptedOffer(ctx, cfg, runtime)
 }
