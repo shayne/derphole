@@ -2223,13 +2223,21 @@ func TestSendExternalViaRelayPrefixThenDirectUDPFallsBackToRelayWhenDirectPrepar
 	t.Cleanup(func() { externalExecutePreparedDirectUDPSendFn = prevExecutePreparedDirectUDPSend })
 
 	var status bytes.Buffer
+	var traceOut bytes.Buffer
+	trace, err := transfertrace.NewRecorder(&traceOut, transfertrace.RoleSend, time.Unix(75, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
 	err = sendExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixSendConfig{
 		src:          bytes.NewReader(payload),
 		tok:          tok,
 		decision:     rendezvous.Decision{Accept: &rendezvous.AcceptInfo{}},
 		derpClient:   senderDERP,
 		listenerDERP: listenerDERP.PublicKey(),
-		cfg:          SendConfig{Emitter: telemetry.New(&status, telemetry.LevelVerbose)},
+		cfg: SendConfig{
+			Emitter: telemetry.New(&status, telemetry.LevelVerbose),
+			Trace:   trace,
+		},
 	})
 	if err != nil {
 		t.Fatalf("sendExternalViaRelayPrefixThenDirectUDP() error = %v", err)
@@ -2242,6 +2250,16 @@ func TestSendExternalViaRelayPrefixThenDirectUDPFallsBackToRelayWhenDirectPrepar
 	}
 	if !bytes.Equal(out.Bytes(), payload) {
 		t.Fatalf("receiver output length = %d, want %d", out.Len(), len(payload))
+	}
+	if err := trace.Close(); err != nil {
+		t.Fatalf("trace.Close() error = %v", err)
+	}
+	traceBody := traceOut.String()
+	if strings.Contains(traceBody, ",send,error,") {
+		t.Fatalf("trace recorded fallback prepare failure as terminal error:\n%s", traceBody)
+	}
+	if !strings.Contains(traceBody, ",send,complete,") {
+		t.Fatalf("trace missing final complete row after fallback:\n%s", traceBody)
 	}
 	for _, needle := range []string{
 		"udp-handoff-send-prepare-error=direct UDP established without usable remote addresses",
@@ -3625,6 +3643,100 @@ func TestExternalPrepareDirectUDPSendWaitsForHandoffProceedBeforeSendingStart(t 
 		}
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for externalPrepareDirectUDPSend() to finish after proceed gate")
+	}
+}
+
+func TestExternalPrepareDirectUDPSendPrepareFailureDoesNotRecordTerminalError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	srv := newSessionTestDERPServer(t)
+	node := srv.Map.Regions[1].Nodes[0]
+	listenerDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(listener) error = %v", err)
+	}
+	defer listenerDERP.Close()
+	senderDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(sender) error = %v", err)
+	}
+	defer senderDERP.Close()
+	warmExternalQUICModeTestDERPRoute(t, ctx, senderDERP, listenerDERP)
+
+	probeConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer probeConn.Close()
+
+	prevWaitReadyAck := externalDirectUDPWaitReadyAckFn
+	externalDirectUDPWaitReadyAckFn = func(context.Context, <-chan derpbind.Packet, ...externalPeerControlAuth) (directUDPReadyAck, error) {
+		return directUDPReadyAck{FastDiscard: true}, nil
+	}
+	t.Cleanup(func() { externalDirectUDPWaitReadyAckFn = prevWaitReadyAck })
+
+	var traceOut bytes.Buffer
+	trace, err := transfertrace.NewRecorder(&traceOut, transfertrace.RoleSend, time.Unix(76, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(76, 0), trace, transfertrace.RoleSend)
+	prepCtx := withExternalTransferMetrics(ctx, metrics)
+	tok := token.Token{
+		SessionID:    [16]byte{0x76},
+		BearerSecret: [32]byte{0x42},
+	}
+
+	_, err = externalPrepareDirectUDPSend(prepCtx, tok, senderDERP, listenerDERP.PublicKey(), nil, []net.PacketConn{probeConn}, nil, nil, nil, nil, SendConfig{})
+	if err == nil {
+		t.Fatal("externalPrepareDirectUDPSend() error = nil, want prepare failure")
+	}
+	if !strings.Contains(err.Error(), "without usable remote addresses") {
+		t.Fatalf("externalPrepareDirectUDPSend() error = %v, want unusable remote addresses", err)
+	}
+	if err := trace.Close(); err != nil {
+		t.Fatalf("trace.Close() error = %v", err)
+	}
+	if traceBody := traceOut.String(); strings.Contains(traceBody, ",send,error,") {
+		t.Fatalf("direct prepare failure was recorded as terminal send error:\n%s", traceBody)
+	}
+}
+
+func TestExternalPrepareDirectUDPReceivePrepareFailureDoesNotRecordTerminalError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	prevWaitReady := externalDirectUDPWaitReadyFn
+	externalDirectUDPWaitReadyFn = func(context.Context, <-chan derpbind.Packet, ...externalPeerControlAuth) error {
+		return nil
+	}
+	t.Cleanup(func() { externalDirectUDPWaitReadyFn = prevWaitReady })
+
+	var traceOut bytes.Buffer
+	trace, err := transfertrace.NewRecorder(&traceOut, transfertrace.RoleReceive, time.Unix(77, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(77, 0), trace, transfertrace.RoleReceive)
+	prepCtx := withExternalTransferMetrics(ctx, metrics)
+	tok := token.Token{
+		SessionID:    [16]byte{0x77},
+		BearerSecret: [32]byte{0x42},
+	}
+
+	_, err = externalPrepareDirectUDPReceive(prepCtx, io.Discard, tok, nil, key.NodePublic{}, nil, nil, nil, rendezvous.Decision{}, nil, nil, ListenConfig{})
+	if err == nil {
+		t.Fatal("externalPrepareDirectUDPReceive() error = nil, want prepare failure")
+	}
+	if !strings.Contains(err.Error(), "without usable receive sockets") {
+		t.Fatalf("externalPrepareDirectUDPReceive() error = %v, want unusable receive sockets", err)
+	}
+	if err := trace.Close(); err != nil {
+		t.Fatalf("trace.Close() error = %v", err)
+	}
+	if traceBody := traceOut.String(); strings.Contains(traceBody, ",receive,error,") {
+		t.Fatalf("direct prepare failure was recorded as terminal receive error:\n%s", traceBody)
 	}
 }
 
