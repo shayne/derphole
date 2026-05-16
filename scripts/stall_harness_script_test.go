@@ -66,6 +66,21 @@ func TestTransferStallHarnessCapturesProgressAndCounters(t *testing.T) {
 		"876000h",
 		"Trace app_bytes are session stream bytes",
 		"Payload size and SHA verification above validate file bytes",
+		"DERPHOLE_STALL_TOOL_NAME",
+		"DERPHOLE_STALL_ASSERT_NO_LEAKS",
+		"DERPHOLE_STALL_KILL_LEAKS",
+		"assert_no_remote_leaks",
+		"remote_leak_snapshot",
+		"terminate_remote_children",
+		"preflight sender",
+		"preflight receiver",
+		"postrun sender",
+		"postrun receiver",
+		"/proc/net/udp6",
+		"socket:[",
+		"leak-check",
+		"DERPHOLE_IPERF_PORT",
+		"DERPHOLE_IPERF_SERVER_HOST",
 	}
 	for _, want := range required {
 		if !strings.Contains(body, want) {
@@ -82,5 +97,17 @@ func TestTransferStallHarnessCapturesProgressAndCounters(t *testing.T) {
 	integrityCheckIndex := strings.Index(body[stallProofIndex:], integrityCheck)
 	if integrityCheckIndex < 0 {
 		t.Fatalf("transfer-stall-harness.sh missing receive integrity checker after expected-stall proof")
+	}
+
+	preflightIndex := strings.Index(body, `assert_no_remote_leaks "${sender_target}" "preflight sender"`)
+	startIndex := strings.Index(body, `DERPHOLE_TRANSFER_TRACE_CSV=$(quote "${sender_trace}")`)
+	if preflightIndex < 0 {
+		t.Fatalf("transfer-stall-harness.sh missing sender preflight leak gate")
+	}
+	if startIndex < 0 {
+		t.Fatalf("transfer-stall-harness.sh missing sender start")
+	}
+	if preflightIndex > startIndex {
+		t.Fatalf("transfer-stall-harness.sh checks leaks after starting sender")
 	}
 }

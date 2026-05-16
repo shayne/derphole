@@ -17,6 +17,11 @@ fi
 
 sender_target="${1:?missing sender host}"
 receiver_target="${2:?missing receiver host}"
+tool_name="${DERPHOLE_STALL_TOOL_NAME:-derphole}"
+assert_no_leaks="${DERPHOLE_STALL_ASSERT_NO_LEAKS:-1}"
+kill_leaks="${DERPHOLE_STALL_KILL_LEAKS:-1}"
+iperf_port="${DERPHOLE_IPERF_PORT:-8321}"
+iperf_server_host="${DERPHOLE_IPERF_SERVER_HOST:-}"
 size_mib="${3:-1024}"
 sample_interval_sec="${DERPHOLE_STALL_SAMPLE_INTERVAL_SEC:-0.5}"
 stall_timeout_sec="${DERPHOLE_STALL_TIMEOUT_SEC:-20}"
@@ -119,6 +124,80 @@ remote_mktemp() {
   remote_sh "$1" 'mktemp -d "${TMPDIR:-/tmp}/derphole-stall.XXXXXX"'
 }
 
+remote_leak_snapshot() {
+  local target="$1"
+  local label="$2"
+  clean_ssh "${target}" 'bash -se' -- "${tool_name}" "${label}" <<'REMOTE_LEAK_SNAPSHOT'
+tool_name="$1"
+label="$2"
+pids="$(pgrep -x "${tool_name}" 2>/dev/null || true)"
+process_count=0
+udp_count=0
+if [[ -n "${pids}" ]]; then
+  process_count="$(printf '%s\n' "${pids}" | awk 'NF { count++ } END { print count + 0 }')"
+  for pid in ${pids}; do
+    fd_dir="/proc/${pid}/fd"
+    [[ -d "${fd_dir}" ]] || continue
+    while IFS= read -r fd; do
+      link="$(readlink "${fd}" 2>/dev/null || true)"
+      case "${link}" in
+        socket:\[*\])
+          inode="${link#socket:[}"
+          inode="${inode%]}"
+          if awk -v inode="${inode}" 'NR > 1 && $10 == inode { found=1 } END { exit found ? 0 : 1 }' /proc/net/udp /proc/net/udp6 2>/dev/null; then
+            udp_count=$((udp_count + 1))
+          fi
+          ;;
+      esac
+    done < <(find "${fd_dir}" -maxdepth 1 -type l 2>/dev/null)
+  done
+fi
+printf 'label=%s tool=%s processes=%s udp_sockets=%s pids=%s\n' "${label}" "${tool_name}" "${process_count}" "${udp_count}" "${pids//$'\n'/ }"
+REMOTE_LEAK_SNAPSHOT
+}
+
+assert_no_remote_leaks() {
+  local target="$1"
+  local label="$2"
+  if [[ "${assert_no_leaks}" != "1" ]]; then
+    return 0
+  fi
+  local snapshot
+  snapshot="$(remote_leak_snapshot "${target}" "${label}")"
+  echo "leak-check ${target} ${snapshot}" >&2
+  local processes
+  local udp_sockets
+  processes="$(awk -F'processes=' '{ print $2 }' <<<"${snapshot}" | awk '{ print $1 }')"
+  udp_sockets="$(awk -F'udp_sockets=' '{ print $2 }' <<<"${snapshot}" | awk '{ print $1 }')"
+  if [[ "${processes}" != "0" || "${udp_sockets}" != "0" ]]; then
+    echo "stall-harness-error=leak-check-failed label=${label} target=${target} ${snapshot}" >&2
+    return 1
+  fi
+}
+
+terminate_remote_children() {
+  local target="$1"
+  local dir="$2"
+  if [[ -z "${dir}" || "${kill_leaks}" != "1" ]]; then
+    return 0
+  fi
+  remote_sh "${target}" "
+for pid_file in $(quote "${dir}")/*.pid; do
+  [[ -f \"\${pid_file}\" ]] || continue
+  pid=\$(cat \"\${pid_file}\" 2>/dev/null || true)
+  [[ -n \"\${pid}\" ]] || continue
+  kill -TERM \"\${pid}\" 2>/dev/null || true
+done
+sleep 1
+for pid_file in $(quote "${dir}")/*.pid; do
+  [[ -f \"\${pid_file}\" ]] || continue
+  pid=\$(cat \"\${pid_file}\" 2>/dev/null || true)
+  [[ -n \"\${pid}\" ]] || continue
+  kill -KILL \"\${pid}\" 2>/dev/null || true
+done
+" >/dev/null 2>&1 || true
+}
+
 remote_env_prefix() {
   local prefix=()
   local disable_tailscale="${DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES:-${DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES:-1}}"
@@ -207,6 +286,8 @@ finish() {
   collect_counters "${receiver_target}" "${receiver_dir}" "after"
   fetch_remote_dir "${sender_target}" "${sender_dir}" "${log_dir}/sender"
   fetch_remote_dir "${receiver_target}" "${receiver_dir}" "${log_dir}/receiver"
+  terminate_remote_children "${sender_target}" "${sender_dir}"
+  terminate_remote_children "${receiver_target}" "${receiver_dir}"
   cleanup_remote
   echo "stall-harness-log-dir=${log_dir}"
   exit "${status}"
@@ -227,6 +308,8 @@ abort_with_dumps() {
   signal_quit "${sender_target}" "${sender_dir}" "send.pid"
   signal_quit "${receiver_target}" "${receiver_dir}" "receive.pid"
   sleep 2
+  terminate_remote_children "${sender_target}" "${sender_dir}"
+  terminate_remote_children "${receiver_target}" "${receiver_dir}"
   exit 124
 }
 
@@ -337,6 +420,8 @@ source_sha="$(remote_sh "${sender_target}" "sha256sum $(quote "${sender_payload}
 
 collect_counters "${sender_target}" "${sender_dir}" "before"
 collect_counters "${receiver_target}" "${receiver_dir}" "before"
+assert_no_remote_leaks "${sender_target}" "preflight sender"
+assert_no_remote_leaks "${receiver_target}" "preflight receiver"
 
 env_prefix="$(remote_env_prefix)"
 sender_progress_flag="--hide-progress"
@@ -382,6 +467,16 @@ remote_sh "${receiver_target}" "
 {
   echo "timestamp_ms,elapsed_ms,sender_status,receiver_status,sender_alive,receiver_alive,sender_log_bytes,receiver_log_bytes,sender_state,receiver_state,bytes_sent,bytes_received,delta_sent,delta_received,send_mbps,receive_mbps"
 } >"${samples_file}"
+{
+  echo "sender_target=${sender_target}"
+  echo "receiver_target=${receiver_target}"
+  echo "size_mib=${size_mib}"
+  echo "sample_interval_sec=${sample_interval_sec}"
+  echo "stall_timeout_sec=${stall_timeout_sec}"
+  echo "tool_name=${tool_name}"
+  echo "iperf_port=${iperf_port}"
+  echo "iperf_server_host=${iperf_server_host}"
+} >"${log_dir}/metadata.env"
 
 start_ms="$(now_ms)"
 last_ms="${start_ms}"
@@ -527,5 +622,8 @@ echo "sender-direct-validated=${sender_direct_validated}"
 if [[ -n "${sender_fallback_reason}" ]]; then
   echo "sender-direct-fallback-seen=true"
 fi
+
+assert_no_remote_leaks "${sender_target}" "postrun sender"
+assert_no_remote_leaks "${receiver_target}" "postrun receiver"
 
 echo "stall-harness-success=true"
