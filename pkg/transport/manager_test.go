@@ -712,6 +712,55 @@ func TestManagerCountsDroppedPeerDatagrams(t *testing.T) {
 	}
 }
 
+func TestManagerPeerRecvQueueDepthTracksCurrentAndMax(t *testing.T) {
+	mgr := NewManager(ManagerConfig{})
+	conn := mgr.PeerDatagramConn(context.Background())
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443}
+
+	if got := mgr.CurrentPeerRecvQueueDepth(); got != 0 {
+		t.Fatalf("CurrentPeerRecvQueueDepth() = %d, want 0", got)
+	}
+	if got := mgr.MaxPeerRecvQueueDepth(); got != 0 {
+		t.Fatalf("MaxPeerRecvQueueDepth() = %d, want 0", got)
+	}
+
+	for i := 0; i < 3; i++ {
+		mgr.enqueuePeerDatagram(addr, []byte("payload"))
+	}
+	if got := mgr.CurrentPeerRecvQueueDepth(); got != 3 {
+		t.Fatalf("CurrentPeerRecvQueueDepth() after enqueue = %d, want 3", got)
+	}
+	if got := mgr.MaxPeerRecvQueueDepth(); got != 3 {
+		t.Fatalf("MaxPeerRecvQueueDepth() after enqueue = %d, want 3", got)
+	}
+
+	for i := 0; i < 2; i++ {
+		payload, _, err := conn.RecvDatagram(context.Background())
+		if err != nil {
+			t.Fatalf("RecvDatagram() error = %v", err)
+		}
+		conn.ReleaseDatagram(payload)
+	}
+	if got := mgr.CurrentPeerRecvQueueDepth(); got != 1 {
+		t.Fatalf("CurrentPeerRecvQueueDepth() after dequeue = %d, want 1", got)
+	}
+	if got := mgr.MaxPeerRecvQueueDepth(); got != 3 {
+		t.Fatalf("MaxPeerRecvQueueDepth() after dequeue = %d, want 3", got)
+	}
+
+	payload, _, err := conn.RecvDatagram(context.Background())
+	if err != nil {
+		t.Fatalf("RecvDatagram() error = %v", err)
+	}
+	conn.ReleaseDatagram(payload)
+	if got := mgr.CurrentPeerRecvQueueDepth(); got != 0 {
+		t.Fatalf("CurrentPeerRecvQueueDepth() after drain = %d, want 0", got)
+	}
+	if got := mgr.MaxPeerRecvQueueDepth(); got != 3 {
+		t.Fatalf("MaxPeerRecvQueueDepth() after drain = %d, want 3", got)
+	}
+}
+
 func TestManagerPeerRecvQueueBuffersHighRateBurst(t *testing.T) {
 	mgr := NewManager(ManagerConfig{})
 	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443}

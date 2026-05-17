@@ -414,6 +414,10 @@ func (m *Manager) DroppedPeerDatagrams() uint64 {
 	return m.peerRecvDrops.Load()
 }
 
+func (m *Manager) CurrentPeerRecvQueueDepth() int {
+	return len(m.peerRecvCh)
+}
+
 func (m *Manager) MaxPeerRecvQueueDepth() int {
 	return int(m.peerRecvMaxDepth.Load())
 }

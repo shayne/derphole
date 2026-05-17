@@ -14,6 +14,7 @@ import (
 	"github.com/shayne/derphole/pkg/probe"
 	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/transfertrace"
+	"github.com/shayne/derphole/pkg/transport"
 )
 
 type externalTransferMetrics struct {
@@ -62,6 +63,7 @@ type externalTransferMetrics struct {
 	outOfOrderBytes        uint64
 	directPacketBytes      int64
 	directCommittedBytes   int64
+	transportManager       *transport.Manager
 }
 
 type externalTransferMetricsContextKey struct{}
@@ -198,6 +200,15 @@ func (m *externalTransferMetrics) CompleteAfterPeerAck(at time.Time) {
 	m.deferSendComplete = false
 	m.mu.Unlock()
 	m.Complete(at)
+}
+
+func (m *externalTransferMetrics) SetTransportManager(manager *transport.Manager) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.transportManager = manager
+	m.mu.Unlock()
 }
 
 func (m *externalTransferMetrics) SetPhase(phase transfertrace.Phase, state string) {
@@ -432,6 +443,12 @@ func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrac
 			transferMS = at.Sub(m.transferStartedAt).Milliseconds()
 		}
 	}
+	peerRecvQueueDepth := 0
+	peerRecvQueueDepthMax := 0
+	if m.transportManager != nil {
+		peerRecvQueueDepth = m.transportManager.CurrentPeerRecvQueueDepth()
+		peerRecvQueueDepthMax = m.transportManager.MaxPeerRecvQueueDepth()
+	}
 	return m.trace, transfertrace.Snapshot{
 		At:                         at,
 		Phase:                      m.phase,
@@ -466,6 +483,8 @@ func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrac
 		OutOfOrderBytes:            m.outOfOrderBytes,
 		DirectPacketBytes:          m.directPacketBytes,
 		DirectCommittedBytes:       m.directCommittedBytes,
+		PeerRecvQueueDepth:         peerRecvQueueDepth,
+		PeerRecvQueueDepthMax:      peerRecvQueueDepthMax,
 		LastState:                  m.lastState,
 		LastError:                  m.lastError,
 	}, true

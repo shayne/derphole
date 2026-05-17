@@ -6,7 +6,9 @@ package session
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"github.com/shayne/derphole/pkg/probe"
 	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/transfertrace"
+	"github.com/shayne/derphole/pkg/transport"
 )
 
 func TestExternalTransferMetricsTrackRelayAndDirectBytes(t *testing.T) {
@@ -121,6 +124,66 @@ func TestExternalTransferMetricsSamplesTraceUntilTick(t *testing.T) {
 		row["app_bytes"] != "65536" ||
 		row["last_state"] != "connected-direct" {
 		t.Fatalf("sampled trace row = %#v, want current metrics snapshot", row)
+	}
+}
+
+func TestExternalTransferMetricsSamplesPeerRecvQueueDepthFromTransportManager(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	relayPackets := make(chan []byte, 2)
+	relayPackets <- []byte("first")
+	relayPackets <- []byte("second")
+	mgr := transport.NewManager(transport.ManagerConfig{
+		RelayAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443},
+		ReceiveRelay: func(ctx context.Context) ([]byte, error) {
+			select {
+			case payload := <-relayPackets:
+				return payload, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	})
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		mgr.Wait()
+	})
+	waitForPeerRecvQueueDepth(t, mgr, 2)
+
+	var out bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleReceive, time.Unix(16, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(16, 0), rec, transfertrace.RoleReceive)
+	metrics.SetTransportManager(mgr)
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct")
+	metrics.Tick(time.Unix(16, int64(100*time.Millisecond)))
+
+	conn := mgr.PeerDatagramConn(ctx)
+	payload, _, err := conn.RecvDatagram(ctx)
+	if err != nil {
+		t.Fatalf("RecvDatagram() error = %v", err)
+	}
+	conn.ReleaseDatagram(payload)
+	waitForPeerRecvQueueDepth(t, mgr, 1)
+	metrics.Tick(time.Unix(16, int64(200*time.Millisecond)))
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := readTransferTraceRows(t, out.String())
+	first := rows[len(rows)-2]
+	if first["peer_recv_queue_depth"] != "2" || first["peer_recv_queue_depth_max"] != "2" {
+		t.Fatalf("first trace row queue depths = current %q max %q, want 2/2; row = %#v", first["peer_recv_queue_depth"], first["peer_recv_queue_depth_max"], first)
+	}
+	last := rows[len(rows)-1]
+	if last["peer_recv_queue_depth"] != "1" || last["peer_recv_queue_depth_max"] != "2" {
+		t.Fatalf("last trace row queue depths = current %q max %q, want 1/2; row = %#v", last["peer_recv_queue_depth"], last["peer_recv_queue_depth_max"], last)
 	}
 }
 
@@ -525,4 +588,18 @@ func readTransferTraceRows(t *testing.T, body string) []map[string]string {
 		rows = append(rows, row)
 	}
 	return rows
+}
+
+func waitForPeerRecvQueueDepth(t *testing.T, mgr *transport.Manager, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if got := mgr.CurrentPeerRecvQueueDepth(); got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("CurrentPeerRecvQueueDepth() = %d, want %d", mgr.CurrentPeerRecvQueueDepth(), want)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }

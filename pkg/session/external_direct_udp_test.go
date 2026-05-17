@@ -742,6 +742,93 @@ func TestRelayPrefixSendRuntimePeerProgressWatcherUsesRuntimeMetrics(t *testing.
 	}
 }
 
+func TestSendExternalViaDirectUDPOnlyAttachesTransportManagerToMetrics(t *testing.T) {
+	origPrepareDirect := externalPrepareDirectUDPSendFn
+	origExecuteDirect := externalExecutePreparedDirectUDPSendFn
+	t.Cleanup(func() {
+		externalPrepareDirectUDPSendFn = origPrepareDirect
+		externalExecutePreparedDirectUDPSendFn = origExecuteDirect
+	})
+
+	manager := transport.NewManager(transport.ManagerConfig{})
+	prepareCalled := false
+	executeCalled := false
+	externalPrepareDirectUDPSendFn = func(ctx context.Context, tok token.Token, derpClient *derpbind.Client, listenerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, readyAckCh <-chan derpbind.Packet, startAckCh <-chan derpbind.Packet, rateProbeCh <-chan derpbind.Packet, cfg SendConfig) (externalDirectUDPSendPlan, error) {
+		prepareCalled = true
+		requireExternalTransferMetricsManager(t, externalTransferMetricsFromContext(ctx), manager)
+		return externalDirectUDPSendPlan{}, nil
+	}
+	externalExecutePreparedDirectUDPSendFn = func(ctx context.Context, src io.Reader, plan externalDirectUDPSendPlan, cfg SendConfig, metrics *externalTransferMetrics) error {
+		executeCalled = true
+		requireExternalTransferMetricsManager(t, metrics, manager)
+		return nil
+	}
+
+	err := sendExternalViaDirectUDPOnly(context.Background(), strings.NewReader("payload"), token.Token{}, nil, key.NodePublic{}, manager, nil, nil, nil, nil, nil, nil, nil, nil, nil, SendConfig{})
+	if err != nil {
+		t.Fatalf("sendExternalViaDirectUDPOnly() error = %v", err)
+	}
+	if !prepareCalled {
+		t.Fatal("sendExternalViaDirectUDPOnly() did not call externalPrepareDirectUDPSendFn")
+	}
+	if !executeCalled {
+		t.Fatal("sendExternalViaDirectUDPOnly() did not call externalExecutePreparedDirectUDPSendFn")
+	}
+}
+
+func TestRelayPrefixSendRuntimeAttachesTransportManagerToMetrics(t *testing.T) {
+	origSendRelay := externalSendExternalHandoffDERPFn
+	origPrepareDirect := externalPrepareDirectUDPSendFn
+	t.Cleanup(func() {
+		externalSendExternalHandoffDERPFn = origSendRelay
+		externalPrepareDirectUDPSendFn = origPrepareDirect
+	})
+
+	manager := transport.NewManager(transport.ManagerConfig{})
+	checked := make(chan error, 1)
+	relayStarted := make(chan struct{})
+	externalSendExternalHandoffDERPFn = func(ctx context.Context, derpClient *derpbind.Client, peerDERP key.NodePublic, spool *externalHandoffSpool, stopCh <-chan struct{}, metrics *externalTransferMetrics, aead cipher.AEAD) error {
+		close(relayStarted)
+		select {
+		case <-stopCh:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	externalPrepareDirectUDPSendFn = func(ctx context.Context, tok token.Token, derpClient *derpbind.Client, listenerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, readyAckCh <-chan derpbind.Packet, startAckCh <-chan derpbind.Packet, rateProbeCh <-chan derpbind.Packet, cfg SendConfig) (externalDirectUDPSendPlan, error) {
+		checked <- checkExternalTransferMetricsManager(externalTransferMetricsFromContext(ctx), manager)
+		<-ctx.Done()
+		return externalDirectUDPSendPlan{}, ctx.Err()
+	}
+
+	rt, err := newExternalRelayPrefixSendRuntime(context.Background(), externalRelayPrefixSendConfig{
+		src:              strings.NewReader("relay-prefix"),
+		tok:              token.Token{},
+		transportManager: manager,
+		cfg:              SendConfig{},
+	})
+	if err != nil {
+		t.Fatalf("newExternalRelayPrefixSendRuntime() error = %v", err)
+	}
+	defer rt.Close()
+
+	select {
+	case <-relayStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for relay-prefix send relay goroutine")
+	}
+	select {
+	case err := <-checked:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for relay-prefix send prepare metrics")
+	}
+	requireExternalTransferMetricsManager(t, rt.metrics, manager)
+}
+
 func TestWatchPeerProgressIgnoresUnauthenticatedAndReplayProgress(t *testing.T) {
 	auth := externalPeerControlAuthForToken(token.Token{
 		SessionID:    [16]byte{1, 2, 3},
@@ -1786,6 +1873,40 @@ func TestReceiveExternalViaDirectUDPOnlyLetsPrepareConsumeReady(t *testing.T) {
 	}
 	if waitReadyCalled {
 		t.Fatal("receiveExternalViaDirectUDPOnly() called externalDirectUDPWaitReadyFn, want prepare function to consume the ready envelope")
+	}
+	if !prepareCalled {
+		t.Fatal("receiveExternalViaDirectUDPOnly() did not call externalPrepareDirectUDPReceiveFn")
+	}
+	if !executeCalled {
+		t.Fatal("receiveExternalViaDirectUDPOnly() did not call externalExecutePreparedDirectUDPReceiveFn")
+	}
+}
+
+func TestReceiveExternalViaDirectUDPOnlyAttachesTransportManagerToMetrics(t *testing.T) {
+	origPrepare := externalPrepareDirectUDPReceiveFn
+	origExecute := externalExecutePreparedDirectUDPReceiveFn
+	t.Cleanup(func() {
+		externalPrepareDirectUDPReceiveFn = origPrepare
+		externalExecutePreparedDirectUDPReceiveFn = origExecute
+	})
+
+	manager := transport.NewManager(transport.ManagerConfig{})
+	prepareCalled := false
+	executeCalled := false
+	externalPrepareDirectUDPReceiveFn = func(ctx context.Context, dst io.Writer, tok token.Token, derpClient *derpbind.Client, peerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, decision rendezvous.Decision, readyCh <-chan derpbind.Packet, startCh <-chan derpbind.Packet, cfg ListenConfig) (externalDirectUDPReceivePlan, error) {
+		prepareCalled = true
+		requireExternalTransferMetricsManager(t, externalTransferMetricsFromContext(ctx), manager)
+		return externalDirectUDPReceivePlan{}, nil
+	}
+	externalExecutePreparedDirectUDPReceiveFn = func(ctx context.Context, plan externalDirectUDPReceivePlan, tok token.Token, cfg ListenConfig, metrics *externalTransferMetrics) error {
+		executeCalled = true
+		requireExternalTransferMetricsManager(t, metrics, manager)
+		return nil
+	}
+
+	err := receiveExternalViaDirectUDPOnly(context.Background(), io.Discard, token.Token{}, nil, key.NodePublic{}, manager, nil, nil, nil, nil, nil, rendezvous.Decision{}, nil, nil, ListenConfig{})
+	if err != nil {
+		t.Fatalf("receiveExternalViaDirectUDPOnly() error = %v", err)
 	}
 	if !prepareCalled {
 		t.Fatal("receiveExternalViaDirectUDPOnly() did not call externalPrepareDirectUDPReceiveFn")
@@ -4254,6 +4375,55 @@ func TestReceiveExternalViaRelayPrefixThenDirectUDPStartsPrepareBeforeTransportM
 	if err := <-errCh; err == nil {
 		t.Fatal("receiveExternalViaRelayPrefixThenDirectUDP() error = nil, want canceled context after test shutdown")
 	}
+}
+
+func TestRelayPrefixReceiveRuntimeAttachesTransportManagerToMetrics(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	prevReceiveRelay := externalReceiveExternalHandoffDERPFn
+	relayStarted := make(chan struct{})
+	externalReceiveExternalHandoffDERPFn = func(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, rx *externalHandoffReceiver, packets <-chan derpbind.Packet, metrics *externalTransferMetrics, packetAEAD cipher.AEAD) error {
+		close(relayStarted)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	t.Cleanup(func() { externalReceiveExternalHandoffDERPFn = prevReceiveRelay })
+
+	prevPrepareDirectUDPReceive := externalPrepareDirectUDPReceiveFn
+	manager := transport.NewManager(transport.ManagerConfig{})
+	checked := make(chan error, 1)
+	externalPrepareDirectUDPReceiveFn = func(ctx context.Context, dst io.Writer, tok token.Token, derpClient *derpbind.Client, peerDERP key.NodePublic, peerAddr net.Addr, probeConns []net.PacketConn, remoteCandidates []net.Addr, decision rendezvous.Decision, readyCh <-chan derpbind.Packet, startCh <-chan derpbind.Packet, cfg ListenConfig) (externalDirectUDPReceivePlan, error) {
+		checked <- checkExternalTransferMetricsManager(externalTransferMetricsFromContext(ctx), manager)
+		<-ctx.Done()
+		return externalDirectUDPReceivePlan{}, ctx.Err()
+	}
+	t.Cleanup(func() { externalPrepareDirectUDPReceiveFn = prevPrepareDirectUDPReceive })
+
+	rt, err := newExternalRelayPrefixReceiveRuntime(ctx, externalRelayPrefixReceiveConfig{
+		dst:              io.Discard,
+		transportManager: manager,
+		cfg:              ListenConfig{},
+	})
+	if err != nil {
+		t.Fatalf("newExternalRelayPrefixReceiveRuntime() error = %v", err)
+	}
+	defer rt.Close()
+
+	select {
+	case <-relayStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for relay-prefix receive relay goroutine")
+	}
+	select {
+	case err := <-checked:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for relay-prefix receive prepare metrics")
+	}
+	requireExternalTransferMetricsManager(t, rt.metrics, manager)
 }
 
 func TestReceiveExternalViaRelayPrefixThenDirectUDPDisablesStandaloneStartTimeout(t *testing.T) {
@@ -10198,6 +10368,26 @@ func firstProbeDataDatagram(t *testing.T, datagrams [][]byte) []byte {
 		}
 	}
 	t.Fatalf("captured %d sender relay datagrams, found no probe data packet", len(datagrams))
+	return nil
+}
+
+func requireExternalTransferMetricsManager(t *testing.T, metrics *externalTransferMetrics, want *transport.Manager) {
+	t.Helper()
+	if err := checkExternalTransferMetricsManager(metrics, want); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func checkExternalTransferMetricsManager(metrics *externalTransferMetrics, want *transport.Manager) error {
+	if metrics == nil {
+		return errors.New("metrics = nil, want transport manager attached")
+	}
+	metrics.mu.Lock()
+	got := metrics.transportManager
+	metrics.mu.Unlock()
+	if got != want {
+		return fmt.Errorf("metrics transport manager = %p, want %p", got, want)
+	}
 	return nil
 }
 

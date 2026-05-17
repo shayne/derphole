@@ -1852,6 +1852,7 @@ func sendExternalViaDirectUDPOnly(ctx context.Context, src io.Reader, tok token.
 		metrics = newExternalTransferMetricsWithTrace(time.Now(), cfg.Trace, transfertrace.RoleSend)
 		ctx = withExternalTransferMetrics(ctx, metrics)
 	}
+	metrics.SetTransportManager(transportManager)
 	stopPeerProgress := startPeerProgressWatcher(ctx, progressCh, externalPeerControlAuthForToken(tok), metrics, cfg.Progress, cfg.Emitter)
 	defer stopPeerProgress()
 	var peerAddr net.Addr
@@ -2253,6 +2254,7 @@ func (rt *externalDirectUDPListenRuntime) receivePayload(ctx context.Context, ac
 func receiveExternalViaDirectUDPOnly(ctx context.Context, dst io.Writer, tok token.Token, derpClient *derpbind.Client, peerDERP key.NodePublic, transportManager *transport.Manager, pathEmitter *transportPathEmitter, punchCancel context.CancelFunc, probeConn net.PacketConn, probeConns []net.PacketConn, remoteCandidates []net.Addr, decision rendezvous.Decision, readyCh <-chan derpbind.Packet, startCh <-chan derpbind.Packet, cfg ListenConfig) error {
 	ctx = withExternalTransferMetrics(ctx, newExternalTransferMetricsWithTrace(time.Now(), cfg.Trace, transfertrace.RoleReceive))
 	metrics := externalTransferMetricsFromContext(ctx)
+	metrics.SetTransportManager(transportManager)
 	peerAddr, _ := transportManager.DirectAddr()
 	externalDirectUDPBeginTryingDirect(pathEmitter, metrics)
 	plan, err := externalPrepareDirectUDPReceiveFn(ctx, dst, tok, derpClient, peerDERP, peerAddr, probeConns, remoteCandidates, decision, readyCh, startCh, cfg)
@@ -2337,6 +2339,7 @@ type externalRelayPrefixSendRuntime struct {
 
 func newExternalRelayPrefixSendRuntime(ctx context.Context, rcfg externalRelayPrefixSendConfig) (*externalRelayPrefixSendRuntime, error) {
 	metrics := externalTransferMetricsOrNew(ctx, nil, rcfg.cfg.Trace, transfertrace.RoleSend)
+	metrics.SetTransportManager(rcfg.transportManager)
 	metrics.SetPhase(transfertrace.PhaseRelay, "connected-relay")
 	ctx = withExternalTransferMetrics(ctx, metrics)
 	packetAEAD, err := externalSessionPacketAEAD(rcfg.tok)
@@ -2801,6 +2804,7 @@ type externalRelayPrefixReceiveRuntime struct {
 
 func newExternalRelayPrefixReceiveRuntime(ctx context.Context, rcfg externalRelayPrefixReceiveConfig) (*externalRelayPrefixReceiveRuntime, error) {
 	metrics := newExternalTransferMetricsWithTrace(time.Now(), rcfg.cfg.Trace, transfertrace.RoleReceive)
+	metrics.SetTransportManager(rcfg.transportManager)
 	metrics.SetPhase(transfertrace.PhaseRelay, "connected-relay")
 	ctx = withExternalTransferMetrics(ctx, metrics)
 	packetAEAD, err := externalSessionPacketAEAD(rcfg.tok)
