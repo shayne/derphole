@@ -4795,6 +4795,104 @@ func TestExternalExecutePreparedDirectUDPReceiveMapsReturnedStatsToTrace(t *test
 	}
 }
 
+func TestExternalExecutePreparedDirectUDPReceivePreservesDeliveredDirectMetricsWhenReceiverRecords(t *testing.T) {
+	origReceive := externalDirectUDPReceiveBlastParallelToWriterFn
+	defer func() {
+		externalDirectUDPReceiveBlastParallelToWriterFn = origReceive
+	}()
+
+	start := time.Now().Add(-time.Second)
+	var traceOut bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&traceOut, transfertrace.RoleReceive, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(start, rec, transfertrace.RoleReceive)
+	delivered := []byte("delivered")
+	externalDirectUDPReceiveBlastParallelToWriterFn = func(_ context.Context, _ []net.PacketConn, dst io.Writer, _ probe.ReceiveConfig, _ int64) (probe.TransferStats, error) {
+		n, err := dst.Write(delivered)
+		if err != nil {
+			return probe.TransferStats{}, err
+		}
+		if n != len(delivered) {
+			return probe.TransferStats{}, io.ErrShortWrite
+		}
+		return probe.TransferStats{
+			BytesReceived:   4096,
+			Lanes:           2,
+			StartedAt:       start,
+			FirstByteAt:     start.Add(100 * time.Millisecond),
+			CompletedAt:     start.Add(500 * time.Millisecond),
+			Retransmits:     3,
+			MaxReplayBytes:  8192,
+			PeakGoodputMbps: 64,
+			Diagnostics: probe.TransferDiagnostics{
+				RateTargetMbps:         300,
+				RateCeilingMbps:        900,
+				ActiveLanes:            2,
+				AvailableLanes:         3,
+				ControllerDecision:     "hold",
+				ControllerReason:       "receiver-limited",
+				ReplayBytes:            1024,
+				RepairRequests:         4,
+				RepairBytes:            2048,
+				DirectPacketBytes:      4096,
+				DirectCommittedBytes:   4096,
+				ReceiverCommittedBytes: 4096,
+			},
+		}, nil
+	}
+
+	err = externalExecutePreparedDirectUDPReceive(context.Background(), externalDirectUDPReceivePlan{
+		probeConns:                     []net.PacketConn{nil, nil, nil},
+		receiveDst:                     externalTransferMetricsWriter{w: io.Discard, record: metrics.RecordDirectWrite},
+		receiveDstRecordsDirectMetrics: true,
+		flushDst:                       func() error { return nil },
+		receiveCfg:                     externalDirectUDPFastDiscardReceiveConfig(),
+		fastDiscard:                    true,
+		start:                          directUDPStart{ExpectedBytes: 4096},
+	}, token.Token{SessionID: [16]byte{0x95}}, ListenConfig{Trace: rec}, metrics)
+	if err != nil {
+		t.Fatalf("externalExecutePreparedDirectUDPReceive() error = %v", err)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := metrics.DirectBytes(); got != int64(len(delivered)) {
+		t.Fatalf("DirectBytes() = %d, want delivered bytes %d", got, len(delivered))
+	}
+	rows := readTransferTraceRows(t, traceOut.String())
+	row := rows[len(rows)-1]
+	deliveredBytes := fmt.Sprint(len(delivered))
+	want := map[string]string{
+		"phase":                  string(transfertrace.PhaseComplete),
+		"direct_bytes":           deliveredBytes,
+		"app_bytes":              deliveredBytes,
+		"direct_lanes_active":    "2",
+		"direct_lanes_available": "3",
+		"rate_target_mbps":       "300",
+		"rate_ceiling_mbps":      "900",
+		"controller_decision":    "hold",
+		"controller_reason":      "receiver-limited",
+		"replay_window_bytes":    "8192",
+		"replay_bytes":           "1024",
+		"retransmits":            "3",
+		"repair_requests":        "4",
+		"repair_bytes":           "2048",
+		"direct_packet_bytes":    "4096",
+		"direct_committed_bytes": "4096",
+	}
+	for column, value := range want {
+		if row[column] != value {
+			t.Fatalf("trace row[%q] = %q, want %q; row = %#v", column, row[column], value, row)
+		}
+	}
+	if row["receive_goodput_mbps"] == "" || row["receiver_committed_mbps"] == "" {
+		t.Fatalf("trace row missing receive diagnostics: %#v", row)
+	}
+}
+
 func TestExternalExecutePreparedDirectUDPReceiveUsesDirectMetricsForLiveWrites(t *testing.T) {
 	origReceive := externalDirectUDPReceiveBlastParallelToWriterFn
 	defer func() {
