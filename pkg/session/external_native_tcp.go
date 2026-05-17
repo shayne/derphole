@@ -144,18 +144,29 @@ func listenExternalNativeTCPOnAddrs(addrs []net.Addr, tlsConfig *tls.Config) (ne
 		if externalNativeTCPAddrIsTailscale(addr) {
 			addrTLSConfig = nil
 		}
-		ln, err := externalNativeTCPListen(addr, addrTLSConfig)
-		if err != nil {
-			if fallbackAddr := externalNativeTCPEphemeralPortAddr(addr); fallbackAddr != nil {
-				ln, err = externalNativeTCPListen(fallbackAddr, addrTLSConfig)
-			}
-		}
+		ln, _, err := listenExternalNativeTCPWithPortFallback(addr, addrTLSConfig)
 		if err != nil {
 			continue
 		}
 		return ln, true
 	}
 	return nil, false
+}
+
+func listenExternalNativeTCPWithPortFallback(addr net.Addr, tlsConfig *tls.Config) (net.Listener, net.Addr, error) {
+	ln, err := externalNativeTCPListen(addr, tlsConfig)
+	if err == nil {
+		return ln, cloneSessionAddr(ln.Addr()), nil
+	}
+	fallbackAddr := externalNativeTCPEphemeralPortAddr(addr)
+	if fallbackAddr == nil {
+		return nil, nil, err
+	}
+	ln, fallbackErr := externalNativeTCPListen(fallbackAddr, tlsConfig)
+	if fallbackErr != nil {
+		return nil, nil, err
+	}
+	return ln, cloneSessionAddr(ln.Addr()), nil
 }
 
 func externalNativeTCPBindOverrideAddrs() []net.Addr {

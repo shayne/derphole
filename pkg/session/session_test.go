@@ -2773,6 +2773,39 @@ func TestListenExternalNativeTCPOnCandidatesFallsBackWhenPreferredPortIsBusy(t *
 	}
 }
 
+func TestExternalQUICModeAcceptStateOpenNativeTCPListenerFallsBackWhenPreferredPortIsBusy(t *testing.T) {
+	busy, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer busy.Close()
+
+	busyAddr := busy.Addr().(*net.TCPAddr)
+	state := &externalQUICModeAcceptState{
+		nativeTCPBindAddr: busyAddr,
+		nativeTCPAddr:     busyAddr,
+	}
+	state.openNativeTCPListener()
+	if state.nativeTCPListener == nil {
+		t.Fatal("openNativeTCPListener() listener = nil, want fallback listener")
+	}
+	defer state.nativeTCPListener.Close()
+
+	gotBind, ok := state.nativeTCPBindAddr.(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("nativeTCPBindAddr = %T, want *net.TCPAddr", state.nativeTCPBindAddr)
+	}
+	if !gotBind.IP.Equal(busyAddr.IP) {
+		t.Fatalf("nativeTCPBindAddr IP = %v, want %v", gotBind.IP, busyAddr.IP)
+	}
+	if gotBind.Port == busyAddr.Port {
+		t.Fatalf("nativeTCPBindAddr port = %d, want fallback away from busy port", gotBind.Port)
+	}
+	if state.nativeTCPAddr == nil || state.nativeTCPAddr.String() != state.nativeTCPListener.Addr().String() {
+		t.Fatalf("nativeTCPAddr = %v, want bound fallback addr %v", state.nativeTCPAddr, state.nativeTCPListener.Addr())
+	}
+}
+
 func TestListenExternalNativeTCPOnCandidatesUsesBindOverride(t *testing.T) {
 	prevListen := externalNativeTCPListen
 	externalNativeTCPListen = func(addr net.Addr, _ *tls.Config) (net.Listener, error) {

@@ -1121,7 +1121,7 @@ func (s *externalQUICModeAcceptState) openNativeTCPListener() {
 		}
 		return
 	}
-	listener, err := listenExternalNativeTCP(s.nativeTCPBindAddr, s.serverNativeTCPTLSConfig())
+	listener, boundAddr, err := listenExternalNativeTCPWithPortFallback(s.nativeTCPBindAddr, s.serverNativeTCPTLSConfig())
 	if err != nil {
 		s.emitDebug("listener-tcp-listen-failed=" + err.Error())
 		s.nativeTCPPeerAddr = nil
@@ -1129,6 +1129,8 @@ func (s *externalQUICModeAcceptState) openNativeTCPListener() {
 		s.nativeTCPListener = nil
 		return
 	}
+	s.nativeTCPBindAddr = boundAddr
+	s.nativeTCPAddr = externalNativeTCPAdvertiseAddr(boundAddr, s.nativeTCPPeerAddr)
 	s.nativeTCPListener = listener
 }
 
