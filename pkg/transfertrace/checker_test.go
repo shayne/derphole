@@ -321,11 +321,15 @@ func TestCheckKeepsDiagnosticsAbsentForLegacyAndEmptyTrace(t *testing.T) {
 }
 
 func TestCheckFailsMalformedNonEmptyDiagnosticField(t *testing.T) {
-	csvText := "timestamp_unix_ms,role,phase,app_bytes,last_error,rate_target_mbps\n" +
-		"1000,send,complete,1024,,fast\n"
-	_, err := Check(strings.NewReader(csvText), Options{Role: RoleSend, ExpectedBytes: 1024, ExpectedBytesSet: true})
-	if err == nil || !strings.Contains(err.Error(), "row 2") || !strings.Contains(err.Error(), "parse rate_target_mbps") || !strings.Contains(err.Error(), "fast") {
-		t.Fatalf("Check() error = %v, want malformed rate_target_mbps at row 2", err)
+	for _, column := range []string{"rate_target_mbps", "rate_ceiling_mbps"} {
+		t.Run(column, func(t *testing.T) {
+			csvText := "timestamp_unix_ms,role,phase,app_bytes,last_error," + column + "\n" +
+				"1000,send,complete,1024,,fast\n"
+			_, err := Check(strings.NewReader(csvText), Options{Role: RoleSend, ExpectedBytes: 1024, ExpectedBytesSet: true})
+			if err == nil || !strings.Contains(err.Error(), "row 2") || !strings.Contains(err.Error(), "parse "+column) || !strings.Contains(err.Error(), "fast") {
+				t.Fatalf("Check() error = %v, want malformed %s at row 2", err, column)
+			}
+		})
 	}
 }
 

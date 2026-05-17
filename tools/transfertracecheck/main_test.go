@@ -39,7 +39,7 @@ func TestRunPrintsSuccess(t *testing.T) {
 	if !strings.Contains(stdout.String(), "trace-ok rows=1 final_app_bytes=4096") {
 		t.Fatalf("stdout = %q, want trace-ok", stdout.String())
 	}
-	if strings.Contains(stdout.String(), "max_rate_target_mbps") || strings.Contains(stdout.String(), "receiver_commit_mbps") {
+	if strings.Contains(stdout.String(), "max_rate_target_mbps") || strings.Contains(stdout.String(), "receiver_committed_mbps") {
 		t.Fatalf("stdout = %q, want legacy output without diagnostics", stdout.String())
 	}
 	if stderr.Len() != 0 {
@@ -102,8 +102,8 @@ func TestRunPrintsDiagnosticSummary(t *testing.T) {
 		"max_replay_bytes=2097152",
 		"max_retransmits=9",
 		"max_peer_recv_queue_depth=1069",
-		"receiver_commit_mbps_min=1.00",
-		"receiver_commit_mbps_max=16.38",
+		"receiver_committed_mbps_min=1.00",
+		"receiver_committed_mbps_max=16.38",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("stdout = %q, want %q", out, want)
