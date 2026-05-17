@@ -2194,8 +2194,45 @@ func TestServiceBlastRepairPacketCountsRepairDiagnostics(t *testing.T) {
 	}
 }
 
-func TestBlastParallelSendProgressIncludesDiagnostics(t *testing.T) {
+func TestSendBlastRepairsCountsEncryptedPayloadBytes(t *testing.T) {
 	runID := testRunID(0xc0)
+	aead := testPacketAEAD(t)
+	history, err := newBlastRepairHistory(runID, 4, true, aead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer history.Close()
+	if err := history.Record(0, []byte("abcd")); err != nil {
+		t.Fatal(err)
+	}
+	history.MarkComplete(4, 1)
+	payload := make([]byte, 8)
+	stats := TransferStats{}
+	batcher := &capturingBatcher{}
+
+	retransmits, repairBytes, err := sendBlastRepairs(context.Background(), batcher, nil, history, payload, &stats, newBlastRepairDeduper(), time.Now(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retransmits != 1 {
+		t.Fatalf("retransmits = %d, want 1", retransmits)
+	}
+	if len(batcher.writes) != 1 {
+		t.Fatalf("repair writes = %d, want 1", len(batcher.writes))
+	}
+	if wirePayloadBytes := len(batcher.writes[0]) - headerLen; wirePayloadBytes != 4+aead.Overhead() {
+		t.Fatalf("wire repair payload bytes = %d, want encrypted payload size %d", wirePayloadBytes, 4+aead.Overhead())
+	}
+	if repairBytes != 4 {
+		t.Fatalf("repairBytes = %d, want original payload bytes 4", repairBytes)
+	}
+	if stats.Diagnostics.RepairBytes != 4 {
+		t.Fatalf("Diagnostics.RepairBytes = %d, want original payload bytes 4", stats.Diagnostics.RepairBytes)
+	}
+}
+
+func TestBlastParallelSendProgressIncludesDiagnostics(t *testing.T) {
+	runID := testRunID(0xc1)
 	activeLanes := 1
 	seq := uint64(0)
 	offset := uint64(0)
@@ -2957,6 +2994,93 @@ func TestSendBlastParallelSingleLaneReportsLaneCount(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatalf("timed out waiting for single-lane receive: %v", ctx.Err())
+	}
+}
+
+func TestSendBlastParallelSingleLaneProgressAndFinalDiagnostics(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	client, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	src := bytes.Repeat([]byte("single-lane-diagnostics"), 1<<10)
+	statsCh := make(chan TransferStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, err := ReceiveBlastParallelToWriter(ctx, []net.PacketConn{server}, io.Discard, ReceiveConfig{Blast: true}, int64(len(src)))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		statsCh <- stats
+	}()
+
+	progressCh := make(chan TransferStats, 1)
+	sendStats, err := SendBlastParallel(ctx, []net.PacketConn{client}, []string{server.LocalAddr().String()}, bytes.NewReader(src), SendConfig{
+		Blast:                      true,
+		RateMbps:                   123,
+		RateCeilingMbps:            456,
+		RateExplorationCeilingMbps: 789,
+		MinActiveLanes:             1,
+		MaxActiveLanes:             1,
+		Progress: func(stats TransferStats) {
+			if stats.BytesSent <= 0 {
+				return
+			}
+			select {
+			case progressCh <- stats:
+			default:
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("SendBlastParallel() error = %v", err)
+	}
+	progressStats := <-progressCh
+	assertSingleLaneDiagnostics(t, "progress", progressStats.Diagnostics, 123, 456, 789, int64(len(src)))
+	assertSingleLaneDiagnostics(t, "final", sendStats.Diagnostics, 123, 456, 789, int64(len(src)))
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ReceiveBlastParallelToWriter() error = %v", err)
+	case stats := <-statsCh:
+		if stats.BytesReceived != int64(len(src)) {
+			t.Fatalf("BytesReceived = %d, want %d", stats.BytesReceived, len(src))
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for single-lane diagnostics receive: %v", ctx.Err())
+	}
+}
+
+func assertSingleLaneDiagnostics(t *testing.T, label string, diagnostics TransferDiagnostics, rateMbps int, ceilingMbps int, explorationCeilingMbps int, sentBytes int64) {
+	t.Helper()
+	if diagnostics.RateTargetMbps != rateMbps {
+		t.Fatalf("%s RateTargetMbps = %d, want %d", label, diagnostics.RateTargetMbps, rateMbps)
+	}
+	if diagnostics.RateCeilingMbps != ceilingMbps {
+		t.Fatalf("%s RateCeilingMbps = %d, want %d", label, diagnostics.RateCeilingMbps, ceilingMbps)
+	}
+	if diagnostics.RateExplorationCeilingMbps != explorationCeilingMbps {
+		t.Fatalf("%s RateExplorationCeilingMbps = %d, want %d", label, diagnostics.RateExplorationCeilingMbps, explorationCeilingMbps)
+	}
+	if diagnostics.RateSelectedMbps != rateMbps {
+		t.Fatalf("%s RateSelectedMbps = %d, want %d", label, diagnostics.RateSelectedMbps, rateMbps)
+	}
+	if diagnostics.ActiveLanes != 1 || diagnostics.AvailableLanes != 1 {
+		t.Fatalf("%s lanes = active %d available %d, want active 1 available 1", label, diagnostics.ActiveLanes, diagnostics.AvailableLanes)
+	}
+	if diagnostics.DirectPacketBytes <= 0 || diagnostics.DirectPacketBytes > sentBytes {
+		t.Fatalf("%s DirectPacketBytes = %d, want 1..%d", label, diagnostics.DirectPacketBytes, sentBytes)
 	}
 }
 

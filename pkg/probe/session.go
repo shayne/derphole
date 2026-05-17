@@ -1820,16 +1820,51 @@ func sendBlastParallelEarlyResult(ctx context.Context, conns []net.PacketConn, r
 		return TransferStats{}, true, fmt.Errorf("packet conn count %d does not match remote addr count %d", len(conns), len(remoteAddrs))
 	}
 	if len(conns) == 1 {
-		stats, err := Send(ctx, conns[0], remoteAddrs[0], src, cfg)
-		if stats.Lanes == 0 {
-			stats.Lanes = 1
-		}
+		stats, err := sendBlastParallelSingleLane(ctx, conns[0], remoteAddrs[0], src, cfg)
 		return stats, true, err
 	}
 	if src == nil {
 		return TransferStats{}, true, errors.New("nil source reader")
 	}
 	return TransferStats{}, false, nil
+}
+
+func sendBlastParallelSingleLane(ctx context.Context, conn net.PacketConn, remoteAddr string, src io.Reader, cfg SendConfig) (TransferStats, error) {
+	if cfg.Progress != nil {
+		progress := cfg.Progress
+		cfg.Progress = func(stats TransferStats) {
+			emitProbeProgress(progress, withSingleLaneDiagnostics(cfg, stats))
+		}
+	}
+	stats, err := Send(ctx, conn, remoteAddr, src, cfg)
+	if stats.Lanes == 0 {
+		stats.Lanes = 1
+	}
+	return withSingleLaneDiagnostics(cfg, stats), err
+}
+
+func withSingleLaneDiagnostics(cfg SendConfig, stats TransferStats) TransferStats {
+	stats.Diagnostics = singleLaneDiagnostics(cfg, stats)
+	return stats
+}
+
+func singleLaneDiagnostics(cfg SendConfig, stats TransferStats) TransferDiagnostics {
+	return TransferDiagnostics{
+		RateTargetMbps:             cfg.RateMbps,
+		RateCeilingMbps:            cfg.RateCeilingMbps,
+		RateExplorationCeilingMbps: cfg.RateExplorationCeilingMbps,
+		RateSelectedMbps:           cfg.RateMbps,
+		ActiveLanes:                1,
+		AvailableLanes:             1,
+		LaneMin:                    cfg.MinActiveLanes,
+		LaneCap:                    cfg.MaxActiveLanes,
+		ReplayBytes:                stats.MaxReplayBytes,
+		Retransmits:                stats.Retransmits,
+		RepairRequests:             stats.Diagnostics.RepairRequests,
+		RepairBytes:                stats.Diagnostics.RepairBytes,
+		DirectPacketBytes:          stats.BytesSent,
+		DirectCommittedBytes:       stats.BytesSent,
+	}
 }
 
 func defaultedSendConfig(cfg SendConfig) SendConfig {
@@ -4132,29 +4167,32 @@ func sendBlastRepairs(ctx context.Context, batcher packetBatcher, peer net.Addr,
 	pending := make([][]byte, 0, batcher.MaxBatch())
 	retransmits := 0
 	var repairBytes int64
+	var pendingBytes int64
 	for len(payload) >= 8 {
 		seq := binary.BigEndian.Uint64(payload[:8])
 		payload = payload[8:]
-		packet, queued := blastRepairPacketForRequest(seq, history, deduper, now, &repairStats)
+		packet, packetPayloadBytes, queued := blastRepairPacketForRequest(seq, history, deduper, now, &repairStats)
 		if !queued {
 			continue
 		}
 		pending = append(pending, packet)
+		pendingBytes += packetPayloadBytes
 		if len(pending) == batcher.MaxBatch() {
-			written, writtenBytes, err := flushBlastRepairPackets(ctx, batcher, peer, pending, stats, progress)
+			written, writtenBytes, err := flushBlastRepairPackets(ctx, batcher, peer, pending, pendingBytes, stats, progress)
 			if err != nil {
 				return retransmits, repairBytes, err
 			}
 			retransmits += written
 			repairBytes += writtenBytes
 			pending = pending[:0]
+			pendingBytes = 0
 		}
 	}
 	if len(pending) == 0 {
 		traceBlastRepairRequest(repairStats, retransmits)
 		return retransmits, repairBytes, nil
 	}
-	written, writtenBytes, err := flushBlastRepairPackets(ctx, batcher, peer, pending, stats, progress)
+	written, writtenBytes, err := flushBlastRepairPackets(ctx, batcher, peer, pending, pendingBytes, stats, progress)
 	if err != nil {
 		return retransmits, repairBytes, err
 	}
@@ -4170,24 +4208,23 @@ type blastRepairRequestStats struct {
 	duplicate   int
 }
 
-func blastRepairPacketForRequest(seq uint64, history *blastRepairHistory, deduper *blastRepairDeduper, now time.Time, stats *blastRepairRequestStats) ([]byte, bool) {
+func blastRepairPacketForRequest(seq uint64, history *blastRepairHistory, deduper *blastRepairDeduper, now time.Time, stats *blastRepairRequestStats) ([]byte, int64, bool) {
 	packet := history.packet(seq)
 	if packet == nil {
 		stats.unavailable++
-		return nil, false
+		return nil, 0, false
 	}
 	if !deduper.ShouldSend(seq, now) {
 		stats.duplicate++
-		return nil, false
+		return nil, 0, false
 	}
-	return packet, true
+	return packet, blastRepairPacketPayloadBytes(packet, history), true
 }
 
-func flushBlastRepairPackets(ctx context.Context, batcher packetBatcher, peer net.Addr, pending [][]byte, stats *TransferStats, progress func(TransferStats)) (int, int64, error) {
+func flushBlastRepairPackets(ctx context.Context, batcher packetBatcher, peer net.Addr, pending [][]byte, repairBytes int64, stats *TransferStats, progress func(TransferStats)) (int, int64, error) {
 	if err := writeBlastBatch(ctx, batcher, peer, pending); err != nil {
 		return 0, 0, err
 	}
-	repairBytes := blastRepairPacketPayloadBytes(pending)
 	if stats != nil {
 		stats.Retransmits += int64(len(pending))
 		stats.PacketsSent += int64(len(pending))
@@ -4204,15 +4241,28 @@ func recordRepairRequest(stats *TransferStats) {
 	stats.Diagnostics.RepairRequests++
 }
 
-func blastRepairPacketPayloadBytes(packets [][]byte) int64 {
-	var bytes int64
-	for _, packet := range packets {
-		if len(packet) <= headerLen {
-			continue
-		}
-		bytes += int64(len(packet) - headerLen)
+func blastRepairPacketPayloadBytes(packet []byte, history *blastRepairHistory) int64 {
+	if len(packet) <= headerLen {
+		return 0
 	}
-	return bytes
+	payloadBytes := len(packet) - headerLen - blastRepairPacketAEADOverhead(history)
+	if payloadBytes < 0 {
+		return 0
+	}
+	return int64(payloadBytes)
+}
+
+func blastRepairPacketAEADOverhead(history *blastRepairHistory) int {
+	if history == nil {
+		return 0
+	}
+	if history.streamReplay != nil && history.streamReplay.packetAEAD != nil {
+		return history.streamReplay.packetAEAD.Overhead()
+	}
+	if history.packetAEAD != nil {
+		return history.packetAEAD.Overhead()
+	}
+	return 0
 }
 
 func traceBlastRepairRequest(stats blastRepairRequestStats, retransmits int) {
