@@ -5161,10 +5161,37 @@ func TestExternalDirectUDPSelectRemoteAddrsByConnLeavesUnverifiedLanesBlank(t *t
 		nil,
 	}
 
-	got := externalDirectUDPSelectRemoteAddrsByConn(observedByConn, 4, nil)
+	got := externalDirectUDPSelectRemoteAddrsByConn(observedByConn, nil, 4, nil)
 	want := []string{"198.51.100.1:10001", "", "198.51.100.1:10003", ""}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("externalDirectUDPSelectRemoteAddrsByConn() = %v, want %v", got, want)
+	}
+}
+
+func TestExternalDirectUDPSelectRemoteAddrsByConnSkipsUnroutableObservedCandidate(t *testing.T) {
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	origRoute := externalDirectUDPRouteCandidate
+	t.Cleanup(func() { externalDirectUDPRouteCandidate = origRoute })
+	externalDirectUDPRouteCandidate = func(_ net.PacketConn, candidate string) bool {
+		return candidate != "10.0.1.85:51476"
+	}
+
+	observedByConn := [][]net.Addr{
+		parseCandidateStrings([]string{
+			"10.0.1.85:51476",
+			"10.0.4.183:51476",
+		}),
+	}
+
+	got := externalDirectUDPSelectRemoteAddrsByConn(observedByConn, []net.PacketConn{conn}, 1, nil)
+	want := []string{"10.0.4.183:51476"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("externalDirectUDPSelectRemoteAddrsByConn(unroutable observed) = %v, want %v", got, want)
 	}
 }
 

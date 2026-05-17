@@ -4063,7 +4063,7 @@ func TestExternalDirectUDPSelectRemoteAddrsByConnKeepsObservedLaneEndpoint(t *te
 		},
 	}
 
-	got := externalDirectUDPSelectRemoteAddrsByConn(observedByConn, 4, nil)
+	got := externalDirectUDPSelectRemoteAddrsByConn(observedByConn, nil, 4, nil)
 	want := []string{
 		"68.20.14.192:38183",
 		"68.20.14.192:34375",

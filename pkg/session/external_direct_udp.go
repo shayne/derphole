@@ -178,6 +178,9 @@ var externalReceiveExternalHandoffDERPFn = receiveExternalHandoffDERP
 var externalSessionPacketAEADDomain = []byte("derphole-session-packet-aead-v1")
 var externalRelayPrefixDERPDataNonceDomain = []byte("derphole-relay-prefix-derp-data-nonce-v1")
 var externalDirectUDPObservePunchAddrsByConn = probe.ObservePunchAddrsByConn
+var externalDirectUDPRouteCandidate = externalDirectUDPDefaultRouteCandidate
+
+var externalDirectUDPRouteProbePayload = []byte("derphole-direct-udp-route-check-v1")
 
 var errExternalDirectUDPNoRateProbePackets = errors.New("direct UDP rate probes received no packets")
 
@@ -4121,7 +4124,7 @@ func externalDirectUDPSelectRemoteAddrs(ctx context.Context, conns []net.PacketC
 	if emitter != nil {
 		emitter.Debug("udp-observed-addrs-by-conn=" + externalDirectUDPFormatObservedAddrsByConn(observedByConn))
 	}
-	selected := externalDirectUDPSelectRemoteAddrsByConn(observedByConn, len(conns), nil)
+	selected := externalDirectUDPSelectRemoteAddrsByConn(observedByConn, conns, len(conns), nil)
 	if emitter != nil {
 		emitter.Debug("udp-selected-addrs=" + strings.Join(selected, ","))
 	}
@@ -4153,7 +4156,7 @@ func externalDirectUDPFormatObservedAddrsByConn(observedByConn [][]net.Addr) str
 	return strings.Join(parts, ",")
 }
 
-func externalDirectUDPSelectRemoteAddrsByConn(observedByConn [][]net.Addr, parallel int, peer net.Addr) []string {
+func externalDirectUDPSelectRemoteAddrsByConn(observedByConn [][]net.Addr, conns []net.PacketConn, parallel int, peer net.Addr) []string {
 	if parallel <= 0 {
 		parallel = len(observedByConn)
 	}
@@ -4163,6 +4166,9 @@ func externalDirectUDPSelectRemoteAddrsByConn(observedByConn [][]net.Addr, paral
 	selectCandidate := func(i int, candidate string) bool {
 		endpoint := externalDirectUDPEndpointKey(candidate)
 		if candidate == "" || seen[candidate] || seenEndpoint[endpoint] {
+			return false
+		}
+		if !externalDirectUDPCanRouteSelectedCandidate(conns, i, candidate) {
 			return false
 		}
 		out[i] = candidate
@@ -4178,6 +4184,22 @@ func externalDirectUDPSelectRemoteAddrsByConn(observedByConn [][]net.Addr, paral
 		}
 	}
 	return out
+}
+
+func externalDirectUDPCanRouteSelectedCandidate(conns []net.PacketConn, i int, candidate string) bool {
+	if i < 0 || i >= len(conns) || conns[i] == nil {
+		return true
+	}
+	return externalDirectUDPRouteCandidate(conns[i], candidate)
+}
+
+func externalDirectUDPDefaultRouteCandidate(conn net.PacketConn, candidate string) bool {
+	addrPort, ok := externalDirectUDPParsedCandidateAddrPort(candidate)
+	if conn == nil || !ok {
+		return false
+	}
+	_, err := conn.WriteTo(externalDirectUDPRouteProbePayload, net.UDPAddrFromAddrPort(addrPort))
+	return err == nil
 }
 
 func externalDirectUDPSelectedAddrCount(addrs []string) int {
