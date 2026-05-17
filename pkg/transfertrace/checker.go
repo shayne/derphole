@@ -45,6 +45,7 @@ type PairResult struct {
 
 type checkerIndexes struct {
 	fields            int
+	header            []string
 	timestamp         int
 	timestampName     string
 	role              int
@@ -494,6 +495,7 @@ func checkerHeaderIndexes(header []string) (checkerIndexes, error) {
 	}
 	return checkerIndexes{
 		fields:            len(header),
+		header:            append([]string(nil), header...),
 		timestamp:         timestamp,
 		timestampName:     timestampName,
 		role:              role,
@@ -520,8 +522,10 @@ func lookupTimestamp(positions map[string]int) (int, string, error) {
 }
 
 func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int) (checkerRow, error) {
-	if len(record) != indexes.fields {
-		return checkerRow{}, fmt.Errorf("row %d: wrong number of fields: got %d, want %d", rowNo, len(record), indexes.fields)
+	var err error
+	record, err = normalizeCheckerRecord(record, indexes, rowNo)
+	if err != nil {
+		return checkerRow{}, err
 	}
 	if err := requireCheckerRowFields(record, indexes, rowNo); err != nil {
 		return checkerRow{}, err
@@ -563,6 +567,59 @@ func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int) (checke
 		lastState:         field(record, indexes.lastState),
 		lastError:         field(record, indexes.lastError),
 	}, nil
+}
+
+func normalizeCheckerRecord(record []string, indexes checkerIndexes, rowNo int) ([]string, error) {
+	if len(record) == indexes.fields {
+		return record, nil
+	}
+	if len(record) > indexes.fields || !missingOnlyTrailingOptionalDiagnostics(indexes.header, len(record)) {
+		return nil, fmt.Errorf("row %d: wrong number of fields: got %d, want %d", rowNo, len(record), indexes.fields)
+	}
+	padded := make([]string, indexes.fields)
+	copy(padded, record)
+	return padded, nil
+}
+
+func missingOnlyTrailingOptionalDiagnostics(header []string, missingStart int) bool {
+	if missingStart >= len(header) {
+		return false
+	}
+	for _, name := range header[missingStart:] {
+		if !isOptionalTrailingDiagnosticColumn(name) {
+			return false
+		}
+	}
+	return true
+}
+
+func isOptionalTrailingDiagnosticColumn(name string) bool {
+	switch name {
+	case "rate_target_mbps",
+		"rate_ceiling_mbps",
+		"rate_exploration_ceiling_mbps",
+		"rate_selected_mbps",
+		"active_lanes",
+		"available_lanes",
+		"lane_min",
+		"lane_cap",
+		"controller_decision",
+		"controller_reason",
+		"send_goodput_mbps",
+		"receive_goodput_mbps",
+		"receiver_committed_mbps",
+		"replay_bytes",
+		"retransmits",
+		"repair_requests",
+		"repair_bytes",
+		"peer_recv_queue_depth",
+		"peer_recv_queue_depth_max",
+		"direct_packet_bytes",
+		"direct_committed_bytes":
+		return true
+	default:
+		return false
+	}
 }
 
 func requireCheckerRowFields(record []string, indexes checkerIndexes, rowNo int) error {

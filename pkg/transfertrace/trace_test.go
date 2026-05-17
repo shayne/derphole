@@ -173,6 +173,189 @@ func TestRecorderWritesReceiverAnchoredProgressColumns(t *testing.T) {
 	assertColumn(t, row, indexes, "fallback_reason", "direct UDP rate probes received no packets")
 }
 
+func TestRecorderWritesDirectUDPDiagnosticFields(t *testing.T) {
+	start := time.UnixMilli(1_000)
+
+	var sendOut bytes.Buffer
+	sendRec, err := NewRecorder(&sendOut, RoleSend, start)
+	if err != nil {
+		t.Fatalf("NewRecorder(send) error = %v", err)
+	}
+	sendRec.Observe(Snapshot{
+		At:                         start.Add(500 * time.Millisecond),
+		Phase:                      PhaseDirectExecute,
+		LocalSentBytes:             1_250_000,
+		PeerReceivedBytes:          1_000_000,
+		RateTargetMbps:             263,
+		RateCeilingMbps:            700,
+		RateExplorationCeilingMbps: 1200,
+		DirectRateSelectedMbps:     263,
+		DirectLanesActive:          4,
+		DirectLanesAvailable:       7,
+		LaneMin:                    4,
+		LaneCap:                    4,
+		ControllerDecision:         "hold",
+		ControllerReason:           "initial-hold",
+		ReplayBytes:                2_696_032,
+		RetransmitCount:            3_600,
+		RepairRequests:             12,
+		RepairBytes:                98_304,
+		PeerRecvQueueDepth:         512,
+		PeerRecvQueueDepthMax:      1_069,
+		DirectPacketBytes:          1_250_000,
+		DirectCommittedBytes:       1_000_000,
+		LastState:                  "connected-direct",
+	})
+	sendRec.Observe(Snapshot{
+		At:                         start.Add(time.Second),
+		Phase:                      PhaseDirectExecute,
+		LocalSentBytes:             2_000_000,
+		PeerReceivedBytes:          1_250_000,
+		RateTargetMbps:             263,
+		RateCeilingMbps:            700,
+		RateExplorationCeilingMbps: 1200,
+		DirectRateSelectedMbps:     263,
+		DirectLanesActive:          4,
+		DirectLanesAvailable:       7,
+		LaneMin:                    4,
+		LaneCap:                    4,
+		ControllerDecision:         "hold",
+		ControllerReason:           "initial-hold",
+		ReplayBytes:                2_696_032,
+		RetransmitCount:            3_600,
+		RepairRequests:             12,
+		RepairBytes:                98_304,
+		PeerRecvQueueDepth:         512,
+		PeerRecvQueueDepthMax:      1_069,
+		DirectPacketBytes:          2_000_000,
+		DirectCommittedBytes:       1_250_000,
+		LastState:                  "connected-direct",
+	})
+	if err := sendRec.Close(); err != nil {
+		t.Fatalf("Close(send) error = %v", err)
+	}
+
+	sendRecords, sendIndexes := readTraceCSV(t, sendOut.String())
+	assertRecordCount(t, sendRecords, 3)
+	assertHeaderSuffix(t, sendRecords[0], directUDPDiagnosticHeader())
+	sendRow := sendRecords[2]
+	assertColumn(t, sendRow, sendIndexes, "rate_target_mbps", "263")
+	assertColumn(t, sendRow, sendIndexes, "rate_ceiling_mbps", "700")
+	assertColumn(t, sendRow, sendIndexes, "rate_exploration_ceiling_mbps", "1200")
+	assertColumn(t, sendRow, sendIndexes, "rate_selected_mbps", "263")
+	assertColumn(t, sendRow, sendIndexes, "active_lanes", "4")
+	assertColumn(t, sendRow, sendIndexes, "available_lanes", "7")
+	assertColumn(t, sendRow, sendIndexes, "lane_min", "4")
+	assertColumn(t, sendRow, sendIndexes, "lane_cap", "4")
+	assertColumn(t, sendRow, sendIndexes, "controller_decision", "hold")
+	assertColumn(t, sendRow, sendIndexes, "controller_reason", "initial-hold")
+	assertColumn(t, sendRow, sendIndexes, "send_goodput_mbps", "12.00")
+	assertColumn(t, sendRow, sendIndexes, "receiver_committed_mbps", "4.00")
+	assertColumn(t, sendRow, sendIndexes, "replay_bytes", "2696032")
+	assertColumn(t, sendRow, sendIndexes, "retransmits", "3600")
+	assertColumn(t, sendRow, sendIndexes, "repair_requests", "12")
+	assertColumn(t, sendRow, sendIndexes, "repair_bytes", "98304")
+	assertColumn(t, sendRow, sendIndexes, "peer_recv_queue_depth", "512")
+	assertColumn(t, sendRow, sendIndexes, "peer_recv_queue_depth_max", "1069")
+	assertColumn(t, sendRow, sendIndexes, "direct_packet_bytes", "2000000")
+	assertColumn(t, sendRow, sendIndexes, "direct_committed_bytes", "1250000")
+
+	var receiveOut bytes.Buffer
+	receiveRec, err := NewRecorder(&receiveOut, RoleReceive, start)
+	if err != nil {
+		t.Fatalf("NewRecorder(receive) error = %v", err)
+	}
+	receiveRec.Observe(Snapshot{
+		At:                   start.Add(500 * time.Millisecond),
+		Phase:                PhaseDirectExecute,
+		DirectBytes:          42,
+		DirectPacketBytes:    1_250_000,
+		DirectCommittedBytes: 1_000_000,
+	})
+	receiveRec.Observe(Snapshot{
+		At:                   start.Add(time.Second),
+		Phase:                PhaseDirectExecute,
+		DirectBytes:          84,
+		DirectPacketBytes:    2_000_000,
+		DirectCommittedBytes: 1_250_000,
+	})
+	if err := receiveRec.Close(); err != nil {
+		t.Fatalf("Close(receive) error = %v", err)
+	}
+
+	receiveRecords, receiveIndexes := readTraceCSV(t, receiveOut.String())
+	assertRecordCount(t, receiveRecords, 3)
+	assertHeaderSuffix(t, receiveRecords[0], directUDPDiagnosticHeader())
+	receiveRow := receiveRecords[2]
+	assertColumn(t, receiveRow, receiveIndexes, "receive_goodput_mbps", "12.00")
+	assertColumn(t, receiveRow, receiveIndexes, "receiver_committed_mbps", "4.00")
+	assertColumn(t, receiveRow, receiveIndexes, "direct_packet_bytes", "2000000")
+	assertColumn(t, receiveRow, receiveIndexes, "direct_committed_bytes", "1250000")
+}
+
+func TestRecorderLeavesRoleSpecificDiagnosticFieldsEmpty(t *testing.T) {
+	start := time.UnixMilli(2_000)
+
+	var sendOut bytes.Buffer
+	sendRec, err := NewRecorder(&sendOut, RoleSend, start)
+	if err != nil {
+		t.Fatalf("NewRecorder(send) error = %v", err)
+	}
+	sendRec.Observe(Snapshot{
+		At:             start.Add(500 * time.Millisecond),
+		Phase:          PhaseDirectExecute,
+		LocalSentBytes: 1_250_000,
+	})
+	if err := sendRec.Close(); err != nil {
+		t.Fatalf("Close(send) error = %v", err)
+	}
+
+	sendRecords, sendIndexes := readTraceCSV(t, sendOut.String())
+	sendRow := sendRecords[1]
+	assertColumn(t, sendRow, sendIndexes, "send_goodput_mbps", "20.00")
+	assertColumn(t, sendRow, sendIndexes, "receive_goodput_mbps", "")
+	assertColumn(t, sendRow, sendIndexes, "receiver_committed_mbps", "")
+	assertColumn(t, sendRow, sendIndexes, "direct_packet_bytes", "")
+	assertColumn(t, sendRow, sendIndexes, "direct_committed_bytes", "")
+
+	var receiveOut bytes.Buffer
+	receiveRec, err := NewRecorder(&receiveOut, RoleReceive, start)
+	if err != nil {
+		t.Fatalf("NewRecorder(receive) error = %v", err)
+	}
+	receiveRec.Observe(Snapshot{
+		At:                   start.Add(500 * time.Millisecond),
+		Phase:                PhaseDirectExecute,
+		DirectPacketBytes:    1_250_000,
+		DirectCommittedBytes: 1_000_000,
+	})
+	if err := receiveRec.Close(); err != nil {
+		t.Fatalf("Close(receive) error = %v", err)
+	}
+
+	receiveRecords, receiveIndexes := readTraceCSV(t, receiveOut.String())
+	receiveRow := receiveRecords[1]
+	assertColumn(t, receiveRow, receiveIndexes, "send_goodput_mbps", "")
+	assertColumn(t, receiveRow, receiveIndexes, "receive_goodput_mbps", "20.00")
+	assertColumn(t, receiveRow, receiveIndexes, "receiver_committed_mbps", "16.00")
+	assertColumn(t, receiveRow, receiveIndexes, "rate_target_mbps", "")
+	assertColumn(t, receiveRow, receiveIndexes, "rate_ceiling_mbps", "")
+	assertColumn(t, receiveRow, receiveIndexes, "rate_exploration_ceiling_mbps", "")
+	assertColumn(t, receiveRow, receiveIndexes, "rate_selected_mbps", "")
+	assertColumn(t, receiveRow, receiveIndexes, "active_lanes", "")
+	assertColumn(t, receiveRow, receiveIndexes, "available_lanes", "")
+	assertColumn(t, receiveRow, receiveIndexes, "lane_min", "")
+	assertColumn(t, receiveRow, receiveIndexes, "lane_cap", "")
+	assertColumn(t, receiveRow, receiveIndexes, "controller_decision", "")
+	assertColumn(t, receiveRow, receiveIndexes, "controller_reason", "")
+	assertColumn(t, receiveRow, receiveIndexes, "replay_bytes", "")
+	assertColumn(t, receiveRow, receiveIndexes, "retransmits", "")
+	assertColumn(t, receiveRow, receiveIndexes, "repair_requests", "")
+	assertColumn(t, receiveRow, receiveIndexes, "repair_bytes", "")
+	assertColumn(t, receiveRow, receiveIndexes, "peer_recv_queue_depth", "")
+	assertColumn(t, receiveRow, receiveIndexes, "peer_recv_queue_depth_max", "")
+}
+
 func TestRecorderRowsParseByHeaderAndBlankZeroOptionalFields(t *testing.T) {
 	var out bytes.Buffer
 	rec, err := NewRecorder(&out, RoleReceive, time.Unix(500, 0))
@@ -292,6 +475,19 @@ func assertRecordCount(t *testing.T, records [][]string, want int) {
 	}
 }
 
+func assertHeaderSuffix(t *testing.T, header []string, suffix []string) {
+	t.Helper()
+	if len(header) < len(suffix) {
+		t.Fatalf("header length = %d, want at least %d", len(header), len(suffix))
+	}
+	start := len(header) - len(suffix)
+	for i, want := range suffix {
+		if got := header[start+i]; got != want {
+			t.Fatalf("header suffix[%d] = %q, want %q; header = %v", i, got, want, header)
+		}
+	}
+}
+
 func assertColumn(t *testing.T, row []string, indexes map[string]int, column string, want string) {
 	t.Helper()
 	index, ok := indexes[column]
@@ -300,6 +496,32 @@ func assertColumn(t *testing.T, row []string, indexes map[string]int, column str
 	}
 	if got := row[index]; got != want {
 		t.Fatalf("%s = %q, want %q", column, got, want)
+	}
+}
+
+func directUDPDiagnosticHeader() []string {
+	return []string{
+		"rate_target_mbps",
+		"rate_ceiling_mbps",
+		"rate_exploration_ceiling_mbps",
+		"rate_selected_mbps",
+		"active_lanes",
+		"available_lanes",
+		"lane_min",
+		"lane_cap",
+		"controller_decision",
+		"controller_reason",
+		"send_goodput_mbps",
+		"receive_goodput_mbps",
+		"receiver_committed_mbps",
+		"replay_bytes",
+		"retransmits",
+		"repair_requests",
+		"repair_bytes",
+		"peer_recv_queue_depth",
+		"peer_recv_queue_depth_max",
+		"direct_packet_bytes",
+		"direct_committed_bytes",
 	}
 }
 

@@ -63,6 +63,27 @@ var header = [...]string{
 	"out_of_order_bytes",
 	"last_state",
 	"last_error",
+	"rate_target_mbps",
+	"rate_ceiling_mbps",
+	"rate_exploration_ceiling_mbps",
+	"rate_selected_mbps",
+	"active_lanes",
+	"available_lanes",
+	"lane_min",
+	"lane_cap",
+	"controller_decision",
+	"controller_reason",
+	"send_goodput_mbps",
+	"receive_goodput_mbps",
+	"receiver_committed_mbps",
+	"replay_bytes",
+	"retransmits",
+	"repair_requests",
+	"repair_bytes",
+	"peer_recv_queue_depth",
+	"peer_recv_queue_depth_max",
+	"direct_packet_bytes",
+	"direct_committed_bytes",
 }
 
 var Header = append([]string(nil), header[:]...)
@@ -70,42 +91,60 @@ var Header = append([]string(nil), header[:]...)
 var HeaderLine = strings.Join(header[:], ",")
 
 type Snapshot struct {
-	At                     time.Time
-	Phase                  Phase
-	RelayBytes             int64
-	DirectBytes            int64
-	AppBytes               int64
-	LocalSentBytes         int64
-	PeerReceivedBytes      int64
-	SetupElapsedMS         int64
-	TransferElapsedMS      int64
-	DirectValidated        bool
-	FallbackReason         string
-	DirectRateSelectedMbps int
-	DirectRateActiveMbps   int
-	DirectLanesActive      int
-	DirectLanesAvailable   int
-	DirectProbeState       string
-	DirectProbeSummary     string
-	ReplayWindowBytes      uint64
-	RepairQueueBytes       uint64
-	RetransmitCount        int64
-	OutOfOrderBytes        uint64
-	LastState              string
-	LastError              string
+	At                         time.Time
+	Phase                      Phase
+	RelayBytes                 int64
+	DirectBytes                int64
+	AppBytes                   int64
+	LocalSentBytes             int64
+	PeerReceivedBytes          int64
+	SetupElapsedMS             int64
+	TransferElapsedMS          int64
+	DirectValidated            bool
+	FallbackReason             string
+	DirectRateSelectedMbps     int
+	DirectRateActiveMbps       int
+	DirectLanesActive          int
+	DirectLanesAvailable       int
+	RateTargetMbps             int
+	RateCeilingMbps            int
+	RateExplorationCeilingMbps int
+	LaneMin                    int
+	LaneCap                    int
+	ControllerDecision         string
+	ControllerReason           string
+	DirectProbeState           string
+	DirectProbeSummary         string
+	ReplayWindowBytes          uint64
+	ReplayBytes                uint64
+	RepairQueueBytes           uint64
+	RetransmitCount            int64
+	RepairRequests             int64
+	RepairBytes                int64
+	OutOfOrderBytes            uint64
+	PeerRecvQueueDepth         int
+	PeerRecvQueueDepthMax      int
+	DirectPacketBytes          int64
+	DirectCommittedBytes       int64
+	LastState                  string
+	LastError                  string
 }
 
 type Recorder struct {
-	mu       sync.Mutex
-	role     Role
-	start    time.Time
-	w        *csv.Writer
-	lastAt   time.Time
-	lastApp  int64
-	current  Snapshot
-	closed   bool
-	terminal bool
-	err      error
+	mu                       sync.Mutex
+	role                     Role
+	start                    time.Time
+	w                        *csv.Writer
+	lastAt                   time.Time
+	lastApp                  int64
+	lastLocalSentBytes       int64
+	lastDirectPacketBytes    int64
+	lastDirectCommittedBytes int64
+	lastPeerReceivedBytes    int64
+	current                  Snapshot
+	closed                   bool
+	terminal                 bool
+	err                      error
 }
 
 func NewRecorder(out io.Writer, role Role, start time.Time) (*Recorder, error) {
@@ -248,10 +287,11 @@ func (r *Recorder) observeLocked(snap Snapshot) {
 	if snap.At.IsZero() {
 		snap.At = time.Now()
 	}
-	deltaBytes := snap.AppBytes - r.lastApp
-	if deltaBytes < 0 {
-		deltaBytes = 0
-	}
+	deltaBytes := nonNegativeDelta(snap.AppBytes, r.lastApp)
+	localSentDelta := nonNegativeDelta(snap.LocalSentBytes, r.lastLocalSentBytes)
+	directPacketDelta := nonNegativeDelta(snap.DirectPacketBytes, r.lastDirectPacketBytes)
+	directCommittedDelta := nonNegativeDelta(snap.DirectCommittedBytes, r.lastDirectCommittedBytes)
+	peerReceivedDelta := nonNegativeDelta(snap.PeerReceivedBytes, r.lastPeerReceivedBytes)
 	deltaMS := int64(0)
 	if !r.lastAt.IsZero() {
 		deltaMS = snap.At.Sub(r.lastAt).Milliseconds()
@@ -261,7 +301,7 @@ func (r *Recorder) observeLocked(snap Snapshot) {
 	if deltaMS < 0 {
 		deltaMS = 0
 	}
-	if err := r.w.Write(r.row(snap, deltaBytes, deltaMS)); err != nil {
+	if err := r.w.Write(r.row(snap, deltaBytes, deltaMS, localSentDelta, directPacketDelta, directCommittedDelta, peerReceivedDelta)); err != nil {
 		r.err = err
 		return
 	}
@@ -273,9 +313,28 @@ func (r *Recorder) observeLocked(snap Snapshot) {
 	r.current = snap
 	r.lastAt = snap.At
 	r.lastApp = snap.AppBytes
+	r.lastLocalSentBytes = snap.LocalSentBytes
+	r.lastDirectPacketBytes = snap.DirectPacketBytes
+	r.lastDirectCommittedBytes = snap.DirectCommittedBytes
+	r.lastPeerReceivedBytes = snap.PeerReceivedBytes
 }
 
-func (r *Recorder) row(snap Snapshot, deltaBytes int64, deltaMS int64) []string {
+func (r *Recorder) row(snap Snapshot, deltaBytes int64, deltaMS int64, localSentDelta int64, directPacketDelta int64, directCommittedDelta int64, peerReceivedDelta int64) []string {
+	sendGoodput := ""
+	if r.role == RoleSend && snap.LocalSentBytes > 0 {
+		sendGoodput = formatMbps(localSentDelta, deltaMS)
+	}
+	receiveGoodput := ""
+	if r.role == RoleReceive && snap.DirectPacketBytes > 0 {
+		receiveGoodput = formatMbps(directPacketDelta, deltaMS)
+	}
+	receiverCommittedGoodput := ""
+	if r.role == RoleReceive && snap.DirectCommittedBytes > 0 {
+		receiverCommittedGoodput = formatMbps(directCommittedDelta, deltaMS)
+	} else if r.role == RoleSend && snap.PeerReceivedBytes > 0 {
+		receiverCommittedGoodput = formatMbps(peerReceivedDelta, deltaMS)
+	}
+
 	return []string{
 		strconv.FormatInt(snap.At.UnixMilli(), 10),
 		strconv.FormatInt(snap.At.Sub(r.start).Milliseconds(), 10),
@@ -304,7 +363,36 @@ func (r *Recorder) row(snap Snapshot, deltaBytes int64, deltaMS int64) []string 
 		formatOptionalUint64(snap.OutOfOrderBytes),
 		snap.LastState,
 		snap.LastError,
+		formatOptionalInt(snap.RateTargetMbps),
+		formatOptionalInt(snap.RateCeilingMbps),
+		formatOptionalInt(snap.RateExplorationCeilingMbps),
+		formatOptionalInt(snap.DirectRateSelectedMbps),
+		formatOptionalInt(snap.DirectLanesActive),
+		formatOptionalInt(snap.DirectLanesAvailable),
+		formatOptionalInt(snap.LaneMin),
+		formatOptionalInt(snap.LaneCap),
+		snap.ControllerDecision,
+		snap.ControllerReason,
+		sendGoodput,
+		receiveGoodput,
+		receiverCommittedGoodput,
+		formatOptionalUint64(snap.ReplayBytes),
+		formatOptionalInt64(snap.RetransmitCount),
+		formatOptionalInt64(snap.RepairRequests),
+		formatOptionalInt64(snap.RepairBytes),
+		formatOptionalInt(snap.PeerRecvQueueDepth),
+		formatOptionalInt(snap.PeerRecvQueueDepthMax),
+		formatOptionalInt64(snap.DirectPacketBytes),
+		formatOptionalInt64(snap.DirectCommittedBytes),
 	}
+}
+
+func nonNegativeDelta(current int64, previous int64) int64 {
+	delta := current - previous
+	if delta < 0 {
+		return 0
+	}
+	return delta
 }
 
 func formatMbps(deltaBytes int64, deltaMS int64) string {
