@@ -27,6 +27,35 @@ Measure raw network capacity separately before blaming tunnel overhead.
 
 Keep source payload size, host pair, and direction fixed when comparing variants. Record duration, throughput, final path state, and whether the session upgraded from `connected-relay` to `connected-direct`.
 
+## Direct UDP Diagnostic Comparison
+
+Use `scripts/direct-udp-diagnostic-benchmark.sh` when a transfer completes but runs below expected line rate.
+
+```bash
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/direct-udp-diagnostic-benchmark.sh <sender-host> <receiver-host> 1024
+```
+
+When comparing against a forwarded iperf3 endpoint instead of the receiver host, start the iperf3 server separately and set the external host:
+
+```bash
+DERPHOLE_DIAG_IPERF_EXTERNAL_HOST=<forwarded-ip> DERPHOLE_IPERF_PORT=8321 DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/direct-udp-diagnostic-benchmark.sh <sender-host> <receiver-host> 1024
+```
+
+The script writes `diagnostic-summary.env` with:
+
+- `diagnostic-iperf-tcp-goodput-mbps`
+- `diagnostic-iperf-udp-goodput-mbps`
+- `diagnostic-transfer-sender-goodput-mbps`
+- `diagnostic-transfer-receiver-goodput-mbps`
+- `diagnostic-transport-max-peer-recv-queue-depth`
+- `diagnostic-probe-samples`
+
+Interpretation:
+
+- high iperf and low probe points at packet engine or UDP socket behavior
+- high probe and low transfer points at stream, replay, repair, queue, or controller behavior
+- low sender and receiver transfer goodput with high queue depth points at backpressure
+
 ## Phase 1 Public Transport Gate
 
 Before changing the public transport protocol, capture a baseline for each host pair and direction:
