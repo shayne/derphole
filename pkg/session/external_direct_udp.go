@@ -1523,6 +1523,11 @@ func externalExecutePreparedDirectUDPSend(ctx context.Context, src io.Reader, pl
 	}
 	externalDirectUDPValidateDirectProgress(nil, metrics, stats)
 	externalDirectUDPSendRecordMetrics(metrics, stats, !plan.sendSrcRecordsDirectMetrics)
+	if plan.sendSrcRecordsDirectMetrics {
+		metrics.SetProbeStatsWithoutByteProgress(stats)
+	} else {
+		metrics.SetProbeStats(stats)
+	}
 	if err != nil {
 		if !plan.sendSrcRecordsDirectMetrics {
 			metrics.SetError(err)
@@ -1745,6 +1750,7 @@ func externalExecutePreparedDirectUDPReceive(ctx context.Context, plan externalD
 	externalDirectUDPValidateDirectProgress(nil, metrics, stats)
 	if err != nil {
 		externalDirectUDPBackfillReceiveMetrics(metrics, stats, !plan.receiveDstRecordsDirectMetrics)
+		metrics.SetProbeStats(stats)
 		metrics.SetError(err)
 	} else {
 		externalDirectUDPRecordReceiveMetrics(metrics, cfg.Emitter, stats, !plan.receiveDstRecordsDirectMetrics)
@@ -1816,6 +1822,7 @@ func externalDirectUDPFlushReceivePlan(plan externalDirectUDPReceivePlan, err er
 
 func externalDirectUDPRecordReceiveMetrics(metrics *externalTransferMetrics, emitter *telemetry.Emitter, stats probe.TransferStats, backfillDirectBytes bool) {
 	externalDirectUDPBackfillReceiveMetrics(metrics, stats, backfillDirectBytes)
+	metrics.SetProbeStats(stats)
 	emitExternalTransferMetricsComplete(metrics, emitter, "udp-receive", stats, time.Now())
 }
 

@@ -44,6 +44,7 @@ type externalTransferMetrics struct {
 	directLanesActive      int
 	directLanesAvailable   int
 	rateTargetMbps         int
+	rateTargetFromProbe    bool
 	rateCeilingMbps        int
 	rateExplorationCeiling int
 	laneMin                int
@@ -263,6 +264,7 @@ func (m *externalTransferMetrics) setProbeStats(stats probe.TransferStats, updat
 		return
 	}
 	m.mu.Lock()
+	diagnostics := m.diagnosticsForProbeStatsLocked(stats)
 	if updateDirectBytes {
 		if stats.BytesSent > m.directBytes {
 			m.directBytes = stats.BytesSent
@@ -276,7 +278,8 @@ func (m *externalTransferMetrics) setProbeStats(stats probe.TransferStats, updat
 	}
 	m.retransmitCount = stats.Retransmits
 	m.replayWindowBytes = stats.MaxReplayBytes
-	m.setProbeDiagnosticsLocked(stats.Diagnostics)
+	m.setProbeLocalSentLocked(stats, diagnostics)
+	m.setProbeDiagnosticsLocked(diagnostics)
 	trace, snap, ok := m.updateTraceLocked(time.Now())
 	m.mu.Unlock()
 	sampleExternalTransferTrace(trace, snap, ok)
@@ -474,11 +477,40 @@ func (m *externalTransferMetrics) setDirectLimitsLocked(selectedRate int, target
 	m.directRateActiveMbps = targetRate
 	m.directLanesActive = activeLanes
 	m.directLanesAvailable = availableLanes
-	m.rateTargetMbps = targetRate
+	if !m.rateTargetFromProbe {
+		m.rateTargetMbps = targetRate
+	}
 	m.rateCeilingMbps = ceilingRate
 	m.rateExplorationCeiling = explorationCeiling
 	m.laneMin = laneMin
 	m.laneCap = laneCap
+}
+
+func (m *externalTransferMetrics) diagnosticsForProbeStatsLocked(stats probe.TransferStats) probe.TransferDiagnostics {
+	diagnostics := stats.Diagnostics
+	if diagnostics.DirectPacketBytes <= 0 {
+		diagnostics.DirectPacketBytes = stats.BytesSent
+		if m.role == transfertrace.RoleReceive {
+			diagnostics.DirectPacketBytes = stats.BytesReceived
+		}
+	}
+	if m.role == transfertrace.RoleReceive && diagnostics.DirectCommittedBytes <= 0 {
+		diagnostics.DirectCommittedBytes = stats.BytesReceived
+	}
+	return diagnostics
+}
+
+func (m *externalTransferMetrics) setProbeLocalSentLocked(stats probe.TransferStats, diagnostics probe.TransferDiagnostics) {
+	if m.role != transfertrace.RoleSend {
+		return
+	}
+	sent := stats.BytesSent
+	if diagnostics.DirectPacketBytes > sent {
+		sent = diagnostics.DirectPacketBytes
+	}
+	if sent > m.localSentBytes {
+		m.localSentBytes = sent
+	}
 }
 
 func (m *externalTransferMetrics) setProbeDiagnosticsLocked(diagnostics probe.TransferDiagnostics) {
@@ -491,6 +523,7 @@ func (m *externalTransferMetrics) setProbeDiagnosticsLocked(diagnostics probe.Tr
 func (m *externalTransferMetrics) setProbeRateDiagnosticsLocked(diagnostics probe.TransferDiagnostics) {
 	if diagnostics.RateTargetMbps > 0 {
 		m.rateTargetMbps = diagnostics.RateTargetMbps
+		m.rateTargetFromProbe = true
 		if m.directRateActiveMbps == 0 {
 			m.directRateActiveMbps = diagnostics.RateTargetMbps
 		}
@@ -510,7 +543,7 @@ func (m *externalTransferMetrics) setProbeLaneDiagnosticsLocked(diagnostics prob
 	if diagnostics.ActiveLanes > 0 {
 		m.directLanesActive = diagnostics.ActiveLanes
 	}
-	if diagnostics.AvailableLanes > 0 {
+	if diagnostics.AvailableLanes > m.directLanesAvailable {
 		m.directLanesAvailable = diagnostics.AvailableLanes
 	}
 	if diagnostics.LaneMin > 0 {
@@ -531,14 +564,24 @@ func (m *externalTransferMetrics) setProbeControllerDiagnosticsLocked(diagnostic
 }
 
 func (m *externalTransferMetrics) setProbeCounterDiagnosticsLocked(diagnostics probe.TransferDiagnostics) {
-	m.replayBytes = diagnostics.ReplayBytes
+	if diagnostics.ReplayBytes > 0 {
+		m.replayBytes = diagnostics.ReplayBytes
+	}
 	if diagnostics.Retransmits > 0 {
 		m.retransmitCount = diagnostics.Retransmits
 	}
-	m.repairRequests = diagnostics.RepairRequests
-	m.repairBytes = diagnostics.RepairBytes
-	m.directPacketBytes = diagnostics.DirectPacketBytes
-	m.directCommittedBytes = diagnostics.DirectCommittedBytes
+	if diagnostics.RepairRequests > 0 {
+		m.repairRequests = diagnostics.RepairRequests
+	}
+	if diagnostics.RepairBytes > 0 {
+		m.repairBytes = diagnostics.RepairBytes
+	}
+	if diagnostics.DirectPacketBytes > 0 {
+		m.directPacketBytes = diagnostics.DirectPacketBytes
+	}
+	if diagnostics.DirectCommittedBytes > 0 {
+		m.directCommittedBytes = diagnostics.DirectCommittedBytes
+	}
 	if diagnostics.ReceiverCommittedBytes > 0 && uint64ToInt64Saturating(diagnostics.ReceiverCommittedBytes) > m.directCommittedBytes {
 		m.directCommittedBytes = uint64ToInt64Saturating(diagnostics.ReceiverCommittedBytes)
 	}

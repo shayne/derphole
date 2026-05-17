@@ -4736,6 +4736,65 @@ func TestExternalExecutePreparedDirectUDPReceiveEmitsSessionMetrics(t *testing.T
 	}
 }
 
+func TestExternalExecutePreparedDirectUDPReceiveMapsReturnedStatsToTrace(t *testing.T) {
+	origReceive := externalDirectUDPReceiveBlastParallelToWriterFn
+	defer func() {
+		externalDirectUDPReceiveBlastParallelToWriterFn = origReceive
+	}()
+
+	start := time.Now().Add(-time.Second)
+	var traceOut bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&traceOut, transfertrace.RoleReceive, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(start, rec, transfertrace.RoleReceive)
+	externalDirectUDPReceiveBlastParallelToWriterFn = func(_ context.Context, _ []net.PacketConn, _ io.Writer, _ probe.ReceiveConfig, _ int64) (probe.TransferStats, error) {
+		return probe.TransferStats{
+			BytesReceived: 4096,
+			Lanes:         2,
+			StartedAt:     start,
+			FirstByteAt:   start.Add(100 * time.Millisecond),
+			CompletedAt:   start.Add(500 * time.Millisecond),
+		}, nil
+	}
+
+	err = externalExecutePreparedDirectUDPReceive(context.Background(), externalDirectUDPReceivePlan{
+		probeConns:  []net.PacketConn{nil, nil},
+		receiveDst:  io.Discard,
+		flushDst:    func() error { return nil },
+		receiveCfg:  externalDirectUDPFastDiscardReceiveConfig(),
+		fastDiscard: true,
+		start:       directUDPStart{ExpectedBytes: 4096},
+	}, token.Token{SessionID: [16]byte{0x94}}, ListenConfig{Trace: rec}, metrics)
+	if err != nil {
+		t.Fatalf("externalExecutePreparedDirectUDPReceive() error = %v", err)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := readTransferTraceRows(t, traceOut.String())
+	row := rows[len(rows)-1]
+	want := map[string]string{
+		"phase":                  string(transfertrace.PhaseComplete),
+		"direct_bytes":           "4096",
+		"app_bytes":              "4096",
+		"direct_lanes_active":    "2",
+		"direct_lanes_available": "2",
+		"direct_packet_bytes":    "4096",
+		"direct_committed_bytes": "4096",
+	}
+	for column, value := range want {
+		if row[column] != value {
+			t.Fatalf("trace row[%q] = %q, want %q; row = %#v", column, row[column], value, row)
+		}
+	}
+	if row["receive_goodput_mbps"] == "" || row["receiver_committed_mbps"] == "" {
+		t.Fatalf("trace row missing receive goodput diagnostics: %#v", row)
+	}
+}
+
 func TestExternalExecutePreparedDirectUDPReceiveUsesDirectMetricsForLiveWrites(t *testing.T) {
 	origReceive := externalDirectUDPReceiveBlastParallelToWriterFn
 	defer func() {

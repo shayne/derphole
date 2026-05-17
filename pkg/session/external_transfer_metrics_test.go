@@ -175,6 +175,7 @@ func TestExternalTransferMetricsSetProbeStatsUpdatesTrace(t *testing.T) {
 		"direct_rate_selected_mbps":     "350",
 		"direct_lanes_active":           "3",
 		"direct_lanes_available":        "4",
+		"local_sent_bytes":              "4096",
 		"rate_target_mbps":              "263",
 		"rate_ceiling_mbps":             "700",
 		"rate_exploration_ceiling_mbps": "1200",
@@ -196,6 +197,9 @@ func TestExternalTransferMetricsSetProbeStatsUpdatesTrace(t *testing.T) {
 		if row[column] != value {
 			t.Fatalf("trace row[%q] = %q, want %q; row = %#v", column, row[column], value, row)
 		}
+	}
+	if row["send_goodput_mbps"] == "" {
+		t.Fatalf("trace row send_goodput_mbps is empty, want probe byte goodput; row = %#v", row)
 	}
 }
 
@@ -243,6 +247,7 @@ func TestExternalTransferMetricsSetProbeStatsWithoutByteProgressWritesDiagnostic
 		"direct_bytes":                  "0",
 		"app_bytes":                     "0",
 		"peer_received_bytes":           "0",
+		"local_sent_bytes":              "8192",
 		"direct_rate_selected_mbps":     "700",
 		"direct_lanes_active":           "2",
 		"direct_lanes_available":        "4",
@@ -262,6 +267,55 @@ func TestExternalTransferMetricsSetProbeStatsWithoutByteProgressWritesDiagnostic
 		"repair_bytes":                  "512",
 		"direct_packet_bytes":           "8192",
 		"direct_committed_bytes":        "4096",
+	}
+	for column, value := range want {
+		if row[column] != value {
+			t.Fatalf("trace row[%q] = %q, want %q; row = %#v", column, row[column], value, row)
+		}
+	}
+	if row["send_goodput_mbps"] == "" {
+		t.Fatalf("trace row send_goodput_mbps is empty, want probe byte goodput; row = %#v", row)
+	}
+}
+
+func TestExternalTransferMetricsFinalLaneUpdatePreservesRuntimeRateTarget(t *testing.T) {
+	var out bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(37, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(37, 0), rec, transfertrace.RoleSend)
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct")
+	metrics.SetDirectLimits(700, 350, 900, 1200, 4, 4, 1, 4)
+	metrics.SetProbeStats(probe.TransferStats{
+		BytesSent: 4096,
+		Diagnostics: probe.TransferDiagnostics{
+			RateTargetMbps:             512,
+			RateCeilingMbps:            900,
+			RateExplorationCeilingMbps: 1200,
+			RateSelectedMbps:           700,
+			ActiveLanes:                4,
+			AvailableLanes:             4,
+			DirectPacketBytes:          4096,
+		},
+	})
+	metrics.SetDirectLimits(700, 350, 900, 1200, 2, 4, 1, 4)
+	metrics.Complete(time.Unix(37, int64(time.Second)))
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := readTransferTraceRows(t, out.String())
+	row := rows[len(rows)-1]
+	want := map[string]string{
+		"phase":                     string(transfertrace.PhaseComplete),
+		"rate_target_mbps":          "512",
+		"direct_rate_active_mbps":   "350",
+		"direct_lanes_active":       "2",
+		"direct_lanes_available":    "4",
+		"active_lanes":              "2",
+		"available_lanes":           "4",
+		"direct_rate_selected_mbps": "700",
 	}
 	for column, value := range want {
 		if row[column] != value {
