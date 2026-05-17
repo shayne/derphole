@@ -1060,7 +1060,7 @@ func externalPrepareDirectUDPSend(ctx context.Context, tok token.Token, derpClie
 	}
 	rateState, sendCfg = externalDirectUDPFinalizeSendRates(rateState, sendCfg, len(probeConns))
 	emitExternalDirectUDPSendFinalDebug(cfg.Emitter, probeConns, sendCfg, rateState)
-	metrics.SetDirectPlan(rateState.selectedRateMbps, rateState.activeRateMbps, len(probeConns), availableLanes)
+	metrics.SetDirectLimits(rateState.selectedRateMbps, rateState.activeRateMbps, sendCfg.RateCeilingMbps, sendCfg.RateExplorationCeilingMbps, len(probeConns), availableLanes, sendCfg.MinActiveLanes, sendCfg.MaxActiveLanes)
 	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct-execute")
 
 	plan.probeConns = probeConns
@@ -1506,13 +1506,13 @@ func externalExecutePreparedDirectUDPSend(ctx context.Context, src io.Reader, pl
 		availableLanes = len(plan.probeConns)
 	}
 	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct-execute")
-	metrics.SetDirectPlan(plan.selectedRateMbps, plan.startRateMbps, len(plan.probeConns), availableLanes)
+	metrics.SetDirectLimits(plan.selectedRateMbps, plan.startRateMbps, plan.sendCfg.RateCeilingMbps, plan.sendCfg.RateExplorationCeilingMbps, len(plan.probeConns), availableLanes, plan.sendCfg.MinActiveLanes, plan.sendCfg.MaxActiveLanes)
 	plan.sendCfg.Progress = externalDirectUDPSendProgressRecorder(plan.sendCfg.Progress, metrics, !plan.sendSrcRecordsDirectMetrics)
 	externalTransferTracef("direct-udp-send-execute-start lanes=%d addrs=%s rate=%d ceiling=%d", len(plan.probeConns), strings.Join(plan.remoteAddrs, ","), plan.sendCfg.RateMbps, plan.sendCfg.RateCeilingMbps)
 	stats, err := probe.SendBlastParallel(ctx, plan.probeConns, plan.remoteAddrs, externalDirectUDPBufferedReader(src), plan.sendCfg)
 	externalTransferTracef("direct-udp-send-execute-done err=%v bytes=%d lanes=%d first-byte-zero=%v complete-zero=%v", err, stats.BytesSent, stats.Lanes, stats.FirstByteAt.IsZero(), stats.CompletedAt.IsZero())
 	if stats.Lanes > 0 {
-		metrics.SetDirectPlan(plan.selectedRateMbps, plan.startRateMbps, stats.Lanes, availableLanes)
+		metrics.SetDirectLimits(plan.selectedRateMbps, plan.startRateMbps, plan.sendCfg.RateCeilingMbps, plan.sendCfg.RateExplorationCeilingMbps, stats.Lanes, availableLanes, plan.sendCfg.MinActiveLanes, plan.sendCfg.MaxActiveLanes)
 	}
 	if cfg.Emitter != nil {
 		cfg.Emitter.Debug("udp-send-transport=" + stats.Transport.Summary())

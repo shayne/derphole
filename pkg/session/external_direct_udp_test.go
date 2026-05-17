@@ -4596,12 +4596,16 @@ func TestExternalExecutePreparedDirectUDPSendEmitsSessionMetrics(t *testing.T) {
 		startRateMbps:    350,
 		availableLanes:   4,
 		sendCfg: probe.SendConfig{
-			Blast:          true,
-			Transport:      externalDirectUDPTransportLabel,
-			ChunkSize:      externalDirectUDPChunkSize,
-			RateMbps:       0,
-			RunID:          runID,
-			RepairPayloads: true,
+			Blast:                      true,
+			Transport:                  externalDirectUDPTransportLabel,
+			ChunkSize:                  externalDirectUDPChunkSize,
+			RateMbps:                   350,
+			RateCeilingMbps:            900,
+			RateExplorationCeilingMbps: 1200,
+			MinActiveLanes:             1,
+			MaxActiveLanes:             4,
+			RunID:                      runID,
+			RepairPayloads:             true,
 			Progress: func(stats probe.TransferStats) {
 				if stats.BytesSent > 0 {
 					progressCalled = true
@@ -4640,8 +4644,27 @@ func TestExternalExecutePreparedDirectUDPSendEmitsSessionMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	traceBody := traceOut.String()
-	if !strings.Contains(traceBody, ",send,complete,") || !strings.Contains(traceBody, ",700,350,1,4,") {
-		t.Fatalf("trace body missing preserved available lanes:\n%s", traceBody)
+	rows := readTransferTraceRows(t, traceBody)
+	row := rows[len(rows)-1]
+	wantTrace := map[string]string{
+		"phase":                         string(transfertrace.PhaseComplete),
+		"direct_rate_selected_mbps":     "700",
+		"direct_rate_active_mbps":       "350",
+		"direct_lanes_active":           "1",
+		"direct_lanes_available":        "4",
+		"rate_target_mbps":              "350",
+		"rate_ceiling_mbps":             "900",
+		"rate_exploration_ceiling_mbps": "1200",
+		"rate_selected_mbps":            "700",
+		"active_lanes":                  "1",
+		"available_lanes":               "4",
+		"lane_min":                      "1",
+		"lane_cap":                      "4",
+	}
+	for column, value := range wantTrace {
+		if row[column] != value {
+			t.Fatalf("trace row[%q] = %q, want %q; row = %#v\nbody:\n%s", column, row[column], value, row, traceBody)
+		}
 	}
 }
 

@@ -136,6 +136,23 @@ func TestExternalTransferMetricsSetProbeStatsUpdatesTrace(t *testing.T) {
 		BytesSent:      4096,
 		Retransmits:    3,
 		MaxReplayBytes: 8192,
+		Diagnostics: probe.TransferDiagnostics{
+			RateTargetMbps:             263,
+			RateCeilingMbps:            700,
+			RateExplorationCeilingMbps: 1200,
+			RateSelectedMbps:           350,
+			ActiveLanes:                3,
+			AvailableLanes:             4,
+			LaneMin:                    2,
+			LaneCap:                    4,
+			ControllerDecision:         "hold",
+			ControllerReason:           "initial-hold",
+			ReplayBytes:                4096,
+			RepairRequests:             5,
+			RepairBytes:                1024,
+			DirectPacketBytes:          4096,
+			DirectCommittedBytes:       3072,
+		},
 	})
 	metrics.Tick(time.Unix(30, int64(100*time.Millisecond)))
 	if err := rec.Close(); err != nil {
@@ -153,6 +170,103 @@ func TestExternalTransferMetricsSetProbeStatsUpdatesTrace(t *testing.T) {
 	}
 	if !strings.Contains(body, ",8192,,3,") {
 		t.Fatalf("trace body missing probe counters:\n%s", body)
+	}
+	want := map[string]string{
+		"direct_rate_selected_mbps":     "350",
+		"direct_lanes_active":           "3",
+		"direct_lanes_available":        "4",
+		"rate_target_mbps":              "263",
+		"rate_ceiling_mbps":             "700",
+		"rate_exploration_ceiling_mbps": "1200",
+		"rate_selected_mbps":            "350",
+		"active_lanes":                  "3",
+		"available_lanes":               "4",
+		"lane_min":                      "2",
+		"lane_cap":                      "4",
+		"controller_decision":           "hold",
+		"controller_reason":             "initial-hold",
+		"replay_bytes":                  "4096",
+		"retransmits":                   "3",
+		"repair_requests":               "5",
+		"repair_bytes":                  "1024",
+		"direct_packet_bytes":           "4096",
+		"direct_committed_bytes":        "3072",
+	}
+	for column, value := range want {
+		if row[column] != value {
+			t.Fatalf("trace row[%q] = %q, want %q; row = %#v", column, row[column], value, row)
+		}
+	}
+}
+
+func TestExternalTransferMetricsSetProbeStatsWithoutByteProgressWritesDiagnosticsOnly(t *testing.T) {
+	var out bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(35, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(35, 0), rec, transfertrace.RoleSend)
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct")
+	metrics.SetProbeStatsWithoutByteProgress(probe.TransferStats{
+		BytesSent:      8192,
+		Retransmits:    7,
+		MaxReplayBytes: 16384,
+		Diagnostics: probe.TransferDiagnostics{
+			RateTargetMbps:             300,
+			RateCeilingMbps:            900,
+			RateExplorationCeilingMbps: 1200,
+			RateSelectedMbps:           700,
+			ActiveLanes:                2,
+			AvailableLanes:             4,
+			LaneMin:                    1,
+			LaneCap:                    4,
+			ControllerDecision:         "increase",
+			ControllerReason:           "clean-window",
+			ReplayBytes:                2048,
+			RepairRequests:             2,
+			RepairBytes:                512,
+			ReceiverCommittedBytes:     4096,
+			DirectPacketBytes:          8192,
+		},
+	})
+	metrics.Tick(time.Unix(35, int64(100*time.Millisecond)))
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := metrics.DirectBytes(); got != 0 {
+		t.Fatalf("DirectBytes() = %d, want 0", got)
+	}
+	rows := readTransferTraceRows(t, out.String())
+	row := rows[len(rows)-1]
+	want := map[string]string{
+		"direct_bytes":                  "0",
+		"app_bytes":                     "0",
+		"peer_received_bytes":           "0",
+		"direct_rate_selected_mbps":     "700",
+		"direct_lanes_active":           "2",
+		"direct_lanes_available":        "4",
+		"rate_target_mbps":              "300",
+		"rate_ceiling_mbps":             "900",
+		"rate_exploration_ceiling_mbps": "1200",
+		"active_lanes":                  "2",
+		"available_lanes":               "4",
+		"lane_min":                      "1",
+		"lane_cap":                      "4",
+		"controller_decision":           "increase",
+		"controller_reason":             "clean-window",
+		"replay_window_bytes":           "16384",
+		"replay_bytes":                  "2048",
+		"retransmits":                   "7",
+		"repair_requests":               "2",
+		"repair_bytes":                  "512",
+		"direct_packet_bytes":           "8192",
+		"direct_committed_bytes":        "4096",
+	}
+	for column, value := range want {
+		if row[column] != value {
+			t.Fatalf("trace row[%q] = %q, want %q; row = %#v", column, row[column], value, row)
+		}
 	}
 }
 

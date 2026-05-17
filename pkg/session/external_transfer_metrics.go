@@ -39,15 +39,28 @@ type externalTransferMetrics struct {
 	lastError              string
 	deferSendComplete      bool
 	directRateSelectedMbps int
+	directRateSelectedPlan bool
 	directRateActiveMbps   int
 	directLanesActive      int
 	directLanesAvailable   int
+	rateTargetMbps         int
+	rateCeilingMbps        int
+	rateExplorationCeiling int
+	laneMin                int
+	laneCap                int
+	controllerDecision     string
+	controllerReason       string
 	directProbeState       string
 	directProbeSummary     string
 	replayWindowBytes      uint64
+	replayBytes            uint64
 	repairQueueBytes       uint64
 	retransmitCount        int64
+	repairRequests         int64
+	repairBytes            int64
 	outOfOrderBytes        uint64
+	directPacketBytes      int64
+	directCommittedBytes   int64
 }
 
 type externalTransferMetricsContextKey struct{}
@@ -211,14 +224,15 @@ func (m *externalTransferMetrics) SetError(err error) {
 }
 
 func (m *externalTransferMetrics) SetDirectPlan(selectedRate int, activeRate int, activeLanes int, availableLanes int) {
+	m.SetDirectLimits(selectedRate, activeRate, 0, 0, activeLanes, availableLanes, 0, 0)
+}
+
+func (m *externalTransferMetrics) SetDirectLimits(selectedRate int, targetRate int, ceilingRate int, explorationCeiling int, activeLanes int, availableLanes int, laneMin int, laneCap int) {
 	if m == nil {
 		return
 	}
 	m.mu.Lock()
-	m.directRateSelectedMbps = selectedRate
-	m.directRateActiveMbps = activeRate
-	m.directLanesActive = activeLanes
-	m.directLanesAvailable = availableLanes
+	m.setDirectLimitsLocked(selectedRate, targetRate, ceilingRate, explorationCeiling, activeLanes, availableLanes, laneMin, laneCap)
 	trace, snap, ok := m.updateTraceLocked(time.Now())
 	m.mu.Unlock()
 	sampleExternalTransferTrace(trace, snap, ok)
@@ -262,6 +276,7 @@ func (m *externalTransferMetrics) setProbeStats(stats probe.TransferStats, updat
 	}
 	m.retransmitCount = stats.Retransmits
 	m.replayWindowBytes = stats.MaxReplayBytes
+	m.setProbeDiagnosticsLocked(stats.Diagnostics)
 	trace, snap, ok := m.updateTraceLocked(time.Now())
 	m.mu.Unlock()
 	sampleExternalTransferTrace(trace, snap, ok)
@@ -415,30 +430,126 @@ func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrac
 		}
 	}
 	return m.trace, transfertrace.Snapshot{
-		At:                     at,
-		Phase:                  m.phase,
-		RelayBytes:             m.relayBytes,
-		DirectBytes:            m.directBytes,
-		AppBytes:               m.appBytesLocked(),
-		LocalSentBytes:         m.localSentBytes,
-		PeerReceivedBytes:      m.peerReceivedBytes,
-		SetupElapsedMS:         setupMS,
-		TransferElapsedMS:      transferMS,
-		DirectValidated:        m.directValidated,
-		FallbackReason:         m.fallbackReason,
-		DirectRateSelectedMbps: m.directRateSelectedMbps,
-		DirectRateActiveMbps:   m.directRateActiveMbps,
-		DirectLanesActive:      m.directLanesActive,
-		DirectLanesAvailable:   m.directLanesAvailable,
-		DirectProbeState:       m.directProbeState,
-		DirectProbeSummary:     m.directProbeSummary,
-		ReplayWindowBytes:      m.replayWindowBytes,
-		RepairQueueBytes:       m.repairQueueBytes,
-		RetransmitCount:        m.retransmitCount,
-		OutOfOrderBytes:        m.outOfOrderBytes,
-		LastState:              m.lastState,
-		LastError:              m.lastError,
+		At:                         at,
+		Phase:                      m.phase,
+		RelayBytes:                 m.relayBytes,
+		DirectBytes:                m.directBytes,
+		AppBytes:                   m.appBytesLocked(),
+		LocalSentBytes:             m.localSentBytes,
+		PeerReceivedBytes:          m.peerReceivedBytes,
+		SetupElapsedMS:             setupMS,
+		TransferElapsedMS:          transferMS,
+		DirectValidated:            m.directValidated,
+		FallbackReason:             m.fallbackReason,
+		DirectRateSelectedMbps:     m.directRateSelectedMbps,
+		DirectRateActiveMbps:       m.directRateActiveMbps,
+		DirectLanesActive:          m.directLanesActive,
+		DirectLanesAvailable:       m.directLanesAvailable,
+		RateTargetMbps:             m.rateTargetMbps,
+		RateCeilingMbps:            m.rateCeilingMbps,
+		RateExplorationCeilingMbps: m.rateExplorationCeiling,
+		LaneMin:                    m.laneMin,
+		LaneCap:                    m.laneCap,
+		ControllerDecision:         m.controllerDecision,
+		ControllerReason:           m.controllerReason,
+		DirectProbeState:           m.directProbeState,
+		DirectProbeSummary:         m.directProbeSummary,
+		ReplayWindowBytes:          m.replayWindowBytes,
+		ReplayBytes:                m.replayBytes,
+		RepairQueueBytes:           m.repairQueueBytes,
+		RetransmitCount:            m.retransmitCount,
+		RepairRequests:             m.repairRequests,
+		RepairBytes:                m.repairBytes,
+		OutOfOrderBytes:            m.outOfOrderBytes,
+		DirectPacketBytes:          m.directPacketBytes,
+		DirectCommittedBytes:       m.directCommittedBytes,
+		LastState:                  m.lastState,
+		LastError:                  m.lastError,
 	}, true
+}
+
+func (m *externalTransferMetrics) setDirectLimitsLocked(selectedRate int, targetRate int, ceilingRate int, explorationCeiling int, activeLanes int, availableLanes int, laneMin int, laneCap int) {
+	m.directRateSelectedMbps = selectedRate
+	m.directRateSelectedPlan = selectedRate > 0
+	m.directRateActiveMbps = targetRate
+	m.directLanesActive = activeLanes
+	m.directLanesAvailable = availableLanes
+	m.rateTargetMbps = targetRate
+	m.rateCeilingMbps = ceilingRate
+	m.rateExplorationCeiling = explorationCeiling
+	m.laneMin = laneMin
+	m.laneCap = laneCap
+}
+
+func (m *externalTransferMetrics) setProbeDiagnosticsLocked(diagnostics probe.TransferDiagnostics) {
+	m.setProbeRateDiagnosticsLocked(diagnostics)
+	m.setProbeLaneDiagnosticsLocked(diagnostics)
+	m.setProbeControllerDiagnosticsLocked(diagnostics)
+	m.setProbeCounterDiagnosticsLocked(diagnostics)
+}
+
+func (m *externalTransferMetrics) setProbeRateDiagnosticsLocked(diagnostics probe.TransferDiagnostics) {
+	if diagnostics.RateTargetMbps > 0 {
+		m.rateTargetMbps = diagnostics.RateTargetMbps
+		if m.directRateActiveMbps == 0 {
+			m.directRateActiveMbps = diagnostics.RateTargetMbps
+		}
+	}
+	if diagnostics.RateCeilingMbps > 0 {
+		m.rateCeilingMbps = diagnostics.RateCeilingMbps
+	}
+	if diagnostics.RateExplorationCeilingMbps > 0 {
+		m.rateExplorationCeiling = diagnostics.RateExplorationCeilingMbps
+	}
+	if diagnostics.RateSelectedMbps > 0 && !m.directRateSelectedPlan {
+		m.directRateSelectedMbps = diagnostics.RateSelectedMbps
+	}
+}
+
+func (m *externalTransferMetrics) setProbeLaneDiagnosticsLocked(diagnostics probe.TransferDiagnostics) {
+	if diagnostics.ActiveLanes > 0 {
+		m.directLanesActive = diagnostics.ActiveLanes
+	}
+	if diagnostics.AvailableLanes > 0 {
+		m.directLanesAvailable = diagnostics.AvailableLanes
+	}
+	if diagnostics.LaneMin > 0 {
+		m.laneMin = diagnostics.LaneMin
+	}
+	if diagnostics.LaneCap > 0 {
+		m.laneCap = diagnostics.LaneCap
+	}
+}
+
+func (m *externalTransferMetrics) setProbeControllerDiagnosticsLocked(diagnostics probe.TransferDiagnostics) {
+	if diagnostics.ControllerDecision != "" {
+		m.controllerDecision = diagnostics.ControllerDecision
+	}
+	if diagnostics.ControllerReason != "" {
+		m.controllerReason = diagnostics.ControllerReason
+	}
+}
+
+func (m *externalTransferMetrics) setProbeCounterDiagnosticsLocked(diagnostics probe.TransferDiagnostics) {
+	m.replayBytes = diagnostics.ReplayBytes
+	if diagnostics.Retransmits > 0 {
+		m.retransmitCount = diagnostics.Retransmits
+	}
+	m.repairRequests = diagnostics.RepairRequests
+	m.repairBytes = diagnostics.RepairBytes
+	m.directPacketBytes = diagnostics.DirectPacketBytes
+	m.directCommittedBytes = diagnostics.DirectCommittedBytes
+	if diagnostics.ReceiverCommittedBytes > 0 && uint64ToInt64Saturating(diagnostics.ReceiverCommittedBytes) > m.directCommittedBytes {
+		m.directCommittedBytes = uint64ToInt64Saturating(diagnostics.ReceiverCommittedBytes)
+	}
+}
+
+func uint64ToInt64Saturating(value uint64) int64 {
+	const maxInt64AsUint64 = uint64(^uint64(0) >> 1)
+	if value > maxInt64AsUint64 {
+		return int64(maxInt64AsUint64)
+	}
+	return int64(value)
 }
 
 func (m *externalTransferMetrics) appBytesLocked() int64 {
