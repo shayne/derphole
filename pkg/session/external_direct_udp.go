@@ -4729,6 +4729,7 @@ func (s *externalDirectUDPRateProbeSender) sendTierPayload(rate int, payload []b
 	activeLanes := externalDirectUDPRateProbeActiveLanes(rate, len(s.conns))
 	laneRate := externalDirectUDPPerLaneRateMbps(rate, activeLanes)
 	sentByLane := make([]int64, len(s.conns))
+	laneErrs := make([]error, len(s.conns))
 	errCh := make(chan error, activeLanes)
 	tierCtx, cancel := context.WithCancel(s.ctx)
 	var wg sync.WaitGroup
@@ -4742,6 +4743,7 @@ func (s *externalDirectUDPRateProbeSender) sendTierPayload(rate int, payload []b
 			tierStart:  tierStart,
 			laneRate:   laneRate,
 			sentByLane: sentByLane,
+			laneErrs:   laneErrs,
 		})
 	}
 	wg.Wait()
@@ -4749,7 +4751,13 @@ func (s *externalDirectUDPRateProbeSender) sendTierPayload(rate int, payload []b
 	if err := externalDirectUDPRateProbeFirstErr(errCh); err != nil {
 		return 0, err
 	}
-	return externalDirectUDPSumInt64(sentByLane), nil
+	total := externalDirectUDPSumInt64(sentByLane)
+	if total == 0 {
+		if err := externalDirectUDPRateProbeFirstActiveLaneErr(laneErrs, activeLanes); err != nil {
+			return 0, err
+		}
+	}
+	return total, nil
 }
 
 type externalDirectUDPRateProbeLaneSend struct {
@@ -4760,6 +4768,7 @@ type externalDirectUDPRateProbeLaneSend struct {
 	tierStart  time.Time
 	laneRate   int
 	sentByLane []int64
+	laneErrs   []error
 }
 
 func (s *externalDirectUDPRateProbeSender) sendTierLane(wg *sync.WaitGroup, cancel context.CancelFunc, errCh chan<- error, laneSend externalDirectUDPRateProbeLaneSend) {
@@ -4767,6 +4776,10 @@ func (s *externalDirectUDPRateProbeSender) sendTierLane(wg *sync.WaitGroup, canc
 	sent, err := s.runTierLane(laneSend)
 	laneSend.sentByLane[laneSend.lane] = sent
 	if err == nil {
+		return
+	}
+	laneSend.laneErrs[laneSend.lane] = err
+	if externalDirectUDPRateProbeIgnorableLaneError(err) {
 		return
 	}
 	errCh <- err
@@ -4845,6 +4858,22 @@ func externalDirectUDPRateProbeFirstErr(errCh <-chan error) error {
 	default:
 		return nil
 	}
+}
+
+func externalDirectUDPRateProbeFirstActiveLaneErr(laneErrs []error, activeLanes int) error {
+	for lane := 0; lane < activeLanes && lane < len(laneErrs); lane++ {
+		if laneErrs[lane] != nil {
+			return laneErrs[lane]
+		}
+	}
+	return nil
+}
+
+func externalDirectUDPRateProbeIgnorableLaneError(err error) bool {
+	return errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.EADDRNOTAVAIL) ||
+		errors.Is(err, syscall.ECONNREFUSED)
 }
 
 func externalDirectUDPSumInt64(values []int64) int64 {
@@ -4930,8 +4959,7 @@ func externalDirectUDPReceiveRateProbes(ctx context.Context, conns []net.PacketC
 	if len(conns) == 0 {
 		return samples, errors.New("no packet conns")
 	}
-	allowedSources, err := externalDirectUDPRateProbeAllowedSources(remoteAddrs)
-	if err != nil {
+	if err := externalDirectUDPValidateRateProbeRemoteAddrs(remoteAddrs); err != nil {
 		return samples, err
 	}
 	deadline := time.Now().Add(externalDirectUDPRateProbeWindow(rates) + externalDirectUDPRateProbeGrace)
@@ -4943,7 +4971,7 @@ func externalDirectUDPReceiveRateProbes(ctx context.Context, conns []net.PacketC
 			return samples, err
 		}
 		wg.Add(1)
-		go externalDirectUDPReceiveRateProbePackets(ctx, conn, allowedSources, samples, &mu, auth, errCh, &wg)
+		go externalDirectUDPReceiveRateProbePackets(ctx, conn, samples, &mu, auth, errCh, &wg)
 	}
 	wg.Wait()
 	select {
@@ -4954,18 +4982,15 @@ func externalDirectUDPReceiveRateProbes(ctx context.Context, conns []net.PacketC
 	return samples, nil
 }
 
-func externalDirectUDPReceiveRateProbePackets(ctx context.Context, conn net.PacketConn, allowedSources map[string]struct{}, samples []directUDPRateProbeSample, mu *sync.Mutex, auth externalDirectUDPRateProbeAuth, errCh chan<- error, wg *sync.WaitGroup) {
+func externalDirectUDPReceiveRateProbePackets(ctx context.Context, conn net.PacketConn, samples []directUDPRateProbeSample, mu *sync.Mutex, auth externalDirectUDPRateProbeAuth, errCh chan<- error, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
 	buf := make([]byte, externalDirectUDPDataWireSize)
 	for {
-		n, addr, err := conn.ReadFrom(buf)
+		n, _, err := conn.ReadFrom(buf)
 		if err != nil {
 			externalDirectUDPReportReceiveRateProbeErr(ctx, err, errCh)
 			return
-		}
-		if !externalDirectUDPRateProbeSourceAllowed(addr, allowedSources) {
-			continue
 		}
 		index, ok := externalDirectUDPRateProbeIndex(buf[:n], len(samples), auth)
 		if !ok {
@@ -4992,30 +5017,21 @@ func externalDirectUDPRecordRateProbeBytes(samples []directUDPRateProbeSample, i
 	mu.Unlock()
 }
 
-func externalDirectUDPRateProbeAllowedSources(remoteAddrs []string) (map[string]struct{}, error) {
-	allowed := make(map[string]struct{}, len(remoteAddrs))
+func externalDirectUDPValidateRateProbeRemoteAddrs(remoteAddrs []string) error {
+	valid := 0
 	for _, raw := range remoteAddrs {
 		if raw == "" {
 			continue
 		}
-		addr, err := net.ResolveUDPAddr("udp", raw)
-		if err != nil {
-			return nil, err
+		if _, err := net.ResolveUDPAddr("udp", raw); err != nil {
+			return err
 		}
-		allowed[addr.String()] = struct{}{}
+		valid++
 	}
-	if len(allowed) == 0 {
-		return nil, errors.New("no rate probe remote addrs")
+	if valid == 0 {
+		return errors.New("no rate probe remote addrs")
 	}
-	return allowed, nil
-}
-
-func externalDirectUDPRateProbeSourceAllowed(addr net.Addr, allowed map[string]struct{}) bool {
-	if addr == nil || len(allowed) == 0 {
-		return false
-	}
-	_, ok := allowed[addr.String()]
-	return ok
+	return nil
 }
 
 func externalDirectUDPRateProbeIndex(packet []byte, samples int, auth externalDirectUDPRateProbeAuth) (int, bool) {

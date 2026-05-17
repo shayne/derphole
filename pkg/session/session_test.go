@@ -2134,8 +2134,8 @@ func TestPublicProbeCandidatesIncludesMappedCandidate(t *testing.T) {
 	}
 
 	got := publicProbeCandidates(ctx, conn, &tailcfg.DERPMap{}, pm)
-	if containsString(got, "100.64.0.11:5555") {
-		t.Fatalf("publicProbeCandidates() = %v, want no default Tailscale CGNAT candidate", got)
+	if !containsString(got, "100.64.0.11:5555") {
+		t.Fatalf("publicProbeCandidates() = %v, want default Tailscale CGNAT candidate", got)
 	}
 	if !containsString(got, "203.0.113.11:5555") {
 		t.Fatalf("publicProbeCandidates() = %v, want gathered host:port candidate", got)
@@ -2434,26 +2434,29 @@ func TestPublicProbeCandidatesSkipsTailscaleCGNATInInternetOnlyTestMode(t *testi
 	}
 }
 
-func TestPublicProbeCandidateAllowedSkipsTailscaleByDefault(t *testing.T) {
-	if publicProbeCandidateAllowed(netip.MustParseAddr("100.125.235.82")) {
-		t.Fatal("publicProbeCandidateAllowed(100.125.235.82) = true, want false by default")
+func TestPublicProbeCandidateAllowedAllowsTailscaleByDefault(t *testing.T) {
+	if !publicProbeCandidateAllowed(netip.MustParseAddr("100.125.235.82")) {
+		t.Fatal("publicProbeCandidateAllowed(100.125.235.82) = false, want true by default")
 	}
-	if publicProbeCandidateAllowed(netip.MustParseAddr("fd7a:115c:a1e0::1")) {
-		t.Fatal("publicProbeCandidateAllowed(fd7a:115c:a1e0::1) = true, want false by default")
+	if !publicProbeCandidateAllowed(netip.MustParseAddr("fd7a:115c:a1e0::1")) {
+		t.Fatal("publicProbeCandidateAllowed(fd7a:115c:a1e0::1) = false, want true by default")
 	}
 	if !publicProbeCandidateAllowed(netip.MustParseAddr("203.0.113.10")) {
 		t.Fatal("publicProbeCandidateAllowed(203.0.113.10) = false, want true")
 	}
 }
 
-func TestPublicProbeCandidateAllowedCanEnableTailscaleExplicitly(t *testing.T) {
-	t.Setenv("DERPHOLE_ENABLE_TAILSCALE_CANDIDATES", "1")
+func TestPublicProbeCandidateAllowedSkipsTailscaleInInternetOnlyTestMode(t *testing.T) {
+	t.Setenv("DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES", "1")
 
-	if !publicProbeCandidateAllowed(netip.MustParseAddr("100.125.235.82")) {
-		t.Fatal("publicProbeCandidateAllowed(100.125.235.82) = false, want true when DERPHOLE_ENABLE_TAILSCALE_CANDIDATES=1")
+	if publicProbeCandidateAllowed(netip.MustParseAddr("100.125.235.82")) {
+		t.Fatal("publicProbeCandidateAllowed(100.125.235.82) = true, want false when DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1")
 	}
-	if !publicProbeCandidateAllowed(netip.MustParseAddr("fd7a:115c:a1e0::1")) {
-		t.Fatal("publicProbeCandidateAllowed(fd7a:115c:a1e0::1) = false, want true when DERPHOLE_ENABLE_TAILSCALE_CANDIDATES=1")
+	if publicProbeCandidateAllowed(netip.MustParseAddr("fd7a:115c:a1e0::1")) {
+		t.Fatal("publicProbeCandidateAllowed(fd7a:115c:a1e0::1) = true, want false when DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1")
+	}
+	if !publicProbeCandidateAllowed(netip.MustParseAddr("203.0.113.10")) {
+		t.Fatal("publicProbeCandidateAllowed(203.0.113.10) = false, want true")
 	}
 }
 

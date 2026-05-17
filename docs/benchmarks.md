@@ -77,7 +77,7 @@ For no-Tailscale route verification, run 3x averaged 1 GiB transfers in both dir
 - Mac -> `pve1`
 - `pve1` -> Mac
 
-Default production runs already skip `100.64.0.0/10` and `fd7a:115c:a1e0::/48` candidates so transport stays independent from Tailscale routes. Use `./scripts/promotion-matrix-no-tailscale.sh 1024` for the public-Internet/private-LAN matrix, and use `DERPHOLE_ENABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh <host> 1024` only when you intentionally want to compare the old over-Tailscale route. `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1` remains available as an explicit guardrail for internet-only tests. For `pve1`, same-LAN private routing is expected because `pve1` and this Mac are on the same LAN.
+Default production runs allow Tailscale CGNAT/ULA candidates, because those routes can be the best path for real users. Set `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1` for public-Internet/private-LAN benchmarks when you need to avoid conflating derphole transport performance with an already-encapsulated Tailscale tunnel. For `pve1`, same-LAN private routing is expected because `pve1` and this Mac are on the same LAN.
 
 Examples:
 

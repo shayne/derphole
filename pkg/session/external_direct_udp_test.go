@@ -162,6 +162,14 @@ func (c *transientNoBufferPacketConn) WriteTo(p []byte, addr net.Addr) (int, err
 	return c.PacketConn.WriteTo(p, addr)
 }
 
+type alwaysHostUnreachablePacketConn struct {
+	net.PacketConn
+}
+
+func (c *alwaysHostUnreachablePacketConn) WriteTo([]byte, net.Addr) (int, error) {
+	return 0, &net.OpError{Op: "write", Net: "udp", Err: syscall.EHOSTUNREACH}
+}
+
 type stubExternalDirectUDPPacketConn struct{}
 
 func (stubExternalDirectUDPPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
@@ -7119,22 +7127,15 @@ func TestExternalDirectUDPRateProbeIndexRejectsForgedMAC(t *testing.T) {
 	}
 }
 
-func TestExternalDirectUDPRateProbeAllowedSourcesAndAccounting(t *testing.T) {
-	allowed, err := externalDirectUDPRateProbeAllowedSources([]string{"127.0.0.1:1234", ""})
-	if err != nil {
-		t.Fatalf("externalDirectUDPRateProbeAllowedSources() error = %v", err)
+func TestExternalDirectUDPRateProbeRemoteAddrValidationAndAccounting(t *testing.T) {
+	if err := externalDirectUDPValidateRateProbeRemoteAddrs([]string{"127.0.0.1:1234", ""}); err != nil {
+		t.Fatalf("externalDirectUDPValidateRateProbeRemoteAddrs() error = %v", err)
 	}
-	if !externalDirectUDPRateProbeSourceAllowed(&net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1234}, allowed) {
-		t.Fatal("externalDirectUDPRateProbeSourceAllowed() = false, want true")
+	if err := externalDirectUDPValidateRateProbeRemoteAddrs([]string{""}); err == nil {
+		t.Fatal("externalDirectUDPValidateRateProbeRemoteAddrs(empty) error = nil")
 	}
-	if externalDirectUDPRateProbeSourceAllowed(nil, allowed) {
-		t.Fatal("externalDirectUDPRateProbeSourceAllowed(nil) = true, want false")
-	}
-	if _, err := externalDirectUDPRateProbeAllowedSources([]string{""}); err == nil {
-		t.Fatal("externalDirectUDPRateProbeAllowedSources(empty) error = nil")
-	}
-	if _, err := externalDirectUDPRateProbeAllowedSources([]string{"bad addr"}); err == nil {
-		t.Fatal("externalDirectUDPRateProbeAllowedSources(bad) error = nil")
+	if err := externalDirectUDPValidateRateProbeRemoteAddrs([]string{"bad addr"}); err == nil {
+		t.Fatal("externalDirectUDPValidateRateProbeRemoteAddrs(bad) error = nil")
 	}
 
 	samples := []directUDPRateProbeSample{{RateMbps: 8}}
@@ -7145,7 +7146,7 @@ func TestExternalDirectUDPRateProbeAllowedSourcesAndAccounting(t *testing.T) {
 	}
 }
 
-func TestExternalDirectUDPReceiveRateProbesRejectsUnexpectedSource(t *testing.T) {
+func TestExternalDirectUDPReceiveRateProbesAcceptsAuthenticatedObservedSource(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
@@ -7159,11 +7160,11 @@ func TestExternalDirectUDPReceiveRateProbesRejectsUnexpectedSource(t *testing.T)
 		t.Fatal(err)
 	}
 	defer allowedSender.Close()
-	forgedSender, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	observedSender, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer forgedSender.Close()
+	defer observedSender.Close()
 
 	auth := externalDirectUDPRateProbeAuth{Key: [32]byte{1}, Nonce: [16]byte{2}}
 	payload, err := externalDirectUDPRateProbePayload(0, 128, auth)
@@ -7174,7 +7175,7 @@ func TestExternalDirectUDPReceiveRateProbesRejectsUnexpectedSource(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := forgedSender.WriteTo(payload, receiverAddr); err != nil {
+	if _, err := observedSender.WriteTo(payload, receiverAddr); err != nil {
 		t.Fatal(err)
 	}
 
@@ -7182,8 +7183,8 @@ func TestExternalDirectUDPReceiveRateProbesRejectsUnexpectedSource(t *testing.T)
 	if err != nil {
 		t.Fatalf("externalDirectUDPReceiveRateProbes() error = %v", err)
 	}
-	if samples[0].BytesReceived != 0 {
-		t.Fatalf("forged source counted %d bytes, want 0", samples[0].BytesReceived)
+	if samples[0].BytesReceived == 0 {
+		t.Fatal("authenticated observed source counted 0 bytes, want rate probe accepted")
 	}
 }
 
@@ -7401,6 +7402,65 @@ func TestExternalDirectUDPSendRateProbesParallelRetriesTransientNoBufferSpace(t 
 	}
 	if !<-seen {
 		t.Fatal("server did not receive a rate probe packet after transient ENOBUFS")
+	}
+}
+
+func TestExternalDirectUDPSendRateProbesParallelKeepsGoodLanesWhenOneLaneHasNoRoute(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	servers := make([]net.PacketConn, 4)
+	clients := make([]net.PacketConn, 4)
+	remoteAddrs := make([]string, 4)
+	for i := range servers {
+		serverConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer serverConn.Close()
+		servers[i] = serverConn
+		remoteAddrs[i] = serverConn.LocalAddr().String()
+
+		clientConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer clientConn.Close()
+		clients[i] = clientConn
+	}
+	clients[2] = &alwaysHostUnreachablePacketConn{PacketConn: clients[2]}
+
+	auth := testExternalDirectUDPRateProbeAuth()
+	readCh := make(chan int, 16)
+	for _, server := range servers {
+		go func(conn net.PacketConn) {
+			buf := make([]byte, 2048)
+			_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+			for {
+				n, _, err := conn.ReadFrom(buf)
+				if err != nil {
+					return
+				}
+				if index, ok := externalDirectUDPRateProbeIndex(buf[:n], 1, auth); ok {
+					readCh <- index
+					return
+				}
+			}
+		}(server)
+	}
+
+	sent, err := externalDirectUDPSendRateProbesParallel(ctx, clients, remoteAddrs, []int{1200}, auth)
+	if err != nil {
+		t.Fatalf("externalDirectUDPSendRateProbesParallel() error = %v", err)
+	}
+	if len(sent) != 1 || sent[0].BytesSent <= 0 {
+		t.Fatalf("sent samples = %#v, want one sample with bytes from reachable lanes", sent)
+	}
+
+	select {
+	case <-readCh:
+	case <-time.After(time.Second):
+		t.Fatal("reachable lanes did not receive rate probe packets")
 	}
 }
 

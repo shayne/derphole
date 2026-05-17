@@ -2443,7 +2443,7 @@ func publicProbeCandidateAllowed(ip netip.Addr) bool {
 	if os.Getenv("DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES") == "1" {
 		return false
 	}
-	return os.Getenv("DERPHOLE_ENABLE_TAILSCALE_CANDIDATES") == "1"
+	return true
 }
 
 func publicProbeAddrs(ctx context.Context, conn net.PacketConn, dm *tailcfg.DERPMap, pm publicPortmap) []net.Addr {
