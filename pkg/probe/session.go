@@ -1863,7 +1863,6 @@ func singleLaneDiagnostics(cfg SendConfig, stats TransferStats) TransferDiagnost
 		RepairRequests:             stats.Diagnostics.RepairRequests,
 		RepairBytes:                stats.Diagnostics.RepairBytes,
 		DirectPacketBytes:          stats.BytesSent,
-		DirectCommittedBytes:       stats.BytesSent,
 	}
 }
 
@@ -3381,12 +3380,12 @@ func (s *blastParallelRepairServeState) handleRepairRequest(ctx context.Context,
 		return s.completeAt(stats, cancel, now), true, nil
 	}
 	key := blastParallelRepairRequestKey{stripe: event.stripe, payload: string(event.payload)}
+	recordRepairRequest(&stats)
 	if s.ignoreRecentRepairRequest(key, now) {
 		return stats, false, nil
 	}
 	repairHistory, repairLane := blastParallelRepairEventHistory(lanes, history, event)
 	s.hadRepair = s.hadRepair || repairHistory.CanRepair()
-	recordRepairRequest(&stats)
 	retransmits, _, err := sendBlastRepairs(ctx, event.lane.batcher, event.lane.peer, repairHistory, event.payload, &stats, blastParallelRepairDeduperForEvent(s.deduper, event.lane, repairLane), now, progress)
 	if err != nil {
 		return TransferStats{}, true, err

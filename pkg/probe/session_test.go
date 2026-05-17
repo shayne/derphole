@@ -2194,6 +2194,61 @@ func TestServiceBlastRepairPacketCountsRepairDiagnostics(t *testing.T) {
 	}
 }
 
+func TestBlastParallelRepairRequestDiagnosticsCountSuppressedDuplicates(t *testing.T) {
+	runID := testRunID(0xc0)
+	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+	history, err := newBlastRepairHistory(runID, 4, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer history.Close()
+	if err := history.Record(0, []byte("abcd")); err != nil {
+		t.Fatal(err)
+	}
+	history.MarkComplete(4, 1)
+
+	batcher := &capturingBatcher{}
+	lane := &blastParallelSendLane{
+		batcher:  batcher,
+		peer:     peer,
+		stripeID: 0,
+	}
+	payload := make([]byte, 8)
+	event := blastParallelRepairEvent{
+		lane:    lane,
+		typ:     PacketTypeRepairRequest,
+		stripe:  0,
+		payload: payload,
+	}
+	state := newBlastParallelRepairServeState()
+	defer state.Close()
+	stats := TransferStats{}
+
+	for i := 0; i < 2; i++ {
+		nextStats, done, err := state.handleRepairRequest(context.Background(), func() {}, []*blastParallelSendLane{lane}, history, stats, event, nil)
+		if err != nil {
+			t.Fatalf("handleRepairRequest(%d) error = %v", i, err)
+		}
+		if done {
+			t.Fatalf("handleRepairRequest(%d) done = true, want false", i)
+		}
+		stats = nextStats
+	}
+
+	if stats.Diagnostics.RepairRequests != 2 {
+		t.Fatalf("RepairRequests = %d, want both repair request events counted", stats.Diagnostics.RepairRequests)
+	}
+	if stats.Retransmits != 1 {
+		t.Fatalf("Retransmits = %d, want duplicate repair request suppressed", stats.Retransmits)
+	}
+	if stats.Diagnostics.RepairBytes != 4 {
+		t.Fatalf("RepairBytes = %d, want only the retransmitted payload bytes", stats.Diagnostics.RepairBytes)
+	}
+	if got := len(batcher.writes); got != 1 {
+		t.Fatalf("repair writes = %d, want duplicate repair request suppressed", got)
+	}
+}
+
 func TestSendBlastRepairsCountsEncryptedPayloadBytes(t *testing.T) {
 	runID := testRunID(0xc0)
 	aead := testPacketAEAD(t)
@@ -3081,6 +3136,18 @@ func assertSingleLaneDiagnostics(t *testing.T, label string, diagnostics Transfe
 	}
 	if diagnostics.DirectPacketBytes <= 0 || diagnostics.DirectPacketBytes > sentBytes {
 		t.Fatalf("%s DirectPacketBytes = %d, want 1..%d", label, diagnostics.DirectPacketBytes, sentBytes)
+	}
+}
+
+func TestSingleLaneDiagnosticsDoesNotReportDirectCommittedBytesWithoutPeerEvidence(t *testing.T) {
+	stats := TransferStats{BytesSent: 4096}
+	diagnostics := singleLaneDiagnostics(SendConfig{RateMbps: 123}, stats)
+
+	if diagnostics.DirectPacketBytes != stats.BytesSent {
+		t.Fatalf("DirectPacketBytes = %d, want sent bytes %d", diagnostics.DirectPacketBytes, stats.BytesSent)
+	}
+	if diagnostics.DirectCommittedBytes != 0 {
+		t.Fatalf("DirectCommittedBytes = %d, want 0 without receiver committed evidence", diagnostics.DirectCommittedBytes)
 	}
 }
 
