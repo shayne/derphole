@@ -2074,6 +2074,78 @@ func TestReceiveExternalHandoffDERPTracksOnlyDeliveredRelayBytes(t *testing.T) {
 	}
 }
 
+func TestReceiveExternalHandoffDERPRepeatsCurrentAckWhileIdle(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	node := srv.Map.Regions[1].Nodes[0]
+	listenerDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(listener) error = %v", err)
+	}
+	defer listenerDERP.Close()
+	senderDERP, err := derpbind.NewClient(ctx, node, srv.DERPURL)
+	if err != nil {
+		t.Fatalf("NewClient(sender) error = %v", err)
+	}
+	defer senderDERP.Close()
+	aead := testExternalSessionAEAD(t, 0x69)
+	warmExternalQUICModeTestDERPRoute(t, ctx, senderDERP, listenerDERP)
+	warmExternalQUICModeTestDERPRoute(t, ctx, listenerDERP, senderDERP)
+
+	relayFrames, unsubscribeRelay := listenerDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == senderDERP.PublicKey() && externalRelayPrefixDERPFrameKindOf(pkt.Payload) != 0
+	})
+	defer unsubscribeRelay()
+	ackFrames, unsubscribeAck := senderDERP.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == listenerDERP.PublicKey() && externalRelayPrefixDERPFrameKindOf(pkt.Payload) == externalRelayPrefixDERPFrameAck
+	})
+	defer unsubscribeAck()
+
+	var out bytes.Buffer
+	rx := newExternalHandoffReceiver(&out, 32)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- receiveExternalHandoffDERP(ctx, listenerDERP, senderDERP.PublicKey(), rx, relayFrames, nil, aead)
+	}()
+
+	if err := externalRelayPrefixDERPSendChunk(ctx, senderDERP, listenerDERP.PublicKey(), externalHandoffChunk{Offset: 0, Payload: []byte("abcd")}, aead); err != nil {
+		t.Fatal(err)
+	}
+	firstAck := waitExternalRelayPrefixDERPAck(t, ackFrames, 2*time.Second)
+	if firstAck != 4 {
+		t.Fatalf("first ack = %d, want 4", firstAck)
+	}
+	repeatedAck := waitExternalRelayPrefixDERPAck(t, ackFrames, externalRelayPrefixDERPAckRepeatInterval*4)
+	if repeatedAck != 4 {
+		t.Fatalf("repeated idle ack = %d, want 4", repeatedAck)
+	}
+
+	cancel()
+	if err := <-errCh; err == nil {
+		t.Fatal("receiveExternalHandoffDERP() error = nil, want canceled context after test shutdown")
+	}
+}
+
+func waitExternalRelayPrefixDERPAck(t *testing.T, ackFrames <-chan derpbind.Packet, timeout time.Duration) int64 {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case pkt := <-ackFrames:
+			ack, err := externalRelayPrefixDERPDecodeAck(pkt.Payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return ack
+		case <-timer.C:
+			t.Fatalf("timed out waiting for DERP prefix ACK after %s", timeout)
+		}
+	}
+}
+
 func TestSendExternalViaRelayPrefixThenDirectUDPCompletesSmallPayloadBeforeSlowDirectSend(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -4424,6 +4496,38 @@ func TestEmitExternalDirectUDPStatsIncludesDataGoodputWithoutFirstByte(t *testin
 	}
 }
 
+func TestEmitExternalDirectUDPSendFinalDebugIncludesDynamicScalingFields(t *testing.T) {
+	var out strings.Builder
+	emitter := telemetry.New(&out, telemetry.LevelVerbose)
+	sendCfg := probe.SendConfig{
+		StripedBlast:               true,
+		RateMbps:                   263,
+		RateCeilingMbps:            350,
+		RateExplorationCeilingMbps: 1200,
+		MinActiveLanes:             4,
+		MaxActiveLanes:             4,
+	}
+	rateState := externalDirectUDPSendRateState{
+		selectedRateMbps: 263,
+		activeRateMbps:   263,
+		rateCeilingMbps:  350,
+	}
+
+	emitExternalDirectUDPSendFinalDebug(emitter, make([]net.PacketConn, 4), sendCfg, rateState)
+	body := out.String()
+	for _, want := range []string{
+		"udp-striped-available-lanes=4",
+		"udp-rate-exploration-ceiling-mbps=1200",
+		"udp-active-lanes-selected=4",
+		"udp-active-lane-min=4",
+		"udp-active-lane-cap=4",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("debug output missing %q:\n%s", want, body)
+		}
+	}
+}
+
 func TestEmitExternalDirectUDPSendStatsIncludesReplayPressure(t *testing.T) {
 	var buf bytes.Buffer
 	emitter := telemetry.New(&buf, telemetry.LevelVerbose)
@@ -5521,6 +5625,38 @@ func TestExternalDirectUDPActiveLanesForRateScalesDownSlowPaths(t *testing.T) {
 	}
 }
 
+func liveVLANLossyButUsefulSentProbeSamples() []directUDPRateProbeSample {
+	return []directUDPRateProbeSample{
+		{RateMbps: 8, BytesSent: 200680, DurationMillis: 200},
+		{RateMbps: 25, BytesSent: 625568, DurationMillis: 200},
+		{RateMbps: 75, BytesSent: 1875320, DurationMillis: 200},
+		{RateMbps: 150, BytesSent: 3750640, DurationMillis: 200},
+		{RateMbps: 350, BytesSent: 8749648, DurationMillis: 200},
+		{RateMbps: 700, BytesSent: 17405530, DurationMillis: 200},
+		{RateMbps: 1000, BytesSent: 24981642, DurationMillis: 200},
+		{RateMbps: 1200, BytesSent: 29974865, DurationMillis: 200},
+		{RateMbps: 1800, BytesSent: 112783607, DurationMillis: 500},
+		{RateMbps: 2000, BytesSent: 125068187, DurationMillis: 500},
+		{RateMbps: 2250, BytesSent: 140852737, DurationMillis: 500},
+	}
+}
+
+func liveVLANLossyButUsefulReceivedProbeSamples() []directUDPRateProbeSample {
+	return []directUDPRateProbeSample{
+		{RateMbps: 8, BytesReceived: 200680, DurationMillis: 200},
+		{RateMbps: 25, BytesReceived: 625568, DurationMillis: 200},
+		{RateMbps: 75, BytesReceived: 1875320, DurationMillis: 200},
+		{RateMbps: 150, BytesReceived: 3750640, DurationMillis: 200},
+		{RateMbps: 350, BytesReceived: 8749648, DurationMillis: 200},
+		{RateMbps: 700, BytesReceived: 13924424, DurationMillis: 200},
+		{RateMbps: 1000, BytesReceived: 13390200, DurationMillis: 200},
+		{RateMbps: 1200, BytesReceived: 12889192, DurationMillis: 200},
+		{RateMbps: 1800, BytesReceived: 32125408, DurationMillis: 500},
+		{RateMbps: 2000, BytesReceived: 32017456, DurationMillis: 500},
+		{RateMbps: 2250, BytesReceived: 32150320, DurationMillis: 500},
+	}
+}
+
 func TestExternalDirectUDPRetainedLanesForRateKeepsStripedHeadroom(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -5542,6 +5678,50 @@ func TestExternalDirectUDPRetainedLanesForRateKeepsStripedHeadroom(t *testing.T)
 				t.Fatalf("externalDirectUDPRetainedLanesForRate(%d, %d, %t) = %d, want %d", tt.rateMbps, tt.available, tt.striped, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestExternalDirectUDPSendRetainedLanesKeepsUsefulProbeFanoutAfterConservativeSelection(t *testing.T) {
+	rateState := externalDirectUDPSendRateState{
+		selectedRateMbps: 263,
+		activeRateMbps:   263,
+		rateCeilingMbps:  350,
+		sentProbeSamples: liveVLANLossyButUsefulSentProbeSamples(),
+		probeResult: directUDPRateProbeResult{
+			Samples: liveVLANLossyButUsefulReceivedProbeSamples(),
+		},
+	}
+	sendCfg := probe.SendConfig{
+		StripedBlast:   true,
+		MaxActiveLanes: 4,
+	}
+	caps := probe.TransportCaps{Kind: "batched", BatchSize: 128}
+
+	got := externalDirectUDPSendRetainedLanes(rateState, sendCfg, 4, 8, caps)
+	if got < 4 {
+		t.Fatalf("externalDirectUDPSendRetainedLanes(live VLAN useful probes) = %d, want at least 4", got)
+	}
+}
+
+func TestExternalDirectUDPUsefulProbeLaneFloorUsesNearBestUsefulHigherLaneCount(t *testing.T) {
+	got := externalDirectUDPUsefulProbeLaneFloor(
+		liveVLANLossyButUsefulSentProbeSamples(),
+		liveVLANLossyButUsefulReceivedProbeSamples(),
+		8,
+	)
+	if got != 4 {
+		t.Fatalf("externalDirectUDPUsefulProbeLaneFloor(live VLAN) = %d, want 4", got)
+	}
+}
+
+func TestExternalDirectUDPUsefulProbeLaneFloorIgnoresCollapsedTopTier(t *testing.T) {
+	got := externalDirectUDPUsefulProbeLaneFloor(
+		liveVLANLossyButUsefulSentProbeSamples(),
+		liveVLANLossyButUsefulReceivedProbeSamples(),
+		8,
+	)
+	if got == 8 {
+		t.Fatalf("externalDirectUDPUsefulProbeLaneFloor(live VLAN) = %d, want collapsed 8-lane tier ignored", got)
 	}
 }
 
@@ -5622,6 +5802,29 @@ func TestExternalDirectUDPDataRateCeilingCapsPartialLaneSlowPaths(t *testing.T) 
 				t.Fatalf("externalDirectUDPDataRateCeilingMbps(%d, %d, %d) = %d, want %d", tt.probeCeil, tt.selectedRate, tt.activeLanes, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestExternalDirectUDPFinalizeSendRatesDoesNotClampUsefulProbeExplorationWithMultipleLanes(t *testing.T) {
+	rateState := externalDirectUDPSendRateState{
+		selectedRateMbps: 263,
+		activeRateMbps:   263,
+		rateCeilingMbps:  350,
+	}
+	sendCfg := probe.SendConfig{
+		RateCeilingMbps:            350,
+		RateExplorationCeilingMbps: 1200,
+		StripedBlast:               true,
+		MinActiveLanes:             4,
+		MaxActiveLanes:             4,
+	}
+
+	gotState, gotCfg := externalDirectUDPFinalizeSendRates(rateState, sendCfg, 4)
+	if gotState.rateCeilingMbps != 350 {
+		t.Fatalf("rateCeilingMbps = %d, want 350", gotState.rateCeilingMbps)
+	}
+	if gotCfg.RateExplorationCeilingMbps < 1200 {
+		t.Fatalf("RateExplorationCeilingMbps = %d, want at least 1200", gotCfg.RateExplorationCeilingMbps)
 	}
 }
 
@@ -6105,6 +6308,23 @@ func TestExternalDirectUDPDataExplorationCeilingOpensCleanSevenHundredKnee(t *te
 func TestExternalDirectUDPDataExplorationCeilingKeepsMediumTierCapped(t *testing.T) {
 	if got, want := externalDirectUDPDataExplorationCeilingMbps(10_000, 600, 700), 700; got != want {
 		t.Fatalf("externalDirectUDPDataExplorationCeilingMbps(medium tier) = %d, want %d", got, want)
+	}
+}
+
+func TestExternalDirectUDPSendExplorationCeilingUsesUsefulLossyHighProbeAfterConservativeSelection(t *testing.T) {
+	rateState := externalDirectUDPSendRateState{
+		maxRateMbps:      10_000,
+		selectedRateMbps: 263,
+		activeRateMbps:   263,
+		rateCeilingMbps:  350,
+		sentProbeSamples: liveVLANLossyButUsefulSentProbeSamples(),
+		probeResult: directUDPRateProbeResult{
+			Samples: liveVLANLossyButUsefulReceivedProbeSamples(),
+		},
+	}
+	got := externalDirectUDPSendExplorationCeiling(rateState, probe.TransportCaps{Kind: "batched", BatchSize: 128}, externalDirectUDPSenderProbeRateLimitResult{})
+	if got < 1000 {
+		t.Fatalf("externalDirectUDPSendExplorationCeiling(live VLAN) = %d, want at least 1000", got)
 	}
 }
 

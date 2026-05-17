@@ -131,6 +131,45 @@ func TestExternalDirectUDPRateProbeFormattingAndSelectorHelpers(t *testing.T) {
 	}
 }
 
+func TestExternalDirectUDPFormatRateProbeSamplesShowsUnknownDeliveryWithoutSenderDenominator(t *testing.T) {
+	tests := []struct {
+		name string
+		sent []directUDPRateProbeSample
+	}{
+		{
+			name: "empty sent samples",
+		},
+		{
+			name: "sent samples missing received rate",
+			sent: []directUDPRateProbeSample{
+				{RateMbps: 600, BytesSent: 13924424},
+			},
+		},
+		{
+			name: "matching sent sample has zero bytes",
+			sent: []directUDPRateProbeSample{
+				{RateMbps: 700, BytesSent: 0},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := externalDirectUDPFormatRateProbeSamples(tt.sent, []directUDPRateProbeSample{
+				{RateMbps: 700, BytesReceived: 13924424, DurationMillis: 200},
+			})
+			if !strings.Contains(out, "700:rx=13924424") {
+				t.Fatalf("formatted probes = %q, want rx bytes", out)
+			}
+			if !strings.Contains(out, "delivery=unknown") {
+				t.Fatalf("formatted probes = %q, want delivery=unknown without sender denominator", out)
+			}
+			if strings.Contains(out, "delivery=0.00") {
+				t.Fatalf("formatted probes = %q, want no fake zero delivery", out)
+			}
+		})
+	}
+}
+
 func TestExternalDirectUDPWaitAndDistributorHelpers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

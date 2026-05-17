@@ -67,6 +67,18 @@ Trace `app_bytes` are session stream bytes and include derphole framing, so payl
 Sender `app_bytes` are receiver-confirmed session stream bytes once progress ACKs start. `local_sent_bytes` records sender-side enqueue/spool progress and can be ahead of receiver progress. Use `transfer_elapsed_ms` for throughput comparisons; `elapsed_ms` includes setup and direct probing time.
 
 `connected-direct` means direct UDP has delivered probe or payload bytes. A run that attempts direct but falls back to relay records `direct-fallback-relay` and a non-empty `fallback_reason`.
+Relay-prefix fallback should continue making trace progress after a direct setup failure; the receiver repeats its DERP prefix ACK while idle so one missed ACK cannot wedge the sender at the relay window.
+
+Use direct UDP send debug telemetry to explain dynamic scaling decisions:
+
+- `udp-striped-available-lanes`: routable direct UDP lane pool retained for data.
+- `udp-active-lanes-selected`: initial active data lane target.
+- `udp-active-lane-min`: minimum active lane floor derived from useful probe evidence.
+- `udp-active-lane-cap`: policy cap from `--parallel` or auto policy.
+- `udp-rate-ceiling-mbps`: conservative clean startup ceiling.
+- `udp-rate-exploration-ceiling-mbps`: higher aggregate ceiling allowed by useful lossy probes.
+
+A healthy LAN/VLAN run should not collapse to one available lane when multiple routable lanes probed successfully. Aggregate rate can start conservative, but the lane pool and exploration ceiling should leave room for controller scaling as quality changes.
 
 For no-Tailscale route verification, run 3x averaged 1 GiB transfers in both directions for:
 
