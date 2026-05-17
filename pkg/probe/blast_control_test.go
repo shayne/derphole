@@ -278,6 +278,60 @@ func TestObserveStripedBlastStatsEventTracksPeakGoodput(t *testing.T) {
 	}
 }
 
+func TestBlastSendControlDiagnosticsSnapshotsControllerState(t *testing.T) {
+	now := time.Unix(14, 0)
+	control := newBlastSendControlWithInitialLossCeiling(200, 900, 500, now)
+	control.ObserveReceiverStatsPayload(blastReceiverStats{CommittedPayloadBytes: 3000}, now, true)
+
+	diagnostics := control.Diagnostics(SendConfig{
+		RateMbps:                   200,
+		RateCeilingMbps:            500,
+		RateExplorationCeilingMbps: 900,
+		MinActiveLanes:             2,
+		MaxActiveLanes:             4,
+	}, 3, 5, 1234, 7, 2, 4096, 8192, 3000)
+
+	if diagnostics.RateTargetMbps != 200 {
+		t.Fatalf("RateTargetMbps = %d, want 200", diagnostics.RateTargetMbps)
+	}
+	if diagnostics.RateCeilingMbps != 500 {
+		t.Fatalf("RateCeilingMbps = %d, want 500", diagnostics.RateCeilingMbps)
+	}
+	if diagnostics.RateExplorationCeilingMbps != 900 {
+		t.Fatalf("RateExplorationCeilingMbps = %d, want 900", diagnostics.RateExplorationCeilingMbps)
+	}
+	if diagnostics.RateSelectedMbps != 200 {
+		t.Fatalf("RateSelectedMbps = %d, want 200", diagnostics.RateSelectedMbps)
+	}
+	if diagnostics.ActiveLanes != 3 || diagnostics.AvailableLanes != 5 {
+		t.Fatalf("lanes = active %d available %d, want active 3 available 5", diagnostics.ActiveLanes, diagnostics.AvailableLanes)
+	}
+	if diagnostics.LaneMin != 2 || diagnostics.LaneCap != 4 {
+		t.Fatalf("lane bounds = min %d cap %d, want min 2 cap 4", diagnostics.LaneMin, diagnostics.LaneCap)
+	}
+	if diagnostics.ReplayBytes != 1234 {
+		t.Fatalf("ReplayBytes = %d, want 1234", diagnostics.ReplayBytes)
+	}
+	if diagnostics.Retransmits != 7 {
+		t.Fatalf("Retransmits = %d, want 7", diagnostics.Retransmits)
+	}
+	if diagnostics.RepairRequests != 2 {
+		t.Fatalf("RepairRequests = %d, want 2", diagnostics.RepairRequests)
+	}
+	if diagnostics.RepairBytes != 4096 {
+		t.Fatalf("RepairBytes = %d, want 4096", diagnostics.RepairBytes)
+	}
+	if diagnostics.ReceiverCommittedBytes != 3000 {
+		t.Fatalf("ReceiverCommittedBytes = %d, want 3000", diagnostics.ReceiverCommittedBytes)
+	}
+	if diagnostics.DirectPacketBytes != 8192 {
+		t.Fatalf("DirectPacketBytes = %d, want 8192", diagnostics.DirectPacketBytes)
+	}
+	if diagnostics.DirectCommittedBytes != 3000 {
+		t.Fatalf("DirectCommittedBytes = %d, want 3000", diagnostics.DirectCommittedBytes)
+	}
+}
+
 func TestHandleBlastSendControlEventRepairRequestBacksOffAdaptiveRate(t *testing.T) {
 	now := time.Unix(15, 0)
 	control := newBlastSendControl(525, 700, now)
@@ -351,6 +405,50 @@ func TestHandleBlastSendControlEventRepairRequestBacksOffAdaptiveRate(t *testing
 	}
 	if stats.Retransmits != 4 {
 		t.Fatalf("Retransmits after a second small repair request = %d, want 4", stats.Retransmits)
+	}
+}
+
+func TestHandleBlastRepairRequestEventCountsRepairDiagnostics(t *testing.T) {
+	now := time.Unix(16, 0)
+	history, err := newBlastRepairHistory([16]byte{3}, 4, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer history.Close()
+	if err := history.Record(0, []byte("abcd")); err != nil {
+		t.Fatal(err)
+	}
+	history.MarkComplete(4, 1)
+	stats := TransferStats{}
+	payload := make([]byte, 8)
+	event := blastSendControlEvent{
+		typ:        PacketTypeRepairRequest,
+		payload:    payload,
+		receivedAt: now,
+	}
+	var progressStats TransferStats
+	progress := func(stats TransferStats) {
+		progressStats = stats
+	}
+
+	complete, repaired, err := handleBlastRepairRequestEvent(context.Background(), &queuedControlBatcher{}, controlTestAddr("peer"), history, &stats, newBlastRepairDeduper(), nil, event, progress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if complete {
+		t.Fatal("repair request completed transfer")
+	}
+	if !repaired {
+		t.Fatal("repair request was not handled")
+	}
+	if stats.Diagnostics.RepairRequests != 1 {
+		t.Fatalf("RepairRequests = %d, want 1", stats.Diagnostics.RepairRequests)
+	}
+	if stats.Diagnostics.RepairBytes != 4 {
+		t.Fatalf("RepairBytes = %d, want retransmitted payload bytes 4", stats.Diagnostics.RepairBytes)
+	}
+	if progressStats.Diagnostics.RepairRequests != 1 || progressStats.Diagnostics.RepairBytes != 4 {
+		t.Fatalf("progress repair diagnostics = requests %d bytes %d, want requests 1 bytes 4", progressStats.Diagnostics.RepairRequests, progressStats.Diagnostics.RepairBytes)
 	}
 }
 

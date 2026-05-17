@@ -167,6 +167,32 @@ func (c *blastSendControl) AckFloor() uint64 {
 	return c.ackFloor
 }
 
+func (c *blastSendControl) Diagnostics(cfg SendConfig, activeLanes int, availableLanes int, replayBytes uint64, retransmits int64, repairRequests int64, repairBytes int64, packetBytes int64, committedBytes int64) TransferDiagnostics {
+	rateTarget := cfg.RateMbps
+	receiverCommittedBytes := uint64(0)
+	if c != nil {
+		rateTarget = c.RateMbps()
+		receiverCommittedBytes = c.receiverCommittedBytes
+	}
+	return TransferDiagnostics{
+		RateTargetMbps:             rateTarget,
+		RateCeilingMbps:            cfg.RateCeilingMbps,
+		RateExplorationCeilingMbps: cfg.RateExplorationCeilingMbps,
+		RateSelectedMbps:           cfg.RateMbps,
+		ActiveLanes:                activeLanes,
+		AvailableLanes:             availableLanes,
+		LaneMin:                    cfg.MinActiveLanes,
+		LaneCap:                    cfg.MaxActiveLanes,
+		ReplayBytes:                replayBytes,
+		Retransmits:                retransmits,
+		RepairRequests:             repairRequests,
+		RepairBytes:                repairBytes,
+		ReceiverCommittedBytes:     receiverCommittedBytes,
+		DirectPacketBytes:          packetBytes,
+		DirectCommittedBytes:       committedBytes,
+	}
+}
+
 func (c *blastSendControl) ObserveReplayPressure(now time.Time, retainedBytes uint64, maxBytes uint64) {
 	if c == nil || c.controller == nil || maxBytes == 0 {
 		return

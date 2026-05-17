@@ -162,7 +162,8 @@ func handleBlastRepairRequestEvent(ctx context.Context, batcher packetBatcher, p
 	if batcher == nil || stats == nil {
 		return false, false, nil
 	}
-	retransmits, err := sendBlastRepairs(ctx, batcher, peer, history, event.payload, stats, deduper, event.receivedAt, progress)
+	recordRepairRequest(stats)
+	retransmits, _, err := sendBlastRepairs(ctx, batcher, peer, history, event.payload, stats, deduper, event.receivedAt, progress)
 	if err != nil {
 		return false, false, err
 	}
