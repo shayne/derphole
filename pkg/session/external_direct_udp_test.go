@@ -786,9 +786,12 @@ func TestRelayPrefixSendRuntimeAttachesTransportManagerToMetrics(t *testing.T) {
 
 	manager := transport.NewManager(transport.ManagerConfig{})
 	checked := make(chan error, 1)
-	relayStarted := make(chan struct{})
+	relayStarted := make(chan struct{}, 1)
 	externalSendExternalHandoffDERPFn = func(ctx context.Context, derpClient *derpbind.Client, peerDERP key.NodePublic, spool *externalHandoffSpool, stopCh <-chan struct{}, metrics *externalTransferMetrics, aead cipher.AEAD) error {
-		close(relayStarted)
+		select {
+		case relayStarted <- struct{}{}:
+		default:
+		}
 		select {
 		case <-stopCh:
 			return nil
@@ -4382,9 +4385,12 @@ func TestRelayPrefixReceiveRuntimeAttachesTransportManagerToMetrics(t *testing.T
 	defer cancel()
 
 	prevReceiveRelay := externalReceiveExternalHandoffDERPFn
-	relayStarted := make(chan struct{})
+	relayStarted := make(chan struct{}, 1)
 	externalReceiveExternalHandoffDERPFn = func(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, rx *externalHandoffReceiver, packets <-chan derpbind.Packet, metrics *externalTransferMetrics, packetAEAD cipher.AEAD) error {
-		close(relayStarted)
+		select {
+		case relayStarted <- struct{}{}:
+		default:
+		}
 		<-ctx.Done()
 		return ctx.Err()
 	}
