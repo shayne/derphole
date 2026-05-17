@@ -58,8 +58,29 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 		pairSummary = fmt.Sprintf(" peer_delta_bytes=%d sender_mbps=%.2f receiver_mbps=%.2f", pairResult.ProgressDeltaBytes, pairResult.SenderRateMbps, pairResult.ReceiverRateMbps)
 	}
 
-	_, _ = fmt.Fprintf(stdout, "trace-ok rows=%d final_app_bytes=%d max_flatline=%s%s\n", result.Rows, result.FinalAppBytes, result.MaxFlatline, pairSummary)
+	diagnosticSummary := formatDiagnosticsSummary(result.Diagnostics)
+	_, _ = fmt.Fprintf(stdout, "trace-ok rows=%d final_app_bytes=%d max_flatline=%s%s%s\n", result.Rows, result.FinalAppBytes, result.MaxFlatline, pairSummary, diagnosticSummary)
 	return 0
+}
+
+func formatDiagnosticsSummary(diagnostics transfertrace.DiagnosticsSummary) string {
+	summary := ""
+	if diagnostics.MaxRateTargetMbps > 0 {
+		summary += fmt.Sprintf(" max_rate_target_mbps=%d", diagnostics.MaxRateTargetMbps)
+	}
+	if diagnostics.MaxReplayBytes > 0 {
+		summary += fmt.Sprintf(" max_replay_bytes=%d", diagnostics.MaxReplayBytes)
+	}
+	if diagnostics.MaxRetransmits > 0 {
+		summary += fmt.Sprintf(" max_retransmits=%d", diagnostics.MaxRetransmits)
+	}
+	if diagnostics.MaxPeerRecvQueueDepth > 0 {
+		summary += fmt.Sprintf(" max_peer_recv_queue_depth=%d", diagnostics.MaxPeerRecvQueueDepth)
+	}
+	if diagnostics.ReceiverCommittedMbpsObserved {
+		summary += fmt.Sprintf(" receiver_commit_mbps_min=%.2f receiver_commit_mbps_max=%.2f", diagnostics.ReceiverCommittedMbpsMin, diagnostics.ReceiverCommittedMbpsMax)
+	}
+	return summary
 }
 
 func parseOptions(args []string, stderr io.Writer) (options, error) {

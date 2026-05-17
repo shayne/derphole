@@ -25,6 +25,17 @@ type Result struct {
 	FinalAppBytes int64
 	FinalPhase    Phase
 	MaxFlatline   time.Duration
+	Diagnostics   DiagnosticsSummary
+}
+
+type DiagnosticsSummary struct {
+	MaxRateTargetMbps             int
+	MaxReplayBytes                uint64
+	MaxRetransmits                int64
+	MaxPeerRecvQueueDepth         int
+	ReceiverCommittedMbpsMin      float64
+	ReceiverCommittedMbpsMax      float64
+	ReceiverCommittedMbpsObserved bool
 }
 
 type PairOptions struct {
@@ -44,20 +55,26 @@ type PairResult struct {
 }
 
 type checkerIndexes struct {
-	fields            int
-	header            []string
-	timestamp         int
-	timestampName     string
-	role              int
-	phase             int
-	elapsedMS         int
-	appBytes          int
-	peerReceivedBytes int
-	transferElapsedMS int
-	directValidated   int
-	fallbackReason    int
-	lastState         int
-	lastError         int
+	fields                int
+	header                []string
+	timestamp             int
+	timestampName         string
+	role                  int
+	phase                 int
+	elapsedMS             int
+	appBytes              int
+	peerReceivedBytes     int
+	transferElapsedMS     int
+	directValidated       int
+	fallbackReason        int
+	lastState             int
+	lastError             int
+	rateTargetMbps        int
+	receiverCommittedMbps int
+	replayBytes           int
+	retransmits           int
+	peerRecvQueueDepth    int
+	peerRecvQueueDepthMax int
 }
 
 type checkerRow struct {
@@ -72,6 +89,17 @@ type checkerRow struct {
 	fallbackReason    string
 	lastState         string
 	lastError         string
+	diagnostics       checkerRowDiagnostics
+}
+
+type checkerRowDiagnostics struct {
+	rateTargetMbps                int
+	receiverCommittedMbps         float64
+	receiverCommittedMbpsObserved bool
+	replayBytes                   uint64
+	retransmits                   int64
+	peerRecvQueueDepth            int
+	peerRecvQueueDepthMax         int
 }
 
 type checker struct {
@@ -158,6 +186,7 @@ func (c *checker) consume(row checkerRow) error {
 	c.result.Rows++
 	c.result.FinalAppBytes = row.appBytes
 	c.result.FinalPhase = row.phase
+	c.recordDiagnostics(row)
 	if row.lastError != "" {
 		return fmt.Errorf("row %d: terminal error: %s", row.rowNo, row.lastError)
 	}
@@ -183,6 +212,50 @@ func (c *checker) consume(row checkerRow) error {
 		return nil
 	}
 	return c.checkFlatline(row)
+}
+
+func (c *checker) recordDiagnostics(row checkerRow) {
+	diagnostics := &c.result.Diagnostics
+	rowDiagnostics := row.diagnostics
+	diagnostics.MaxRateTargetMbps = maxInt(diagnostics.MaxRateTargetMbps, rowDiagnostics.rateTargetMbps)
+	diagnostics.MaxReplayBytes = maxUint64(diagnostics.MaxReplayBytes, rowDiagnostics.replayBytes)
+	diagnostics.MaxRetransmits = maxInt64(diagnostics.MaxRetransmits, rowDiagnostics.retransmits)
+	diagnostics.MaxPeerRecvQueueDepth = maxInt(diagnostics.MaxPeerRecvQueueDepth, maxInt(rowDiagnostics.peerRecvQueueDepth, rowDiagnostics.peerRecvQueueDepthMax))
+	recordReceiverCommittedMbps(diagnostics, rowDiagnostics)
+}
+
+func recordReceiverCommittedMbps(diagnostics *DiagnosticsSummary, row checkerRowDiagnostics) {
+	if !row.receiverCommittedMbpsObserved {
+		return
+	}
+	if !diagnostics.ReceiverCommittedMbpsObserved || row.receiverCommittedMbps < diagnostics.ReceiverCommittedMbpsMin {
+		diagnostics.ReceiverCommittedMbpsMin = row.receiverCommittedMbps
+	}
+	if !diagnostics.ReceiverCommittedMbpsObserved || row.receiverCommittedMbps > diagnostics.ReceiverCommittedMbpsMax {
+		diagnostics.ReceiverCommittedMbpsMax = row.receiverCommittedMbps
+	}
+	diagnostics.ReceiverCommittedMbpsObserved = true
+}
+
+func maxInt(a int, b int) int {
+	if b > a {
+		return b
+	}
+	return a
+}
+
+func maxInt64(a int64, b int64) int64 {
+	if b > a {
+		return b
+	}
+	return a
+}
+
+func maxUint64(a uint64, b uint64) uint64 {
+	if b > a {
+		return b
+	}
+	return a
 }
 
 func (c *checker) checkFlatline(row checkerRow) error {
@@ -494,20 +567,26 @@ func checkerHeaderIndexes(header []string) (checkerIndexes, error) {
 		return checkerIndexes{}, err
 	}
 	return checkerIndexes{
-		fields:            len(header),
-		header:            append([]string(nil), header...),
-		timestamp:         timestamp,
-		timestampName:     timestampName,
-		role:              role,
-		phase:             phase,
-		elapsedMS:         optional("elapsed_ms"),
-		appBytes:          appBytes,
-		peerReceivedBytes: optional("peer_received_bytes"),
-		transferElapsedMS: optional("transfer_elapsed_ms"),
-		directValidated:   optional("direct_validated"),
-		fallbackReason:    optional("fallback_reason"),
-		lastState:         optional("last_state"),
-		lastError:         lastError,
+		fields:                len(header),
+		header:                append([]string(nil), header...),
+		timestamp:             timestamp,
+		timestampName:         timestampName,
+		role:                  role,
+		phase:                 phase,
+		elapsedMS:             optional("elapsed_ms"),
+		appBytes:              appBytes,
+		peerReceivedBytes:     optional("peer_received_bytes"),
+		transferElapsedMS:     optional("transfer_elapsed_ms"),
+		directValidated:       optional("direct_validated"),
+		fallbackReason:        optional("fallback_reason"),
+		lastState:             optional("last_state"),
+		lastError:             lastError,
+		rateTargetMbps:        optional("rate_target_mbps"),
+		receiverCommittedMbps: optional("receiver_committed_mbps"),
+		replayBytes:           optional("replay_bytes"),
+		retransmits:           optional("retransmits"),
+		peerRecvQueueDepth:    optional("peer_recv_queue_depth"),
+		peerRecvQueueDepthMax: optional("peer_recv_queue_depth_max"),
 	}, nil
 }
 
@@ -554,6 +633,10 @@ func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int) (checke
 	if err != nil {
 		return checkerRow{}, err
 	}
+	diagnostics, err := parseCheckerRowDiagnostics(record, indexes, rowNo)
+	if err != nil {
+		return checkerRow{}, err
+	}
 	return checkerRow{
 		rowNo:             rowNo,
 		timestamp:         time.UnixMilli(timestampMS),
@@ -566,6 +649,43 @@ func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int) (checke
 		fallbackReason:    field(record, indexes.fallbackReason),
 		lastState:         field(record, indexes.lastState),
 		lastError:         field(record, indexes.lastError),
+		diagnostics:       diagnostics,
+	}, nil
+}
+
+func parseCheckerRowDiagnostics(record []string, indexes checkerIndexes, rowNo int) (checkerRowDiagnostics, error) {
+	rateTargetMbps, err := parseOptionalIntDiagnosticField(record, indexes.rateTargetMbps, "rate_target_mbps", rowNo)
+	if err != nil {
+		return checkerRowDiagnostics{}, err
+	}
+	receiverCommittedMbps, receiverCommittedMbpsObserved, err := parseOptionalFloatDiagnosticField(record, indexes.receiverCommittedMbps, "receiver_committed_mbps", rowNo)
+	if err != nil {
+		return checkerRowDiagnostics{}, err
+	}
+	replayBytes, err := parseOptionalUint64DiagnosticField(record, indexes.replayBytes, "replay_bytes", rowNo)
+	if err != nil {
+		return checkerRowDiagnostics{}, err
+	}
+	retransmits, err := parseOptionalInt64DiagnosticField(record, indexes.retransmits, "retransmits", rowNo)
+	if err != nil {
+		return checkerRowDiagnostics{}, err
+	}
+	peerRecvQueueDepth, err := parseOptionalIntDiagnosticField(record, indexes.peerRecvQueueDepth, "peer_recv_queue_depth", rowNo)
+	if err != nil {
+		return checkerRowDiagnostics{}, err
+	}
+	peerRecvQueueDepthMax, err := parseOptionalIntDiagnosticField(record, indexes.peerRecvQueueDepthMax, "peer_recv_queue_depth_max", rowNo)
+	if err != nil {
+		return checkerRowDiagnostics{}, err
+	}
+	return checkerRowDiagnostics{
+		rateTargetMbps:                rateTargetMbps,
+		receiverCommittedMbps:         receiverCommittedMbps,
+		receiverCommittedMbpsObserved: receiverCommittedMbpsObserved,
+		replayBytes:                   replayBytes,
+		retransmits:                   retransmits,
+		peerRecvQueueDepth:            peerRecvQueueDepth,
+		peerRecvQueueDepthMax:         peerRecvQueueDepthMax,
 	}, nil
 }
 
@@ -693,6 +813,69 @@ func parseOptionalBoolField(record []string, index int, name string, rowNo int) 
 		return false, fmt.Errorf("row %d: parse %s %q: %w", rowNo, name, value, err)
 	}
 	return b, nil
+}
+
+func parseOptionalIntDiagnosticField(record []string, index int, name string, rowNo int) (int, error) {
+	if index < 0 {
+		return 0, nil
+	}
+	value := field(record, index)
+	if value == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("row %d: parse %s %q: %w", rowNo, name, value, err)
+	}
+	return n, nil
+}
+
+func parseOptionalInt64DiagnosticField(record []string, index int, name string, rowNo int) (int64, error) {
+	if index < 0 {
+		return 0, nil
+	}
+	value := field(record, index)
+	if value == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("row %d: parse %s %q: %w", rowNo, name, value, err)
+	}
+	return n, nil
+}
+
+func parseOptionalUint64DiagnosticField(record []string, index int, name string, rowNo int) (uint64, error) {
+	if index < 0 {
+		return 0, nil
+	}
+	value := field(record, index)
+	if value == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("row %d: parse %s %q: %w", rowNo, name, value, err)
+	}
+	return n, nil
+}
+
+func parseOptionalFloatDiagnosticField(record []string, index int, name string, rowNo int) (float64, bool, error) {
+	if index < 0 {
+		return 0, false, nil
+	}
+	value := field(record, index)
+	if value == "" {
+		return 0, false, nil
+	}
+	n, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, false, fmt.Errorf("row %d: parse %s %q: %w", rowNo, name, value, err)
+	}
+	if math.IsNaN(n) || math.IsInf(n, 0) {
+		return 0, false, fmt.Errorf("row %d: parse %s %q: non-finite value", rowNo, name, value)
+	}
+	return n, true, nil
 }
 
 func field(record []string, index int) string {

@@ -39,6 +39,76 @@ func TestRunPrintsSuccess(t *testing.T) {
 	if !strings.Contains(stdout.String(), "trace-ok rows=1 final_app_bytes=4096") {
 		t.Fatalf("stdout = %q, want trace-ok", stdout.String())
 	}
+	if strings.Contains(stdout.String(), "max_rate_target_mbps") || strings.Contains(stdout.String(), "receiver_commit_mbps") {
+		t.Fatalf("stdout = %q, want legacy output without diagnostics", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestRunPrintsDiagnosticSummary(t *testing.T) {
+	path := writeTrace(t, transfertrace.HeaderLine+"\n"+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms":         "1000",
+			"elapsed_ms":                "0",
+			"role":                      "send",
+			"phase":                     "direct_execute",
+			"direct_bytes":              "1024",
+			"app_bytes":                 "1024",
+			"delta_app_bytes":           "1024",
+			"app_mbps":                  "0.00",
+			"local_sent_bytes":          "1024",
+			"peer_received_bytes":       "1024",
+			"transfer_elapsed_ms":       "500",
+			"direct_validated":          "true",
+			"last_state":                "connected-direct",
+			"rate_target_mbps":          "263",
+			"receiver_committed_mbps":   "1.00",
+			"replay_bytes":              "1048576",
+			"retransmits":               "7",
+			"peer_recv_queue_depth":     "512",
+			"peer_recv_queue_depth_max": "700",
+		})+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms":         "1500",
+			"elapsed_ms":                "500",
+			"role":                      "send",
+			"phase":                     "complete",
+			"direct_bytes":              "2048",
+			"app_bytes":                 "2048",
+			"delta_app_bytes":           "1024",
+			"app_mbps":                  "16.38",
+			"local_sent_bytes":          "2048",
+			"peer_received_bytes":       "2048",
+			"transfer_elapsed_ms":       "1000",
+			"direct_validated":          "true",
+			"last_state":                "stream-complete",
+			"rate_target_mbps":          "300",
+			"receiver_committed_mbps":   "16.38",
+			"replay_bytes":              "2097152",
+			"retransmits":               "9",
+			"peer_recv_queue_depth":     "900",
+			"peer_recv_queue_depth_max": "1069",
+		}))
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-role", "send", "-expected-bytes", "2048", path}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() exit = %d, stderr = %q", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"max_rate_target_mbps=300",
+		"max_replay_bytes=2097152",
+		"max_retransmits=9",
+		"max_peer_recv_queue_depth=1069",
+		"receiver_commit_mbps_min=1.00",
+		"receiver_commit_mbps_max=16.38",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("stdout = %q, want %q", out, want)
+		}
+	}
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
@@ -164,4 +234,21 @@ func writeTrace(t *testing.T, text string) string {
 		t.Fatalf("write trace: %v", err)
 	}
 	return path
+}
+
+func traceCSVRow(t *testing.T, values map[string]string) string {
+	t.Helper()
+	fields := make([]string, len(transfertrace.Header))
+	positions := make(map[string]int, len(transfertrace.Header))
+	for i, name := range transfertrace.Header {
+		positions[name] = i
+	}
+	for name, value := range values {
+		index, ok := positions[name]
+		if !ok {
+			t.Fatalf("unknown trace header %q", name)
+		}
+		fields[index] = value
+	}
+	return strings.Join(fields, ",") + "\n"
 }
