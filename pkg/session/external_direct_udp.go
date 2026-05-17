@@ -1176,6 +1176,7 @@ func externalDirectUDPNewSendConfig(tok token.Token, packetAEAD cipher.AEAD, rea
 		ParallelHandshakeTimeout: externalDirectUDPHandshakeWait,
 		MaxActiveLanes:           policyActiveLaneCap,
 		MinActiveLanes:           externalDirectUDPConstrainedReceiverMinActiveLanes(readyAck, lanes),
+		DisableConnectedUDP:      true,
 	}
 }
 
@@ -1446,7 +1447,9 @@ func externalExecutePreparedDirectUDPSend(ctx context.Context, src io.Reader, pl
 	externalDirectUDPValidateDirectProgress(nil, metrics, stats)
 	externalDirectUDPSendRecordMetrics(metrics, stats, !plan.sendSrcRecordsDirectMetrics)
 	if err != nil {
-		metrics.SetError(err)
+		if !plan.sendSrcRecordsDirectMetrics {
+			metrics.SetError(err)
+		}
 	} else {
 		emitExternalTransferMetricsComplete(metrics, cfg.Emitter, "udp-send", stats, stats.CompletedAt)
 	}
@@ -2590,7 +2593,11 @@ func (rt *externalRelayPrefixSendRuntime) handleRelayDoneDuringDirect(directCanc
 				rt.finishOnRelay()
 				return nil
 			}
+			rt.metrics.SetError(directErr)
 			return directErr
+		}
+		if relayErr != nil {
+			rt.metrics.SetError(relayErr)
 		}
 		return relayErr
 	}
@@ -2620,6 +2627,7 @@ func (rt *externalRelayPrefixSendRuntime) handleDirectDoneBeforeRelay(directErr 
 			rt.rcfg.cfg.Emitter.Debug("udp-handoff-send-direct-before-progress-error=" + directErr.Error())
 		}
 		if relayErr := rt.waitRelayErr(); relayErr != nil {
+			rt.metrics.SetError(relayErr)
 			return relayErr
 		}
 		rt.finishOnRelay()
@@ -2628,7 +2636,11 @@ func (rt *externalRelayPrefixSendRuntime) handleDirectDoneBeforeRelay(directErr 
 	rt.stopRelay()
 	relayErr := rt.waitRelayErr()
 	if directErr != nil {
+		rt.metrics.SetError(directErr)
 		return directErr
+	}
+	if relayErr != nil {
+		rt.metrics.SetError(relayErr)
 	}
 	return relayErr
 }
@@ -6693,9 +6705,10 @@ func externalDirectUDPConnsForSectionAddrs(conns []net.PacketConn, sectionAddrs 
 
 func externalDirectUDPFastDiscardReceiveConfig() probe.ReceiveConfig {
 	return probe.ReceiveConfig{
-		Blast:        true,
-		Transport:    externalDirectUDPTransportLabel,
-		FECGroupSize: externalDirectUDPFECGroupSize,
+		Blast:               true,
+		Transport:           externalDirectUDPTransportLabel,
+		FECGroupSize:        externalDirectUDPFECGroupSize,
+		DisableConnectedUDP: true,
 	}
 }
 

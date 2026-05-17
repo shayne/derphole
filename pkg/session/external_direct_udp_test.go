@@ -2838,6 +2838,30 @@ func TestExternalRelayPrefixSendRuntimeHandleDirectDoneBeforeRelayFallsBackToRel
 	}
 }
 
+func TestExternalExecutePreparedDirectUDPSendDefersRelayPrefixDirectErrorTelemetry(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	var traceOut bytes.Buffer
+	trace, err := transfertrace.NewRecorder(&traceOut, transfertrace.RoleSend, time.Unix(81, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(81, 0), trace, transfertrace.RoleSend)
+	plan := externalDirectUDPSendPlan{sendSrcRecordsDirectMetrics: true}
+
+	err = externalExecutePreparedDirectUDPSend(ctx, strings.NewReader("payload"), plan, SendConfig{}, metrics)
+	if err == nil {
+		t.Fatal("externalExecutePreparedDirectUDPSend() error = nil, want direct attempt failure")
+	}
+	if err := trace.Close(); err != nil {
+		t.Fatalf("trace.Close() error = %v", err)
+	}
+	if traceBody := traceOut.String(); strings.Contains(traceBody, ",send,error,") {
+		t.Fatalf("relay-prefix direct attempt failure was recorded as terminal send error:\n%s", traceBody)
+	}
+}
+
 func TestExternalRelayPrefixSendRuntimeRelayDoneDoesNotCancelDirectAfterProgress(t *testing.T) {
 	spool, err := newExternalHandoffSpool(strings.NewReader("abc"), 4, 8)
 	if err != nil {
@@ -4781,6 +4805,26 @@ func TestExternalDirectUDPFastDiscardReceiveConfigAcceptsDiscoveredRuns(t *testi
 	}
 	if len(cfg.ExpectedRunIDs) != 0 {
 		t.Fatalf("ExpectedRunIDs = %d entries, want probe-compatible discovered run IDs", len(cfg.ExpectedRunIDs))
+	}
+}
+
+func TestExternalDirectUDPConfigsDisableConnectedUDPSockets(t *testing.T) {
+	tok := token.Token{SessionID: [16]byte{1, 2, 3, 4}}
+	sendCfg := externalDirectUDPNewSendConfig(
+		tok,
+		nil,
+		directUDPReadyAck{},
+		externalDirectUDPParallelism,
+		externalDirectUDPParallelism,
+		externalDirectUDPInitialSendRateState(),
+	)
+	if !sendCfg.DisableConnectedUDP {
+		t.Fatal("direct UDP send config allows connected UDP sockets")
+	}
+
+	receiveCfg := externalDirectUDPFastDiscardReceiveConfig()
+	if !receiveCfg.DisableConnectedUDP {
+		t.Fatal("direct UDP receive config allows connected UDP sockets")
 	}
 }
 

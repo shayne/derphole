@@ -128,6 +128,7 @@ type SendConfig struct {
 	StreamReplayWindowBytes    uint64
 	MaxActiveLanes             int
 	MinActiveLanes             int
+	DisableConnectedUDP        bool
 	Progress                   func(TransferStats)
 }
 
@@ -142,6 +143,7 @@ type ReceiveConfig struct {
 	FECGroupSize         int
 	SpoolOutput          bool
 	PacketAEAD           cipher.AEAD
+	DisableConnectedUDP  bool
 	Progress             func(TransferStats)
 }
 
@@ -2533,6 +2535,9 @@ func parallelActiveLanesForConfig(rateMbps int, available int, striped bool, min
 }
 
 func shouldUseConnectedBatcherForParallelSend(batcher packetBatcher, laneCount int, cfg SendConfig) bool {
+	if cfg.DisableConnectedUDP {
+		return false
+	}
 	if batcher == nil {
 		return false
 	}
@@ -5926,6 +5931,9 @@ func handleBlastStreamLaneHello(ctx context.Context, lane *blastStreamReceiveLan
 }
 
 func maybeConnectBlastStreamReceiveLane(lane *blastStreamReceiveLane, cfg ReceiveConfig, connected *atomic.Bool, addr net.Addr) {
+	if cfg.DisableConnectedUDP {
+		return
+	}
 	if lane.batcher.MaxBatch() != 1 || lane.batcher.Capabilities().Connected {
 		return
 	}
@@ -7232,6 +7240,9 @@ func (s *blastParallelConnReceiveState) handleHello(packet blastParallelConnPack
 }
 
 func (s *blastParallelConnReceiveState) maybeConnectBatcher(addr net.Addr) {
+	if s.cfg.DisableConnectedUDP {
+		return
+	}
 	if s.batcher.MaxBatch() != 1 || s.batcher.Capabilities().Connected {
 		return
 	}

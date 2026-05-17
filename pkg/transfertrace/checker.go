@@ -49,6 +49,7 @@ type checkerIndexes struct {
 	timestampName     string
 	role              int
 	phase             int
+	elapsedMS         int
 	appBytes          int
 	peerReceivedBytes int
 	transferElapsedMS int
@@ -61,6 +62,7 @@ type checkerIndexes struct {
 type checkerRow struct {
 	rowNo             int
 	timestamp         time.Time
+	elapsedMS         int64
 	phase             Phase
 	appBytes          int64
 	peerReceivedBytes int64
@@ -300,7 +302,7 @@ func compareCheckerPair(primaryRows []checkerRow, peerRows []checkerRow, opts Pa
 		ProgressDeltaBytes:   delta,
 		MaxProgressLeadBytes: maxLead,
 		SenderRateMbps:       mbps(senderFinal.peerReceivedBytes, senderFinal.transferElapsedMS),
-		ReceiverRateMbps:     mbps(receiverFinal.appBytes, receiverFinal.transferElapsedMS),
+		ReceiverRateMbps:     mbps(receiverFinal.appBytes, receiverTransferElapsedMS(receiverRows)),
 	}
 	if delta != 0 {
 		return result, fmt.Errorf("sender peer_received_bytes = %d, receiver app_bytes = %d", senderFinal.peerReceivedBytes, receiverFinal.appBytes)
@@ -325,9 +327,14 @@ func maxSenderProgressLead(senderRows []checkerRow, receiverRows []checkerRow) i
 	var maxLead int64
 	receiverIndex := 0
 	var receiverBytes int64
+	useTransferElapsed := useTransferElapsedForProgressLead(senderRows, receiverRows)
+	receiverBaseElapsed := firstReceiverAppElapsedMS(receiverRows)
 	for _, sender := range senderRows {
-		senderElapsed := comparableElapsed(sender)
-		for receiverIndex < len(receiverRows) && comparableElapsed(receiverRows[receiverIndex]) <= senderElapsed {
+		if sender.phase == PhaseComplete {
+			continue
+		}
+		senderElapsed := comparableElapsed(sender, useTransferElapsed, 0)
+		for receiverIndex < len(receiverRows) && comparableElapsed(receiverRows[receiverIndex], useTransferElapsed, receiverBaseElapsed) <= senderElapsed {
 			if receiverRows[receiverIndex].appBytes > receiverBytes {
 				receiverBytes = receiverRows[receiverIndex].appBytes
 			}
@@ -341,7 +348,58 @@ func maxSenderProgressLead(senderRows []checkerRow, receiverRows []checkerRow) i
 	return maxLead
 }
 
-func comparableElapsed(row checkerRow) int64 {
+func useTransferElapsedForProgressLead(senderRows []checkerRow, receiverRows []checkerRow) bool {
+	senderHasTransferElapsed := false
+	for _, row := range senderRows {
+		if row.peerReceivedBytes > 0 && row.transferElapsedMS > 0 {
+			senderHasTransferElapsed = true
+			break
+		}
+	}
+	if !senderHasTransferElapsed {
+		return false
+	}
+	for _, row := range receiverRows {
+		if row.appBytes > 0 && (row.transferElapsedMS > 0 || row.elapsedMS > 0) {
+			return true
+		}
+	}
+	return false
+}
+
+func firstReceiverAppElapsedMS(rows []checkerRow) int64 {
+	for _, row := range rows {
+		if row.appBytes > 0 && row.elapsedMS > 0 {
+			return row.elapsedMS
+		}
+	}
+	return 0
+}
+
+func receiverTransferElapsedMS(rows []checkerRow) int64 {
+	if len(rows) == 0 {
+		return 0
+	}
+	final := rows[len(rows)-1]
+	if final.transferElapsedMS > 0 {
+		return final.transferElapsedMS
+	}
+	base := firstReceiverAppElapsedMS(rows)
+	if base > 0 && final.elapsedMS > base {
+		return final.elapsedMS - base
+	}
+	return 0
+}
+
+func comparableElapsed(row checkerRow, useTransferElapsed bool, receiverBaseElapsed int64) int64 {
+	if useTransferElapsed {
+		if row.transferElapsedMS > 0 {
+			return row.transferElapsedMS
+		}
+		if receiverBaseElapsed > 0 && row.elapsedMS > 0 {
+			return row.elapsedMS - receiverBaseElapsed
+		}
+	}
 	return row.timestamp.UnixMilli()
 }
 
@@ -440,6 +498,7 @@ func checkerHeaderIndexes(header []string) (checkerIndexes, error) {
 		timestampName:     timestampName,
 		role:              role,
 		phase:             phase,
+		elapsedMS:         optional("elapsed_ms"),
 		appBytes:          appBytes,
 		peerReceivedBytes: optional("peer_received_bytes"),
 		transferElapsedMS: optional("transfer_elapsed_ms"),
@@ -464,16 +523,14 @@ func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int) (checke
 	if len(record) != indexes.fields {
 		return checkerRow{}, fmt.Errorf("row %d: wrong number of fields: got %d, want %d", rowNo, len(record), indexes.fields)
 	}
-	if err := requireField(record, indexes.timestamp, indexes.timestampName, rowNo); err != nil {
-		return checkerRow{}, err
-	}
-	if err := requireField(record, indexes.phase, "phase", rowNo); err != nil {
-		return checkerRow{}, err
-	}
-	if err := requireField(record, indexes.appBytes, "app_bytes", rowNo); err != nil {
+	if err := requireCheckerRowFields(record, indexes, rowNo); err != nil {
 		return checkerRow{}, err
 	}
 	timestampMS, err := parseIntField(record, indexes.timestamp, indexes.timestampName, rowNo)
+	if err != nil {
+		return checkerRow{}, err
+	}
+	elapsedMS, err := parseOptionalIntField(record, indexes.elapsedMS, "elapsed_ms", rowNo)
 	if err != nil {
 		return checkerRow{}, err
 	}
@@ -496,6 +553,7 @@ func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int) (checke
 	return checkerRow{
 		rowNo:             rowNo,
 		timestamp:         time.UnixMilli(timestampMS),
+		elapsedMS:         elapsedMS,
 		phase:             Phase(field(record, indexes.phase)),
 		appBytes:          appBytes,
 		peerReceivedBytes: peerReceivedBytes,
@@ -505,6 +563,23 @@ func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int) (checke
 		lastState:         field(record, indexes.lastState),
 		lastError:         field(record, indexes.lastError),
 	}, nil
+}
+
+func requireCheckerRowFields(record []string, indexes checkerIndexes, rowNo int) error {
+	required := []struct {
+		index int
+		name  string
+	}{
+		{indexes.timestamp, indexes.timestampName},
+		{indexes.phase, "phase"},
+		{indexes.appBytes, "app_bytes"},
+	}
+	for _, field := range required {
+		if err := requireField(record, field.index, field.name, rowNo); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func validateCheckerRowStatus(row checkerRow) error {

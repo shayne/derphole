@@ -248,6 +248,58 @@ func TestCheckPairAllowsSynchronizedSenderReceiverProgress(t *testing.T) {
 	}
 }
 
+func TestCheckPairUsesTransferElapsedForPeerProgressLead(t *testing.T) {
+	sendTrace := HeaderLine + "\n" +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:       1000,
+			elapsedMS:         2000,
+			role:              RoleSend,
+			phase:             PhaseRelay,
+			appBytes:          1024,
+			deltaAppBytes:     1024,
+			peerReceivedBytes: 1024,
+			transferElapsedMS: 500,
+			lastState:         "connected-relay",
+		}) +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:       2000,
+			elapsedMS:         3000,
+			role:              RoleSend,
+			phase:             PhaseComplete,
+			appBytes:          2048,
+			deltaAppBytes:     1024,
+			peerReceivedBytes: 2048,
+			transferElapsedMS: 1000,
+			lastState:         "stream-complete",
+		})
+	receiveTrace := HeaderLine + "\n" +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:   1008,
+			elapsedMS:     1500,
+			role:          RoleReceive,
+			phase:         PhaseRelay,
+			appBytes:      1024,
+			deltaAppBytes: 1024,
+			lastState:     "connected-relay",
+		}) +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:   2008,
+			elapsedMS:     2500,
+			role:          RoleReceive,
+			phase:         PhaseComplete,
+			appBytes:      2048,
+			deltaAppBytes: 1024,
+			lastState:     "stream-complete",
+		})
+	result, err := CheckPair(strings.NewReader(sendTrace), strings.NewReader(receiveTrace), PairOptions{Role: RoleSend})
+	if err != nil {
+		t.Fatalf("CheckPair() error = %v", err)
+	}
+	if result.MaxProgressLeadBytes != 0 {
+		t.Fatalf("MaxProgressLeadBytes = %d, want 0", result.MaxProgressLeadBytes)
+	}
+}
+
 func TestCheckPairFailsSenderPeerProgressDivergence(t *testing.T) {
 	sendTrace := HeaderLine + "\n" +
 		testTraceRow(testTraceRowConfig{

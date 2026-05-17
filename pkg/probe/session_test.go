@@ -31,6 +31,32 @@ func testRunID(seed byte) [16]byte {
 	return runID
 }
 
+func listenUDP4(t *testing.T) *net.UDPConn {
+	t.Helper()
+	addr, err := net.ResolveUDPAddr("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.ListenUDP("udp4", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return conn
+}
+
+func requireConnectedUDPBatcher(t *testing.T, peer net.Addr) {
+	t.Helper()
+	conn := listenUDP4(t)
+	defer conn.Close()
+	batcher, ok := newConnectedUDPBatcher(conn, peer, probeTransportLegacy)
+	if !ok {
+		t.Skip("connected UDP batcher is unavailable on this platform")
+	}
+	if !batcher.Capabilities().Connected {
+		t.Fatal("connected UDP batcher did not report connected capabilities")
+	}
+}
+
 func writeProbePacket(t *testing.T, conn net.PacketConn, dst net.Addr, packet Packet) {
 	t.Helper()
 	wire, err := MarshalPacket(packet, nil)
@@ -2985,6 +3011,85 @@ func TestShouldUseConnectedBatcherForParallelBatchOnlyLowLaneRate(t *testing.T) 
 	}
 	if shouldUseConnectedBatcherForParallelSend(&capsBatcher{caps: TransportCaps{Kind: probeTransportBatched, BatchSize: 128, TXOffload: true, RXQOverflow: true}}, 4, SendConfig{RateCeilingMbps: 1000, MaxActiveLanes: 4}) {
 		t.Fatal("shouldUseConnectedBatcherForParallelSend(offload batcher) = true, want false")
+	}
+}
+
+func TestSendConfigDisableConnectedUDPSkipsParallelSendConnect(t *testing.T) {
+	client := listenUDP4(t)
+	defer client.Close()
+	server := listenUDP4(t)
+	defer server.Close()
+	requireConnectedUDPBatcher(t, server.LocalAddr())
+
+	batcher := newPacketBatcher(client, probeTransportLegacy)
+	stats := TransferStats{}
+	got := maybeConnectedParallelSendBatcher(client, server.LocalAddr(), batcher, 1, SendConfig{DisableConnectedUDP: true}, &stats)
+	if got.Capabilities().Connected {
+		t.Fatal("maybeConnectedParallelSendBatcher() connected socket with DisableConnectedUDP=true")
+	}
+	if stats.Transport.Connected {
+		t.Fatal("stats transport recorded connected socket with DisableConnectedUDP=true")
+	}
+}
+
+func TestReceiveConfigDisableConnectedUDPSkipsStreamReceiveConnect(t *testing.T) {
+	receiver := listenUDP4(t)
+	defer receiver.Close()
+	sender := listenUDP4(t)
+	defer sender.Close()
+	requireConnectedUDPBatcher(t, sender.LocalAddr())
+
+	connected := atomic.Bool{}
+	lane := &blastStreamReceiveLane{
+		conn:    receiver,
+		batcher: newPacketBatcher(receiver, probeTransportLegacy),
+	}
+	maybeConnectBlastStreamReceiveLane(lane, ReceiveConfig{DisableConnectedUDP: true}, &connected, sender.LocalAddr())
+	if lane.batcher.Capabilities().Connected {
+		t.Fatal("maybeConnectBlastStreamReceiveLane() connected socket with DisableConnectedUDP=true")
+	}
+	if connected.Load() {
+		t.Fatal("connected flag set with DisableConnectedUDP=true")
+	}
+}
+
+func TestReceiveConfigDisableConnectedUDPSkipsParallelReceiveConnect(t *testing.T) {
+	receiver := listenUDP4(t)
+	defer receiver.Close()
+	sender := listenUDP4(t)
+	defer sender.Close()
+	requireConnectedUDPBatcher(t, sender.LocalAddr())
+
+	connected := atomic.Bool{}
+	state := newBlastParallelConnReceiveState(
+		context.Background(),
+		receiver,
+		io.Discard,
+		ReceiveConfig{DisableConnectedUDP: true},
+		0,
+		1,
+		&atomic.Int64{},
+		&atomic.Int32{},
+		&atomic.Int32{},
+		&atomic.Int64{},
+		&sync.Mutex{},
+		&sync.Once{},
+		&time.Time{},
+		&connected,
+		&atomic.Bool{},
+		make(chan struct{}),
+		func() {},
+		func() {},
+		func() {},
+		func(uint64) {},
+		func(time.Time, int64) {},
+	)
+	state.maybeConnectBatcher(sender.LocalAddr())
+	if state.batcher.Capabilities().Connected {
+		t.Fatal("blastParallelConnReceiveState.maybeConnectBatcher() connected socket with DisableConnectedUDP=true")
+	}
+	if connected.Load() {
+		t.Fatal("connected flag set with DisableConnectedUDP=true")
 	}
 }
 
