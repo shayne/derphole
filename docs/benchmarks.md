@@ -56,6 +56,20 @@ Interpretation:
 - high probe and low transfer points at stream, replay, repair, queue, or controller behavior
 - low sender and receiver transfer goodput with high queue depth points at backpressure
 
+## Direct Transport QUIC Comparison
+
+Use this when validating the QUIC direct data plane:
+
+```bash
+: "${DERPHOLE_BENCH_SENDER:?set sender host}"
+: "${DERPHOLE_BENCH_RECEIVER:?set receiver host}"
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/direct-transport-benchmark.sh "${DERPHOLE_BENCH_SENDER}" "${DERPHOLE_BENCH_RECEIVER}" 1024
+```
+
+The script forces `DERPHOLE_DIRECT_TRANSPORT=quic`, runs the existing iperf-plus-transfer diagnostic flow, and writes `diagnostic-direct-transport=quic` in `diagnostic-summary.env`.
+
+Do not compare QUIC runs to blast runs unless the same host pair, direction, payload size, and Tailscale-candidate setting are used.
+
 ## Phase 1 Public Transport Gate
 
 Before changing the public transport protocol, capture a baseline for each host pair and direction:

@@ -215,6 +215,9 @@ remote_env_prefix() {
   if [[ -n "${DERPHOLE_NATIVE_TCP_CONNS:-}" ]]; then
     prefix+=(DERPHOLE_NATIVE_TCP_CONNS="$(quote "${DERPHOLE_NATIVE_TCP_CONNS}")")
   fi
+  if [[ -n "${DERPHOLE_DIRECT_TRANSPORT:-}" ]]; then
+    prefix+=(DERPHOLE_DIRECT_TRANSPORT="$(quote "${DERPHOLE_DIRECT_TRANSPORT}")")
+  fi
   printf '%s ' "${prefix[@]}"
 }
 
