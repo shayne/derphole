@@ -1,0 +1,104 @@
+// Copyright (c) 2026 Shayne All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package directquic
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"net"
+	"testing"
+	"time"
+
+	"github.com/shayne/derphole/pkg/quicpath"
+)
+
+func TestEndpointTransfersOneUnidirectionalStream(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverPacketConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket(server) error = %v", err)
+	}
+	defer serverPacketConn.Close()
+
+	clientPacketConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket(client) error = %v", err)
+	}
+	defer clientPacketConn.Close()
+
+	serverIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(server) error = %v", err)
+	}
+	clientIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(client) error = %v", err)
+	}
+
+	serverCh := make(chan *Endpoint, 1)
+	serverErr := make(chan error, 1)
+	go func() {
+		endpoint, err := Listen(ctx, ListenConfig{
+			PacketConn: serverPacketConn,
+			Identity:   serverIdentity,
+			PeerPublic: clientIdentity.Public,
+		})
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		serverCh <- endpoint
+	}()
+
+	client, err := Dial(ctx, DialConfig{
+		PacketConn: clientPacketConn,
+		RemoteAddr: serverPacketConn.LocalAddr(),
+		Identity:   clientIdentity,
+		PeerPublic: serverIdentity.Public,
+	})
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer client.Close()
+
+	var server *Endpoint
+	select {
+	case server = <-serverCh:
+	case err := <-serverErr:
+		t.Fatalf("Listen() error = %v", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for server endpoint")
+	}
+	defer server.Close()
+
+	payload := []byte("direct-quic payload")
+	send, err := client.OpenSendStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenSendStream() error = %v", err)
+	}
+	if _, err := send.Write(payload); err != nil {
+		t.Fatalf("send.Write() error = %v", err)
+	}
+	if err := send.Close(); err != nil {
+		t.Fatalf("send.Close() error = %v", err)
+	}
+
+	receive, err := server.AcceptReceiveStream(ctx)
+	if err != nil {
+		t.Fatalf("AcceptReceiveStream() error = %v", err)
+	}
+	defer receive.Close()
+
+	var got bytes.Buffer
+	if _, err := io.Copy(&got, receive); err != nil {
+		t.Fatalf("io.Copy() error = %v", err)
+	}
+	if !bytes.Equal(got.Bytes(), payload) {
+		t.Fatalf("payload = %q, want %q", got.Bytes(), payload)
+	}
+}
