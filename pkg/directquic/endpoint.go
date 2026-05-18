@@ -50,12 +50,22 @@ type Endpoint struct {
 }
 
 func Listen(ctx context.Context, cfg ListenConfig) (*Endpoint, error) {
+	return ListenWithReady(ctx, cfg, nil)
+}
+
+func ListenWithReady(ctx context.Context, cfg ListenConfig, ready func() error) (*Endpoint, error) {
 	if err := validateCommon(cfg.PacketConn, cfg.PeerPublic); err != nil {
 		return nil, err
 	}
 	listener, err := quic.Listen(cfg.PacketConn, quicpath.ServerTLSConfig(cfg.Identity, cfg.PeerPublic), endpointQUICConfig())
 	if err != nil {
 		return nil, err
+	}
+	if ready != nil {
+		if err := ready(); err != nil {
+			_ = listener.Close()
+			return nil, err
+		}
 	}
 	conn, err := listener.Accept(ctx)
 	if err != nil {

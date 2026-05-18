@@ -103,6 +103,78 @@ func TestEndpointTransfersOneUnidirectionalStream(t *testing.T) {
 	}
 }
 
+func TestListenWithReadyRunsBeforeAccept(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(server) error = %v", err)
+	}
+	defer serverConn.Close()
+	clientConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(client) error = %v", err)
+	}
+	defer clientConn.Close()
+
+	serverIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(server) error = %v", err)
+	}
+	clientIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(client) error = %v", err)
+	}
+
+	ready := make(chan struct{})
+	serverCh := make(chan *Endpoint, 1)
+	serverErr := make(chan error, 1)
+	go func() {
+		server, err := ListenWithReady(ctx, ListenConfig{
+			PacketConn: serverConn,
+			Identity:   serverIdentity,
+			PeerPublic: clientIdentity.Public,
+		}, func() error {
+			close(ready)
+			return nil
+		})
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		serverCh <- server
+	}()
+
+	select {
+	case <-ready:
+	case err := <-serverErr:
+		t.Fatalf("ListenWithReady() error before ready = %v", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for ready callback")
+	}
+
+	client, err := Dial(ctx, DialConfig{
+		PacketConn: clientConn,
+		RemoteAddr: serverConn.LocalAddr(),
+		Identity:   clientIdentity,
+		PeerPublic: serverIdentity.Public,
+	})
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer client.Close()
+
+	select {
+	case server := <-serverCh:
+		defer server.Close()
+	case err := <-serverErr:
+		t.Fatalf("ListenWithReady() error = %v", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for server accept")
+	}
+}
+
 func TestDialRejectsUnexpectedPeerIdentity(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

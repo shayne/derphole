@@ -459,15 +459,24 @@ type externalDirectUDPSendRuntime struct {
 	pm           publicPortmap
 	auth         externalPeerControlAuth
 	decision     rendezvous.Decision
+	quicIdentity quicpath.SessionIdentity
 	subs         externalDirectUDPSendSubscriptions
 	metrics      *externalTransferMetrics
 	cleanupConns func()
 }
 
 func newExternalDirectUDPSendRuntime(ctx context.Context, cfg SendConfig) (*externalDirectUDPSendRuntime, error) {
+	return newExternalDirectSendRuntime(ctx, cfg, decodeExternalDirectUDPSendToken)
+}
+
+func newExternalDirectQUICSendRuntime(ctx context.Context, cfg SendConfig) (*externalDirectUDPSendRuntime, error) {
+	return newExternalDirectSendRuntime(ctx, cfg, decodeExternalDirectQUICSendToken)
+}
+
+func newExternalDirectSendRuntime(ctx context.Context, cfg SendConfig, decodeToken func(string) (token.Token, error)) (*externalDirectUDPSendRuntime, error) {
 	rt := &externalDirectUDPSendRuntime{cfg: sendConfigWithInferredExpectedBytes(cfg)}
 	var err error
-	rt.tok, err = decodeExternalDirectUDPSendToken(rt.cfg.Token)
+	rt.tok, err = decodeToken(rt.cfg.Token)
 	if err != nil {
 		return nil, err
 	}
@@ -491,6 +500,28 @@ func newExternalDirectUDPSendRuntime(ctx context.Context, cfg SendConfig) (*exte
 }
 
 func decodeExternalDirectUDPSendToken(raw string) (token.Token, error) {
+	tok, err := decodeExternalDirectSendToken(raw)
+	if err != nil {
+		return token.Token{}, err
+	}
+	if tok.Capabilities&token.CapabilityDirectQUIC != 0 {
+		return token.Token{}, errExternalDirectQUICTokenRequiresQUIC
+	}
+	return tok, nil
+}
+
+func decodeExternalDirectQUICSendToken(raw string) (token.Token, error) {
+	tok, err := decodeExternalDirectSendToken(raw)
+	if err != nil {
+		return token.Token{}, err
+	}
+	if tok.Capabilities&token.CapabilityDirectQUIC == 0 {
+		return token.Token{}, errExternalDirectQUICTokenUnsupported
+	}
+	return tok, nil
+}
+
+func decodeExternalDirectSendToken(raw string) (token.Token, error) {
 	tok, err := token.Decode(raw, time.Now())
 	if err != nil {
 		return token.Token{}, err
@@ -550,6 +581,7 @@ func (rt *externalDirectUDPSendRuntime) claim(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	rt.quicIdentity = claimIdentity
 	localCandidates := externalDirectUDPSendLocalCandidates(ctx, rt.cfg, rt.probeConns, rt.dm, rt.portmaps)
 	claim := externalDirectUDPSendClaim(rt.tok, rt.derpClient.PublicKey(), claimIdentity.Public, len(rt.probeConns), localCandidates, rt.cfg)
 	rt.auth = externalPeerControlAuthForToken(rt.tok)

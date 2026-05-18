@@ -22,6 +22,7 @@ const (
 	CapabilityStdioOffer
 	CapabilityWebFile
 	CapabilityDerptunTCP
+	CapabilityDirectQUIC
 )
 
 type Token struct {
