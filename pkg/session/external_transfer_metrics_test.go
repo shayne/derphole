@@ -305,6 +305,69 @@ func TestExternalTransferMetricsSetDirectQUICStatsUpdatesTrace(t *testing.T) {
 	}
 }
 
+func TestExternalTransferMetricsDirectQUICSendProgressUsesLocalBytesBeforeAck(t *testing.T) {
+	var out bytes.Buffer
+	start := time.Unix(81, 0)
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(start, rec, transfertrace.RoleSend)
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, "connected-direct-quic")
+	metrics.RecordDirectQUICSend(2<<20, start.Add(100*time.Millisecond))
+	metrics.Tick(start.Add(500 * time.Millisecond))
+	metrics.RecordPeerProgressFromFirstByte(2<<20, start.Add(800*time.Millisecond))
+	metrics.Tick(start.Add(900 * time.Millisecond))
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := readTransferTraceRows(t, out.String())
+	beforeAck := rows[len(rows)-2]
+	if beforeAck["app_bytes"] != "2097152" ||
+		beforeAck["local_sent_bytes"] != "2097152" ||
+		beforeAck["peer_received_bytes"] != "0" ||
+		beforeAck["direct_transport"] != "quic" ||
+		beforeAck["direct_packet_bytes"] != "2097152" {
+		t.Fatalf("pre-ACK trace row = %#v, want QUIC sender local progress", beforeAck)
+	}
+	afterAck := rows[len(rows)-1]
+	if afterAck["app_bytes"] != "2097152" ||
+		afterAck["peer_received_bytes"] != "2097152" ||
+		afterAck["transfer_elapsed_ms"] != "700" {
+		t.Fatalf("post-ACK trace row = %#v, want ACK-anchored peer progress", afterAck)
+	}
+}
+
+func TestExternalTransferMetricsDirectQUICReceiveProgressWritesCommittedBytes(t *testing.T) {
+	var out bytes.Buffer
+	start := time.Unix(82, 0)
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleReceive, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(start, rec, transfertrace.RoleReceive)
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, "connected-direct-quic")
+	metrics.RecordDirectQUICReceive(3<<20, start.Add(100*time.Millisecond))
+	metrics.Tick(start.Add(500 * time.Millisecond))
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := readTransferTraceRows(t, out.String())
+	row := rows[len(rows)-1]
+	if row["app_bytes"] != "3145728" ||
+		row["direct_bytes"] != "3145728" ||
+		row["direct_packet_bytes"] != "3145728" ||
+		row["direct_committed_bytes"] != "3145728" ||
+		row["direct_transport"] != "quic" {
+		t.Fatalf("trace row = %#v, want QUIC receive progress", row)
+	}
+	if row["receive_goodput_mbps"] == "" {
+		t.Fatalf("trace row receive_goodput_mbps is empty, want QUIC receive rate; row = %#v", row)
+	}
+}
+
 func TestExternalTransferMetricsSetProbeStatsWithoutByteProgressWritesDiagnosticsOnly(t *testing.T) {
 	var out bytes.Buffer
 	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(35, 0))

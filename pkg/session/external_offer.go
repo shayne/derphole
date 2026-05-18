@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"strconv"
 	"time"
@@ -24,7 +25,7 @@ import (
 )
 
 func offerExternal(ctx context.Context, cfg OfferConfig) (retTok string, retErr error) {
-	tok, session, err := issuePublicSessionWithCapabilities(ctx, token.CapabilityStdioOffer)
+	tok, session, err := issuePublicSessionWithCapabilities(ctx, externalOfferCapabilitiesFromEnv())
 	if err != nil {
 		return "", err
 	}
@@ -48,6 +49,18 @@ func offerExternal(ctx context.Context, cfg OfferConfig) (retTok string, retErr 
 	}
 
 	return tok, serveExternalOfferClaims(ctx, session, claimCh, auth, pathEmitter, cfg, &retErr)
+}
+
+func externalOfferCapabilitiesFromEnv() uint32 {
+	capabilities := token.CapabilityStdioOffer
+	if externalDirectTransportFromEnv() == externalDirectTransportQUIC {
+		capabilities |= token.CapabilityDirectQUIC
+	}
+	return capabilities
+}
+
+func externalOfferUsesDirectQUIC(tok token.Token) bool {
+	return tok.Capabilities&token.CapabilityDirectQUIC != 0
 }
 
 func sendExternalOfferToken(ctx context.Context, tokenSink chan<- string, tok string) error {
@@ -87,16 +100,19 @@ type externalOfferDirectRuntime struct {
 	pm               publicPortmap
 	localCandidates  []net.Addr
 	remoteCandidates []net.Addr
+	peerQUICPublic   [32]byte
 	cleanup          func()
 }
 
 type externalOfferPeerChannels struct {
-	ackCh       <-chan derpbind.Packet
-	readyAckCh  <-chan derpbind.Packet
-	startAckCh  <-chan derpbind.Packet
-	rateProbeCh <-chan derpbind.Packet
-	progressCh  <-chan derpbind.Packet
-	cleanup     func()
+	ackCh           <-chan derpbind.Packet
+	readyAckCh      <-chan derpbind.Packet
+	startAckCh      <-chan derpbind.Packet
+	rateProbeCh     <-chan derpbind.Packet
+	progressCh      <-chan derpbind.Packet
+	quicModeRespCh  <-chan derpbind.Packet
+	quicModeReadyCh <-chan derpbind.Packet
+	cleanup         func()
 }
 
 type externalOfferTransportRuntime struct {
@@ -147,6 +163,9 @@ func sendExternalAcceptedOffer(ctx context.Context, session *relaySession, claim
 	var countedSrc *byteCountingReadCloser
 	abortCh, heartbeatCh, cleanupPeerSubs := subscribeExternalOfferPeerControl(session, peerDERP)
 	defer cleanupPeerSubs()
+	if externalOfferUsesDirectQUIC(session.token) {
+		heartbeatCh = nil
+	}
 	ctx, stopPeerAbort := withPeerControlContext(ctx, session.derp, peerDERP, abortCh, heartbeatCh, func() int64 {
 		return externalOfferCountedSrcCount(countedSrc)
 	}, auth)
@@ -189,13 +208,16 @@ func sendExternalAcceptedOffer(ctx context.Context, session *relaySession, claim
 		metrics.SetError(err)
 		return err
 	}
-	if err := sendExternalOfferPayload(ctx, session, countedSrc, direct, channels, transportRuntime, peerDERP, pathEmitter, cfg); err != nil {
+	usedDirectQUIC, err := sendExternalOfferPayload(ctx, session, countedSrc, direct, channels, transportRuntime, peerDERP, pathEmitter, cfg)
+	if err != nil {
 		metrics.SetError(err)
 		return err
 	}
-	if err := waitForPeerAckWithTimeout(ctx, channels.ackCh, countedSrc.Count(), externalDirectUDPAckWait, auth); err != nil {
-		metrics.SetError(err)
-		return err
+	if !usedDirectQUIC {
+		if err := waitForPeerAckWithTimeout(ctx, channels.ackCh, countedSrc.Count(), externalDirectUDPAckWait, auth); err != nil {
+			metrics.SetError(err)
+			return err
+		}
 	}
 	completeExternalSendMetricsAfterPeerAck(metrics, countedSrc.Count(), time.Now())
 	pathEmitter.Complete(transportRuntime.manager)
@@ -224,12 +246,13 @@ func externalOfferCountedSrcCount(countedSrc *byteCountingReadCloser) int64 {
 
 func prepareExternalOfferDirectRuntime(ctx context.Context, session *relaySession, claim rendezvous.Claim, decision rendezvous.Decision, cfg OfferConfig) (externalOfferDirectRuntime, error) {
 	direct := externalOfferDirectRuntime{
-		decision:   decision,
-		relayOnly:  cfg.ForceRelay || externalClaimRelayOnly(claim),
-		probeConn:  session.probeConn,
-		probeConns: []net.PacketConn{session.probeConn},
-		portmaps:   []publicPortmap{publicSessionPortmap(session)},
-		cleanup:    func() {},
+		decision:       decision,
+		relayOnly:      cfg.ForceRelay || externalClaimRelayOnly(claim),
+		probeConn:      session.probeConn,
+		probeConns:     []net.PacketConn{session.probeConn},
+		portmaps:       []publicPortmap{publicSessionPortmap(session)},
+		peerQUICPublic: claim.QUICPublic,
+		cleanup:        func() {},
 	}
 	if !direct.relayOnly {
 		probeConn, probeConns, portmaps, cleanup, err := externalAcceptedDirectUDPSet(session.probeConn, publicSessionPortmap(session), cfg.Emitter)
@@ -274,18 +297,28 @@ func subscribeExternalOfferPeerChannels(session *relaySession, peerDERP key.Node
 	progressCh, unsubscribeProgress := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == peerDERP && isProgressPayload(pkt.Payload)
 	})
+	quicModeRespCh, unsubscribeQUICModeResp := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == peerDERP && isQUICModeResponsePayload(pkt.Payload)
+	})
+	quicModeReadyCh, unsubscribeQUICModeReady := session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == peerDERP && isQUICModeReadyPayload(pkt.Payload)
+	})
 	return externalOfferPeerChannels{
-		ackCh:       ackCh,
-		readyAckCh:  readyAckCh,
-		startAckCh:  startAckCh,
-		rateProbeCh: rateProbeCh,
-		progressCh:  progressCh,
+		ackCh:           ackCh,
+		readyAckCh:      readyAckCh,
+		startAckCh:      startAckCh,
+		rateProbeCh:     rateProbeCh,
+		progressCh:      progressCh,
+		quicModeRespCh:  quicModeRespCh,
+		quicModeReadyCh: quicModeReadyCh,
 		cleanup: func() {
 			unsubscribeAck()
 			unsubscribeReadyAck()
 			unsubscribeStartAck()
 			unsubscribeRateProbe()
 			unsubscribeProgress()
+			unsubscribeQUICModeResp()
+			unsubscribeQUICModeReady()
 		},
 	}
 }
@@ -347,11 +380,33 @@ func sendExternalOfferDecision(ctx context.Context, session *relaySession, peerD
 	return nil
 }
 
-func sendExternalOfferPayload(ctx context.Context, session *relaySession, countedSrc *byteCountingReadCloser, direct externalOfferDirectRuntime, channels externalOfferPeerChannels, transportRuntime *externalOfferTransportRuntime, peerDERP key.NodePublic, pathEmitter *transportPathEmitter, cfg OfferConfig) error {
+func sendExternalOfferPayload(ctx context.Context, session *relaySession, countedSrc *byteCountingReadCloser, direct externalOfferDirectRuntime, channels externalOfferPeerChannels, transportRuntime *externalOfferTransportRuntime, peerDERP key.NodePublic, pathEmitter *transportPathEmitter, cfg OfferConfig) (bool, error) {
 	if direct.relayOnly {
-		return sendExternalRelayUDPWithPeerProgress(ctx, countedSrc, transportRuntime.manager, session.token, channels.progressCh, externalOfferSendConfig(cfg))
+		return false, sendExternalRelayUDPWithPeerProgress(ctx, countedSrc, transportRuntime.manager, session.token, channels.progressCh, externalOfferSendConfig(cfg))
 	}
-	return sendExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixSendConfig{
+	if externalOfferUsesDirectQUIC(session.token) {
+		ready, err := externalOfferRequestDirectQUICModeFn(ctx, session.derp, peerDERP, transportRuntime.manager, channels.quicModeRespCh, channels.quicModeReadyCh, authForSession(session))
+		if err != nil {
+			return false, err
+		}
+		if !ready {
+			metrics := externalTransferMetricsFromContext(ctx)
+			externalDirectUDPMarkDirectFallbackRelay(pathEmitter, metrics, errors.New("direct QUIC path not validated"))
+			return false, sendExternalViaRelayPrefixThenDirectUDP(ctx, externalOfferRelayPrefixSendConfig(countedSrc, session, direct, channels, transportRuntime, peerDERP, pathEmitter, cfg))
+		}
+		metrics := externalTransferMetricsFromContext(ctx)
+		metrics.SetTransportManager(transportRuntime.manager)
+		metrics.SetPhase(transfertrace.PhaseDirectExecute, "connected-direct-quic")
+		stopDirectMetrics := externalDirectQUICWatchDirectPath(ctx, transportRuntime.manager, metrics)
+		defer stopDirectMetrics()
+		pathEmitter.Emit(StateTryingDirect)
+		return true, externalDirectQUICSendOverManagerAndThenFn(ctx, countedSrc, transportRuntime.manager, session.quicIdentity, direct.peerQUICPublic, nil)
+	}
+	return false, sendExternalViaRelayPrefixThenDirectUDP(ctx, externalOfferRelayPrefixSendConfig(countedSrc, session, direct, channels, transportRuntime, peerDERP, pathEmitter, cfg))
+}
+
+func externalOfferRelayPrefixSendConfig(countedSrc io.Reader, session *relaySession, direct externalOfferDirectRuntime, channels externalOfferPeerChannels, transportRuntime *externalOfferTransportRuntime, peerDERP key.NodePublic, pathEmitter *transportPathEmitter, cfg OfferConfig) externalRelayPrefixSendConfig {
+	return externalRelayPrefixSendConfig{
 		src:              countedSrc,
 		tok:              session.token,
 		decision:         direct.decision,
@@ -369,7 +424,14 @@ func sendExternalOfferPayload(ctx context.Context, session *relaySession, counte
 		rateProbeCh:      channels.rateProbeCh,
 		progressCh:       channels.progressCh,
 		cfg:              externalOfferSendConfig(cfg),
-	})
+	}
+}
+
+func authForSession(session *relaySession) externalPeerControlAuth {
+	if session == nil {
+		return externalPeerControlAuth{}
+	}
+	return externalPeerControlAuthForToken(session.token)
 }
 
 func externalOfferSendConfig(cfg OfferConfig) SendConfig {
@@ -395,6 +457,8 @@ type externalOfferReceiveChannels struct {
 	relayPrefixPackets <-chan derpbind.Packet
 	readyCh            <-chan derpbind.Packet
 	startCh            <-chan derpbind.Packet
+	quicModeReqCh      <-chan derpbind.Packet
+	quicModeAckCh      <-chan derpbind.Packet
 	cleanup            func()
 }
 
@@ -416,6 +480,7 @@ type externalOfferReceiveRuntime struct {
 	auth              externalPeerControlAuth
 	relayOnly         bool
 	countedDst        *byteCountingWriteCloser
+	quicIdentity      quicpath.SessionIdentity
 }
 
 func (r *externalOfferReceiveRuntime) Close() {
@@ -445,6 +510,9 @@ func receiveExternal(ctx context.Context, cfg ReceiveConfig) (retErr error) {
 
 	abortCh, heartbeatCh, cleanupPeerSubs := subscribeExternalOfferReceivePeerControl(runtime)
 	defer cleanupPeerSubs()
+	if externalOfferUsesDirectQUIC(runtime.tok) {
+		heartbeatCh = nil
+	}
 	ctx, stopPeerAbort := withPeerControlContext(ctx, runtime.derpClient, runtime.listenerDERP, abortCh, heartbeatCh, runtime.countedDstCount, runtime.auth)
 	defer stopPeerAbort()
 	defer notifyPeerAbortOnError(&retErr, ctx, runtime.derpClient, runtime.listenerDERP, runtime.countedDstCount, runtime.auth)
@@ -498,6 +566,15 @@ func decodeExternalOfferReceiveToken(rawToken string) (token.Token, error) {
 	if tok.Capabilities&token.CapabilityStdioOffer == 0 {
 		return token.Token{}, ErrUnknownSession
 	}
+	if externalDirectTransportFromEnv() == externalDirectTransportQUIC {
+		if tok.Capabilities&token.CapabilityDirectQUIC == 0 {
+			return token.Token{}, errExternalDirectQUICTokenUnsupported
+		}
+		return tok, nil
+	}
+	if tok.Capabilities&token.CapabilityDirectQUIC != 0 {
+		return token.Token{}, errExternalDirectQUICTokenRequiresQUIC
+	}
 	return tok, nil
 }
 
@@ -514,14 +591,24 @@ func subscribeExternalOfferReceiveChannels(derpClient *derpbind.Client, listener
 	startCh, unsubscribeStart := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == listenerDERP && isDirectUDPStartPayload(pkt.Payload)
 	})
+	quicModeReqCh, unsubscribeQUICModeReq := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == listenerDERP && isQUICModeRequestPayload(pkt.Payload)
+	})
+	quicModeAckCh, unsubscribeQUICModeAck := derpClient.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == listenerDERP && isQUICModeAckPayload(pkt.Payload)
+	})
 	return externalOfferReceiveChannels{
 		relayPrefixPackets: relayPrefixPackets,
 		readyCh:            readyCh,
 		startCh:            startCh,
+		quicModeReqCh:      quicModeReqCh,
+		quicModeAckCh:      quicModeAckCh,
 		cleanup: func() {
 			unsubscribeRelayPrefix()
 			unsubscribeReady()
 			unsubscribeStart()
+			unsubscribeQUICModeReq()
+			unsubscribeQUICModeAck()
 		},
 	}
 }
@@ -544,6 +631,7 @@ func (r *externalOfferReceiveRuntime) buildClaim(ctx context.Context, cfg Receiv
 	if err != nil {
 		return err
 	}
+	r.quicIdentity = claimIdentity
 	r.localCandidates = externalOfferReceiveCandidates(ctx, cfg, r)
 	claimParallel := len(r.probeConns)
 	if cfg.ForceRelay {
@@ -686,7 +774,36 @@ func receiveExternalOfferPayload(ctx context.Context, cfg ReceiveConfig, runtime
 	if runtime.relayOnly {
 		return receiveExternalRelayUDP(ctx, runtime.countedDst, transportManager, runtime.tok, cfg.Emitter)
 	}
-	return receiveExternalViaRelayPrefixThenDirectUDP(ctx, externalRelayPrefixReceiveConfig{
+	if externalOfferUsesDirectQUIC(runtime.tok) {
+		ready, err := externalOfferAcceptDirectQUICModeFn(ctx, runtime.derpClient, runtime.listenerDERP, transportManager, runtime.channels.quicModeReqCh, runtime.channels.quicModeAckCh, runtime.auth)
+		if err != nil {
+			return err
+		}
+		if !ready {
+			metrics := externalTransferMetricsFromContext(ctx)
+			externalDirectUDPMarkDirectFallbackRelay(pathEmitter, metrics, errors.New("direct QUIC path not validated"))
+			return receiveExternalViaRelayPrefixThenDirectUDP(ctx, externalOfferRelayPrefixReceiveConfig(runtime, transportManager, pathEmitter, punchCancel, cfg))
+		}
+		metrics := newExternalTransferMetricsWithTrace(time.Now(), cfg.Trace, transfertrace.RoleReceive)
+		metrics.SetTransportManager(transportManager)
+		metrics.SetPhase(transfertrace.PhaseDirectExecute, "connected-direct-quic")
+		stopDirectMetrics := externalDirectQUICWatchDirectPath(ctx, transportManager, metrics)
+		defer stopDirectMetrics()
+		ctx = withExternalTransferMetrics(ctx, metrics)
+		pathEmitter.Emit(StateTryingDirect)
+		err = externalDirectQUICReceiveOverManagerFn(ctx, runtime.countedDst, transportManager, runtime.quicIdentity, runtime.tok.QUICPublic)
+		if err != nil {
+			metrics.SetError(err)
+			return err
+		}
+		metrics.Complete(time.Now())
+		return nil
+	}
+	return receiveExternalViaRelayPrefixThenDirectUDP(ctx, externalOfferRelayPrefixReceiveConfig(runtime, transportManager, pathEmitter, punchCancel, cfg))
+}
+
+func externalOfferRelayPrefixReceiveConfig(runtime *externalOfferReceiveRuntime, transportManager *transport.Manager, pathEmitter *transportPathEmitter, punchCancel context.CancelFunc, cfg ReceiveConfig) externalRelayPrefixReceiveConfig {
+	return externalRelayPrefixReceiveConfig{
 		dst:              runtime.countedDst,
 		tok:              runtime.tok,
 		derpClient:       runtime.derpClient,
@@ -708,5 +825,5 @@ func receiveExternalOfferPayload(ctx context.Context, cfg ReceiveConfig, runtime
 			UsePublicDERP: cfg.UsePublicDERP,
 			Trace:         cfg.Trace,
 		},
-	})
+	}
 }

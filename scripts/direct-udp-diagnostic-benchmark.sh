@@ -223,6 +223,7 @@ transfer_status=0
 set +e
 DERPHOLE_STALL_LOG_DIR="${log_dir}/transfer" \
 DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES="${DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES:-1}" \
+DERPHOLE_DIRECT_TRANSPORT="${DERPHOLE_DIRECT_TRANSPORT:-}" \
 ./scripts/transfer-stall-harness.sh "${sender_host}" "${receiver_host}" "${size_mib}" | tee "${log_dir}/transfer/harness.out"
 transfer_status=${PIPESTATUS[0]}
 set -e
@@ -236,12 +237,43 @@ find_metric() {
     | tail -n 1
 }
 
+find_trace_metric() {
+  local key="$1"
+  awk -v key="${key}" '
+    /trace-ok/ {
+      for (i = 1; i <= NF; i++) {
+        split($i, parts, "=")
+        if (parts[1] == key) {
+          value = parts[2]
+        }
+      }
+    }
+    END {
+      if (value != "") {
+        print value
+      }
+    }
+  ' "${log_dir}/transfer/harness.out" 2>/dev/null || true
+}
+
+fill_zero_metric() {
+  local current="$1"
+  local fallback="$2"
+  if [[ -z "${current}" || "${current}" == "0" || "${current}" == "0.00" ]]; then
+    printf '%s\n' "${fallback}"
+    return 0
+  fi
+  printf '%s\n' "${current}"
+}
+
 probe_samples="$(find_metric "udp-rate-probe-samples")"
 sender_goodput="$(find_metric "udp-send-goodput-mbps")"
 receiver_goodput="$(find_metric "udp-receive-goodput-mbps")"
 sender_peak="$(find_metric "udp-send-peak-goodput-mbps")"
 receiver_peak="$(find_metric "udp-receive-peak-goodput-mbps")"
 queue_depth="$(find_metric "transport-max-peer-recv-queue-depth")"
+sender_goodput="$(fill_zero_metric "${sender_goodput}" "$(find_trace_metric "sender_mbps")")"
+receiver_goodput="$(fill_zero_metric "${receiver_goodput}" "$(find_trace_metric "receiver_mbps")")"
 
 {
   echo "diagnostic-log-dir=${log_dir}"

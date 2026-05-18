@@ -22,6 +22,7 @@ import (
 	"tailscale.com/net/netmon"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+	"tailscale.com/types/logger"
 )
 
 type testDERPServer struct {
@@ -468,6 +469,75 @@ func TestNewDERPNodeDialerUsesOverrideHostInsteadOfNodeIPs(t *testing.T) {
 	case <-accepted:
 	case <-time.After(time.Second):
 		t.Fatal("dialer() did not reach override host listener")
+	}
+}
+
+func TestRaceDERPDialDoesNotReturnFirstFailedTarget(t *testing.T) {
+	restore := stubDERPDial(t, func(ctx context.Context, _ logger.Logf, _ *netmon.Monitor, network, _ string) (net.Conn, error) {
+		if network == "tcp6" {
+			return nil, errors.New("network unreachable")
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		local, remote := net.Pipe()
+		go remote.Close()
+		return local, nil
+	})
+	defer restore()
+
+	conn, err := raceDERPDial(context.Background(), t.Logf, netmon.NewStatic(), []derpDialTarget{
+		derpDialTargetFor("tcp6", "2001:db8::1", "443"),
+		derpDialTargetFor("tcp4", "127.0.0.1", "443"),
+	})
+	if err != nil {
+		t.Fatalf("raceDERPDial() error = %v", err)
+	}
+	_ = conn.Close()
+}
+
+func TestRaceDERPDialReportsPendingTargetsOnTimeout(t *testing.T) {
+	restore := stubDERPDial(t, func(ctx context.Context, _ logger.Logf, _ *netmon.Monitor, network, _ string) (net.Conn, error) {
+		if network == "tcp6" {
+			return nil, errors.New("network unreachable")
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	defer restore()
+
+	prevTimeout := derpDialTimeout
+	derpDialTimeout = 10 * time.Millisecond
+	defer func() { derpDialTimeout = prevTimeout }()
+
+	_, err := raceDERPDial(context.Background(), t.Logf, netmon.NewStatic(), []derpDialTarget{
+		derpDialTargetFor("tcp6", "2001:db8::1", "443"),
+		derpDialTargetFor("tcp4", "203.0.113.10", "443"),
+	})
+	if err == nil {
+		t.Fatal("raceDERPDial() error = nil, want joined target errors")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"dial tcp6 [2001:db8::1]:443: network unreachable",
+		"dial tcp4 203.0.113.10:443: context deadline exceeded",
+	} {
+		if !bytes.Contains([]byte(msg), []byte(want)) {
+			t.Fatalf("raceDERPDial() error = %q, want substring %q", msg, want)
+		}
+	}
+}
+
+func stubDERPDial(t *testing.T, fn func(context.Context, logger.Logf, *netmon.Monitor, string, string) (net.Conn, error)) func() {
+	t.Helper()
+	prev := derpDialContext
+	derpDialContext = fn
+	return func() {
+		derpDialContext = prev
 	}
 }
 

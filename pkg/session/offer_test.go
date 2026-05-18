@@ -19,6 +19,7 @@ import (
 
 	"github.com/shayne/derphole/pkg/derpbind"
 	"github.com/shayne/derphole/pkg/probe"
+	"github.com/shayne/derphole/pkg/quicpath"
 	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/token"
 	"github.com/shayne/derphole/pkg/transfertrace"
@@ -307,7 +308,7 @@ func TestExternalOfferPayloadPassesProgressToRelayPrefixSend(t *testing.T) {
 		return nil
 	}
 
-	err := sendExternalOfferPayload(
+	_, err := sendExternalOfferPayload(
 		context.Background(),
 		&relaySession{},
 		nil,
@@ -331,6 +332,168 @@ func TestExternalOfferPayloadPassesProgressToRelayPrefixSend(t *testing.T) {
 		}
 	default:
 		t.Fatal("progress callback was not invoked")
+	}
+}
+
+func TestExternalOfferCapabilitiesIncludeDirectQUICWhenSelected(t *testing.T) {
+	t.Setenv("DERPHOLE_DIRECT_TRANSPORT", "")
+	if got := externalOfferCapabilitiesFromEnv(); got != token.CapabilityStdioOffer {
+		t.Fatalf("default offer capabilities = %08b, want stdio offer only", got)
+	}
+
+	t.Setenv("DERPHOLE_DIRECT_TRANSPORT", "quic")
+	got := externalOfferCapabilitiesFromEnv()
+	if got&token.CapabilityStdioOffer == 0 {
+		t.Fatalf("quic offer capabilities = %08b, missing stdio offer", got)
+	}
+	if got&token.CapabilityDirectQUIC == 0 {
+		t.Fatalf("quic offer capabilities = %08b, missing direct quic", got)
+	}
+}
+
+func TestExternalOfferReceiveTokenValidationSeparatesBlastAndQUIC(t *testing.T) {
+	base := token.Token{
+		Version:         token.SupportedVersion,
+		ExpiresUnix:     time.Now().Add(time.Minute).Unix(),
+		BootstrapRegion: 1,
+		DERPPublic:      [32]byte{1},
+		QUICPublic:      [32]byte{2},
+		BearerSecret:    [32]byte{3},
+		Capabilities:    token.CapabilityStdioOffer,
+	}
+	rawBlast, err := token.Encode(base)
+	if err != nil {
+		t.Fatalf("token.Encode(blast offer) error = %v", err)
+	}
+	quicTok := base
+	quicTok.Capabilities |= token.CapabilityDirectQUIC
+	rawQUIC, err := token.Encode(quicTok)
+	if err != nil {
+		t.Fatalf("token.Encode(quic offer) error = %v", err)
+	}
+
+	t.Setenv("DERPHOLE_DIRECT_TRANSPORT", "")
+	if _, err := decodeExternalOfferReceiveToken(rawBlast); err != nil {
+		t.Fatalf("decodeExternalOfferReceiveToken(blast) error = %v", err)
+	}
+	if _, err := decodeExternalOfferReceiveToken(rawQUIC); !errors.Is(err, errExternalDirectQUICTokenRequiresQUIC) {
+		t.Fatalf("decodeExternalOfferReceiveToken(quic without env) error = %v, want %v", err, errExternalDirectQUICTokenRequiresQUIC)
+	}
+
+	t.Setenv("DERPHOLE_DIRECT_TRANSPORT", "quic")
+	if _, err := decodeExternalOfferReceiveToken(rawBlast); !errors.Is(err, errExternalDirectQUICTokenUnsupported) {
+		t.Fatalf("decodeExternalOfferReceiveToken(blast with quic env) error = %v, want %v", err, errExternalDirectQUICTokenUnsupported)
+	}
+	if _, err := decodeExternalOfferReceiveToken(rawQUIC); err != nil {
+		t.Fatalf("decodeExternalOfferReceiveToken(quic) error = %v", err)
+	}
+}
+
+func TestExternalOfferPayloadUsesDirectQUICWhenTokenRequiresIt(t *testing.T) {
+	origSend := externalDirectQUICSendOverManagerAndThenFn
+	origMode := externalOfferRequestDirectQUICModeFn
+	t.Cleanup(func() {
+		externalDirectQUICSendOverManagerAndThenFn = origSend
+		externalOfferRequestDirectQUICModeFn = origMode
+	})
+
+	payload := "offer direct quic payload"
+	peerQUICPublic := [32]byte{0x42}
+	called := make(chan string, 1)
+	externalDirectQUICSendOverManagerAndThenFn = func(ctx context.Context, src io.Reader, manager *transport.Manager, identity quicpath.SessionIdentity, peer [32]byte, afterStreamClosed func() error) error {
+		if peer != peerQUICPublic {
+			t.Fatalf("peer = %x, want %x", peer, peerQUICPublic)
+		}
+		got, err := io.ReadAll(src)
+		if err != nil {
+			return err
+		}
+		called <- string(got)
+		return nil
+	}
+	externalOfferRequestDirectQUICModeFn = func(context.Context, *derpbind.Client, key.NodePublic, *transport.Manager, <-chan derpbind.Packet, <-chan derpbind.Packet, externalPeerControlAuth) (bool, error) {
+		return true, nil
+	}
+
+	tok := testExternalSessionToken(0x98)
+	tok.Capabilities = token.CapabilityStdioOffer | token.CapabilityDirectQUIC
+	usedQUIC, err := sendExternalOfferPayload(
+		context.Background(),
+		&relaySession{token: tok},
+		newByteCountingReadCloser(nopReadCloser{Reader: strings.NewReader(payload)}),
+		externalOfferDirectRuntime{peerQUICPublic: peerQUICPublic},
+		externalOfferPeerChannels{},
+		&externalOfferTransportRuntime{ctx: context.Background()},
+		key.NodePublic{},
+		newTransportPathEmitter(nil),
+		OfferConfig{},
+	)
+	if err != nil {
+		t.Fatalf("sendExternalOfferPayload() error = %v", err)
+	}
+	if !usedQUIC {
+		t.Fatal("sendExternalOfferPayload() usedQUIC = false, want true")
+	}
+	select {
+	case got := <-called:
+		if got != payload {
+			t.Fatalf("direct quic payload = %q, want %q", got, payload)
+		}
+	default:
+		t.Fatal("direct quic send was not called")
+	}
+}
+
+func TestExternalOfferReceivePayloadUsesDirectQUICWhenTokenRequiresIt(t *testing.T) {
+	origReceive := externalDirectQUICReceiveOverManagerFn
+	origMode := externalOfferAcceptDirectQUICModeFn
+	t.Cleanup(func() {
+		externalDirectQUICReceiveOverManagerFn = origReceive
+		externalOfferAcceptDirectQUICModeFn = origMode
+	})
+
+	peerQUICPublic := [32]byte{0x24}
+	called := make(chan struct{}, 1)
+	externalDirectQUICReceiveOverManagerFn = func(ctx context.Context, dst io.Writer, manager *transport.Manager, identity quicpath.SessionIdentity, peer [32]byte) error {
+		if peer != peerQUICPublic {
+			t.Fatalf("peer = %x, want %x", peer, peerQUICPublic)
+		}
+		if _, err := dst.Write([]byte("received over quic")); err != nil {
+			return err
+		}
+		called <- struct{}{}
+		return nil
+	}
+	externalOfferAcceptDirectQUICModeFn = func(context.Context, *derpbind.Client, key.NodePublic, *transport.Manager, <-chan derpbind.Packet, <-chan derpbind.Packet, externalPeerControlAuth) (bool, error) {
+		return true, nil
+	}
+
+	tok := testExternalSessionToken(0x99)
+	tok.Capabilities = token.CapabilityStdioOffer | token.CapabilityDirectQUIC
+	tok.QUICPublic = peerQUICPublic
+	var out bytes.Buffer
+	err := receiveExternalOfferPayload(
+		context.Background(),
+		ReceiveConfig{},
+		&externalOfferReceiveRuntime{
+			tok:          tok,
+			countedDst:   newByteCountingWriteCloser(nopWriteCloser{Writer: &out}),
+			quicIdentity: quicpath.SessionIdentity{Public: [32]byte{0x23}},
+		},
+		nil,
+		newTransportPathEmitter(nil),
+		func() {},
+	)
+	if err != nil {
+		t.Fatalf("receiveExternalOfferPayload() error = %v", err)
+	}
+	select {
+	case <-called:
+	default:
+		t.Fatal("direct quic receive was not called")
+	}
+	if got := out.String(); got != "received over quic" {
+		t.Fatalf("received payload = %q, want direct quic payload", got)
 	}
 }
 
@@ -368,7 +531,7 @@ func TestRelayOnlyOfferSendPeerProgressWatcherPreservesProgressCallback(t *testi
 		RelaySend: func(context.Context, []byte) error { return nil },
 	})
 
-	err = sendExternalOfferPayload(
+	_, err = sendExternalOfferPayload(
 		context.Background(),
 		&relaySession{token: tok},
 		newByteCountingReadCloser(nopReadCloser{Reader: bytes.NewReader([]byte("relay-only-offer-progress"))}),
@@ -547,6 +710,62 @@ func TestOfferedStdioStartsRelayPayloadBeforeDelayedDirectPromotion(t *testing.T
 	}
 	if got := receiverOut.String(); got != "relay-first offered payload" {
 		t.Fatalf("receiver output = %q, want %q", got, "relay-first offered payload")
+	}
+}
+
+func TestOfferedDirectQUICFallsBackToRelayBeforeDelayedDirectPromotion(t *testing.T) {
+	t.Setenv("DERPHOLE_DIRECT_TRANSPORT", "quic")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
+
+	origWait := externalDirectQUICModeWait
+	externalDirectQUICModeWait = 100 * time.Millisecond
+	t.Cleanup(func() { externalDirectQUICModeWait = origWait })
+
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	payload := "direct quic should fall back to relay"
+	var receiverOut bytes.Buffer
+	var receiverStatus syncBuffer
+	var senderStatus syncBuffer
+
+	tokenSink := make(chan string, 1)
+	offerErr := make(chan error, 1)
+	go func() {
+		_, err := Offer(ctx, OfferConfig{
+			Emitter:       telemetry.New(&senderStatus, telemetry.LevelVerbose),
+			TokenSink:     tokenSink,
+			StdioIn:       strings.NewReader(payload),
+			UsePublicDERP: true,
+		})
+		offerErr <- err
+	}()
+
+	token := <-tokenSink
+	if err := Receive(ctx, ReceiveConfig{
+		Token:         token,
+		Emitter:       telemetry.New(&receiverStatus, telemetry.LevelVerbose),
+		StdioOut:      &receiverOut,
+		UsePublicDERP: true,
+	}); err != nil {
+		t.Fatalf("Receive() error = %v receiver=%q sender=%q", err, receiverStatus.String(), senderStatus.String())
+	}
+	if err := <-offerErr; err != nil {
+		t.Fatalf("Offer() error = %v receiver=%q sender=%q", err, receiverStatus.String(), senderStatus.String())
+	}
+	if got := receiverOut.String(); got != payload {
+		t.Fatalf("receiver output = %q, want %q", got, payload)
+	}
+	if got := senderStatus.String(); strings.Contains(got, "connected-direct-quic") || !strings.Contains(got, string(StateDirectFallbackRelay)) {
+		t.Fatalf("sender status = %q, want direct QUIC fallback to relay", got)
+	}
+	if got := receiverStatus.String(); strings.Contains(got, "connected-direct-quic") || !strings.Contains(got, string(StateDirectFallbackRelay)) {
+		t.Fatalf("receiver status = %q, want direct QUIC fallback to relay", got)
 	}
 }
 

@@ -132,6 +132,18 @@ func (e *Endpoint) Close() error {
 	return e.CloseWithError(0, "")
 }
 
+func (e *Endpoint) WaitClosed(ctx context.Context) error {
+	if e == nil || e.conn == nil {
+		return nil
+	}
+	select {
+	case <-e.conn.Context().Done():
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (e *Endpoint) CloseWithError(code uint64, reason string) error {
 	if e == nil {
 		return nil

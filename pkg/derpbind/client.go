@@ -71,6 +71,12 @@ const (
 
 const losslessSubscriberQueueSize = 64
 
+var derpDialTimeout = 5 * time.Second
+
+var derpDialContext = func(ctx context.Context, logf logger.Logf, netMon *netmon.Monitor, network, addr string) (net.Conn, error) {
+	return netns.NewDialer(logf, netMon).DialContext(ctx, network, addr)
+}
+
 func NewClient(ctx context.Context, node *tailcfg.DERPNode, serverURL string) (*Client, error) {
 	priv := key.NewNode()
 	return newClientWithPrivateKey(ctx, node, serverURL, priv)
@@ -116,6 +122,12 @@ func newClientWithPrivateKey(ctx context.Context, node *tailcfg.DERPNode, server
 type derpDialTarget struct {
 	network string
 	addr    string
+}
+
+type derpDialResult struct {
+	target derpDialTarget
+	conn   net.Conn
+	err    error
 }
 
 func newDERPNodeDialer(node *tailcfg.DERPNode, logf logger.Logf, netMon *netmon.Monitor) func(context.Context, string, string) (net.Conn, error) {
@@ -214,21 +226,30 @@ func raceDERPDial(ctx context.Context, logf logger.Logf, netMon *netmon.Monitor,
 	if len(targets) == 0 {
 		return nil, errors.New("no DERP dial targets")
 	}
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := derpDialContextWithTimeout(ctx)
 	defer cancel()
 
-	dialer := netns.NewDialer(logf, netMon)
-	type result struct {
-		conn net.Conn
-		err  error
+	results, pending := startDERPDials(ctx, logf, netMon, targets)
+	errs := make([]error, 0, len(targets))
+	for range targets {
+		conn, done, err := receiveDERPDialResult(ctx, results, pending, &errs)
+		if done {
+			return conn, err
+		}
 	}
-	results := make(chan result, len(targets))
+	return nil, errors.Join(errs...)
+}
+
+func startDERPDials(ctx context.Context, logf logger.Logf, netMon *netmon.Monitor, targets []derpDialTarget) (<-chan derpDialResult, map[derpDialTarget]struct{}) {
+	results := make(chan derpDialResult, len(targets))
+	pending := make(map[derpDialTarget]struct{}, len(targets))
 	for _, target := range targets {
 		target := target
+		pending[target] = struct{}{}
 		go func() {
-			conn, err := dialer.DialContext(ctx, target.network, target.addr)
+			conn, err := derpDialContext(ctx, logf, netMon, target.network, target.addr)
 			select {
-			case results <- result{conn: conn, err: err}:
+			case results <- derpDialResult{target: target, conn: conn, err: err}:
 			case <-ctx.Done():
 				if conn != nil {
 					_ = conn.Close()
@@ -236,21 +257,47 @@ func raceDERPDial(ctx context.Context, logf logger.Logf, netMon *netmon.Monitor,
 			}
 		}()
 	}
+	return results, pending
+}
 
-	var firstErr error
-	for range targets {
-		res := <-results
-		if res.err == nil {
-			return res.conn, nil
-		}
-		if firstErr == nil {
-			firstErr = res.err
-		}
+func receiveDERPDialResult(ctx context.Context, results <-chan derpDialResult, pending map[derpDialTarget]struct{}, errs *[]error) (net.Conn, bool, error) {
+	select {
+	case res := <-results:
+		return handleDERPDialResult(res, pending, errs)
+	case <-ctx.Done():
+		return nil, true, finishDERPDialErrors(pending, *errs, ctx.Err())
 	}
-	if firstErr == nil {
-		firstErr = context.Canceled
+}
+
+func handleDERPDialResult(res derpDialResult, pending map[derpDialTarget]struct{}, errs *[]error) (net.Conn, bool, error) {
+	delete(pending, res.target)
+	if res.err == nil {
+		return res.conn, true, nil
 	}
-	return nil, firstErr
+	*errs = append(*errs, derpDialTargetError(res.target, res.err))
+	return nil, false, nil
+}
+
+func finishDERPDialErrors(pending map[derpDialTarget]struct{}, errs []error, err error) error {
+	for target := range pending {
+		errs = append(errs, derpDialTargetError(target, err))
+	}
+	return errors.Join(errs...)
+}
+
+func derpDialTargetError(target derpDialTarget, err error) error {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" && opErr.Net == target.network && opErr.Addr != nil && opErr.Addr.String() == target.addr {
+		return err
+	}
+	return fmt.Errorf("dial %s %s: %w", target.network, target.addr, err)
+}
+
+func derpDialContextWithTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= derpDialTimeout {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, derpDialTimeout)
 }
 
 func (c *Client) PublicKey() key.NodePublic { return c.pub }

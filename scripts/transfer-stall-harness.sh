@@ -479,6 +479,7 @@ remote_sh "${receiver_target}" "
   echo "tool_name=${tool_name}"
   echo "iperf_port=${iperf_port}"
   echo "iperf_server_host=${iperf_server_host}"
+  echo "direct_transport=${DERPHOLE_DIRECT_TRANSPORT:-}"
 } >"${log_dir}/metadata.env"
 
 start_ms="$(now_ms)"

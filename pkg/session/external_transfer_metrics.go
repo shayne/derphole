@@ -170,6 +170,40 @@ func (m *externalTransferMetrics) SetDirectAppProgressBase(offset int64) {
 	m.mu.Unlock()
 }
 
+func (m *externalTransferMetrics) MarkDirectQUIC(at time.Time) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.directTransport = "quic"
+	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
+	m.mu.Unlock()
+	sampleExternalTransferTrace(trace, snap, ok)
+}
+
+func (m *externalTransferMetrics) RecordDirectQUICSend(n int64, at time.Time) {
+	m.recordDirectQUICBytes(n, at, true)
+}
+
+func (m *externalTransferMetrics) RecordDirectQUICReceive(n int64, at time.Time) {
+	m.recordDirectQUICBytes(n, at, false)
+}
+
+func (m *externalTransferMetrics) RecordPeerProgressFromFirstByte(bytesReceived int64, at time.Time) {
+	if m == nil {
+		return
+	}
+	at = nonZeroTime(at)
+	m.mu.Lock()
+	firstByteAt := m.firstByteAt
+	m.mu.Unlock()
+	transferElapsedMS := int64(0)
+	if !firstByteAt.IsZero() && at.After(firstByteAt) {
+		transferElapsedMS = at.Sub(firstByteAt).Milliseconds()
+	}
+	m.RecordPeerProgress(bytesReceived, transferElapsedMS, at)
+}
+
 func (m *externalTransferMetrics) Complete(at time.Time) {
 	if m == nil {
 		return
@@ -473,6 +507,28 @@ func (m *externalTransferMetrics) recordWrite(totalBytes *int64, n int64, at tim
 	sampleExternalTransferTrace(trace, snap, ok)
 }
 
+func (m *externalTransferMetrics) recordDirectQUICBytes(n int64, at time.Time, send bool) {
+	if m == nil || n <= 0 {
+		return
+	}
+	at = nonZeroTime(at)
+	m.mu.Lock()
+	m.directTransport = "quic"
+	m.directBytes += n
+	m.directPacketBytes += n
+	if send {
+		m.localSentBytes += n
+	} else {
+		m.directCommittedBytes += n
+	}
+	if m.firstByteAt.IsZero() || at.Before(m.firstByteAt) {
+		m.firstByteAt = at
+	}
+	trace, snap, ok := m.updateTraceLocked(at)
+	m.mu.Unlock()
+	sampleExternalTransferTrace(trace, snap, ok)
+}
+
 func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrace.Recorder, transfertrace.Snapshot, bool) {
 	if m.trace == nil || at.IsZero() {
 		return nil, transfertrace.Snapshot{}, false
@@ -691,6 +747,9 @@ func (m *externalTransferMetrics) appBytesLocked() int64 {
 	if m.role == transfertrace.RoleSend {
 		if m.peerProgressSet {
 			return m.peerReceivedBytes
+		}
+		if m.directTransport == "quic" {
+			return m.localSentBytes
 		}
 		return 0
 	}

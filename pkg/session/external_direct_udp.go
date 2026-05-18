@@ -823,6 +823,10 @@ func (rt *externalDirectUDPSendRuntime) withPeerControl(ctx context.Context) (co
 	return withPeerControlContext(ctx, rt.derpClient, rt.listenerDERP, rt.subs.abortCh, rt.subs.heartbeatCh, rt.countedSrc.Count, rt.auth)
 }
 
+func (rt *externalDirectUDPSendRuntime) withPeerControlNoHeartbeatWatch(ctx context.Context) (context.Context, func()) {
+	return withPeerControlContext(ctx, rt.derpClient, rt.listenerDERP, rt.subs.abortCh, nil, rt.countedSrc.Count, rt.auth)
+}
+
 func (rt *externalDirectUDPSendRuntime) notifyPeerAbortOnError(retErr *error, ctx context.Context) {
 	notifyPeerAbortOnError(retErr, ctx, rt.derpClient, rt.listenerDERP, rt.countedSrc.Count, rt.auth)
 }
@@ -3445,7 +3449,11 @@ func (rt *externalHandoffDERPSendRuntime) startStopWatcher() {
 }
 
 func (rt *externalHandoffDERPSendRuntime) startAckReader() {
-	ackPackets, unsubscribe := rt.client.SubscribeLossless(func(pkt derpbind.Packet) bool {
+	// Relay-prefix ACKs are cumulative and repeated by the receiver. A newer ACK
+	// supersedes older ones, so this must not use a blocking lossless subscriber:
+	// if the ACK reader or any stale control path backs up, sender backpressure
+	// can deadlock the whole DERP receive loop.
+	ackPackets, unsubscribe := rt.client.Subscribe(func(pkt derpbind.Packet) bool {
 		kind := externalRelayPrefixDERPFrameKindOf(pkt.Payload)
 		return pkt.From == rt.peerDERP && (kind == externalRelayPrefixDERPFrameAck || kind == externalRelayPrefixDERPFrameHandoffAck)
 	})

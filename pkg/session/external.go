@@ -283,13 +283,18 @@ func issuePublicSessionWithCapabilities(ctx context.Context, capabilities uint32
 		return "", nil, err
 	}
 
+	peerPublic := wgPublic
+	if capabilities&token.CapabilityDirectQUIC != 0 {
+		peerPublic = quicIdentity.Public
+	}
+
 	tokValue := token.Token{
 		Version:         token.SupportedVersion,
 		SessionID:       sessionID,
 		ExpiresUnix:     time.Now().Add(time.Hour).Unix(),
 		BootstrapRegion: uint16(node.RegionID),
 		DERPPublic:      derpPublicKeyRaw32(derpClient.PublicKey()),
-		QUICPublic:      wgPublic,
+		QUICPublic:      peerPublic,
 		BearerSecret:    bearerSecret,
 		Capabilities:    capabilities,
 	}
