@@ -89,6 +89,10 @@ var newPublicPortmap = func(emitter *telemetry.Emitter) publicPortmap {
 	return portmap.New(emitter)
 }
 var newTransportManager = transport.NewManager
+var sendExternalViaDirectUDPFn = sendExternalViaDirectUDP
+var listenExternalViaDirectUDPFn = listenExternalViaDirectUDP
+var sendExternalViaDirectQUICFn = sendExternalViaDirectQUIC
+var listenExternalViaDirectQUICFn = listenExternalViaDirectQUIC
 
 type publicPortmap interface {
 	transport.Portmap
@@ -352,7 +356,12 @@ func issuePublicSession(ctx context.Context) (string, *relaySession, error) {
 }
 
 func sendExternal(ctx context.Context, cfg SendConfig) error {
-	return sendExternalViaDirectUDP(ctx, cfg)
+	switch externalDirectTransportFromEnv() {
+	case externalDirectTransportQUIC:
+		return sendExternalViaDirectQUICFn(ctx, cfg)
+	default:
+		return sendExternalViaDirectUDPFn(ctx, cfg)
+	}
 }
 
 type externalNativeDirectModeResult struct {
@@ -503,7 +512,12 @@ func receiveExternalHandoffCarriers(ctx context.Context, carriers []io.ReadWrite
 }
 
 func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
-	return listenExternalViaDirectUDP(ctx, cfg)
+	switch externalDirectTransportFromEnv() {
+	case externalDirectTransportQUIC:
+		return listenExternalViaDirectQUICFn(ctx, cfg)
+	default:
+		return listenExternalViaDirectUDPFn(ctx, cfg)
+	}
 }
 
 func sendExternalNativeTCPDirect(ctx context.Context, src io.Reader, conns []net.Conn) error {
