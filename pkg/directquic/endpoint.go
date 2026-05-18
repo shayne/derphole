@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 
 	quic "github.com/quic-go/quic-go"
 	"github.com/shayne/derphole/pkg/quicpath"
@@ -33,9 +34,19 @@ type DialConfig struct {
 	PeerPublic [32]byte
 }
 
+type Stats struct {
+	BytesSent     int64
+	BytesReceived int64
+	CloseReason   string
+}
+
 type Endpoint struct {
 	conn     *quic.Conn
 	listener *quic.Listener
+
+	mu     sync.Mutex
+	stats  Stats
+	closed bool
 }
 
 func Listen(ctx context.Context, cfg ListenConfig) (*Endpoint, error) {
@@ -69,7 +80,11 @@ func Dial(ctx context.Context, cfg DialConfig) (*Endpoint, error) {
 }
 
 func (e *Endpoint) OpenSendStream(ctx context.Context) (io.WriteCloser, error) {
-	return e.conn.OpenUniStreamSync(ctx)
+	stream, err := e.conn.OpenUniStreamSync(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return sendStreamStatsWriter{stream: stream, endpoint: e}, nil
 }
 
 func (e *Endpoint) AcceptReceiveStream(ctx context.Context) (io.ReadCloser, error) {
@@ -77,23 +92,66 @@ func (e *Endpoint) AcceptReceiveStream(ctx context.Context) (io.ReadCloser, erro
 	if err != nil {
 		return nil, err
 	}
-	return receiveStreamCloser{stream: stream}, nil
+	return receiveStreamCloser{stream: stream, endpoint: e}, nil
 }
 
 func (e *Endpoint) Close() error {
+	return e.CloseWithError(0, "")
+}
+
+func (e *Endpoint) CloseWithError(code uint64, reason string) error {
 	if e == nil {
 		return nil
 	}
-	var err error
-	if e.conn != nil {
-		err = e.conn.CloseWithError(0, "")
+
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return nil
 	}
-	if e.listener != nil {
-		if listenerErr := e.listener.Close(); err == nil {
+	e.closed = true
+	e.stats.CloseReason = reason
+	conn := e.conn
+	listener := e.listener
+	e.mu.Unlock()
+
+	var err error
+	if conn != nil {
+		err = conn.CloseWithError(quic.ApplicationErrorCode(code), reason)
+	}
+	if listener != nil {
+		if listenerErr := listener.Close(); err == nil {
 			err = listenerErr
 		}
 	}
 	return err
+}
+
+func (e *Endpoint) Stats() Stats {
+	if e == nil {
+		return Stats{}
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.stats
+}
+
+func (e *Endpoint) addBytesSent(n int) {
+	if e == nil || n <= 0 {
+		return
+	}
+	e.mu.Lock()
+	e.stats.BytesSent += int64(n)
+	e.mu.Unlock()
+}
+
+func (e *Endpoint) addBytesReceived(n int) {
+	if e == nil || n <= 0 {
+		return
+	}
+	e.mu.Lock()
+	e.stats.BytesReceived += int64(n)
+	e.mu.Unlock()
 }
 
 func validateCommon(packetConn net.PacketConn, peerPublic [32]byte) error {
@@ -112,12 +170,30 @@ func endpointQUICConfig() *quic.Config {
 	return cfg
 }
 
+type sendStreamStatsWriter struct {
+	stream   *quic.SendStream
+	endpoint *Endpoint
+}
+
+func (s sendStreamStatsWriter) Write(p []byte) (int, error) {
+	n, err := s.stream.Write(p)
+	s.endpoint.addBytesSent(n)
+	return n, err
+}
+
+func (s sendStreamStatsWriter) Close() error {
+	return s.stream.Close()
+}
+
 type receiveStreamCloser struct {
-	stream *quic.ReceiveStream
+	stream   *quic.ReceiveStream
+	endpoint *Endpoint
 }
 
 func (r receiveStreamCloser) Read(p []byte) (int, error) {
-	return r.stream.Read(p)
+	n, err := r.stream.Read(p)
+	r.endpoint.addBytesReceived(n)
+	return n, err
 }
 
 func (r receiveStreamCloser) Close() error {
