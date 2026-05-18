@@ -77,6 +77,9 @@ func formatDiagnosticsSummary(diagnostics transfertrace.DiagnosticsSummary) stri
 	if diagnostics.MaxPeerRecvQueueDepth > 0 {
 		summary += fmt.Sprintf(" max_peer_recv_queue_depth=%d", diagnostics.MaxPeerRecvQueueDepth)
 	}
+	if diagnostics.DirectTransport != "" {
+		summary += fmt.Sprintf(" direct_transport=%s", diagnostics.DirectTransport)
+	}
 	if diagnostics.ReceiverCommittedMbpsObserved {
 		summary += fmt.Sprintf(" receiver_committed_mbps_min=%.2f receiver_committed_mbps_max=%.2f", diagnostics.ReceiverCommittedMbpsMin, diagnostics.ReceiverCommittedMbpsMax)
 	}

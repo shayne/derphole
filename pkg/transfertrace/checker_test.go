@@ -283,6 +283,48 @@ func TestCheckReportsDiagnosticsSummaryFromDirectUDPFields(t *testing.T) {
 	}
 }
 
+func TestCheckReportsQUICDiagnosticsSummary(t *testing.T) {
+	csvText := HeaderLine + "\n" +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:     1000,
+			role:            RoleSend,
+			phase:           PhaseDirectExecute,
+			appBytes:        1024,
+			deltaAppBytes:   1024,
+			directValidated: true,
+			lastState:       "connected-direct-quic",
+			directTransport: "quic",
+			quicHandshakeMS: 12,
+			quicFirstByteMS: 18,
+			quicBytesSent:   1024,
+			quicGoodputMbps: "8.19",
+			quicCloseReason: "normal",
+		}) +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:     1500,
+			elapsedMS:       500,
+			role:            RoleSend,
+			phase:           PhaseComplete,
+			appBytes:        1024,
+			deltaAppBytes:   0,
+			directValidated: true,
+			lastState:       "stream-complete",
+			directTransport: "quic",
+			quicHandshakeMS: 12,
+			quicFirstByteMS: 18,
+			quicBytesSent:   1024,
+			quicGoodputMbps: "8.19",
+			quicCloseReason: "normal",
+		})
+	result, err := Check(strings.NewReader(csvText), Options{Role: RoleSend, StallWindow: time.Second, ExpectedBytes: 1024, ExpectedBytesSet: true})
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if result.Diagnostics.DirectTransport != "quic" {
+		t.Fatalf("DirectTransport = %q, want quic", result.Diagnostics.DirectTransport)
+	}
+}
+
 func TestCheckKeepsDiagnosticsAbsentForLegacyAndEmptyTrace(t *testing.T) {
 	tests := []struct {
 		name string
@@ -669,6 +711,12 @@ type testTraceRowConfig struct {
 	retransmits           int64
 	peerRecvQueueDepth    int
 	peerRecvQueueDepthMax int
+	directTransport       string
+	quicHandshakeMS       int64
+	quicFirstByteMS       int64
+	quicBytesSent         int64
+	quicGoodputMbps       string
+	quicCloseReason       string
 }
 
 func testTraceRow(cfg testTraceRowConfig) string {
@@ -695,6 +743,12 @@ func testTraceRow(cfg testTraceRowConfig) string {
 	fields[41] = formatTestOptionalInt64(cfg.retransmits)
 	fields[44] = formatTestOptionalInt(cfg.peerRecvQueueDepth)
 	fields[45] = formatTestOptionalInt(cfg.peerRecvQueueDepthMax)
+	fields[48] = cfg.directTransport
+	fields[49] = formatTestOptionalInt64(cfg.quicHandshakeMS)
+	fields[50] = formatTestOptionalInt64(cfg.quicFirstByteMS)
+	fields[51] = formatTestOptionalInt64(cfg.quicBytesSent)
+	fields[53] = cfg.quicGoodputMbps
+	fields[56] = cfg.quicCloseReason
 	return strings.Join(fields, ",") + "\n"
 }
 

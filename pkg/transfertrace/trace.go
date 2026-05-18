@@ -84,6 +84,15 @@ var header = [...]string{
 	"peer_recv_queue_depth_max",
 	"direct_packet_bytes",
 	"direct_committed_bytes",
+	"direct_transport",
+	"quic_handshake_ms",
+	"quic_first_byte_ms",
+	"quic_stream_bytes_sent",
+	"quic_stream_bytes_received",
+	"quic_stream_goodput_mbps",
+	"quic_smoothed_rtt_ms",
+	"quic_loss_events",
+	"quic_close_reason",
 }
 
 var Header = append([]string(nil), header[:]...)
@@ -126,6 +135,15 @@ type Snapshot struct {
 	PeerRecvQueueDepthMax      int
 	DirectPacketBytes          int64
 	DirectCommittedBytes       int64
+	DirectTransport            string
+	QUICHandshakeMS            int64
+	QUICFirstByteMS            int64
+	QUICStreamBytesSent        int64
+	QUICStreamBytesReceived    int64
+	QUICStreamGoodputMbps      string
+	QUICSmoothedRTTMS          string
+	QUICLossEvents             int64
+	QUICCloseReason            string
 	LastState                  string
 	LastError                  string
 }
@@ -384,6 +402,15 @@ func (r *Recorder) row(snap Snapshot, deltaBytes int64, deltaMS int64, localSent
 		formatOptionalInt(snap.PeerRecvQueueDepthMax),
 		formatOptionalInt64(snap.DirectPacketBytes),
 		formatOptionalInt64(snap.DirectCommittedBytes),
+		snap.DirectTransport,
+		formatOptionalInt64(snap.QUICHandshakeMS),
+		formatOptionalInt64(snap.QUICFirstByteMS),
+		formatOptionalInt64(snap.QUICStreamBytesSent),
+		formatOptionalInt64(snap.QUICStreamBytesReceived),
+		snap.QUICStreamGoodputMbps,
+		snap.QUICSmoothedRTTMS,
+		formatOptionalInt64(snap.QUICLossEvents),
+		snap.QUICCloseReason,
 	}
 }
 

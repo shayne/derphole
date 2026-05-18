@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/shayne/derphole/pkg/directquic"
 	"github.com/shayne/derphole/pkg/probe"
 	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/transfertrace"
@@ -63,6 +64,15 @@ type externalTransferMetrics struct {
 	outOfOrderBytes        uint64
 	directPacketBytes      int64
 	directCommittedBytes   int64
+	directTransport        string
+	quicHandshakeMS        int64
+	quicFirstByteMS        int64
+	quicStreamBytesSent    int64
+	quicStreamBytesRecv    int64
+	quicStreamGoodputMbps  string
+	quicSmoothedRTTMS      string
+	quicLossEvents         int64
+	quicCloseReason        string
 	transportManager       *transport.Manager
 }
 
@@ -268,6 +278,41 @@ func (m *externalTransferMetrics) SetProbeStats(stats probe.TransferStats) {
 
 func (m *externalTransferMetrics) SetProbeStatsWithoutByteProgress(stats probe.TransferStats) {
 	m.setProbeStats(stats, false)
+}
+
+func (m *externalTransferMetrics) SetDirectQUICStats(stats directquic.Stats) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.directTransport = "quic"
+	m.quicHandshakeMS = stats.HandshakeMS
+	m.quicFirstByteMS = stats.FirstByteMS
+	m.quicStreamBytesSent = stats.BytesSent
+	m.quicStreamBytesRecv = stats.BytesReceived
+	m.quicCloseReason = stats.CloseReason
+	m.quicStreamGoodputMbps = externalDirectQUICGoodputMbps(stats)
+	if stats.BytesSent > m.directBytes {
+		m.directBytes = stats.BytesSent
+	}
+	if stats.BytesReceived > m.directBytes {
+		m.directBytes = stats.BytesReceived
+	}
+	if m.role == transfertrace.RoleSend && stats.BytesSent > m.localSentBytes {
+		m.localSentBytes = stats.BytesSent
+	}
+	if stats.FirstByteAt.IsZero() {
+		trace, snap, ok := m.updateTraceLocked(time.Now())
+		m.mu.Unlock()
+		sampleExternalTransferTrace(trace, snap, ok)
+		return
+	}
+	if m.firstByteAt.IsZero() || stats.FirstByteAt.Before(m.firstByteAt) {
+		m.firstByteAt = stats.FirstByteAt
+	}
+	trace, snap, ok := m.updateTraceLocked(nonZeroTime(stats.FirstByteAt))
+	m.mu.Unlock()
+	sampleExternalTransferTrace(trace, snap, ok)
 }
 
 func (m *externalTransferMetrics) setProbeStats(stats probe.TransferStats, updateDirectBytes bool) {
@@ -483,6 +528,15 @@ func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrac
 		OutOfOrderBytes:            m.outOfOrderBytes,
 		DirectPacketBytes:          m.directPacketBytes,
 		DirectCommittedBytes:       m.directCommittedBytes,
+		DirectTransport:            m.directTransport,
+		QUICHandshakeMS:            m.quicHandshakeMS,
+		QUICFirstByteMS:            m.quicFirstByteMS,
+		QUICStreamBytesSent:        m.quicStreamBytesSent,
+		QUICStreamBytesReceived:    m.quicStreamBytesRecv,
+		QUICStreamGoodputMbps:      m.quicStreamGoodputMbps,
+		QUICSmoothedRTTMS:          m.quicSmoothedRTTMS,
+		QUICLossEvents:             m.quicLossEvents,
+		QUICCloseReason:            m.quicCloseReason,
 		PeerRecvQueueDepth:         peerRecvQueueDepth,
 		PeerRecvQueueDepthMax:      peerRecvQueueDepthMax,
 		LastState:                  m.lastState,
@@ -612,6 +666,25 @@ func uint64ToInt64Saturating(value uint64) int64 {
 		return int64(maxInt64AsUint64)
 	}
 	return int64(value)
+}
+
+func externalDirectQUICGoodputMbps(stats directquic.Stats) string {
+	bytes := stats.BytesSent
+	if stats.BytesReceived > bytes {
+		bytes = stats.BytesReceived
+	}
+	if bytes <= 0 || stats.FirstByteAt.IsZero() {
+		return ""
+	}
+	end := stats.ClosedAt
+	if end.IsZero() {
+		end = time.Now()
+	}
+	elapsed := end.Sub(stats.FirstByteAt)
+	if elapsed <= 0 {
+		return ""
+	}
+	return strconv.FormatFloat(float64(bytes*8)/elapsed.Seconds()/1_000_000, 'f', 2, 64)
 }
 
 func (m *externalTransferMetrics) appBytesLocked() int64 {

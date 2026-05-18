@@ -293,6 +293,44 @@ func TestRecorderWritesDirectUDPDiagnosticFields(t *testing.T) {
 	assertColumn(t, receiveRow, receiveIndexes, "direct_committed_bytes", "1250000")
 }
 
+func TestRecorderWritesDirectQUICFields(t *testing.T) {
+	var out bytes.Buffer
+	rec, err := NewRecorder(&out, RoleSend, time.Unix(0, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	rec.Observe(Snapshot{
+		At:                      time.Unix(0, int64(time.Second)),
+		Phase:                   PhaseDirectExecute,
+		AppBytes:                1024,
+		DirectTransport:         "quic",
+		QUICHandshakeMS:         12,
+		QUICFirstByteMS:         18,
+		QUICStreamBytesSent:     1024,
+		QUICStreamBytesReceived: 512,
+		QUICStreamGoodputMbps:   "8.19",
+		QUICSmoothedRTTMS:       "1.25",
+		QUICLossEvents:          2,
+		QUICCloseReason:         "normal",
+		LastState:               "connected-direct-quic",
+	})
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	records, indexes := readTraceCSV(t, out.String())
+	row := records[1]
+	assertColumn(t, row, indexes, "direct_transport", "quic")
+	assertColumn(t, row, indexes, "quic_handshake_ms", "12")
+	assertColumn(t, row, indexes, "quic_first_byte_ms", "18")
+	assertColumn(t, row, indexes, "quic_stream_bytes_sent", "1024")
+	assertColumn(t, row, indexes, "quic_stream_bytes_received", "512")
+	assertColumn(t, row, indexes, "quic_stream_goodput_mbps", "8.19")
+	assertColumn(t, row, indexes, "quic_smoothed_rtt_ms", "1.25")
+	assertColumn(t, row, indexes, "quic_loss_events", "2")
+	assertColumn(t, row, indexes, "quic_close_reason", "normal")
+}
+
 func TestRecorderLeavesRoleSpecificDiagnosticFieldsEmpty(t *testing.T) {
 	start := time.UnixMilli(2_000)
 
@@ -522,6 +560,15 @@ func directUDPDiagnosticHeader() []string {
 		"peer_recv_queue_depth_max",
 		"direct_packet_bytes",
 		"direct_committed_bytes",
+		"direct_transport",
+		"quic_handshake_ms",
+		"quic_first_byte_ms",
+		"quic_stream_bytes_sent",
+		"quic_stream_bytes_received",
+		"quic_stream_goodput_mbps",
+		"quic_smoothed_rtt_ms",
+		"quic_loss_events",
+		"quic_close_reason",
 	}
 }
 

@@ -34,6 +34,7 @@ type DiagnosticsSummary struct {
 	MaxReplayBytes                uint64
 	MaxRetransmits                int64
 	MaxPeerRecvQueueDepth         int
+	DirectTransport               string
 	ReceiverCommittedMbpsMin      float64
 	ReceiverCommittedMbpsMax      float64
 	ReceiverCommittedMbpsObserved bool
@@ -70,6 +71,7 @@ type checkerIndexes struct {
 	fallbackReason     int
 	lastState          int
 	lastError          int
+	directTransport    int
 	numericDiagnostics []checkerNumericDiagnostic
 }
 
@@ -96,6 +98,7 @@ type checkerRowDiagnostics struct {
 	retransmits                   int64
 	peerRecvQueueDepth            int
 	peerRecvQueueDepthMax         int
+	directTransport               string
 }
 
 type checkerNumericDiagnosticKind int
@@ -145,6 +148,12 @@ var checkerNumericDiagnosticColumns = []checkerNumericDiagnosticColumn{
 	{name: "peer_recv_queue_depth_max", kind: checkerNumericDiagnosticInt},
 	{name: "direct_packet_bytes", kind: checkerNumericDiagnosticInt64},
 	{name: "direct_committed_bytes", kind: checkerNumericDiagnosticInt64},
+	{name: "quic_handshake_ms", kind: checkerNumericDiagnosticInt64},
+	{name: "quic_first_byte_ms", kind: checkerNumericDiagnosticInt64},
+	{name: "quic_stream_bytes_sent", kind: checkerNumericDiagnosticInt64},
+	{name: "quic_stream_bytes_received", kind: checkerNumericDiagnosticInt64},
+	{name: "quic_stream_goodput_mbps", kind: checkerNumericDiagnosticFloat},
+	{name: "quic_loss_events", kind: checkerNumericDiagnosticInt64},
 }
 
 type checker struct {
@@ -266,6 +275,9 @@ func (c *checker) recordDiagnostics(row checkerRow) {
 	diagnostics.MaxReplayBytes = maxUint64(diagnostics.MaxReplayBytes, rowDiagnostics.replayBytes)
 	diagnostics.MaxRetransmits = maxInt64(diagnostics.MaxRetransmits, rowDiagnostics.retransmits)
 	diagnostics.MaxPeerRecvQueueDepth = maxInt(diagnostics.MaxPeerRecvQueueDepth, maxInt(rowDiagnostics.peerRecvQueueDepth, rowDiagnostics.peerRecvQueueDepthMax))
+	if rowDiagnostics.directTransport != "" {
+		diagnostics.DirectTransport = rowDiagnostics.directTransport
+	}
 	recordReceiverCommittedMbps(diagnostics, rowDiagnostics)
 }
 
@@ -626,6 +638,7 @@ func checkerHeaderIndexes(header []string) (checkerIndexes, error) {
 		fallbackReason:     optional("fallback_reason"),
 		lastState:          optional("last_state"),
 		lastError:          lastError,
+		directTransport:    optional("direct_transport"),
 		numericDiagnostics: checkerNumericDiagnostics(positions),
 	}, nil
 }
@@ -720,6 +733,7 @@ func parseCheckerRowDiagnostics(record []string, indexes checkerIndexes, rowNo i
 			diagnostics.record(column.name, value)
 		}
 	}
+	diagnostics.directTransport = field(record, indexes.directTransport)
 	return diagnostics, nil
 }
 
@@ -787,7 +801,16 @@ func isOptionalTrailingDiagnosticColumn(name string) bool {
 		"peer_recv_queue_depth",
 		"peer_recv_queue_depth_max",
 		"direct_packet_bytes",
-		"direct_committed_bytes":
+		"direct_committed_bytes",
+		"direct_transport",
+		"quic_handshake_ms",
+		"quic_first_byte_ms",
+		"quic_stream_bytes_sent",
+		"quic_stream_bytes_received",
+		"quic_stream_goodput_mbps",
+		"quic_smoothed_rtt_ms",
+		"quic_loss_events",
+		"quic_close_reason":
 		return true
 	default:
 		return false

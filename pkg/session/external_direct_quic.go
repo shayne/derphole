@@ -16,6 +16,7 @@ import (
 	"github.com/shayne/derphole/pkg/quicpath"
 	"github.com/shayne/derphole/pkg/rendezvous"
 	"github.com/shayne/derphole/pkg/token"
+	"github.com/shayne/derphole/pkg/transfertrace"
 	"github.com/shayne/derphole/pkg/transport"
 )
 
@@ -40,13 +41,19 @@ func sendExternalViaDirectQUIC(ctx context.Context, cfg SendConfig) (retErr erro
 }
 
 func (rt *externalDirectUDPSendRuntime) runQUIC(ctx context.Context) error {
+	rt.metrics = newExternalTransferMetricsWithTrace(time.Now(), rt.cfg.Trace, transfertrace.RoleSend)
+	rt.metrics.DeferSendCompleteUntilPeerAck()
+	ctx = withExternalTransferMetrics(ctx, rt.metrics)
 	pathEmitter := newTransportPathEmitter(rt.cfg.Emitter)
 	pathEmitter.Emit(StateProbing)
 	tr, err := rt.startTransport(ctx, pathEmitter)
 	if err != nil {
+		rt.metrics.SetError(err)
 		return err
 	}
 	defer tr.Close()
+	rt.metrics.SetTransportManager(tr.manager)
+	rt.metrics.SetPhase(transfertrace.PhaseDirectExecute, "connected-direct-quic")
 	if !tr.relayOnly {
 		pathEmitter.Emit(StateTryingDirect)
 	}
@@ -57,8 +64,10 @@ func (rt *externalDirectUDPSendRuntime) runQUIC(ctx context.Context) error {
 	if err := externalDirectQUICSendOverManagerAndThen(tr.ctx, rt.countedSrc, tr.manager, rt.quicIdentity, rt.tok.QUICPublic, func() error {
 		return waitForPeerAckWithTimeout(ctx, rt.subs.ackCh, rt.countedSrc.Count(), externalDirectUDPAckWait, rt.auth)
 	}); err != nil {
+		rt.metrics.SetError(err)
 		return err
 	}
+	completeExternalSendMetricsAfterPeerAck(rt.metrics, rt.countedSrc.Count(), time.Now())
 	pathEmitter.Complete(tr.manager)
 	return nil
 }
@@ -113,6 +122,8 @@ func (rt *externalDirectUDPListenRuntime) runQUIC(ctx context.Context) (string, 
 }
 
 func (rt *externalDirectUDPListenRuntime) receiveAcceptedQUIC(ctx context.Context, accepted externalDirectUDPAcceptedClaim) (retErr error) {
+	metrics := newExternalTransferMetricsWithTrace(time.Now(), rt.cfg.Trace, transfertrace.RoleReceive)
+	ctx = withExternalTransferMetrics(ctx, metrics)
 	peerSubs := rt.subscribePeer(accepted.peerDERP)
 	defer peerSubs.Close()
 	var countedDst *byteCountingWriteCloser
@@ -130,12 +141,16 @@ func (rt *externalDirectUDPListenRuntime) receiveAcceptedQUIC(ctx context.Contex
 	emitExternalDirectUDPClaimAccepted(rt.cfg.Emitter)
 	tr, decision, err := rt.prepareQUICTransfer(ctx, accepted)
 	if err != nil {
+		metrics.SetError(err)
 		return err
 	}
 	accepted.decision = decision
 	defer tr.Close()
+	metrics.SetTransportManager(tr.transportManager)
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, "connected-direct-quic")
 	countedDst, err = rt.openCountedSink(ctx)
 	if err != nil {
+		metrics.SetError(err)
 		return err
 	}
 	defer func() { _ = countedDst.Close() }()
@@ -154,11 +169,14 @@ func (rt *externalDirectUDPListenRuntime) receiveAcceptedQUIC(ctx context.Contex
 		emitExternalDirectUDPDecisionSent(rt.cfg.Emitter)
 		return nil
 	}); err != nil {
+		metrics.SetError(err)
 		return err
 	}
 	if err := sendPeerAck(ctx, rt.session.derp, accepted.peerDERP, countedDst.Count(), rt.auth); err != nil {
+		metrics.SetError(err)
 		return err
 	}
+	metrics.Complete(time.Now())
 	rt.pathEmitter.Complete(tr.transportManager)
 	return nil
 }
@@ -197,6 +215,7 @@ func externalDirectQUICSendOverManager(ctx context.Context, src io.Reader, manag
 }
 
 func externalDirectQUICSendOverManagerAndThen(ctx context.Context, src io.Reader, manager *transport.Manager, identity quicpath.SessionIdentity, peer [32]byte, afterStreamClosed func() error) error {
+	metrics := externalTransferMetricsFromContext(ctx)
 	peerConn := manager.PeerDatagramConn(ctx)
 	adapter := quicpath.NewAdapter(peerConn)
 	defer func() { _ = adapter.Close() }()
@@ -210,7 +229,11 @@ func externalDirectQUICSendOverManagerAndThen(ctx context.Context, src io.Reader
 	if err != nil {
 		return err
 	}
-	defer func() { _ = endpoint.Close() }()
+	defer func() {
+		_ = endpoint.Close()
+		metrics.SetDirectQUICStats(endpoint.Stats())
+	}()
+	metrics.SetDirectQUICStats(endpoint.Stats())
 
 	before := endpoint.Stats().BytesSent
 	stream, err := endpoint.OpenSendStream(ctx)
@@ -227,9 +250,11 @@ func externalDirectQUICSendOverManagerAndThen(ctx context.Context, src io.Reader
 		_ = stream.Close()
 		return err
 	}
+	metrics.SetDirectQUICStats(endpoint.Stats())
 	if err := stream.Close(); err != nil {
 		return err
 	}
+	metrics.SetDirectQUICStats(endpoint.Stats())
 	if endpoint.Stats().BytesSent > before {
 		if err := externalDirectQUICWaitForCommittedBytes(ctx, func() int64 {
 			return endpoint.Stats().BytesSent
@@ -246,6 +271,7 @@ func externalDirectQUICSendOverManagerAndThen(ctx context.Context, src io.Reader
 }
 
 func externalDirectQUICReceiveOverManager(ctx context.Context, dst io.Writer, manager *transport.Manager, identity quicpath.SessionIdentity, peer [32]byte) error {
+	metrics := externalTransferMetricsFromContext(ctx)
 	peerConn := manager.PeerDatagramConn(ctx)
 	adapter := quicpath.NewAdapter(peerConn)
 	defer func() { _ = adapter.Close() }()
@@ -258,7 +284,11 @@ func externalDirectQUICReceiveOverManager(ctx context.Context, dst io.Writer, ma
 	if err != nil {
 		return err
 	}
-	defer func() { _ = endpoint.Close() }()
+	defer func() {
+		_ = endpoint.Close()
+		metrics.SetDirectQUICStats(endpoint.Stats())
+	}()
+	metrics.SetDirectQUICStats(endpoint.Stats())
 
 	stream, err := endpoint.AcceptReceiveStream(ctx)
 	if err != nil {
@@ -266,6 +296,7 @@ func externalDirectQUICReceiveOverManager(ctx context.Context, dst io.Writer, ma
 	}
 	buf := make([]byte, externalDirectQUICCopyBufferSize)
 	_, copyErr := io.CopyBuffer(dst, stream, buf)
+	metrics.SetDirectQUICStats(endpoint.Stats())
 	closeErr := stream.Close()
 	if copyErr != nil {
 		return copyErr
@@ -274,6 +305,7 @@ func externalDirectQUICReceiveOverManager(ctx context.Context, dst io.Writer, ma
 }
 
 func externalDirectQUICReceiveOverManagerAfterListen(ctx context.Context, dst io.Writer, manager *transport.Manager, identity quicpath.SessionIdentity, peer [32]byte, afterListen func() error) error {
+	metrics := externalTransferMetricsFromContext(ctx)
 	peerConn := manager.PeerDatagramConn(ctx)
 	adapter := quicpath.NewAdapter(peerConn)
 	defer func() { _ = adapter.Close() }()
@@ -286,7 +318,11 @@ func externalDirectQUICReceiveOverManagerAfterListen(ctx context.Context, dst io
 	if err != nil {
 		return err
 	}
-	defer func() { _ = endpoint.Close() }()
+	defer func() {
+		_ = endpoint.Close()
+		metrics.SetDirectQUICStats(endpoint.Stats())
+	}()
+	metrics.SetDirectQUICStats(endpoint.Stats())
 
 	stream, err := endpoint.AcceptReceiveStream(ctx)
 	if err != nil {
@@ -295,6 +331,7 @@ func externalDirectQUICReceiveOverManagerAfterListen(ctx context.Context, dst io
 	defer func() { _ = stream.Close() }()
 	buf := make([]byte, externalDirectQUICCopyBufferSize)
 	_, err = io.CopyBuffer(dst, stream, buf)
+	metrics.SetDirectQUICStats(endpoint.Stats())
 	return err
 }
 

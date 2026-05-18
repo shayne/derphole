@@ -90,6 +90,7 @@ func TestRunPrintsDiagnosticSummary(t *testing.T) {
 			"retransmits":               "9",
 			"peer_recv_queue_depth":     "900",
 			"peer_recv_queue_depth_max": "1069",
+			"direct_transport":          "quic",
 		}))
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"-role", "send", "-expected-bytes", "2048", path}, &stdout, &stderr)
@@ -102,6 +103,7 @@ func TestRunPrintsDiagnosticSummary(t *testing.T) {
 		"max_replay_bytes=2097152",
 		"max_retransmits=9",
 		"max_peer_recv_queue_depth=1069",
+		"direct_transport=quic",
 		"receiver_committed_mbps_min=1.00",
 		"receiver_committed_mbps_max=16.38",
 	} {

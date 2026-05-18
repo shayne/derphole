@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	quic "github.com/quic-go/quic-go"
 	"github.com/shayne/derphole/pkg/quicpath"
@@ -37,6 +38,12 @@ type DialConfig struct {
 type Stats struct {
 	BytesSent     int64
 	BytesReceived int64
+	HandshakeMS   int64
+	FirstByteMS   int64
+	OpenedAt      time.Time
+	HandshakeAt   time.Time
+	FirstByteAt   time.Time
+	ClosedAt      time.Time
 	CloseReason   string
 }
 
@@ -44,9 +51,10 @@ type Endpoint struct {
 	conn     *quic.Conn
 	listener *quic.Listener
 
-	mu     sync.Mutex
-	stats  Stats
-	closed bool
+	mu           sync.Mutex
+	stats        Stats
+	closed       bool
+	firstByteSet bool
 }
 
 func Listen(ctx context.Context, cfg ListenConfig) (*Endpoint, error) {
@@ -57,6 +65,7 @@ func ListenWithReady(ctx context.Context, cfg ListenConfig, ready func() error) 
 	if err := validateCommon(cfg.PacketConn, cfg.PeerPublic); err != nil {
 		return nil, err
 	}
+	openedAt := time.Now()
 	listener, err := quic.Listen(cfg.PacketConn, quicpath.ServerTLSConfig(cfg.Identity, cfg.PeerPublic), endpointQUICConfig())
 	if err != nil {
 		return nil, err
@@ -72,7 +81,7 @@ func ListenWithReady(ctx context.Context, cfg ListenConfig, ready func() error) 
 		_ = listener.Close()
 		return nil, err
 	}
-	return &Endpoint{conn: conn, listener: listener}, nil
+	return newEndpoint(conn, listener, openedAt), nil
 }
 
 func Dial(ctx context.Context, cfg DialConfig) (*Endpoint, error) {
@@ -82,11 +91,25 @@ func Dial(ctx context.Context, cfg DialConfig) (*Endpoint, error) {
 	if cfg.RemoteAddr == nil {
 		return nil, errNilRemoteAddr
 	}
+	openedAt := time.Now()
 	conn, err := quic.Dial(ctx, cfg.PacketConn, cfg.RemoteAddr, quicpath.ClientTLSConfig(cfg.Identity, cfg.PeerPublic), endpointQUICConfig())
 	if err != nil {
 		return nil, err
 	}
-	return &Endpoint{conn: conn}, nil
+	return newEndpoint(conn, nil, openedAt), nil
+}
+
+func newEndpoint(conn *quic.Conn, listener *quic.Listener, openedAt time.Time) *Endpoint {
+	handshakeAt := time.Now()
+	return &Endpoint{
+		conn:     conn,
+		listener: listener,
+		stats: Stats{
+			OpenedAt:    openedAt,
+			HandshakeAt: handshakeAt,
+			HandshakeMS: handshakeAt.Sub(openedAt).Milliseconds(),
+		},
+	}
 }
 
 func (e *Endpoint) OpenSendStream(ctx context.Context) (io.WriteCloser, error) {
@@ -121,6 +144,7 @@ func (e *Endpoint) CloseWithError(code uint64, reason string) error {
 	}
 	e.closed = true
 	e.stats.CloseReason = reason
+	e.stats.ClosedAt = time.Now()
 	conn := e.conn
 	listener := e.listener
 	e.mu.Unlock()
@@ -152,6 +176,7 @@ func (e *Endpoint) addBytesSent(n int) {
 	}
 	e.mu.Lock()
 	e.stats.BytesSent += int64(n)
+	e.recordFirstByteLocked(time.Now())
 	e.mu.Unlock()
 }
 
@@ -161,7 +186,17 @@ func (e *Endpoint) addBytesReceived(n int) {
 	}
 	e.mu.Lock()
 	e.stats.BytesReceived += int64(n)
+	e.recordFirstByteLocked(time.Now())
 	e.mu.Unlock()
+}
+
+func (e *Endpoint) recordFirstByteLocked(at time.Time) {
+	if e.firstByteSet {
+		return
+	}
+	e.firstByteSet = true
+	e.stats.FirstByteAt = at
+	e.stats.FirstByteMS = at.Sub(e.stats.OpenedAt).Milliseconds()
 }
 
 func validateCommon(packetConn net.PacketConn, peerPublic [32]byte) error {
