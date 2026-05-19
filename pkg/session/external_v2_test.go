@@ -85,6 +85,49 @@ func TestExternalV2ReceiverCancelAbortsSender(t *testing.T) {
 	}
 }
 
+func TestExternalV2TransferTraceCompletes(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "v2")
+
+	var sendOut bytes.Buffer
+	sendTrace, err := transfertrace.NewRecorder(&sendOut, transfertrace.RoleSend, time.Unix(100, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder(send) error = %v", err)
+	}
+	var receiveOut bytes.Buffer
+	receiveTrace, err := transfertrace.NewRecorder(&receiveOut, transfertrace.RoleReceive, time.Unix(100, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder(receive) error = %v", err)
+	}
+
+	payload := strings.Repeat("x", 4096)
+	if received := runExternalV2RoundTrip(t, payload, sendTrace, receiveTrace); received != payload {
+		t.Fatalf("received = %q, want %q", received, payload)
+	}
+	if err := sendTrace.Close(); err != nil {
+		t.Fatalf("send trace Close() error = %v", err)
+	}
+	if err := receiveTrace.Close(); err != nil {
+		t.Fatalf("receive trace Close() error = %v", err)
+	}
+	if _, err := transfertrace.Check(strings.NewReader(sendOut.String()), transfertrace.Options{
+		Role:             transfertrace.RoleSend,
+		ExpectedBytes:    int64(len(payload)),
+		ExpectedBytesSet: true,
+	}); err != nil {
+		t.Fatalf("send trace check error = %v\n%s", err, sendOut.String())
+	}
+	if _, err := transfertrace.Check(strings.NewReader(receiveOut.String()), transfertrace.Options{
+		Role:             transfertrace.RoleReceive,
+		ExpectedBytes:    int64(len(payload)),
+		ExpectedBytesSet: true,
+	}); err != nil {
+		t.Fatalf("receive trace check error = %v\n%s", err, receiveOut.String())
+	}
+}
+
 func runExternalV2RoundTrip(t *testing.T, payload string, sendTrace *transfertrace.Recorder, receiveTrace *transfertrace.Recorder) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

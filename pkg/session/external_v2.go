@@ -19,6 +19,7 @@ import (
 	"github.com/shayne/derphole/pkg/derpbind"
 	"github.com/shayne/derphole/pkg/quicpath"
 	"github.com/shayne/derphole/pkg/token"
+	"github.com/shayne/derphole/pkg/transfertrace"
 	"github.com/shayne/derphole/pkg/transport"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -26,6 +27,7 @@ import (
 
 const externalV2CopyBufferSize = 1 << 20
 const externalV2AbortNotifyWait = 2 * time.Second
+const externalV2AbortDrainWait = 250 * time.Millisecond
 
 type externalV2SendRuntime struct {
 	cfg          SendConfig
@@ -167,7 +169,15 @@ func (rt *externalV2SendRuntime) Close() {
 	}
 }
 
-func (rt *externalV2SendRuntime) run(ctx context.Context) error {
+func (rt *externalV2SendRuntime) run(ctx context.Context) (retErr error) {
+	metrics := newExternalTransferMetricsWithTrace(time.Now(), rt.cfg.Trace, transfertrace.RoleSend)
+	defer func() {
+		if retErr != nil {
+			metrics.SetError(retErr)
+		}
+	}()
+	ctx = withExternalTransferMetrics(ctx, metrics)
+
 	src, err := openSendSource(ctx, rt.cfg)
 	if err != nil {
 		return err
@@ -176,6 +186,7 @@ func (rt *externalV2SendRuntime) run(ctx context.Context) error {
 
 	pathEmitter := newTransportPathEmitter(rt.cfg.Emitter)
 	pathEmitter.Emit(StateWaiting)
+	metrics.SetPhase(transfertrace.PhaseClaim, string(StateWaiting))
 	if err := rt.sendClaim(ctx); err != nil {
 		return err
 	}
@@ -186,9 +197,12 @@ func (rt *externalV2SendRuntime) run(ctx context.Context) error {
 		return err
 	}
 	defer cleanup()
-	if err := rt.sendStream(ctx, manager, src); err != nil {
+	metrics.SetTransportManager(manager)
+	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
+	if err := rt.sendStream(ctx, manager, src, metrics); err != nil {
 		return err
 	}
+	metrics.Complete(time.Now())
 	pathEmitter.Complete(manager)
 	return nil
 }
@@ -215,7 +229,7 @@ func (rt *externalV2SendRuntime) acceptAndStartTransport(ctx context.Context, pa
 	}, nil
 }
 
-func (rt *externalV2SendRuntime) sendStream(ctx context.Context, manager *transport.Manager, src io.Reader) error {
+func (rt *externalV2SendRuntime) sendStream(ctx context.Context, manager *transport.Manager, src io.Reader, metrics *externalTransferMetrics) error {
 	client := dataplane.NewQUICClient(manager, rt.identity, rt.tok.QUICPublic)
 	stream, err := client.Open(ctx)
 	if err != nil {
@@ -225,16 +239,16 @@ func (rt *externalV2SendRuntime) sendStream(ctx context.Context, manager *transp
 		_ = client.CloseWithError(1, "peer aborted transfer")
 	})
 	defer stopAbortWatch()
-	if err := copyExternalV2SendStream(src, stream); err != nil {
+	if err := copyExternalV2SendStream(src, stream, metrics); err != nil {
 		_ = client.CloseWithError(1, err.Error())
-		if abortErr := drainExternalV2Abort(abortErrCh); abortErr != nil {
+		if abortErr := waitExternalV2Abort(abortErrCh); abortErr != nil {
 			return abortErr
 		}
 		return err
 	}
 	if err := stream.Close(); err != nil {
 		_ = client.CloseWithError(1, err.Error())
-		if abortErr := drainExternalV2Abort(abortErrCh); abortErr != nil {
+		if abortErr := waitExternalV2Abort(abortErrCh); abortErr != nil {
 			return abortErr
 		}
 		return err
@@ -244,6 +258,7 @@ func (rt *externalV2SendRuntime) sendStream(ctx context.Context, manager *transp
 		_ = client.CloseWithError(1, err.Error())
 		return err
 	}
+	metrics.RecordPeerProgress(complete.BytesReceived, 0, time.Now())
 	if err := client.CloseWithError(0, "complete"); err != nil {
 		return err
 	}
@@ -337,11 +352,13 @@ func externalV2AbortError(abort *peerAbort) error {
 	return fmt.Errorf("%w: %s", ErrPeerAborted, abort.Reason)
 }
 
-func drainExternalV2Abort(ch <-chan error) error {
+func waitExternalV2Abort(ch <-chan error) error {
+	timer := time.NewTimer(externalV2AbortDrainWait)
+	defer timer.Stop()
 	select {
 	case err := <-ch:
 		return err
-	default:
+	case <-timer.C:
 		return nil
 	}
 }
@@ -461,6 +478,14 @@ func (rt *externalV2ListenRuntime) nextClaim(ctx context.Context) (externalV2Acc
 }
 
 func (rt *externalV2ListenRuntime) receive(ctx context.Context, accepted externalV2AcceptedClaim) (retErr error) {
+	metrics := newExternalTransferMetricsWithTrace(time.Now(), rt.cfg.Trace, transfertrace.RoleReceive)
+	defer func() {
+		if retErr != nil {
+			metrics.SetError(retErr)
+		}
+	}()
+	ctx = withExternalTransferMetrics(ctx, metrics)
+
 	dst, err := openListenSink(ctx, rt.cfg)
 	if err != nil {
 		return err
@@ -479,6 +504,8 @@ func (rt *externalV2ListenRuntime) receive(ctx context.Context, accepted externa
 			rt.notifyAbort(accepted.peerDERP, retErr)
 		}
 	}()
+	metrics.SetTransportManager(manager)
+	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
 
 	pathEmitter := newTransportPathEmitter(rt.cfg.Emitter)
 	pathEmitter.Watch(transferCtx, manager)
@@ -492,7 +519,7 @@ func (rt *externalV2ListenRuntime) receive(ctx context.Context, accepted externa
 	if err != nil {
 		return err
 	}
-	bytesReceived, err = copyExternalV2ReceiveStream(dst, stream)
+	bytesReceived, err = copyExternalV2ReceiveStream(dst, stream, metrics)
 	if err != nil {
 		_ = server.CloseWithError(1, err.Error())
 		return err
@@ -508,6 +535,7 @@ func (rt *externalV2ListenRuntime) receive(ctx context.Context, accepted externa
 	if err := server.CloseWithError(0, "complete"); err != nil {
 		return err
 	}
+	metrics.Complete(time.Now())
 	pathEmitter.Complete(manager)
 	return nil
 }
@@ -551,8 +579,12 @@ func (rt *externalV2ListenRuntime) sendComplete(ctx context.Context, peerDERP ke
 	}, rt.auth)
 }
 
-func copyExternalV2SendStream(src io.Reader, stream dataplane.Stream) error {
-	writer := bufio.NewWriterSize(stream, externalV2CopyBufferSize)
+func copyExternalV2SendStream(src io.Reader, stream dataplane.Stream, metrics *externalTransferMetrics) error {
+	dst := io.Writer(stream)
+	if metrics != nil {
+		dst = externalTransferMetricsWriter{w: dst, record: metrics.RecordDirectQUICSend}
+	}
+	writer := bufio.NewWriterSize(dst, externalV2CopyBufferSize)
 	buf := make([]byte, externalV2CopyBufferSize)
 	if _, err := io.CopyBuffer(writer, src, buf); err != nil {
 		return err
@@ -560,7 +592,10 @@ func copyExternalV2SendStream(src io.Reader, stream dataplane.Stream) error {
 	return writer.Flush()
 }
 
-func copyExternalV2ReceiveStream(dst io.Writer, stream dataplane.Stream) (int64, error) {
+func copyExternalV2ReceiveStream(dst io.Writer, stream dataplane.Stream, metrics *externalTransferMetrics) (int64, error) {
+	if metrics != nil {
+		dst = externalTransferMetricsWriter{w: dst, record: metrics.RecordDirectQUICReceive}
+	}
 	buf := make([]byte, externalV2CopyBufferSize)
 	return io.CopyBuffer(dst, stream, buf)
 }
