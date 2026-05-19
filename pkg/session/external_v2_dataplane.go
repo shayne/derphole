@@ -1,0 +1,436 @@
+// Copyright (c) 2026 Shayne All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package session
+
+import (
+	"context"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/shayne/derphole/pkg/derpbind"
+	"github.com/shayne/derphole/pkg/probe"
+	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/transport"
+	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
+)
+
+const (
+	externalV2DataPlaneReadyWait     = 5 * time.Second
+	externalV2DataPlaneRetry         = 250 * time.Millisecond
+	externalV2DataPlaneReinforce     = 1 * time.Second
+	externalV2DataPlaneReinforceTick = 100 * time.Millisecond
+	externalV2DataPlaneCandidateWait = 750 * time.Millisecond
+)
+
+type externalV2DirectPacketPath struct {
+	conn    net.PacketConn
+	addr    net.Addr
+	conns   []net.PacketConn
+	addrs   []net.Addr
+	raw     bool
+	cleanup func()
+}
+
+func (p externalV2DirectPacketPath) Close() {
+	if p.cleanup != nil {
+		p.cleanup()
+	}
+}
+
+func negotiateExternalV2DirectPacketPath(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, manager *transport.Manager, dm *tailcfg.DERPMap, auth externalPeerControlAuth, emitter *telemetry.Emitter, streamCount int) (externalV2DirectPacketPath, error) {
+	if !externalV2CanUseRawDirect(manager) {
+		return externalV2DirectPacketPath{}, nil
+	}
+	local, ok := openExternalV2RawDirectLocal(ctx, dm, emitter, streamCount)
+	if !ok {
+		return externalV2DirectPacketPath{}, nil
+	}
+
+	peerReady, peerCandidates, err := exchangeExternalV2RawDirectPeer(ctx, client, peerDERP, local, auth, emitter)
+	if err != nil {
+		local.Close()
+		return externalV2DirectPacketPath{}, err
+	}
+	return selectExternalV2RawDirectPath(ctx, local, peerReady, peerCandidates, emitter), nil
+}
+
+func externalV2CanUseRawDirect(manager *transport.Manager) bool {
+	return externalV2RawDirectEnabled() && manager != nil
+}
+
+func openExternalV2RawDirectLocal(ctx context.Context, dm *tailcfg.DERPMap, emitter *telemetry.Emitter, streamCount int) (externalV2DataPacketPath, bool) {
+	local, err := openExternalV2DataPacketPath(ctx, dm, emitter, streamCount)
+	if err != nil {
+		emitExternalV2Debug(emitter, "v2-raw-direct-open-error="+err.Error())
+		return externalV2DataPacketPath{}, false
+	}
+	if len(local.conns) == 0 || len(local.candidates) == 0 {
+		local.Close()
+		emitExternalV2Debug(emitter, "v2-raw-direct-local=false")
+		return externalV2DataPacketPath{}, false
+	}
+	emitExternalV2Debug(emitter, "v2-raw-direct-local=true candidates="+strconv.Itoa(len(local.candidates)))
+	return local, true
+}
+
+func exchangeExternalV2RawDirectPeer(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, local externalV2DataPacketPath, auth externalPeerControlAuth, emitter *telemetry.Emitter) (externalV2DataPlaneReady, []net.Addr, error) {
+	readyCh, unsubscribe := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
+		return pkt.From == peerDERP && isV2DataPlaneReadyPayload(pkt.Payload)
+	})
+	defer unsubscribe()
+
+	peerReady, err := exchangeExternalV2DataPlaneReady(ctx, client, peerDERP, readyCh, true, local.candidates, local.candidateSets, auth)
+	if err != nil {
+		return externalV2DataPlaneReady{}, nil, err
+	}
+	peerCandidates := parseCandidateStrings(peerReady.Candidates)
+	emitExternalV2Debug(emitter, "v2-raw-direct-peer="+boolString(peerReady.RawDirect)+" candidates="+strconv.Itoa(len(peerCandidates)))
+	return peerReady, peerCandidates, nil
+}
+
+func selectExternalV2RawDirectPath(ctx context.Context, local externalV2DataPacketPath, peerReady externalV2DataPlaneReady, peerCandidates []net.Addr, emitter *telemetry.Emitter) externalV2DirectPacketPath {
+	if !peerReady.RawDirect || len(peerCandidates) == 0 {
+		local.Close()
+		emitExternalV2Debug(emitter, "v2-data-plane=manager")
+		return externalV2DirectPacketPath{}
+	}
+
+	addrs := selectExternalV2DataPacketAddrs(ctx, local.conns, peerReady.CandidateSets, peerCandidates, emitter)
+	if len(addrs) == 0 {
+		local.Close()
+		emitExternalV2Debug(emitter, "v2-data-plane=manager")
+		return externalV2DirectPacketPath{}
+	}
+	for _, conn := range local.conns {
+		_ = conn.SetDeadline(time.Time{})
+	}
+	emitExternalV2Debug(emitter, "v2-raw-direct-addr="+joinNetAddrs(addrs))
+	emitExternalV2Debug(emitter, "v2-raw-direct-active="+strconv.Itoa(len(addrs)))
+	emitExternalV2Debug(emitter, "v2-data-plane=raw-direct")
+	return externalV2DirectPacketPath{conn: local.conns[0], addr: addrs[0], conns: local.conns[:len(addrs)], addrs: addrs, raw: true, cleanup: local.cleanup}
+}
+
+func externalV2RawDirectEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DERPHOLE_V2_RAW_DIRECT"))) {
+	case "0", "false", "off", "no":
+		return false
+	default:
+		return true
+	}
+}
+
+type externalV2DataPacketPath struct {
+	conns         []net.PacketConn
+	candidates    []string
+	candidateSets [][]string
+	cleanup       func()
+}
+
+func (p externalV2DataPacketPath) Close() {
+	if p.cleanup != nil {
+		p.cleanup()
+	}
+}
+
+func openExternalV2DataPacketPath(ctx context.Context, dm *tailcfg.DERPMap, emitter *telemetry.Emitter, streamCount int) (externalV2DataPacketPath, error) {
+	count := externalV2RawDirectSocketCount(streamCount)
+	conns := make([]net.PacketConn, 0, count)
+	portmaps := make([]publicPortmap, 0, count)
+	for range count {
+		conn, err := net.ListenPacket("udp4", ":0")
+		if err != nil {
+			closeExternalV2DataPacketResources(conns, portmaps)
+			return externalV2DataPacketPath{}, err
+		}
+		conns = append(conns, conn)
+		portmaps = append(portmaps, newBoundPublicPortmap(conn, emitter))
+		_ = probe.PreviewTransportCaps(conn, "batched")
+	}
+	cleanup := func() {
+		closeExternalV2DataPacketResources(conns, portmaps)
+	}
+	candidateSets := externalV2DataPacketCandidates(ctx, conns, portmaps, dm)
+	var candidates []string
+	for _, set := range candidateSets {
+		candidates = append(candidates, set...)
+	}
+	return externalV2DataPacketPath{conns: conns, candidates: candidates, candidateSets: candidateSets, cleanup: cleanup}, nil
+}
+
+func externalV2RawDirectSocketCount(streamCount int) int {
+	if streamCount < 1 {
+		return 1
+	}
+	if streamCount > MaxParallelStripes {
+		return MaxParallelStripes
+	}
+	return streamCount
+}
+
+func closeExternalV2DataPacketResources(conns []net.PacketConn, portmaps []publicPortmap) {
+	for _, pm := range portmaps {
+		if pm != nil {
+			_ = pm.Close()
+		}
+	}
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+}
+
+func externalV2DataPacketCandidates(ctx context.Context, conns []net.PacketConn, portmaps []publicPortmap, dm *tailcfg.DERPMap) [][]string {
+	sets := externalDirectUDPCandidateSetsWithTimeout(ctx, conns, dm, portmaps, externalV2DataPlaneCandidateWait)
+	return externalDirectUDPInferWANPerPort(sets)
+}
+
+func selectExternalV2DataPacketAddrs(ctx context.Context, conns []net.PacketConn, peerCandidateSets [][]string, peerCandidates []net.Addr, emitter *telemetry.Emitter) []net.Addr {
+	switch {
+	case len(conns) == 0:
+		return nil
+	case len(peerCandidateSets) > 0:
+		return selectExternalV2DataPacketAddrsBySet(ctx, conns, peerCandidateSets, emitter)
+	case len(peerCandidates) == 0:
+		return nil
+	default:
+		return selectExternalV2DataPacketAddrsByFlatCandidates(ctx, conns, peerCandidates, emitter)
+	}
+}
+
+func selectExternalV2DataPacketAddrsByFlatCandidates(ctx context.Context, conns []net.PacketConn, peerCandidates []net.Addr, emitter *telemetry.Emitter) []net.Addr {
+	punchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go externalDirectUDPStartPunching(punchCtx, conns, peerCandidates)
+
+	observedByConn := externalDirectUDPObservePunchAddrsByConn(ctx, conns, externalDirectUDPPunchWait)
+	if emitter != nil {
+		emitter.Debug("v2-raw-direct-observed-addrs=" + externalDirectUDPFormatObservedAddrsByConn(observedByConn))
+	}
+	selected := externalDirectUDPSelectRemoteAddrsByConn(observedByConn, conns, len(conns), nil)
+	if emitter != nil {
+		emitter.Debug("v2-raw-direct-selected-addrs=" + strings.Join(selected, ","))
+	}
+	if !externalV2DataPacketSelectionObserved(ctx, selected, emitter) {
+		return nil
+	}
+	fallback := externalDirectUDPParallelCandidateStringsForPeer(peerCandidates, len(conns), nil)
+	fallback = externalDirectUDPFilterFallbackAddrsForSelectedScope(selected, fallback)
+	if emitter != nil {
+		emitter.Debug("v2-raw-direct-fallback-addrs=" + strings.Join(fallback, ","))
+	}
+	return selectedExternalV2DataPacketAddrs(conns, selected, fallback, true)
+}
+
+func selectExternalV2DataPacketAddrsBySet(ctx context.Context, conns []net.PacketConn, peerCandidateSets [][]string, emitter *telemetry.Emitter) []net.Addr {
+	count := externalV2DataPacketSetCount(conns, peerCandidateSets)
+	if count == 0 {
+		return nil
+	}
+	peerAddrsBySet, ok := externalV2DataPacketPeerAddrsBySet(peerCandidateSets, count)
+	if !ok {
+		return nil
+	}
+	punchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	for i := range count {
+		go externalDirectUDPStartPunching(punchCtx, []net.PacketConn{conns[i]}, peerAddrsBySet[i])
+	}
+	observedByConn := externalDirectUDPObservePunchAddrsByConn(ctx, conns[:count], externalDirectUDPPunchWait)
+	if emitter != nil {
+		emitter.Debug("v2-raw-direct-observed-addrs=" + externalDirectUDPFormatObservedAddrsByConn(observedByConn))
+	}
+	selected := selectedExternalV2DataPacketSetAddrs(observedByConn, count)
+	if emitter != nil {
+		emitter.Debug("v2-raw-direct-selected-addrs=" + strings.Join(selected, ","))
+	}
+	if !externalV2DataPacketSelectionObserved(ctx, selected, emitter) {
+		return nil
+	}
+	fallback := fallbackExternalV2DataPacketSetAddrs(peerAddrsBySet, count)
+	if emitter != nil {
+		emitter.Debug("v2-raw-direct-fallback-addrs=" + strings.Join(fallback, ","))
+	}
+	return selectedExternalV2DataPacketAddrs(conns[:count], selected, fallback, false)
+}
+
+func externalV2DataPacketSetCount(conns []net.PacketConn, peerCandidateSets [][]string) int {
+	if len(peerCandidateSets) < len(conns) {
+		return len(peerCandidateSets)
+	}
+	return len(conns)
+}
+
+func externalV2DataPacketPeerAddrsBySet(peerCandidateSets [][]string, count int) ([][]net.Addr, bool) {
+	peerAddrsBySet := make([][]net.Addr, count)
+	for i := range count {
+		peerAddrsBySet[i] = parseCandidateStrings(peerCandidateSets[i])
+		if len(peerAddrsBySet[i]) == 0 {
+			return nil, false
+		}
+	}
+	return peerAddrsBySet, true
+}
+
+func selectedExternalV2DataPacketSetAddrs(observedByConn [][]net.Addr, count int) []string {
+	selected := make([]string, count)
+	for i := range count {
+		if i >= len(observedByConn) || len(observedByConn[i]) == 0 {
+			continue
+		}
+		observed := externalDirectUDPParallelCandidateStrings(observedByConn[i], 1)
+		if len(observed) > 0 {
+			selected[i] = observed[0]
+		}
+	}
+	return selected
+}
+
+func fallbackExternalV2DataPacketSetAddrs(peerAddrsBySet [][]net.Addr, count int) []string {
+	fallback := make([]string, count)
+	for i := range count {
+		candidates := externalDirectUDPParallelCandidateStringsForPeer(peerAddrsBySet[i], 1, nil)
+		if len(candidates) > 0 {
+			fallback[i] = candidates[0]
+		}
+	}
+	return fallback
+}
+
+func selectedExternalV2DataPacketAddrs(conns []net.PacketConn, selected []string, fallback []string, allowFallbackPool bool) []net.Addr {
+	addrs := make([]net.Addr, 0, len(conns))
+	for i, conn := range conns {
+		candidate := selectExternalV2DataPacketCandidate(conn, i, selected, fallback, allowFallbackPool)
+		if candidate == "" {
+			break
+		}
+		parsed := parseCandidateStrings([]string{candidate})
+		if len(parsed) != 1 {
+			break
+		}
+		addrs = append(addrs, parsed[0])
+	}
+	return addrs
+}
+
+func externalV2DataPacketSelectionObserved(ctx context.Context, selected []string, emitter *telemetry.Emitter) bool {
+	if externalDirectUDPSelectedAddrCount(selected) > 0 || externalDirectUDPAllowUnverifiedFallback(ctx) {
+		return true
+	}
+	if emitter != nil {
+		emitter.Debug("v2-raw-direct-no-observed-addrs")
+	}
+	return false
+}
+
+func selectExternalV2DataPacketCandidate(conn net.PacketConn, index int, selected []string, fallback []string, allowFallbackPool bool) string {
+	candidates := make([]string, 0, 1+len(fallback))
+	if index < len(selected) && selected[index] != "" {
+		candidates = append(candidates, selected[index])
+	}
+	if index < len(fallback) && fallback[index] != "" {
+		candidates = append(candidates, fallback[index])
+	}
+	if allowFallbackPool {
+		candidates = append(candidates, fallback...)
+	}
+	for _, candidate := range candidates {
+		if candidate == "" || !externalDirectUDPRouteCandidate(conn, candidate) {
+			continue
+		}
+		return candidate
+	}
+	return ""
+}
+
+func joinNetAddrs(addrs []net.Addr) string {
+	parts := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		if addr != nil {
+			parts = append(parts, addr.String())
+		}
+	}
+	return strings.Join(parts, ",")
+}
+
+func exchangeExternalV2DataPlaneReady(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, readyCh <-chan derpbind.Packet, rawDirect bool, candidates []string, candidateSets [][]string, auth externalPeerControlAuth) (externalV2DataPlaneReady, error) {
+	readyCtx, cancel := context.WithTimeout(ctx, externalV2DataPlaneReadyWait)
+	defer cancel()
+	if err := sendExternalV2DataPlaneReady(readyCtx, client, peerDERP, rawDirect, candidates, candidateSets, auth); err != nil {
+		return externalV2DataPlaneReady{}, err
+	}
+	ticker := time.NewTicker(externalV2DataPlaneRetry)
+	defer ticker.Stop()
+	for {
+		select {
+		case pkt, ok := <-readyCh:
+			if !ok {
+				return externalV2DataPlaneReady{}, ErrPeerDisconnected
+			}
+			ready, ok, err := externalV2DataPlaneReadyFromPayload(pkt.Payload, auth)
+			if err != nil {
+				return externalV2DataPlaneReady{}, err
+			}
+			if ok {
+				reinforceExternalV2DataPlaneReady(ctx, client, peerDERP, rawDirect, candidates, candidateSets, auth)
+				return ready, nil
+			}
+		case <-ticker.C:
+			if err := sendExternalV2DataPlaneReady(readyCtx, client, peerDERP, rawDirect, candidates, candidateSets, auth); err != nil {
+				return externalV2DataPlaneReady{}, err
+			}
+		case <-readyCtx.Done():
+			return externalV2DataPlaneReady{}, readyCtx.Err()
+		}
+	}
+}
+
+func reinforceExternalV2DataPlaneReady(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, rawDirect bool, candidates []string, candidateSets [][]string, auth externalPeerControlAuth) {
+	_ = sendExternalV2DataPlaneReady(ctx, client, peerDERP, rawDirect, candidates, candidateSets, auth)
+	go func() {
+		deadline := time.NewTimer(externalV2DataPlaneReinforce)
+		defer deadline.Stop()
+		ticker := time.NewTicker(externalV2DataPlaneReinforceTick)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-deadline.C:
+				return
+			case <-ticker.C:
+				_ = sendExternalV2DataPlaneReady(ctx, client, peerDERP, rawDirect, candidates, candidateSets, auth)
+			}
+		}
+	}()
+}
+
+func sendExternalV2DataPlaneReady(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, rawDirect bool, candidates []string, candidateSets [][]string, auth externalPeerControlAuth) error {
+	ready := externalV2DataPlaneReady{Protocol: externalV2Protocol, RawDirect: rawDirect, Candidates: candidates, CandidateSets: candidateSets}
+	return sendAuthenticatedEnvelope(ctx, client, peerDERP, envelope{
+		Type:             envelopeV2DataPlaneReady,
+		V2DataPlaneReady: &ready,
+	}, auth)
+}
+
+func externalV2DataPlaneReadyFromPayload(payload []byte, auth externalPeerControlAuth) (externalV2DataPlaneReady, bool, error) {
+	env, ok, err := externalV2EnvelopeFromPayload(payload, auth)
+	if err != nil || !ok || env.Type != envelopeV2DataPlaneReady || env.V2DataPlaneReady == nil {
+		return externalV2DataPlaneReady{}, false, err
+	}
+	if env.V2DataPlaneReady.Protocol != externalV2Protocol {
+		return externalV2DataPlaneReady{}, false, errExternalV2Unsupported
+	}
+	return *env.V2DataPlaneReady, true, nil
+}
+
+func boolString(v bool) string {
+	if v {
+		return "true"
+	}
+	return "false"
+}

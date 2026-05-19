@@ -24,6 +24,7 @@ import (
 	"github.com/shayne/derphole/pkg/candidate"
 	"github.com/shayne/derphole/pkg/derpbind"
 	"github.com/shayne/derphole/pkg/portmap"
+	"github.com/shayne/derphole/pkg/probe"
 	"github.com/shayne/derphole/pkg/quicpath"
 	"github.com/shayne/derphole/pkg/rendezvous"
 	"github.com/shayne/derphole/pkg/telemetry"
@@ -47,6 +48,7 @@ const (
 	envelopeV2Claim            = "v2_claim"
 	envelopeV2Accept           = "v2_accept"
 	envelopeV2Complete         = "v2_complete"
+	envelopeV2DataPlaneReady   = "v2_data_plane_ready"
 	envelopeDirectUDPReady     = "direct_udp_ready"
 	envelopeDirectUDPReadyAck  = "direct_udp_ready_ack"
 	envelopeDirectUDPStart     = "direct_udp_start"
@@ -121,6 +123,7 @@ type envelope struct {
 	V2Claim            *externalV2Claim          `json:"v2_claim,omitempty"`
 	V2Accept           *externalV2Accept         `json:"v2_accept,omitempty"`
 	V2Complete         *externalV2Complete       `json:"v2_complete,omitempty"`
+	V2DataPlaneReady   *externalV2DataPlaneReady `json:"v2_data_plane_ready,omitempty"`
 	DirectUDPReadyAck  *directUDPReadyAck        `json:"direct_udp_ready_ack,omitempty"`
 	DirectUDPStart     *directUDPStart           `json:"direct_udp_start,omitempty"`
 	DirectUDPRateProbe *directUDPRateProbeResult `json:"direct_udp_rate_probe,omitempty"`
@@ -646,6 +649,7 @@ func externalTransportManagerConfig(
 
 func configureExternalDirectTransport(cfg *transport.ManagerConfig, conn net.PacketConn, dm *tailcfg.DERPMap, pm publicPortmap, localCandidates []net.Addr) {
 	stunPackets := make(chan traversal.STUNPacket, 256)
+	_ = probe.PreviewTransportCaps(conn, "batched")
 	cfg.DirectConn = conn
 	cfg.DirectBatchConn = publicDirectBatchConn(conn)
 	cfg.HandleSTUNPacket = func(payload []byte, addr net.Addr) {
@@ -727,6 +731,80 @@ func requestExternalQUICMode(
 		},
 	}
 	return finishExternalQUICModeRequest(ctx, client, peerDERP, subs.readyCh, ackEnv, resp, addr, ok, nativeTCPConns, resolvedPolicy, auth)
+}
+
+func requestExternalTCPMode(
+	ctx context.Context,
+	client *derpbind.Client,
+	peerDERP key.NodePublic,
+	manager *transport.Manager,
+	localCandidates []net.Addr,
+	emitter *telemetry.Emitter,
+	clientTLSConfig *tls.Config,
+	serverTLSConfig *tls.Config,
+	nativeTCPAuth externalNativeTCPAuth,
+	parallelPolicy ParallelPolicy,
+	forceRelay bool,
+	authOpt ...externalPeerControlAuth,
+) ([]net.Conn, ParallelPolicy, error) {
+	if !externalQUICModeRequestAllowed(forceRelay, manager) {
+		return nil, ParallelPolicy{}, nil
+	}
+	auth := optionalPeerControlAuth(authOpt)
+	parallelPolicy = parallelPolicy.normalized()
+
+	tcpOffer := openExternalQUICModeTCPRequest(localCandidates, serverTLSConfig)
+	defer tcpOffer.Close()
+	emitExternalQUICModeTCPRequest(emitter, tcpOffer)
+	if !tcpOffer.requested {
+		return nil, ParallelPolicy{}, nil
+	}
+
+	subs := subscribeExternalQUICModeRequest(client, peerDERP)
+	defer subs.Close()
+
+	if err := sendExternalTCPModeRequest(ctx, client, peerDERP, tcpOffer, parallelPolicy, auth); err != nil {
+		return nil, ParallelPolicy{}, err
+	}
+
+	modeCtx, cancel := context.WithTimeout(ctx, externalNativeQUICWait)
+	defer cancel()
+	resp, ok, err := receiveExternalQUICModeResponseOrNack(modeCtx, client, peerDERP, subs.modeCh, emitter, auth)
+	if err != nil {
+		return nil, ParallelPolicy{}, err
+	}
+	if !ok || !resp.NativeTCP {
+		return nil, externalQUICModeResolvedPolicy(resp, parallelPolicy), nil
+	}
+	emitExternalQUICModeTCPResponse(emitter, resp)
+
+	resolvedPolicy := externalQUICModeResolvedPolicy(resp, parallelPolicy)
+	addr, addrOK := externalQUICModeResponseDirectAddr(ctx, manager, resp)
+	nativeTCPConns, nativeTCP := connectExternalQUICModeNativeTCP(modeCtx, tcpOffer, addr, resp, clientTLSConfig, nativeTCPAuth, parallelPolicy, emitter)
+	ackEnv := envelope{
+		Type: envelopeQUICModeAck,
+		QUICModeAck: &quicModeAck{
+			NativeDirect: false,
+			NativeTCP:    nativeTCP && len(nativeTCPConns) > 0,
+		},
+	}
+	_, conns, _, policy, err := finishExternalQUICModeRequest(ctx, client, peerDERP, subs.readyCh, ackEnv, quicModeResponse{NativeTCP: resp.NativeTCP}, addr, addrOK, nativeTCPConns, resolvedPolicy, auth)
+	return conns, policy, err
+}
+
+func sendExternalTCPModeRequest(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, tcpOffer externalQUICModeTCPRequest, parallelPolicy ParallelPolicy, auth externalPeerControlAuth) error {
+	return sendAuthenticatedEnvelope(ctx, client, peerDERP, envelope{
+		Type: envelopeQUICModeReq,
+		QUICModeReq: &quicModeRequest{
+			NativeDirect:    false,
+			NativeTCP:       tcpOffer.requested,
+			DirectAddr:      tcpOffer.addr,
+			NativeTCPConns:  externalParallelTCPConnCount(parallelPolicy),
+			ParallelMode:    string(parallelPolicy.Mode),
+			ParallelInitial: parallelPolicy.Initial,
+			ParallelCap:     parallelPolicy.Cap,
+		},
+	}, auth)
 }
 
 type externalQUICModeTCPRequest struct {
@@ -1136,7 +1214,6 @@ func externalQUICModeTCPPeerCandidate(req quicModeRequest) (net.Addr, bool) {
 func (s *externalQUICModeAcceptState) selectInitialNativeTCPResponseAddr(peerCandidate net.Addr) {
 	bindAddr := selectExternalNativeTCPResponseAddr(peerCandidate, nil, s.localCandidates)
 	if bindAddr == nil {
-		s.selectInitialNativeTCPOfferAddr()
 		return
 	}
 	s.nativeTCPPeerAddr = peerCandidate
@@ -2610,6 +2687,12 @@ func externalDecisionRelayOnly(decision rendezvous.Decision) bool {
 func cloneSessionAddr(addr net.Addr) net.Addr {
 	switch v := addr.(type) {
 	case *net.UDPAddr:
+		cp := *v
+		if v.IP != nil {
+			cp.IP = append(net.IP(nil), v.IP...)
+		}
+		return &cp
+	case *net.TCPAddr:
 		cp := *v
 		if v.IP != nil {
 			cp.IP = append(net.IP(nil), v.IP...)

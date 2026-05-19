@@ -9,6 +9,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 )
@@ -102,5 +103,77 @@ func TestCopyExternalNativeTCPUsesSourceWriterToFastPath(t *testing.T) {
 	}
 	if !src.writeToCalled {
 		t.Fatal("copyExternalNativeTCP() did not use source WriteTo fast path")
+	}
+}
+
+func TestExternalNativeTCPRouteCanUseLocalAddrCandidateUsesRouteSourceForPrivatePeer(t *testing.T) {
+	prevRouteLocalIP := externalNativeTCPRouteLocalIP
+	externalNativeTCPRouteLocalIP = func(net.Addr) (netip.Addr, bool) {
+		return netip.MustParseAddr("192.168.100.229"), true
+	}
+	t.Cleanup(func() { externalNativeTCPRouteLocalIP = prevRouteLocalIP })
+
+	if !externalNativeTCPRouteCanUseLocalAddrCandidate(
+		&net.UDPAddr{IP: net.IPv4(192, 168, 100, 229), Port: 53246},
+		&net.TCPAddr{IP: net.IPv4(10, 0, 4, 2), Port: 45321},
+	) {
+		t.Fatal("externalNativeTCPRouteCanUseLocalAddrCandidate() = false, want route-source private address accepted")
+	}
+}
+
+func TestExternalNativeTCPRouteCanUseLocalAddrCandidateRejectsPrivateRouteSourceForPublicPeer(t *testing.T) {
+	prevRouteLocalIP := externalNativeTCPRouteLocalIP
+	externalNativeTCPRouteLocalIP = func(net.Addr) (netip.Addr, bool) {
+		return netip.MustParseAddr("10.0.4.2"), true
+	}
+	t.Cleanup(func() { externalNativeTCPRouteLocalIP = prevRouteLocalIP })
+
+	if externalNativeTCPRouteCanUseLocalAddrCandidate(
+		&net.UDPAddr{IP: net.IPv4(10, 0, 4, 2), Port: 53246},
+		&net.TCPAddr{IP: net.IPv4(203, 0, 113, 9), Port: 45321},
+	) {
+		t.Fatal("externalNativeTCPRouteCanUseLocalAddrCandidate() = true, want private address rejected for public peer")
+	}
+}
+
+func TestSelectExternalNativeTCPResponseAddrUsesRouteSourceOverBridgeAddress(t *testing.T) {
+	prevRouteLocalIP := externalNativeTCPRouteLocalIP
+	externalNativeTCPRouteLocalIP = func(net.Addr) (netip.Addr, bool) {
+		return netip.MustParseAddr("192.168.100.229"), true
+	}
+	t.Cleanup(func() { externalNativeTCPRouteLocalIP = prevRouteLocalIP })
+
+	got := selectExternalNativeTCPResponseAddr(
+		&net.TCPAddr{IP: net.IPv4(10, 0, 4, 2), Port: 45321},
+		nil,
+		[]net.Addr{
+			&net.UDPAddr{IP: net.IPv4(172, 17, 0, 1), Port: 56354},
+			&net.UDPAddr{IP: net.IPv4(192, 168, 100, 229), Port: 56354},
+		},
+	)
+	if got == nil {
+		t.Fatal("selectExternalNativeTCPResponseAddr() = nil, want route-source candidate")
+	}
+	if got.String() != "192.168.100.229:56354" {
+		t.Fatalf("selectExternalNativeTCPResponseAddr() = %v, want 192.168.100.229:56354", got)
+	}
+}
+
+func TestSelectExternalNativeTCPResponseAddrRejectsUnrelatedBridgeAddress(t *testing.T) {
+	prevRouteLocalIP := externalNativeTCPRouteLocalIP
+	externalNativeTCPRouteLocalIP = func(net.Addr) (netip.Addr, bool) {
+		return netip.Addr{}, false
+	}
+	t.Cleanup(func() { externalNativeTCPRouteLocalIP = prevRouteLocalIP })
+
+	got := selectExternalNativeTCPResponseAddr(
+		&net.TCPAddr{IP: net.IPv4(10, 0, 4, 2), Port: 45321},
+		nil,
+		[]net.Addr{
+			&net.UDPAddr{IP: net.IPv4(172, 17, 0, 1), Port: 56354},
+		},
+	)
+	if got != nil {
+		t.Fatalf("selectExternalNativeTCPResponseAddr() = %v, want nil", got)
 	}
 }

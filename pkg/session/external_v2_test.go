@@ -94,6 +94,7 @@ func TestExternalV2OfferReceiveRoundTrip(t *testing.T) {
 func TestExternalV2OfferReceivePromotesToDirectWhenBothSidesReady(t *testing.T) {
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+	t.Setenv("DERPHOLE_V2_NATIVE_TCP", "1")
 
 	prevInterfaceAddrs := publicInterfaceAddrs
 	publicInterfaceAddrs = func() ([]net.Addr, error) {
@@ -198,6 +199,12 @@ func TestExternalV2OfferReceivePromotesToDirectWhenBothSidesReady(t *testing.T) 
 	if got := receiverStatus.String(); !strings.Contains(got, string(StateTryingDirect)) || !strings.Contains(got, string(StateDirect)) {
 		t.Fatalf("receiver status = %q, want v2 offer direct promotion", got)
 	}
+	if got := senderStatus.String(); !strings.Contains(got, "v2-native-tcp=true") {
+		t.Fatalf("sender status = %q, want native TCP v2 offer promotion", got)
+	}
+	if got := receiverStatus.String(); !strings.Contains(got, "v2-native-tcp=true") {
+		t.Fatalf("receiver status = %q, want native TCP v2 offer promotion", got)
+	}
 }
 
 func TestExternalV2ReceiverCancelAbortsSender(t *testing.T) {
@@ -301,6 +308,7 @@ func TestExternalV2TransferTraceCompletes(t *testing.T) {
 func TestExternalV2PromotesToDirectWhenBothSidesReady(t *testing.T) {
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+	t.Setenv("DERPHOLE_V2_NATIVE_TCP", "1")
 
 	prevInterfaceAddrs := publicInterfaceAddrs
 	publicInterfaceAddrs = func() ([]net.Addr, error) {
@@ -397,6 +405,12 @@ func TestExternalV2PromotesToDirectWhenBothSidesReady(t *testing.T) {
 	}
 	if got := listenerStatus.String(); !strings.Contains(got, string(StateTryingDirect)) || !strings.Contains(got, string(StateDirect)) {
 		t.Fatalf("listener status = %q, want v2 direct promotion", got)
+	}
+	if got := senderStatus.String(); !strings.Contains(got, "v2-native-tcp=true") {
+		t.Fatalf("sender status = %q, want native TCP v2 promotion", got)
+	}
+	if got := listenerStatus.String(); !strings.Contains(got, "v2-native-tcp=true") {
+		t.Fatalf("listener status = %q, want native TCP v2 promotion", got)
 	}
 }
 

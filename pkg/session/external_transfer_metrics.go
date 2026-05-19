@@ -185,6 +185,17 @@ func (m *externalTransferMetrics) MarkDirectQUIC(at time.Time) {
 	sampleExternalTransferTrace(trace, snap, ok)
 }
 
+func (m *externalTransferMetrics) MarkDirectTCP(at time.Time) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.directTransport = "tcp"
+	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
+	m.mu.Unlock()
+	sampleExternalTransferTrace(trace, snap, ok)
+}
+
 func (m *externalTransferMetrics) RecordDirectQUICSend(n int64, at time.Time) {
 	m.recordDirectQUICBytes(n, at, true)
 }

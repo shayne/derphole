@@ -121,3 +121,97 @@ func TestQUICDataPlaneCopiesOverRelayManager(t *testing.T) {
 		t.Fatal("Stats().BytesSent = 0, want positive")
 	}
 }
+
+func TestQUICDataPlaneCopiesOverMultiplePacketConns(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const streams = 2
+	serverConns := make([]net.PacketConn, 0, streams)
+	clientConns := make([]net.PacketConn, 0, streams)
+	remotes := make([]net.Addr, 0, streams)
+	for range streams {
+		serverConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("ListenPacket(server) error = %v", err)
+		}
+		defer serverConn.Close()
+		clientConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("ListenPacket(client) error = %v", err)
+		}
+		defer clientConn.Close()
+		serverConns = append(serverConns, serverConn)
+		clientConns = append(clientConns, clientConn)
+		remotes = append(remotes, serverConn.LocalAddr())
+	}
+
+	serverIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(server) error = %v", err)
+	}
+	clientIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(client) error = %v", err)
+	}
+
+	server := NewQUICServerOnPacketConns(serverConns, serverIdentity, clientIdentity.Public)
+	ready := make(chan struct{})
+	recvErr := make(chan error, 1)
+	var got bytes.Buffer
+	go func() {
+		readers, err := server.AcceptStreamsWithReady(ctx, streams, func() error {
+			close(ready)
+			return nil
+		})
+		if err != nil {
+			recvErr <- err
+			return
+		}
+		for _, reader := range readers {
+			if _, err := io.Copy(&got, reader); err != nil {
+				recvErr <- err
+				return
+			}
+			_ = reader.Close()
+		}
+		recvErr <- nil
+	}()
+
+	select {
+	case <-ready:
+	case err := <-recvErr:
+		t.Fatalf("AcceptStreamsWithReady() error before ready = %v", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for packet listeners")
+	}
+
+	client := NewQUICClientOnPacketConns(clientConns, remotes, clientIdentity, serverIdentity.Public)
+	writers, err := client.OpenStreams(ctx, streams)
+	if err != nil {
+		t.Fatalf("OpenStreams() error = %v", err)
+	}
+	for i, writer := range writers {
+		if _, err := writer.Write([]byte{byte('a' + i)}); err != nil {
+			t.Fatalf("writer %d Write() error = %v", i, err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatalf("writer %d Close() error = %v", i, err)
+		}
+	}
+	if err := <-recvErr; err != nil {
+		t.Fatalf("receive error = %v", err)
+	}
+	if got.String() != "ab" {
+		t.Fatalf("received = %q, want ab", got.String())
+	}
+	if client.Stats().BytesSent == 0 || server.Stats().BytesReceived == 0 {
+		t.Fatalf("stats not populated: client=%+v server=%+v", client.Stats(), server.Stats())
+	}
+	if err := client.CloseWithError(7, "test-close"); err != nil {
+		t.Fatalf("client CloseWithError() error = %v", err)
+	}
+	if err := server.CloseWithError(0, ""); err != nil {
+		t.Fatalf("server CloseWithError() error = %v", err)
+	}
+}

@@ -240,6 +240,14 @@ func (m *Manager) DirectAddr() (net.Addr, bool) {
 	return addr, active && addr != nil
 }
 
+func (m *Manager) DirectPacketConn() (net.PacketConn, net.Addr, bool) {
+	addr, active := m.DirectAddr()
+	if !active || addr == nil || m.cfg.DirectConn == nil {
+		return nil, nil, false
+	}
+	return m.cfg.DirectConn, cloneAddr(addr), true
+}
+
 func (m *Manager) demoteStaleDirectLocked(now time.Time) bool {
 	if m.state.current != PathDirect || !m.state.directIsStale(now, m.directStaleTimeout()) {
 		return false

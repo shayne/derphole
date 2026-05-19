@@ -28,6 +28,13 @@ const ALPN = "derphole-quic/1"
 const ServerName = "derphole"
 const MaxIncomingStreams = 64
 
+const (
+	initialStreamReceiveWindow     = 16 << 20
+	maxStreamReceiveWindow         = 128 << 20
+	initialConnectionReceiveWindow = 32 << 20
+	maxConnectionReceiveWindow     = 256 << 20
+)
+
 var ErrPeerIdentityMismatch = errors.New("quic peer identity mismatch")
 
 type SessionIdentity struct {
@@ -37,14 +44,18 @@ type SessionIdentity struct {
 
 func DefaultQUICConfig() *quic.Config {
 	return &quic.Config{
-		KeepAlivePeriod:       5 * time.Second,
-		MaxIdleTimeout:        30 * time.Second,
-		HandshakeIdleTimeout:  10 * time.Second,
-		InitialPacketSize:     1200,
-		MaxIncomingStreams:    MaxIncomingStreams,
-		MaxIncomingUniStreams: -1,
-		EnableDatagrams:       false,
-		Tracer:                tracerFromEnv(),
+		KeepAlivePeriod:                5 * time.Second,
+		MaxIdleTimeout:                 30 * time.Second,
+		HandshakeIdleTimeout:           10 * time.Second,
+		InitialPacketSize:              1200,
+		InitialStreamReceiveWindow:     initialStreamReceiveWindow,
+		MaxStreamReceiveWindow:         maxStreamReceiveWindow,
+		InitialConnectionReceiveWindow: initialConnectionReceiveWindow,
+		MaxConnectionReceiveWindow:     maxConnectionReceiveWindow,
+		MaxIncomingStreams:             MaxIncomingStreams,
+		MaxIncomingUniStreams:          -1,
+		EnableDatagrams:                false,
+		Tracer:                         tracerFromEnv(),
 	}
 }
 

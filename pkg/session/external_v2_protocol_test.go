@@ -38,3 +38,21 @@ func TestExternalV2AcceptValidationRequiresAccepted(t *testing.T) {
 		t.Fatalf("validateExternalV2Accept() error = %v, want %v", err, errExternalV2Rejected)
 	}
 }
+
+func TestExternalV2ParallelPolicyDefaultsAndRoundTrips(t *testing.T) {
+	if got, want := externalV2ParallelPolicy(externalV2Claim{}), DefaultParallelPolicy(); got != want {
+		t.Fatalf("default claim parallel policy = %#v, want %#v", got, want)
+	}
+
+	mode, initial, cap := externalV2SetParallelPolicy(AutoParallelPolicy())
+	claim := externalV2Claim{ParallelMode: mode, ParallelInitial: initial, ParallelCap: cap}
+	if got, want := externalV2ParallelPolicy(claim), AutoParallelPolicy(); got != want {
+		t.Fatalf("claim parallel policy = %#v, want %#v", got, want)
+	}
+
+	mode, initial, cap = externalV2SetParallelPolicy(FixedParallelPolicy(8))
+	accept := externalV2Accept{ParallelMode: mode, ParallelInitial: initial, ParallelCap: cap}
+	if got, want := externalV2StreamCount(externalV2ParallelPolicy(accept)), 8; got != want {
+		t.Fatalf("accept stream count = %d, want %d", got, want)
+	}
+}

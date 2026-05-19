@@ -103,6 +103,269 @@ func TestEndpointTransfersOneUnidirectionalStream(t *testing.T) {
 	}
 }
 
+func TestEndpointTransfersMultipleUnidirectionalStreams(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverPacketConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket(server) error = %v", err)
+	}
+	defer serverPacketConn.Close()
+
+	clientPacketConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket(client) error = %v", err)
+	}
+	defer clientPacketConn.Close()
+
+	serverIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(server) error = %v", err)
+	}
+	clientIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(client) error = %v", err)
+	}
+
+	serverCh := make(chan *Endpoint, 1)
+	serverErr := make(chan error, 1)
+	go func() {
+		endpoint, err := Listen(ctx, ListenConfig{
+			PacketConn: serverPacketConn,
+			Identity:   serverIdentity,
+			PeerPublic: clientIdentity.Public,
+		})
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		serverCh <- endpoint
+	}()
+
+	client, err := Dial(ctx, DialConfig{
+		PacketConn: clientPacketConn,
+		RemoteAddr: serverPacketConn.LocalAddr(),
+		Identity:   clientIdentity,
+		PeerPublic: serverIdentity.Public,
+	})
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer client.Close()
+
+	var server *Endpoint
+	select {
+	case server = <-serverCh:
+	case err := <-serverErr:
+		t.Fatalf("Listen() error = %v", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for server endpoint")
+	}
+	defer server.Close()
+
+	sendStreams, err := client.OpenSendStreams(ctx, 3)
+	if err != nil {
+		t.Fatalf("OpenSendStreams() error = %v", err)
+	}
+	for i, stream := range sendStreams {
+		payload := []byte{byte('a' + i)}
+		if _, err := stream.Write(payload); err != nil {
+			t.Fatalf("send stream %d Write() error = %v", i, err)
+		}
+		if err := stream.Close(); err != nil {
+			t.Fatalf("send stream %d Close() error = %v", i, err)
+		}
+	}
+	receiveStreams, err := server.AcceptReceiveStreams(ctx, 3)
+	if err != nil {
+		t.Fatalf("AcceptReceiveStreams() error = %v", err)
+	}
+	defer closeReadClosers(receiveStreams)
+
+	for i, stream := range receiveStreams {
+		var got [1]byte
+		if _, err := io.ReadFull(stream, got[:]); err != nil {
+			t.Fatalf("receive stream %d ReadFull() error = %v", i, err)
+		}
+		if want := byte('a' + i); got[0] != want {
+			t.Fatalf("receive stream %d byte = %q, want %q", i, got[0], want)
+		}
+	}
+}
+
+func TestEndpointTransfersMultipleConnections(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverPacketConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket(server) error = %v", err)
+	}
+	defer serverPacketConn.Close()
+
+	clientPacketConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket(client) error = %v", err)
+	}
+	defer clientPacketConn.Close()
+
+	serverIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(server) error = %v", err)
+	}
+	clientIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(client) error = %v", err)
+	}
+
+	const connCount = 3
+	serverCh := make(chan *Endpoint, 1)
+	serverErr := make(chan error, 1)
+	go func() {
+		endpoint, err := ListenConnectionsWithReady(ctx, ListenConfig{
+			PacketConn: serverPacketConn,
+			Identity:   serverIdentity,
+			PeerPublic: clientIdentity.Public,
+		}, connCount, nil)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		serverCh <- endpoint
+	}()
+
+	client, err := DialConnections(ctx, DialConfig{
+		PacketConn: clientPacketConn,
+		RemoteAddr: serverPacketConn.LocalAddr(),
+		Identity:   clientIdentity,
+		PeerPublic: serverIdentity.Public,
+	}, connCount)
+	if err != nil {
+		t.Fatalf("DialConnections() error = %v", err)
+	}
+	defer client.Close()
+
+	var server *Endpoint
+	select {
+	case server = <-serverCh:
+	case err := <-serverErr:
+		t.Fatalf("ListenConnectionsWithReady() error = %v", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for server endpoint")
+	}
+	defer server.Close()
+
+	sendStreams, err := client.OpenSendStreams(ctx, connCount)
+	if err != nil {
+		t.Fatalf("OpenSendStreams() error = %v", err)
+	}
+	for i, stream := range sendStreams {
+		payload := []byte{byte('A' + i)}
+		if _, err := stream.Write(payload); err != nil {
+			t.Fatalf("send stream %d Write() error = %v", i, err)
+		}
+		if err := stream.Close(); err != nil {
+			t.Fatalf("send stream %d Close() error = %v", i, err)
+		}
+	}
+	receiveStreams, err := server.AcceptReceiveStreams(ctx, connCount)
+	if err != nil {
+		t.Fatalf("AcceptReceiveStreams() error = %v", err)
+	}
+	defer closeReadClosers(receiveStreams)
+
+	for i, stream := range receiveStreams {
+		var got [1]byte
+		if _, err := io.ReadFull(stream, got[:]); err != nil {
+			t.Fatalf("receive stream %d ReadFull() error = %v", i, err)
+		}
+		if want := byte('A' + i); got[0] != want {
+			t.Fatalf("receive stream %d byte = %q, want %q", i, got[0], want)
+		}
+	}
+}
+
+func TestEndpointWaitClosedReturnsForNilAndClosedEndpoint(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var nilEndpoint *Endpoint
+	if err := nilEndpoint.WaitClosed(ctx); err != nil {
+		t.Fatalf("nil WaitClosed() error = %v", err)
+	}
+	if err := (&Endpoint{}).WaitClosed(ctx); err != nil {
+		t.Fatalf("empty WaitClosed() error = %v", err)
+	}
+
+	serverPacketConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket(server) error = %v", err)
+	}
+	defer serverPacketConn.Close()
+	clientPacketConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket(client) error = %v", err)
+	}
+	defer clientPacketConn.Close()
+
+	serverIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(server) error = %v", err)
+	}
+	clientIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(client) error = %v", err)
+	}
+
+	serverCh := make(chan *Endpoint, 1)
+	serverErr := make(chan error, 1)
+	go func() {
+		endpoint, err := Listen(ctx, ListenConfig{
+			PacketConn: serverPacketConn,
+			Identity:   serverIdentity,
+			PeerPublic: clientIdentity.Public,
+		})
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		serverCh <- endpoint
+	}()
+
+	client, err := Dial(ctx, DialConfig{
+		PacketConn: clientPacketConn,
+		RemoteAddr: serverPacketConn.LocalAddr(),
+		Identity:   clientIdentity,
+		PeerPublic: serverIdentity.Public,
+	})
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	var server *Endpoint
+	select {
+	case server = <-serverCh:
+	case err := <-serverErr:
+		t.Fatalf("Listen() error = %v", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for server endpoint")
+	}
+	defer server.Close()
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Millisecond)
+	if err := client.WaitClosed(waitCtx); err == nil {
+		t.Fatal("WaitClosed(open) error = nil, want context deadline")
+	}
+	waitCancel()
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("client Close() error = %v", err)
+	}
+	if err := client.WaitClosed(ctx); err != nil {
+		t.Fatalf("WaitClosed(closed) error = %v", err)
+	}
+}
+
 func TestListenWithReadyRunsBeforeAccept(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

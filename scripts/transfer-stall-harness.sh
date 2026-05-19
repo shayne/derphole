@@ -215,6 +215,12 @@ remote_env_prefix() {
   if [[ -n "${DERPHOLE_NATIVE_TCP_CONNS:-}" ]]; then
     prefix+=(DERPHOLE_NATIVE_TCP_CONNS="$(quote "${DERPHOLE_NATIVE_TCP_CONNS}")")
   fi
+  if [[ -n "${DERPHOLE_V2_NATIVE_TCP:-}" ]]; then
+    prefix+=(DERPHOLE_V2_NATIVE_TCP="$(quote "${DERPHOLE_V2_NATIVE_TCP}")")
+  fi
+  if [[ -n "${DERPHOLE_V2_RAW_DIRECT:-}" ]]; then
+    prefix+=(DERPHOLE_V2_RAW_DIRECT="$(quote "${DERPHOLE_V2_RAW_DIRECT}")")
+  fi
   if [[ -n "${DERPHOLE_DIRECT_TRANSPORT:-}" ]]; then
     prefix+=(DERPHOLE_DIRECT_TRANSPORT="$(quote "${DERPHOLE_DIRECT_TRANSPORT}")")
   fi

@@ -23,6 +23,22 @@ func TestDefaultQUICConfigKeepsPathMTUDiscoveryEnabled(t *testing.T) {
 	}
 }
 
+func TestDefaultQUICConfigUsesThroughputScaleFlowControl(t *testing.T) {
+	cfg := DefaultQUICConfig()
+	if got, want := cfg.InitialStreamReceiveWindow, uint64(initialStreamReceiveWindow); got != want {
+		t.Fatalf("InitialStreamReceiveWindow = %d, want %d", got, want)
+	}
+	if got, want := cfg.MaxStreamReceiveWindow, uint64(maxStreamReceiveWindow); got != want {
+		t.Fatalf("MaxStreamReceiveWindow = %d, want %d", got, want)
+	}
+	if got, want := cfg.InitialConnectionReceiveWindow, uint64(initialConnectionReceiveWindow); got != want {
+		t.Fatalf("InitialConnectionReceiveWindow = %d, want %d", got, want)
+	}
+	if got, want := cfg.MaxConnectionReceiveWindow, uint64(maxConnectionReceiveWindow); got != want {
+		t.Fatalf("MaxConnectionReceiveWindow = %d, want %d", got, want)
+	}
+}
+
 func TestDefaultQUICConfigEnablesQlogTracerFromEnv(t *testing.T) {
 	t.Setenv("DERPHOLE_QLOG_DIR", t.TempDir())
 

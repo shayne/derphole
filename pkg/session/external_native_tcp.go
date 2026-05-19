@@ -31,6 +31,7 @@ var externalNativeTCPBearerAuthDomain = []byte("derphole-native-tcp-v1")
 
 var externalNativeTCPAddrAllowed = externalNativeTCPAddrAllowedDefault
 var externalNativeTCPListen = listenExternalNativeTCP
+var externalNativeTCPRouteLocalIP = externalNativeTCPRouteLocalIPDefault
 
 const externalNativeTCPBindAddrEnv = "DERPHOLE_NATIVE_TCP_BIND_ADDR"
 const externalNativeTCPAdvertiseAddrEnv = "DERPHOLE_NATIVE_TCP_ADVERTISE_ADDR"
@@ -316,10 +317,73 @@ func selectExternalNativeTCPRouteAddr(peerAddr net.Addr, localCandidates []net.A
 }
 
 func externalNativeTCPRouteCanUseLocalAddrCandidate(localAddr, peerAddr net.Addr) bool {
-	if externalNativeQUICStripeCanUseLocalAddrCandidate(localAddr, peerAddr) {
+	localIP, peerIP, ok := externalNativeTCPRouteCandidateIPs(localAddr, peerAddr)
+	if !ok {
+		return false
+	}
+	if allowed, decided := externalNativeTCPRouteSpecialScopeDecision(localAddr, peerAddr, localIP, peerIP); decided {
+		return allowed
+	}
+	return externalNativeTCPRouteLocalIPsMatch(localIP, peerIP, localAddr, peerAddr)
+}
+
+func externalNativeTCPRouteCandidateIPs(localAddr, peerAddr net.Addr) (netip.Addr, netip.Addr, bool) {
+	localIP, ok := sessionAddrIP(localAddr)
+	if !ok {
+		return netip.Addr{}, netip.Addr{}, false
+	}
+	peerIP, ok := sessionAddrIP(peerAddr)
+	return localIP, peerIP, ok
+}
+
+func externalNativeTCPRouteSpecialScopeDecision(localAddr, peerAddr net.Addr, localIP, peerIP netip.Addr) (bool, bool) {
+	if localIP.IsLoopback() || peerIP.IsLoopback() {
+		return localIP.IsLoopback() == peerIP.IsLoopback(), true
+	}
+	if externalNativeTCPAddrIsPublic(localAddr) || externalNativeTCPAddrIsPublic(peerAddr) {
+		return externalNativeTCPAddrIsPublic(localAddr) == externalNativeTCPAddrIsPublic(peerAddr), true
+	}
+	if externalNativeTCPAddrIsTailscale(localAddr) || externalNativeTCPAddrIsTailscale(peerAddr) {
+		return externalNativeTCPAddrIsTailscale(localAddr) == externalNativeTCPAddrIsTailscale(peerAddr), true
+	}
+	return false, false
+}
+
+func externalNativeTCPRouteLocalIPsMatch(localIP, peerIP netip.Addr, localAddr, peerAddr net.Addr) bool {
+	if externalNativeQUICStripeSameRouteLocalPrefix(localIP, peerIP) {
 		return true
 	}
-	return externalNativeTCPAddrIsPublic(localAddr) && externalNativeTCPAddrIsPublic(peerAddr)
+	routeIP, ok := externalNativeTCPRouteLocalIP(peerAddr)
+	return ok && routeIP == localIP
+}
+
+func externalNativeTCPRouteLocalIPDefault(peerAddr net.Addr) (netip.Addr, bool) {
+	peerIP, ok := sessionAddrIP(peerAddr)
+	if !ok || peerIP.IsUnspecified() {
+		return netip.Addr{}, false
+	}
+	network := "udp4"
+	if peerIP.Is6() {
+		network = "udp6"
+	}
+	routeProbe, err := net.DialUDP(network, nil, &net.UDPAddr{
+		IP:   net.IP(peerIP.AsSlice()),
+		Port: 9,
+	})
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	defer func() { _ = routeProbe.Close() }()
+
+	localUDPAddr, ok := routeProbe.LocalAddr().(*net.UDPAddr)
+	if !ok || localUDPAddr == nil || len(localUDPAddr.IP) == 0 || localUDPAddr.IP.IsUnspecified() {
+		return netip.Addr{}, false
+	}
+	localIP, ok := netip.AddrFromSlice(localUDPAddr.IP)
+	if !ok {
+		return netip.Addr{}, false
+	}
+	return localIP.Unmap(), true
 }
 
 func externalNativeTCPSharedPrefixBits(peerAddr, candidate net.Addr) int {

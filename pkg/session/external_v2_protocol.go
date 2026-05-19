@@ -23,19 +23,32 @@ type externalV2Claim struct {
 	Candidates      []string `json:"candidates,omitempty"`
 	RelayCapable    bool     `json:"relay_capable"`
 	ReceiverLimited bool     `json:"receiver_limited,omitempty"`
+	ParallelMode    string   `json:"parallel_mode,omitempty"`
+	ParallelInitial int      `json:"parallel_initial,omitempty"`
+	ParallelCap     int      `json:"parallel_cap,omitempty"`
 }
 
 type externalV2Accept struct {
-	Protocol     string   `json:"protocol"`
-	Accepted     bool     `json:"accepted"`
-	Candidates   []string `json:"candidates,omitempty"`
-	RelayCapable bool     `json:"relay_capable"`
-	Reason       string   `json:"reason,omitempty"`
+	Protocol        string   `json:"protocol"`
+	Accepted        bool     `json:"accepted"`
+	Candidates      []string `json:"candidates,omitempty"`
+	RelayCapable    bool     `json:"relay_capable"`
+	Reason          string   `json:"reason,omitempty"`
+	ParallelMode    string   `json:"parallel_mode,omitempty"`
+	ParallelInitial int      `json:"parallel_initial,omitempty"`
+	ParallelCap     int      `json:"parallel_cap,omitempty"`
 }
 
 type externalV2Complete struct {
 	Protocol      string `json:"protocol"`
 	BytesReceived int64  `json:"bytes_received"`
+}
+
+type externalV2DataPlaneReady struct {
+	Protocol      string     `json:"protocol"`
+	RawDirect     bool       `json:"raw_direct,omitempty"`
+	Candidates    []string   `json:"candidates,omitempty"`
+	CandidateSets [][]string `json:"candidate_sets,omitempty"`
 }
 
 func validateExternalV2SendToken(tok token.Token) error {
@@ -62,6 +75,35 @@ func validateExternalV2Accept(accept externalV2Accept) error {
 	return nil
 }
 
+func (m externalV2Claim) getParallelMode() string { return m.ParallelMode }
+func (m externalV2Claim) getParallelInitial() int { return m.ParallelInitial }
+func (m externalV2Claim) getParallelCap() int     { return m.ParallelCap }
+
+func (m externalV2Accept) getParallelMode() string { return m.ParallelMode }
+func (m externalV2Accept) getParallelInitial() int { return m.ParallelInitial }
+func (m externalV2Accept) getParallelCap() int     { return m.ParallelCap }
+
+func externalV2ParallelPolicy(msg interface {
+	getParallelMode() string
+	getParallelInitial() int
+	getParallelCap() int
+}) ParallelPolicy {
+	policy := parallelPolicyFromFields(msg.getParallelMode(), msg.getParallelInitial(), msg.getParallelCap())
+	if policy == (ParallelPolicy{}) {
+		return DefaultParallelPolicy()
+	}
+	return policy.normalized()
+}
+
+func externalV2SetParallelPolicy(policy ParallelPolicy) (mode string, initial int, cap int) {
+	policy = policy.normalized()
+	return string(policy.Mode), policy.Initial, policy.Cap
+}
+
+func externalV2StreamCount(policy ParallelPolicy) int {
+	return externalParallelQUICConnCount(policy)
+}
+
 func isV2ClaimPayload(payload []byte) bool {
 	env, ok := decodeExternalV2Payload(payload, envelopeV2Claim)
 	return ok && env.V2Claim != nil
@@ -75,6 +117,11 @@ func isV2AcceptPayload(payload []byte) bool {
 func isV2CompletePayload(payload []byte) bool {
 	env, ok := decodeExternalV2Payload(payload, envelopeV2Complete)
 	return ok && env.V2Complete != nil
+}
+
+func isV2DataPlaneReadyPayload(payload []byte) bool {
+	env, ok := decodeExternalV2Payload(payload, envelopeV2DataPlaneReady)
+	return ok && env.V2DataPlaneReady != nil
 }
 
 func decodeExternalV2Payload(payload []byte, typ string) (envelope, bool) {
