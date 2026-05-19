@@ -62,13 +62,17 @@ func (q *QUICClient) Open(ctx context.Context) (Stream, error) {
 }
 
 func (q *QUICServer) Accept(ctx context.Context) (Stream, error) {
+	return q.AcceptWithReady(ctx, nil)
+}
+
+func (q *QUICServer) AcceptWithReady(ctx context.Context, ready func() error) (Stream, error) {
 	peerConn := q.manager.PeerDatagramConn(ctx)
 	adapter := quicpath.NewAdapter(peerConn)
-	endpoint, err := directquic.Listen(ctx, directquic.ListenConfig{
+	endpoint, err := directquic.ListenWithReady(ctx, directquic.ListenConfig{
 		PacketConn: adapter,
 		Identity:   q.identity,
 		PeerPublic: q.peer,
-	})
+	}, ready)
 	if err != nil {
 		_ = adapter.Close()
 		return nil, err

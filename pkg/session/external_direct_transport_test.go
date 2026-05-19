@@ -34,6 +34,7 @@ func TestExternalDirectTransportFromEnv(t *testing.T) {
 }
 
 func TestSendExternalDispatchesQUICWhenSelected(t *testing.T) {
+	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "legacy")
 	t.Setenv("DERPHOLE_DIRECT_TRANSPORT", "quic")
 
 	sentinel := errors.New("quic send")
@@ -64,6 +65,7 @@ func TestSendExternalDispatchesQUICWhenSelected(t *testing.T) {
 }
 
 func TestListenExternalDispatchesQUICWhenSelected(t *testing.T) {
+	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "legacy")
 	t.Setenv("DERPHOLE_DIRECT_TRANSPORT", "quic")
 
 	sentinel := errors.New("quic listen")

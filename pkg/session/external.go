@@ -96,6 +96,8 @@ var sendExternalViaDirectUDPFn = sendExternalViaDirectUDP
 var listenExternalViaDirectUDPFn = listenExternalViaDirectUDP
 var sendExternalViaDirectQUICFn = sendExternalViaDirectQUIC
 var listenExternalViaDirectQUICFn = listenExternalViaDirectQUIC
+var sendExternalViaV2Fn = sendExternalViaV2
+var listenExternalViaV2Fn = listenExternalViaV2
 
 type publicPortmap interface {
 	transport.Portmap
@@ -367,6 +369,9 @@ func issuePublicSession(ctx context.Context) (string, *relaySession, error) {
 }
 
 func sendExternal(ctx context.Context, cfg SendConfig) error {
+	if externalTransferProtocolFromEnv() == externalTransferProtocolV2 {
+		return sendExternalViaV2Fn(ctx, cfg)
+	}
 	switch externalDirectTransportFromEnv() {
 	case externalDirectTransportQUIC:
 		return sendExternalViaDirectQUICFn(ctx, cfg)
@@ -523,6 +528,9 @@ func receiveExternalHandoffCarriers(ctx context.Context, carriers []io.ReadWrite
 }
 
 func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
+	if externalTransferProtocolFromEnv() == externalTransferProtocolV2 {
+		return listenExternalViaV2Fn(ctx, cfg)
+	}
 	switch externalDirectTransportFromEnv() {
 	case externalDirectTransportQUIC:
 		return listenExternalViaDirectQUICFn(ctx, cfg)
@@ -2789,6 +2797,9 @@ var transportDataPayloadExclusions = []func([]byte) bool{
 	isProgressPayload,
 	isAbortPayload,
 	isHeartbeatPayload,
+	isV2ClaimPayload,
+	isV2AcceptPayload,
+	isV2CompletePayload,
 	isDirectUDPReadyPayload,
 	isDirectUDPReadyAckPayload,
 	isDirectUDPStartPayload,

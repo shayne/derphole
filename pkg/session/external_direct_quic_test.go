@@ -133,6 +133,7 @@ func TestExternalSendReceiveViaDirectQUICRoundTrip(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "legacy")
 	t.Setenv("DERPHOLE_DIRECT_TRANSPORT", "quic")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

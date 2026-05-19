@@ -61,3 +61,27 @@ func validateExternalV2Accept(accept externalV2Accept) error {
 	}
 	return nil
 }
+
+func isV2ClaimPayload(payload []byte) bool {
+	env, ok := decodeExternalV2Payload(payload, envelopeV2Claim)
+	return ok && env.V2Claim != nil
+}
+
+func isV2AcceptPayload(payload []byte) bool {
+	env, ok := decodeExternalV2Payload(payload, envelopeV2Accept)
+	return ok && env.V2Accept != nil
+}
+
+func isV2CompletePayload(payload []byte) bool {
+	env, ok := decodeExternalV2Payload(payload, envelopeV2Complete)
+	return ok && env.V2Complete != nil
+}
+
+func decodeExternalV2Payload(payload []byte, typ string) (envelope, bool) {
+	var env envelope
+	if len(payload) == 0 || payload[0] != '{' {
+		return env, false
+	}
+	env, err := decodeEnvelope(payload)
+	return env, err == nil && env.Type == typ
+}

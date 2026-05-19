@@ -3828,6 +3828,7 @@ type sessionTestDERPServer struct {
 
 func newSessionTestDERPServer(t *testing.T) *sessionTestDERPServer {
 	t.Helper()
+	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "legacy")
 
 	server := derpserver.New(key.NewNode(), t.Logf)
 	t.Cleanup(func() {
