@@ -25,6 +25,7 @@ import (
 )
 
 const externalV2CopyBufferSize = 1 << 20
+const externalV2AbortNotifyWait = 2 * time.Second
 
 type externalV2SendRuntime struct {
 	cfg          SendConfig
@@ -39,8 +40,10 @@ type externalV2SendRuntime struct {
 
 	acceptCh            <-chan derpbind.Packet
 	completeCh          <-chan derpbind.Packet
+	abortCh             <-chan derpbind.Packet
 	unsubscribeAccept   func()
 	unsubscribeComplete func()
+	unsubscribeAbort    func()
 }
 
 type externalV2ListenRuntime struct {
@@ -138,6 +141,9 @@ func (rt *externalV2SendRuntime) subscribe() {
 	rt.completeCh, rt.unsubscribeComplete = rt.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == rt.listenerDERP && isV2CompletePayload(pkt.Payload)
 	})
+	rt.abortCh, rt.unsubscribeAbort = rt.derp.Subscribe(func(pkt derpbind.Packet) bool {
+		return pkt.From == rt.listenerDERP && isAbortPayload(pkt.Payload)
+	})
 }
 
 func (rt *externalV2SendRuntime) Close() {
@@ -146,6 +152,9 @@ func (rt *externalV2SendRuntime) Close() {
 	}
 	if rt.unsubscribeComplete != nil {
 		rt.unsubscribeComplete()
+	}
+	if rt.unsubscribeAbort != nil {
+		rt.unsubscribeAbort()
 	}
 	if rt.derp != nil {
 		_ = rt.derp.Close()
@@ -212,15 +221,25 @@ func (rt *externalV2SendRuntime) sendStream(ctx context.Context, manager *transp
 	if err != nil {
 		return err
 	}
+	abortErrCh, stopAbortWatch := rt.watchAbort(ctx, func() {
+		_ = client.CloseWithError(1, "peer aborted transfer")
+	})
+	defer stopAbortWatch()
 	if err := copyExternalV2SendStream(src, stream); err != nil {
 		_ = client.CloseWithError(1, err.Error())
+		if abortErr := drainExternalV2Abort(abortErrCh); abortErr != nil {
+			return abortErr
+		}
 		return err
 	}
 	if err := stream.Close(); err != nil {
 		_ = client.CloseWithError(1, err.Error())
+		if abortErr := drainExternalV2Abort(abortErrCh); abortErr != nil {
+			return abortErr
+		}
 		return err
 	}
-	complete, err := rt.receiveComplete(ctx)
+	complete, err := rt.receiveComplete(ctx, abortErrCh)
 	if err != nil {
 		_ = client.CloseWithError(1, err.Error())
 		return err
@@ -232,6 +251,25 @@ func (rt *externalV2SendRuntime) sendStream(ctx context.Context, manager *transp
 		return fmt.Errorf("invalid v2 complete bytes %d", complete.BytesReceived)
 	}
 	return nil
+}
+
+func (rt *externalV2SendRuntime) watchAbort(ctx context.Context, onAbort func()) (<-chan error, func()) {
+	watchCtx, cancel := context.WithCancel(ctx)
+	errCh := make(chan error, 1)
+	go func() {
+		err := rt.receiveAbort(watchCtx)
+		if err == nil {
+			return
+		}
+		if onAbort != nil {
+			onAbort()
+		}
+		select {
+		case errCh <- err:
+		default:
+		}
+	}()
+	return errCh, cancel
 }
 
 func (rt *externalV2SendRuntime) sendClaim(ctx context.Context) error {
@@ -269,7 +307,46 @@ func (rt *externalV2SendRuntime) receiveAccept(ctx context.Context) (externalV2A
 	}
 }
 
-func (rt *externalV2SendRuntime) receiveComplete(ctx context.Context) (externalV2Complete, error) {
+func (rt *externalV2SendRuntime) receiveAbort(ctx context.Context) error {
+	for {
+		select {
+		case pkt, ok := <-rt.abortCh:
+			if !ok {
+				return ErrPeerDisconnected
+			}
+			env, err := decodeAuthenticatedEnvelope(pkt.Payload, rt.auth)
+			if err != nil {
+				if ignoreAuthenticatedEnvelopeError(err, rt.auth) {
+					continue
+				}
+				return err
+			}
+			if env.Type == envelopeAbort && env.Abort != nil {
+				return externalV2AbortError(env.Abort)
+			}
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}
+
+func externalV2AbortError(abort *peerAbort) error {
+	if abort == nil || abort.Reason == "" {
+		return ErrPeerAborted
+	}
+	return fmt.Errorf("%w: %s", ErrPeerAborted, abort.Reason)
+}
+
+func drainExternalV2Abort(ch <-chan error) error {
+	select {
+	case err := <-ch:
+		return err
+	default:
+		return nil
+	}
+}
+
+func (rt *externalV2SendRuntime) receiveComplete(ctx context.Context, abortErrCh <-chan error) (externalV2Complete, error) {
 	for {
 		select {
 		case pkt, ok := <-rt.completeCh:
@@ -286,6 +363,8 @@ func (rt *externalV2SendRuntime) receiveComplete(ctx context.Context) (externalV
 			if env.Type == envelopeV2Complete && env.V2Complete != nil {
 				return *env.V2Complete, nil
 			}
+		case err := <-abortErrCh:
+			return externalV2Complete{}, err
 		case <-ctx.Done():
 			return externalV2Complete{}, ctx.Err()
 		}
@@ -381,7 +460,7 @@ func (rt *externalV2ListenRuntime) nextClaim(ctx context.Context) (externalV2Acc
 	}
 }
 
-func (rt *externalV2ListenRuntime) receive(ctx context.Context, accepted externalV2AcceptedClaim) error {
+func (rt *externalV2ListenRuntime) receive(ctx context.Context, accepted externalV2AcceptedClaim) (retErr error) {
 	dst, err := openListenSink(ctx, rt.cfg)
 	if err != nil {
 		return err
@@ -395,6 +474,11 @@ func (rt *externalV2ListenRuntime) receive(ctx context.Context, accepted externa
 		return err
 	}
 	defer cleanup()
+	defer func() {
+		if retErr != nil {
+			rt.notifyAbort(accepted.peerDERP, retErr)
+		}
+	}()
 
 	pathEmitter := newTransportPathEmitter(rt.cfg.Emitter)
 	pathEmitter.Watch(transferCtx, manager)
@@ -426,6 +510,22 @@ func (rt *externalV2ListenRuntime) receive(ctx context.Context, accepted externa
 	}
 	pathEmitter.Complete(manager)
 	return nil
+}
+
+func (rt *externalV2ListenRuntime) notifyAbort(peerDERP key.NodePublic, err error) {
+	if rt.session == nil || rt.session.derp == nil {
+		return
+	}
+	reason := ""
+	if err != nil {
+		reason = err.Error()
+	}
+	abortCtx, cancel := context.WithTimeout(context.Background(), externalV2AbortNotifyWait)
+	defer cancel()
+	_ = sendAuthenticatedEnvelope(abortCtx, rt.session.derp, peerDERP, envelope{
+		Type:  envelopeAbort,
+		Abort: newPeerAbort(reason, 0),
+	}, rt.auth)
 }
 
 func (rt *externalV2ListenRuntime) sendAccept(ctx context.Context, peerDERP key.NodePublic) error {

@@ -7,7 +7,10 @@ package session
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,6 +27,61 @@ func TestExternalV2SendReceiveRoundTrip(t *testing.T) {
 	const payload = "external v2 payload"
 	if received := runExternalV2RoundTrip(t, payload, nil, nil); received != payload {
 		t.Fatalf("received = %q, want %q", received, payload)
+	}
+}
+
+func TestExternalV2ReceiverCancelAbortsSender(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "v2")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	receiveCtx, cancelReceive := context.WithCancel(ctx)
+
+	tokenSink := make(chan string, 1)
+	listenErr := make(chan error, 1)
+	go func() {
+		_, err := listenExternal(receiveCtx, ListenConfig{
+			TokenSink:     tokenSink,
+			StdioOut:      &cancelOnWrite{cancel: cancelReceive},
+			UsePublicDERP: true,
+		})
+		listenErr <- err
+	}()
+
+	var raw string
+	select {
+	case raw = <-tokenSink:
+	case err := <-listenErr:
+		t.Fatalf("listenExternal() returned before token: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for token: %v", ctx.Err())
+	}
+
+	sendErr := make(chan error, 1)
+	go func() {
+		sendErr <- sendExternal(ctx, SendConfig{
+			Token:         raw,
+			StdioIn:       io.LimitReader(zeroReader{}, 32<<20),
+			UsePublicDERP: true,
+		})
+	}()
+
+	select {
+	case err := <-sendErr:
+		if !errors.Is(err, ErrPeerAborted) {
+			t.Fatalf("sendExternal() error = %v, want %v", err, ErrPeerAborted)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for sender abort: %v", ctx.Err())
+	}
+
+	select {
+	case <-listenErr:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for listener exit: %v", ctx.Err())
 	}
 }
 
@@ -78,4 +136,21 @@ func runExternalV2RoundTrip(t *testing.T, payload string, sendTrace *transfertra
 		t.Fatalf("timed out waiting for listener: %v", ctx.Err())
 	}
 	return received.String()
+}
+
+type cancelOnWrite struct {
+	once   sync.Once
+	cancel context.CancelFunc
+}
+
+func (w *cancelOnWrite) Write(p []byte) (int, error) {
+	w.once.Do(w.cancel)
+	return 0, context.Canceled
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
 }
