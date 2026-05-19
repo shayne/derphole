@@ -23,6 +23,7 @@ const (
 	CapabilityWebFile
 	CapabilityDerptunTCP
 	CapabilityDirectQUIC
+	CapabilityTransferV2
 )
 
 type Token struct {
