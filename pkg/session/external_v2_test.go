@@ -8,12 +8,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/token"
 	"github.com/shayne/derphole/pkg/transfertrace"
 )
@@ -125,6 +128,108 @@ func TestExternalV2TransferTraceCompletes(t *testing.T) {
 		ExpectedBytesSet: true,
 	}); err != nil {
 		t.Fatalf("receive trace check error = %v\n%s", err, receiveOut.String())
+	}
+}
+
+func TestExternalV2PromotesToDirectWhenBothSidesReady(t *testing.T) {
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+
+	prevInterfaceAddrs := publicInterfaceAddrs
+	publicInterfaceAddrs = func() ([]net.Addr, error) {
+		return []net.Addr{
+			&net.IPNet{
+				IP:   net.IPv4(127, 0, 0, 1),
+				Mask: net.CIDRMask(8, 32),
+			},
+		}, nil
+	}
+	t.Cleanup(func() { publicInterfaceAddrs = prevInterfaceAddrs })
+
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "v2")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	payload := bytes.Repeat([]byte("external-v2-direct:"), (4<<20)/len("external-v2-direct:"))
+	var received bytes.Buffer
+	var listenerStatus syncBuffer
+	var senderStatus syncBuffer
+
+	tokenSink := make(chan string, 1)
+	listenErr := make(chan error, 1)
+	go func() {
+		_, err := listenExternal(ctx, ListenConfig{
+			TokenSink:     tokenSink,
+			Emitter:       telemetry.New(&listenerStatus, telemetry.LevelVerbose),
+			StdioOut:      &received,
+			UsePublicDERP: true,
+		})
+		listenErr <- err
+	}()
+
+	var raw string
+	select {
+	case raw = <-tokenSink:
+	case err := <-listenErr:
+		t.Fatalf("listenExternal() returned before token: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for token: %v", ctx.Err())
+	}
+
+	stdin := &sessionTestGatedReader{
+		payload: payload,
+		gateAt:  len(payload) / 4,
+		gate: func() error {
+			gateCtx, gateCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer gateCancel()
+			if err := waitForSessionTestStatusContains(gateCtx, &senderStatus, string(StateDirect)); err != nil {
+				return fmt.Errorf("waiting for v2 sender direct path: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+			}
+			if err := waitForSessionTestStatusContains(gateCtx, &listenerStatus, string(StateDirect)); err != nil {
+				return fmt.Errorf("waiting for v2 listener direct path: %w; listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+			}
+			return nil
+		},
+	}
+	sendErr := make(chan error, 1)
+	go func() {
+		sendErr <- sendExternal(ctx, SendConfig{
+			Token:         raw,
+			Emitter:       telemetry.New(&senderStatus, telemetry.LevelVerbose),
+			StdioIn:       stdin,
+			UsePublicDERP: true,
+		})
+	}()
+
+	select {
+	case err := <-sendErr:
+		if err != nil {
+			t.Fatalf("sendExternal() error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for sender: %v; listener=%q sender=%q", ctx.Err(), listenerStatus.String(), senderStatus.String())
+	}
+	select {
+	case err := <-listenErr:
+		if err != nil {
+			t.Fatalf("listenExternal() error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for listener: %v; listener=%q sender=%q", ctx.Err(), listenerStatus.String(), senderStatus.String())
+	}
+
+	if !bytes.Equal(received.Bytes(), payload) {
+		t.Fatalf("listener output length = %d, want %d", received.Len(), len(payload))
+	}
+	if got := senderStatus.String(); !strings.Contains(got, string(StateTryingDirect)) || !strings.Contains(got, string(StateDirect)) {
+		t.Fatalf("sender status = %q, want v2 direct promotion", got)
+	}
+	if got := listenerStatus.String(); !strings.Contains(got, string(StateTryingDirect)) || !strings.Contains(got, string(StateDirect)) {
+		t.Fatalf("listener status = %q, want v2 direct promotion", got)
 	}
 }
 

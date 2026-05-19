@@ -18,6 +18,7 @@ import (
 	"github.com/shayne/derphole/pkg/dataplane"
 	"github.com/shayne/derphole/pkg/derpbind"
 	"github.com/shayne/derphole/pkg/quicpath"
+	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/token"
 	"github.com/shayne/derphole/pkg/transfertrace"
 	"github.com/shayne/derphole/pkg/transport"
@@ -28,6 +29,8 @@ import (
 const externalV2CopyBufferSize = 1 << 20
 const externalV2AbortNotifyWait = 2 * time.Second
 const externalV2AbortDrainWait = 250 * time.Millisecond
+const externalV2DirectNudgeInterval = 250 * time.Millisecond
+const externalV2DirectNudgeDuration = 2 * time.Second
 
 type externalV2SendRuntime struct {
 	cfg          SendConfig
@@ -39,6 +42,7 @@ type externalV2SendRuntime struct {
 	pm           publicPortmap
 	identity     quicpath.SessionIdentity
 	auth         externalPeerControlAuth
+	candidates   []string
 
 	acceptCh            <-chan derpbind.Packet
 	completeCh          <-chan derpbind.Packet
@@ -61,6 +65,19 @@ type externalV2ListenRuntime struct {
 type externalV2AcceptedClaim struct {
 	peerDERP key.NodePublic
 	claim    externalV2Claim
+}
+
+type externalV2ListenTransport struct {
+	ctx             context.Context
+	manager         *transport.Manager
+	localCandidates []string
+	cleanup         func()
+}
+
+func (tr externalV2ListenTransport) Close() {
+	if tr.cleanup != nil {
+		tr.cleanup()
+	}
 }
 
 func sendExternalViaV2(ctx context.Context, cfg SendConfig) error {
@@ -192,7 +209,7 @@ func (rt *externalV2SendRuntime) run(ctx context.Context) (retErr error) {
 	}
 	pathEmitter.Emit(StateClaimed)
 
-	manager, cleanup, err := rt.acceptAndStartTransport(ctx, pathEmitter)
+	manager, cleanup, err := rt.acceptAndStartTransport(ctx, pathEmitter, metrics)
 	if err != nil {
 		return err
 	}
@@ -207,7 +224,7 @@ func (rt *externalV2SendRuntime) run(ctx context.Context) (retErr error) {
 	return nil
 }
 
-func (rt *externalV2SendRuntime) acceptAndStartTransport(ctx context.Context, pathEmitter *transportPathEmitter) (*transport.Manager, func(), error) {
+func (rt *externalV2SendRuntime) acceptAndStartTransport(ctx context.Context, pathEmitter *transportPathEmitter, metrics *externalTransferMetrics) (*transport.Manager, func(), error) {
 	accept, err := rt.receiveAccept(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -216,14 +233,31 @@ func (rt *externalV2SendRuntime) acceptAndStartTransport(ctx context.Context, pa
 		return nil, nil, err
 	}
 	transferCtx, cancel := context.WithCancel(ctx)
-	manager, cleanup, err := startExternalTransportManager(transferCtx, rt.tok, rt.probeConn, rt.dm, rt.derp, rt.listenerDERP, nil, rt.pm, true)
+	relayOnly := !externalV2DirectEnabled(rt.cfg.ForceRelay, accept.RelayCapable)
+	manager, cleanup, err := startExternalTransportManager(transferCtx, rt.tok, rt.probeConn, rt.dm, rt.derp, rt.listenerDERP, parseCandidateStrings(rt.candidates), rt.pm, relayOnly)
 	if err != nil {
 		cancel()
 		return nil, nil, err
 	}
 	pathEmitter.Watch(transferCtx, manager)
 	pathEmitter.Flush(manager)
+	if !relayOnly {
+		pathEmitter.Emit(StateTryingDirect)
+	}
+	stopDirectMetrics := externalDirectQUICWatchDirectPath(transferCtx, manager, metrics)
+	remoteCandidates := parseRemoteCandidateStrings(accept.Candidates)
+	emitExternalV2Debug(rt.cfg.Emitter, fmt.Sprintf("v2-remote-candidates=%d", len(remoteCandidates)))
+	if len(remoteCandidates) > 0 {
+		manager.SeedRemoteCandidates(transferCtx, remoteCandidates)
+	}
+	reseedCancel := externalV2StartRemoteCandidateReseeds(transferCtx, manager, remoteCandidates, relayOnly)
+	nudgeCancel := externalV2StartDirectNudges(transferCtx, rt.derp, rt.listenerDERP, rt.auth, rt.candidates, relayOnly)
+	punchCancel := externalV2StartPunching(transferCtx, []net.PacketConn{rt.probeConn}, remoteCandidates, relayOnly)
 	return manager, func() {
+		punchCancel()
+		nudgeCancel()
+		reseedCancel()
+		stopDirectMetrics()
 		cleanup()
 		cancel()
 	}, nil
@@ -288,9 +322,12 @@ func (rt *externalV2SendRuntime) watchAbort(ctx context.Context, onAbort func())
 }
 
 func (rt *externalV2SendRuntime) sendClaim(ctx context.Context) error {
+	rt.candidates = externalV2ProbeCandidates(ctx, rt.cfg.ForceRelay, rt.probeConn, rt.dm, rt.pm)
+	emitExternalV2Debug(rt.cfg.Emitter, fmt.Sprintf("v2-claim-candidates=%d", len(rt.candidates)))
 	claim := externalV2Claim{
 		Protocol:     externalV2Protocol,
 		QUICPublic:   rt.identity.Public,
+		Candidates:   rt.candidates,
 		RelayCapable: true,
 	}
 	return sendAuthenticatedEnvelope(ctx, rt.derp, rt.listenerDERP, envelope{
@@ -492,29 +529,24 @@ func (rt *externalV2ListenRuntime) receive(ctx context.Context, accepted externa
 	}
 	defer func() { _ = dst.Close() }()
 
-	transferCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	manager, cleanup, err := startExternalTransportManager(transferCtx, rt.session.token, rt.session.probeConn, rt.session.derpMap, rt.session.derp, accepted.peerDERP, nil, publicSessionPortmap(rt.session), true)
+	pathEmitter := newTransportPathEmitter(rt.cfg.Emitter)
+	tr, err := rt.startReceiveTransport(ctx, accepted, metrics, pathEmitter)
 	if err != nil {
 		return err
 	}
-	defer cleanup()
+	defer tr.Close()
 	defer func() {
 		if retErr != nil {
 			rt.notifyAbort(accepted.peerDERP, retErr)
 		}
 	}()
-	metrics.SetTransportManager(manager)
+	metrics.SetTransportManager(tr.manager)
 	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
 
-	pathEmitter := newTransportPathEmitter(rt.cfg.Emitter)
-	pathEmitter.Watch(transferCtx, manager)
-	pathEmitter.Flush(manager)
-
-	server := dataplane.NewQUICServer(manager, rt.session.quicIdentity, accepted.claim.QUICPublic)
+	server := dataplane.NewQUICServer(tr.manager, rt.session.quicIdentity, accepted.claim.QUICPublic)
 	var bytesReceived int64
-	stream, err := server.AcceptWithReady(transferCtx, func() error {
-		return rt.sendAccept(ctx, accepted.peerDERP)
+	stream, err := server.AcceptWithReady(tr.ctx, func() error {
+		return rt.sendAccept(ctx, accepted.peerDERP, tr.localCandidates)
 	})
 	if err != nil {
 		return err
@@ -536,8 +568,47 @@ func (rt *externalV2ListenRuntime) receive(ctx context.Context, accepted externa
 		return err
 	}
 	metrics.Complete(time.Now())
-	pathEmitter.Complete(manager)
+	pathEmitter.Complete(tr.manager)
 	return nil
+}
+
+func (rt *externalV2ListenRuntime) startReceiveTransport(ctx context.Context, accepted externalV2AcceptedClaim, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter) (externalV2ListenTransport, error) {
+	transferCtx, cancel := context.WithCancel(ctx)
+	localCandidates := externalV2ProbeCandidates(ctx, rt.cfg.ForceRelay, rt.session.probeConn, rt.session.derpMap, publicSessionPortmap(rt.session))
+	emitExternalV2Debug(rt.cfg.Emitter, fmt.Sprintf("v2-accept-candidates=%d", len(localCandidates)))
+	relayOnly := !externalV2DirectEnabled(rt.cfg.ForceRelay, accepted.claim.RelayCapable)
+	manager, cleanup, err := startExternalTransportManager(transferCtx, rt.session.token, rt.session.probeConn, rt.session.derpMap, rt.session.derp, accepted.peerDERP, parseCandidateStrings(localCandidates), publicSessionPortmap(rt.session), relayOnly)
+	if err != nil {
+		cancel()
+		return externalV2ListenTransport{}, err
+	}
+	pathEmitter.Watch(transferCtx, manager)
+	pathEmitter.Flush(manager)
+	if !relayOnly {
+		pathEmitter.Emit(StateTryingDirect)
+	}
+	stopDirectMetrics := externalDirectQUICWatchDirectPath(transferCtx, manager, metrics)
+	remoteCandidates := parseRemoteCandidateStrings(accepted.claim.Candidates)
+	emitExternalV2Debug(rt.cfg.Emitter, fmt.Sprintf("v2-remote-candidates=%d", len(remoteCandidates)))
+	if len(remoteCandidates) > 0 {
+		manager.SeedRemoteCandidates(transferCtx, remoteCandidates)
+	}
+	reseedCancel := externalV2StartRemoteCandidateReseeds(transferCtx, manager, remoteCandidates, relayOnly)
+	nudgeCancel := externalV2StartDirectNudges(transferCtx, rt.session.derp, accepted.peerDERP, rt.auth, localCandidates, relayOnly)
+	punchCancel := externalV2StartPunching(transferCtx, []net.PacketConn{rt.session.probeConn}, remoteCandidates, relayOnly)
+	return externalV2ListenTransport{
+		ctx:             transferCtx,
+		manager:         manager,
+		localCandidates: localCandidates,
+		cleanup: func() {
+			punchCancel()
+			nudgeCancel()
+			reseedCancel()
+			stopDirectMetrics()
+			cleanup()
+			cancel()
+		},
+	}, nil
 }
 
 func (rt *externalV2ListenRuntime) notifyAbort(peerDERP key.NodePublic, err error) {
@@ -556,10 +627,11 @@ func (rt *externalV2ListenRuntime) notifyAbort(peerDERP key.NodePublic, err erro
 	}, rt.auth)
 }
 
-func (rt *externalV2ListenRuntime) sendAccept(ctx context.Context, peerDERP key.NodePublic) error {
+func (rt *externalV2ListenRuntime) sendAccept(ctx context.Context, peerDERP key.NodePublic, candidates []string) error {
 	accept := externalV2Accept{
 		Protocol:     externalV2Protocol,
 		Accepted:     true,
+		Candidates:   candidates,
 		RelayCapable: true,
 	}
 	return sendAuthenticatedEnvelope(ctx, rt.session.derp, peerDERP, envelope{
@@ -598,4 +670,98 @@ func copyExternalV2ReceiveStream(dst io.Writer, stream dataplane.Stream, metrics
 	}
 	buf := make([]byte, externalV2CopyBufferSize)
 	return io.CopyBuffer(dst, stream, buf)
+}
+
+func externalV2DirectEnabled(forceRelay bool, peerRelayCapable bool) bool {
+	return !forceRelay && peerRelayCapable
+}
+
+func externalV2ProbeCandidates(ctx context.Context, forceRelay bool, conn net.PacketConn, dm *tailcfg.DERPMap, pm publicPortmap) []string {
+	if forceRelay || conn == nil {
+		return nil
+	}
+	return publicProbeCandidates(ctx, conn, dm, pm)
+}
+
+func externalV2StartPunching(ctx context.Context, conns []net.PacketConn, remoteCandidates []net.Addr, relayOnly bool) context.CancelFunc {
+	if relayOnly || len(remoteCandidates) == 0 {
+		return func() {}
+	}
+	punchCtx, cancel := context.WithCancel(ctx)
+	externalDirectUDPStartPunching(punchCtx, conns, remoteCandidates)
+	return cancel
+}
+
+func externalV2StartDirectNudges(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, auth externalPeerControlAuth, candidates []string, relayOnly bool) context.CancelFunc {
+	if relayOnly || client == nil || peerDERP.IsZero() {
+		return func() {}
+	}
+	nudgeCtx, cancel := context.WithCancel(ctx)
+	go func() {
+		defer cancel()
+		deadline := time.NewTimer(externalV2DirectNudgeDuration)
+		defer deadline.Stop()
+		ticker := time.NewTicker(externalV2DirectNudgeInterval)
+		defer ticker.Stop()
+
+		sendExternalV2DirectNudge(nudgeCtx, client, peerDERP, auth, candidates)
+		for {
+			select {
+			case <-nudgeCtx.Done():
+				return
+			case <-deadline.C:
+				return
+			case <-ticker.C:
+				sendExternalV2DirectNudge(nudgeCtx, client, peerDERP, auth, candidates)
+			}
+		}
+	}()
+	return cancel
+}
+
+func externalV2StartRemoteCandidateReseeds(ctx context.Context, manager *transport.Manager, remoteCandidates []net.Addr, relayOnly bool) context.CancelFunc {
+	if relayOnly || manager == nil || len(remoteCandidates) == 0 {
+		return func() {}
+	}
+	reseedCtx, cancel := context.WithCancel(ctx)
+	go func() {
+		defer cancel()
+		deadline := time.NewTimer(externalV2DirectNudgeDuration)
+		defer deadline.Stop()
+		ticker := time.NewTicker(externalV2DirectNudgeInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-reseedCtx.Done():
+				return
+			case <-deadline.C:
+				return
+			case <-ticker.C:
+				if manager.PathState() == transport.PathDirect {
+					return
+				}
+				manager.SeedRemoteCandidates(reseedCtx, remoteCandidates)
+			}
+		}
+	}()
+	return cancel
+}
+
+func sendExternalV2DirectNudge(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, auth externalPeerControlAuth, candidates []string) {
+	if len(candidates) > 0 {
+		_ = sendTransportControl(ctx, client, peerDERP, transport.ControlMessage{
+			Type:       transport.ControlCandidates,
+			Candidates: candidates,
+		}, auth)
+	}
+	_ = sendTransportControl(ctx, client, peerDERP, transport.ControlMessage{
+		Type: transport.ControlCallMeMaybe,
+	}, auth)
+}
+
+func emitExternalV2Debug(emitter *telemetry.Emitter, msg string) {
+	if emitter != nil {
+		emitter.Debug(msg)
+	}
 }
