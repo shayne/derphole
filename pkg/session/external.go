@@ -44,6 +44,9 @@ const (
 	envelopeProgress           = "progress"
 	envelopeAbort              = "abort"
 	envelopeHeartbeat          = "heartbeat"
+	envelopeV2Claim            = "v2_claim"
+	envelopeV2Accept           = "v2_accept"
+	envelopeV2Complete         = "v2_complete"
 	envelopeDirectUDPReady     = "direct_udp_ready"
 	envelopeDirectUDPReadyAck  = "direct_udp_ready_ack"
 	envelopeDirectUDPStart     = "direct_udp_start"
@@ -111,6 +114,9 @@ type envelope struct {
 	Progress           *peerProgress             `json:"progress,omitempty"`
 	Abort              *peerAbort                `json:"abort,omitempty"`
 	Heartbeat          *peerHeartbeat            `json:"heartbeat,omitempty"`
+	V2Claim            *externalV2Claim          `json:"v2_claim,omitempty"`
+	V2Accept           *externalV2Accept         `json:"v2_accept,omitempty"`
+	V2Complete         *externalV2Complete       `json:"v2_complete,omitempty"`
 	DirectUDPReadyAck  *directUDPReadyAck        `json:"direct_udp_ready_ack,omitempty"`
 	DirectUDPStart     *directUDPStart           `json:"direct_udp_start,omitempty"`
 	DirectUDPRateProbe *directUDPRateProbeResult `json:"direct_udp_rate_probe,omitempty"`
