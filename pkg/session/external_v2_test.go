@@ -33,6 +33,173 @@ func TestExternalV2SendReceiveRoundTrip(t *testing.T) {
 	}
 }
 
+func TestExternalV2OfferReceiveRoundTrip(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "v2")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const payload = "external v2 offered payload"
+	tokenSink := make(chan string, 1)
+	offerErr := make(chan error, 1)
+	go func() {
+		_, err := Offer(ctx, OfferConfig{
+			TokenSink:     tokenSink,
+			StdioIn:       strings.NewReader(payload),
+			ForceRelay:    true,
+			UsePublicDERP: true,
+		})
+		offerErr <- err
+	}()
+
+	var raw string
+	select {
+	case raw = <-tokenSink:
+	case err := <-offerErr:
+		t.Fatalf("Offer() returned before token: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for token: %v", ctx.Err())
+	}
+	tok, err := token.Decode(raw, time.Now())
+	if err != nil {
+		t.Fatalf("token.Decode() error = %v", err)
+	}
+	if tok.Capabilities&token.CapabilityTransferV2 == 0 {
+		t.Fatalf("token capabilities = %08b, want transfer v2", tok.Capabilities)
+	}
+	if tok.Capabilities&token.CapabilityStdioOffer == 0 {
+		t.Fatalf("token capabilities = %08b, want stdio offer", tok.Capabilities)
+	}
+
+	var received bytes.Buffer
+	if err := Receive(ctx, ReceiveConfig{
+		Token:         raw,
+		StdioOut:      &received,
+		ForceRelay:    true,
+		UsePublicDERP: true,
+	}); err != nil {
+		t.Fatalf("Receive() error = %v", err)
+	}
+	if err := <-offerErr; err != nil {
+		t.Fatalf("Offer() error = %v", err)
+	}
+	if got := received.String(); got != payload {
+		t.Fatalf("received = %q, want %q", got, payload)
+	}
+}
+
+func TestExternalV2OfferReceivePromotesToDirectWhenBothSidesReady(t *testing.T) {
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+
+	prevInterfaceAddrs := publicInterfaceAddrs
+	publicInterfaceAddrs = func() ([]net.Addr, error) {
+		return []net.Addr{
+			&net.IPNet{
+				IP:   net.IPv4(127, 0, 0, 1),
+				Mask: net.CIDRMask(8, 32),
+			},
+		}, nil
+	}
+	t.Cleanup(func() { publicInterfaceAddrs = prevInterfaceAddrs })
+
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "v2")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	payload := bytes.Repeat([]byte("external-v2-offer-direct:"), (4<<20)/len("external-v2-offer-direct:"))
+	var received bytes.Buffer
+	var receiverStatus syncBuffer
+	var senderStatus syncBuffer
+
+	tokenSink := make(chan string, 1)
+	stdin := &sessionTestGatedReader{
+		payload: payload,
+		gateAt:  len(payload) / 4,
+		gate: func() error {
+			gateCtx, gateCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer gateCancel()
+			if err := waitForSessionTestStatusContains(gateCtx, &senderStatus, string(StateDirect)); err != nil {
+				return fmt.Errorf("waiting for v2 offer sender direct path: %w; receiver=%q sender=%q", err, receiverStatus.String(), senderStatus.String())
+			}
+			if err := waitForSessionTestStatusContains(gateCtx, &receiverStatus, string(StateDirect)); err != nil {
+				return fmt.Errorf("waiting for v2 offer receiver direct path: %w; receiver=%q sender=%q", err, receiverStatus.String(), senderStatus.String())
+			}
+			return nil
+		},
+	}
+	offerErr := make(chan error, 1)
+	go func() {
+		_, err := Offer(ctx, OfferConfig{
+			TokenSink:     tokenSink,
+			Emitter:       telemetry.New(&senderStatus, telemetry.LevelVerbose),
+			StdioIn:       stdin,
+			UsePublicDERP: true,
+		})
+		offerErr <- err
+	}()
+
+	var raw string
+	select {
+	case raw = <-tokenSink:
+	case err := <-offerErr:
+		t.Fatalf("Offer() returned before token: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for token: %v; receiver=%q sender=%q", ctx.Err(), receiverStatus.String(), senderStatus.String())
+	}
+	tok, err := token.Decode(raw, time.Now())
+	if err != nil {
+		t.Fatalf("token.Decode() error = %v", err)
+	}
+	if tok.Capabilities&token.CapabilityTransferV2 == 0 {
+		t.Fatalf("token capabilities = %08b, want transfer v2; sender=%q", tok.Capabilities, senderStatus.String())
+	}
+
+	receiveErr := make(chan error, 1)
+	go func() {
+		receiveErr <- Receive(ctx, ReceiveConfig{
+			Token:         raw,
+			Emitter:       telemetry.New(&receiverStatus, telemetry.LevelVerbose),
+			StdioOut:      &received,
+			UsePublicDERP: true,
+		})
+	}()
+
+	select {
+	case err := <-receiveErr:
+		if err != nil {
+			t.Fatalf("Receive() error = %v receiver=%q sender=%q", err, receiverStatus.String(), senderStatus.String())
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for receiver: %v; receiver=%q sender=%q", ctx.Err(), receiverStatus.String(), senderStatus.String())
+	}
+	select {
+	case err := <-offerErr:
+		if err != nil {
+			t.Fatalf("Offer() error = %v receiver=%q sender=%q", err, receiverStatus.String(), senderStatus.String())
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for sender: %v; receiver=%q sender=%q", ctx.Err(), receiverStatus.String(), senderStatus.String())
+	}
+
+	if !bytes.Equal(received.Bytes(), payload) {
+		t.Fatalf("receiver output length = %d, want %d", received.Len(), len(payload))
+	}
+	if got := senderStatus.String(); !strings.Contains(got, string(StateTryingDirect)) || !strings.Contains(got, string(StateDirect)) {
+		t.Fatalf("sender status = %q, want v2 offer direct promotion", got)
+	}
+	if got := receiverStatus.String(); !strings.Contains(got, string(StateTryingDirect)) || !strings.Contains(got, string(StateDirect)) {
+		t.Fatalf("receiver status = %q, want v2 offer direct promotion", got)
+	}
+}
+
 func TestExternalV2ReceiverCancelAbortsSender(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)

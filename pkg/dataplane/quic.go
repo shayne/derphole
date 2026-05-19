@@ -61,6 +61,30 @@ func (q *QUICClient) Open(ctx context.Context) (Stream, error) {
 	return writeOnlyStream{WriteCloser: stream}, nil
 }
 
+func (q *QUICClient) Accept(ctx context.Context) (Stream, error) {
+	peerConn := q.manager.PeerDatagramConn(ctx)
+	adapter := quicpath.NewAdapter(peerConn)
+	endpoint, err := directquic.Dial(ctx, directquic.DialConfig{
+		PacketConn: adapter,
+		RemoteAddr: peerConn.RemoteAddr(),
+		Identity:   q.identity,
+		PeerPublic: q.peer,
+	})
+	if err != nil {
+		_ = adapter.Close()
+		return nil, err
+	}
+	stream, err := endpoint.AcceptReceiveStream(ctx)
+	if err != nil {
+		_ = endpoint.Close()
+		_ = adapter.Close()
+		return nil, err
+	}
+	q.endpoint = endpoint
+	q.adapter = adapter
+	return readOnlyStream{ReadCloser: stream}, nil
+}
+
 func (q *QUICServer) Accept(ctx context.Context) (Stream, error) {
 	return q.AcceptWithReady(ctx, nil)
 }
@@ -86,6 +110,29 @@ func (q *QUICServer) AcceptWithReady(ctx context.Context, ready func() error) (S
 	q.endpoint = endpoint
 	q.adapter = adapter
 	return readOnlyStream{ReadCloser: stream}, nil
+}
+
+func (q *QUICServer) OpenWithReady(ctx context.Context, ready func() error) (Stream, error) {
+	peerConn := q.manager.PeerDatagramConn(ctx)
+	adapter := quicpath.NewAdapter(peerConn)
+	endpoint, err := directquic.ListenWithReady(ctx, directquic.ListenConfig{
+		PacketConn: adapter,
+		Identity:   q.identity,
+		PeerPublic: q.peer,
+	}, ready)
+	if err != nil {
+		_ = adapter.Close()
+		return nil, err
+	}
+	stream, err := endpoint.OpenSendStream(ctx)
+	if err != nil {
+		_ = endpoint.Close()
+		_ = adapter.Close()
+		return nil, err
+	}
+	q.endpoint = endpoint
+	q.adapter = adapter
+	return writeOnlyStream{WriteCloser: stream}, nil
 }
 
 func (q *QUICClient) Stats() Stats {

@@ -128,6 +128,30 @@ func TestExternalTransferMetricsSamplesTraceUntilTick(t *testing.T) {
 	}
 }
 
+func TestExternalTransferMetricsDirectValidationMovesTraceToDirect(t *testing.T) {
+	var out bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(16, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(16, 0), rec, transfertrace.RoleSend)
+	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
+	metrics.MarkDirectValidated(time.Unix(16, int64(250*time.Millisecond)))
+	metrics.RecordDirectWrite(128<<10, time.Unix(16, int64(300*time.Millisecond)))
+	metrics.Tick(time.Unix(16, int64(500*time.Millisecond)))
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := readTransferTraceRows(t, out.String())
+	row := rows[len(rows)-1]
+	if row["direct_validated"] != "true" ||
+		row["phase"] != string(transfertrace.PhaseDirectExecute) ||
+		row["last_state"] != string(StateDirect) {
+		t.Fatalf("trace row = %#v, want validated direct state", row)
+	}
+}
+
 func TestExternalTransferMetricsSamplesPeerRecvQueueDepthFromTransportManager(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

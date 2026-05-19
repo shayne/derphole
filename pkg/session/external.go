@@ -98,6 +98,8 @@ var sendExternalViaDirectQUICFn = sendExternalViaDirectQUIC
 var listenExternalViaDirectQUICFn = listenExternalViaDirectQUIC
 var sendExternalViaV2Fn = sendExternalViaV2
 var listenExternalViaV2Fn = listenExternalViaV2
+var offerExternalViaV2Fn = offerExternalViaV2
+var receiveExternalOfferViaV2Fn = receiveExternalOfferViaV2
 
 type publicPortmap interface {
 	transport.Portmap

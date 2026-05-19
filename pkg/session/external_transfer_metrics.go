@@ -141,6 +141,10 @@ func (m *externalTransferMetrics) MarkDirectValidated(at time.Time) {
 	}
 	m.mu.Lock()
 	m.directValidated = true
+	if m.phase != transfertrace.PhaseComplete && m.phase != transfertrace.PhaseError {
+		m.phase = transfertrace.PhaseDirectExecute
+		m.lastState = string(StateDirect)
+	}
 	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
 	m.mu.Unlock()
 	sampleExternalTransferTrace(trace, snap, ok)
