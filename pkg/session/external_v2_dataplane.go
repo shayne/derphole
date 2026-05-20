@@ -26,6 +26,9 @@ const (
 	externalV2DataPlaneReinforce     = 1 * time.Second
 	externalV2DataPlaneReinforceTick = 100 * time.Millisecond
 	externalV2DataPlaneCandidateWait = 750 * time.Millisecond
+
+	externalV2DataPlanePhaseCandidates = "candidates"
+	externalV2DataPlanePhaseSelection  = "selection"
 )
 
 type externalV2DirectPacketPath struct {
@@ -47,21 +50,34 @@ func negotiateExternalV2DirectPacketPath(ctx context.Context, client *derpbind.C
 	if !externalV2CanUseRawDirect(manager) {
 		return externalV2DirectPacketPath{}, nil
 	}
-	local, ok := openExternalV2RawDirectLocal(ctx, dm, emitter, streamCount)
-	if !ok {
-		return externalV2DirectPacketPath{}, nil
+	var local externalV2DataPacketPath
+	localRawDirect := false
+	if externalV2RawDirectEnabled() {
+		var ok bool
+		local, ok = openExternalV2RawDirectLocal(ctx, dm, emitter, streamCount)
+		localRawDirect = ok
+	} else {
+		emitExternalV2Debug(emitter, "v2-raw-direct-local=false disabled=true")
 	}
+	readyCh, unsubscribe := subscribeExternalV2DataPlaneReady(client, peerDERP)
+	defer unsubscribe()
 
-	peerReady, peerCandidates, err := exchangeExternalV2RawDirectPeer(ctx, client, peerDERP, local, auth, emitter)
+	peerReady, peerCandidates, err := exchangeExternalV2RawDirectPeer(ctx, client, peerDERP, readyCh, localRawDirect, local.candidates, local.candidateSets, auth, emitter)
 	if err != nil {
 		local.Close()
 		return externalV2DirectPacketPath{}, err
 	}
-	return selectExternalV2RawDirectPath(ctx, local, peerReady, peerCandidates, emitter), nil
+	path := selectExternalV2RawDirectPath(ctx, local, peerReady, peerCandidates, emitter)
+	peerSelected, err := exchangeExternalV2RawDirectSelection(ctx, client, peerDERP, readyCh, path.raw, auth)
+	if err != nil {
+		path.Close()
+		return externalV2DirectPacketPath{}, err
+	}
+	return finalizeExternalV2RawDirectPath(path, peerSelected, emitter), nil
 }
 
 func externalV2CanUseRawDirect(manager *transport.Manager) bool {
-	return externalV2RawDirectEnabled() && manager != nil
+	return manager != nil
 }
 
 func openExternalV2RawDirectLocal(ctx context.Context, dm *tailcfg.DERPMap, emitter *telemetry.Emitter, streamCount int) (externalV2DataPacketPath, bool) {
@@ -79,13 +95,14 @@ func openExternalV2RawDirectLocal(ctx context.Context, dm *tailcfg.DERPMap, emit
 	return local, true
 }
 
-func exchangeExternalV2RawDirectPeer(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, local externalV2DataPacketPath, auth externalPeerControlAuth, emitter *telemetry.Emitter) (externalV2DataPlaneReady, []net.Addr, error) {
-	readyCh, unsubscribe := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
+func subscribeExternalV2DataPlaneReady(client *derpbind.Client, peerDERP key.NodePublic) (<-chan derpbind.Packet, func()) {
+	return client.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == peerDERP && isV2DataPlaneReadyPayload(pkt.Payload)
 	})
-	defer unsubscribe()
+}
 
-	peerReady, err := exchangeExternalV2DataPlaneReady(ctx, client, peerDERP, readyCh, true, local.candidates, local.candidateSets, auth)
+func exchangeExternalV2RawDirectPeer(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, readyCh <-chan derpbind.Packet, rawDirect bool, candidates []string, candidateSets [][]string, auth externalPeerControlAuth, emitter *telemetry.Emitter) (externalV2DataPlaneReady, []net.Addr, error) {
+	peerReady, err := exchangeExternalV2DataPlaneReady(ctx, client, peerDERP, readyCh, externalV2DataPlanePhaseCandidates, rawDirect, candidates, candidateSets, auth)
 	if err != nil {
 		return externalV2DataPlaneReady{}, nil, err
 	}
@@ -96,17 +113,29 @@ func exchangeExternalV2RawDirectPeer(ctx context.Context, client *derpbind.Clien
 	return peerReady, peerCandidates, nil
 }
 
+func exchangeExternalV2RawDirectSelection(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, readyCh <-chan derpbind.Packet, selected bool, auth externalPeerControlAuth) (bool, error) {
+	peerReady, err := exchangeExternalV2DataPlaneReady(ctx, client, peerDERP, readyCh, externalV2DataPlanePhaseSelection, selected, nil, nil, auth)
+	if err != nil {
+		return false, err
+	}
+	return peerReady.RawDirect, nil
+}
+
 func selectExternalV2RawDirectPath(ctx context.Context, local externalV2DataPacketPath, peerReady externalV2DataPlaneReady, peerCandidates []net.Addr, emitter *telemetry.Emitter) externalV2DirectPacketPath {
+	if len(local.conns) == 0 {
+		emitExternalV2Debug(emitter, "v2-raw-direct-local-selection=false")
+		return externalV2DirectPacketPath{}
+	}
 	if !peerReady.RawDirect || len(peerCandidates) == 0 {
 		local.Close()
-		emitExternalV2Debug(emitter, "v2-data-plane=manager")
+		emitExternalV2Debug(emitter, "v2-raw-direct-local-selection=false")
 		return externalV2DirectPacketPath{}
 	}
 
 	addrs := selectExternalV2DataPacketAddrs(ctx, local.conns, peerReady.CandidateSets, peerCandidates, emitter)
 	if len(addrs) == 0 {
 		local.Close()
-		emitExternalV2Debug(emitter, "v2-data-plane=manager")
+		emitExternalV2Debug(emitter, "v2-raw-direct-local-selection=false")
 		return externalV2DirectPacketPath{}
 	}
 	for _, conn := range local.conns {
@@ -114,8 +143,24 @@ func selectExternalV2RawDirectPath(ctx context.Context, local externalV2DataPack
 	}
 	emitExternalV2Debug(emitter, "v2-raw-direct-addr="+joinNetAddrs(addrs))
 	emitExternalV2Debug(emitter, "v2-raw-direct-active="+strconv.Itoa(len(addrs)))
-	emitExternalV2Debug(emitter, "v2-data-plane=raw-direct")
+	emitExternalV2Debug(emitter, "v2-raw-direct-local-selection=true")
 	return externalV2DirectPacketPath{conn: local.conns[0], addr: addrs[0], conns: local.conns[:len(addrs)], addrs: addrs, raw: true, cleanup: local.cleanup}
+}
+
+func finalizeExternalV2RawDirectPath(path externalV2DirectPacketPath, peerSelected bool, emitter *telemetry.Emitter) externalV2DirectPacketPath {
+	if !path.raw {
+		emitExternalV2Debug(emitter, "v2-data-plane=manager")
+		return externalV2DirectPacketPath{}
+	}
+	if !peerSelected {
+		path.Close()
+		emitExternalV2Debug(emitter, "v2-raw-direct-peer-selection=false")
+		emitExternalV2Debug(emitter, "v2-data-plane=manager")
+		return externalV2DirectPacketPath{}
+	}
+	emitExternalV2Debug(emitter, "v2-raw-direct-peer-selection=true")
+	emitExternalV2Debug(emitter, "v2-data-plane=raw-direct")
+	return path
 }
 
 func externalV2RawDirectEnabled() bool {
@@ -220,7 +265,7 @@ func selectExternalV2DataPacketAddrsByFlatCandidates(ctx context.Context, conns 
 	}
 	selected := externalDirectUDPSelectRemoteAddrsByConn(observedByConn, conns, len(conns), nil)
 	if emitter != nil {
-		emitter.Debug("v2-raw-direct-selected-addrs=" + strings.Join(selected, ","))
+		emitter.Debug("v2-raw-direct-selected-addrs=" + formatExternalV2SelectedAddrs(selected))
 	}
 	if !externalV2DataPacketSelectionObserved(ctx, selected, emitter) {
 		return nil
@@ -255,7 +300,7 @@ func selectExternalV2DataPacketAddrsBySet(ctx context.Context, conns []net.Packe
 	}
 	selected := selectedExternalV2DataPacketSetAddrs(observedByConn, count)
 	if emitter != nil {
-		emitter.Debug("v2-raw-direct-selected-addrs=" + strings.Join(selected, ","))
+		emitter.Debug("v2-raw-direct-selected-addrs=" + formatExternalV2SelectedAddrs(selected))
 	}
 	if !externalV2DataPacketSelectionObserved(ctx, selected, emitter) {
 		return nil
@@ -415,10 +460,23 @@ func joinNetAddrs(addrs []net.Addr) string {
 	return strings.Join(parts, ",")
 }
 
-func exchangeExternalV2DataPlaneReady(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, readyCh <-chan derpbind.Packet, rawDirect bool, candidates []string, candidateSets [][]string, auth externalPeerControlAuth) (externalV2DataPlaneReady, error) {
+func formatExternalV2SelectedAddrs(selected []string) string {
+	parts := make([]string, 0, len(selected))
+	for _, addr := range selected {
+		if addr != "" {
+			parts = append(parts, addr)
+		}
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, ",")
+}
+
+func exchangeExternalV2DataPlaneReady(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, readyCh <-chan derpbind.Packet, phase string, rawDirect bool, candidates []string, candidateSets [][]string, auth externalPeerControlAuth) (externalV2DataPlaneReady, error) {
 	readyCtx, cancel := context.WithTimeout(ctx, externalV2DataPlaneReadyWait)
 	defer cancel()
-	if err := sendExternalV2DataPlaneReady(readyCtx, client, peerDERP, rawDirect, candidates, candidateSets, auth); err != nil {
+	if err := sendExternalV2DataPlaneReady(readyCtx, client, peerDERP, phase, rawDirect, candidates, candidateSets, auth); err != nil {
 		return externalV2DataPlaneReady{}, err
 	}
 	ticker := time.NewTicker(externalV2DataPlaneRetry)
@@ -426,19 +484,16 @@ func exchangeExternalV2DataPlaneReady(ctx context.Context, client *derpbind.Clie
 	for {
 		select {
 		case pkt, ok := <-readyCh:
-			if !ok {
-				return externalV2DataPlaneReady{}, ErrPeerDisconnected
-			}
-			ready, ok, err := externalV2DataPlaneReadyFromPayload(pkt.Payload, auth)
+			ready, ok, err := externalV2DataPlaneReadyFromPacket(pkt, ok, phase, auth)
 			if err != nil {
 				return externalV2DataPlaneReady{}, err
 			}
 			if ok {
-				reinforceExternalV2DataPlaneReady(ctx, client, peerDERP, rawDirect, candidates, candidateSets, auth)
+				reinforceExternalV2DataPlaneReady(ctx, client, peerDERP, phase, rawDirect, candidates, candidateSets, auth)
 				return ready, nil
 			}
 		case <-ticker.C:
-			if err := sendExternalV2DataPlaneReady(readyCtx, client, peerDERP, rawDirect, candidates, candidateSets, auth); err != nil {
+			if err := sendExternalV2DataPlaneReady(readyCtx, client, peerDERP, phase, rawDirect, candidates, candidateSets, auth); err != nil {
 				return externalV2DataPlaneReady{}, err
 			}
 		case <-readyCtx.Done():
@@ -447,8 +502,23 @@ func exchangeExternalV2DataPlaneReady(ctx context.Context, client *derpbind.Clie
 	}
 }
 
-func reinforceExternalV2DataPlaneReady(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, rawDirect bool, candidates []string, candidateSets [][]string, auth externalPeerControlAuth) {
-	_ = sendExternalV2DataPlaneReady(ctx, client, peerDERP, rawDirect, candidates, candidateSets, auth)
+func externalV2DataPlaneReadyFromPacket(pkt derpbind.Packet, packetOK bool, phase string, auth externalPeerControlAuth) (externalV2DataPlaneReady, bool, error) {
+	if !packetOK {
+		return externalV2DataPlaneReady{}, false, ErrPeerDisconnected
+	}
+	ready, ok, err := externalV2DataPlaneReadyFromPayload(pkt.Payload, auth)
+	if err != nil || !ok || !externalV2DataPlaneReadyPhaseMatches(ready.Phase, phase) {
+		return externalV2DataPlaneReady{}, false, err
+	}
+	return ready, true, nil
+}
+
+func externalV2DataPlaneReadyPhaseMatches(got string, want string) bool {
+	return got == want || (got == "" && want == externalV2DataPlanePhaseCandidates)
+}
+
+func reinforceExternalV2DataPlaneReady(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, phase string, rawDirect bool, candidates []string, candidateSets [][]string, auth externalPeerControlAuth) {
+	_ = sendExternalV2DataPlaneReady(ctx, client, peerDERP, phase, rawDirect, candidates, candidateSets, auth)
 	go func() {
 		deadline := time.NewTimer(externalV2DataPlaneReinforce)
 		defer deadline.Stop()
@@ -461,14 +531,14 @@ func reinforceExternalV2DataPlaneReady(ctx context.Context, client *derpbind.Cli
 			case <-deadline.C:
 				return
 			case <-ticker.C:
-				_ = sendExternalV2DataPlaneReady(ctx, client, peerDERP, rawDirect, candidates, candidateSets, auth)
+				_ = sendExternalV2DataPlaneReady(ctx, client, peerDERP, phase, rawDirect, candidates, candidateSets, auth)
 			}
 		}
 	}()
 }
 
-func sendExternalV2DataPlaneReady(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, rawDirect bool, candidates []string, candidateSets [][]string, auth externalPeerControlAuth) error {
-	ready := externalV2DataPlaneReady{Protocol: externalV2Protocol, RawDirect: rawDirect, Candidates: candidates, CandidateSets: candidateSets}
+func sendExternalV2DataPlaneReady(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, phase string, rawDirect bool, candidates []string, candidateSets [][]string, auth externalPeerControlAuth) error {
+	ready := externalV2DataPlaneReady{Protocol: externalV2Protocol, Phase: phase, RawDirect: rawDirect, Candidates: candidates, CandidateSets: candidateSets}
 	return sendAuthenticatedEnvelope(ctx, client, peerDERP, envelope{
 		Type:             envelopeV2DataPlaneReady,
 		V2DataPlaneReady: &ready,

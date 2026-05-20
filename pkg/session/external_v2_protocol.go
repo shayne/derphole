@@ -46,6 +46,7 @@ type externalV2Complete struct {
 
 type externalV2DataPlaneReady struct {
 	Protocol      string     `json:"protocol"`
+	Phase         string     `json:"phase,omitempty"`
 	RawDirect     bool       `json:"raw_direct,omitempty"`
 	Candidates    []string   `json:"candidates,omitempty"`
 	CandidateSets [][]string `json:"candidate_sets,omitempty"`

@@ -40,6 +40,30 @@ func TestExternalV2DataPacketSelectionRequiresObservedPunchByDefault(t *testing.
 	}
 }
 
+func TestExternalV2DataPlaneReadyPhaseMatchesOnlyExpectedPhase(t *testing.T) {
+	if !externalV2DataPlaneReadyPhaseMatches(externalV2DataPlanePhaseCandidates, externalV2DataPlanePhaseCandidates) {
+		t.Fatal("candidate phase did not match itself")
+	}
+	if !externalV2DataPlaneReadyPhaseMatches("", externalV2DataPlanePhaseCandidates) {
+		t.Fatal("legacy empty phase did not match candidate phase")
+	}
+	if externalV2DataPlaneReadyPhaseMatches(externalV2DataPlanePhaseCandidates, externalV2DataPlanePhaseSelection) {
+		t.Fatal("candidate phase matched selection phase")
+	}
+	if externalV2DataPlaneReadyPhaseMatches("", externalV2DataPlanePhaseSelection) {
+		t.Fatal("legacy empty phase matched selection phase")
+	}
+}
+
+func TestFormatExternalV2SelectedAddrsReportsNoneForEmptyLaneSelections(t *testing.T) {
+	if got := formatExternalV2SelectedAddrs([]string{"", "", ""}); got != "none" {
+		t.Fatalf("formatted selected addrs = %q, want none", got)
+	}
+	if got, want := formatExternalV2SelectedAddrs([]string{"", "203.0.113.10:1234", ""}), "203.0.113.10:1234"; got != want {
+		t.Fatalf("formatted selected addrs = %q, want %q", got, want)
+	}
+}
+
 func TestSelectExternalV2DataPacketAddrsUsesObservedFlatCandidates(t *testing.T) {
 	conns := listenUDPConnsForExternalV2DataPacketTest(t, 2)
 	observed := parseCandidateStrings([]string{"127.0.0.1:41001", "127.0.0.1:41002"})
@@ -138,6 +162,24 @@ func TestSelectExternalV2DataPacketAddrsBySetFiltersObservedTailscaleInInternetO
 
 	if got := selectExternalV2DataPacketAddrs(context.Background(), conns, peerCandidateSets, nil, nil); len(got) != 0 {
 		t.Fatalf("selected addrs = %v, want no raw-direct promotion from set-mapped Tailscale observation in internet-only mode", got)
+	}
+}
+
+func TestFinalizeExternalV2RawDirectPathRequiresPeerRawSelection(t *testing.T) {
+	closed := false
+	path := externalV2DirectPacketPath{
+		raw: true,
+		cleanup: func() {
+			closed = true
+		},
+	}
+
+	got := finalizeExternalV2RawDirectPath(path, false, nil)
+	if got.raw {
+		t.Fatal("finalized path uses raw-direct when peer selected manager, want manager fallback")
+	}
+	if !closed {
+		t.Fatal("raw-direct resources were not closed after peer selected manager")
 	}
 }
 
