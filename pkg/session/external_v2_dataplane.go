@@ -89,6 +89,8 @@ func exchangeExternalV2RawDirectPeer(ctx context.Context, client *derpbind.Clien
 	if err != nil {
 		return externalV2DataPlaneReady{}, nil, err
 	}
+	peerReady.Candidates = filterExternalV2DataPacketCandidateStrings(peerReady.Candidates)
+	peerReady.CandidateSets = filterExternalV2DataPacketCandidateSets(peerReady.CandidateSets)
 	peerCandidates := parseCandidateStrings(peerReady.Candidates)
 	emitExternalV2Debug(emitter, "v2-raw-direct-peer="+boolString(peerReady.RawDirect)+" candidates="+strconv.Itoa(len(peerCandidates)))
 	return peerReady, peerCandidates, nil
@@ -203,11 +205,16 @@ func selectExternalV2DataPacketAddrs(ctx context.Context, conns []net.PacketConn
 }
 
 func selectExternalV2DataPacketAddrsByFlatCandidates(ctx context.Context, conns []net.PacketConn, peerCandidates []net.Addr, emitter *telemetry.Emitter) []net.Addr {
+	peerCandidates = filterExternalV2DataPacketAddrs(peerCandidates)
+	if len(peerCandidates) == 0 {
+		return nil
+	}
 	punchCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go externalDirectUDPStartPunching(punchCtx, conns, peerCandidates)
 
 	observedByConn := externalDirectUDPObservePunchAddrsByConn(ctx, conns, externalDirectUDPPunchWait)
+	observedByConn = filterExternalV2DataPacketObservedAddrs(observedByConn)
 	if emitter != nil {
 		emitter.Debug("v2-raw-direct-observed-addrs=" + externalDirectUDPFormatObservedAddrsByConn(observedByConn))
 	}
@@ -227,6 +234,7 @@ func selectExternalV2DataPacketAddrsByFlatCandidates(ctx context.Context, conns 
 }
 
 func selectExternalV2DataPacketAddrsBySet(ctx context.Context, conns []net.PacketConn, peerCandidateSets [][]string, emitter *telemetry.Emitter) []net.Addr {
+	peerCandidateSets = filterExternalV2DataPacketCandidateSets(peerCandidateSets)
 	count := externalV2DataPacketSetCount(conns, peerCandidateSets)
 	if count == 0 {
 		return nil
@@ -241,6 +249,7 @@ func selectExternalV2DataPacketAddrsBySet(ctx context.Context, conns []net.Packe
 		go externalDirectUDPStartPunching(punchCtx, []net.PacketConn{conns[i]}, peerAddrsBySet[i])
 	}
 	observedByConn := externalDirectUDPObservePunchAddrsByConn(ctx, conns[:count], externalDirectUDPPunchWait)
+	observedByConn = filterExternalV2DataPacketObservedAddrs(observedByConn)
 	if emitter != nil {
 		emitter.Debug("v2-raw-direct-observed-addrs=" + externalDirectUDPFormatObservedAddrsByConn(observedByConn))
 	}
@@ -256,6 +265,55 @@ func selectExternalV2DataPacketAddrsBySet(ctx context.Context, conns []net.Packe
 		emitter.Debug("v2-raw-direct-fallback-addrs=" + strings.Join(fallback, ","))
 	}
 	return selectedExternalV2DataPacketAddrs(conns[:count], selected, fallback, false)
+}
+
+func filterExternalV2DataPacketObservedAddrs(observedByConn [][]net.Addr) [][]net.Addr {
+	filtered := make([][]net.Addr, len(observedByConn))
+	for i, observed := range observedByConn {
+		filtered[i] = filterExternalV2DataPacketAddrs(observed)
+	}
+	return filtered
+}
+
+func filterExternalV2DataPacketAddrs(addrs []net.Addr) []net.Addr {
+	if len(addrs) == 0 {
+		return nil
+	}
+	filtered := make([]net.Addr, 0, len(addrs))
+	for _, addr := range addrs {
+		addrPort, ok := externalDirectUDPAddrPort(addr)
+		if !ok || !publicProbeCandidateAllowed(addrPort.Addr()) {
+			continue
+		}
+		filtered = append(filtered, addr)
+	}
+	return filtered
+}
+
+func filterExternalV2DataPacketCandidateSets(candidateSets [][]string) [][]string {
+	if len(candidateSets) == 0 {
+		return nil
+	}
+	filtered := make([][]string, len(candidateSets))
+	for i, candidates := range candidateSets {
+		filtered[i] = filterExternalV2DataPacketCandidateStrings(candidates)
+	}
+	return filtered
+}
+
+func filterExternalV2DataPacketCandidateStrings(candidates []string) []string {
+	if len(candidates) == 0 {
+		return nil
+	}
+	filtered := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		addrPort, ok := externalDirectUDPParsedCandidateAddrPort(candidate)
+		if !ok || !publicProbeCandidateAllowed(addrPort.Addr()) {
+			continue
+		}
+		filtered = append(filtered, addrPort.String())
+	}
+	return filtered
 }
 
 func externalV2DataPacketSetCount(conns []net.PacketConn, peerCandidateSets [][]string) int {

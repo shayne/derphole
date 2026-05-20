@@ -95,6 +95,52 @@ func TestSelectExternalV2DataPacketAddrsKeepsCandidateSetsLaneMapped(t *testing.
 	}
 }
 
+func TestSelectExternalV2DataPacketAddrsFiltersObservedTailscaleInInternetOnlyMode(t *testing.T) {
+	t.Setenv("DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES", "1")
+	conns := listenUDPConnsForExternalV2DataPacketTest(t, 1)
+	observed := parseCandidateStrings([]string{"100.125.235.82:60438"})
+	peerCandidates := parseCandidateStrings([]string{"100.125.235.82:60438", "108.18.210.122:60438"})
+
+	prevObserve := externalDirectUDPObservePunchAddrsByConn
+	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+		return [][]net.Addr{{observed[0]}}
+	}
+	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = prevObserve })
+
+	prevRoute := externalDirectUDPRouteCandidate
+	externalDirectUDPRouteCandidate = func(net.PacketConn, string) bool {
+		return true
+	}
+	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
+
+	if got := selectExternalV2DataPacketAddrs(context.Background(), conns, nil, peerCandidates, nil); len(got) != 0 {
+		t.Fatalf("selected addrs = %v, want no raw-direct promotion from Tailscale observation in internet-only mode", got)
+	}
+}
+
+func TestSelectExternalV2DataPacketAddrsBySetFiltersObservedTailscaleInInternetOnlyMode(t *testing.T) {
+	t.Setenv("DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES", "1")
+	conns := listenUDPConnsForExternalV2DataPacketTest(t, 1)
+	observed := parseCandidateStrings([]string{"100.125.235.82:60438"})
+	peerCandidateSets := [][]string{{"100.125.235.82:60438", "108.18.210.122:60438"}}
+
+	prevObserve := externalDirectUDPObservePunchAddrsByConn
+	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+		return [][]net.Addr{{observed[0]}}
+	}
+	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = prevObserve })
+
+	prevRoute := externalDirectUDPRouteCandidate
+	externalDirectUDPRouteCandidate = func(net.PacketConn, string) bool {
+		return true
+	}
+	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
+
+	if got := selectExternalV2DataPacketAddrs(context.Background(), conns, peerCandidateSets, nil, nil); len(got) != 0 {
+		t.Fatalf("selected addrs = %v, want no raw-direct promotion from set-mapped Tailscale observation in internet-only mode", got)
+	}
+}
+
 func listenUDPConnsForExternalV2DataPacketTest(t *testing.T, count int) []net.PacketConn {
 	t.Helper()
 	conns := make([]net.PacketConn, 0, count)

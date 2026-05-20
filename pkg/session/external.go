@@ -2554,10 +2554,15 @@ func publicProbeCandidateAllowed(ip netip.Addr) bool {
 	if !publicProbeTailscaleCGNATPrefix.Contains(ip) && !publicProbeTailscaleULAPrefix.Contains(ip) {
 		return true
 	}
-	if os.Getenv("DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES") == "1" {
+	if publicProbeTailscaleCandidatesDisabled() {
 		return false
 	}
 	return true
+}
+
+func publicProbeTailscaleCandidatesDisabled() bool {
+	return os.Getenv("DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES") == "1" ||
+		os.Getenv("DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES") == "1"
 }
 
 func publicProbeAddrs(ctx context.Context, conn net.PacketConn, dm *tailcfg.DERPMap, pm publicPortmap) []net.Addr {
