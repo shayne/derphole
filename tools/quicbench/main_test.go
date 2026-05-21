@@ -51,6 +51,18 @@ func TestParseSendArgsReverse(t *testing.T) {
 	}
 }
 
+func TestParseSendArgsUni(t *testing.T) {
+	t.Parallel()
+
+	got, err := parseSendArgs([]string{"--uni", "127.0.0.1:1234", "128MiB"})
+	if err != nil {
+		t.Fatalf("parseSendArgs() error = %v", err)
+	}
+	if !got.uni {
+		t.Fatal("uni = false, want true")
+	}
+}
+
 func TestParseSendArgsStreams(t *testing.T) {
 	t.Parallel()
 
@@ -136,7 +148,10 @@ func TestSendLocalBindAddrUsesPeerRouteIP(t *testing.T) {
 func TestQUICBenchForwardAndReverseTransfers(t *testing.T) {
 	t.Parallel()
 
-	cases := []sendArgs{{bytesToSend: 4097, streams: 2, connections: 2}}
+	cases := []sendArgs{
+		{bytesToSend: 4097, streams: 2, connections: 2},
+		{bytesToSend: 4097, uni: true, streams: 2, connections: 2},
+	}
 	for _, tc := range cases {
 		tc := tc
 		name := "forward"
@@ -310,7 +325,7 @@ func runQUICBenchTransfer(t *testing.T, cfg sendArgs) {
 func TestBenchRequestRoundTripAndValidation(t *testing.T) {
 	t.Parallel()
 
-	want := sendArgs{bytesToSend: 12345, reverse: true, streams: 3, connections: 2}
+	want := sendArgs{bytesToSend: 12345, reverse: true, uni: true, streams: 3, connections: 2}
 	var buf bytes.Buffer
 	if err := writeBenchRequest(&buf, want); err != nil {
 		t.Fatalf("writeBenchRequest() error = %v", err)

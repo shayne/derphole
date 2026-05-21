@@ -7,6 +7,7 @@ package session
 import (
 	"context"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -40,6 +41,8 @@ type externalV2DirectPacketPath struct {
 	raw     bool
 	cleanup func()
 }
+
+var externalV2InterfaceAddrs = net.InterfaceAddrs
 
 func (p externalV2DirectPacketPath) Close() {
 	if p.cleanup != nil {
@@ -268,13 +271,13 @@ func selectExternalV2DataPacketAddrsByFlatCandidates(ctx context.Context, conns 
 	if emitter != nil {
 		emitter.Debug("v2-raw-direct-selected-addrs=" + formatExternalV2SelectedAddrs(selected))
 	}
-	if !externalV2DataPacketSelectionObserved(ctx, selected, emitter) {
-		return nil
-	}
 	fallback := externalDirectUDPParallelCandidateStringsForPeer(peerCandidates, len(conns), nil)
 	fallback = externalDirectUDPFilterFallbackAddrsForSelectedScope(selected, fallback)
 	if emitter != nil {
 		emitter.Debug("v2-raw-direct-fallback-addrs=" + strings.Join(fallback, ","))
+	}
+	if !externalV2DataPacketSelectionAllowed(ctx, conns, selected, fallback, true, emitter) {
+		return nil
 	}
 	return selectedExternalV2DataPacketAddrs(conns, selected, fallback, true)
 }
@@ -303,12 +306,12 @@ func selectExternalV2DataPacketAddrsBySet(ctx context.Context, conns []net.Packe
 	if emitter != nil {
 		emitter.Debug("v2-raw-direct-selected-addrs=" + formatExternalV2SelectedAddrs(selected))
 	}
-	if !externalV2DataPacketSelectionObserved(ctx, selected, emitter) {
-		return nil
-	}
-	fallback := fallbackExternalV2DataPacketSetAddrs(peerAddrsBySet, count)
+	fallback := fallbackExternalV2DataPacketSetAddrs(conns, peerAddrsBySet, count)
 	if emitter != nil {
 		emitter.Debug("v2-raw-direct-fallback-addrs=" + strings.Join(fallback, ","))
+	}
+	if !externalV2DataPacketSelectionAllowed(ctx, conns[:count], selected, fallback, false, emitter) {
+		return nil
 	}
 	return selectedExternalV2DataPacketAddrs(conns[:count], selected, fallback, false)
 }
@@ -411,15 +414,33 @@ func selectedExternalV2DataPacketSetAddrs(observedByConn [][]net.Addr, count int
 	return selected
 }
 
-func fallbackExternalV2DataPacketSetAddrs(peerAddrsBySet [][]net.Addr, count int) []string {
+func fallbackExternalV2DataPacketSetAddrs(conns []net.PacketConn, peerAddrsBySet [][]net.Addr, count int) []string {
 	fallback := make([]string, count)
 	for i := range count {
+		if i < len(conns) {
+			if candidate := externalV2DataPacketRoutablePrivateFallback(conns[i], peerAddrsBySet[i]); candidate != "" {
+				fallback[i] = candidate
+				continue
+			}
+		}
 		candidates := externalDirectUDPParallelCandidateStringsForPeer(peerAddrsBySet[i], 1, nil)
 		if len(candidates) > 0 {
 			fallback[i] = candidates[0]
 		}
 	}
 	return fallback
+}
+
+func externalV2DataPacketRoutablePrivateFallback(conn net.PacketConn, candidates []net.Addr) string {
+	for _, candidate := range externalDirectUDPOrderedCandidateStringsForPeer(candidates, nil) {
+		if !externalV2DataPacketUsablePrivateFallback(candidate) {
+			continue
+		}
+		if externalDirectUDPRouteCandidate(conn, candidate) {
+			return candidate
+		}
+	}
+	return ""
 }
 
 func selectedExternalV2DataPacketAddrs(conns []net.PacketConn, selected []string, fallback []string, allowFallbackPool bool) []net.Addr {
@@ -448,10 +469,81 @@ func externalV2DataPacketSelectionObserved(ctx context.Context, selected []strin
 	return false
 }
 
+func externalV2DataPacketSelectionAllowed(ctx context.Context, conns []net.PacketConn, selected []string, fallback []string, allowFallbackPool bool, emitter *telemetry.Emitter) bool {
+	if externalV2DataPacketSelectionObserved(ctx, selected, nil) {
+		return true
+	}
+	if externalV2DataPacketHasRoutablePrivateFallback(conns, fallback, allowFallbackPool) {
+		return true
+	}
+	if emitter != nil {
+		emitter.Debug("v2-raw-direct-no-observed-addrs")
+	}
+	return false
+}
+
+func externalV2DataPacketHasRoutablePrivateFallback(conns []net.PacketConn, fallback []string, allowFallbackPool bool) bool {
+	for i, conn := range conns {
+		for _, candidate := range externalV2DataPacketFallbackCandidatesForLane(i, fallback, allowFallbackPool) {
+			if !externalV2DataPacketUsablePrivateFallback(candidate) {
+				continue
+			}
+			if externalDirectUDPRouteCandidate(conn, candidate) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func externalV2DataPacketFallbackCandidatesForLane(index int, fallback []string, allowFallbackPool bool) []string {
+	candidates := make([]string, 0, 1+len(fallback))
+	if index >= 0 && index < len(fallback) && fallback[index] != "" {
+		candidates = append(candidates, fallback[index])
+	}
+	if allowFallbackPool {
+		candidates = append(candidates, fallback...)
+	}
+	return candidates
+}
+
+func externalV2DataPacketUsablePrivateFallback(candidate string) bool {
+	addrPort, ok := externalDirectUDPParsedCandidateAddrPort(candidate)
+	return ok && externalV2DataPacketOnLinkPrivateAddr(addrPort.Addr())
+}
+
+func externalV2DataPacketOnLinkPrivateAddr(addr netip.Addr) bool {
+	if !addr.IsValid() || !addr.IsPrivate() {
+		return false
+	}
+	prefixes, err := externalV2InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, rawPrefix := range prefixes {
+		if externalV2DataPacketPrefixContainsPrivatePeer(rawPrefix, addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func externalV2DataPacketPrefixContainsPrivatePeer(rawPrefix net.Addr, addr netip.Addr) bool {
+	prefix, err := netip.ParsePrefix(rawPrefix.String())
+	if err != nil {
+		return false
+	}
+	local := prefix.Addr()
+	if !local.IsValid() || !local.IsPrivate() || local.IsLoopback() || local == addr {
+		return false
+	}
+	return prefix.Contains(addr)
+}
+
 func selectExternalV2DataPacketCandidate(conn net.PacketConn, index int, selected []string, fallback []string, allowFallbackPool bool) string {
 	candidates := make([]string, 0, 1+len(fallback))
 	if index < len(selected) && selected[index] != "" {
-		candidates = append(candidates, selected[index])
+		return selected[index]
 	}
 	if index < len(fallback) && fallback[index] != "" {
 		candidates = append(candidates, fallback[index])

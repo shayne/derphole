@@ -22,14 +22,15 @@ import (
 )
 
 const listenUsage = "usage: quicbench listen [addr]"
-const sendUsage = "usage: quicbench send [--reverse] [--streams N] [--connections N] <addr> <bytes>"
+const sendUsage = "usage: quicbench send [--reverse] [--uni] [--streams N] [--connections N] <addr> <bytes>"
 const copyBufferSize = 256 << 10
-const requestHeaderSize = 13
+const requestHeaderSize = 14
 
 type sendArgs struct {
 	addr        string
 	bytesToSend int64
 	reverse     bool
+	uni         bool
 	streams     int
 	connections int
 }
@@ -113,7 +114,7 @@ func listenQUIC(addr string) (net.PacketConn, *quic.Listener, error) {
 		_ = udpConn.Close()
 		return nil, nil, err
 	}
-	listener, err := quic.Listen(udpConn, quicpath.DefaultTLSConfig(cert, quicpath.ServerName), quicpath.DefaultQUICConfig())
+	listener, err := quic.Listen(udpConn, quicpath.DefaultTLSConfig(cert, quicpath.ServerName), benchQUICConfig())
 	if err != nil {
 		_ = udpConn.Close()
 		return nil, nil, err
@@ -211,7 +212,7 @@ func dialInitialQUICConn(addr string) (*quic.Transport, []*quic.Conn, error) {
 		return nil, nil, err
 	}
 	transport := &quic.Transport{Conn: udpConn}
-	conn, err := transport.Dial(context.Background(), serverAddr, quicpath.DefaultClientTLSConfig(), quicpath.DefaultQUICConfig())
+	conn, err := transport.Dial(context.Background(), serverAddr, quicpath.DefaultClientTLSConfig(), benchQUICConfig())
 	if err != nil {
 		_ = transport.Close()
 		return nil, nil, err
@@ -240,7 +241,7 @@ func dialExtraQUICConns(transport *quic.Transport, serverAddr net.Addr, conns []
 		return conns, fmt.Errorf("unexpected QUIC remote address %T", serverAddr)
 	}
 	for len(conns) < want {
-		conn, err := transport.Dial(context.Background(), udpAddr, quicpath.DefaultClientTLSConfig(), quicpath.DefaultQUICConfig())
+		conn, err := transport.Dial(context.Background(), udpAddr, quicpath.DefaultClientTLSConfig(), benchQUICConfig())
 		if err != nil {
 			return conns, err
 		}
@@ -283,6 +284,9 @@ func parseSendOption(cfg *sendArgs, args []string) ([]string, bool, error) {
 	case "--reverse":
 		cfg.reverse = true
 		return args[1:], true, nil
+	case "--uni":
+		cfg.uni = true
+		return args[1:], true, nil
 	case "--streams":
 		return parsePositiveIntOption(args, &cfg.streams)
 	case "--connections":
@@ -322,6 +326,9 @@ func writeBenchRequest(stream io.Writer, cfg sendArgs) error {
 	if cfg.reverse {
 		header[0] = 1
 	}
+	if cfg.uni {
+		header[13] = 1
+	}
 	binary.BigEndian.PutUint64(header[1:], uint64(cfg.bytesToSend))
 	binary.BigEndian.PutUint16(header[9:], uint16(cfg.streams))
 	binary.BigEndian.PutUint16(header[11:], uint16(cfg.connections))
@@ -345,65 +352,37 @@ func readBenchRequest(stream io.Reader) (sendArgs, error) {
 	return sendArgs{
 		bytesToSend: int64(binary.BigEndian.Uint64(header[1:])),
 		reverse:     header[0] == 1,
+		uni:         header[13] == 1,
 		streams:     streams,
 		connections: connections,
 	}, nil
 }
 
 func runListenForwardStreams(conns []*quic.Conn, cfg sendArgs) (int64, error) {
-	return drainIncomingStreams(conns, cfg.streams)
+	return drainIncomingStreams(conns, cfg)
 }
 
 func runListenReverseStreams(conns []*quic.Conn, cfg sendArgs) (int64, error) {
-	streams := make([]*quic.Stream, 0, len(conns)*cfg.streams)
-	for _, conn := range conns {
-		for range cfg.streams {
-			stream, err := conn.OpenStreamSync(context.Background())
-			if err != nil {
-				return 0, err
-			}
-			streams = append(streams, stream)
-		}
+	streams, err := openOutgoingStreams(conns, cfg)
+	if err != nil {
+		return 0, err
 	}
 	return transferFixedStreams(streams, cfg.bytesToSend)
 }
 
 func runSendForwardStreams(conns []*quic.Conn, cfg sendArgs) (int64, error) {
-	streams := make([]*quic.Stream, 0, len(conns)*cfg.streams)
-	for _, conn := range conns {
-		for range cfg.streams {
-			stream, err := conn.OpenStreamSync(context.Background())
-			if err != nil {
-				return 0, err
-			}
-			streams = append(streams, stream)
-		}
+	streams, err := openOutgoingStreams(conns, cfg)
+	if err != nil {
+		return 0, err
 	}
 	return transferFixedStreams(streams, cfg.bytesToSend)
 }
 
-func runSendReverseStreams(conns []*quic.Conn, cfg sendArgs) (int64, error) {
-	return drainIncomingStreams(conns, cfg.streams)
-}
-
-type streamResult struct {
-	n   int64
-	err error
-}
-
-func drainIncomingStreams(conns []*quic.Conn, streamCount int) (int64, error) {
-	streams, err := acceptIncomingStreams(conns, streamCount)
-	if err != nil {
-		return 0, err
-	}
-	return drainStreams(streams)
-}
-
-func acceptIncomingStreams(conns []*quic.Conn, streamCount int) ([]*quic.Stream, error) {
-	streams := make([]*quic.Stream, 0, len(conns)*streamCount)
+func openOutgoingStreams(conns []*quic.Conn, cfg sendArgs) ([]io.WriteCloser, error) {
+	streams := make([]io.WriteCloser, 0, len(conns)*cfg.streams)
 	for _, conn := range conns {
-		for range streamCount {
-			stream, err := conn.AcceptStream(context.Background())
+		for range cfg.streams {
+			stream, err := openOutgoingStream(conn, cfg.uni)
 			if err != nil {
 				return nil, err
 			}
@@ -413,7 +392,69 @@ func acceptIncomingStreams(conns []*quic.Conn, streamCount int) ([]*quic.Stream,
 	return streams, nil
 }
 
-func drainStreams(streams []*quic.Stream) (int64, error) {
+func openOutgoingStream(conn *quic.Conn, uni bool) (io.WriteCloser, error) {
+	if uni {
+		return conn.OpenUniStreamSync(context.Background())
+	}
+	return conn.OpenStreamSync(context.Background())
+}
+
+func runSendReverseStreams(conns []*quic.Conn, cfg sendArgs) (int64, error) {
+	return drainIncomingStreams(conns, cfg)
+}
+
+type streamResult struct {
+	n   int64
+	err error
+}
+
+func drainIncomingStreams(conns []*quic.Conn, cfg sendArgs) (int64, error) {
+	streams, err := acceptIncomingStreams(conns, cfg)
+	if err != nil {
+		return 0, err
+	}
+	return drainStreams(streams)
+}
+
+func acceptIncomingStreams(conns []*quic.Conn, cfg sendArgs) ([]io.ReadCloser, error) {
+	streams := make([]io.ReadCloser, 0, len(conns)*cfg.streams)
+	for _, conn := range conns {
+		for range cfg.streams {
+			stream, err := acceptIncomingStream(conn, cfg.uni)
+			if err != nil {
+				return nil, err
+			}
+			streams = append(streams, stream)
+		}
+	}
+	return streams, nil
+}
+
+func acceptIncomingStream(conn *quic.Conn, uni bool) (io.ReadCloser, error) {
+	if uni {
+		stream, err := conn.AcceptUniStream(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		return receiveStreamReadCloser{stream: stream}, nil
+	}
+	return conn.AcceptStream(context.Background())
+}
+
+type receiveStreamReadCloser struct {
+	stream *quic.ReceiveStream
+}
+
+func (r receiveStreamReadCloser) Read(p []byte) (int, error) {
+	return r.stream.Read(p)
+}
+
+func (r receiveStreamReadCloser) Close() error {
+	r.stream.CancelRead(0)
+	return nil
+}
+
+func drainStreams(streams []io.ReadCloser) (int64, error) {
 	results := make(chan streamResult, len(streams))
 	var wg sync.WaitGroup
 	for _, stream := range streams {
@@ -425,7 +466,7 @@ func drainStreams(streams []*quic.Stream) (int64, error) {
 	return collectStreamResults(results)
 }
 
-func drainStream(stream *quic.Stream, results chan<- streamResult, wg *sync.WaitGroup) {
+func drainStream(stream io.ReadCloser, results chan<- streamResult, wg *sync.WaitGroup) {
 	defer wg.Done()
 	n, err := io.CopyBuffer(io.Discard, stream, make([]byte, copyBufferSize))
 	_ = stream.Close()
@@ -443,7 +484,7 @@ func collectStreamResults(results <-chan streamResult) (int64, error) {
 	return total, nil
 }
 
-func transferFixedStreams(streams []*quic.Stream, bytesToSend int64) (int64, error) {
+func transferFixedStreams(streams []io.WriteCloser, bytesToSend int64) (int64, error) {
 	results := make(chan streamResult, len(streams))
 	var wg sync.WaitGroup
 	for i, stream := range streams {
@@ -455,7 +496,7 @@ func transferFixedStreams(streams []*quic.Stream, bytesToSend int64) (int64, err
 	return collectStreamResults(results)
 }
 
-func transferFixedStream(stream *quic.Stream, bytesToSend int64, results chan<- streamResult, wg *sync.WaitGroup) {
+func transferFixedStream(stream io.WriteCloser, bytesToSend int64, results chan<- streamResult, wg *sync.WaitGroup) {
 	defer wg.Done()
 	n, err := io.CopyBuffer(stream, io.LimitReader(zeroReader{}, bytesToSend), make([]byte, copyBufferSize))
 	if closeErr := stream.Close(); err == nil {
@@ -473,6 +514,12 @@ func closeQUICConns(conns []*quic.Conn) {
 	for _, conn := range conns {
 		_ = conn.CloseWithError(0, "")
 	}
+}
+
+func benchQUICConfig() *quic.Config {
+	cfg := quicpath.DefaultQUICConfig()
+	cfg.MaxIncomingUniStreams = quicpath.MaxIncomingStreams
+	return cfg
 }
 
 func bytesForStream(total int64, streamCount, index int) int64 {
