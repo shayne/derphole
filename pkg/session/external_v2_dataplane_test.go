@@ -211,6 +211,52 @@ func TestSelectExternalV2DataPacketAddrsAllowsRoutablePrivateFallbackWithoutObse
 	}
 }
 
+func TestSelectExternalV2DataPacketAddrsUsesOnLinkFallbackWithoutPunchObserve(t *testing.T) {
+	setExternalV2DataPacketTestInterfaceAddrs(t, "192.168.10.2/24")
+	conns := listenUDPConnsForExternalV2DataPacketTest(t, 1)
+	peerCandidateSets := [][]string{{"192.168.10.42:50000"}}
+
+	prevObserve := externalDirectUDPObservePunchAddrsByConn
+	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+		t.Fatal("punch observer called for on-link private fallback")
+		return nil
+	}
+	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = prevObserve })
+
+	prevRoute := externalDirectUDPRouteCandidate
+	externalDirectUDPRouteCandidate = func(_ net.PacketConn, candidate string) bool {
+		return candidate == "192.168.10.42:50000"
+	}
+	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
+
+	got := selectExternalV2DataPacketAddrs(context.Background(), conns, peerCandidateSets, nil, nil, 0)
+	if len(got) != 1 || got[0].String() != "192.168.10.42:50000" {
+		t.Fatalf("selected addrs = %v, want clean on-link private fallback", got)
+	}
+}
+
+func TestSelectExternalV2DataPacketAddrsIgnoresIPv6OnLinkFallbackForUDP4Path(t *testing.T) {
+	setExternalV2DataPacketTestInterfaceAddrs(t, "fd37:89f2:37b4:4af8::2/64")
+	conns := listenUDPConnsForExternalV2DataPacketTest(t, 1)
+	peerCandidateSets := [][]string{{"[fd37:89f2:37b4:4af8::42]:50000"}}
+
+	prevObserve := externalDirectUDPObservePunchAddrsByConn
+	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+		return [][]net.Addr{{}}
+	}
+	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = prevObserve })
+
+	prevRoute := externalDirectUDPRouteCandidate
+	externalDirectUDPRouteCandidate = func(net.PacketConn, string) bool {
+		return true
+	}
+	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
+
+	if got := selectExternalV2DataPacketAddrs(context.Background(), conns, peerCandidateSets, nil, nil, 0); len(got) != 0 {
+		t.Fatalf("selected addrs = %v, want no IPv6 fallback for udp4 raw-direct path", got)
+	}
+}
+
 func TestSelectExternalV2DataPacketAddrsRejectsOffLinkPrivateFallbackWithoutObservedPunch(t *testing.T) {
 	setExternalV2DataPacketTestInterfaceAddrs(t, "192.168.10.2/24")
 	conns := listenUDPConnsForExternalV2DataPacketTest(t, 1)
