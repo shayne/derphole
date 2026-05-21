@@ -43,6 +43,7 @@ type externalV2DirectPacketPath struct {
 }
 
 var externalV2InterfaceAddrs = net.InterfaceAddrs
+var externalV2DefaultRouteIPv4 = defaultRouteIPv4
 
 func (p externalV2DirectPacketPath) Close() {
 	if p.cleanup != nil {
@@ -193,8 +194,12 @@ func openExternalV2DataPacketPath(ctx context.Context, dm *tailcfg.DERPMap, emit
 	count := externalV2RawDirectSocketCount(streamCount)
 	conns := make([]net.PacketConn, 0, count)
 	portmaps := make([]publicPortmap, 0, count)
+	listenAddr := externalV2DataPacketListenAddr()
 	for range count {
-		conn, err := net.ListenPacket("udp4", ":0")
+		conn, err := net.ListenPacket("udp4", listenAddr)
+		if err != nil && listenAddr != ":0" {
+			conn, err = net.ListenPacket("udp4", ":0")
+		}
 		if err != nil {
 			closeExternalV2DataPacketResources(conns, portmaps)
 			return externalV2DataPacketPath{}, err
@@ -212,6 +217,27 @@ func openExternalV2DataPacketPath(ctx context.Context, dm *tailcfg.DERPMap, emit
 		candidates = append(candidates, set...)
 	}
 	return externalV2DataPacketPath{conns: conns, candidates: candidates, candidateSets: candidateSets, cleanup: cleanup}, nil
+}
+
+func externalV2DataPacketListenAddr() string {
+	ip := externalV2DefaultRouteIPv4()
+	if ip == nil || ip.IsUnspecified() || ip.IsLoopback() || ip.To4() == nil {
+		return ":0"
+	}
+	return net.JoinHostPort(ip.String(), "0")
+}
+
+func defaultRouteIPv4() net.IP {
+	conn, err := net.DialTimeout("udp4", "198.51.100.1:9", 100*time.Millisecond)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = conn.Close() }()
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || addr == nil {
+		return nil
+	}
+	return addr.IP.To4()
 }
 
 func externalV2RawDirectSocketCount(streamCount int) int {

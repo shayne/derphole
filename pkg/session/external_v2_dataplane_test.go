@@ -432,6 +432,34 @@ func setExternalV2DataPacketTestInterfaceAddrs(t *testing.T, cidrs ...string) {
 	t.Cleanup(func() { externalV2InterfaceAddrs = prev })
 }
 
+func TestExternalV2DataPacketListenAddrUsesConcreteDefaultRouteIPv4(t *testing.T) {
+	prev := externalV2DefaultRouteIPv4
+	externalV2DefaultRouteIPv4 = func() net.IP {
+		return net.ParseIP("10.0.4.184")
+	}
+	t.Cleanup(func() { externalV2DefaultRouteIPv4 = prev })
+
+	if got, want := externalV2DataPacketListenAddr(), "10.0.4.184:0"; got != want {
+		t.Fatalf("externalV2DataPacketListenAddr() = %q, want %q", got, want)
+	}
+}
+
+func TestExternalV2DataPacketListenAddrFallsBackToWildcard(t *testing.T) {
+	for _, ip := range []net.IP{nil, net.IPv4(127, 0, 0, 1), net.ParseIP("::1")} {
+		t.Run(ip.String(), func(t *testing.T) {
+			prev := externalV2DefaultRouteIPv4
+			externalV2DefaultRouteIPv4 = func() net.IP {
+				return ip
+			}
+			t.Cleanup(func() { externalV2DefaultRouteIPv4 = prev })
+
+			if got, want := externalV2DataPacketListenAddr(), ":0"; got != want {
+				t.Fatalf("externalV2DataPacketListenAddr() = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestExternalV2RawDirectEnabledDefaultsOnAndCanBeDisabled(t *testing.T) {
 	t.Setenv("DERPHOLE_V2_RAW_DIRECT", "")
 	if !externalV2RawDirectEnabled() {
