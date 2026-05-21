@@ -81,7 +81,7 @@ func TestSelectExternalV2DataPacketAddrsUsesObservedFlatCandidates(t *testing.T)
 	}
 	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
 
-	got := selectExternalV2DataPacketAddrs(context.Background(), conns, nil, peerCandidates, nil)
+	got := selectExternalV2DataPacketAddrs(context.Background(), conns, nil, peerCandidates, nil, 0)
 	if len(got) != 2 {
 		t.Fatalf("selected addrs len = %d, want 2 (%v)", len(got), got)
 	}
@@ -110,7 +110,7 @@ func TestSelectExternalV2DataPacketAddrsKeepsCandidateSetsLaneMapped(t *testing.
 	}
 	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
 
-	got := selectExternalV2DataPacketAddrs(context.Background(), conns, peerCandidateSets, nil, nil)
+	got := selectExternalV2DataPacketAddrs(context.Background(), conns, peerCandidateSets, nil, nil, 0)
 	if len(got) != 2 {
 		t.Fatalf("selected addrs len = %d, want 2 (%v)", len(got), got)
 	}
@@ -137,7 +137,7 @@ func TestSelectExternalV2DataPacketAddrsFiltersObservedTailscaleInInternetOnlyMo
 	}
 	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
 
-	if got := selectExternalV2DataPacketAddrs(context.Background(), conns, nil, peerCandidates, nil); len(got) != 0 {
+	if got := selectExternalV2DataPacketAddrs(context.Background(), conns, nil, peerCandidates, nil, 0); len(got) != 0 {
 		t.Fatalf("selected addrs = %v, want no raw-direct promotion from Tailscale observation in internet-only mode", got)
 	}
 }
@@ -160,7 +160,7 @@ func TestSelectExternalV2DataPacketAddrsBySetFiltersObservedTailscaleInInternetO
 	}
 	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
 
-	if got := selectExternalV2DataPacketAddrs(context.Background(), conns, peerCandidateSets, nil, nil); len(got) != 0 {
+	if got := selectExternalV2DataPacketAddrs(context.Background(), conns, peerCandidateSets, nil, nil, 0); len(got) != 0 {
 		t.Fatalf("selected addrs = %v, want no raw-direct promotion from set-mapped Tailscale observation in internet-only mode", got)
 	}
 }
@@ -180,6 +180,42 @@ func TestFinalizeExternalV2RawDirectPathRequiresPeerRawSelection(t *testing.T) {
 	}
 	if !closed {
 		t.Fatal("raw-direct resources were not closed after peer selected manager")
+	}
+}
+
+func TestStartExternalV2DataPacketPunchingHonorsDelay(t *testing.T) {
+	local := listenUDPConnsForExternalV2DataPacketTest(t, 1)
+	receiver, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+
+	remoteAddr, err := net.ResolveUDPAddr("udp", receiver.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startExternalV2DataPacketPunching(ctx, local, []net.Addr{remoteAddr}, 100*time.Millisecond)
+
+	if err := receiver.SetReadDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1500)
+	if _, _, err := receiver.ReadFrom(buf); err == nil {
+		t.Fatal("received punch before configured delay")
+	}
+
+	if err := receiver.SetReadDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	n, _, err := receiver.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("did not receive punch after configured delay: %v", err)
+	}
+	if got := string(buf[:n]); got != "derphole-punch" {
+		t.Fatalf("punch payload = %q, want derphole-punch", got)
 	}
 }
 

@@ -149,6 +149,123 @@ func TestObservePunchAddrsByConnPreservesSocketAssociation(t *testing.T) {
 	}
 }
 
+func TestObservePunchAddrsByConnRepliesToFirstPunch(t *testing.T) {
+	receiver, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+
+	sender, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+
+	if _, err := sender.WriteTo([]byte(defaultPunchPayload), receiver.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan [][]net.Addr, 1)
+	go func() {
+		done <- ObservePunchAddrsByConn(ctx, []net.PacketConn{receiver}, 500*time.Millisecond)
+	}()
+
+	if err := sender.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1500)
+	n, addr, err := sender.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("sender did not receive punch reply: %v", err)
+	}
+	if got := string(buf[:n]); got != defaultPunchPayload {
+		t.Fatalf("punch reply payload = %q, want %q", got, defaultPunchPayload)
+	}
+	if got, want := addr.String(), receiver.LocalAddr().String(); got != want {
+		t.Fatalf("punch reply addr = %q, want %q", got, want)
+	}
+
+	select {
+	case got := <-done:
+		gotStrings := CandidateStrings(got[0])
+		if len(gotStrings) != 1 || gotStrings[0] != sender.LocalAddr().String() {
+			t.Fatalf("ObservePunchAddrsByConn()[0] = %v, want %s", gotStrings, sender.LocalAddr())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ObservePunchAddrsByConn did not return")
+	}
+}
+
+func TestObservePunchAddrsByConnRateLimitsRepeatedPunchReplies(t *testing.T) {
+	const replyInterval = 100 * time.Millisecond
+
+	receiver, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+
+	sender, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan [][]net.Addr, 1)
+	go func() {
+		done <- ObservePunchAddrsByConn(ctx, []net.PacketConn{receiver}, 350*time.Millisecond)
+	}()
+
+	sendPunch := func() {
+		t.Helper()
+		if _, err := sender.WriteTo([]byte(defaultPunchPayload), receiver.LocalAddr()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	readReply := func(deadline time.Time) bool {
+		t.Helper()
+		if err := sender.SetReadDeadline(deadline); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 1500)
+		n, _, err := sender.ReadFrom(buf)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				return false
+			}
+			t.Fatal(err)
+		}
+		return string(buf[:n]) == defaultPunchPayload
+	}
+
+	sendPunch()
+	if !readReply(time.Now().Add(time.Second)) {
+		t.Fatal("first punch did not get a reply")
+	}
+
+	sendPunch()
+	if readReply(time.Now().Add(25 * time.Millisecond)) {
+		t.Fatal("duplicate punch got an immediate reply, want rate limiting")
+	}
+
+	time.Sleep(replyInterval + 25*time.Millisecond)
+	sendPunch()
+	if !readReply(time.Now().Add(time.Second)) {
+		t.Fatal("repeated punch after reply interval did not get a reply")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("ObservePunchAddrsByConn did not return")
+	}
+}
+
 func TestObservePunchAddrsByConnReturnsAfterAllConnsObserved(t *testing.T) {
 	receivers := make([]net.PacketConn, 2)
 	for i := range receivers {
@@ -174,7 +291,7 @@ func TestObservePunchAddrsByConnReturnsAfterAllConnsObserved(t *testing.T) {
 
 	startedAt := time.Now()
 	got := ObservePunchAddrsByConn(context.Background(), receivers, 500*time.Millisecond)
-	if elapsed := time.Since(startedAt); elapsed > 250*time.Millisecond {
+	if elapsed := time.Since(startedAt); elapsed > 400*time.Millisecond {
 		t.Fatalf("ObservePunchAddrsByConn() took %s after all conns were observed", elapsed)
 	}
 	if len(got) != len(receivers) {

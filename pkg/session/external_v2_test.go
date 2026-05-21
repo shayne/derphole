@@ -262,6 +262,76 @@ func TestExternalV2ReceiverCancelAbortsSender(t *testing.T) {
 	}
 }
 
+func TestExternalV2SenderCancelAbortsReceiver(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "v2")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	sendCtx, cancelSend := context.WithCancel(ctx)
+
+	tokenSink := make(chan string, 1)
+	listenErr := make(chan error, 1)
+	wrote := make(chan struct{})
+	go func() {
+		_, err := listenExternal(ctx, ListenConfig{
+			TokenSink:     tokenSink,
+			StdioOut:      &cancelPeerOnWrite{cancel: cancelSend, wrote: wrote},
+			ForceRelay:    true,
+			UsePublicDERP: true,
+		})
+		listenErr <- err
+	}()
+
+	var raw string
+	select {
+	case raw = <-tokenSink:
+	case err := <-listenErr:
+		t.Fatalf("listenExternal() returned before token: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for token: %v", ctx.Err())
+	}
+
+	sendErr := make(chan error, 1)
+	go func() {
+		sendErr <- sendExternal(sendCtx, SendConfig{
+			Token:          raw,
+			StdioIn:        &cancelablePrefixReader{ctx: sendCtx, limit: 2 << 20},
+			ForceRelay:     true,
+			UsePublicDERP:  true,
+			ParallelPolicy: FixedParallelPolicy(1),
+		})
+	}()
+
+	select {
+	case <-wrote:
+	case err := <-listenErr:
+		t.Fatalf("listenExternal() returned before canceling sender: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for receiver write: %v", ctx.Err())
+	}
+
+	select {
+	case err := <-listenErr:
+		if !errors.Is(err, ErrPeerAborted) {
+			t.Fatalf("listenExternal() error = %v, want %v", err, ErrPeerAborted)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for listener abort: %v", ctx.Err())
+	}
+
+	select {
+	case err := <-sendErr:
+		if err == nil {
+			t.Fatalf("sendExternal() error = nil, want cancellation")
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for sender exit: %v", ctx.Err())
+	}
+}
+
 func TestExternalV2TransferTraceCompletes(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
@@ -475,6 +545,42 @@ type cancelOnWrite struct {
 func (w *cancelOnWrite) Write(p []byte) (int, error) {
 	w.once.Do(w.cancel)
 	return 0, context.Canceled
+}
+
+type cancelPeerOnWrite struct {
+	once   sync.Once
+	cancel context.CancelFunc
+	wrote  chan<- struct{}
+}
+
+func (w *cancelPeerOnWrite) Write(p []byte) (int, error) {
+	w.once.Do(func() {
+		if w.wrote != nil {
+			close(w.wrote)
+		}
+		w.cancel()
+	})
+	return len(p), nil
+}
+
+type cancelablePrefixReader struct {
+	ctx   context.Context
+	limit int
+	read  int
+}
+
+func (r *cancelablePrefixReader) Read(p []byte) (int, error) {
+	if r.read < r.limit {
+		remaining := r.limit - r.read
+		if remaining < len(p) {
+			p = p[:remaining]
+		}
+		clear(p)
+		r.read += len(p)
+		return len(p), nil
+	}
+	<-r.ctx.Done()
+	return 0, r.ctx.Err()
 }
 
 type zeroReader struct{}

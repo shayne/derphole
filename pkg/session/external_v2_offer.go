@@ -232,7 +232,7 @@ func (rt *externalV2OfferRuntime) send(ctx context.Context, accepted externalV2A
 func (rt *externalV2OfferRuntime) sendQUIC(ctx context.Context, accepted externalV2AcceptedClaim, tr externalV2ListenTransport, policy ParallelPolicy, countedSrc *byteCountingReadCloser, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter) error {
 	streamCount := externalV2StreamCount(policy)
 	server := dataplane.NewQUICServer(tr.manager, rt.session.quicIdentity, accepted.claim.QUICPublic)
-	rawPath, err := negotiateExternalV2DirectPacketPath(ctx, rt.session.derp, accepted.peerDERP, tr.manager, rt.session.derpMap, rt.auth, rt.cfg.Emitter, streamCount)
+	rawPath, err := negotiateExternalV2DirectPacketPath(ctx, rt.session.derp, accepted.peerDERP, tr.manager, rt.session.derpMap, rt.auth, rt.cfg.Emitter, streamCount, externalV2DataPlaneSenderPunchDelay)
 	if err != nil {
 		return err
 	}
@@ -721,7 +721,7 @@ func (rt *externalV2OfferReceiveRuntime) receiveNativeTCP(ctx context.Context, t
 
 func (rt *externalV2OfferReceiveRuntime) acceptReceiveStreams(tr externalV2ListenTransport, streamCount int) (*dataplane.QUICClient, []io.ReadCloser, externalV2DirectPacketPath, error) {
 	client := dataplane.NewQUICClient(tr.manager, rt.identity, rt.tok.QUICPublic)
-	rawPath, err := negotiateExternalV2DirectPacketPath(tr.ctx, rt.derp, rt.listenerDERP, tr.manager, rt.dm, rt.auth, rt.cfg.Emitter, streamCount)
+	rawPath, err := negotiateExternalV2DirectPacketPath(tr.ctx, rt.derp, rt.listenerDERP, tr.manager, rt.dm, rt.auth, rt.cfg.Emitter, streamCount, 0)
 	if err != nil {
 		return nil, nil, externalV2DirectPacketPath{}, err
 	}

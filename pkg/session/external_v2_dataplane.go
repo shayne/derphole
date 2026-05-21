@@ -21,11 +21,12 @@ import (
 )
 
 const (
-	externalV2DataPlaneReadyWait     = 5 * time.Second
-	externalV2DataPlaneRetry         = 250 * time.Millisecond
-	externalV2DataPlaneReinforce     = 1 * time.Second
-	externalV2DataPlaneReinforceTick = 100 * time.Millisecond
-	externalV2DataPlaneCandidateWait = 750 * time.Millisecond
+	externalV2DataPlaneReadyWait        = 5 * time.Second
+	externalV2DataPlaneRetry            = 250 * time.Millisecond
+	externalV2DataPlaneReinforce        = 1 * time.Second
+	externalV2DataPlaneReinforceTick    = 100 * time.Millisecond
+	externalV2DataPlaneCandidateWait    = 750 * time.Millisecond
+	externalV2DataPlaneSenderPunchDelay = 350 * time.Millisecond
 
 	externalV2DataPlanePhaseCandidates = "candidates"
 	externalV2DataPlanePhaseSelection  = "selection"
@@ -46,7 +47,7 @@ func (p externalV2DirectPacketPath) Close() {
 	}
 }
 
-func negotiateExternalV2DirectPacketPath(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, manager *transport.Manager, dm *tailcfg.DERPMap, auth externalPeerControlAuth, emitter *telemetry.Emitter, streamCount int) (externalV2DirectPacketPath, error) {
+func negotiateExternalV2DirectPacketPath(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, manager *transport.Manager, dm *tailcfg.DERPMap, auth externalPeerControlAuth, emitter *telemetry.Emitter, streamCount int, punchDelay time.Duration) (externalV2DirectPacketPath, error) {
 	if !externalV2CanUseRawDirect(manager) {
 		return externalV2DirectPacketPath{}, nil
 	}
@@ -67,7 +68,7 @@ func negotiateExternalV2DirectPacketPath(ctx context.Context, client *derpbind.C
 		local.Close()
 		return externalV2DirectPacketPath{}, err
 	}
-	path := selectExternalV2RawDirectPath(ctx, local, peerReady, peerCandidates, emitter)
+	path := selectExternalV2RawDirectPath(ctx, local, peerReady, peerCandidates, emitter, punchDelay)
 	peerSelected, err := exchangeExternalV2RawDirectSelection(ctx, client, peerDERP, readyCh, path.raw, auth)
 	if err != nil {
 		path.Close()
@@ -121,7 +122,7 @@ func exchangeExternalV2RawDirectSelection(ctx context.Context, client *derpbind.
 	return peerReady.RawDirect, nil
 }
 
-func selectExternalV2RawDirectPath(ctx context.Context, local externalV2DataPacketPath, peerReady externalV2DataPlaneReady, peerCandidates []net.Addr, emitter *telemetry.Emitter) externalV2DirectPacketPath {
+func selectExternalV2RawDirectPath(ctx context.Context, local externalV2DataPacketPath, peerReady externalV2DataPlaneReady, peerCandidates []net.Addr, emitter *telemetry.Emitter, punchDelay time.Duration) externalV2DirectPacketPath {
 	if len(local.conns) == 0 {
 		emitExternalV2Debug(emitter, "v2-raw-direct-local-selection=false")
 		return externalV2DirectPacketPath{}
@@ -132,7 +133,7 @@ func selectExternalV2RawDirectPath(ctx context.Context, local externalV2DataPack
 		return externalV2DirectPacketPath{}
 	}
 
-	addrs := selectExternalV2DataPacketAddrs(ctx, local.conns, peerReady.CandidateSets, peerCandidates, emitter)
+	addrs := selectExternalV2DataPacketAddrs(ctx, local.conns, peerReady.CandidateSets, peerCandidates, emitter, punchDelay)
 	if len(addrs) == 0 {
 		local.Close()
 		emitExternalV2Debug(emitter, "v2-raw-direct-local-selection=false")
@@ -236,27 +237,27 @@ func externalV2DataPacketCandidates(ctx context.Context, conns []net.PacketConn,
 	return externalDirectUDPInferWANPerPort(sets)
 }
 
-func selectExternalV2DataPacketAddrs(ctx context.Context, conns []net.PacketConn, peerCandidateSets [][]string, peerCandidates []net.Addr, emitter *telemetry.Emitter) []net.Addr {
+func selectExternalV2DataPacketAddrs(ctx context.Context, conns []net.PacketConn, peerCandidateSets [][]string, peerCandidates []net.Addr, emitter *telemetry.Emitter, punchDelay time.Duration) []net.Addr {
 	switch {
 	case len(conns) == 0:
 		return nil
 	case len(peerCandidateSets) > 0:
-		return selectExternalV2DataPacketAddrsBySet(ctx, conns, peerCandidateSets, emitter)
+		return selectExternalV2DataPacketAddrsBySet(ctx, conns, peerCandidateSets, emitter, punchDelay)
 	case len(peerCandidates) == 0:
 		return nil
 	default:
-		return selectExternalV2DataPacketAddrsByFlatCandidates(ctx, conns, peerCandidates, emitter)
+		return selectExternalV2DataPacketAddrsByFlatCandidates(ctx, conns, peerCandidates, emitter, punchDelay)
 	}
 }
 
-func selectExternalV2DataPacketAddrsByFlatCandidates(ctx context.Context, conns []net.PacketConn, peerCandidates []net.Addr, emitter *telemetry.Emitter) []net.Addr {
+func selectExternalV2DataPacketAddrsByFlatCandidates(ctx context.Context, conns []net.PacketConn, peerCandidates []net.Addr, emitter *telemetry.Emitter, punchDelay time.Duration) []net.Addr {
 	peerCandidates = filterExternalV2DataPacketAddrs(peerCandidates)
 	if len(peerCandidates) == 0 {
 		return nil
 	}
 	punchCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go externalDirectUDPStartPunching(punchCtx, conns, peerCandidates)
+	startExternalV2DataPacketPunching(punchCtx, conns, peerCandidates, punchDelay)
 
 	observedByConn := externalDirectUDPObservePunchAddrsByConn(ctx, conns, externalDirectUDPPunchWait)
 	observedByConn = filterExternalV2DataPacketObservedAddrs(observedByConn)
@@ -278,7 +279,7 @@ func selectExternalV2DataPacketAddrsByFlatCandidates(ctx context.Context, conns 
 	return selectedExternalV2DataPacketAddrs(conns, selected, fallback, true)
 }
 
-func selectExternalV2DataPacketAddrsBySet(ctx context.Context, conns []net.PacketConn, peerCandidateSets [][]string, emitter *telemetry.Emitter) []net.Addr {
+func selectExternalV2DataPacketAddrsBySet(ctx context.Context, conns []net.PacketConn, peerCandidateSets [][]string, emitter *telemetry.Emitter, punchDelay time.Duration) []net.Addr {
 	peerCandidateSets = filterExternalV2DataPacketCandidateSets(peerCandidateSets)
 	count := externalV2DataPacketSetCount(conns, peerCandidateSets)
 	if count == 0 {
@@ -291,7 +292,7 @@ func selectExternalV2DataPacketAddrsBySet(ctx context.Context, conns []net.Packe
 	punchCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	for i := range count {
-		go externalDirectUDPStartPunching(punchCtx, []net.PacketConn{conns[i]}, peerAddrsBySet[i])
+		startExternalV2DataPacketPunching(punchCtx, []net.PacketConn{conns[i]}, peerAddrsBySet[i], punchDelay)
 	}
 	observedByConn := externalDirectUDPObservePunchAddrsByConn(ctx, conns[:count], externalDirectUDPPunchWait)
 	observedByConn = filterExternalV2DataPacketObservedAddrs(observedByConn)
@@ -310,6 +311,23 @@ func selectExternalV2DataPacketAddrsBySet(ctx context.Context, conns []net.Packe
 		emitter.Debug("v2-raw-direct-fallback-addrs=" + strings.Join(fallback, ","))
 	}
 	return selectedExternalV2DataPacketAddrs(conns[:count], selected, fallback, false)
+}
+
+func startExternalV2DataPacketPunching(ctx context.Context, conns []net.PacketConn, peerCandidates []net.Addr, delay time.Duration) {
+	if delay <= 0 {
+		externalDirectUDPStartPunching(ctx, conns, peerCandidates)
+		return
+	}
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			externalDirectUDPStartPunching(ctx, conns, peerCandidates)
+		}
+	}()
 }
 
 func filterExternalV2DataPacketObservedAddrs(observedByConn [][]net.Addr) [][]net.Addr {

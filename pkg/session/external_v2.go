@@ -29,7 +29,7 @@ import (
 
 const externalV2CopyBufferSize = 1 << 20
 const externalV2AbortNotifyWait = 2 * time.Second
-const externalV2AbortDrainWait = 250 * time.Millisecond
+const externalV2AbortDrainWait = time.Second
 const externalV2DirectNudgeInterval = 250 * time.Millisecond
 const externalV2DirectNudgeDuration = 2 * time.Second
 
@@ -195,6 +195,13 @@ func (rt *externalV2SendRuntime) run(ctx context.Context) (retErr error) {
 		}
 	}()
 	ctx = withExternalTransferMetrics(ctx, metrics)
+	bytesTransferred := func() int64 {
+		return metrics.RelayBytes() + metrics.DirectBytes()
+	}
+	stopLocalCancelAbort := watchExternalV2LocalCancelAbort(ctx, rt.derp, rt.listenerDERP, bytesTransferred, rt.auth)
+	defer stopLocalCancelAbort()
+	defer notifyPeerAbortOnError(&retErr, ctx, rt.derp, rt.listenerDERP, bytesTransferred, rt.auth)
+	defer notifyPeerAbortOnLocalCancel(&retErr, ctx, rt.derp, rt.listenerDERP, bytesTransferred, rt.auth)
 
 	src, err := openSendSource(ctx, rt.cfg)
 	if err != nil {
@@ -327,7 +334,7 @@ func (rt *externalV2SendRuntime) sendNativeTCP(ctx context.Context, manager *tra
 
 func (rt *externalV2SendRuntime) sendStream(ctx context.Context, manager *transport.Manager, src io.Reader, metrics *externalTransferMetrics, streamCount int) error {
 	client := dataplane.NewQUICClient(manager, rt.identity, rt.tok.QUICPublic)
-	path, err := negotiateExternalV2DirectPacketPath(ctx, rt.derp, rt.listenerDERP, manager, rt.dm, rt.auth, rt.cfg.Emitter, streamCount)
+	path, err := negotiateExternalV2DirectPacketPath(ctx, rt.derp, rt.listenerDERP, manager, rt.dm, rt.auth, rt.cfg.Emitter, streamCount, externalV2DataPlaneSenderPunchDelay)
 	if err != nil {
 		return err
 	}
@@ -344,11 +351,7 @@ func (rt *externalV2SendRuntime) sendStream(ctx context.Context, manager *transp
 	})
 	defer stopAbortWatch()
 	if err := copyExternalV2SendStreams(ctx, src, streams, metrics); err != nil {
-		_ = client.CloseWithError(1, err.Error())
-		if abortErr := waitExternalV2Abort(abortErrCh); abortErr != nil {
-			return abortErr
-		}
-		return err
+		return externalV2SendQUICStreamError(ctx, client, abortErrCh, err)
 	}
 	complete, err := rt.receiveComplete(ctx, abortErrCh)
 	if err != nil {
@@ -363,6 +366,21 @@ func (rt *externalV2SendRuntime) sendStream(ctx context.Context, manager *transp
 		return fmt.Errorf("invalid v2 complete bytes %d", complete.BytesReceived)
 	}
 	return nil
+}
+
+func externalV2SendQUICStreamError(ctx context.Context, client *dataplane.QUICClient, abortErrCh <-chan error, err error) error {
+	_ = client.CloseWithError(1, err.Error())
+	return externalV2PreferPeerAbort(ctx, abortErrCh, err)
+}
+
+func externalV2PreferPeerAbort(ctx context.Context, abortErrCh <-chan error, err error) error {
+	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return err
+	}
+	if abortErr := waitExternalV2Abort(abortErrCh); abortErr != nil {
+		return abortErr
+	}
+	return err
 }
 
 func (rt *externalV2SendRuntime) watchAbort(ctx context.Context, onAbort func()) (<-chan error, func()) {
@@ -631,7 +649,7 @@ func (rt *externalV2ListenRuntime) receive(ctx context.Context, accepted externa
 func (rt *externalV2ListenRuntime) receiveQUIC(ctx context.Context, accepted externalV2AcceptedClaim, tr externalV2ListenTransport, policy ParallelPolicy, dst io.Writer, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter) error {
 	server := dataplane.NewQUICServer(tr.manager, rt.session.quicIdentity, accepted.claim.QUICPublic)
 	streamCount := externalV2StreamCount(policy)
-	rawPath, err := negotiateExternalV2DirectPacketPath(ctx, rt.session.derp, accepted.peerDERP, tr.manager, rt.session.derpMap, rt.auth, rt.cfg.Emitter, streamCount)
+	rawPath, err := negotiateExternalV2DirectPacketPath(ctx, rt.session.derp, accepted.peerDERP, tr.manager, rt.session.derpMap, rt.auth, rt.cfg.Emitter, streamCount, 0)
 	if err != nil {
 		return err
 	}
@@ -639,6 +657,10 @@ func (rt *externalV2ListenRuntime) receiveQUIC(ctx context.Context, accepted ext
 	if rawPath.raw {
 		server = dataplane.NewQUICServerOnPacketConns(rawPath.conns, rt.session.quicIdentity, accepted.claim.QUICPublic)
 	}
+	abortErrCh, stopAbortWatch := rt.watchAbort(ctx, accepted.peerDERP, func() {
+		_ = server.CloseWithError(1, "peer aborted transfer")
+	})
+	defer stopAbortWatch()
 	streams, err := server.AcceptStreamsWithReady(tr.ctx, streamCount, nil)
 	if err != nil {
 		return err
@@ -646,7 +668,7 @@ func (rt *externalV2ListenRuntime) receiveQUIC(ctx context.Context, accepted ext
 	bytesReceived, err := copyExternalV2ReceiveStreams(ctx, dst, streams, metrics)
 	if err != nil {
 		_ = server.CloseWithError(1, err.Error())
-		return err
+		return externalV2PreferPeerAbort(ctx, abortErrCh, err)
 	}
 	if err := rt.sendComplete(ctx, accepted.peerDERP, bytesReceived); err != nil {
 		_ = server.CloseWithError(1, err.Error())
@@ -658,6 +680,71 @@ func (rt *externalV2ListenRuntime) receiveQUIC(ctx context.Context, accepted ext
 	metrics.Complete(time.Now())
 	pathEmitter.Complete(tr.manager)
 	return nil
+}
+
+func watchExternalV2LocalCancelAbort(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, bytesTransferred func() int64, auth externalPeerControlAuth) context.CancelFunc {
+	watchCtx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-ctx.Done():
+			err := normalizePeerAbortError(ctx, ctx.Err())
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
+			var bytes int64
+			if bytesTransferred != nil {
+				bytes = bytesTransferred()
+			}
+			sendPeerAbortBestEffort(client, peerDERP, peerAbortReason(err), bytes, auth)
+		case <-watchCtx.Done():
+		}
+	}()
+	return cancel
+}
+
+func (rt *externalV2ListenRuntime) watchAbort(ctx context.Context, peerDERP key.NodePublic, onAbort func()) (<-chan error, func()) {
+	abortCh, unsubscribe := rt.session.derp.Subscribe(func(pkt derpbind.Packet) bool {
+		return pkt.From == peerDERP && isAbortPayload(pkt.Payload)
+	})
+	watchCtx, cancel := context.WithCancel(ctx)
+	errCh := make(chan error, 1)
+	go func() {
+		err := receiveExternalV2Abort(watchCtx, abortCh, rt.auth)
+		if err == nil {
+			return
+		}
+		if onAbort != nil {
+			onAbort()
+		}
+		select {
+		case errCh <- err:
+		default:
+		}
+	}()
+	return errCh, func() {
+		cancel()
+		unsubscribe()
+	}
+}
+
+func receiveExternalV2Abort(ctx context.Context, abortCh <-chan derpbind.Packet, auth externalPeerControlAuth) error {
+	for {
+		select {
+		case pkt, ok := <-abortCh:
+			if !ok {
+				return ErrPeerDisconnected
+			}
+			abortErr, ok, err := externalV2AbortFromPayload(pkt.Payload, auth)
+			if err != nil {
+				return err
+			}
+			if ok {
+				return abortErr
+			}
+		case <-ctx.Done():
+			return nil
+		}
+	}
 }
 
 func (rt *externalV2ListenRuntime) subscribeNativeModeRequests(peerDERP key.NodePublic) (<-chan derpbind.Packet, func()) {

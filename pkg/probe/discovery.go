@@ -19,11 +19,13 @@ import (
 )
 
 const (
-	defaultDiscoveryTimeout = 750 * time.Millisecond
-	defaultPunchInterval    = 25 * time.Millisecond
-	defaultPunchPayload     = "derphole-punch"
-	tailscaleV4Prefix       = "100.64.0.0/10"
-	tailscaleV6Prefix       = "fd7a:115c:a1e0::/48"
+	defaultDiscoveryTimeout    = 750 * time.Millisecond
+	defaultPunchInterval       = 25 * time.Millisecond
+	defaultPunchReplyInterval  = 100 * time.Millisecond
+	defaultPunchObserverLinger = 250 * time.Millisecond
+	defaultPunchPayload        = "derphole-punch"
+	tailscaleV4Prefix          = "100.64.0.0/10"
+	tailscaleV6Prefix          = "fd7a:115c:a1e0::/48"
 )
 
 var (
@@ -379,8 +381,9 @@ func (o *punchObserver) observeConn(i int, conn net.PacketConn) {
 
 	buf := make([]byte, 1500)
 	seen := make(map[string]net.Addr)
+	lastReply := make(map[string]time.Time)
 	for {
-		done, err := o.readPunch(conn, buf, seen)
+		done, err := o.readPunch(conn, buf, seen, lastReply)
 		if done || err != nil {
 			o.observed[i] = mapAddrs(seen)
 			return
@@ -388,7 +391,7 @@ func (o *punchObserver) observeConn(i int, conn net.PacketConn) {
 	}
 }
 
-func (o *punchObserver) readPunch(conn net.PacketConn, buf []byte, seen map[string]net.Addr) (bool, error) {
+func (o *punchObserver) readPunch(conn net.PacketConn, buf []byte, seen map[string]net.Addr, lastReply map[string]time.Time) (bool, error) {
 	if err := o.ctx.Err(); err != nil {
 		return true, err
 	}
@@ -402,8 +405,23 @@ func (o *punchObserver) readPunch(conn net.PacketConn, buf []byte, seen map[stri
 	if string(buf[:n]) != defaultPunchPayload {
 		return false, nil
 	}
+	if shouldReplyToPunch(addr.String(), lastReply, time.Now()) {
+		_, _ = conn.WriteTo([]byte(defaultPunchPayload), addr)
+	}
 	o.observeAddr(seen, addr)
 	return false, nil
+}
+
+func shouldReplyToPunch(key string, lastReply map[string]time.Time, now time.Time) bool {
+	if key == "" {
+		return false
+	}
+	last, ok := lastReply[key]
+	if ok && now.Sub(last) < defaultPunchReplyInterval {
+		return false
+	}
+	lastReply[key] = now
+	return true
 }
 
 func (o *punchObserver) nextReadDeadline() time.Time {
@@ -428,6 +446,16 @@ func (o *punchObserver) observeAddr(seen map[string]net.Addr, addr net.Addr) {
 	firstForConn := len(seen) == 0
 	seen[addr.String()] = cloneAddr(addr)
 	if firstForConn && o.observedConns.Add(1) >= o.expected {
+		go o.cancelAfterLinger()
+	}
+}
+
+func (o *punchObserver) cancelAfterLinger() {
+	timer := time.NewTimer(defaultPunchObserverLinger)
+	defer timer.Stop()
+	select {
+	case <-o.ctx.Done():
+	case <-timer.C:
 		o.cancel()
 	}
 }
