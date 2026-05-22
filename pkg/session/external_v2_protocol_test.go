@@ -28,7 +28,7 @@ func TestExternalV2TokenRejectsMissingCapability(t *testing.T) {
 }
 
 func TestExternalV2ClaimValidationRequiresProtocol(t *testing.T) {
-	claim := externalV2Claim{Protocol: "legacy"}
+	claim := externalV2Claim{Protocol: "unsupported"}
 	if err := validateExternalV2Claim(claim); !errors.Is(err, errExternalV2Unsupported) {
 		t.Fatalf("validateExternalV2Claim() error = %v, want %v", err, errExternalV2Unsupported)
 	}

@@ -93,7 +93,7 @@ func TestTransferStallHarnessCapturesProgressAndCounters(t *testing.T) {
 	}
 	for _, reject := range forbidden {
 		if strings.Contains(body, reject) {
-			t.Fatalf("transfer-stall-harness.sh still contains legacy marker %q", reject)
+			t.Fatalf("transfer-stall-harness.sh still contains retired marker %q", reject)
 		}
 	}
 

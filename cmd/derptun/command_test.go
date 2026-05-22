@@ -93,7 +93,7 @@ func TestRunServeQREmitsCompactInviteAndServesWithServerToken(t *testing.T) {
 	}
 	assertDerivedDerptunClientCredential(t, serverToken, cred)
 	if strings.Contains(stderr.String(), "derphole://") {
-		t.Fatalf("stderr contains legacy URL payload: %q", stderr.String())
+		t.Fatalf("stderr contains removed URL payload: %q", stderr.String())
 	}
 }
 
@@ -108,7 +108,7 @@ func TestRunServeRejectsRemovedWebFlag(t *testing.T) {
 		t.Fatalf("stderr = %q, want unknown or unsupported flag error", stderr.String())
 	}
 	if strings.Contains(stderr.String(), "--web requires --qr") {
-		t.Fatalf("stderr = %q, contains legacy --web requires --qr behavior", stderr.String())
+		t.Fatalf("stderr = %q, contains removed --web requires --qr behavior", stderr.String())
 	}
 }
 

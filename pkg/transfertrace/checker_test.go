@@ -325,13 +325,13 @@ func TestCheckReportsQUICDiagnosticsSummary(t *testing.T) {
 	}
 }
 
-func TestCheckKeepsDiagnosticsAbsentForLegacyAndEmptyTrace(t *testing.T) {
+func TestCheckKeepsDiagnosticsAbsentForMinimalAndEmptyTrace(t *testing.T) {
 	tests := []struct {
 		name string
 		csv  string
 	}{
 		{
-			name: "legacy minimal header",
+			name: "minimal header",
 			csv: "timestamp_unix_ms,role,phase,app_bytes,last_error\n" +
 				"1000,receive,complete,4096,\n",
 		},

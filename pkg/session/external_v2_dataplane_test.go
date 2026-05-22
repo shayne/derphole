@@ -45,13 +45,13 @@ func TestExternalV2DataPlaneReadyPhaseMatchesOnlyExpectedPhase(t *testing.T) {
 		t.Fatal("candidate phase did not match itself")
 	}
 	if !externalV2DataPlaneReadyPhaseMatches("", externalV2DataPlanePhaseCandidates) {
-		t.Fatal("legacy empty phase did not match candidate phase")
+		t.Fatal("zero-value phase did not match candidate phase")
 	}
 	if externalV2DataPlaneReadyPhaseMatches(externalV2DataPlanePhaseCandidates, externalV2DataPlanePhaseSelection) {
 		t.Fatal("candidate phase matched selection phase")
 	}
 	if externalV2DataPlaneReadyPhaseMatches("", externalV2DataPlanePhaseSelection) {
-		t.Fatal("legacy empty phase matched selection phase")
+		t.Fatal("zero-value phase matched selection phase")
 	}
 }
 
