@@ -795,6 +795,29 @@ func TestShareOpenExternalCanUpgradeAfterRelayStartAndServeConnections(t *testin
 	}
 }
 
+func TestShareOpenExternalUsesV2RawDirectDataPlane(t *testing.T) {
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+
+	result := runExternalShareOpenSession(t, shareOpenRoundTripConfig{
+		relayPayload:        "raw-direct-first",
+		upgradePayloads:     []string{"raw-direct-second"},
+		enableDirectAtStart: true,
+	})
+
+	if !strings.Contains(result.ShareStatus, "v2-data-plane=raw-direct") {
+		t.Fatalf("share status = %q, want v2 raw-direct data plane", result.ShareStatus)
+	}
+	if !strings.Contains(result.OpenStatus, "v2-data-plane=raw-direct") {
+		t.Fatalf("open status = %q, want v2 raw-direct data plane", result.OpenStatus)
+	}
+	if got := result.RelayReply; got != "raw-direct-first" {
+		t.Fatalf("first reply = %q, want %q", got, "raw-direct-first")
+	}
+	if got := result.UpgradeReplies["raw-direct-second"]; got != "raw-direct-second" {
+		t.Fatalf("second reply = %q, want %q", got, "raw-direct-second")
+	}
+}
+
 func TestExternalListenSendUsesRelayUDPWhenDirectNeverBecomesReady(t *testing.T) {
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
@@ -1928,8 +1951,9 @@ func TestParseRemoteCandidateStringsAllowsLoopbackForFakeTransport(t *testing.T)
 }
 
 type shareOpenRoundTripConfig struct {
-	relayPayload    string
-	upgradePayloads []string
+	relayPayload        string
+	upgradePayloads     []string
+	enableDirectAtStart bool
 }
 
 type shareOpenRoundTripResult struct {
@@ -1969,7 +1993,11 @@ func runExternalShareOpenSession(t *testing.T, cfg shareOpenRoundTripConfig) sha
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
-	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
+	if cfg.enableDirectAtStart {
+		t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+	} else {
+		t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixNano(), 10))
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1984,7 +2012,7 @@ func runExternalShareOpenSession(t *testing.T, cfg shareOpenRoundTripConfig) sha
 	shareErr := make(chan error, 1)
 	go func() {
 		_, err := Share(ctx, ShareConfig{
-			Emitter:       telemetry.New(&shareStatus, telemetry.LevelDefault),
+			Emitter:       telemetry.New(&shareStatus, telemetry.LevelVerbose),
 			TokenSink:     tokenSink,
 			TargetAddr:    backendAddr,
 			UsePublicDERP: true,
@@ -1999,7 +2027,7 @@ func runExternalShareOpenSession(t *testing.T, cfg shareOpenRoundTripConfig) sha
 		openErr <- Open(ctx, OpenConfig{
 			Token:         tok,
 			BindAddrSink:  bindSink,
-			Emitter:       telemetry.New(&openStatus, telemetry.LevelDefault),
+			Emitter:       telemetry.New(&openStatus, telemetry.LevelVerbose),
 			UsePublicDERP: true,
 		})
 	}()

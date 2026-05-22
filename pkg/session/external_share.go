@@ -102,12 +102,30 @@ func acceptExternalShareClaim(ctx context.Context, cfg ShareConfig, session *rel
 	if err := sendAuthenticatedEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}, auth); err != nil {
 		return tok, err
 	}
+	rawPath, err := negotiateExternalV2DirectPacketPath(transportCtx, session.derp, peerDERP, transportManager, session.derpMap, auth, cfg.Emitter, 1, 0, cfg.ForceRelay)
+	if err != nil {
+		return tok, err
+	}
+	defer rawPath.Close()
+	rawDirect := rawPath.raw
+	if rawDirect {
+		rawListener, err := listenExternalShareRawQUIC(rawPath, session, claim)
+		if err != nil {
+			return tok, err
+		}
+		_ = quicListener.Close()
+		_ = adapter.Close()
+		quicListener = rawListener
+	}
 	claimErrCh := rejectAdditionalShareClaims(ctx, session.derp, session.gate, claimCh, auth)
 	quicConn, err := quicListener.Accept(ctx)
 	if err != nil {
 		return tok, err
 	}
 	defer func() { _ = quicConn.CloseWithError(0, "") }()
+	if rawDirect {
+		pathEmitter.Emit(StateDirect)
+	}
 	return tok, serveQUICListenerWithClaimRejections(ctx, quicConn, cfg.TargetAddr, cfg.Emitter, claimErrCh)
 }
 
@@ -139,6 +157,10 @@ func listenExternalShareQUIC(transportCtx context.Context, session *relaySession
 		return nil, nil, err
 	}
 	return adapter, quicListener, nil
+}
+
+func listenExternalShareRawQUIC(rawPath externalV2DirectPacketPath, session *relaySession, claim rendezvous.Claim) (*quic.Listener, error) {
+	return quic.Listen(rawPath.conn, quicpath.ServerTLSConfig(session.quicIdentity, claim.QUICPublic), quicpath.DefaultQUICConfig())
 }
 
 func openExternal(ctx context.Context, cfg OpenConfig, tok token.Token) error {
@@ -251,14 +273,15 @@ func (r *openExternalRuntime) open(ctx context.Context, cfg OpenConfig, decision
 	pathEmitter.Flush(transportManager)
 	seedAcceptedDecisionCandidates(transportCtx, transportManager, decision)
 
-	peerConn := transportManager.PeerDatagramConn(transportCtx)
-	adapter := quicpath.NewAdapter(peerConn)
-	defer func() { _ = adapter.Close() }()
-	quicConn, err := quic.Dial(ctx, adapter, peerConn.RemoteAddr(), quicpath.ClientTLSConfig(r.clientIdentity, r.tok.QUICPublic), quicpath.DefaultQUICConfig())
+	quicConn, closePacketPath, rawDirect, err := r.openQUIC(ctx, cfg, transportCtx, transportManager)
 	if err != nil {
 		return err
 	}
+	defer closePacketPath()
 	defer func() { _ = quicConn.CloseWithError(0, "") }()
+	if rawDirect {
+		pathEmitter.Emit(StateDirect)
+	}
 
 	listener, err := openLocalListener(cfg, r.tok)
 	if err != nil {
@@ -274,6 +297,31 @@ func (r *openExternalRuntime) open(ctx context.Context, cfg OpenConfig, decision
 		}
 		return quicpath.WrapStream(quicConn, streamConn), nil
 	}, cfg.Emitter)
+}
+
+func (r *openExternalRuntime) openQUIC(ctx context.Context, cfg OpenConfig, transportCtx context.Context, transportManager *transport.Manager) (*quic.Conn, func(), bool, error) {
+	rawPath, err := negotiateExternalV2DirectPacketPath(transportCtx, r.derpClient, r.listenerDERP, transportManager, r.dm, externalPeerControlAuthForToken(r.tok), cfg.Emitter, 1, externalV2DataPlaneSenderPunchDelay, cfg.ForceRelay)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if rawPath.raw {
+		quicConn, err := quic.Dial(ctx, rawPath.conn, rawPath.addr, quicpath.ClientTLSConfig(r.clientIdentity, r.tok.QUICPublic), quicpath.DefaultQUICConfig())
+		if err != nil {
+			rawPath.Close()
+			return nil, nil, false, err
+		}
+		return quicConn, rawPath.Close, true, nil
+	}
+	rawPath.Close()
+
+	peerConn := transportManager.PeerDatagramConn(transportCtx)
+	adapter := quicpath.NewAdapter(peerConn)
+	quicConn, err := quic.Dial(ctx, adapter, peerConn.RemoteAddr(), quicpath.ClientTLSConfig(r.clientIdentity, r.tok.QUICPublic), quicpath.DefaultQUICConfig())
+	if err != nil {
+		_ = adapter.Close()
+		return nil, nil, false, err
+	}
+	return quicConn, func() { _ = adapter.Close() }, false, nil
 }
 
 func serveQUICListener(ctx context.Context, conn *quic.Conn, targetAddr string, emitter *telemetry.Emitter) error {
