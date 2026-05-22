@@ -34,7 +34,6 @@ func TestTransferStallHarnessCapturesProgressAndCounters(t *testing.T) {
 		"receiver_state",
 		"kill -QUIT",
 		"DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES",
-		"DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES",
 		"ip -s -s link",
 		"nstat -az",
 		"/proc/net/snmp",
@@ -85,6 +84,17 @@ func TestTransferStallHarnessCapturesProgressAndCounters(t *testing.T) {
 	for _, want := range required {
 		if !strings.Contains(body, want) {
 			t.Fatalf("transfer-stall-harness.sh missing %q", want)
+		}
+	}
+
+	forbidden := []string{
+		"DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES",
+		"direct-udp-",
+		"relay-prefix-",
+	}
+	for _, reject := range forbidden {
+		if strings.Contains(body, reject) {
+			t.Fatalf("transfer-stall-harness.sh still contains legacy marker %q", reject)
 		}
 	}
 

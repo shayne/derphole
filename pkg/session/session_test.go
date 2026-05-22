@@ -1458,14 +1458,14 @@ func TestPublicProbeCandidateAllowedSkipsTailscaleInInternetOnlyTestMode(t *test
 	}
 }
 
-func TestPublicProbeCandidateAllowedSkipsTailscaleWithLegacyDerpcatEnv(t *testing.T) {
+func TestPublicProbeCandidateAllowedIgnoresLegacyDerpcatEnv(t *testing.T) {
 	t.Setenv("DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES", "1")
 
-	if publicProbeCandidateAllowed(netip.MustParseAddr("100.125.235.82")) {
-		t.Fatal("publicProbeCandidateAllowed(100.125.235.82) = true, want false when DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1")
+	if !publicProbeCandidateAllowed(netip.MustParseAddr("100.125.235.82")) {
+		t.Fatal("publicProbeCandidateAllowed(100.125.235.82) = false, want true when only legacy DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1")
 	}
-	if publicProbeCandidateAllowed(netip.MustParseAddr("fd7a:115c:a1e0::1")) {
-		t.Fatal("publicProbeCandidateAllowed(fd7a:115c:a1e0::1) = true, want false when DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1")
+	if !publicProbeCandidateAllowed(netip.MustParseAddr("fd7a:115c:a1e0::1")) {
+		t.Fatal("publicProbeCandidateAllowed(fd7a:115c:a1e0::1) = false, want true when only legacy DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1")
 	}
 	if !publicProbeCandidateAllowed(netip.MustParseAddr("203.0.113.10")) {
 		t.Fatal("publicProbeCandidateAllowed(203.0.113.10) = false, want true")

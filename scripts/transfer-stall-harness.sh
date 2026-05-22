@@ -200,10 +200,9 @@ done
 
 remote_env_prefix() {
   local prefix=()
-  local disable_tailscale="${DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES:-${DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES:-1}}"
+  local disable_tailscale="${DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES:-0}"
   if [[ "${disable_tailscale}" == "1" ]]; then
     prefix+=(DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1)
-    prefix+=(DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES=1)
   fi
   if [[ "${DERPHOLE_STALL_TRACE:-1}" == "1" ]]; then
     prefix+=(DERPHOLE_TRACE_HANDOFF=1)
@@ -372,9 +371,9 @@ END { printf "%d %d\n", current + 0, total + 0 }
 ')
   read -r progress_bytes progress_total <<<"${progress}"
   state=$(tr '\r' '\n' <"${log_file}" | awk '
-/^(waiting-for-claim|claimed|probing-direct|connected-direct|connected-relay|stream-complete)$/ { line = $0 }
-/^(udp-|direct-udp-|relay-prefix-)/ { line = $0 }
-/peer disconnected|context canceled|message too long|write udp/ { line = $0 }
+/^(waiting-for-claim|claimed|probing-direct|trying-direct|connected-direct|connected-relay|direct-fallback-relay|stream-complete)$/ { line = $0 }
+/^(v2-|transport-|udp-peer-progress)/ { line = $0 }
+/peer disconnected|context canceled|message too long|write udp|timeout: no recent network activity/ { line = $0 }
 END {
   gsub(/[[:cntrl:]\t,]/, " ", line)
   print substr(line, 1, 240)
