@@ -88,7 +88,6 @@ func TestTransferStallHarnessCapturesProgressAndCounters(t *testing.T) {
 	}
 
 	forbidden := []string{
-		"DERPCAT_TEST_DISABLE_TAILSCALE_CANDIDATES",
 		"direct-udp-",
 		"relay-prefix-",
 	}

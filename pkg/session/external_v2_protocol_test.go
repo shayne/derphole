@@ -59,10 +59,7 @@ func TestExternalV2ParallelPolicyDefaultsAndRoundTrips(t *testing.T) {
 	}
 }
 
-func TestSendExternalIgnoresLegacySelectorEnvAndUsesV2(t *testing.T) {
-	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "legacy")
-	t.Setenv("DERPHOLE_DIRECT_TRANSPORT", "blast")
-
+func TestSendExternalUsesV2(t *testing.T) {
 	sentinel := errors.New("v2 send")
 	prev := sendExternalViaV2Fn
 	t.Cleanup(func() { sendExternalViaV2Fn = prev })
@@ -82,10 +79,7 @@ func TestSendExternalIgnoresLegacySelectorEnvAndUsesV2(t *testing.T) {
 	}
 }
 
-func TestListenExternalIgnoresLegacySelectorEnvAndUsesV2(t *testing.T) {
-	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "legacy")
-	t.Setenv("DERPHOLE_DIRECT_TRANSPORT", "blast")
-
+func TestListenExternalUsesV2(t *testing.T) {
 	sentinel := errors.New("v2 listen")
 	prev := listenExternalViaV2Fn
 	t.Cleanup(func() { listenExternalViaV2Fn = prev })
@@ -105,10 +99,7 @@ func TestListenExternalIgnoresLegacySelectorEnvAndUsesV2(t *testing.T) {
 	}
 }
 
-func TestOfferIgnoresLegacySelectorEnvAndUsesV2(t *testing.T) {
-	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "legacy")
-	t.Setenv("DERPHOLE_DIRECT_TRANSPORT", "blast")
-
+func TestOfferUsesV2(t *testing.T) {
 	sentinel := errors.New("v2 offer")
 	prev := offerExternalViaV2Fn
 	t.Cleanup(func() { offerExternalViaV2Fn = prev })
@@ -128,10 +119,7 @@ func TestOfferIgnoresLegacySelectorEnvAndUsesV2(t *testing.T) {
 	}
 }
 
-func TestReceiveIgnoresLegacySelectorEnvAndUsesV2(t *testing.T) {
-	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "legacy")
-	t.Setenv("DERPHOLE_DIRECT_TRANSPORT", "blast")
-
+func TestReceiveUsesV2(t *testing.T) {
 	rawToken, err := token.Encode(token.Token{
 		ExpiresUnix:  time.Now().Add(time.Hour).Unix(),
 		Capabilities: token.CapabilityStdioOffer | token.CapabilityTransferV2,

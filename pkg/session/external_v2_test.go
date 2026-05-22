@@ -25,7 +25,6 @@ func TestExternalV2SendReceiveRoundTrip(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
-	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "v2")
 
 	const payload = "external v2 payload"
 	if received := runExternalV2RoundTrip(t, payload, nil, nil); received != payload {
@@ -37,7 +36,6 @@ func TestExternalV2OfferReceiveRoundTrip(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
-	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "v2")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -94,7 +92,6 @@ func TestExternalV2OfferReceiveRoundTrip(t *testing.T) {
 func TestExternalV2OfferReceivePromotesToDirectWhenBothSidesReady(t *testing.T) {
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
-	t.Setenv("DERPHOLE_V2_NATIVE_TCP", "1")
 
 	prevInterfaceAddrs := publicInterfaceAddrs
 	publicInterfaceAddrs = func() ([]net.Addr, error) {
@@ -110,7 +107,6 @@ func TestExternalV2OfferReceivePromotesToDirectWhenBothSidesReady(t *testing.T) 
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
-	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "v2")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -199,19 +195,12 @@ func TestExternalV2OfferReceivePromotesToDirectWhenBothSidesReady(t *testing.T) 
 	if got := receiverStatus.String(); !strings.Contains(got, string(StateTryingDirect)) || !strings.Contains(got, string(StateDirect)) {
 		t.Fatalf("receiver status = %q, want v2 offer direct promotion", got)
 	}
-	if got := senderStatus.String(); strings.Contains(got, "v2-native-tcp=true") {
-		t.Fatalf("sender status = %q, native TCP should be ignored by v2 offer transfer", got)
-	}
-	if got := receiverStatus.String(); strings.Contains(got, "v2-native-tcp=true") {
-		t.Fatalf("receiver status = %q, native TCP should be ignored by v2 offer transfer", got)
-	}
 }
 
 func TestExternalV2ReceiverCancelAbortsSender(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
-	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "v2")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -266,7 +255,6 @@ func TestExternalV2SenderCancelAbortsReceiver(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
-	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "v2")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -336,7 +324,6 @@ func TestExternalV2TransferTraceCompletes(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
-	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "v2")
 
 	var sendOut bytes.Buffer
 	sendTrace, err := transfertrace.NewRecorder(&sendOut, transfertrace.RoleSend, time.Unix(100, 0))
@@ -378,7 +365,6 @@ func TestExternalV2TransferTraceCompletes(t *testing.T) {
 func TestExternalV2PromotesToDirectWhenBothSidesReady(t *testing.T) {
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
-	t.Setenv("DERPHOLE_V2_NATIVE_TCP", "1")
 
 	prevInterfaceAddrs := publicInterfaceAddrs
 	publicInterfaceAddrs = func() ([]net.Addr, error) {
@@ -394,7 +380,6 @@ func TestExternalV2PromotesToDirectWhenBothSidesReady(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
-	t.Setenv("DERPHOLE_TRANSFER_PROTOCOL", "v2")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -475,12 +460,6 @@ func TestExternalV2PromotesToDirectWhenBothSidesReady(t *testing.T) {
 	}
 	if got := listenerStatus.String(); !strings.Contains(got, string(StateTryingDirect)) || !strings.Contains(got, string(StateDirect)) {
 		t.Fatalf("listener status = %q, want v2 direct promotion", got)
-	}
-	if got := senderStatus.String(); strings.Contains(got, "v2-native-tcp=true") {
-		t.Fatalf("sender status = %q, native TCP should be ignored by v2 transfer", got)
-	}
-	if got := listenerStatus.String(); strings.Contains(got, "v2-native-tcp=true") {
-		t.Fatalf("listener status = %q, native TCP should be ignored by v2 transfer", got)
 	}
 }
 

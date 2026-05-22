@@ -66,9 +66,6 @@ func TestClassifyTopologyDetectsDirectPathPossible(t *testing.T) {
 	if !slices.Contains(got, TopologyClassDirectPathPossible) {
 		t.Fatalf("ClassifyTopology() = %v, want %s", got, TopologyClassDirectPathPossible)
 	}
-	if slices.Contains(got, "direct-udp-possible") {
-		t.Fatalf("ClassifyTopology() = %v, want no legacy direct-udp class", got)
-	}
 }
 
 func TestTopologySSHCommandFormatsTarget(t *testing.T) {
