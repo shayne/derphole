@@ -4413,7 +4413,7 @@ func receiveBlastDataUDP(ctx context.Context, conn *net.UDPConn, peer net.Addr, 
 	} else {
 		defer cleanup()
 	}
-	batcher := newLegacyBatcher(conn)
+	batcher := newSinglePacketBatcher(conn)
 	for {
 		n, addrPort, err := conn.ReadFromUDPAddrPort(buf)
 		if err != nil {

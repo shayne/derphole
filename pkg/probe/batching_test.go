@@ -13,18 +13,18 @@ import (
 	"time"
 )
 
-func TestNormalizeTransportDefaultsToLegacy(t *testing.T) {
+func TestNormalizeTransportDefaultsToSingle(t *testing.T) {
 	got, err := normalizeTransport("")
 	if err != nil {
 		t.Fatalf("normalizeTransport(\"\") error = %v", err)
 	}
-	if got != probeTransportLegacy {
-		t.Fatalf("normalizeTransport(\"\") = %q, want %q", got, probeTransportLegacy)
+	if got != probeTransportSingle {
+		t.Fatalf("normalizeTransport(\"\") = %q, want %q", got, probeTransportSingle)
 	}
 }
 
 func TestNormalizeTransportAcceptsKnownValues(t *testing.T) {
-	for _, tc := range []string{probeTransportLegacy, probeTransportBatched} {
+	for _, tc := range []string{probeTransportSingle, probeTransportBatched} {
 		got, err := normalizeTransport(tc)
 		if err != nil {
 			t.Fatalf("normalizeTransport(%q) error = %v", tc, err)
@@ -101,7 +101,7 @@ func TestCachedDeadlineRefreshesOnlyNearExpiry(t *testing.T) {
 	}
 }
 
-func TestLegacyBatcherWritesAndReadsSinglePacket(t *testing.T) {
+func TestSingleBatcherWritesAndReadsSinglePacket(t *testing.T) {
 	a, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -114,9 +114,9 @@ func TestLegacyBatcherWritesAndReadsSinglePacket(t *testing.T) {
 	}
 	defer b.Close()
 
-	batcher := newLegacyBatcher(a)
-	if batcher.Capabilities().Kind != probeTransportLegacy {
-		t.Fatalf("Capabilities().Kind = %q, want %q", batcher.Capabilities().Kind, probeTransportLegacy)
+	batcher := newSinglePacketBatcher(a)
+	if batcher.Capabilities().Kind != probeTransportSingle {
+		t.Fatalf("Capabilities().Kind = %q, want %q", batcher.Capabilities().Kind, probeTransportSingle)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -130,10 +130,10 @@ func TestLegacyBatcherWritesAndReadsSinglePacket(t *testing.T) {
 	}
 
 	bufs := []batchReadBuffer{{Bytes: make([]byte, 32)}, {Bytes: make([]byte, 32)}}
-	if n, err := readBatchWith(newLegacyBatcher(b), ctx, time.Second, bufs); err != nil {
+	if n, err := readBatchWith(newSinglePacketBatcher(b), ctx, time.Second, bufs); err != nil {
 		t.Fatalf("readBatchWith() error = %v", err)
 	} else if n != 1 {
-		t.Fatalf("readBatchWith() = %d, want 1 on legacy path", n)
+		t.Fatalf("readBatchWith() = %d, want 1 on single path", n)
 	}
 	if got := string(bufs[0].Bytes[:bufs[0].N]); got != "one" {
 		t.Fatalf("first payload = %q, want %q", got, "one")
@@ -296,7 +296,7 @@ func TestConnectedUDPBatcherWritesAndReadsConnectedSocket(t *testing.T) {
 	}
 	defer client.Close()
 
-	batcher, ok := newConnectedUDPBatcher(client, server.LocalAddr(), probeTransportLegacy)
+	batcher, ok := newConnectedUDPBatcher(client, server.LocalAddr(), probeTransportSingle)
 	if !ok {
 		t.Fatal("newConnectedUDPBatcher() ok = false, want true")
 	}
@@ -364,7 +364,7 @@ func TestConnectedUDPBatcherConnectsDualStackSocketToIPv4Peer(t *testing.T) {
 		t.Skipf("udp listener is not dual-stack on this platform: %s", client.LocalAddr())
 	}
 
-	batcher, ok := newConnectedUDPBatcher(client, server.LocalAddr(), probeTransportLegacy)
+	batcher, ok := newConnectedUDPBatcher(client, server.LocalAddr(), probeTransportSingle)
 	if !ok {
 		t.Fatalf("newConnectedUDPBatcher(%s -> %s) ok = false, want true", client.LocalAddr(), server.LocalAddr())
 	}

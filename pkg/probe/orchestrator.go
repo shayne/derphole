@@ -225,7 +225,7 @@ func defaultProbeMode(mode string) string {
 
 func defaultProbeTransport(transport string) string {
 	if transport == "" {
-		return probeTransportLegacy
+		return probeTransportSingle
 	}
 	return transport
 }
@@ -417,7 +417,7 @@ func normalizeOrchestrateConfig(cfg OrchestrateConfig) (OrchestrateConfig, error
 		cfg.Direction = "forward"
 	}
 	if cfg.Transport == "" {
-		cfg.Transport = probeTransportLegacy
+		cfg.Transport = probeTransportSingle
 	}
 	if cfg.SizeBytes < 0 {
 		return OrchestrateConfig{}, errors.New("size bytes must be non-negative")

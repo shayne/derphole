@@ -165,7 +165,7 @@ func isRunSuccessful(run RunReport) bool {
 	if run.Success != nil {
 		return *run.Success
 	}
-	// Preserve legacy zero-value RunReport behavior.
+	// Preserve zero-value RunReport behavior.
 	return true
 }
 

@@ -11,13 +11,13 @@ import (
 )
 
 func TestNormalizeTransportForCLI(t *testing.T) {
-	for _, raw := range []string{"", "legacy", " LEGACY "} {
+	for _, raw := range []string{"", "single", " SINGLE "} {
 		got, err := NormalizeTransportForCLI(raw)
 		if err != nil {
 			t.Fatalf("NormalizeTransportForCLI(%q) error = %v", raw, err)
 		}
-		if got != probeTransportLegacy {
-			t.Fatalf("NormalizeTransportForCLI(%q) = %q, want legacy", raw, got)
+		if got != probeTransportSingle {
+			t.Fatalf("NormalizeTransportForCLI(%q) = %q, want single", raw, got)
 		}
 	}
 	if got, err := NormalizeTransportForCLI("batched"); err != nil || got != probeTransportBatched {

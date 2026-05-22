@@ -159,7 +159,7 @@ func TestSummarizeRunsDoesNotCountUnmeasuredZeroFirstByteAsMeasured(t *testing.T
 	}
 }
 
-func TestSummarizeRunsDoesNotCountLegacyZeroFirstByteAsMeasured(t *testing.T) {
+func TestSummarizeRunsDoesNotCountSingleZeroFirstByteAsMeasured(t *testing.T) {
 	summary := SummarizeRuns([]RunReport{{
 		GoodputMbps: 1,
 		DurationMS:  10,
@@ -267,7 +267,7 @@ func TestSeriesSummaryJSONOmitsMissingPeakGoodput(t *testing.T) {
 	}
 }
 
-func TestSummarizeRunsTreatsLegacyReportsAsSuccessful(t *testing.T) {
+func TestSummarizeRunsTreatsSingleReportsAsSuccessful(t *testing.T) {
 	runs := []RunReport{
 		{
 			GoodputMbps: 10,

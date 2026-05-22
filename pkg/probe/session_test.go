@@ -48,7 +48,7 @@ func requireConnectedUDPBatcher(t *testing.T, peer net.Addr) {
 	t.Helper()
 	conn := listenUDP4(t)
 	defer conn.Close()
-	batcher, ok := newConnectedUDPBatcher(conn, peer, probeTransportLegacy)
+	batcher, ok := newConnectedUDPBatcher(conn, peer, probeTransportSingle)
 	if !ok {
 		t.Skip("connected UDP batcher is unavailable on this platform")
 	}
@@ -1371,7 +1371,7 @@ func TestSendBlastParallelSkipsUnreachableOptionalLane(t *testing.T) {
 	go func() {
 		_, err := ReceiveBlastStreamParallelToWriter(ctx, []net.PacketConn{receiver}, &got, ReceiveConfig{
 			Blast:           true,
-			Transport:       "legacy",
+			Transport:       "single",
 			RequireComplete: true,
 		}, int64(len(payload)))
 		receiveErr <- err
@@ -1382,7 +1382,7 @@ func TestSendBlastParallelSkipsUnreachableOptionalLane(t *testing.T) {
 		"127.0.0.1:1",
 	}, bytes.NewReader(payload), SendConfig{
 		Blast:                    true,
-		Transport:                "legacy",
+		Transport:                "single",
 		ChunkSize:                512,
 		AllowPartialParallel:     true,
 		ParallelHandshakeTimeout: 50 * time.Millisecond,
@@ -1442,7 +1442,7 @@ func TestSendBlastParallelRetriesTransientNoBufferSpaceDuringStripedRehandshake(
 	go func() {
 		_, err := ReceiveBlastStreamParallelToWriter(ctx, []net.PacketConn{receiver}, &got, ReceiveConfig{
 			Blast:           true,
-			Transport:       "legacy",
+			Transport:       "single",
 			RequireComplete: true,
 		}, int64(len(payload)))
 		receiveErr <- err
@@ -1453,7 +1453,7 @@ func TestSendBlastParallelRetriesTransientNoBufferSpaceDuringStripedRehandshake(
 		"127.0.0.1:1",
 	}, bytes.NewReader(payload), SendConfig{
 		Blast:                    true,
-		Transport:                "legacy",
+		Transport:                "single",
 		ChunkSize:                512,
 		AllowPartialParallel:     true,
 		ParallelHandshakeTimeout: 50 * time.Millisecond,
@@ -3263,8 +3263,8 @@ func TestSendBlastParallelSingleLaneBatchedUsesConnectedUDP(t *testing.T) {
 	if sendStats.Transport.RequestedKind != probeTransportBatched {
 		t.Fatalf("send requested transport = %q, want %q", sendStats.Transport.RequestedKind, probeTransportBatched)
 	}
-	if sendStats.Transport.Kind != probeTransportLegacy && sendStats.Transport.Kind != probeTransportBatched {
-		t.Fatalf("send transport kind = %q, want %q or %q", sendStats.Transport.Kind, probeTransportLegacy, probeTransportBatched)
+	if sendStats.Transport.Kind != probeTransportSingle && sendStats.Transport.Kind != probeTransportBatched {
+		t.Fatalf("send transport kind = %q, want %q or %q", sendStats.Transport.Kind, probeTransportSingle, probeTransportBatched)
 	}
 
 	select {
@@ -3303,7 +3303,7 @@ func TestSendConfigDisableConnectedUDPSkipsParallelSendConnect(t *testing.T) {
 	defer server.Close()
 	requireConnectedUDPBatcher(t, server.LocalAddr())
 
-	batcher := newPacketBatcher(client, probeTransportLegacy)
+	batcher := newPacketBatcher(client, probeTransportSingle)
 	stats := TransferStats{}
 	got := maybeConnectedParallelSendBatcher(client, server.LocalAddr(), batcher, 1, SendConfig{DisableConnectedUDP: true}, &stats)
 	if got.Capabilities().Connected {
@@ -3324,7 +3324,7 @@ func TestReceiveConfigDisableConnectedUDPSkipsStreamReceiveConnect(t *testing.T)
 	connected := atomic.Bool{}
 	lane := &blastStreamReceiveLane{
 		conn:    receiver,
-		batcher: newPacketBatcher(receiver, probeTransportLegacy),
+		batcher: newPacketBatcher(receiver, probeTransportSingle),
 	}
 	maybeConnectBlastStreamReceiveLane(lane, ReceiveConfig{DisableConnectedUDP: true}, &connected, sender.LocalAddr())
 	if lane.batcher.Capabilities().Connected {

@@ -128,7 +128,7 @@ func TestSSHRunnerDefaultsAndEnvironmentInjection(t *testing.T) {
 		"DERPHOLE_PROBE_RATE_MBPS=750",
 		"DERPHOLE_PROBE_REQUIRE_COMPLETE=true",
 		"DERPHOLE_PROBE_REPAIR_PAYLOADS=0",
-		defaultProbeRemotePath + " server --listen :0 --mode raw --transport legacy",
+		defaultProbeRemotePath + " server --listen :0 --mode raw --transport single",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("ServerCommand() missing %q: %#v", want, cmd)
@@ -149,8 +149,8 @@ func TestCommandHelpersValidateDefaultsAndOptionalFlags(t *testing.T) {
 	if got := defaultProbeMode(""); got != "raw" {
 		t.Fatalf("defaultProbeMode(empty) = %q, want raw", got)
 	}
-	if got := defaultProbeTransport(""); got != probeTransportLegacy {
-		t.Fatalf("defaultProbeTransport(empty) = %q, want legacy", got)
+	if got := defaultProbeTransport(""); got != probeTransportSingle {
+		t.Fatalf("defaultProbeTransport(empty) = %q, want single", got)
 	}
 
 	argv := appendOptionalStringFlag([]string{"probe"}, "--flag", "")
@@ -410,7 +410,7 @@ func TestRunOrchestrateForwardTransfersAndReportsDirect(t *testing.T) {
 			Retransmits:  3,
 			PacketsSent:  12,
 			PacketsAcked: 8,
-			Transport:    TransportCaps{Kind: "legacy", RequestedKind: "batched"},
+			Transport:    TransportCaps{Kind: "single", RequestedKind: "batched"},
 		}, nil
 	}
 
@@ -452,7 +452,7 @@ func TestRunOrchestrateForwardTransfersAndReportsDirect(t *testing.T) {
 	if report.Retransmits != 3 {
 		t.Fatalf("report.Retransmits = %d, want 3", report.Retransmits)
 	}
-	if report.Local.Kind != "legacy" || report.Remote.Kind != "batched" {
+	if report.Local.Kind != "single" || report.Remote.Kind != "batched" {
 		t.Fatalf("transport report = %#v", report)
 	}
 	if len(gotArgv) < 7 || gotArgv[0] != "ssh" || !strings.Contains(strings.Join(gotArgv, " "), "BatchMode=yes") || !strings.Contains(strings.Join(gotArgv, " "), "ConnectTimeout=5") || !strings.Contains(strings.Join(gotArgv, " "), "/tmp/derphole-probe server --listen :0 --mode raw --transport batched") || !strings.Contains(strings.Join(gotArgv, " "), "--peer-candidates 198.51.100.10:40000") {
@@ -494,7 +494,7 @@ func TestRunOrchestrateForwardDoesNotInventMeasuredFirstByteFromZeroDone(t *test
 			Retransmits:  3,
 			PacketsSent:  12,
 			PacketsAcked: 8,
-			Transport:    TransportCaps{Kind: "legacy", RequestedKind: "batched"},
+			Transport:    TransportCaps{Kind: "single", RequestedKind: "batched"},
 		}, nil
 	}
 
@@ -557,7 +557,7 @@ func TestRunOrchestrateForwardBlastPassesRateToSingleSession(t *testing.T) {
 			StartedAt:   startedAt,
 			FirstByteAt: startedAt.Add(9 * time.Millisecond),
 			CompletedAt: startedAt.Add(2 * time.Second),
-			Transport:   TransportCaps{Kind: "legacy", RequestedKind: "batched"},
+			Transport:   TransportCaps{Kind: "single", RequestedKind: "batched"},
 		}, nil
 	}
 
@@ -652,7 +652,7 @@ func TestRunOrchestrateForwardBlastParallelPrefersRemoteDoneFirstByte(t *testing
 					StartedAt:   startedAt,
 					FirstByteAt: startedAt.Add(5 * time.Millisecond),
 					CompletedAt: startedAt.Add(100 * time.Millisecond),
-					Transport:   TransportCaps{Kind: "legacy", RequestedKind: "batched"},
+					Transport:   TransportCaps{Kind: "single", RequestedKind: "batched"},
 				}, nil
 			}
 
@@ -787,7 +787,7 @@ func TestRunOrchestrateReverseTransfersAndReportsDirect(t *testing.T) {
 			StartedAt:     startedAt,
 			FirstByteAt:   startedAt.Add(10 * time.Millisecond),
 			CompletedAt:   startedAt.Add(1500 * time.Millisecond),
-			Transport:     TransportCaps{Kind: "legacy", RequestedKind: "batched"},
+			Transport:     TransportCaps{Kind: "single", RequestedKind: "batched"},
 		}, nil
 	}
 
@@ -818,7 +818,7 @@ func TestRunOrchestrateReverseTransfersAndReportsDirect(t *testing.T) {
 	if report.Retransmits != 2 {
 		t.Fatalf("report.Retransmits = %d, want 2", report.Retransmits)
 	}
-	if report.Local.Kind != "legacy" || report.Remote.Kind != "batched" {
+	if report.Local.Kind != "single" || report.Remote.Kind != "batched" {
 		t.Fatalf("transport report = %#v", report)
 	}
 	joined := strings.Join(gotArgv, " ")
@@ -862,7 +862,7 @@ func TestRunOrchestrateReverseFailsOnShortReceive(t *testing.T) {
 			StartedAt:     startedAt,
 			FirstByteAt:   startedAt.Add(5 * time.Millisecond),
 			CompletedAt:   startedAt.Add(100 * time.Millisecond),
-			Transport:     TransportCaps{Kind: "legacy", RequestedKind: "batched"},
+			Transport:     TransportCaps{Kind: "single", RequestedKind: "batched"},
 		}, nil
 	}
 
@@ -936,7 +936,7 @@ func TestRunOrchestrateReverseBlastSingleUsesExpectedReceiver(t *testing.T) {
 			StartedAt:     startedAt,
 			FirstByteAt:   startedAt.Add(5 * time.Millisecond),
 			CompletedAt:   startedAt.Add(100 * time.Millisecond),
-			Transport:     TransportCaps{Kind: "legacy", RequestedKind: "batched"},
+			Transport:     TransportCaps{Kind: "single", RequestedKind: "batched"},
 		}, nil
 	}
 
@@ -1238,8 +1238,8 @@ func TestProbeSendTuningDefaultsAndOverrides(t *testing.T) {
 		_ = os.Unsetenv(key)
 	}
 
-	if got := probeWindowSize("raw", probeTransportLegacy); got != 256 {
-		t.Fatalf("probeWindowSize(raw, legacy) = %d, want 256", got)
+	if got := probeWindowSize("raw", probeTransportSingle); got != 256 {
+		t.Fatalf("probeWindowSize(raw, single) = %d, want 256", got)
 	}
 	if got := probeWindowSize("raw", probeTransportBatched); got != 384 {
 		t.Fatalf("probeWindowSize(raw, batched) = %d, want 384", got)
@@ -1260,7 +1260,7 @@ func TestProbeSendTuningDefaultsAndOverrides(t *testing.T) {
 	_ = os.Unsetenv("DERPHOLE_PROBE_WINDOW_SIZE")
 	_ = os.Setenv("DERPHOLE_PROBE_WINDOW", strconv.Itoa(320))
 	if got := probeWindowSize("raw", probeTransportBatched); got != 320 {
-		t.Fatalf("probeWindowSize(raw, batched) legacy override = %d, want 320", got)
+		t.Fatalf("probeWindowSize(raw, batched) fallback override = %d, want 320", got)
 	}
 	if got := probeChunkSize(); got != 1300 {
 		t.Fatalf("probeChunkSize() = %d, want 1300", got)

@@ -448,7 +448,7 @@ func probeTracef(format string, args ...any) {
 type clientFlags struct {
 	Host           string `flag:"host" help:"Remote host to connect to"`
 	Mode           string `flag:"mode" help:"Probe mode"`
-	Transport      string `flag:"transport" help:"UDP transport: legacy or batched" default:"legacy"`
+	Transport      string `flag:"transport" help:"UDP transport: single or batched" default:"single"`
 	SizeBytes      int64  `flag:"size-bytes" help:"Payload size in bytes" default:"1024"`
 	ChunkSize      int    `flag:"chunk-size" help:"UDP payload size per packet for raw/blast modes"`
 	WindowSize     int    `flag:"window-size" help:"Reliable raw-mode in-flight window"`

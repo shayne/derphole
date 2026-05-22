@@ -12,7 +12,7 @@ if [[ -z "${probe_transport}" ]]; then
   if [[ "${probe_mode}" == "raw" || "${probe_mode}" == "blast" ]]; then
     probe_transport="batched"
   else
-    probe_transport="legacy"
+    probe_transport="single"
   fi
 fi
 

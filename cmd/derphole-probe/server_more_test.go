@@ -22,8 +22,8 @@ func TestServerRunConfigValidationAndDefaults(t *testing.T) {
 	if failed || code != 0 {
 		t.Fatalf("parseServerRunConfig() failed=%v code=%d stderr=%q", failed, code, stderr.String())
 	}
-	if cfg.listenAddr != ":0" || cfg.transport != "legacy" || cfg.flags.Parallel != 3 {
-		t.Fatalf("cfg = %+v, want listen :0 legacy parallel 3", cfg)
+	if cfg.listenAddr != ":0" || cfg.transport != "single" || cfg.flags.Parallel != 3 {
+		t.Fatalf("cfg = %+v, want listen :0 single parallel 3", cfg)
 	}
 	if len(cfg.peerCandidates) != 2 {
 		t.Fatalf("peerCandidates = %v, want two parsed candidates", cfg.peerCandidates)
@@ -62,7 +62,7 @@ func TestRunServerTransferWritesReadyBeforeReceiveError(t *testing.T) {
 	}
 	defer conn.Close()
 
-	cfg := serverRunConfig{mode: "blast", transport: "legacy", flags: serverFlags{SizeBytes: 0}}
+	cfg := serverRunConfig{mode: "blast", transport: "single", flags: serverFlags{SizeBytes: 0}}
 	var stdout bytes.Buffer
 	_, err = runServerTransfer(context.Background(), conn, []net.PacketConn{conn}, cfg, nil, &stdout)
 	if err == nil || !strings.Contains(err.Error(), "size bytes is required") {

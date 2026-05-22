@@ -344,7 +344,7 @@ func durationMS(start, end time.Time) int64 {
 type serverFlags struct {
 	ListenAddr     string `flag:"listen" help:"Listen address for the server"`
 	Mode           string `flag:"mode" help:"Probe mode"`
-	Transport      string `flag:"transport" help:"UDP transport: legacy or batched" default:"legacy"`
+	Transport      string `flag:"transport" help:"UDP transport: single or batched" default:"single"`
 	PeerCandidates string `flag:"peer-candidates" help:"Comma-separated peer candidate addresses"`
 	SizeBytes      int64  `flag:"size-bytes" help:"Expected payload size for blast server mode"`
 	Parallel       int    `flag:"parallel" help:"Parallel blast sockets" default:"1"`

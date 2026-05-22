@@ -29,7 +29,7 @@ func TestMarshalBlastStatsPayloadRoundTripsReceiverProgress(t *testing.T) {
 	}
 }
 
-func TestUnmarshalBlastStatsPayloadBackfillsCommittedBytesForLegacyPayload(t *testing.T) {
+func TestUnmarshalBlastStatsPayloadBackfillsCommittedBytesForSinglePayload(t *testing.T) {
 	payload := make([]byte, blastStatsPayloadLenV1)
 	binary.BigEndian.PutUint64(payload[0:8], 12345)
 	binary.BigEndian.PutUint64(payload[8:16], 67)
@@ -41,6 +41,6 @@ func TestUnmarshalBlastStatsPayloadBackfillsCommittedBytesForLegacyPayload(t *te
 		t.Fatal("unmarshalBlastStatsPayload() ok = false")
 	}
 	if got.CommittedPayloadBytes != got.ReceivedPayloadBytes {
-		t.Fatalf("CommittedPayloadBytes = %d, want legacy fallback %d", got.CommittedPayloadBytes, got.ReceivedPayloadBytes)
+		t.Fatalf("CommittedPayloadBytes = %d, want single fallback %d", got.CommittedPayloadBytes, got.ReceivedPayloadBytes)
 	}
 }

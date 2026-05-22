@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	probeTransportLegacy             = "legacy"
+	probeTransportSingle             = "single"
 	probeTransportBatched            = "batched"
 	probeIdealBatchSize              = 128
 	probePacedBatchTarget            = 2 * time.Millisecond
@@ -71,8 +71,8 @@ type packetBatcher interface {
 
 func normalizeTransport(raw string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "", probeTransportLegacy:
-		return probeTransportLegacy, nil
+	case "", probeTransportSingle:
+		return probeTransportSingle, nil
 	case probeTransportBatched:
 		return probeTransportBatched, nil
 	default:
@@ -88,19 +88,19 @@ func PreviewTransportCaps(conn net.PacketConn, requested string) TransportCaps {
 	return newPacketBatcher(conn, requested).Capabilities()
 }
 
-func newLegacyBatcher(conn net.PacketConn) packetBatcher {
-	return newLegacyBatcherRequested(conn, probeTransportLegacy)
+func newSinglePacketBatcher(conn net.PacketConn) packetBatcher {
+	return newSinglePacketBatcherRequested(conn, probeTransportSingle)
 }
 
-func newLegacyBatcherRequested(conn net.PacketConn, requested string) packetBatcher {
+func newSinglePacketBatcherRequested(conn net.PacketConn, requested string) packetBatcher {
 	requested, err := normalizeTransport(requested)
 	if err != nil {
-		requested = probeTransportLegacy
+		requested = probeTransportSingle
 	}
-	return &legacyBatcher{
+	return &singlePacketBatcher{
 		conn: conn,
 		caps: tuneSocketCaps(conn, TransportCaps{
-			Kind:          probeTransportLegacy,
+			Kind:          probeTransportSingle,
 			RequestedKind: requested,
 		}),
 	}
@@ -109,17 +109,17 @@ func newLegacyBatcherRequested(conn net.PacketConn, requested string) packetBatc
 func newPacketBatcher(conn net.PacketConn, requested string) packetBatcher {
 	requested, err := normalizeTransport(requested)
 	if err != nil {
-		requested = probeTransportLegacy
+		requested = probeTransportSingle
 	}
 	if requested == probeTransportBatched {
 		if batcher := newPlatformBatcher(conn, requested); batcher != nil {
 			return batcher
 		}
 	}
-	return newLegacyBatcherRequested(conn, requested)
+	return newSinglePacketBatcherRequested(conn, requested)
 }
 
-type legacyBatcher struct {
+type singlePacketBatcher struct {
 	conn       net.PacketConn
 	caps       TransportCaps
 	deadlineMu sync.Mutex
@@ -127,10 +127,10 @@ type legacyBatcher struct {
 	writeBy    time.Time
 }
 
-func (b *legacyBatcher) Capabilities() TransportCaps { return b.caps }
-func (b *legacyBatcher) MaxBatch() int               { return 1 }
+func (b *singlePacketBatcher) Capabilities() TransportCaps { return b.caps }
+func (b *singlePacketBatcher) MaxBatch() int               { return 1 }
 
-func (b *legacyBatcher) WriteBatch(ctx context.Context, peer net.Addr, packets [][]byte) (int, error) {
+func (b *singlePacketBatcher) WriteBatch(ctx context.Context, peer net.Addr, packets [][]byte) (int, error) {
 	if len(packets) == 0 {
 		return 0, nil
 	}
@@ -147,7 +147,7 @@ func (b *legacyBatcher) WriteBatch(ctx context.Context, peer net.Addr, packets [
 	return writePacketBatch(b.conn, peer, packets)
 }
 
-func (b *legacyBatcher) writeUDPBatch(peer net.Addr, packets [][]byte) (int, bool, error) {
+func (b *singlePacketBatcher) writeUDPBatch(peer net.Addr, packets [][]byte) (int, bool, error) {
 	udpConn, ok := b.conn.(*net.UDPConn)
 	if !ok {
 		return 0, false, nil
@@ -174,7 +174,7 @@ func writePacketBatch(conn net.PacketConn, peer net.Addr, packets [][]byte) (int
 	return len(packets), nil
 }
 
-func (b *legacyBatcher) ReadBatch(ctx context.Context, timeout time.Duration, bufs []batchReadBuffer) (int, error) {
+func (b *singlePacketBatcher) ReadBatch(ctx context.Context, timeout time.Duration, bufs []batchReadBuffer) (int, error) {
 	if len(bufs) == 0 {
 		return 0, nil
 	}
@@ -214,7 +214,7 @@ func (b *legacyBatcher) ReadBatch(ctx context.Context, timeout time.Duration, bu
 	return 1, nil
 }
 
-func (b *legacyBatcher) setReadDeadline(ctx context.Context, timeout time.Duration) error {
+func (b *singlePacketBatcher) setReadDeadline(ctx context.Context, timeout time.Duration) error {
 	deadline, err := batchReadDeadline(ctx, timeout)
 	if err != nil {
 		return err
@@ -231,13 +231,13 @@ func (b *legacyBatcher) setReadDeadline(ctx context.Context, timeout time.Durati
 	return nil
 }
 
-func (b *legacyBatcher) invalidateReadDeadline() {
+func (b *singlePacketBatcher) invalidateReadDeadline() {
 	b.deadlineMu.Lock()
 	defer b.deadlineMu.Unlock()
 	b.readBy = time.Time{}
 }
 
-func (b *legacyBatcher) setWriteDeadline(ctx context.Context) error {
+func (b *singlePacketBatcher) setWriteDeadline(ctx context.Context) error {
 	deadline, err := batchWriteDeadline(ctx)
 	if err != nil {
 		return err
@@ -279,13 +279,13 @@ func newConnectedUDPBatcher(conn net.PacketConn, peer net.Addr, requested string
 	probeTracef("connected udp enabled local=%s peer=%s", udpConn.LocalAddr(), udpPeer)
 	requested, err := normalizeTransport(requested)
 	if err != nil {
-		requested = probeTransportLegacy
+		requested = probeTransportSingle
 	}
 	return &connectedUDPBatcher{
 		conn: udpConn,
 		peer: cloneAddr(udpPeer),
 		caps: tuneSocketCaps(udpConn, TransportCaps{
-			Kind:          probeTransportLegacy,
+			Kind:          probeTransportSingle,
 			RequestedKind: requested,
 			Connected:     true,
 		}),

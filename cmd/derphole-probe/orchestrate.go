@@ -121,7 +121,7 @@ type orchestrateFlags struct {
 	Host      string `flag:"host" help:"Remote host to benchmark"`
 	User      string `flag:"user" help:"SSH user" default:"root"`
 	Mode      string `flag:"mode" help:"Probe mode: raw or blast; AEAD lands in Task 5" default:"raw"`
-	Transport string `flag:"transport" help:"UDP transport: legacy or batched" default:"legacy"`
+	Transport string `flag:"transport" help:"UDP transport: single or batched" default:"single"`
 	Direction string `flag:"direction" help:"Transfer direction" default:"forward"`
 	SizeBytes int64  `flag:"size-bytes" help:"Payload size in bytes" default:"1048576"`
 	Parallel  int    `flag:"parallel" help:"Parallel raw/blast stripes" default:"1"`

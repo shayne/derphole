@@ -24,7 +24,7 @@ func TestMarkdownReportIncludesCoreMetrics(t *testing.T) {
 		LossRate:      0.125,
 		Retransmits:   4,
 		Local: TransportCaps{
-			Kind:             "legacy",
+			Kind:             "single",
 			RequestedKind:    "batched",
 			RequestedSockBuf: 8 << 20,
 			ReadBufferBytes:  425984,
@@ -40,7 +40,7 @@ func TestMarkdownReportIncludesCoreMetrics(t *testing.T) {
 	}
 
 	md := report.Markdown()
-	want := "- host=ktzlxc mode=raw transport=batched direction=forward size=1048576 bytes_received=1048576 duration_ms=1250 goodput_mbps=670.5 direct=true first_byte_ms=18 loss_rate=0.1250 retransmits=4 local=legacy(req=batched batch=0 read_buf=425984 write_buf=425984 tx_offload=false rx_offload=false rxq_overflow=false connected=false) remote=batched(req=batched batch=128 read_buf=0 write_buf=0 tx_offload=true rx_offload=true rxq_overflow=false connected=false)"
+	want := "- host=ktzlxc mode=raw transport=batched direction=forward size=1048576 bytes_received=1048576 duration_ms=1250 goodput_mbps=670.5 direct=true first_byte_ms=18 loss_rate=0.1250 retransmits=4 local=single(req=batched batch=0 read_buf=425984 write_buf=425984 tx_offload=false rx_offload=false rxq_overflow=false connected=false) remote=batched(req=batched batch=128 read_buf=0 write_buf=0 tx_offload=true rx_offload=true rxq_overflow=false connected=false)"
 	if md != want {
 		t.Fatalf("Markdown() = %q, want %q", md, want)
 	}
@@ -63,7 +63,7 @@ func TestRunReportJSONEncodesCoreMetrics(t *testing.T) {
 		LossRate:          0.02,
 		Retransmits:       1,
 		Success:           boolPtr(true),
-		Local:             TransportCaps{Kind: "legacy", RequestedKind: "batched"},
+		Local:             TransportCaps{Kind: "single", RequestedKind: "batched"},
 		Remote:            TransportCaps{Kind: "batched", RequestedKind: "batched", BatchSize: 128, TXOffload: true},
 	}
 
@@ -85,7 +85,7 @@ func TestRunReportJSONEncodesCoreMetrics(t *testing.T) {
 		t.Fatalf("decoded report = %#v", decoded)
 	}
 	local, ok := decoded["local"].(map[string]any)
-	if !ok || local["kind"] != "legacy" || local["requested_kind"] != "batched" {
+	if !ok || local["kind"] != "single" || local["requested_kind"] != "batched" {
 		t.Fatalf("decoded local transport = %#v", decoded["local"])
 	}
 	remote, ok := decoded["remote"].(map[string]any)
@@ -126,7 +126,7 @@ func TestRunReportJSONRoundTripsExplicitFalseSuccess(t *testing.T) {
 	}
 }
 
-func TestRunReportJSONLegacyOmittedSuccessPreservesLegacyBehavior(t *testing.T) {
+func TestRunReportJSONSingleOmittedSuccessPreservesSingleBehavior(t *testing.T) {
 	report := RunReport{
 		Host:        "ktzlxc",
 		Mode:        "raw",
@@ -156,7 +156,7 @@ func TestRunReportJSONLegacyOmittedSuccessPreservesLegacyBehavior(t *testing.T) 
 		t.Fatalf("roundTripped.Success = %#v, want nil", roundTripped.Success)
 	}
 	if got := SummarizeRuns([]RunReport{roundTripped}); got.SuccessCount != 1 {
-		t.Fatalf("legacy round-tripped report did not count as successful")
+		t.Fatalf("round-tripped report did not count as successful")
 	}
 }
 
