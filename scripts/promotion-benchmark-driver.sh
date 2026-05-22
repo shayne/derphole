@@ -32,6 +32,8 @@ local_bin="./dist/${tool}"
 linux_bin="dist/${tool}-linux-amd64"
 sender_log="${tmp}/sender.err"
 receiver_log="${tmp}/receiver.err"
+sender_trace_csv="${tmp}/sender.trace.csv"
+receiver_trace_csv="${tmp}/receiver.trace.csv"
 receiver_out="${tmp}/receiver.out"
 payload="${tmp}/payload.bin"
 send_pid=""
@@ -42,12 +44,6 @@ parallel_args_remote=""
 
 if [[ "${DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES:-}" == "1" ]]; then
   remote_env+=(DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1)
-fi
-if [[ "${DERPHOLE_TRACE_HANDOFF:-}" == "1" ]]; then
-  remote_env+=(DERPHOLE_TRACE_HANDOFF=1)
-fi
-if [[ "${DERPHOLE_PROBE_TRACE:-}" == "1" ]]; then
-  remote_env+=(DERPHOLE_PROBE_TRACE=1)
 fi
 if [[ "${tool}" == "derphole" && -n "${DERPHOLE_PARALLEL_ARGS:-}" ]]; then
   read -r -a parallel_args <<<"${DERPHOLE_PARALLEL_ARGS}"
@@ -89,10 +85,68 @@ print(f"{(size * 8.0) / (duration_ms * 1000.0):.2f}")
 PY
 }
 
-last_metric_value() {
+trace_metric_value() {
+  local mode="$1"
+  local file="$2"
+  local key="$3"
+
+  if [[ ! -s "${file}" ]]; then
+    return 0
+  fi
+  python3 - "${mode}" "${file}" "${key}" <<'PY'
+import csv
+import sys
+
+mode, path, key = sys.argv[1:4]
+result = ""
+best = None
+with open(path, newline="") as fh:
+    for row in csv.DictReader(fh):
+        value = (row.get(key) or "").strip()
+        if not value:
+            continue
+        if mode == "last":
+            result = value
+            continue
+        try:
+            numeric = float(value)
+        except ValueError:
+            continue
+        if best is None or numeric > best:
+            best = numeric
+            result = f"{numeric:.2f}"
+print(result)
+PY
+}
+
+last_trace_value() {
+  trace_metric_value last "$1" "$2"
+}
+
+max_trace_value() {
+  trace_metric_value max "$1" "$2"
+}
+
+trace_has_direct_bytes() {
   local file="$1"
-  local key="$2"
-  sed -n "s/^${key}=//p" "${file}" | tail -n 1
+  if [[ ! -s "${file}" ]]; then
+    return 1
+  fi
+  python3 - "${file}" <<'PY'
+import csv
+import sys
+
+with open(sys.argv[1], newline="") as fh:
+    for row in csv.DictReader(fh):
+        try:
+            if int(row.get("direct_bytes") or "0") > 0:
+                sys.exit(0)
+        except ValueError:
+            pass
+        if (row.get("direct_validated") or "").lower() == "true":
+            sys.exit(0)
+sys.exit(1)
+PY
 }
 
 emit_benchmark_footer() {
@@ -165,23 +219,16 @@ require_direct_evidence() {
   fi
 }
 
-require_direct_path_log() {
+require_direct_trace() {
   local label="$1"
   local file="$2"
-  local metric_prefix="$3"
 
-  if grep -q '^udp-relay=true$' "${file}"; then
-    echo "${label} fell back to relay instead of v2 direct path" >&2
+  if [[ ! -s "${file}" ]]; then
+    echo "${label} missing transfer trace" >&2
     exit 1
   fi
-  if grep -q "^${metric_prefix}-data-goodput-mbps=" "${file}"; then
-    return 0
-  fi
-  if grep -q '^v2-data-plane=raw-direct$' "${file}" && grep -Eq '^v2-raw-direct-active=[1-9][0-9]*$' "${file}"; then
-    return 0
-  fi
-  if ! grep -q "^${metric_prefix}-data-goodput-mbps=" "${file}"; then
-    echo "${label} missing direct transfer evidence" >&2
+  if ! trace_has_direct_bytes "${file}"; then
+    echo "${label} missing direct transfer trace evidence" >&2
     exit 1
   fi
 }
@@ -200,6 +247,12 @@ preserve_logs() {
   fi
   if [[ -f "${receiver_log}" ]]; then
     cp "${receiver_log}" "${log_dir}/${prefix}-receiver.log"
+  fi
+  if [[ -f "${sender_trace_csv}" ]]; then
+    cp "${sender_trace_csv}" "${log_dir}/${prefix}-sender.trace.csv"
+  fi
+  if [[ -f "${receiver_trace_csv}" ]]; then
+    cp "${receiver_trace_csv}" "${log_dir}/${prefix}-receiver.trace.csv"
   fi
 }
 
@@ -273,7 +326,7 @@ cleanup() {
   if [[ -n "${listener_pid}" ]]; then
     kill "${listener_pid}" 2>/dev/null || true
   fi
-  remote "if [[ -f '${remote_base}.pid' ]]; then kill \$(cat '${remote_base}.pid') 2>/dev/null || true; fi; rm -f '${remote_base}.pid' '${remote_base}.payload' '${remote_base}.out' '${remote_base}.err' '${remote_upload}'; if [[ '${remote_bin_dir}' != '${requested_remote_bin_dir}' ]]; then rm -f '${remote_bin}'; fi" >/dev/null 2>&1 || true
+  remote "if [[ -f '${remote_base}.pid' ]]; then kill \$(cat '${remote_base}.pid') 2>/dev/null || true; fi; rm -f '${remote_base}.pid' '${remote_base}.payload' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_upload}'; if [[ '${remote_bin_dir}' != '${requested_remote_bin_dir}' ]]; then rm -f '${remote_bin}'; fi" >/dev/null 2>&1 || true
   rm -rf "${tmp}"
 }
 
@@ -310,7 +363,7 @@ run_forward_derphole() {
   dd if=/dev/urandom of="${payload}" bs=1048576 count="${size_mib}" 2>/dev/null
   source_sha="$(shasum -a 256 "${payload}" | awk '{print $1}')"
 
-  remote "rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err'; nohup '${remote_bin}' --verbose listen >'${remote_base}.out' 2>'${remote_base}.err' </dev/null & echo \$! > '${remote_base}.pid'"
+  remote "rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv'; nohup env DERPHOLE_TRANSFER_TRACE_CSV='${remote_base}.trace.csv' '${remote_bin}' --verbose listen >'${remote_base}.out' 2>'${remote_base}.err' </dev/null & echo \$! > '${remote_base}.pid'"
 
   token=""
   for _ in $(seq 1 200); do
@@ -327,13 +380,14 @@ run_forward_derphole() {
 
   start_ms="$(now_ms)"
   if ((${#parallel_args[@]})); then
-    "${local_bin}" --verbose pipe "${parallel_args[@]}" "${token}" < "${payload}" >/dev/null 2>"${sender_log}"
+    DERPHOLE_TRANSFER_TRACE_CSV="${sender_trace_csv}" "${local_bin}" --verbose pipe "${parallel_args[@]}" "${token}" < "${payload}" >/dev/null 2>"${sender_log}"
   else
-    "${local_bin}" --verbose pipe "${token}" < "${payload}" >/dev/null 2>"${sender_log}"
+    DERPHOLE_TRANSFER_TRACE_CSV="${sender_trace_csv}" "${local_bin}" --verbose pipe "${token}" < "${payload}" >/dev/null 2>"${sender_log}"
   fi
 
   wait_remote_pid_exit
   remote "cat '${remote_base}.err'" >"${receiver_log}"
+  remote "cat '${remote_base}.trace.csv'" >"${receiver_trace_csv}"
   sink_sha="$(remote "sha256sum '${remote_base}.out' | awk '{print \$1}'")"
   sink_size="$(remote "wc -c < '${remote_base}.out'")"
 }
@@ -343,7 +397,7 @@ run_reverse_derphole() {
   remote "dd if=/dev/urandom of='${remote_base}.payload' bs=1048576 count='${size_mib}' 2>/dev/null"
   source_sha="$(remote "sha256sum '${remote_base}.payload' | awk '{print \$1}'")"
 
-  "${local_bin}" --verbose listen >"${receiver_out}" 2>"${receiver_log}" &
+  DERPHOLE_TRANSFER_TRACE_CSV="${receiver_trace_csv}" "${local_bin}" --verbose listen >"${receiver_out}" 2>"${receiver_log}" &
   listener_pid="$!"
 
   token=""
@@ -360,7 +414,7 @@ run_reverse_derphole() {
   fi
 
   local remote_send_cmd
-  remote_send_cmd="'${remote_bin}' --verbose pipe"
+  remote_send_cmd="DERPHOLE_TRANSFER_TRACE_CSV='${remote_base}.trace.csv' '${remote_bin}' --verbose pipe"
   if [[ -n "${parallel_args_remote}" ]]; then
     remote_send_cmd+=" ${parallel_args_remote}"
   fi
@@ -372,6 +426,7 @@ run_reverse_derphole() {
   wait "${listener_pid}"
   listener_pid=""
   remote "cat '${remote_base}.err'" >"${sender_log}"
+  remote "cat '${remote_base}.trace.csv'" >"${sender_trace_csv}"
   sink_sha="$(shasum -a 256 "${receiver_out}" | awk '{print $1}')"
   sink_size="$(wc -c < "${receiver_out}" | tr -d '[:space:]')"
 }
@@ -402,12 +457,18 @@ finalize_run() {
   [[ -n "${receiver_trace}" ]]
   require_direct_evidence "sender" "${sender_trace}"
   require_direct_evidence "receiver" "${receiver_trace}"
-  require_direct_path_log "sender" "${sender_log}" "udp-send"
-  require_direct_path_log "receiver" "${receiver_log}" "udp-receive"
+  require_direct_trace "sender" "${sender_trace_csv}"
+  require_direct_trace "receiver" "${receiver_trace_csv}"
 
-  sender_goodput_mbps="$(last_metric_value "${sender_log}" "udp-send-goodput-mbps")"
-  sender_peak_goodput_mbps="$(last_metric_value "${sender_log}" "udp-send-peak-goodput-mbps")"
-  sender_first_byte_ms="$(last_metric_value "${sender_log}" "udp-send-session-first-byte-ms")"
+  sender_goodput_mbps="$(last_trace_value "${sender_trace_csv}" "send_goodput_mbps")"
+  if [[ -z "${sender_goodput_mbps}" ]]; then
+    sender_goodput_mbps="$(last_trace_value "${sender_trace_csv}" "app_mbps")"
+  fi
+  sender_peak_goodput_mbps="$(max_trace_value "${sender_trace_csv}" "send_goodput_mbps")"
+  if [[ -z "${sender_peak_goodput_mbps}" ]]; then
+    sender_peak_goodput_mbps="$(max_trace_value "${sender_trace_csv}" "app_mbps")"
+  fi
+  sender_first_byte_ms="$(last_trace_value "${sender_trace_csv}" "quic_first_byte_ms")"
   assert_no_tool_leaks
 
   end_ms="$(now_ms)"
@@ -442,6 +503,10 @@ finalize_run() {
   cat "${sender_log}"
   echo "--- receiver log"
   cat "${receiver_log}"
+  echo "--- sender trace"
+  cat "${sender_trace_csv}"
+  echo "--- receiver trace"
+  cat "${receiver_trace_csv}"
 }
 
 build_and_install_remote_binary

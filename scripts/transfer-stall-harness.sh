@@ -204,10 +204,6 @@ remote_env_prefix() {
   if [[ "${disable_tailscale}" == "1" ]]; then
     prefix+=(DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1)
   fi
-  if [[ "${DERPHOLE_STALL_TRACE:-1}" == "1" ]]; then
-    prefix+=(DERPHOLE_TRACE_HANDOFF=1)
-    prefix+=(DERPHOLE_PROBE_TRACE=1)
-  fi
   if [[ -n "${DERPHOLE_V2_RAW_DIRECT:-}" ]]; then
     prefix+=(DERPHOLE_V2_RAW_DIRECT="$(quote "${DERPHOLE_V2_RAW_DIRECT}")")
   fi

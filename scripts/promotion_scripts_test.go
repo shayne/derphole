@@ -70,3 +70,33 @@ func TestPromotionWrappersUseSharedDriver(t *testing.T) {
 		})
 	}
 }
+
+func TestPromotionDriverUsesV2TransferTraceMetrics(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(filepath.Join(".", "promotion-benchmark-driver.sh"))
+	if err != nil {
+		t.Fatalf("read promotion-benchmark-driver.sh: %v", err)
+	}
+	body := string(data)
+
+	for _, want := range []string{
+		"DERPHOLE_TRANSFER_TRACE_CSV",
+		"require_direct_trace",
+		"send_goodput_mbps",
+		"direct_bytes",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("promotion driver missing %q", want)
+		}
+	}
+	for _, retired := range []string{
+		"udp-" + "send",
+		"udp-" + "receive",
+		"DERPHOLE_TRACE_" + "HANDOFF",
+	} {
+		if strings.Contains(body, retired) {
+			t.Fatalf("promotion driver still references retired telemetry %q", retired)
+		}
+	}
+}

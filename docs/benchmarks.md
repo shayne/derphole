@@ -92,16 +92,16 @@ Sender `app_bytes` are receiver-confirmed session stream bytes once progress ACK
 `connected-direct` means a direct path has delivered probe or payload bytes. A run that attempts direct but falls back to relay records `direct-fallback-relay` and a non-empty `fallback_reason`.
 Relay fallback should continue making trace progress after a direct setup failure; v2 keeps the application stream on one QUIC path instead of reviving the retired split-stream protocol.
 
-Use v2 direct-path telemetry to explain scaling decisions:
+Use v2 trace and verbose telemetry to explain path selection:
 
-- `udp-striped-available-lanes`: routable direct UDP lane pool retained for data.
-- `udp-active-lanes-selected`: initial active data lane target.
-- `udp-active-lane-min`: minimum active lane floor derived from useful probe evidence.
-- `udp-active-lane-cap`: policy cap from `--parallel` or auto policy.
-- `udp-rate-ceiling-mbps`: conservative clean startup ceiling.
-- `udp-rate-exploration-ceiling-mbps`: higher aggregate ceiling allowed by useful lossy probes.
+- `v2-data-plane=raw-direct` means both peers agreed on raw UDP packet conns before QUIC started.
+- `v2-data-plane=manager` means QUIC is running over the manager-backed relay/direct packet substrate.
+- `v2-raw-direct-active` and `v2-raw-direct-selected-addrs` show the raw-direct lane set.
+- `direct_bytes` and `relay_bytes` in the trace show actual byte movement by path.
+- `fallback_reason` explains direct setup failures that continued over relay.
+- `peer_recv_queue_depth` and `peer_recv_queue_depth_max` show receiver-side backpressure inside the packet manager.
 
-A healthy LAN/VLAN run should not collapse to one available lane when multiple routable lanes probed successfully. Aggregate rate can start conservative, but the lane pool and exploration ceiling should leave room for controller scaling as quality changes.
+A healthy LAN/VLAN run should either use raw-direct or show direct byte growth through the manager path. If verbose logs show `v2-raw-direct-no-observed-addrs`, inspect candidate reachability and routing before treating throughput as a transport regression.
 
 For no-Tailscale route verification, run 3x averaged 1 GiB transfers in both directions for:
 

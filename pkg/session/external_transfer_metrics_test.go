@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/transfertrace"
 	"github.com/shayne/derphole/pkg/transport"
 )
@@ -42,31 +41,6 @@ func TestExternalTransferMetricsNilReceiverWriteAndCompleteNoop(t *testing.T) {
 	m.RecordRelayWrite(1024, time.Unix(1, 0))
 	m.RecordDirectWrite(2048, time.Unix(2, 0))
 	m.Complete(time.Unix(3, 0))
-}
-
-func TestEmitExternalTransferMetricsIncludesWallAndPeakValues(t *testing.T) {
-	start := time.Unix(0, 0)
-	m := newExternalTransferMetrics(start)
-	m.RecordRelayWrite(64<<10, start.Add(15*time.Millisecond))
-	m.RecordDirectWrite(1<<20, start.Add(300*time.Millisecond))
-	m.Complete(start.Add(1300 * time.Millisecond))
-
-	var buf bytes.Buffer
-	emitter := telemetry.New(&buf, telemetry.LevelVerbose)
-	m.Emit(emitter, "udp-send", 2011.4)
-
-	got := buf.String()
-	for _, needle := range []string{
-		"udp-send-wall-duration-ms=1300",
-		"udp-send-session-first-byte-ms=15",
-		"udp-send-relay-bytes=65536",
-		"udp-send-direct-bytes=1048576",
-		"udp-send-peak-goodput-mbps=2011.40",
-	} {
-		if !strings.Contains(got, needle) {
-			t.Fatalf("metrics output missing %q in %q", needle, got)
-		}
-	}
 }
 
 func TestExternalTransferMetricsUpdatesTrace(t *testing.T) {

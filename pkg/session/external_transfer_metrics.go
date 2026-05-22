@@ -7,11 +7,9 @@ package session
 import (
 	"context"
 	"io"
-	"strconv"
 	"sync"
 	"time"
 
-	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/transfertrace"
 	"github.com/shayne/derphole/pkg/transport"
 )
@@ -398,17 +396,6 @@ func (m *externalTransferMetrics) DirectBytes() int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.directBytes
-}
-
-func (m *externalTransferMetrics) Emit(emitter *telemetry.Emitter, prefix string, peakGoodputMbps float64) {
-	if emitter == nil {
-		return
-	}
-	emitter.Debug(prefix + "-wall-duration-ms=" + strconv.FormatInt(m.TotalDurationMS(), 10))
-	emitter.Debug(prefix + "-session-first-byte-ms=" + strconv.FormatInt(m.FirstByteMS(), 10))
-	emitter.Debug(prefix + "-relay-bytes=" + strconv.FormatInt(m.RelayBytes(), 10))
-	emitter.Debug(prefix + "-direct-bytes=" + strconv.FormatInt(m.DirectBytes(), 10))
-	emitter.Debug(prefix + "-peak-goodput-mbps=" + strconv.FormatFloat(peakGoodputMbps, 'f', 2, 64))
 }
 
 func withExternalTransferMetrics(ctx context.Context, metrics *externalTransferMetrics) context.Context {
