@@ -765,7 +765,7 @@ func copyExternalV2SendStreams(ctx context.Context, src io.Reader, streams []io.
 	if len(streams) == 1 {
 		dst := io.Writer(streams[0])
 		if metrics != nil {
-			dst = externalTransferMetricsWriter{w: dst, record: metrics.RecordDirectQUICSend}
+			dst = externalTransferMetricsWriter{w: dst, record: metrics.RecordDirectPathSend}
 		}
 		writer := bufio.NewWriterSize(dst, externalV2CopyBufferSize)
 		buf := make([]byte, externalV2CopyBufferSize)
@@ -783,7 +783,7 @@ func copyExternalV2SendStreams(ctx context.Context, src io.Reader, streams []io.
 		if metrics != nil {
 			writer = externalTransferMetricsWriteCloser{
 				WriteCloser: writer,
-				record:      metrics.RecordDirectQUICSend,
+				record:      metrics.RecordDirectPathSend,
 			}
 		}
 		writers = append(writers, writer)
@@ -795,7 +795,7 @@ func copyExternalV2ReceiveStreams(ctx context.Context, dst io.Writer, streams []
 	countingDst := &byteCountingWriter{w: dst}
 	recordDst := io.Writer(countingDst)
 	if metrics != nil {
-		recordDst = externalTransferMetricsWriter{w: recordDst, record: metrics.RecordDirectQUICReceive}
+		recordDst = externalTransferMetricsWriter{w: recordDst, record: metrics.RecordDirectPathReceive}
 	}
 	if len(streams) == 1 {
 		buf := make([]byte, externalV2CopyBufferSize)

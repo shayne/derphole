@@ -290,7 +290,7 @@ func TestExternalTransferMetricsSetProbeStatsUpdatesTrace(t *testing.T) {
 	}
 }
 
-func TestExternalTransferMetricsDirectQUICSendProgressUsesLocalBytesBeforeAck(t *testing.T) {
+func TestExternalTransferMetricsDirectPathSendProgressUsesLocalBytesBeforeAck(t *testing.T) {
 	var out bytes.Buffer
 	start := time.Unix(81, 0)
 	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, start)
@@ -298,8 +298,8 @@ func TestExternalTransferMetricsDirectQUICSendProgressUsesLocalBytesBeforeAck(t 
 		t.Fatal(err)
 	}
 	metrics := newExternalTransferMetricsWithTrace(start, rec, transfertrace.RoleSend)
-	metrics.SetPhase(transfertrace.PhaseDirectExecute, "connected-direct-quic")
-	metrics.RecordDirectQUICSend(2<<20, start.Add(100*time.Millisecond))
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, "connected-direct")
+	metrics.RecordDirectPathSend(2<<20, start.Add(100*time.Millisecond))
 	metrics.Tick(start.Add(500 * time.Millisecond))
 	metrics.RecordPeerProgressFromFirstByte(2<<20, start.Add(800*time.Millisecond))
 	metrics.Tick(start.Add(900 * time.Millisecond))
@@ -314,7 +314,7 @@ func TestExternalTransferMetricsDirectQUICSendProgressUsesLocalBytesBeforeAck(t 
 		beforeAck["peer_received_bytes"] != "0" ||
 		beforeAck["direct_transport"] != "quic" ||
 		beforeAck["direct_packet_bytes"] != "2097152" {
-		t.Fatalf("pre-ACK trace row = %#v, want QUIC sender local progress", beforeAck)
+		t.Fatalf("pre-ACK trace row = %#v, want direct-path sender local progress", beforeAck)
 	}
 	afterAck := rows[len(rows)-1]
 	if afterAck["app_bytes"] != "2097152" ||
@@ -324,7 +324,7 @@ func TestExternalTransferMetricsDirectQUICSendProgressUsesLocalBytesBeforeAck(t 
 	}
 }
 
-func TestExternalTransferMetricsDirectQUICReceiveProgressWritesCommittedBytes(t *testing.T) {
+func TestExternalTransferMetricsDirectPathReceiveProgressWritesCommittedBytes(t *testing.T) {
 	var out bytes.Buffer
 	start := time.Unix(82, 0)
 	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleReceive, start)
@@ -332,8 +332,8 @@ func TestExternalTransferMetricsDirectQUICReceiveProgressWritesCommittedBytes(t 
 		t.Fatal(err)
 	}
 	metrics := newExternalTransferMetricsWithTrace(start, rec, transfertrace.RoleReceive)
-	metrics.SetPhase(transfertrace.PhaseDirectExecute, "connected-direct-quic")
-	metrics.RecordDirectQUICReceive(3<<20, start.Add(100*time.Millisecond))
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, "connected-direct")
+	metrics.RecordDirectPathReceive(3<<20, start.Add(100*time.Millisecond))
 	metrics.Tick(start.Add(500 * time.Millisecond))
 	if err := rec.Close(); err != nil {
 		t.Fatal(err)
@@ -346,10 +346,10 @@ func TestExternalTransferMetricsDirectQUICReceiveProgressWritesCommittedBytes(t 
 		row["direct_packet_bytes"] != "3145728" ||
 		row["direct_committed_bytes"] != "3145728" ||
 		row["direct_transport"] != "quic" {
-		t.Fatalf("trace row = %#v, want QUIC receive progress", row)
+		t.Fatalf("trace row = %#v, want direct-path receive progress", row)
 	}
 	if row["receive_goodput_mbps"] == "" {
-		t.Fatalf("trace row receive_goodput_mbps is empty, want QUIC receive rate; row = %#v", row)
+		t.Fatalf("trace row receive_goodput_mbps is empty, want direct-path receive rate; row = %#v", row)
 	}
 }
 

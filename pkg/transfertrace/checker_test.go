@@ -208,7 +208,7 @@ func TestCheckAllowsDirectFallbackRelayReason(t *testing.T) {
 			appBytes:        1024,
 			deltaAppBytes:   1024,
 			directValidated: false,
-			fallbackReason:  "direct UDP rate probes received no packets",
+			fallbackReason:  "direct path probes received no packets",
 			lastState:       "stream-complete",
 		})
 	_, err := Check(strings.NewReader(csvText), Options{Role: RoleSend, ExpectedBytes: 1024})
@@ -217,7 +217,7 @@ func TestCheckAllowsDirectFallbackRelayReason(t *testing.T) {
 	}
 }
 
-func TestCheckReportsDiagnosticsSummaryFromDirectUDPFields(t *testing.T) {
+func TestCheckReportsDiagnosticsSummaryFromDirectPathFields(t *testing.T) {
 	csvText := HeaderLine + "\n" +
 		testTraceRow(testTraceRowConfig{
 			timestampMS:           1000,
@@ -292,7 +292,7 @@ func TestCheckReportsQUICDiagnosticsSummary(t *testing.T) {
 			appBytes:        1024,
 			deltaAppBytes:   1024,
 			directValidated: true,
-			lastState:       "connected-direct-quic",
+			lastState:       "connected-direct",
 			directTransport: "quic",
 			quicHandshakeMS: 12,
 			quicFirstByteMS: 18,

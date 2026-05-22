@@ -157,7 +157,7 @@ func TestRecorderWritesReceiverAnchoredProgressColumns(t *testing.T) {
 		SetupElapsedMS:    250,
 		TransferElapsedMS: 250,
 		DirectValidated:   false,
-		FallbackReason:    "direct UDP rate probes received no packets",
+		FallbackReason:    "direct path probes received no packets",
 		LastState:         "direct-fallback-relay",
 	})
 	if err := rec.Close(); err != nil {
@@ -170,10 +170,10 @@ func TestRecorderWritesReceiverAnchoredProgressColumns(t *testing.T) {
 	assertColumn(t, row, indexes, "setup_elapsed_ms", "250")
 	assertColumn(t, row, indexes, "transfer_elapsed_ms", "250")
 	assertColumn(t, row, indexes, "direct_validated", "false")
-	assertColumn(t, row, indexes, "fallback_reason", "direct UDP rate probes received no packets")
+	assertColumn(t, row, indexes, "fallback_reason", "direct path probes received no packets")
 }
 
-func TestRecorderWritesDirectUDPDiagnosticFields(t *testing.T) {
+func TestRecorderWritesDirectPathDiagnosticFields(t *testing.T) {
 	start := time.UnixMilli(1_000)
 
 	var sendOut bytes.Buffer
@@ -237,7 +237,7 @@ func TestRecorderWritesDirectUDPDiagnosticFields(t *testing.T) {
 
 	sendRecords, sendIndexes := readTraceCSV(t, sendOut.String())
 	assertRecordCount(t, sendRecords, 3)
-	assertHeaderSuffix(t, sendRecords[0], directUDPDiagnosticHeader())
+	assertHeaderSuffix(t, sendRecords[0], directPathDiagnosticHeader())
 	sendRow := sendRecords[2]
 	assertColumn(t, sendRow, sendIndexes, "rate_target_mbps", "263")
 	assertColumn(t, sendRow, sendIndexes, "rate_ceiling_mbps", "700")
@@ -285,7 +285,7 @@ func TestRecorderWritesDirectUDPDiagnosticFields(t *testing.T) {
 
 	receiveRecords, receiveIndexes := readTraceCSV(t, receiveOut.String())
 	assertRecordCount(t, receiveRecords, 3)
-	assertHeaderSuffix(t, receiveRecords[0], directUDPDiagnosticHeader())
+	assertHeaderSuffix(t, receiveRecords[0], directPathDiagnosticHeader())
 	receiveRow := receiveRecords[2]
 	assertColumn(t, receiveRow, receiveIndexes, "receive_goodput_mbps", "12.00")
 	assertColumn(t, receiveRow, receiveIndexes, "receiver_committed_mbps", "4.00")
@@ -293,7 +293,7 @@ func TestRecorderWritesDirectUDPDiagnosticFields(t *testing.T) {
 	assertColumn(t, receiveRow, receiveIndexes, "direct_committed_bytes", "1250000")
 }
 
-func TestRecorderWritesDirectQUICFields(t *testing.T) {
+func TestRecorderWritesQUICTransportFields(t *testing.T) {
 	var out bytes.Buffer
 	rec, err := NewRecorder(&out, RoleSend, time.Unix(0, 0))
 	if err != nil {
@@ -312,7 +312,7 @@ func TestRecorderWritesDirectQUICFields(t *testing.T) {
 		QUICSmoothedRTTMS:       "1.25",
 		QUICLossEvents:          2,
 		QUICCloseReason:         "normal",
-		LastState:               "connected-direct-quic",
+		LastState:               "connected-direct",
 	})
 	if err := rec.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
@@ -537,7 +537,7 @@ func assertColumn(t *testing.T, row []string, indexes map[string]int, column str
 	}
 }
 
-func directUDPDiagnosticHeader() []string {
+func directPathDiagnosticHeader() []string {
 	return []string{
 		"rate_target_mbps",
 		"rate_ceiling_mbps",

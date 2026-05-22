@@ -173,34 +173,12 @@ func (m *externalTransferMetrics) SetDirectAppProgressBase(offset int64) {
 	m.mu.Unlock()
 }
 
-func (m *externalTransferMetrics) MarkDirectQUIC(at time.Time) {
-	if m == nil {
-		return
-	}
-	m.mu.Lock()
-	m.directTransport = "quic"
-	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
-	m.mu.Unlock()
-	sampleExternalTransferTrace(trace, snap, ok)
+func (m *externalTransferMetrics) RecordDirectPathSend(n int64, at time.Time) {
+	m.recordDirectPathBytes(n, at, true)
 }
 
-func (m *externalTransferMetrics) MarkDirectTCP(at time.Time) {
-	if m == nil {
-		return
-	}
-	m.mu.Lock()
-	m.directTransport = "tcp"
-	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
-	m.mu.Unlock()
-	sampleExternalTransferTrace(trace, snap, ok)
-}
-
-func (m *externalTransferMetrics) RecordDirectQUICSend(n int64, at time.Time) {
-	m.recordDirectQUICBytes(n, at, true)
-}
-
-func (m *externalTransferMetrics) RecordDirectQUICReceive(n int64, at time.Time) {
-	m.recordDirectQUICBytes(n, at, false)
+func (m *externalTransferMetrics) RecordDirectPathReceive(n int64, at time.Time) {
+	m.recordDirectPathBytes(n, at, false)
 }
 
 func (m *externalTransferMetrics) RecordPeerProgressFromFirstByte(bytesReceived int64, at time.Time) {
@@ -443,7 +421,7 @@ func (m *externalTransferMetrics) recordWrite(totalBytes *int64, n int64, at tim
 	sampleExternalTransferTrace(trace, snap, ok)
 }
 
-func (m *externalTransferMetrics) recordDirectQUICBytes(n int64, at time.Time, send bool) {
+func (m *externalTransferMetrics) recordDirectPathBytes(n int64, at time.Time, send bool) {
 	if m == nil || n <= 0 {
 		return
 	}
