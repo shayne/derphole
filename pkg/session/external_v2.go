@@ -29,6 +29,8 @@ import (
 const externalV2CopyBufferSize = 1 << 20
 const externalV2AbortNotifyWait = 2 * time.Second
 const externalV2AbortDrainWait = time.Second
+const externalV2AbortSignalDrainWait = 150 * time.Millisecond
+const externalV2StreamOpenWait = 2 * time.Second
 const externalV2DirectNudgeInterval = 250 * time.Millisecond
 const externalV2DirectNudgeDuration = 2 * time.Second
 
@@ -289,9 +291,20 @@ func (rt *externalV2SendRuntime) sendStream(ctx context.Context, manager *transp
 		_ = client.CloseWithError(1, "peer aborted transfer")
 	})
 	defer stopAbortWatch()
-	streams, err := client.OpenStreams(streamCtx, streamCount)
+	openCtx := streamCtx
+	cancelOpen := func() {}
+	boundedOpen := path.raw
+	if path.raw {
+		openCtx, cancelOpen = context.WithTimeout(streamCtx, externalV2StreamOpenWait)
+	}
+	streams, err := client.OpenStreams(openCtx, streamCount)
+	cancelOpen()
 	if err != nil {
-		return externalV2PreferPeerAbort(ctx, abortErrCh, err)
+		err = externalV2PreferPeerAbort(ctx, abortErrCh, err)
+		if boundedOpen {
+			err = externalV2StreamOpenFailure(err)
+		}
+		return err
 	}
 	if err := copyExternalV2SendStreams(streamCtx, src, streams, metrics); err != nil {
 		return externalV2SendQUICStreamError(ctx, client, abortErrCh, err)
@@ -324,6 +337,19 @@ func externalV2PreferPeerAbort(ctx context.Context, abortErrCh <-chan error, err
 		return abortErr
 	}
 	return err
+}
+
+func externalV2StreamOpenFailure(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ErrPeerDisconnected
+	}
+	return err
+}
+
+func drainExternalV2AbortSignal() {
+	timer := time.NewTimer(externalV2AbortSignalDrainWait)
+	defer timer.Stop()
+	<-timer.C
 }
 
 func (rt *externalV2SendRuntime) watchAbort(ctx context.Context, onAbort func()) (<-chan error, func()) {
@@ -559,11 +585,12 @@ func (rt *externalV2ListenRuntime) receive(ctx context.Context, accepted externa
 	if err != nil {
 		return err
 	}
-	defer tr.Close()
 	defer func() {
 		if retErr != nil {
 			rt.notifyAbort(accepted.peerDERP, retErr)
+			drainExternalV2AbortSignal()
 		}
+		tr.Close()
 	}()
 	metrics.SetTransportManager(tr.manager)
 	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
@@ -594,9 +621,20 @@ func (rt *externalV2ListenRuntime) receiveQUIC(ctx context.Context, accepted ext
 		_ = server.CloseWithError(1, "peer aborted transfer")
 	})
 	defer stopAbortWatch()
-	streams, err := server.AcceptStreamsWithReady(streamCtx, streamCount, nil)
+	openCtx := streamCtx
+	cancelOpen := func() {}
+	boundedOpen := rawPath.raw
+	if rawPath.raw {
+		openCtx, cancelOpen = context.WithTimeout(streamCtx, externalV2StreamOpenWait)
+	}
+	streams, err := server.AcceptStreamsWithReady(openCtx, streamCount, nil)
+	cancelOpen()
 	if err != nil {
-		return externalV2PreferPeerAbort(ctx, abortErrCh, err)
+		err = externalV2PreferPeerAbort(ctx, abortErrCh, err)
+		if boundedOpen {
+			err = externalV2StreamOpenFailure(err)
+		}
+		return err
 	}
 	bytesReceived, err := copyExternalV2ReceiveStreams(streamCtx, dst, streams, metrics)
 	if err != nil {

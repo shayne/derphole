@@ -149,8 +149,8 @@ func TestPublicRelayOnlyOfferExitsWhenReceiverCancels(t *testing.T) {
 
 	select {
 	case err := <-offerErr:
-		if !errors.Is(err, ErrPeerAborted) {
-			t.Fatalf("Offer() error = %v, want %v; sender=%q receiver=%q", err, ErrPeerAborted, senderStatus.String(), receiverStatus.String())
+		if !errors.Is(err, ErrPeerAborted) && !errors.Is(err, ErrPeerDisconnected) {
+			t.Fatalf("Offer() error = %v, want peer abort/disconnect; sender=%q receiver=%q", err, senderStatus.String(), receiverStatus.String())
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatalf("Offer() did not exit after receiver cancellation; sender=%q receiver=%q", senderStatus.String(), receiverStatus.String())

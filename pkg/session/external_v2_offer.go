@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"go4.org/mem"
@@ -216,9 +217,29 @@ func (rt *externalV2OfferRuntime) send(ctx context.Context, accepted externalV2A
 	defer func() { _ = countedSrc.Close() }()
 
 	pathEmitter := newTransportPathEmitter(rt.cfg.Emitter)
-	tr, err := rt.startSendTransport(ctx, accepted, metrics, pathEmitter)
+	transferCtx, cancelTransfer := context.WithCancel(ctx)
+	defer cancelTransfer()
+	var endpointMu sync.Mutex
+	var activeEndpoint externalV2QUICEndpoint
+	setEndpoint := func(endpoint externalV2QUICEndpoint) {
+		endpointMu.Lock()
+		activeEndpoint = endpoint
+		endpointMu.Unlock()
+	}
+	abortErrCh, stopAbortWatch := rt.watchAbort(ctx, accepted.peerDERP, func() {
+		cancelTransfer()
+		endpointMu.Lock()
+		endpoint := activeEndpoint
+		endpointMu.Unlock()
+		if endpoint != nil {
+			_ = endpoint.CloseWithError(1, "peer aborted transfer")
+		}
+	})
+	defer stopAbortWatch()
+
+	tr, err := rt.startSendTransport(transferCtx, accepted, metrics, pathEmitter)
 	if err != nil {
-		return err
+		return externalV2PreferPeerAbort(ctx, abortErrCh, err)
 	}
 	defer tr.Close()
 	metrics.SetTransportManager(tr.manager)
@@ -228,20 +249,18 @@ func (rt *externalV2OfferRuntime) send(ctx context.Context, accepted externalV2A
 	defer progressStop()
 
 	policy := rt.cfg.ParallelPolicy.normalized()
-	if err := rt.sendAccept(ctx, accepted.peerDERP, tr.localCandidates, policy); err != nil {
-		return err
+	if err := rt.sendAccept(transferCtx, accepted.peerDERP, tr.localCandidates, policy); err != nil {
+		return externalV2PreferPeerAbort(ctx, abortErrCh, err)
 	}
 
-	return rt.sendQUIC(ctx, accepted, tr, policy, countedSrc, metrics, pathEmitter)
+	return rt.sendQUIC(ctx, transferCtx, accepted, tr, policy, countedSrc, metrics, pathEmitter, abortErrCh, setEndpoint)
 }
 
-func (rt *externalV2OfferRuntime) sendQUIC(ctx context.Context, accepted externalV2AcceptedClaim, tr externalV2ListenTransport, policy ParallelPolicy, countedSrc *byteCountingReadCloser, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter) error {
-	streamCtx, cancelStream := context.WithCancel(ctx)
-	defer cancelStream()
+func (rt *externalV2OfferRuntime) sendQUIC(preferenceCtx context.Context, ctx context.Context, accepted externalV2AcceptedClaim, tr externalV2ListenTransport, policy ParallelPolicy, countedSrc *byteCountingReadCloser, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter, abortErrCh <-chan error, setEndpoint func(externalV2QUICEndpoint)) error {
 	streamCount := externalV2StreamCount(policy)
-	rawPath, err := negotiateExternalV2DirectPacketPath(streamCtx, rt.session.derp, accepted.peerDERP, tr.manager, rt.session.derpMap, rt.auth, rt.cfg.Emitter, streamCount, externalV2DataPlaneSenderPunchDelay, tr.relayOnly)
+	rawPath, err := negotiateExternalV2DirectPacketPath(ctx, rt.session.derp, accepted.peerDERP, tr.manager, rt.session.derpMap, rt.auth, rt.cfg.Emitter, streamCount, externalV2DataPlaneSenderPunchDelay, tr.relayOnly)
 	if err != nil {
-		return err
+		return externalV2PreferPeerAbort(preferenceCtx, abortErrCh, err)
 	}
 	defer rawPath.Close()
 	var endpoint externalV2QUICEndpoint
@@ -249,29 +268,23 @@ func (rt *externalV2OfferRuntime) sendQUIC(ctx context.Context, accepted externa
 	if rawPath.raw {
 		client := dataplane.NewQUICClientOnPacketConns(rawPath.conns, rawPath.addrs, rt.session.quicIdentity, accepted.claim.QUICPublic)
 		endpoint = client
-		abortErrCh, stopAbortWatch := rt.watchAbort(ctx, accepted.peerDERP, func() {
-			cancelStream()
-			_ = endpoint.CloseWithError(1, "peer aborted transfer")
-		})
-		defer stopAbortWatch()
-		streams, err = client.OpenStreams(streamCtx, streamCount)
+		setEndpoint(endpoint)
+		openCtx, cancelOpen := context.WithTimeout(ctx, externalV2StreamOpenWait)
+		streams, err = client.OpenStreams(openCtx, streamCount)
+		cancelOpen()
 		if err != nil {
-			return err
+			return externalV2StreamOpenFailure(externalV2PreferPeerAbort(preferenceCtx, abortErrCh, err))
 		}
-		return rt.sendQUICStreams(streamCtx, accepted, countedSrc, streams, endpoint, abortErrCh, metrics, pathEmitter, tr.manager)
+		return rt.sendQUICStreams(ctx, accepted, countedSrc, streams, endpoint, abortErrCh, metrics, pathEmitter, tr.manager)
 	}
 	server := dataplane.NewQUICServer(tr.manager, rt.session.quicIdentity, accepted.claim.QUICPublic)
 	endpoint = server
-	abortErrCh, stopAbortWatch := rt.watchAbort(ctx, accepted.peerDERP, func() {
-		cancelStream()
-		_ = endpoint.CloseWithError(1, "peer aborted transfer")
-	})
-	defer stopAbortWatch()
-	streams, err = server.OpenStreamsWithReady(streamCtx, streamCount, nil)
+	setEndpoint(endpoint)
+	streams, err = server.OpenStreamsWithReady(ctx, streamCount, nil)
 	if err != nil {
-		return err
+		return externalV2PreferPeerAbort(preferenceCtx, abortErrCh, err)
 	}
-	return rt.sendQUICStreams(streamCtx, accepted, countedSrc, streams, endpoint, abortErrCh, metrics, pathEmitter, tr.manager)
+	return rt.sendQUICStreams(ctx, accepted, countedSrc, streams, endpoint, abortErrCh, metrics, pathEmitter, tr.manager)
 }
 
 type externalV2QUICEndpoint interface {
@@ -601,16 +614,22 @@ func (rt *externalV2OfferReceiveRuntime) run(ctx context.Context) (retErr error)
 	if err := rt.sendClaim(ctx); err != nil {
 		return err
 	}
+	var tr externalV2ListenTransport
+	trOpen := false
+	defer func() {
+		if retErr != nil {
+			rt.notifyAbort(retErr)
+			drainExternalV2AbortSignal()
+		}
+		if trOpen {
+			tr.Close()
+		}
+	}()
 	tr, accept, err := rt.acceptAndStartTransport(ctx, pathEmitter, metrics)
 	if err != nil {
 		return err
 	}
-	defer tr.Close()
-	defer func() {
-		if retErr != nil {
-			rt.notifyAbort(retErr)
-		}
-	}()
+	trOpen = true
 	metrics.SetTransportManager(tr.manager)
 	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
 
@@ -649,10 +668,12 @@ func (rt *externalV2OfferReceiveRuntime) acceptReceiveStreams(tr externalV2Liste
 	}
 	if rawPath.raw {
 		server := dataplane.NewQUICServerOnPacketConns(rawPath.conns, rt.identity, rt.tok.QUICPublic)
-		streams, err := server.AcceptStreamsWithReady(tr.ctx, streamCount, nil)
+		openCtx, cancelOpen := context.WithTimeout(tr.ctx, externalV2StreamOpenWait)
+		streams, err := server.AcceptStreamsWithReady(openCtx, streamCount, nil)
+		cancelOpen()
 		if err != nil {
 			rawPath.Close()
-			return nil, nil, externalV2DirectPacketPath{}, err
+			return nil, nil, externalV2DirectPacketPath{}, externalV2StreamOpenFailure(err)
 		}
 		return server, streams, rawPath, nil
 	}
@@ -871,8 +892,10 @@ func (rt *externalV2OfferReceiveRuntime) notifyAbort(err error) {
 	}
 	abortCtx, cancel := context.WithTimeout(context.Background(), externalV2AbortNotifyWait)
 	defer cancel()
-	_ = sendAuthenticatedEnvelope(abortCtx, rt.derp, rt.listenerDERP, envelope{
+	if err := sendAuthenticatedEnvelope(abortCtx, rt.derp, rt.listenerDERP, envelope{
 		Type:  envelopeAbort,
 		Abort: newPeerAbort(reason, bytesReceived),
-	}, rt.auth)
+	}, rt.auth); err != nil {
+		emitExternalV2Debug(rt.cfg.Emitter, "v2-abort-notify-error="+err.Error())
+	}
 }
