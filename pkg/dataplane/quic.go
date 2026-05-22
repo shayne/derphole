@@ -302,10 +302,7 @@ func closePacketPaths(paths []packetPath) {
 }
 
 func endpointConnectionCount(path packetPath, streams int) int {
-	if path.adapter != nil {
-		return 1
-	}
-	return streams
+	return 1
 }
 
 func (q *QUICClient) Stats() Stats {

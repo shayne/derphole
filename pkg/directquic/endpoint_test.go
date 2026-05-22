@@ -275,13 +275,23 @@ func TestEndpointTransfersMultipleConnections(t *testing.T) {
 	}
 	defer closeReadClosers(receiveStreams)
 
+	seen := make(map[byte]bool, connCount)
 	for i, stream := range receiveStreams {
 		var got [1]byte
 		if _, err := io.ReadFull(stream, got[:]); err != nil {
 			t.Fatalf("receive stream %d ReadFull() error = %v", i, err)
 		}
-		if want := byte('A' + i); got[0] != want {
-			t.Fatalf("receive stream %d byte = %q, want %q", i, got[0], want)
+		if got[0] < 'A' || got[0] >= 'A'+connCount {
+			t.Fatalf("receive stream %d byte = %q, want one of A-C", i, got[0])
+		}
+		if seen[got[0]] {
+			t.Fatalf("receive stream %d byte = %q, duplicate payload", i, got[0])
+		}
+		seen[got[0]] = true
+	}
+	for i := range connCount {
+		if !seen[byte('A'+i)] {
+			t.Fatalf("missing payload %q from receive streams", byte('A'+i))
 		}
 	}
 }

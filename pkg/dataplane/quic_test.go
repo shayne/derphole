@@ -215,3 +215,15 @@ func TestQUICDataPlaneCopiesOverMultiplePacketConns(t *testing.T) {
 		t.Fatalf("server CloseWithError() error = %v", err)
 	}
 }
+
+func TestEndpointConnectionCountUsesOneConnectionPerPacketPath(t *testing.T) {
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer conn.Close()
+
+	if got := endpointConnectionCount(packetPath{conn: conn}, 4); got != 1 {
+		t.Fatalf("endpointConnectionCount(raw packet path) = %d, want 1", got)
+	}
+}
