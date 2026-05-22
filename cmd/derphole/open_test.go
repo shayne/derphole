@@ -31,6 +31,7 @@ func TestRunHelpOpenShowsOpenHelp(t *testing.T) {
 func TestOpenHelpMentionsServiceOpenUsage(t *testing.T) {
 	help := openHelpText()
 	for _, want := range []string{
+		"direct-path promotion",
 		"Open a shared service locally until Ctrl-C.",
 		"derphole open <token>",
 		"derphole open <token> 127.0.0.1:8080",

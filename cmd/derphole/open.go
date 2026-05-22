@@ -17,7 +17,7 @@ import (
 
 type openFlags struct {
 	ForceRelay bool   `flag:"force-relay" help:"Disable direct probing"`
-	Parallel   string `flag:"parallel" short:"P" help:"Direct stripe count (1-16) or auto"`
+	Parallel   string `flag:"parallel" short:"P" help:"Direct-path stripe count (1-16) or auto"`
 }
 
 type openArgs struct {
@@ -28,7 +28,7 @@ type openArgs struct {
 var openHelpConfig = yargs.HelpConfig{
 	Command: yargs.CommandInfo{
 		Name:        "derphole",
-		Description: "Open a shared TCP service locally over public DERP with direct UDP promotion when available.",
+		Description: "Open a shared TCP service locally over public DERP with direct-path promotion when available.",
 		Examples: []string{
 			"derphole open <token>",
 			"derphole open <token> 127.0.0.1:8080",
@@ -38,7 +38,7 @@ var openHelpConfig = yargs.HelpConfig{
 	SubCommands: map[string]yargs.SubCommandInfo{
 		"open": {
 			Name:        "open",
-			Description: "Open a shared service locally until Ctrl-C.",
+			Description: "Open a shared service locally until Ctrl-C. Uses direct-path promotion when available.",
 			Usage:       "[--force-relay] [--parallel]",
 			Examples: []string{
 				"derphole open <token>",

@@ -31,6 +31,7 @@ func TestRunHelpListenShowsListenHelp(t *testing.T) {
 func TestListenHelpMentionsRawStreamUsage(t *testing.T) {
 	help := listenHelpText()
 	for _, want := range []string{
+		"direct-path promotion",
 		"Listen for one incoming raw byte stream and write it to stdout.",
 		"derphole listen",
 		"derphole listen --print-token-only",

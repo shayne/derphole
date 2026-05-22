@@ -22,7 +22,7 @@ type rootGlobalFlags struct {
 var rootRegistry = yargs.Registry{
 	Command: yargs.CommandInfo{
 		Name:        "derptun",
-		Description: "Open durable TCP tunnels through DERP rendezvous and direct UDP promotion.",
+		Description: "Open durable TCP tunnels through DERP rendezvous and direct-path promotion.",
 		Examples: []string{
 			"derptun token server > server.dts",
 			"derptun token client --token-file server.dts > client.dtc",
@@ -38,7 +38,7 @@ var rootRegistry = yargs.Registry{
 		"open":     {Info: yargs.SubCommandInfo{Name: "open", Description: "Open a local TCP listener using a client token."}},
 		"connect":  {Info: yargs.SubCommandInfo{Name: "connect", Description: "Connect one client tunnel stream over stdin/stdout."}},
 		"version":  {Info: yargs.SubCommandInfo{Name: "version", Description: "Print the derptun version."}},
-		"netcheck": {Info: yargs.SubCommandInfo{Name: "netcheck", Description: "Check local direct UDP network capabilities."}},
+		"netcheck": {Info: yargs.SubCommandInfo{Name: "netcheck", Description: "Check local UDP direct-path capabilities."}},
 	},
 }
 

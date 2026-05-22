@@ -31,6 +31,7 @@ func TestRunHelpShareShowsShareHelp(t *testing.T) {
 func TestShareHelpMentionsServiceSharingUsage(t *testing.T) {
 	help := shareHelpText()
 	for _, want := range []string{
+		"direct-path promotion",
 		"Share a local TCP service until Ctrl-C.",
 		"derphole share 127.0.0.1:3000",
 		"derphole share 127.0.0.1:8080 --print-token-only",

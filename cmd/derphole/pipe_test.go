@@ -31,6 +31,7 @@ func TestRunHelpPipeShowsPipeHelp(t *testing.T) {
 func TestPipeHelpMentionsRawStreamAndParallelFlag(t *testing.T) {
 	help := pipeHelpText()
 	for _, want := range []string{
+		"direct-path promotion",
 		"Send stdin as a raw byte stream to a derphole listener.",
 		"cat file | derphole pipe <token>",
 		"printf 'hello' | derphole pipe <token>",

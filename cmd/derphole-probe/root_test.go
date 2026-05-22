@@ -20,6 +20,9 @@ func TestRunShowsHelpForNoArgs(t *testing.T) {
 	if stderr.Len() == 0 {
 		t.Fatal("stderr help text is empty")
 	}
+	if !bytes.Contains(stderr.Bytes(), []byte("raw UDP path benchmark")) {
+		t.Fatalf("stderr help = %q, want raw UDP path benchmark wording", stderr.String())
+	}
 }
 
 func TestRunShowsHelpForHelpFlag(t *testing.T) {

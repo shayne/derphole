@@ -27,7 +27,7 @@ type shareArgs struct {
 var shareHelpConfig = yargs.HelpConfig{
 	Command: yargs.CommandInfo{
 		Name:        "derphole",
-		Description: "Expose a local TCP service over public DERP with direct UDP promotion when available.",
+		Description: "Expose a local TCP service over public DERP with direct-path promotion when available.",
 		Examples: []string{
 			"derphole share 127.0.0.1:3000",
 			"derphole share 127.0.0.1:8080 --print-token-only",
@@ -37,7 +37,7 @@ var shareHelpConfig = yargs.HelpConfig{
 	SubCommands: map[string]yargs.SubCommandInfo{
 		"share": {
 			Name:        "share",
-			Description: "Share a local TCP service until Ctrl-C.",
+			Description: "Share a local TCP service until Ctrl-C. Uses direct-path promotion when available.",
 			Usage:       "[--print-token-only] [--force-relay]",
 			Examples: []string{
 				"derphole share 127.0.0.1:3000",

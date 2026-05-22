@@ -14,7 +14,7 @@ import (
 var registry = yargs.Registry{
 	Command: yargs.CommandInfo{
 		Name:        "derphole-probe",
-		Description: "Experimental direct UDP benchmark probe.",
+		Description: "Experimental raw UDP path benchmark probe.",
 	},
 	SubCommands: map[string]yargs.CommandSpec{
 		"server": {
@@ -44,7 +44,7 @@ var registry = yargs.Registry{
 		"topology": {
 			Info: yargs.SubCommandInfo{
 				Name:        "topology",
-				Description: "Diagnose direct UDP topology between this host and an SSH target.",
+				Description: "Diagnose UDP direct-path topology between this host and an SSH target.",
 			},
 		},
 	},

@@ -17,7 +17,7 @@ func TestRootHelpShowsDerptunCommands(t *testing.T) {
 		t.Fatalf("code = %d, want 0", code)
 	}
 	out := stderr.String()
-	for _, want := range []string{"derptun", "token", "serve", "open", "connect", "netcheck"} {
+	for _, want := range []string{"derptun", "direct-path promotion", "token", "serve", "open", "connect", "netcheck"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("help missing %q in:\n%s", want, out)
 		}

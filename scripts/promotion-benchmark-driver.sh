@@ -165,13 +165,13 @@ require_direct_evidence() {
   fi
 }
 
-require_direct_blast_log() {
+require_direct_path_log() {
   local label="$1"
   local file="$2"
   local metric_prefix="$3"
 
   if grep -q '^udp-relay=true$' "${file}"; then
-    echo "${label} fell back to relay instead of direct UDP blast" >&2
+    echo "${label} fell back to relay instead of v2 direct path" >&2
     exit 1
   fi
   if grep -q "^${metric_prefix}-data-goodput-mbps=" "${file}"; then
@@ -402,8 +402,8 @@ finalize_run() {
   [[ -n "${receiver_trace}" ]]
   require_direct_evidence "sender" "${sender_trace}"
   require_direct_evidence "receiver" "${receiver_trace}"
-  require_direct_blast_log "sender" "${sender_log}" "udp-send"
-  require_direct_blast_log "receiver" "${receiver_log}" "udp-receive"
+  require_direct_path_log "sender" "${sender_log}" "udp-send"
+  require_direct_path_log "receiver" "${receiver_log}" "udp-receive"
 
   sender_goodput_mbps="$(last_metric_value "${sender_log}" "udp-send-goodput-mbps")"
   sender_peak_goodput_mbps="$(last_metric_value "${sender_log}" "udp-send-peak-goodput-mbps")"

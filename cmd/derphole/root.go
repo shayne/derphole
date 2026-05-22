@@ -87,7 +87,7 @@ var rootRegistry = yargs.Registry{
 		"netcheck": {
 			Info: yargs.SubCommandInfo{
 				Name:        "netcheck",
-				Description: "Check local direct UDP network capabilities.",
+				Description: "Check local UDP direct-path capabilities.",
 			},
 		},
 	},

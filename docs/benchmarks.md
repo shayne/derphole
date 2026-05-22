@@ -89,10 +89,10 @@ Trace `app_bytes` are session stream bytes and include derphole framing, so payl
 
 Sender `app_bytes` are receiver-confirmed session stream bytes once progress ACKs start. `local_sent_bytes` records sender-side enqueue/spool progress and can be ahead of receiver progress. Use `transfer_elapsed_ms` for throughput comparisons; `elapsed_ms` includes setup and direct probing time.
 
-`connected-direct` means direct UDP has delivered probe or payload bytes. A run that attempts direct but falls back to relay records `direct-fallback-relay` and a non-empty `fallback_reason`.
-Relay-prefix fallback should continue making trace progress after a direct setup failure; the receiver repeats its DERP prefix ACK while idle so one missed ACK cannot wedge the sender at the relay window.
+`connected-direct` means a direct path has delivered probe or payload bytes. A run that attempts direct but falls back to relay records `direct-fallback-relay` and a non-empty `fallback_reason`.
+Relay fallback should continue making trace progress after a direct setup failure; v2 keeps the application stream on one QUIC path instead of reviving the retired relay-prefix handoff protocol.
 
-Use direct UDP send debug telemetry to explain dynamic scaling decisions:
+Use v2 direct-path telemetry to explain scaling decisions:
 
 - `udp-striped-available-lanes`: routable direct UDP lane pool retained for data.
 - `udp-active-lanes-selected`: initial active data lane target.
@@ -120,9 +120,9 @@ Examples:
 - `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_PARALLEL_ARGS='--parallel=auto' ./scripts/promotion-test.sh canlxc 1024`
 - `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_PARALLEL_ARGS='--parallel=8' ./scripts/promotion-test-reverse.sh ktzlxc 1024`
 
-## Direct UDP Probe Harness
+## Raw Path Probe Harness
 
-The raw-mode direct UDP probe harness is a microbenchmark for packet-engine experiments. Production `listen/pipe` now uses DERP-coordinated direct UDP by default, so treat this harness as a lower-level comparison tool rather than the proof of the default transport.
+The raw UDP probe harness is a microbenchmark for packet-engine experiments. Production `listen/pipe` uses v2 QUIC over manager-backed or raw-direct paths, so treat this harness as a lower-level comparison tool rather than the proof of the default transport.
 
 Every derphole baseline command in this validation path must set `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1`.
 

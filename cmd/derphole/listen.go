@@ -22,7 +22,7 @@ type listenFlags struct {
 var listenHelpConfig = yargs.HelpConfig{
 	Command: yargs.CommandInfo{
 		Name:        "derphole",
-		Description: "Move one byte stream between hosts over public DERP with direct UDP promotion when available.",
+		Description: "Move one byte stream between hosts over public DERP with direct-path promotion when available.",
 		Examples: []string{
 			"derphole listen",
 			"cat file | derphole pipe <token>",
@@ -32,7 +32,7 @@ var listenHelpConfig = yargs.HelpConfig{
 	SubCommands: map[string]yargs.SubCommandInfo{
 		"listen": {
 			Name:        "listen",
-			Description: "Listen for one incoming raw byte stream and write it to stdout.",
+			Description: "Listen for one incoming raw byte stream and write it to stdout. Uses direct-path promotion when available.",
 			Usage:       "[--print-token-only] [--force-relay]",
 			Examples: []string{
 				"derphole listen",

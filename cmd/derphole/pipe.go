@@ -16,7 +16,7 @@ import (
 
 type pipeFlags struct {
 	ForceRelay bool   `flag:"force-relay" help:"Disable direct probing"`
-	Parallel   string `flag:"parallel" short:"P" help:"Direct stripe count (1-16) or auto"`
+	Parallel   string `flag:"parallel" short:"P" help:"Direct-path stripe count (1-16) or auto"`
 }
 
 type pipeArgs struct {
@@ -26,7 +26,7 @@ type pipeArgs struct {
 var pipeHelpConfig = yargs.HelpConfig{
 	Command: yargs.CommandInfo{
 		Name:        "derphole",
-		Description: "Move one byte stream between hosts over public DERP with direct UDP promotion when available.",
+		Description: "Move one byte stream between hosts over public DERP with direct-path promotion when available.",
 		Examples: []string{
 			"derphole listen",
 			"cat file | derphole pipe <token>",
@@ -36,7 +36,7 @@ var pipeHelpConfig = yargs.HelpConfig{
 	SubCommands: map[string]yargs.SubCommandInfo{
 		"pipe": {
 			Name:        "pipe",
-			Description: "Send stdin as a raw byte stream to a derphole listener.",
+			Description: "Send stdin as a raw byte stream to a derphole listener. Uses direct-path promotion when available.",
 			Usage:       "[--force-relay] [--parallel]",
 			Examples: []string{
 				"cat file | derphole pipe <token>",
