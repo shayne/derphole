@@ -13,7 +13,7 @@ import (
 const (
 	TopologyClassSSHFrontDoorMismatch = "ssh-front-door-mismatch"
 	TopologyClassRemoteUDPUnreachable = "remote-udp-unreachable"
-	TopologyClassDirectUDPPossible    = "direct-udp-possible"
+	TopologyClassDirectPathPossible   = "direct-path-possible"
 )
 
 type TopologyReport struct {
@@ -84,7 +84,7 @@ func classifyUDPReachability(results []UDPReachabilityResult) string {
 		return ""
 	}
 	if anyUDPReachabilityReceived(results) {
-		return TopologyClassDirectUDPPossible
+		return TopologyClassDirectPathPossible
 	}
 	return TopologyClassRemoteUDPUnreachable
 }
@@ -101,7 +101,7 @@ func anyUDPReachabilityReceived(results []UDPReachabilityResult) bool {
 func classifyPunchTests(results []UDPPunchResult) string {
 	for _, result := range results {
 		if result.LocalReceived || result.RemoteReceived {
-			return TopologyClassDirectUDPPossible
+			return TopologyClassDirectPathPossible
 		}
 	}
 	return ""

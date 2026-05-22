@@ -51,7 +51,7 @@ func TestClassifyTopologyDetectsRemoteUDPUnreachable(t *testing.T) {
 	}
 }
 
-func TestClassifyTopologyDetectsDirectUDPPossible(t *testing.T) {
+func TestClassifyTopologyDetectsDirectPathPossible(t *testing.T) {
 	report := TopologyReport{
 		UDPReachability: []UDPReachabilityResult{
 			{Target: "egress", Address: "203.0.113.10:47000", Received: true},
@@ -63,8 +63,11 @@ func TestClassifyTopologyDetectsDirectUDPPossible(t *testing.T) {
 
 	got := ClassifyTopology(report)
 
-	if !slices.Contains(got, TopologyClassDirectUDPPossible) {
-		t.Fatalf("ClassifyTopology() = %v, want %s", got, TopologyClassDirectUDPPossible)
+	if !slices.Contains(got, TopologyClassDirectPathPossible) {
+		t.Fatalf("ClassifyTopology() = %v, want %s", got, TopologyClassDirectPathPossible)
+	}
+	if slices.Contains(got, "direct-udp-possible") {
+		t.Fatalf("ClassifyTopology() = %v, want no legacy direct-udp class", got)
 	}
 }
 
