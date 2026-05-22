@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/shayne/derphole/pkg/derpbind"
-	"github.com/shayne/derphole/pkg/probe"
 	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/transport"
 	"tailscale.com/tailcfg"
@@ -207,7 +206,7 @@ func openExternalV2DataPacketPath(ctx context.Context, dm *tailcfg.DERPMap, emit
 		}
 		conns = append(conns, conn)
 		portmaps = append(portmaps, newBoundPublicPortmap(conn, emitter))
-		_ = probe.PreviewTransportCaps(conn, "batched")
+		tuneExternalPacketConn(conn)
 	}
 	cleanup := func() {
 		closeExternalV2DataPacketResources(conns, portmaps)

@@ -5,7 +5,9 @@
 package session
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"slices"
@@ -14,20 +16,26 @@ import (
 	"sync"
 	"time"
 
-	"github.com/shayne/derphole/pkg/probe"
 	"github.com/shayne/derphole/pkg/transport"
 	"tailscale.com/tailcfg"
 )
 
-const externalV2RawDirectPunchWait = 1200 * time.Millisecond
+const (
+	externalV2RawDirectPunchWait      = 1200 * time.Millisecond
+	externalV2RawDirectPunchInterval  = 25 * time.Millisecond
+	externalV2RawDirectPunchReplyWait = 100 * time.Millisecond
+	externalV2RawDirectObserveLinger  = 250 * time.Millisecond
+	externalV2RawDirectObserveBufSize = 1500
+)
 
 type externalV2RawDirectAllowUnverifiedFallbackContextKey struct{}
 
 var externalV2RawDirectProbeCandidates = publicProbeCandidates
-var externalV2RawDirectObservePunchAddrsByConn = probe.ObservePunchAddrsByConn
+var externalV2RawDirectObservePunchAddrsByConn = observeExternalV2RawDirectPunchAddrsByConn
 var externalV2RawDirectRouteCandidate = externalV2RawDirectDefaultRouteCandidate
 
 var externalV2RawDirectRouteProbePayload = []byte("derphole-raw-direct-route-check-v1")
+var externalV2RawDirectPunchPayload = []byte("derphole-punch")
 
 func withExternalV2RawDirectAllowUnverifiedFallback(ctx context.Context) context.Context {
 	return context.WithValue(ctx, externalV2RawDirectAllowUnverifiedFallbackContextKey{}, true)
@@ -137,8 +145,214 @@ func externalV2RawDirectStartPunching(ctx context.Context, conns []net.PacketCon
 		if conn == nil {
 			continue
 		}
-		go probe.PunchAddrs(ctx, conn, remoteCandidates, nil, 0)
+		go punchExternalV2RawDirectAddrs(ctx, conn, remoteCandidates)
 	}
+}
+
+func punchExternalV2RawDirectAddrs(ctx context.Context, conn net.PacketConn, addrs []net.Addr) {
+	send := func() {
+		for _, addr := range addrs {
+			if addr != nil {
+				_, _ = conn.WriteTo(externalV2RawDirectPunchPayload, addr)
+			}
+		}
+	}
+	send()
+	ticker := time.NewTicker(externalV2RawDirectPunchInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			send()
+		}
+	}
+}
+
+func observeExternalV2RawDirectPunchAddrsByConn(ctx context.Context, conns []net.PacketConn, wait time.Duration) [][]net.Addr {
+	if wait <= 0 {
+		wait = externalV2RawDirectPunchWait
+	}
+	observeCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+
+	observed := make([][]net.Addr, len(conns))
+	expected := externalV2RawDirectConnCount(conns)
+	if expected == 0 {
+		return observed
+	}
+	var wg sync.WaitGroup
+	var observedConns atomicCounter
+	var stopOnce sync.Once
+	stopAfterAllObserved := func() {
+		stopOnce.Do(func() {
+			go stopExternalV2RawDirectObservationAfterLinger(observeCtx, cancel)
+		})
+	}
+	for i, conn := range conns {
+		if conn == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, conn net.PacketConn) {
+			defer wg.Done()
+			observed[i] = observeExternalV2RawDirectPunchAddrs(
+				observeCtx,
+				conn,
+				&observedConns,
+				expected,
+				stopAfterAllObserved,
+			)
+		}(i, conn)
+	}
+	wg.Wait()
+	return observed
+}
+
+func observeExternalV2RawDirectPunchAddrs(
+	ctx context.Context,
+	conn net.PacketConn,
+	observedConns *atomicCounter,
+	expectedConns int,
+	stopAfterAllObserved func(),
+) []net.Addr {
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+	seen := map[string]net.Addr{}
+	lastReply := map[string]time.Time{}
+	buf := make([]byte, externalV2RawDirectObserveBufSize)
+	for {
+		addr, ok := readExternalV2RawDirectPunch(ctx, conn, buf)
+		if !ok {
+			break
+		}
+		if addr == nil {
+			continue
+		}
+		if externalV2RawDirectShouldReplyToPunch(addr.String(), lastReply, time.Now()) {
+			_, _ = conn.WriteTo(externalV2RawDirectPunchPayload, addr)
+		}
+		firstForConn := len(seen) == 0
+		seen[addr.String()] = externalV2RawDirectCloneAddr(addr)
+		if firstForConn && observedConns.Add(1) >= expectedConns {
+			stopAfterAllObserved()
+		}
+	}
+	return externalV2RawDirectPreferredAddrs(seen)
+}
+
+func readExternalV2RawDirectPunch(ctx context.Context, conn net.PacketConn, buf []byte) (net.Addr, bool) {
+	if err := conn.SetReadDeadline(externalV2RawDirectObserveReadDeadline(ctx)); err != nil {
+		return nil, false
+	}
+	n, addr, err := conn.ReadFrom(buf)
+	if err != nil {
+		return nil, externalV2RawDirectContinueObservation(ctx, err)
+	}
+	if addr == nil || !bytes.Equal(buf[:n], externalV2RawDirectPunchPayload) {
+		return nil, true
+	}
+	return addr, true
+}
+
+func externalV2RawDirectContinueObservation(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	return externalV2RawDirectNetTimeout(err)
+}
+
+func stopExternalV2RawDirectObservationAfterLinger(ctx context.Context, cancel context.CancelFunc) {
+	timer := time.NewTimer(externalV2RawDirectObserveLinger)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+		cancel()
+	}
+}
+
+func externalV2RawDirectConnCount(conns []net.PacketConn) int {
+	count := 0
+	for _, conn := range conns {
+		if conn != nil {
+			count++
+		}
+	}
+	return count
+}
+
+func externalV2RawDirectObserveReadDeadline(ctx context.Context) time.Time {
+	deadline := time.Now().Add(50 * time.Millisecond)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		return ctxDeadline
+	}
+	return deadline
+}
+
+func externalV2RawDirectShouldReplyToPunch(addr string, lastReply map[string]time.Time, now time.Time) bool {
+	if addr == "" {
+		return false
+	}
+	last, ok := lastReply[addr]
+	if ok && now.Sub(last) < externalV2RawDirectPunchReplyWait {
+		return false
+	}
+	lastReply[addr] = now
+	return true
+}
+
+type atomicCounter struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (c *atomicCounter) Add(delta int) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n += delta
+	return c.n
+}
+
+func externalV2RawDirectNetTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func externalV2RawDirectCloneAddr(addr net.Addr) net.Addr {
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok || udpAddr == nil {
+		return addr
+	}
+	cp := *udpAddr
+	if udpAddr.IP != nil {
+		cp.IP = append(net.IP(nil), udpAddr.IP...)
+	}
+	return &cp
+}
+
+func externalV2RawDirectPreferredAddrs(seen map[string]net.Addr) []net.Addr {
+	out := make([]net.Addr, 0, len(seen))
+	for _, addr := range seen {
+		out = append(out, addr)
+	}
+	slices.SortFunc(out, func(a, b net.Addr) int {
+		aRank := externalV2RawDirectAddrRank(a)
+		bRank := externalV2RawDirectAddrRank(b)
+		if aRank != bRank {
+			return aRank - bRank
+		}
+		return strings.Compare(a.String(), b.String())
+	})
+	return out
+}
+
+func externalV2RawDirectAddrRank(addr net.Addr) int {
+	addrPort, ok := externalV2RawDirectAddrPort(addr)
+	if !ok {
+		return 100
+	}
+	return externalV2RawDirectAddrCandidateRank(addrPort.Addr())
 }
 
 func externalV2RawDirectFormatObservedAddrsByConn(observedByConn [][]net.Addr) string {
@@ -253,11 +467,28 @@ func externalV2RawDirectParallelCandidateStringsForPeer(candidates []net.Addr, p
 }
 
 func externalV2RawDirectOrderedCandidateStringsForPeer(candidates []net.Addr, peer net.Addr) []string {
-	ordered := externalV2RawDirectAppendPeerCandidate(probe.CandidateStringsInOrder(candidates), peer)
+	ordered := externalV2RawDirectAppendPeerCandidate(externalV2RawDirectCandidateStringsInOrder(candidates), peer)
 	if fakeTransportEnabled() {
 		return externalV2RawDirectPreferLoopbackStrings(ordered)
 	}
 	return externalV2RawDirectPreferPeerAddrStrings(ordered, peer)
+}
+
+func externalV2RawDirectCandidateStringsInOrder(candidates []net.Addr) []string {
+	out := make([]string, 0, len(candidates))
+	seen := make(map[string]bool)
+	for _, addr := range candidates {
+		if addr == nil {
+			continue
+		}
+		candidate := addr.String()
+		if candidate == "" || seen[candidate] {
+			continue
+		}
+		out = append(out, candidate)
+		seen[candidate] = true
+	}
+	return out
 }
 
 func externalV2RawDirectAppendPeerCandidate(ordered []string, peer net.Addr) []string {

@@ -400,6 +400,62 @@ func TestStartExternalV2DataPacketPunchingHonorsDelay(t *testing.T) {
 	}
 }
 
+func TestObserveExternalV2RawDirectPunchAddrsIgnoresNonPunchAndReplies(t *testing.T) {
+	local := listenUDPConnsForExternalV2DataPacketTest(t, 1)
+	peer, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	observedCh := make(chan [][]net.Addr, 1)
+	go func() {
+		observedCh <- observeExternalV2RawDirectPunchAddrsByConn(ctx, local, 500*time.Millisecond)
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	if _, err := peer.WriteTo([]byte("not-a-punch"), local[0].LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1500)
+	if _, _, err := peer.ReadFrom(buf); err == nil {
+		t.Fatal("observer replied to non-punch payload")
+	} else if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("non-punch read error = %v, want timeout", err)
+	}
+
+	if _, err := peer.WriteTo(externalV2RawDirectPunchPayload, local[0].LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	n, _, err := peer.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("did not receive punch reply: %v", err)
+	}
+	if got := string(buf[:n]); got != string(externalV2RawDirectPunchPayload) {
+		t.Fatalf("punch reply payload = %q, want %q", got, string(externalV2RawDirectPunchPayload))
+	}
+
+	select {
+	case observed := <-observedCh:
+		if len(observed) != 1 || len(observed[0]) != 1 {
+			t.Fatalf("observed addrs = %v, want one peer address", observed)
+		}
+		if got, want := observed[0][0].String(), peer.LocalAddr().String(); got != want {
+			t.Fatalf("observed addr = %q, want %q", got, want)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for observed addrs: %v", ctx.Err())
+	}
+}
+
 func listenUDPConnsForExternalV2DataPacketTest(t *testing.T, count int) []net.PacketConn {
 	t.Helper()
 	conns := make([]net.PacketConn, 0, count)

@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shayne/derphole/pkg/probe"
 	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/transfertrace"
 	"github.com/shayne/derphole/pkg/transport"
@@ -54,7 +53,7 @@ func TestEmitExternalTransferMetricsIncludesWallAndPeakValues(t *testing.T) {
 
 	var buf bytes.Buffer
 	emitter := telemetry.New(&buf, telemetry.LevelVerbose)
-	m.Emit(emitter, "udp-send", probe.TransferStats{PeakGoodputMbps: 2011.4})
+	m.Emit(emitter, "udp-send", 2011.4)
 
 	got := buf.String()
 	for _, needle := range []string{
@@ -211,7 +210,7 @@ func TestExternalTransferMetricsSamplesPeerRecvQueueDepthFromTransportManager(t 
 	}
 }
 
-func TestExternalTransferMetricsSetProbeStatsUpdatesTrace(t *testing.T) {
+func TestExternalTransferMetricsSetDirectStatsUpdatesTrace(t *testing.T) {
 	var out bytes.Buffer
 	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(30, 0))
 	if err != nil {
@@ -219,11 +218,11 @@ func TestExternalTransferMetricsSetProbeStatsUpdatesTrace(t *testing.T) {
 	}
 	metrics := newExternalTransferMetricsWithTrace(time.Unix(30, 0), rec, transfertrace.RoleSend)
 	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct")
-	metrics.SetProbeStats(probe.TransferStats{
+	metrics.SetDirectStats(externalDirectTransferStats{
 		BytesSent:      4096,
 		Retransmits:    3,
 		MaxReplayBytes: 8192,
-		Diagnostics: probe.TransferDiagnostics{
+		Diagnostics: externalDirectTransferDiagnostics{
 			RateTargetMbps:             263,
 			RateCeilingMbps:            700,
 			RateExplorationCeilingMbps: 1200,
@@ -256,7 +255,7 @@ func TestExternalTransferMetricsSetProbeStatsUpdatesTrace(t *testing.T) {
 		t.Fatalf("trace row = %#v, want send direct bytes with receiver-anchored app_bytes=0", row)
 	}
 	if !strings.Contains(body, ",8192,,3,") {
-		t.Fatalf("trace body missing probe counters:\n%s", body)
+		t.Fatalf("trace body missing direct counters:\n%s", body)
 	}
 	want := map[string]string{
 		"direct_rate_selected_mbps":     "350",
@@ -286,7 +285,7 @@ func TestExternalTransferMetricsSetProbeStatsUpdatesTrace(t *testing.T) {
 		}
 	}
 	if row["send_goodput_mbps"] == "" {
-		t.Fatalf("trace row send_goodput_mbps is empty, want probe byte goodput; row = %#v", row)
+		t.Fatalf("trace row send_goodput_mbps is empty, want direct byte goodput; row = %#v", row)
 	}
 }
 
@@ -353,7 +352,7 @@ func TestExternalTransferMetricsDirectPathReceiveProgressWritesCommittedBytes(t 
 	}
 }
 
-func TestExternalTransferMetricsSetProbeStatsWithoutByteProgressWritesDiagnosticsOnly(t *testing.T) {
+func TestExternalTransferMetricsSetDirectStatsWithoutByteProgressWritesDiagnosticsOnly(t *testing.T) {
 	var out bytes.Buffer
 	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(35, 0))
 	if err != nil {
@@ -361,11 +360,11 @@ func TestExternalTransferMetricsSetProbeStatsWithoutByteProgressWritesDiagnostic
 	}
 	metrics := newExternalTransferMetricsWithTrace(time.Unix(35, 0), rec, transfertrace.RoleSend)
 	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct")
-	metrics.SetProbeStatsWithoutByteProgress(probe.TransferStats{
+	metrics.SetDirectStatsWithoutByteProgress(externalDirectTransferStats{
 		BytesSent:      8192,
 		Retransmits:    7,
 		MaxReplayBytes: 16384,
-		Diagnostics: probe.TransferDiagnostics{
+		Diagnostics: externalDirectTransferDiagnostics{
 			RateTargetMbps:             300,
 			RateCeilingMbps:            900,
 			RateExplorationCeilingMbps: 1200,
@@ -424,7 +423,7 @@ func TestExternalTransferMetricsSetProbeStatsWithoutByteProgressWritesDiagnostic
 		}
 	}
 	if row["send_goodput_mbps"] == "" {
-		t.Fatalf("trace row send_goodput_mbps is empty, want probe byte goodput; row = %#v", row)
+		t.Fatalf("trace row send_goodput_mbps is empty, want direct byte goodput; row = %#v", row)
 	}
 }
 
@@ -437,9 +436,9 @@ func TestExternalTransferMetricsFinalLaneUpdatePreservesRuntimeRateTarget(t *tes
 	metrics := newExternalTransferMetricsWithTrace(time.Unix(37, 0), rec, transfertrace.RoleSend)
 	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct")
 	metrics.SetDirectLimits(700, 350, 900, 1200, 4, 4, 1, 4)
-	metrics.SetProbeStats(probe.TransferStats{
+	metrics.SetDirectStats(externalDirectTransferStats{
 		BytesSent: 4096,
-		Diagnostics: probe.TransferDiagnostics{
+		Diagnostics: externalDirectTransferDiagnostics{
 			RateTargetMbps:             512,
 			RateCeilingMbps:            900,
 			RateExplorationCeilingMbps: 1200,

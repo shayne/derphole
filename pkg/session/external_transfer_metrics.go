@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/shayne/derphole/pkg/probe"
 	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/transfertrace"
 	"github.com/shayne/derphole/pkg/transport"
@@ -45,7 +44,7 @@ type externalTransferMetrics struct {
 	directLanesActive      int
 	directLanesAvailable   int
 	rateTargetMbps         int
-	rateTargetFromProbe    bool
+	rateTargetFromDirect   bool
 	rateCeilingMbps        int
 	rateExplorationCeiling int
 	laneMin                int
@@ -73,6 +72,35 @@ type externalTransferMetrics struct {
 	quicLossEvents         int64
 	quicCloseReason        string
 	transportManager       *transport.Manager
+}
+
+type externalDirectTransferStats struct {
+	BytesSent       int64
+	BytesReceived   int64
+	Retransmits     int64
+	MaxReplayBytes  uint64
+	PeakGoodputMbps float64
+	Diagnostics     externalDirectTransferDiagnostics
+}
+
+type externalDirectTransferDiagnostics struct {
+	RateTargetMbps             int
+	RateCeilingMbps            int
+	RateExplorationCeilingMbps int
+	RateSelectedMbps           int
+	ActiveLanes                int
+	AvailableLanes             int
+	LaneMin                    int
+	LaneCap                    int
+	ControllerDecision         string
+	ControllerReason           string
+	ReplayBytes                uint64
+	Retransmits                int64
+	RepairRequests             int64
+	RepairBytes                int64
+	DirectPacketBytes          int64
+	DirectCommittedBytes       int64
+	ReceiverCommittedBytes     uint64
 }
 
 type externalTransferMetricsContextKey struct{}
@@ -298,20 +326,20 @@ func (m *externalTransferMetrics) SetProbeSummary(state string, summary string) 
 	sampleExternalTransferTrace(trace, snap, ok)
 }
 
-func (m *externalTransferMetrics) SetProbeStats(stats probe.TransferStats) {
-	m.setProbeStats(stats, true)
+func (m *externalTransferMetrics) SetDirectStats(stats externalDirectTransferStats) {
+	m.setDirectStats(stats, true)
 }
 
-func (m *externalTransferMetrics) SetProbeStatsWithoutByteProgress(stats probe.TransferStats) {
-	m.setProbeStats(stats, false)
+func (m *externalTransferMetrics) SetDirectStatsWithoutByteProgress(stats externalDirectTransferStats) {
+	m.setDirectStats(stats, false)
 }
 
-func (m *externalTransferMetrics) setProbeStats(stats probe.TransferStats, updateDirectBytes bool) {
+func (m *externalTransferMetrics) setDirectStats(stats externalDirectTransferStats, updateDirectBytes bool) {
 	if m == nil {
 		return
 	}
 	m.mu.Lock()
-	diagnostics := m.diagnosticsForProbeStatsLocked(stats)
+	diagnostics := m.diagnosticsForDirectStatsLocked(stats)
 	if updateDirectBytes {
 		if stats.BytesSent > m.directBytes {
 			m.directBytes = stats.BytesSent
@@ -325,8 +353,8 @@ func (m *externalTransferMetrics) setProbeStats(stats probe.TransferStats, updat
 	}
 	m.retransmitCount = stats.Retransmits
 	m.replayWindowBytes = stats.MaxReplayBytes
-	m.setProbeLocalSentLocked(stats, diagnostics)
-	m.setProbeDiagnosticsLocked(diagnostics)
+	m.setDirectLocalSentLocked(stats, diagnostics)
+	m.setDirectDiagnosticsLocked(diagnostics)
 	trace, snap, ok := m.updateTraceLocked(time.Now())
 	m.mu.Unlock()
 	sampleExternalTransferTrace(trace, snap, ok)
@@ -372,7 +400,7 @@ func (m *externalTransferMetrics) DirectBytes() int64 {
 	return m.directBytes
 }
 
-func (m *externalTransferMetrics) Emit(emitter *telemetry.Emitter, prefix string, stats probe.TransferStats) {
+func (m *externalTransferMetrics) Emit(emitter *telemetry.Emitter, prefix string, peakGoodputMbps float64) {
 	if emitter == nil {
 		return
 	}
@@ -380,7 +408,7 @@ func (m *externalTransferMetrics) Emit(emitter *telemetry.Emitter, prefix string
 	emitter.Debug(prefix + "-session-first-byte-ms=" + strconv.FormatInt(m.FirstByteMS(), 10))
 	emitter.Debug(prefix + "-relay-bytes=" + strconv.FormatInt(m.RelayBytes(), 10))
 	emitter.Debug(prefix + "-direct-bytes=" + strconv.FormatInt(m.DirectBytes(), 10))
-	emitter.Debug(prefix + "-peak-goodput-mbps=" + strconv.FormatFloat(stats.PeakGoodputMbps, 'f', 2, 64))
+	emitter.Debug(prefix + "-peak-goodput-mbps=" + strconv.FormatFloat(peakGoodputMbps, 'f', 2, 64))
 }
 
 func withExternalTransferMetrics(ctx context.Context, metrics *externalTransferMetrics) context.Context {
@@ -520,7 +548,7 @@ func (m *externalTransferMetrics) setDirectLimitsLocked(selectedRate int, target
 	m.directRateActiveMbps = targetRate
 	m.directLanesActive = activeLanes
 	m.directLanesAvailable = availableLanes
-	if !m.rateTargetFromProbe {
+	if !m.rateTargetFromDirect {
 		m.rateTargetMbps = targetRate
 	}
 	m.rateCeilingMbps = ceilingRate
@@ -529,7 +557,7 @@ func (m *externalTransferMetrics) setDirectLimitsLocked(selectedRate int, target
 	m.laneCap = laneCap
 }
 
-func (m *externalTransferMetrics) diagnosticsForProbeStatsLocked(stats probe.TransferStats) probe.TransferDiagnostics {
+func (m *externalTransferMetrics) diagnosticsForDirectStatsLocked(stats externalDirectTransferStats) externalDirectTransferDiagnostics {
 	diagnostics := stats.Diagnostics
 	if diagnostics.DirectPacketBytes <= 0 {
 		diagnostics.DirectPacketBytes = stats.BytesSent
@@ -543,7 +571,7 @@ func (m *externalTransferMetrics) diagnosticsForProbeStatsLocked(stats probe.Tra
 	return diagnostics
 }
 
-func (m *externalTransferMetrics) setProbeLocalSentLocked(stats probe.TransferStats, diagnostics probe.TransferDiagnostics) {
+func (m *externalTransferMetrics) setDirectLocalSentLocked(stats externalDirectTransferStats, diagnostics externalDirectTransferDiagnostics) {
 	if m.role != transfertrace.RoleSend {
 		return
 	}
@@ -556,17 +584,17 @@ func (m *externalTransferMetrics) setProbeLocalSentLocked(stats probe.TransferSt
 	}
 }
 
-func (m *externalTransferMetrics) setProbeDiagnosticsLocked(diagnostics probe.TransferDiagnostics) {
-	m.setProbeRateDiagnosticsLocked(diagnostics)
-	m.setProbeLaneDiagnosticsLocked(diagnostics)
-	m.setProbeControllerDiagnosticsLocked(diagnostics)
-	m.setProbeCounterDiagnosticsLocked(diagnostics)
+func (m *externalTransferMetrics) setDirectDiagnosticsLocked(diagnostics externalDirectTransferDiagnostics) {
+	m.setDirectRateDiagnosticsLocked(diagnostics)
+	m.setDirectLaneDiagnosticsLocked(diagnostics)
+	m.setDirectControllerDiagnosticsLocked(diagnostics)
+	m.setDirectCounterDiagnosticsLocked(diagnostics)
 }
 
-func (m *externalTransferMetrics) setProbeRateDiagnosticsLocked(diagnostics probe.TransferDiagnostics) {
+func (m *externalTransferMetrics) setDirectRateDiagnosticsLocked(diagnostics externalDirectTransferDiagnostics) {
 	if diagnostics.RateTargetMbps > 0 {
 		m.rateTargetMbps = diagnostics.RateTargetMbps
-		m.rateTargetFromProbe = true
+		m.rateTargetFromDirect = true
 		if m.directRateActiveMbps == 0 {
 			m.directRateActiveMbps = diagnostics.RateTargetMbps
 		}
@@ -582,7 +610,7 @@ func (m *externalTransferMetrics) setProbeRateDiagnosticsLocked(diagnostics prob
 	}
 }
 
-func (m *externalTransferMetrics) setProbeLaneDiagnosticsLocked(diagnostics probe.TransferDiagnostics) {
+func (m *externalTransferMetrics) setDirectLaneDiagnosticsLocked(diagnostics externalDirectTransferDiagnostics) {
 	if diagnostics.ActiveLanes > 0 {
 		m.directLanesActive = diagnostics.ActiveLanes
 	}
@@ -597,7 +625,7 @@ func (m *externalTransferMetrics) setProbeLaneDiagnosticsLocked(diagnostics prob
 	}
 }
 
-func (m *externalTransferMetrics) setProbeControllerDiagnosticsLocked(diagnostics probe.TransferDiagnostics) {
+func (m *externalTransferMetrics) setDirectControllerDiagnosticsLocked(diagnostics externalDirectTransferDiagnostics) {
 	if diagnostics.ControllerDecision != "" {
 		m.controllerDecision = diagnostics.ControllerDecision
 	}
@@ -606,7 +634,7 @@ func (m *externalTransferMetrics) setProbeControllerDiagnosticsLocked(diagnostic
 	}
 }
 
-func (m *externalTransferMetrics) setProbeCounterDiagnosticsLocked(diagnostics probe.TransferDiagnostics) {
+func (m *externalTransferMetrics) setDirectCounterDiagnosticsLocked(diagnostics externalDirectTransferDiagnostics) {
 	if diagnostics.ReplayBytes > 0 {
 		m.replayBytes = diagnostics.ReplayBytes
 	}

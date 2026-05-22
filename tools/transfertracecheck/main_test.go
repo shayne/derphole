@@ -40,7 +40,7 @@ func TestRunPrintsSuccess(t *testing.T) {
 		t.Fatalf("stdout = %q, want trace-ok", stdout.String())
 	}
 	if strings.Contains(stdout.String(), "max_rate_target_mbps") || strings.Contains(stdout.String(), "receiver_committed_mbps") {
-		t.Fatalf("stdout = %q, want legacy output without diagnostics", stdout.String())
+		t.Fatalf("stdout = %q, want minimal output without diagnostics", stdout.String())
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr = %q, want empty", stderr.String())

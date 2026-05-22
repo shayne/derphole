@@ -21,7 +21,6 @@ import (
 	"github.com/shayne/derphole/pkg/candidate"
 	"github.com/shayne/derphole/pkg/derpbind"
 	"github.com/shayne/derphole/pkg/portmap"
-	"github.com/shayne/derphole/pkg/probe"
 	"github.com/shayne/derphole/pkg/quicpath"
 	"github.com/shayne/derphole/pkg/rendezvous"
 	"github.com/shayne/derphole/pkg/telemetry"
@@ -304,7 +303,7 @@ func externalTransportManagerConfig(
 
 func configureExternalDirectTransport(cfg *transport.ManagerConfig, conn net.PacketConn, dm *tailcfg.DERPMap, pm publicPortmap, localCandidates []net.Addr) {
 	stunPackets := make(chan traversal.STUNPacket, 256)
-	_ = probe.PreviewTransportCaps(conn, "batched")
+	tuneExternalPacketConn(conn)
 	cfg.DirectConn = conn
 	cfg.DirectBatchConn = publicDirectBatchConn(conn)
 	cfg.HandleSTUNPacket = func(payload []byte, addr net.Addr) {
@@ -318,6 +317,16 @@ func configureExternalDirectTransport(cfg *transport.ManagerConfig, conn net.Pac
 		}
 	}
 	cfg.CandidateSource = publicCandidateSource(conn, dm, pm, localCandidates, stunPackets)
+}
+
+func tuneExternalPacketConn(conn net.PacketConn) {
+	const socketBufferBytes = 8 << 20
+	if setter, ok := conn.(interface{ SetReadBuffer(int) error }); ok {
+		_ = setter.SetReadBuffer(socketBufferBytes)
+	}
+	if setter, ok := conn.(interface{ SetWriteBuffer(int) error }); ok {
+		_ = setter.SetWriteBuffer(socketBufferBytes)
+	}
 }
 
 func publicDirectBatchConn(conn net.PacketConn) transport.DirectBatchConn {
