@@ -11,6 +11,7 @@ import (
 
 	"github.com/shayne/derphole/pkg/session"
 	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/transfertrace"
 	"github.com/shayne/yargs"
 )
 
@@ -72,7 +73,12 @@ func runParsedPipe(parsed *yargs.TypedParseResult[struct{}, pipeFlags, pipeArgs]
 
 	ctx, stop := commandContext()
 	defer stop()
-	if err := executePipeSession(ctx, parsed, policy, level, stdin, stderr); err != nil {
+	trace, closeTrace, ok := openTransferTraceFromEnv(transfertrace.RoleSend, stderr)
+	if !ok {
+		return 1
+	}
+	defer closeTrace()
+	if err := executePipeSession(ctx, parsed, policy, level, stdin, stderr, trace); err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
@@ -81,7 +87,7 @@ func runParsedPipe(parsed *yargs.TypedParseResult[struct{}, pipeFlags, pipeArgs]
 	return 0
 }
 
-func executePipeSession(ctx context.Context, parsed *yargs.TypedParseResult[struct{}, pipeFlags, pipeArgs], policy session.ParallelPolicy, level telemetry.Level, stdin io.Reader, stderr io.Writer) error {
+func executePipeSession(ctx context.Context, parsed *yargs.TypedParseResult[struct{}, pipeFlags, pipeArgs], policy session.ParallelPolicy, level telemetry.Level, stdin io.Reader, stderr io.Writer, trace *transfertrace.Recorder) error {
 	return sendSession(ctx, session.SendConfig{
 		Token:          parsed.Args.Token,
 		Emitter:        telemetry.New(stderr, commandSessionTelemetryLevel(level)),
@@ -89,6 +95,7 @@ func executePipeSession(ctx context.Context, parsed *yargs.TypedParseResult[stru
 		ForceRelay:     parsed.SubCommandFlags.ForceRelay,
 		UsePublicDERP:  usePublicDERPTransport(),
 		ParallelPolicy: policy,
+		Trace:          trace,
 	})
 }
 

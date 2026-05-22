@@ -11,6 +11,7 @@ import (
 
 	"github.com/shayne/derphole/pkg/session"
 	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/transfertrace"
 	"github.com/shayne/yargs"
 )
 
@@ -58,7 +59,12 @@ func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) i
 	emitter := telemetry.New(stderr, commandSessionTelemetryLevel(level))
 	ctx, stop := commandContext()
 	defer stop()
-	tokenSink, done := startListenSession(ctx, parsed, emitter, stdout)
+	trace, closeTrace, ok := openTransferTraceFromEnv(transfertrace.RoleReceive, stderr)
+	if !ok {
+		return 1
+	}
+	defer closeTrace()
+	tokenSink, done := startListenSession(ctx, parsed, emitter, stdout, trace)
 	tok, code, finished := waitListenToken(tokenSink, done, stderr)
 	if finished {
 		return code
@@ -72,7 +78,7 @@ func runListen(args []string, level telemetry.Level, stdout, stderr io.Writer) i
 	return waitListenDone(done, stderr)
 }
 
-func startListenSession(ctx context.Context, parsed *yargs.TypedParseResult[struct{}, listenFlags, struct{}], emitter *telemetry.Emitter, stdout io.Writer) (<-chan string, <-chan error) {
+func startListenSession(ctx context.Context, parsed *yargs.TypedParseResult[struct{}, listenFlags, struct{}], emitter *telemetry.Emitter, stdout io.Writer, trace *transfertrace.Recorder) (<-chan string, <-chan error) {
 	tokenSink := make(chan string, 1)
 	done := make(chan error, 1)
 	go func() {
@@ -82,6 +88,7 @@ func startListenSession(ctx context.Context, parsed *yargs.TypedParseResult[stru
 			StdioOut:      stdout,
 			ForceRelay:    parsed.SubCommandFlags.ForceRelay,
 			UsePublicDERP: usePublicDERPTransport(),
+			Trace:         trace,
 		})
 		done <- err
 	}()

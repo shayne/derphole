@@ -6,8 +6,15 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"io"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/shayne/derphole/pkg/session"
+	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/transfertrace"
 )
 
 func TestRunHelpPipeShowsPipeHelp(t *testing.T) {
@@ -42,5 +49,27 @@ func TestPipeHelpMentionsRawStreamAndParallelFlag(t *testing.T) {
 		if !strings.Contains(help, want) {
 			t.Fatalf("pipeHelpText() = %q, want %q", help, want)
 		}
+	}
+}
+
+func TestRunPipePassesTransferTraceFromEnvironment(t *testing.T) {
+	t.Setenv("DERPHOLE_TRANSFER_TRACE_CSV", filepath.Join(t.TempDir(), "pipe.csv"))
+	prev := sendSession
+	t.Cleanup(func() {
+		sendSession = prev
+	})
+
+	var got *transfertrace.Recorder
+	sendSession = func(_ context.Context, cfg session.SendConfig) error {
+		got = cfg.Trace
+		return nil
+	}
+
+	code := runPipe([]string{"token"}, telemetry.LevelQuiet, strings.NewReader("payload"), io.Discard, io.Discard)
+	if code != 0 {
+		t.Fatalf("runPipe() code = %d, want 0", code)
+	}
+	if got == nil {
+		t.Fatal("Trace was nil")
 	}
 }
