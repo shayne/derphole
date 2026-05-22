@@ -89,12 +89,16 @@ wait_for_local_exit() {
 
 path_trace() {
   local file="$1"
-  grep -Eo 'connected-(relay|direct)' "${file}" 2>/dev/null || true
+  grep -E 'connected-(relay|direct)|v2-data-plane=raw-direct|v2-raw-direct-active=[1-9][0-9]*' "${file}" 2>/dev/null || true
 }
 
 remote_path_trace() {
   local file="$1"
-  remote "grep -Eo 'connected-(relay|direct)' '${file}' 2>/dev/null || true"
+  remote "grep -E 'connected-(relay|direct)|v2-data-plane=raw-direct|v2-raw-direct-active=[1-9][0-9]*' '${file}' 2>/dev/null || true"
+}
+
+has_direct_path_evidence() {
+  grep -Eq 'connected-direct|v2-data-plane=raw-direct|v2-raw-direct-active=[1-9][0-9]*'
 }
 
 send_staged_payload() {
@@ -127,7 +131,7 @@ require_direct_evidence_on_either_side() {
   local left_trace="$2"
   local right_trace="$3"
 
-  if grep -q 'connected-direct' <<<"${left_trace}" || grep -q 'connected-direct' <<<"${right_trace}"; then
+  if has_direct_path_evidence <<<"${left_trace}" || has_direct_path_evidence <<<"${right_trace}"; then
     return 0
   fi
 
