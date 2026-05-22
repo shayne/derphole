@@ -878,10 +878,10 @@ func TestExternalListenSendUsesRelayUDPWhenDirectNeverBecomesReady(t *testing.T)
 		t.Fatalf("listener output = %q, want %q", got, "native-direct")
 	}
 	if got := senderStatus.String(); !strings.Contains(got, string(StateRelay)) || strings.Contains(got, "udp-relay=true") || strings.Contains(got, string(StateDirect)) || strings.Contains(got, "udp-stream=true") {
-		t.Fatalf("sender status = %q, want relay-prefix completion without UDP fallback or direct promotion", got)
+		t.Fatalf("sender status = %q, want relay completion without direct promotion", got)
 	}
 	if got := listenerStatus.String(); !strings.Contains(got, string(StateRelay)) || strings.Contains(got, "udp-relay=true") || strings.Contains(got, string(StateDirect)) || strings.Contains(got, "udp-stream=true") {
-		t.Fatalf("listener status = %q, want relay-prefix completion without UDP fallback or direct promotion", got)
+		t.Fatalf("listener status = %q, want relay completion without direct promotion", got)
 	}
 }
 

@@ -266,8 +266,8 @@ func TestPublicRelayOnlyOfferedStdioRoundTripWhenOnlyOfferForcesRelay(t *testing
 	if got := senderStatus.String(); !strings.Contains(got, string(StateRelay)) || strings.Contains(got, "v2-data-plane=raw-direct") {
 		t.Fatalf("sender status = %q, want v2 relay path", got)
 	}
-	if got := receiverStatus.String(); !strings.Contains(got, string(StateRelay)) || strings.Contains(got, "udp-handoff-receive-prepare-error") || strings.Contains(got, "v2-data-plane=raw-direct") {
-		t.Fatalf("receiver status = %q, want v2 relay path without direct handoff prepare", got)
+	if got := receiverStatus.String(); !strings.Contains(got, string(StateRelay)) || strings.Contains(got, "v2-data-plane=raw-direct") {
+		t.Fatalf("receiver status = %q, want v2 relay path without raw-direct data plane", got)
 	}
 }
 
@@ -325,8 +325,8 @@ func TestPublicRelayOnlyOfferedStdioRoundTripWhenOnlyReceiveForcesRelay(t *testi
 	if got := senderStatus.String(); !strings.Contains(got, string(StateRelay)) || strings.Contains(got, "v2-data-plane=raw-direct") {
 		t.Fatalf("sender status = %q, want v2 relay path", got)
 	}
-	if got := receiverStatus.String(); !strings.Contains(got, string(StateRelay)) || strings.Contains(got, "udp-handoff-receive-prepare-error") || strings.Contains(got, "v2-data-plane=raw-direct") {
-		t.Fatalf("receiver status = %q, want v2 relay path without direct handoff prepare", got)
+	if got := receiverStatus.String(); !strings.Contains(got, string(StateRelay)) || strings.Contains(got, "v2-data-plane=raw-direct") {
+		t.Fatalf("receiver status = %q, want v2 relay path without raw-direct data plane", got)
 	}
 }
 

@@ -90,7 +90,7 @@ Trace `app_bytes` are session stream bytes and include derphole framing, so payl
 Sender `app_bytes` are receiver-confirmed session stream bytes once progress ACKs start. `local_sent_bytes` records sender-side enqueue/spool progress and can be ahead of receiver progress. Use `transfer_elapsed_ms` for throughput comparisons; `elapsed_ms` includes setup and direct probing time.
 
 `connected-direct` means a direct path has delivered probe or payload bytes. A run that attempts direct but falls back to relay records `direct-fallback-relay` and a non-empty `fallback_reason`.
-Relay fallback should continue making trace progress after a direct setup failure; v2 keeps the application stream on one QUIC path instead of reviving the retired relay-prefix handoff protocol.
+Relay fallback should continue making trace progress after a direct setup failure; v2 keeps the application stream on one QUIC path instead of reviving the retired split-stream protocol.
 
 Use v2 direct-path telemetry to explain scaling decisions:
 
@@ -171,7 +171,7 @@ For repeatable browser-send to CLI-receive measurements, use the automated Playw
 SIZE_MB=1024 REMOTE_HOST=root@ktzlxc ./scripts/smoke-web-cli-browser.sh
 ```
 
-The harness runs the remote receiver without `--verbose` by default because verbose out-of-order direct-frame traces distort throughput. Use `VERBOSE=1` only when diagnosing direct handoff or frame ordering. Use `DIRECT=0` only for relay-only comparisons.
+The harness runs the remote receiver without `--verbose` by default because verbose direct-frame traces distort throughput. Use `VERBOSE=1` only when diagnosing direct-path setup or frame ordering. Use `DIRECT=0` only for relay-only comparisons.
 
 For manual testing:
 

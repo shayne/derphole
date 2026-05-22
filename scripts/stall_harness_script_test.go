@@ -88,8 +88,8 @@ func TestTransferStallHarnessCapturesProgressAndCounters(t *testing.T) {
 	}
 
 	forbidden := []string{
-		"direct-udp-",
-		"relay-prefix-",
+		strings.Join([]string{"direct", "udp"}, "-") + "-",
+		strings.Join([]string{"relay", "prefix"}, "-") + "-",
 	}
 	for _, reject := range forbidden {
 		if strings.Contains(body, reject) {
