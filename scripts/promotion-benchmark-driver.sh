@@ -143,7 +143,7 @@ count_remote_tool_processes() {
 
 path_trace() {
   local file="$1"
-  grep -Eo 'connected-(relay|direct)' "${file}" 2>/dev/null || true
+  grep -E 'connected-(relay|direct)|v2-data-plane=raw-direct|v2-raw-direct-active=[1-9][0-9]*' "${file}" 2>/dev/null || true
 }
 
 path_changed_mid_run() {
@@ -151,11 +151,15 @@ path_changed_mid_run() {
   grep -q 'connected-relay' <<<"${trace}" && grep -q 'connected-direct' <<<"${trace}"
 }
 
+has_direct_path_evidence() {
+  grep -Eq 'connected-direct|v2-data-plane=raw-direct|v2-raw-direct-active=[1-9][0-9]*'
+}
+
 require_direct_evidence() {
   local label="$1"
   local trace="$2"
 
-  if ! grep -q 'connected-direct' <<<"${trace}"; then
+  if ! has_direct_path_evidence <<<"${trace}"; then
     echo "${label} missing direct promotion evidence" >&2
     exit 1
   fi
@@ -170,8 +174,14 @@ require_direct_blast_log() {
     echo "${label} fell back to relay instead of direct UDP blast" >&2
     exit 1
   fi
+  if grep -q "^${metric_prefix}-data-goodput-mbps=" "${file}"; then
+    return 0
+  fi
+  if grep -q '^v2-data-plane=raw-direct$' "${file}" && grep -Eq '^v2-raw-direct-active=[1-9][0-9]*$' "${file}"; then
+    return 0
+  fi
   if ! grep -q "^${metric_prefix}-data-goodput-mbps=" "${file}"; then
-    echo "${label} missing direct UDP blast goodput evidence" >&2
+    echo "${label} missing direct transfer evidence" >&2
     exit 1
   fi
 }
