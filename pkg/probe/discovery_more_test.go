@@ -10,24 +10,6 @@ import (
 	"testing"
 )
 
-func TestNormalizeTransportForCLI(t *testing.T) {
-	for _, raw := range []string{"", "single", " SINGLE "} {
-		got, err := NormalizeTransportForCLI(raw)
-		if err != nil {
-			t.Fatalf("NormalizeTransportForCLI(%q) error = %v", raw, err)
-		}
-		if got != probeTransportSingle {
-			t.Fatalf("NormalizeTransportForCLI(%q) = %q, want single", raw, got)
-		}
-	}
-	if got, err := NormalizeTransportForCLI("batched"); err != nil || got != probeTransportBatched {
-		t.Fatalf("NormalizeTransportForCLI(batched) = %q, %v; want batched nil", got, err)
-	}
-	if _, err := NormalizeTransportForCLI("unknown"); err == nil {
-		t.Fatal("NormalizeTransportForCLI(unknown) error = nil, want failure")
-	}
-}
-
 func TestInterfaceCandidateFiltersInvalidAddresses(t *testing.T) {
 	got, ok := interfaceCandidate(&net.IPNet{IP: net.ParseIP("192.168.10.8"), Mask: net.CIDRMask(24, 32)}, 4242)
 	if !ok || got.String() != "192.168.10.8:4242" {

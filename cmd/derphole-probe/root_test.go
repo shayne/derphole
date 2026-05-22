@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 )
 
@@ -20,8 +21,11 @@ func TestRunShowsHelpForNoArgs(t *testing.T) {
 	if stderr.Len() == 0 {
 		t.Fatal("stderr help text is empty")
 	}
-	if !bytes.Contains(stderr.Bytes(), []byte("raw UDP path benchmark")) {
-		t.Fatalf("stderr help = %q, want raw UDP path benchmark wording", stderr.String())
+	if bytes.Contains(stderr.Bytes(), []byte("raw UDP path benchmark")) {
+		t.Fatalf("stderr help = %q, want retired raw UDP benchmark wording removed", stderr.String())
+	}
+	if !strings.Contains(strings.ToLower(stderr.String()), "production benchmark") {
+		t.Fatalf("stderr help = %q, want production benchmark wording", stderr.String())
 	}
 }
 
@@ -38,15 +42,32 @@ func TestRunShowsHelpForHelpFlag(t *testing.T) {
 	}
 }
 
-func TestRunHelpCommandShowsSubcommandHelp(t *testing.T) {
+func TestRunHelpCommandRejectsRetiredRawProbeCommands(t *testing.T) {
+	for _, command := range []string{"server", "client", "orchestrate"} {
+		t.Run(command, func(t *testing.T) {
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+
+			code := run([]string{"help", command}, &stdout, &stderr)
+			if code != 2 {
+				t.Fatalf("run(help %s) code = %d, want 2", command, code)
+			}
+			if got, want := stderr.String(), "unknown command: "+command+"\n"; got != want {
+				t.Fatalf("stderr = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestRunHelpCommandShowsMatrixSubcommandHelp(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	code := run([]string{"help", "server"}, &stdout, &stderr)
+	code := run([]string{"help", "matrix"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("run() code = %d, want 0", code)
 	}
-	if got, want := stderr.String(), "usage: derphole-probe server\n"; got != want {
+	if got, want := stderr.String(), "usage: derphole-probe matrix\n"; got != want {
 		t.Fatalf("stderr = %q, want %q", got, want)
 	}
 }
@@ -68,7 +89,7 @@ func TestRunHelpCommandRejectsExtraArgs(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	code := run([]string{"help", "server", "extra"}, &stdout, &stderr)
+	code := run([]string{"help", "matrix", "extra"}, &stdout, &stderr)
 	if code != 2 {
 		t.Fatalf("run() code = %d, want 2", code)
 	}
@@ -100,53 +121,5 @@ func TestRunRejectsUnknownCommand(t *testing.T) {
 	}
 	if stderr.Len() == 0 {
 		t.Fatal("stderr error text is empty")
-	}
-}
-
-func TestRunServerRejectsPositionalArgs(t *testing.T) {
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-
-	if got := runServer([]string{"unexpected"}, &stdout, &stderr); got != 2 {
-		t.Fatalf("runServer() = %d, want 2", got)
-	}
-	if stderr.Len() == 0 {
-		t.Fatal("stderr error text is empty")
-	}
-}
-
-func TestRunClientRejectsPositionalArgs(t *testing.T) {
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-
-	if got := runClient([]string{"unexpected"}, &stdout, &stderr); got != 2 {
-		t.Fatalf("runClient() = %d, want 2", got)
-	}
-	if stderr.Len() == 0 {
-		t.Fatal("stderr error text is empty")
-	}
-}
-
-func TestRunOrchestrateRejectsPositionalArgs(t *testing.T) {
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-
-	if got := runOrchestrate([]string{"unexpected"}, &stdout, &stderr); got != 2 {
-		t.Fatalf("runOrchestrate() = %d, want 2", got)
-	}
-	if stderr.Len() == 0 {
-		t.Fatal("stderr error text is empty")
-	}
-}
-
-func TestRunServerShowsHelpForHelpFlag(t *testing.T) {
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-
-	if got := runServer([]string{"--help"}, &stdout, &stderr); got != 0 {
-		t.Fatalf("runServer() = %d, want 0", got)
-	}
-	if stderr.Len() == 0 {
-		t.Fatal("stderr help text is empty")
 	}
 }

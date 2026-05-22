@@ -112,6 +112,103 @@ func TestObservePunchAddrsReturnsPacketSources(t *testing.T) {
 	}
 }
 
+func TestPunchAddrsSendsDefaultPayloadAndStopsOnContextCancel(t *testing.T) {
+	receiver, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+
+	sender, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		PunchAddrs(ctx, sender, []net.Addr{nil, receiver.LocalAddr()}, nil, 0)
+	}()
+
+	if err := receiver.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1500)
+	n, addr, err := receiver.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("receiver did not receive punch: %v", err)
+	}
+	if got := string(buf[:n]); got != defaultPunchPayload {
+		t.Fatalf("punch payload = %q, want %q", got, defaultPunchPayload)
+	}
+	if got, want := addr.String(), sender.LocalAddr().String(); got != want {
+		t.Fatalf("punch source = %q, want %q", got, want)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("PunchAddrs did not stop after context cancel")
+	}
+}
+
+func TestPunchAddrsSendsCustomPayloadRepeatedly(t *testing.T) {
+	receiver, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+
+	sender, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		PunchAddrs(ctx, sender, []net.Addr{receiver.LocalAddr()}, []byte("custom"), 5*time.Millisecond)
+	}()
+
+	for i := 0; i < 2; i++ {
+		if err := receiver.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 1500)
+		n, _, err := receiver.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("receiver read %d error = %v", i, err)
+		}
+		if got := string(buf[:n]); got != "custom" {
+			t.Fatalf("punch payload %d = %q, want custom", i, got)
+		}
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("PunchAddrs did not stop after custom payload test")
+	}
+}
+
+func TestPunchAddrsReturnsWithoutConnOrTargets(t *testing.T) {
+	PunchAddrs(context.Background(), nil, []net.Addr{&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}}, nil, 0)
+
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	PunchAddrs(context.Background(), conn, nil, nil, 0)
+}
+
 func TestObservePunchAddrsByConnPreservesSocketAssociation(t *testing.T) {
 	receivers := make([]net.PacketConn, 2)
 	for i := range receivers {

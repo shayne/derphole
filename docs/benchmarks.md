@@ -120,26 +120,21 @@ Examples:
 - `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_PARALLEL_ARGS='--parallel=auto' ./scripts/promotion-test.sh canlxc 1024`
 - `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_PARALLEL_ARGS='--parallel=8' ./scripts/promotion-test-reverse.sh ktzlxc 1024`
 
-## Raw Path Probe Harness
+## Production Matrix Runner
 
-The raw UDP probe harness is a microbenchmark for packet-engine experiments. Production `listen/pipe` uses v2 QUIC over manager-backed or raw-direct paths, so treat this harness as a lower-level comparison tool rather than the proof of the default transport.
+The old raw/blast packet-engine probe harness has been retired. Use production promotion scripts for transport validation, because they exercise the same v2 session path as `listen/pipe`, `send/receive`, and `share/open`.
 
-Every derphole baseline command in this validation path must set `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1`.
+Use these harnesses for proof runs:
 
-Use the promotion scripts above for end-to-end default-transport validation. Use the raw probe harnesses when you need to isolate packet-engine throughput, pacing, repair, or batching behavior outside the full DERP coordination path.
+- `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh ktzlxc 1024`
+- `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh ktzlxc 1024`
+- `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-matrix-no-tailscale.sh 1024`
 
-Use these harnesses for the proof run:
+Useful production tuning knobs:
 
-- `./scripts/probe-benchmark.sh ktzlxc 1073741824`
-- `DERPHOLE_PROBE_PEER_HOST=<reachable-local-host> DERPHOLE_PROBE_PEER_USER=<ssh-user-on-that-host> ./scripts/probe-benchmark-reverse.sh ktzlxc 1073741824`
-- `./scripts/probe-matrix.sh`
-
-Useful probe tuning knobs:
-
-- `DERPHOLE_PROBE_PARALLEL=<n>` controls raw/blast stripe count.
-- `DERPHOLE_PROBE_WINDOW_SIZE=<n>` controls the reliable raw-mode in-flight window.
-- `DERPHOLE_PROBE_WINDOW=<n>` is accepted as a shorthand alias for `DERPHOLE_PROBE_WINDOW_SIZE`.
-- `DERPHOLE_PROBE_CHUNK_SIZE=<bytes>` controls raw/blast payload size per packet.
+- `DERPHOLE_PARALLEL_ARGS='--parallel=auto'` lets the active side choose direct-path striping.
+- `DERPHOLE_PARALLEL_ARGS='--parallel=<n>'` forces a specific striping request for controlled comparisons.
+- `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1` removes Tailscale CGNAT/ULA candidates from test runs only.
 
 The matrix runner covers:
 
@@ -151,15 +146,13 @@ The matrix runner covers:
 
 `eric@eric-nuc` is the asymmetric long-haul residential host in the standard matrix. As of April 12, 2026, a fresh Ookla run from that machine measured about `409.8 Mbps` download and `33.0 Mbps` upload, so reverse and forward expectations should be judged against that ceiling instead of the `ktzlxc` class hosts.
 
-Keep the raw probe comparison separate from the derphole baseline runs. The baseline commands should continue to use the no-Tailscale guardrail, for example:
+The baseline commands should continue to use the no-Tailscale guardrail when measuring public-Internet or private-LAN paths without encapsulated Tailscale routes:
 
 - `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh ktzlxc 1024`
 - `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh canlxc 1024`
 - `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh uklxc 1024`
 - `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh november-oscar.exe.xyz 1024`
 - `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test.sh eric@eric-nuc 1024`
-
-The reverse probe harness is only valid when the remote host can actually SSH to the peer host and user you supply. Do not rely on the local hostname unless that name is resolvable and reachable from the remote side.
 
 ### Browser to CLI WebRTC
 
