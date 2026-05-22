@@ -200,6 +200,10 @@ func signalsFor(signals map[string]*signal, path string) *signal {
 }
 
 func gitChurn(root string, commits int) (map[string]int, bool) {
+	active, ok := trackedGoFiles(root)
+	if !ok {
+		return nil, false
+	}
 	cmd := exec.Command("git", "log", "--name-only", "--format=", fmt.Sprintf("--max-count=%d", commits), "--", ".")
 	cmd.Dir = root
 	out, err := cmd.Output()
@@ -213,9 +217,34 @@ func gitChurn(root string, commits int) (map[string]int, bool) {
 		if path == "" || skipPath(path) {
 			continue
 		}
+		if _, ok := active[path]; !ok {
+			continue
+		}
 		churn[path]++
 	}
 	return churn, true
+}
+
+func trackedGoFiles(root string) (map[string]struct{}, bool) {
+	cmd := exec.Command("git", "ls-files", "--", "*.go")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, false
+	}
+	active := map[string]struct{}{}
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		path := cleanPath(scanner.Text())
+		if path == "" || skipPath(path) {
+			continue
+		}
+		active[path] = struct{}{}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, false
+	}
+	return active, true
 }
 
 func readCoverage(path string) (map[string]float64, bool, error) {

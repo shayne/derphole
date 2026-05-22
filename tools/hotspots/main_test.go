@@ -7,6 +7,7 @@ package main
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -103,6 +104,43 @@ FAIL   999.0    99           0.0%       generated      pkg/thing.pb.go:10
 	}
 }
 
+func TestBuildReportIgnoresDeletedFilesInGitChurn(t *testing.T) {
+	dir := t.TempDir()
+	runGit(t, dir, "init")
+	runGit(t, dir, "config", "user.email", "test@example.invalid")
+	runGit(t, dir, "config", "user.name", "Test User")
+
+	mustWrite(t, filepath.Join(dir, "pkg/active.go"), []byte("package pkg\n\nfunc active() {}\n"))
+	mustWrite(t, filepath.Join(dir, "pkg/retired.go"), []byte("package pkg\n\nfunc retired() {}\n"))
+	runGit(t, dir, "add", ".")
+	runGit(t, dir, "commit", "-m", "initial")
+
+	if err := os.Remove(filepath.Join(dir, "pkg/retired.go")); err != nil {
+		t.Fatalf("remove retired file: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "pkg/active.go"), []byte("package pkg\n\nfunc active() {}\nfunc changed() {}\n"))
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-m", "retire old file")
+
+	report, err := buildReport(options{
+		Root:         dir,
+		CoveragePath: "missing-cover.out",
+		GolangCIPath: "missing-golangci.json",
+		CRAPPath:     "missing-crap.txt",
+		Limit:        10,
+		ChurnCommits: 10,
+	})
+	if err != nil {
+		t.Fatalf("buildReport returned error: %v", err)
+	}
+	if !strings.Contains(report, "pkg/active.go") {
+		t.Fatalf("report missing active file churn:\n%s", report)
+	}
+	if strings.Contains(report, "pkg/retired.go") {
+		t.Fatalf("report includes deleted file churn:\n%s", report)
+	}
+}
+
 func TestRunCLIWritesOutputWhenRequested(t *testing.T) {
 	dir := t.TempDir()
 	mustWrite(t, filepath.Join(dir, "coverage.out"), []byte(`mode: set
@@ -180,5 +218,15 @@ func mustWrite(t *testing.T, path string, b []byte) {
 	}
 	if err := os.WriteFile(path, b, 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func runGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, out)
 	}
 }

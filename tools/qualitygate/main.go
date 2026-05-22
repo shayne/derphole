@@ -163,7 +163,7 @@ type golangCIIssue struct {
 var (
 	cyclopFunctionRE = regexp.MustCompile(`function ([^[:space:]]+) is `)
 	backtickFuncRE   = regexp.MustCompile("func `([^`]+)`")
-	legacyFunctionRE = regexp.MustCompile(`func ([^[:space:]]+) `)
+	plainFunctionRE  = regexp.MustCompile(`func ([^[:space:]]+) `)
 )
 
 func parseGolangCIJSON(report []byte) ([]hotspot, error) {
@@ -208,7 +208,7 @@ func parseGolangCIJSON(report []byte) ([]hotspot, error) {
 }
 
 func issueFunction(text string) string {
-	for _, re := range []*regexp.Regexp{backtickFuncRE, cyclopFunctionRE, legacyFunctionRE} {
+	for _, re := range []*regexp.Regexp{backtickFuncRE, cyclopFunctionRE, plainFunctionRE} {
 		if match := re.FindStringSubmatch(text); len(match) == 2 {
 			return match[1]
 		}
