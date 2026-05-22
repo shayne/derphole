@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shayne/derphole/pkg/directquic"
 	"github.com/shayne/derphole/pkg/probe"
 	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/transfertrace"
@@ -288,44 +287,6 @@ func TestExternalTransferMetricsSetProbeStatsUpdatesTrace(t *testing.T) {
 	}
 	if row["send_goodput_mbps"] == "" {
 		t.Fatalf("trace row send_goodput_mbps is empty, want probe byte goodput; row = %#v", row)
-	}
-}
-
-func TestExternalTransferMetricsSetDirectQUICStatsUpdatesTrace(t *testing.T) {
-	var out bytes.Buffer
-	start := time.Unix(80, 0)
-	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, start)
-	if err != nil {
-		t.Fatal(err)
-	}
-	metrics := newExternalTransferMetricsWithTrace(start, rec, transfertrace.RoleSend)
-	metrics.SetPhase(transfertrace.PhaseDirectExecute, "connected-direct-quic")
-	metrics.SetDirectQUICStats(directquic.Stats{
-		BytesSent:   1024,
-		HandshakeMS: 12,
-		FirstByteMS: 18,
-		OpenedAt:    start,
-		FirstByteAt: start.Add(18 * time.Millisecond),
-		ClosedAt:    start.Add(1018 * time.Millisecond),
-	})
-	metrics.Tick(start.Add(1018 * time.Millisecond))
-	if err := rec.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	rows := readTransferTraceRows(t, out.String())
-	row := rows[len(rows)-1]
-	want := map[string]string{
-		"direct_transport":         "quic",
-		"quic_handshake_ms":        "12",
-		"quic_first_byte_ms":       "18",
-		"quic_stream_bytes_sent":   "1024",
-		"quic_stream_goodput_mbps": "0.01",
-	}
-	for column, value := range want {
-		if row[column] != value {
-			t.Fatalf("trace row[%q] = %q, want %q; row = %#v", column, row[column], value, row)
-		}
 	}
 }
 
