@@ -16,6 +16,7 @@ import (
 var errExternalStripedDuplicateChunk = errors.New("duplicate striped chunk sequence")
 
 const externalStripedFrameHeaderSize = 12
+const externalStripedWarmupSeq = ^uint64(0)
 
 type externalStripedChunk struct {
 	seq  uint64
@@ -70,11 +71,18 @@ func newExternalStripedChunkPool(chunkSize int) *sync.Pool {
 func startExternalStripedWriters(writers []io.WriteCloser, chunkPool *sync.Pool) (chan externalStripedChunk, chan error, func()) {
 	jobs := make(chan externalStripedChunk, len(writers)*2)
 	errCh := make(chan error, len(writers))
+	warmup := len(writers) > 1
 	var wg sync.WaitGroup
 	for _, writer := range writers {
 		wg.Add(1)
 		go func(dst io.Writer) {
 			defer wg.Done()
+			if warmup {
+				if err := writeExternalStripedChunk(dst, externalStripedChunk{seq: externalStripedWarmupSeq}); err != nil {
+					errCh <- err
+					return
+				}
+			}
 			for chunk := range jobs {
 				if err := writeExternalStripedChunk(dst, chunk); err != nil {
 					putExternalStripedBuffer(chunkPool, chunk.data)
@@ -97,7 +105,7 @@ func sendExternalStripedChunks(ctx context.Context, src io.Reader, jobs chan ext
 			break
 		}
 		buf := getExternalStripedBuffer(chunkPool)
-		n, err := io.ReadFull(src, buf)
+		n, err := src.Read(buf)
 		if n > 0 {
 			nextSeq, err := sendExternalStripedChunkJob(ctx, jobs, errCh, chunkPool, seq, buf[:n], buf)
 			if err != nil {
@@ -241,6 +249,10 @@ func handleExternalStripedReadResult(dst io.Writer, pending map[uint64][]byte, r
 		putExternalStripedChunkBuffer(chunkPool, result.chunk)
 		return state, result.err
 	}
+	if result.chunk.seq == externalStripedWarmupSeq {
+		putExternalStripedChunkBuffer(chunkPool, result.chunk)
+		return state, nil
+	}
 	if result.chunk.seq == nextSeq {
 		next, err := writeExternalStripedImmediateChunk(dst, result.chunk, chunkPool, nextSeq)
 		state.nextSeq = next
@@ -275,7 +287,7 @@ func bufferExternalStripedOutOfOrderChunk(pending map[uint64][]byte, chunk exter
 }
 
 func putExternalStripedChunkBuffer(chunkPool *sync.Pool, chunk externalStripedChunk) {
-	if len(chunk.data) > 0 {
+	if chunk.data != nil {
 		putExternalStripedBuffer(chunkPool, chunk.data)
 	}
 }
