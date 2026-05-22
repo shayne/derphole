@@ -77,6 +77,11 @@ wait_for_file_pattern() {
   return 1
 }
 
+has_direct_path_evidence() {
+  local file="$1"
+  grep -Eq 'connected-direct|v2-data-plane=raw-direct|v2-raw-direct-active=[1-9][0-9]*' "${file}" 2>/dev/null
+}
+
 fetch_remote_serve_log() {
   ssh "${remote_user}@${target}" "cat '${remote_base}/serve.err' 2>/dev/null || true" >"${serve_log}" || true
 }
@@ -114,7 +119,7 @@ PY
 
   for _ in $(seq 1 120); do
     got_count="$(grep -c '^pong$' "${out_file}" 2>/dev/null || true)"
-    if [[ "${got_count}" == "80" ]] && grep -q 'connected-direct' "${log_file}" 2>/dev/null; then
+    if [[ "${got_count}" == "80" ]] && has_direct_path_evidence "${log_file}"; then
       break
     fi
     if ! kill -0 "${connect_pid}" 2>/dev/null; then
@@ -155,7 +160,7 @@ start_holding_connect() {
   printf 'ping\n' >&9
 
   for _ in $(seq 1 120); do
-    if grep -q '^pong$' "${active_out}" 2>/dev/null && grep -q 'connected-direct' "${active_log}" 2>/dev/null; then
+    if grep -q '^pong$' "${active_out}" 2>/dev/null && has_direct_path_evidence "${active_log}"; then
       return 0
     fi
     if ! kill -0 "${active_connect_pid}" 2>/dev/null; then
@@ -282,8 +287,8 @@ expect_claimed_contender() {
 require_direct_evidence() {
   local label="$1"
   local file="$2"
-  if ! grep -q 'connected-direct' "${file}"; then
-    echo "${label} did not report connected-direct with Tailscale candidates disabled" >&2
+  if ! has_direct_path_evidence "${file}"; then
+    echo "${label} did not report direct path evidence with Tailscale candidates disabled" >&2
     sed -n '1,200p' "${file}" >&2 || true
     exit 1
   fi
@@ -372,7 +377,7 @@ for _ in $(seq 1 80); do
     exit 1
   fi
   fetch_remote_serve_log
-  if grep -q 'connected-direct' "${open_log}" && grep -q 'connected-direct' "${serve_log}"; then
+  if has_direct_path_evidence "${open_log}" && has_direct_path_evidence "${serve_log}"; then
     break
   fi
   sleep 0.25

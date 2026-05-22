@@ -10,6 +10,7 @@ tmp="$(mktemp -d)"
 remote_tmp=""
 remote_base=""
 remote_upload=""
+remote_bin=""
 local_listener_pid=""
 remote_user="${DERPHOLE_REMOTE_USER:-root}"
 remote_env=()
@@ -29,6 +30,7 @@ remote() {
 remote_tmp="$(remote 'mktemp -d "${TMPDIR:-/tmp}/derphole-relay-smoke.XXXXXXXXXX"')"
 remote_base="${remote_tmp}/derphole-relay-smoke"
 remote_upload="${remote_tmp}/derphole-bin"
+remote_bin="${remote_tmp}/derphole"
 
 cleanup() {
   if [[ -n "${local_listener_pid}" ]]; then
@@ -97,10 +99,10 @@ dump_remote_logs() {
 mise run build
 mise run build-linux-amd64
 scp dist/derphole-linux-amd64 "${remote_user}@${target}:${remote_upload}" >/dev/null
-remote "install -m 0755 '${remote_upload}' /usr/local/bin/derphole && rm -f '${remote_upload}' && /usr/local/bin/derphole --help >/dev/null 2>&1"
+remote "install -m 0755 '${remote_upload}' '${remote_bin}' && rm -f '${remote_upload}' && '${remote_bin}' --help >/dev/null 2>&1"
 
 payload_local_to_remote="hello relay local-to-${target}-${relay_plaintext_marker}-$(date +%s)"
-remote "rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err'; nohup /usr/local/bin/derphole --verbose listen --force-relay >'${remote_base}.out' 2>'${remote_base}.err' </dev/null & echo \$! > '${remote_base}.pid'"
+remote "rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err'; nohup '${remote_bin}' --verbose listen --force-relay >'${remote_base}.out' 2>'${remote_base}.err' </dev/null & echo \$! > '${remote_base}.pid'"
 remote_token="$(wait_for_remote_token)" || {
   echo "failed to capture remote listener token" >&2
   dump_remote_logs >&2
@@ -133,7 +135,7 @@ local_token="$(wait_for_local_token "${local_listener_log}")" || {
   sed -n '1,160p' "${local_listener_log}" >&2 || true
   exit 1
 }
-remote "printf '%s' '${payload_remote_to_local}' | /usr/local/bin/derphole --verbose pipe '${local_token}' --force-relay >'${remote_base}.sender.out' 2>'${remote_base}.sender.err'"
+remote "printf '%s' '${payload_remote_to_local}' | '${remote_bin}' --verbose pipe '${local_token}' --force-relay >'${remote_base}.sender.out' 2>'${remote_base}.sender.err'"
 wait_for_local_exit "${local_listener_pid}" || {
   echo "local relay listener did not exit" >&2
   sed -n '1,160p' "${local_listener_log}" >&2 || true

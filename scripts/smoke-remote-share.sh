@@ -10,6 +10,7 @@ tmp="$(mktemp -d)"
 remote_tmp=""
 remote_base=""
 remote_upload=""
+remote_bin=""
 local_share_pid=""
 local_http_pid=""
 remote_user="${DERPHOLE_REMOTE_USER:-root}"
@@ -26,6 +27,7 @@ remote() {
 remote_tmp="$(remote 'mktemp -d "${TMPDIR:-/tmp}/derphole-share-smoke.XXXXXXXXXX"')"
 remote_base="${remote_tmp}/derphole-share-smoke"
 remote_upload="${remote_tmp}/derphole-bin"
+remote_bin="${remote_tmp}/derphole"
 
 cleanup() {
   if [[ -n "${local_share_pid}" ]]; then
@@ -83,12 +85,16 @@ wait_for_remote_bind() {
 
 path_trace() {
   local file="$1"
-  grep -Eo 'connected-(relay|direct)' "${file}" 2>/dev/null || true
+  grep -E 'connected-(relay|direct)|v2-data-plane=raw-direct|v2-raw-direct-active=[1-9][0-9]*' "${file}" 2>/dev/null || true
 }
 
 remote_path_trace() {
   local file="$1"
-  remote "grep -Eo 'connected-(relay|direct)' '${file}' 2>/dev/null || true"
+  remote "grep -E 'connected-(relay|direct)|v2-data-plane=raw-direct|v2-raw-direct-active=[1-9][0-9]*' '${file}' 2>/dev/null || true"
+}
+
+has_direct_path_evidence() {
+  grep -Eq 'connected-direct|v2-data-plane=raw-direct|v2-raw-direct-active=[1-9][0-9]*'
 }
 
 assert_path_evidence() {
@@ -110,7 +116,7 @@ require_direct_evidence() {
   local label="$1"
   local trace="$2"
 
-  if ! grep -q 'connected-direct' <<<"${trace}"; then
+  if ! has_direct_path_evidence <<<"${trace}"; then
     echo "${label} missing direct promotion evidence" >&2
     exit 1
   fi
@@ -129,7 +135,7 @@ wait_for_direct_evidence() {
     else
       trace="$(remote_path_trace "${remote_open_err}")"
     fi
-    if grep -q 'connected-direct' <<<"${trace}"; then
+    if has_direct_path_evidence <<<"${trace}"; then
       printf '%s\n' "${trace}"
       return 0
     fi
@@ -150,7 +156,7 @@ wait_for_direct_evidence() {
 mise run build
 mise run build-linux-amd64
 scp dist/derphole-linux-amd64 "${remote_user}@${target}:${remote_upload}" >/dev/null
-remote "install -m 0755 '${remote_upload}' /usr/local/bin/derphole && rm -f '${remote_upload}' && /usr/local/bin/derphole help open >/dev/null 2>&1"
+remote "install -m 0755 '${remote_upload}' '${remote_bin}' && rm -f '${remote_upload}' && '${remote_bin}' help open >/dev/null 2>&1"
 
 shared_content="hello shared service ${target} $(date +%s)"
 printf '%s\n' "${shared_content}" >"${tmp}/index.html"
@@ -169,7 +175,7 @@ token="$(wait_for_local_token "${local_share_log}")" || {
 }
 
 remote_open_err="${remote_base}.open.err"
-remote "rm -f '${remote_base}.pid' '${remote_open_err}'; nohup /usr/local/bin/derphole --verbose open '${token}' >/dev/null 2>'${remote_open_err}' </dev/null & echo \$! > '${remote_base}.pid'"
+remote "rm -f '${remote_base}.pid' '${remote_open_err}'; nohup '${remote_bin}' --verbose open '${token}' >/dev/null 2>'${remote_open_err}' </dev/null & echo \$! > '${remote_base}.pid'"
 bind_addr="$(wait_for_remote_bind "${remote_open_err}")" || {
   echo "failed to capture remote bind address" >&2
   remote "sed -n '1,200p' '${remote_open_err}'" >&2 || true
@@ -195,10 +201,10 @@ fi
 share_trace="$(path_trace "${local_share_log}")"
 open_trace="$(remote_path_trace "${remote_open_err}")"
 
-if ! grep -q 'connected-direct' <<<"${share_trace}"; then
+if ! has_direct_path_evidence <<<"${share_trace}"; then
   share_trace="$(wait_for_direct_evidence "share" "local" "${shared_content}" "${bind_addr}" || true)"
 fi
-if ! grep -q 'connected-direct' <<<"${open_trace}"; then
+if ! has_direct_path_evidence <<<"${open_trace}"; then
   open_trace="$(wait_for_direct_evidence "open" "remote" "${shared_content}" "${bind_addr}" || true)"
 fi
 
