@@ -6,6 +6,8 @@ package token
 
 import (
 	"encoding/base64"
+	"encoding/binary"
+	"hash/crc32"
 	"strings"
 	"testing"
 	"time"
@@ -57,6 +59,13 @@ func TestEncodeRejectsUnsupportedVersion(t *testing.T) {
 	}
 }
 
+func TestEncodeRejectsRetiredV3TokenVersion(t *testing.T) {
+	_, err := Encode(Token{Version: 3, ExpiresUnix: time.Now().Add(time.Minute).Unix()})
+	if err != ErrUnsupportedVersion {
+		t.Fatalf("Encode() error = %v, want ErrUnsupportedVersion", err)
+	}
+}
+
 func TestDecodeRejectsUnsupportedVersion(t *testing.T) {
 	tok := Token{Version: SupportedVersion, ExpiresUnix: time.Now().Add(time.Minute).Unix()}
 	encoded, err := Encode(tok)
@@ -69,6 +78,25 @@ func TestDecodeRejectsUnsupportedVersion(t *testing.T) {
 	}
 	raw[0] = SupportedVersion + 1
 	raw = raw[:len(raw)-1]
+	encoded = base64.RawURLEncoding.EncodeToString(raw)
+	if _, err := Decode(encoded, time.Now()); err != ErrUnsupportedVersion {
+		t.Fatalf("Decode() error = %v, want ErrUnsupportedVersion", err)
+	}
+}
+
+func TestDecodeRejectsRetiredV3TokenVersion(t *testing.T) {
+	tok := Token{Version: SupportedVersion, ExpiresUnix: time.Now().Add(time.Minute).Unix()}
+	encoded, err := Encode(tok)
+	if err != nil {
+		t.Fatalf("Encode() error = %v", err)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("DecodeString() error = %v", err)
+	}
+	raw[0] = 3
+	checksum := crc32.ChecksumIEEE(raw[:len(raw)-4])
+	binary.BigEndian.PutUint32(raw[len(raw)-4:], checksum)
 	encoded = base64.RawURLEncoding.EncodeToString(raw)
 	if _, err := Decode(encoded, time.Now()); err != ErrUnsupportedVersion {
 		t.Fatalf("Decode() error = %v, want ErrUnsupportedVersion", err)
@@ -139,7 +167,7 @@ func TestEncodeWireFormatContract(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeString() error = %v", err)
 	}
-	if got, want := len(raw), fixedPayloadSizeCurrent+4; got != want {
+	if got, want := len(raw), fixedPayloadSize+4; got != want {
 		t.Fatalf("raw length = %d, want %d", got, want)
 	}
 	decoded, err := Decode(encoded, time.Unix(tok.ExpiresUnix-1, 0))
@@ -202,31 +230,6 @@ func TestEncodeDecodeRoundTripAttachToken(t *testing.T) {
 	}
 	if decoded.Capabilities&CapabilityStdio == 0 || decoded.Capabilities&CapabilityShare == 0 {
 		t.Fatalf("Capabilities = %08b, want mixed capability bits preserved", decoded.Capabilities)
-	}
-}
-
-func TestDecodeAcceptsLegacyVersion3Token(t *testing.T) {
-	tok := Token{
-		Version:         3,
-		SessionID:       [16]byte{1, 2, 3, 4},
-		ExpiresUnix:     time.Now().Add(5 * time.Minute).Unix(),
-		BootstrapRegion: 12,
-		DERPPublic:      [32]byte{5, 6, 7, 8},
-		BearerSecret:    [32]byte{17, 18, 19, 20},
-		Capabilities:    CapabilityStdio,
-		QUICPublic:      [32]byte{21, 22, 23, 24},
-	}
-
-	encoded, err := Encode(tok)
-	if err != nil {
-		t.Fatalf("Encode() error = %v", err)
-	}
-	decoded, err := Decode(encoded, time.Now())
-	if err != nil {
-		t.Fatalf("Decode() error = %v", err)
-	}
-	if decoded.Version != 3 {
-		t.Fatalf("Version = %d, want 3", decoded.Version)
 	}
 }
 
@@ -307,10 +310,10 @@ func FuzzDecode(f *testing.F) {
 }
 
 func FuzzEncodeDecode(f *testing.F) {
-	f.Add([]byte("derphole seed"), int64(1), uint32(CapabilityStdio), false)
-	f.Add([]byte(strings.Repeat("x", 128)), int64(3600), uint32(CapabilityShare), true)
+	f.Add([]byte("derphole seed"), int64(1), uint32(CapabilityStdio))
+	f.Add([]byte(strings.Repeat("x", 128)), int64(3600), uint32(CapabilityShare))
 
-	f.Fuzz(func(t *testing.T, seed []byte, expiresDelta int64, capabilities uint32, legacy bool) {
+	f.Fuzz(func(t *testing.T, seed []byte, expiresDelta int64, capabilities uint32) {
 		now := time.Unix(1700000000, 0)
 		if expiresDelta < 0 {
 			expiresDelta = -expiresDelta
@@ -319,9 +322,6 @@ func FuzzEncodeDecode(f *testing.F) {
 			Version:      SupportedVersion,
 			ExpiresUnix:  now.Unix() + 1 + expiresDelta%86400,
 			Capabilities: capabilities,
-		}
-		if legacy {
-			tok.Version = legacyVersion
 		}
 		copy(tok.SessionID[:], seed)
 		copy(tok.DERPPublic[:], seed)

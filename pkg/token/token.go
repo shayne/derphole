@@ -21,7 +21,7 @@ const (
 	CapabilityStdioOffer
 	CapabilityWebFile
 	CapabilityDerptunTCP
-	CapabilityDirectQUIC
+	_
 	CapabilityTransferV2
 )
 
@@ -45,12 +45,10 @@ var (
 
 const (
 	SupportedVersion uint8 = 5
-	legacyVersion    uint8 = 3
 )
 
 const (
-	fixedPayloadSizeV3      = 1 + 16 + 8 + 2 + 32 + 32 + 32 + 4
-	fixedPayloadSizeCurrent = fixedPayloadSizeV3
+	fixedPayloadSize = 1 + 16 + 8 + 2 + 32 + 32 + 32 + 4
 )
 
 func Encode(tok Token) (string, error) {
@@ -76,7 +74,7 @@ func encodeVersion(version uint8) (uint8, error) {
 	if version == 0 {
 		return SupportedVersion, nil
 	}
-	if version != legacyVersion && version != SupportedVersion {
+	if version != SupportedVersion {
 		return 0, ErrUnsupportedVersion
 	}
 	return version, nil
@@ -159,14 +157,10 @@ func decodeEnvelope(encoded string) (Token, []byte, error) {
 }
 
 func tokenWireSize(version uint8) (int, bool) {
-	switch version {
-	case legacyVersion:
-		return fixedPayloadSizeV3 + 4, true
-	case SupportedVersion:
-		return fixedPayloadSizeCurrent + 4, true
-	default:
+	if version != SupportedVersion {
 		return 0, false
 	}
+	return fixedPayloadSize + 4, true
 }
 
 type payloadReader struct {

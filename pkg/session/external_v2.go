@@ -161,7 +161,7 @@ func (rt *externalV2SendRuntime) subscribe() {
 	rt.completeCh, rt.unsubscribeComplete = rt.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == rt.listenerDERP && isV2CompletePayload(pkt.Payload)
 	})
-	rt.abortCh, rt.unsubscribeAbort = rt.derp.Subscribe(func(pkt derpbind.Packet) bool {
+	rt.abortCh, rt.unsubscribeAbort = rt.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == rt.listenerDERP && isAbortPayload(pkt.Payload)
 	})
 }
@@ -636,7 +636,7 @@ func watchExternalV2LocalCancelAbort(ctx context.Context, client *derpbind.Clien
 }
 
 func (rt *externalV2ListenRuntime) watchAbort(ctx context.Context, peerDERP key.NodePublic, onAbort func()) (<-chan error, func()) {
-	abortCh, unsubscribe := rt.session.derp.Subscribe(func(pkt derpbind.Packet) bool {
+	abortCh, unsubscribe := rt.session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == peerDERP && isAbortPayload(pkt.Payload)
 	})
 	watchCtx, cancel := context.WithCancel(ctx)

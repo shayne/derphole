@@ -107,7 +107,7 @@ func (rt *externalV2OfferRuntime) subscribe() {
 	rt.completeCh, rt.unsubscribeComplete = rt.session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return isV2CompletePayload(pkt.Payload)
 	})
-	rt.abortCh, rt.unsubscribeAbort = rt.session.derp.Subscribe(func(pkt derpbind.Packet) bool {
+	rt.abortCh, rt.unsubscribeAbort = rt.session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return isAbortPayload(pkt.Payload)
 	})
 	rt.progressCh, rt.unsubscribeProgress = rt.session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
@@ -236,8 +236,10 @@ func (rt *externalV2OfferRuntime) send(ctx context.Context, accepted externalV2A
 }
 
 func (rt *externalV2OfferRuntime) sendQUIC(ctx context.Context, accepted externalV2AcceptedClaim, tr externalV2ListenTransport, policy ParallelPolicy, countedSrc *byteCountingReadCloser, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter) error {
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
 	streamCount := externalV2StreamCount(policy)
-	rawPath, err := negotiateExternalV2DirectPacketPath(ctx, rt.session.derp, accepted.peerDERP, tr.manager, rt.session.derpMap, rt.auth, rt.cfg.Emitter, streamCount, externalV2DataPlaneSenderPunchDelay, tr.relayOnly)
+	rawPath, err := negotiateExternalV2DirectPacketPath(streamCtx, rt.session.derp, accepted.peerDERP, tr.manager, rt.session.derpMap, rt.auth, rt.cfg.Emitter, streamCount, externalV2DataPlaneSenderPunchDelay, tr.relayOnly)
 	if err != nil {
 		return err
 	}
@@ -248,26 +250,28 @@ func (rt *externalV2OfferRuntime) sendQUIC(ctx context.Context, accepted externa
 		client := dataplane.NewQUICClientOnPacketConns(rawPath.conns, rawPath.addrs, rt.session.quicIdentity, accepted.claim.QUICPublic)
 		endpoint = client
 		abortErrCh, stopAbortWatch := rt.watchAbort(ctx, accepted.peerDERP, func() {
+			cancelStream()
 			_ = endpoint.CloseWithError(1, "peer aborted transfer")
 		})
 		defer stopAbortWatch()
-		streams, err = client.OpenStreams(tr.ctx, streamCount)
+		streams, err = client.OpenStreams(streamCtx, streamCount)
 		if err != nil {
 			return err
 		}
-		return rt.sendQUICStreams(ctx, accepted, countedSrc, streams, endpoint, abortErrCh, metrics, pathEmitter, tr.manager)
+		return rt.sendQUICStreams(streamCtx, accepted, countedSrc, streams, endpoint, abortErrCh, metrics, pathEmitter, tr.manager)
 	}
 	server := dataplane.NewQUICServer(tr.manager, rt.session.quicIdentity, accepted.claim.QUICPublic)
 	endpoint = server
 	abortErrCh, stopAbortWatch := rt.watchAbort(ctx, accepted.peerDERP, func() {
+		cancelStream()
 		_ = endpoint.CloseWithError(1, "peer aborted transfer")
 	})
 	defer stopAbortWatch()
-	streams, err = server.OpenStreamsWithReady(tr.ctx, streamCount, nil)
+	streams, err = server.OpenStreamsWithReady(streamCtx, streamCount, nil)
 	if err != nil {
 		return err
 	}
-	return rt.sendQUICStreams(ctx, accepted, countedSrc, streams, endpoint, abortErrCh, metrics, pathEmitter, tr.manager)
+	return rt.sendQUICStreams(streamCtx, accepted, countedSrc, streams, endpoint, abortErrCh, metrics, pathEmitter, tr.manager)
 }
 
 type externalV2QUICEndpoint interface {
@@ -554,7 +558,7 @@ func (rt *externalV2OfferReceiveRuntime) subscribe() {
 	rt.acceptCh, rt.unsubscribeAccept = rt.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == rt.listenerDERP && isV2AcceptPayload(pkt.Payload)
 	})
-	rt.abortCh, rt.unsubscribeAbort = rt.derp.Subscribe(func(pkt derpbind.Packet) bool {
+	rt.abortCh, rt.unsubscribeAbort = rt.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
 		return pkt.From == rt.listenerDERP && isAbortPayload(pkt.Payload)
 	})
 }
@@ -585,7 +589,6 @@ func (rt *externalV2OfferReceiveRuntime) run(ctx context.Context) (retErr error)
 	defer func() {
 		if retErr != nil {
 			metrics.SetError(retErr)
-			rt.notifyAbort(retErr)
 		}
 	}()
 	ctx = withExternalTransferMetrics(ctx, metrics)
@@ -603,6 +606,11 @@ func (rt *externalV2OfferReceiveRuntime) run(ctx context.Context) (retErr error)
 		return err
 	}
 	defer tr.Close()
+	defer func() {
+		if retErr != nil {
+			rt.notifyAbort(retErr)
+		}
+	}()
 	metrics.SetTransportManager(tr.manager)
 	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
 
