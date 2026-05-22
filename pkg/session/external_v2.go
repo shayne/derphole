@@ -849,7 +849,7 @@ func externalV2StartPunching(ctx context.Context, conns []net.PacketConn, remote
 		return func() {}
 	}
 	punchCtx, cancel := context.WithCancel(ctx)
-	externalDirectUDPStartPunching(punchCtx, conns, remoteCandidates)
+	externalV2RawDirectStartPunching(punchCtx, conns, remoteCandidates)
 	return cancel
 }
 

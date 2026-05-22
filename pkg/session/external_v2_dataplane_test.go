@@ -12,11 +12,11 @@ import (
 )
 
 func TestExternalV2DataPacketCandidateKeepsSetMappedLanesIsolated(t *testing.T) {
-	prevRoute := externalDirectUDPRouteCandidate
-	externalDirectUDPRouteCandidate = func(_ net.PacketConn, _ string) bool {
+	prevRoute := externalV2RawDirectRouteCandidate
+	externalV2RawDirectRouteCandidate = func(_ net.PacketConn, _ string) bool {
 		return true
 	}
-	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
+	t.Cleanup(func() { externalV2RawDirectRouteCandidate = prevRoute })
 
 	selected := []string{"", ""}
 	fallback := []string{"", "203.0.113.20:20000"}
@@ -35,7 +35,7 @@ func TestExternalV2DataPacketSelectionRequiresObservedPunchByDefault(t *testing.
 	if !externalV2DataPacketSelectionObserved(context.Background(), []string{"198.51.100.10:10000", ""}, nil) {
 		t.Fatal("selection not observed with one selected address, want true")
 	}
-	if !externalV2DataPacketSelectionObserved(withExternalDirectUDPAllowUnverifiedFallback(context.Background()), []string{"", ""}, nil) {
+	if !externalV2DataPacketSelectionObserved(withExternalV2RawDirectAllowUnverifiedFallback(context.Background()), []string{"", ""}, nil) {
 		t.Fatal("selection not allowed with unverified fallback context, want true")
 	}
 }
@@ -69,17 +69,17 @@ func TestSelectExternalV2DataPacketAddrsUsesObservedFlatCandidates(t *testing.T)
 	observed := parseCandidateStrings([]string{"127.0.0.1:41001", "127.0.0.1:41002"})
 	peerCandidates := parseCandidateStrings([]string{"127.0.0.1:42001", "127.0.0.1:42002"})
 
-	prevObserve := externalDirectUDPObservePunchAddrsByConn
-	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+	prevObserve := externalV2RawDirectObservePunchAddrsByConn
+	externalV2RawDirectObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
 		return [][]net.Addr{{observed[0]}, {observed[1]}}
 	}
-	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = prevObserve })
+	t.Cleanup(func() { externalV2RawDirectObservePunchAddrsByConn = prevObserve })
 
-	prevRoute := externalDirectUDPRouteCandidate
-	externalDirectUDPRouteCandidate = func(net.PacketConn, string) bool {
+	prevRoute := externalV2RawDirectRouteCandidate
+	externalV2RawDirectRouteCandidate = func(net.PacketConn, string) bool {
 		return true
 	}
-	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
+	t.Cleanup(func() { externalV2RawDirectRouteCandidate = prevRoute })
 
 	got := selectExternalV2DataPacketAddrs(context.Background(), conns, nil, peerCandidates, nil, 0)
 	if len(got) != 2 {
@@ -98,17 +98,17 @@ func TestSelectExternalV2DataPacketAddrsKeepsCandidateSetsLaneMapped(t *testing.
 		{"127.0.0.1:44002"},
 	}
 
-	prevObserve := externalDirectUDPObservePunchAddrsByConn
-	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+	prevObserve := externalV2RawDirectObservePunchAddrsByConn
+	externalV2RawDirectObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
 		return [][]net.Addr{{observed[0]}, {observed[1]}}
 	}
-	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = prevObserve })
+	t.Cleanup(func() { externalV2RawDirectObservePunchAddrsByConn = prevObserve })
 
-	prevRoute := externalDirectUDPRouteCandidate
-	externalDirectUDPRouteCandidate = func(net.PacketConn, string) bool {
+	prevRoute := externalV2RawDirectRouteCandidate
+	externalV2RawDirectRouteCandidate = func(net.PacketConn, string) bool {
 		return true
 	}
-	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
+	t.Cleanup(func() { externalV2RawDirectRouteCandidate = prevRoute })
 
 	got := selectExternalV2DataPacketAddrs(context.Background(), conns, peerCandidateSets, nil, nil, 0)
 	if len(got) != 2 {
@@ -124,17 +124,17 @@ func TestSelectExternalV2DataPacketAddrsTrustsObservedBeforeFallbackRouteProbe(t
 	observed := parseCandidateStrings([]string{"192.168.10.42:43001"})
 	peerCandidateSets := [][]string{{"198.51.100.20:43001", "192.168.10.42:43001"}}
 
-	prevObserve := externalDirectUDPObservePunchAddrsByConn
-	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+	prevObserve := externalV2RawDirectObservePunchAddrsByConn
+	externalV2RawDirectObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
 		return [][]net.Addr{{observed[0]}}
 	}
-	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = prevObserve })
+	t.Cleanup(func() { externalV2RawDirectObservePunchAddrsByConn = prevObserve })
 
-	prevRoute := externalDirectUDPRouteCandidate
-	externalDirectUDPRouteCandidate = func(_ net.PacketConn, candidate string) bool {
+	prevRoute := externalV2RawDirectRouteCandidate
+	externalV2RawDirectRouteCandidate = func(_ net.PacketConn, candidate string) bool {
 		return candidate == "198.51.100.20:43001"
 	}
-	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
+	t.Cleanup(func() { externalV2RawDirectRouteCandidate = prevRoute })
 
 	got := selectExternalV2DataPacketAddrs(context.Background(), conns, peerCandidateSets, nil, nil, 0)
 	if len(got) != 1 || got[0].String() != "192.168.10.42:43001" {
@@ -148,17 +148,17 @@ func TestSelectExternalV2DataPacketAddrsFiltersObservedTailscaleInInternetOnlyMo
 	observed := parseCandidateStrings([]string{"100.64.0.10:60438"})
 	peerCandidates := parseCandidateStrings([]string{"100.64.0.10:60438", "198.51.100.20:60438"})
 
-	prevObserve := externalDirectUDPObservePunchAddrsByConn
-	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+	prevObserve := externalV2RawDirectObservePunchAddrsByConn
+	externalV2RawDirectObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
 		return [][]net.Addr{{observed[0]}}
 	}
-	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = prevObserve })
+	t.Cleanup(func() { externalV2RawDirectObservePunchAddrsByConn = prevObserve })
 
-	prevRoute := externalDirectUDPRouteCandidate
-	externalDirectUDPRouteCandidate = func(net.PacketConn, string) bool {
+	prevRoute := externalV2RawDirectRouteCandidate
+	externalV2RawDirectRouteCandidate = func(net.PacketConn, string) bool {
 		return true
 	}
-	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
+	t.Cleanup(func() { externalV2RawDirectRouteCandidate = prevRoute })
 
 	if got := selectExternalV2DataPacketAddrs(context.Background(), conns, nil, peerCandidates, nil, 0); len(got) != 0 {
 		t.Fatalf("selected addrs = %v, want no raw-direct promotion from Tailscale observation in internet-only mode", got)
@@ -171,17 +171,17 @@ func TestSelectExternalV2DataPacketAddrsBySetFiltersObservedTailscaleInInternetO
 	observed := parseCandidateStrings([]string{"100.64.0.10:60438"})
 	peerCandidateSets := [][]string{{"100.64.0.10:60438", "198.51.100.20:60438"}}
 
-	prevObserve := externalDirectUDPObservePunchAddrsByConn
-	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+	prevObserve := externalV2RawDirectObservePunchAddrsByConn
+	externalV2RawDirectObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
 		return [][]net.Addr{{observed[0]}}
 	}
-	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = prevObserve })
+	t.Cleanup(func() { externalV2RawDirectObservePunchAddrsByConn = prevObserve })
 
-	prevRoute := externalDirectUDPRouteCandidate
-	externalDirectUDPRouteCandidate = func(net.PacketConn, string) bool {
+	prevRoute := externalV2RawDirectRouteCandidate
+	externalV2RawDirectRouteCandidate = func(net.PacketConn, string) bool {
 		return true
 	}
-	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
+	t.Cleanup(func() { externalV2RawDirectRouteCandidate = prevRoute })
 
 	if got := selectExternalV2DataPacketAddrs(context.Background(), conns, peerCandidateSets, nil, nil, 0); len(got) != 0 {
 		t.Fatalf("selected addrs = %v, want no raw-direct promotion from set-mapped Tailscale observation in internet-only mode", got)
@@ -193,17 +193,17 @@ func TestSelectExternalV2DataPacketAddrsAllowsRoutablePrivateFallbackWithoutObse
 	conns := listenUDPConnsForExternalV2DataPacketTest(t, 1)
 	peerCandidateSets := [][]string{{"192.168.10.42:50000"}}
 
-	prevObserve := externalDirectUDPObservePunchAddrsByConn
-	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+	prevObserve := externalV2RawDirectObservePunchAddrsByConn
+	externalV2RawDirectObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
 		return [][]net.Addr{{}}
 	}
-	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = prevObserve })
+	t.Cleanup(func() { externalV2RawDirectObservePunchAddrsByConn = prevObserve })
 
-	prevRoute := externalDirectUDPRouteCandidate
-	externalDirectUDPRouteCandidate = func(net.PacketConn, string) bool {
+	prevRoute := externalV2RawDirectRouteCandidate
+	externalV2RawDirectRouteCandidate = func(net.PacketConn, string) bool {
 		return true
 	}
-	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
+	t.Cleanup(func() { externalV2RawDirectRouteCandidate = prevRoute })
 
 	got := selectExternalV2DataPacketAddrs(context.Background(), conns, peerCandidateSets, nil, nil, 0)
 	if len(got) != 1 || got[0].String() != "192.168.10.42:50000" {
@@ -216,18 +216,18 @@ func TestSelectExternalV2DataPacketAddrsUsesOnLinkFallbackWithoutPunchObserve(t 
 	conns := listenUDPConnsForExternalV2DataPacketTest(t, 1)
 	peerCandidateSets := [][]string{{"192.168.10.42:50000"}}
 
-	prevObserve := externalDirectUDPObservePunchAddrsByConn
-	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+	prevObserve := externalV2RawDirectObservePunchAddrsByConn
+	externalV2RawDirectObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
 		t.Fatal("punch observer called for on-link private fallback")
 		return nil
 	}
-	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = prevObserve })
+	t.Cleanup(func() { externalV2RawDirectObservePunchAddrsByConn = prevObserve })
 
-	prevRoute := externalDirectUDPRouteCandidate
-	externalDirectUDPRouteCandidate = func(_ net.PacketConn, candidate string) bool {
+	prevRoute := externalV2RawDirectRouteCandidate
+	externalV2RawDirectRouteCandidate = func(_ net.PacketConn, candidate string) bool {
 		return candidate == "192.168.10.42:50000"
 	}
-	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
+	t.Cleanup(func() { externalV2RawDirectRouteCandidate = prevRoute })
 
 	got := selectExternalV2DataPacketAddrs(context.Background(), conns, peerCandidateSets, nil, nil, 0)
 	if len(got) != 1 || got[0].String() != "192.168.10.42:50000" {
@@ -240,17 +240,17 @@ func TestSelectExternalV2DataPacketAddrsIgnoresIPv6OnLinkFallbackForUDP4Path(t *
 	conns := listenUDPConnsForExternalV2DataPacketTest(t, 1)
 	peerCandidateSets := [][]string{{"[fd37:89f2:37b4:4af8::42]:50000"}}
 
-	prevObserve := externalDirectUDPObservePunchAddrsByConn
-	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+	prevObserve := externalV2RawDirectObservePunchAddrsByConn
+	externalV2RawDirectObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
 		return [][]net.Addr{{}}
 	}
-	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = prevObserve })
+	t.Cleanup(func() { externalV2RawDirectObservePunchAddrsByConn = prevObserve })
 
-	prevRoute := externalDirectUDPRouteCandidate
-	externalDirectUDPRouteCandidate = func(net.PacketConn, string) bool {
+	prevRoute := externalV2RawDirectRouteCandidate
+	externalV2RawDirectRouteCandidate = func(net.PacketConn, string) bool {
 		return true
 	}
-	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
+	t.Cleanup(func() { externalV2RawDirectRouteCandidate = prevRoute })
 
 	if got := selectExternalV2DataPacketAddrs(context.Background(), conns, peerCandidateSets, nil, nil, 0); len(got) != 0 {
 		t.Fatalf("selected addrs = %v, want no IPv6 fallback for udp4 raw-direct path", got)
@@ -262,17 +262,17 @@ func TestSelectExternalV2DataPacketAddrsRejectsOffLinkPrivateFallbackWithoutObse
 	conns := listenUDPConnsForExternalV2DataPacketTest(t, 1)
 	peerCandidateSets := [][]string{{"192.168.20.42:50000"}}
 
-	prevObserve := externalDirectUDPObservePunchAddrsByConn
-	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+	prevObserve := externalV2RawDirectObservePunchAddrsByConn
+	externalV2RawDirectObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
 		return [][]net.Addr{{}}
 	}
-	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = prevObserve })
+	t.Cleanup(func() { externalV2RawDirectObservePunchAddrsByConn = prevObserve })
 
-	prevRoute := externalDirectUDPRouteCandidate
-	externalDirectUDPRouteCandidate = func(net.PacketConn, string) bool {
+	prevRoute := externalV2RawDirectRouteCandidate
+	externalV2RawDirectRouteCandidate = func(net.PacketConn, string) bool {
 		return true
 	}
-	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
+	t.Cleanup(func() { externalV2RawDirectRouteCandidate = prevRoute })
 
 	if got := selectExternalV2DataPacketAddrs(context.Background(), conns, peerCandidateSets, nil, nil, 0); len(got) != 0 {
 		t.Fatalf("selected addrs = %v, want no off-link private fallback without an observed punch", got)
@@ -284,17 +284,17 @@ func TestSelectExternalV2DataPacketAddrsPrefersRoutablePrivateFallbackOverPublic
 	conns := listenUDPConnsForExternalV2DataPacketTest(t, 1)
 	peerCandidateSets := [][]string{{"198.51.100.20:50000", "192.168.10.42:50000"}}
 
-	prevObserve := externalDirectUDPObservePunchAddrsByConn
-	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+	prevObserve := externalV2RawDirectObservePunchAddrsByConn
+	externalV2RawDirectObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
 		return [][]net.Addr{{}}
 	}
-	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = prevObserve })
+	t.Cleanup(func() { externalV2RawDirectObservePunchAddrsByConn = prevObserve })
 
-	prevRoute := externalDirectUDPRouteCandidate
-	externalDirectUDPRouteCandidate = func(_ net.PacketConn, candidate string) bool {
+	prevRoute := externalV2RawDirectRouteCandidate
+	externalV2RawDirectRouteCandidate = func(_ net.PacketConn, candidate string) bool {
 		return candidate == "192.168.10.42:50000"
 	}
-	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
+	t.Cleanup(func() { externalV2RawDirectRouteCandidate = prevRoute })
 
 	got := selectExternalV2DataPacketAddrs(context.Background(), conns, peerCandidateSets, nil, nil, 0)
 	if len(got) != 1 || got[0].String() != "192.168.10.42:50000" {
@@ -307,17 +307,17 @@ func TestSelectExternalV2DataPacketAddrsPrefersOnLinkPrivateFallbackOverOffLinkP
 	conns := listenUDPConnsForExternalV2DataPacketTest(t, 1)
 	peerCandidateSets := [][]string{{"198.51.100.20:50000", "192.168.20.42:50000", "192.168.10.42:50000"}}
 
-	prevObserve := externalDirectUDPObservePunchAddrsByConn
-	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+	prevObserve := externalV2RawDirectObservePunchAddrsByConn
+	externalV2RawDirectObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
 		return [][]net.Addr{{}}
 	}
-	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = prevObserve })
+	t.Cleanup(func() { externalV2RawDirectObservePunchAddrsByConn = prevObserve })
 
-	prevRoute := externalDirectUDPRouteCandidate
-	externalDirectUDPRouteCandidate = func(net.PacketConn, string) bool {
+	prevRoute := externalV2RawDirectRouteCandidate
+	externalV2RawDirectRouteCandidate = func(net.PacketConn, string) bool {
 		return true
 	}
-	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
+	t.Cleanup(func() { externalV2RawDirectRouteCandidate = prevRoute })
 
 	got := selectExternalV2DataPacketAddrs(context.Background(), conns, peerCandidateSets, nil, nil, 0)
 	if len(got) != 1 || got[0].String() != "192.168.10.42:50000" {
@@ -329,17 +329,17 @@ func TestSelectExternalV2DataPacketAddrsRejectsPublicFallbackWithoutObservedPunc
 	conns := listenUDPConnsForExternalV2DataPacketTest(t, 1)
 	peerCandidateSets := [][]string{{"198.51.100.20:50000"}}
 
-	prevObserve := externalDirectUDPObservePunchAddrsByConn
-	externalDirectUDPObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
+	prevObserve := externalV2RawDirectObservePunchAddrsByConn
+	externalV2RawDirectObservePunchAddrsByConn = func(context.Context, []net.PacketConn, time.Duration) [][]net.Addr {
 		return [][]net.Addr{{}}
 	}
-	t.Cleanup(func() { externalDirectUDPObservePunchAddrsByConn = prevObserve })
+	t.Cleanup(func() { externalV2RawDirectObservePunchAddrsByConn = prevObserve })
 
-	prevRoute := externalDirectUDPRouteCandidate
-	externalDirectUDPRouteCandidate = func(net.PacketConn, string) bool {
+	prevRoute := externalV2RawDirectRouteCandidate
+	externalV2RawDirectRouteCandidate = func(net.PacketConn, string) bool {
 		return true
 	}
-	t.Cleanup(func() { externalDirectUDPRouteCandidate = prevRoute })
+	t.Cleanup(func() { externalV2RawDirectRouteCandidate = prevRoute })
 
 	if got := selectExternalV2DataPacketAddrs(context.Background(), conns, peerCandidateSets, nil, nil, 0); len(got) != 0 {
 		t.Fatalf("selected addrs = %v, want no unobserved public fallback", got)

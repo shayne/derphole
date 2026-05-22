@@ -263,8 +263,8 @@ func closeExternalV2DataPacketResources(conns []net.PacketConn, portmaps []publi
 }
 
 func externalV2DataPacketCandidates(ctx context.Context, conns []net.PacketConn, portmaps []publicPortmap, dm *tailcfg.DERPMap) [][]string {
-	sets := externalDirectUDPCandidateSetsWithTimeout(ctx, conns, dm, portmaps, externalV2DataPlaneCandidateWait)
-	return externalDirectUDPInferWANPerPort(sets)
+	sets := externalV2RawDirectCandidateSetsWithTimeout(ctx, conns, dm, portmaps, externalV2DataPlaneCandidateWait)
+	return externalV2RawDirectInferWANPerPort(sets)
 }
 
 func selectExternalV2DataPacketAddrs(ctx context.Context, conns []net.PacketConn, peerCandidateSets [][]string, peerCandidates []net.Addr, emitter *telemetry.Emitter, punchDelay time.Duration) []net.Addr {
@@ -285,8 +285,8 @@ func selectExternalV2DataPacketAddrsByFlatCandidates(ctx context.Context, conns 
 	if len(peerCandidates) == 0 {
 		return nil
 	}
-	fallback := externalDirectUDPParallelCandidateStringsForPeer(peerCandidates, len(conns), nil)
-	fallback = externalDirectUDPFilterFallbackAddrsForSelectedScope(nil, fallback)
+	fallback := externalV2RawDirectParallelCandidateStringsForPeer(peerCandidates, len(conns), nil)
+	fallback = externalV2RawDirectFilterFallbackAddrsForSelectedScope(nil, fallback)
 	if addrs := externalV2DataPacketCleanPrivateFallbackAddrs(conns, fallback, true); len(addrs) > 0 {
 		emitExternalV2CleanPrivateFallbackSelection(emitter, fallback)
 		return addrs
@@ -295,16 +295,16 @@ func selectExternalV2DataPacketAddrsByFlatCandidates(ctx context.Context, conns 
 	defer cancel()
 	startExternalV2DataPacketPunching(punchCtx, conns, peerCandidates, punchDelay)
 
-	observedByConn := externalDirectUDPObservePunchAddrsByConn(ctx, conns, externalDirectUDPPunchWait)
+	observedByConn := externalV2RawDirectObservePunchAddrsByConn(ctx, conns, externalV2RawDirectPunchWait)
 	observedByConn = filterExternalV2DataPacketObservedAddrs(observedByConn)
 	if emitter != nil {
-		emitter.Debug("v2-raw-direct-observed-addrs=" + externalDirectUDPFormatObservedAddrsByConn(observedByConn))
+		emitter.Debug("v2-raw-direct-observed-addrs=" + externalV2RawDirectFormatObservedAddrsByConn(observedByConn))
 	}
-	selected := externalDirectUDPSelectRemoteAddrsByConn(observedByConn, conns, len(conns), nil)
+	selected := externalV2RawDirectSelectRemoteAddrsByConn(observedByConn, conns, len(conns), nil)
 	if emitter != nil {
 		emitter.Debug("v2-raw-direct-selected-addrs=" + formatExternalV2SelectedAddrs(selected))
 	}
-	fallback = externalDirectUDPFilterFallbackAddrsForSelectedScope(selected, fallback)
+	fallback = externalV2RawDirectFilterFallbackAddrsForSelectedScope(selected, fallback)
 	if emitter != nil {
 		emitter.Debug("v2-raw-direct-fallback-addrs=" + strings.Join(fallback, ","))
 	}
@@ -334,10 +334,10 @@ func selectExternalV2DataPacketAddrsBySet(ctx context.Context, conns []net.Packe
 	for i := range count {
 		startExternalV2DataPacketPunching(punchCtx, []net.PacketConn{conns[i]}, peerAddrsBySet[i], punchDelay)
 	}
-	observedByConn := externalDirectUDPObservePunchAddrsByConn(ctx, conns[:count], externalDirectUDPPunchWait)
+	observedByConn := externalV2RawDirectObservePunchAddrsByConn(ctx, conns[:count], externalV2RawDirectPunchWait)
 	observedByConn = filterExternalV2DataPacketObservedAddrs(observedByConn)
 	if emitter != nil {
-		emitter.Debug("v2-raw-direct-observed-addrs=" + externalDirectUDPFormatObservedAddrsByConn(observedByConn))
+		emitter.Debug("v2-raw-direct-observed-addrs=" + externalV2RawDirectFormatObservedAddrsByConn(observedByConn))
 	}
 	selected := selectedExternalV2DataPacketSetAddrs(observedByConn, count)
 	if emitter != nil {
@@ -364,7 +364,7 @@ func emitExternalV2CleanPrivateFallbackSelection(emitter *telemetry.Emitter, fal
 
 func startExternalV2DataPacketPunching(ctx context.Context, conns []net.PacketConn, peerCandidates []net.Addr, delay time.Duration) {
 	if delay <= 0 {
-		externalDirectUDPStartPunching(ctx, conns, peerCandidates)
+		externalV2RawDirectStartPunching(ctx, conns, peerCandidates)
 		return
 	}
 	go func() {
@@ -374,7 +374,7 @@ func startExternalV2DataPacketPunching(ctx context.Context, conns []net.PacketCo
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			externalDirectUDPStartPunching(ctx, conns, peerCandidates)
+			externalV2RawDirectStartPunching(ctx, conns, peerCandidates)
 		}
 	}()
 }
@@ -393,7 +393,7 @@ func filterExternalV2DataPacketAddrs(addrs []net.Addr) []net.Addr {
 	}
 	filtered := make([]net.Addr, 0, len(addrs))
 	for _, addr := range addrs {
-		addrPort, ok := externalDirectUDPAddrPort(addr)
+		addrPort, ok := externalV2RawDirectAddrPort(addr)
 		if !ok || !publicProbeCandidateAllowed(addrPort.Addr()) {
 			continue
 		}
@@ -419,7 +419,7 @@ func filterExternalV2DataPacketCandidateStrings(candidates []string) []string {
 	}
 	filtered := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
-		addrPort, ok := externalDirectUDPParsedCandidateAddrPort(candidate)
+		addrPort, ok := externalV2RawDirectParsedCandidateAddrPort(candidate)
 		if !ok || !publicProbeCandidateAllowed(addrPort.Addr()) {
 			continue
 		}
@@ -452,7 +452,7 @@ func selectedExternalV2DataPacketSetAddrs(observedByConn [][]net.Addr, count int
 		if i >= len(observedByConn) || len(observedByConn[i]) == 0 {
 			continue
 		}
-		observed := externalDirectUDPParallelCandidateStrings(observedByConn[i], 1)
+		observed := externalV2RawDirectParallelCandidateStrings(observedByConn[i], 1)
 		if len(observed) > 0 {
 			selected[i] = observed[0]
 		}
@@ -469,7 +469,7 @@ func fallbackExternalV2DataPacketSetAddrs(conns []net.PacketConn, peerAddrsBySet
 				continue
 			}
 		}
-		candidates := externalDirectUDPParallelCandidateStringsForPeer(peerAddrsBySet[i], 1, nil)
+		candidates := externalV2RawDirectParallelCandidateStringsForPeer(peerAddrsBySet[i], 1, nil)
 		if len(candidates) > 0 {
 			fallback[i] = candidates[0]
 		}
@@ -490,7 +490,7 @@ func externalV2DataPacketCleanPrivateFallbackAddrs(conns []net.PacketConn, fallb
 			break
 		}
 		addrs = append(addrs, parsed[0])
-		seenEndpoint[externalDirectUDPEndpointKey(candidate)] = true
+		seenEndpoint[externalV2RawDirectEndpointKey(candidate)] = true
 	}
 	return addrs
 }
@@ -501,7 +501,7 @@ func externalV2DataPacketCleanPrivateFallbackCandidate(conn net.PacketConn, inde
 		if !externalV2DataPacketUsablePrivateFallback(candidate) {
 			continue
 		}
-		endpoint := externalDirectUDPEndpointKey(candidate)
+		endpoint := externalV2RawDirectEndpointKey(candidate)
 		if seenEndpoint[endpoint] {
 			continue
 		}
@@ -512,7 +512,7 @@ func externalV2DataPacketCleanPrivateFallbackCandidate(conn net.PacketConn, inde
 
 func externalV2DataPacketRoutablePrivateFallback(conn net.PacketConn, candidates []net.Addr) string {
 	_ = conn
-	for _, candidate := range externalDirectUDPOrderedCandidateStringsForPeer(candidates, nil) {
+	for _, candidate := range externalV2RawDirectOrderedCandidateStringsForPeer(candidates, nil) {
 		if !externalV2DataPacketUsablePrivateFallback(candidate) {
 			continue
 		}
@@ -538,7 +538,7 @@ func selectedExternalV2DataPacketAddrs(conns []net.PacketConn, selected []string
 }
 
 func externalV2DataPacketSelectionObserved(ctx context.Context, selected []string, emitter *telemetry.Emitter) bool {
-	if externalDirectUDPSelectedAddrCount(selected) > 0 || externalDirectUDPAllowUnverifiedFallback(ctx) {
+	if externalV2RawDirectSelectedAddrCount(selected) > 0 || externalV2RawDirectAllowUnverifiedFallback(ctx) {
 		return true
 	}
 	if emitter != nil {
@@ -585,7 +585,7 @@ func externalV2DataPacketFallbackCandidatesForLane(index int, fallback []string,
 }
 
 func externalV2DataPacketUsablePrivateFallback(candidate string) bool {
-	addrPort, ok := externalDirectUDPParsedCandidateAddrPort(candidate)
+	addrPort, ok := externalV2RawDirectParsedCandidateAddrPort(candidate)
 	return ok && externalV2DataPacketOnLinkPrivateAddr(addrPort.Addr())
 }
 
@@ -629,7 +629,7 @@ func selectExternalV2DataPacketCandidate(conn net.PacketConn, index int, selecte
 		candidates = append(candidates, fallback...)
 	}
 	for _, candidate := range candidates {
-		if candidate == "" || !externalDirectUDPRouteCandidate(conn, candidate) {
+		if candidate == "" || !externalV2RawDirectRouteCandidate(conn, candidate) {
 			continue
 		}
 		return candidate

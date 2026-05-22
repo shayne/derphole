@@ -993,7 +993,7 @@ func TestDirectFallbackDoesNotEmitConnectedDirect(t *testing.T) {
 
 		pathEmitter.Emit(StateRelay)
 		pathEmitter.SuppressWatcherDirect()
-		externalDirectUDPActivateDirectPath(pathEmitter, manager, nil)
+		externalV2RawDirectActivateDirectPath(pathEmitter, manager, nil)
 		pathEmitter.Emit(StateDirectFallbackRelay)
 		forceTransportManagerPathState(t, manager, transport.PathDirect)
 		pathEmitter.Complete(manager)
@@ -2272,7 +2272,7 @@ func waitNoErr(t *testing.T, err error) {
 	}
 }
 
-func TestExternalDirectUDPDedupeAndFillKeepsManagerAddr(t *testing.T) {
+func TestExternalV2RawDirectDedupeAndFillKeepsManagerAddr(t *testing.T) {
 	selected := []string{
 		"68.20.14.192:50001",
 		"10.0.1.254:50001",
@@ -2286,7 +2286,7 @@ func TestExternalDirectUDPDedupeAndFillKeepsManagerAddr(t *testing.T) {
 		"10.0.1.254:50004",
 	}
 
-	got := externalDirectUDPDedupeAndFill(selected, fallback)
+	got := externalV2RawDirectDedupeAndFill(selected, fallback)
 	want := []string{
 		"68.20.14.192:50001",
 		"10.0.1.254:50002",
@@ -2294,22 +2294,22 @@ func TestExternalDirectUDPDedupeAndFillKeepsManagerAddr(t *testing.T) {
 		"10.0.1.254:50004",
 	}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("externalDirectUDPDedupeAndFill() = %v, want %v", got, want)
+		t.Fatalf("externalV2RawDirectDedupeAndFill() = %v, want %v", got, want)
 	}
 }
 
-func TestExternalDirectUDPDedupeAndFillPreservesObservedCandidateForEndpoint(t *testing.T) {
+func TestExternalV2RawDirectDedupeAndFillPreservesObservedCandidateForEndpoint(t *testing.T) {
 	selected := []string{"10.0.1.254:50001"}
 	fallback := []string{"108.18.210.19:50001"}
 
-	got := externalDirectUDPDedupeAndFill(selected, fallback)
+	got := externalV2RawDirectDedupeAndFill(selected, fallback)
 	want := []string{"10.0.1.254:50001"}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("externalDirectUDPDedupeAndFill() = %v, want observed candidate %v", got, want)
+		t.Fatalf("externalV2RawDirectDedupeAndFill() = %v, want observed candidate %v", got, want)
 	}
 }
 
-func TestExternalDirectUDPParallelCandidatesPreferWANForSameEndpoint(t *testing.T) {
+func TestExternalV2RawDirectParallelCandidatesPreferWANForSameEndpoint(t *testing.T) {
 	candidates := []net.Addr{
 		&net.UDPAddr{IP: net.IPv4(10, 0, 1, 254), Port: 50001},
 		&net.UDPAddr{IP: net.IPv4(108, 18, 210, 19), Port: 50001},
@@ -2317,14 +2317,14 @@ func TestExternalDirectUDPParallelCandidatesPreferWANForSameEndpoint(t *testing.
 		&net.UDPAddr{IP: net.IPv4(108, 18, 210, 19), Port: 50002},
 	}
 
-	got := externalDirectUDPParallelCandidateStrings(candidates, 2)
+	got := externalV2RawDirectParallelCandidateStrings(candidates, 2)
 	want := []string{"108.18.210.19:50001", "108.18.210.19:50002"}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("externalDirectUDPParallelCandidateStrings() = %v, want %v", got, want)
+		t.Fatalf("externalV2RawDirectParallelCandidateStrings() = %v, want %v", got, want)
 	}
 }
 
-func TestExternalDirectUDPParallelCandidatesPreserveWANLaneOrder(t *testing.T) {
+func TestExternalV2RawDirectParallelCandidatesPreserveWANLaneOrder(t *testing.T) {
 	candidates := []net.Addr{
 		&net.UDPAddr{IP: net.IPv4(108, 18, 210, 19), Port: 54908},
 		&net.UDPAddr{IP: net.IPv4(108, 18, 210, 19), Port: 51051},
@@ -2332,7 +2332,7 @@ func TestExternalDirectUDPParallelCandidatesPreserveWANLaneOrder(t *testing.T) {
 		&net.UDPAddr{IP: net.IPv4(108, 18, 210, 19), Port: 49808},
 	}
 
-	got := externalDirectUDPParallelCandidateStrings(candidates, 4)
+	got := externalV2RawDirectParallelCandidateStrings(candidates, 4)
 	want := []string{
 		"108.18.210.19:54908",
 		"108.18.210.19:51051",
@@ -2340,11 +2340,11 @@ func TestExternalDirectUDPParallelCandidatesPreserveWANLaneOrder(t *testing.T) {
 		"108.18.210.19:49808",
 	}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("externalDirectUDPParallelCandidateStrings() = %v, want %v", got, want)
+		t.Fatalf("externalV2RawDirectParallelCandidateStrings() = %v, want %v", got, want)
 	}
 }
 
-func TestExternalDirectUDPSelectRemoteAddrsByConnKeepsObservedLaneEndpoint(t *testing.T) {
+func TestExternalV2RawDirectSelectRemoteAddrsByConnKeepsObservedLaneEndpoint(t *testing.T) {
 	observedByConn := [][]net.Addr{
 		{&net.UDPAddr{IP: net.IPv4(68, 20, 14, 192), Port: 38183}},
 		{&net.UDPAddr{IP: net.IPv4(68, 20, 14, 192), Port: 34375}},
@@ -2358,7 +2358,7 @@ func TestExternalDirectUDPSelectRemoteAddrsByConnKeepsObservedLaneEndpoint(t *te
 		},
 	}
 
-	got := externalDirectUDPSelectRemoteAddrsByConn(observedByConn, nil, 4, nil)
+	got := externalV2RawDirectSelectRemoteAddrsByConn(observedByConn, nil, 4, nil)
 	want := []string{
 		"68.20.14.192:38183",
 		"68.20.14.192:34375",
@@ -2366,29 +2366,29 @@ func TestExternalDirectUDPSelectRemoteAddrsByConnKeepsObservedLaneEndpoint(t *te
 		"68.20.14.192:44442",
 	}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("externalDirectUDPSelectRemoteAddrsByConn() = %v, want observed reachable endpoints %v", got, want)
+		t.Fatalf("externalV2RawDirectSelectRemoteAddrsByConn() = %v, want observed reachable endpoints %v", got, want)
 	}
 }
 
-func TestExternalDirectUDPInferWANPerPortForPrivateOnlyLanes(t *testing.T) {
+func TestExternalV2RawDirectInferWANPerPortForPrivateOnlyLanes(t *testing.T) {
 	sets := [][]string{
 		{"68.20.14.192:50001", "10.0.1.254:50001"},
 		{"10.0.1.254:50002"},
 		{"10.0.1.254:50003"},
 	}
 
-	got := externalDirectUDPInferWANPerPort(sets)
+	got := externalV2RawDirectInferWANPerPort(sets)
 	want := [][]string{
 		{"68.20.14.192:50001", "10.0.1.254:50001"},
 		{"68.20.14.192:50002", "10.0.1.254:50002"},
 		{"68.20.14.192:50003", "10.0.1.254:50003"},
 	}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("externalDirectUDPInferWANPerPort() = %v, want %v", got, want)
+		t.Fatalf("externalV2RawDirectInferWANPerPort() = %v, want %v", got, want)
 	}
 }
 
-func TestExternalDirectUDPPreferWANStringsFeedsFirstPerLaneCandidate(t *testing.T) {
+func TestExternalV2RawDirectPreferWANStringsFeedsFirstPerLaneCandidate(t *testing.T) {
 	candidates := []string{
 		"10.0.1.254:50001",
 		"10.0.4.184:50001",
@@ -2396,8 +2396,8 @@ func TestExternalDirectUDPPreferWANStringsFeedsFirstPerLaneCandidate(t *testing.
 		"127.0.0.1:50001",
 	}
 
-	got := externalDirectUDPPreferWANStrings(candidates)
+	got := externalV2RawDirectPreferWANStrings(candidates)
 	if got[0] != "68.20.14.192:50001" {
-		t.Fatalf("externalDirectUDPPreferWANStrings()[0] = %q, want WAN candidate", got[0])
+		t.Fatalf("externalV2RawDirectPreferWANStrings()[0] = %q, want WAN candidate", got[0])
 	}
 }

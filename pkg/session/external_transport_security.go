@@ -14,7 +14,7 @@ import (
 	"tailscale.com/types/key"
 )
 
-var externalTransportDiscoveryMACDomain = []byte("derphole-transport-direct-udp-disco-mac-v1")
+var externalTransportDiscoveryMACDomain = []byte("derphole-transport-raw-direct-disco-mac-v2")
 
 func externalTransportDiscoveryKey(tok token.Token, localDERP, peerDERP key.NodePublic) transport.DiscoveryKey {
 	localRaw := localDERP.AppendTo(nil)
