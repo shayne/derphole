@@ -127,6 +127,36 @@ max_trace_value() {
   trace_metric_value max "$1" "$2"
 }
 
+trace_average_mbps() {
+  local file="$1"
+  local bytes_key="$2"
+  local elapsed_key="$3"
+
+  if [[ ! -s "${file}" ]]; then
+    return 0
+  fi
+  python3 - "${file}" "${bytes_key}" "${elapsed_key}" <<'PY'
+import csv
+import sys
+
+path, bytes_key, elapsed_key = sys.argv[1:4]
+last = None
+with open(path, newline="") as fh:
+    for row in csv.DictReader(fh):
+        last = row
+if not last:
+    sys.exit(0)
+try:
+    byte_count = int((last.get(bytes_key) or "0").strip())
+    elapsed_ms = int((last.get(elapsed_key) or "0").strip())
+except ValueError:
+    sys.exit(0)
+if byte_count <= 0 or elapsed_ms <= 0:
+    sys.exit(0)
+print(f"{(byte_count * 8.0) / (elapsed_ms * 1000.0):.2f}")
+PY
+}
+
 trace_has_direct_bytes() {
   local file="$1"
   if [[ ! -s "${file}" ]]; then
@@ -460,7 +490,10 @@ finalize_run() {
   require_direct_trace "sender" "${sender_trace_csv}"
   require_direct_trace "receiver" "${receiver_trace_csv}"
 
-  sender_goodput_mbps="$(last_trace_value "${sender_trace_csv}" "send_goodput_mbps")"
+  sender_goodput_mbps="$(trace_average_mbps "${sender_trace_csv}" "app_bytes" "elapsed_ms")"
+  if [[ -z "${sender_goodput_mbps}" ]]; then
+    sender_goodput_mbps="$(last_trace_value "${sender_trace_csv}" "send_goodput_mbps")"
+  fi
   if [[ -z "${sender_goodput_mbps}" ]]; then
     sender_goodput_mbps="$(last_trace_value "${sender_trace_csv}" "app_mbps")"
   fi

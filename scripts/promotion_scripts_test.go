@@ -100,3 +100,27 @@ func TestPromotionDriverUsesV2TransferTraceMetrics(t *testing.T) {
 		}
 	}
 }
+
+func TestPromotionDriverReportsAverageTraceGoodput(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(filepath.Join(".", "promotion-benchmark-driver.sh"))
+	if err != nil {
+		t.Fatalf("read promotion-benchmark-driver.sh: %v", err)
+	}
+	body := string(data)
+
+	for _, want := range []string{
+		"trace_average_mbps",
+		`sender_goodput_mbps="$(trace_average_mbps "${sender_trace_csv}" "app_bytes" "elapsed_ms")"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("promotion driver missing average-goodput logic %q", want)
+		}
+	}
+	averageIndex := strings.Index(body, `sender_goodput_mbps="$(trace_average_mbps "${sender_trace_csv}" "app_bytes" "elapsed_ms")"`)
+	fallbackIndex := strings.Index(body, `sender_goodput_mbps="$(last_trace_value "${sender_trace_csv}" "send_goodput_mbps")"`)
+	if fallbackIndex >= 0 && fallbackIndex < averageIndex {
+		t.Fatal("promotion driver checks final instantaneous send_goodput_mbps before average trace goodput")
+	}
+}
