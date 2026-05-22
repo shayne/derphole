@@ -51,8 +51,9 @@ func (p externalV2DirectPacketPath) Close() {
 	}
 }
 
-func negotiateExternalV2DirectPacketPath(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, manager *transport.Manager, dm *tailcfg.DERPMap, auth externalPeerControlAuth, emitter *telemetry.Emitter, streamCount int, punchDelay time.Duration) (externalV2DirectPacketPath, error) {
-	if !externalV2CanUseRawDirect(manager) {
+func negotiateExternalV2DirectPacketPath(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, manager *transport.Manager, dm *tailcfg.DERPMap, auth externalPeerControlAuth, emitter *telemetry.Emitter, streamCount int, punchDelay time.Duration, relayOnly bool) (externalV2DirectPacketPath, error) {
+	if relayOnly || !externalV2CanUseRawDirect(manager) {
+		emitExternalV2Debug(emitter, "v2-data-plane=manager")
 		return externalV2DirectPacketPath{}, nil
 	}
 	var local externalV2DataPacketPath

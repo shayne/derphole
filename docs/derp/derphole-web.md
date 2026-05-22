@@ -32,8 +32,8 @@ The browser build reuses the repository's DERP rendezvous primitives:
 - `pkg/derpbind`
 
 It does not import `pkg/session`, because that package intentionally includes
-native UDP, WireGuard, QUIC, and socket tuning code that is not available in a
-browser WASM runtime.
+native UDP, QUIC path management, and socket tuning code that is not available
+in a browser WASM runtime.
 
 ## Transfer Model
 

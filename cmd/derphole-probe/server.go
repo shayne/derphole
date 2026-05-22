@@ -136,7 +136,7 @@ func validateServerMode(mode string, stderr io.Writer) (int, bool) {
 		_, _ = fmt.Fprint(stderr, subcommandUsageLine("server"))
 		return 2, true
 	}
-	if mode != "raw" && mode != "blast" && mode != "wg" && mode != "wgos" && mode != "wgiperf" {
+	if mode != "raw" && mode != "blast" {
 		_, _ = fmt.Fprintln(stderr, "unsupported mode:", mode)
 		_, _ = fmt.Fprint(stderr, subcommandUsageLine("server"))
 		return 2, true
@@ -145,9 +145,6 @@ func validateServerMode(mode string, stderr io.Writer) (int, bool) {
 }
 
 func runServerTransfer(ctx context.Context, conn net.PacketConn, conns []net.PacketConn, cfg serverRunConfig, candidates []net.Addr, stdout io.Writer) (probe.TransferStats, error) {
-	if cfg.mode == "wgiperf" {
-		return runWGIPerfServer(ctx, conn, cfg, candidates, stdout)
-	}
 	if err := writeMachineLine(stdout, "READY", clientReady(conn, candidates, cfg.transport)); err != nil {
 		return probe.TransferStats{}, err
 	}
@@ -161,24 +158,8 @@ func runServerTransfer(ctx context.Context, conn net.PacketConn, conns []net.Pac
 	return stats, err
 }
 
-func runWGIPerfServer(ctx context.Context, conn net.PacketConn, cfg serverRunConfig, candidates []net.Addr, stdout io.Writer) (probe.TransferStats, error) {
-	server, err := probe.StartWireGuardOSIperfServer(ctx, conn, serverWireGuardConfig(cfg))
-	if err != nil {
-		return probe.TransferStats{}, err
-	}
-	defer func() { _ = server.Close() }()
-	if err := writeMachineLine(stdout, "READY", clientReady(conn, candidates, cfg.transport)); err != nil {
-		return probe.TransferStats{}, err
-	}
-	return server.Wait()
-}
-
 func receiveServerTransfer(ctx context.Context, conn net.PacketConn, conns []net.PacketConn, cfg serverRunConfig) (probe.TransferStats, error) {
 	switch cfg.mode {
-	case "wg":
-		return probe.ReceiveWireGuardToWriter(ctx, conn, io.Discard, serverWireGuardConfig(cfg))
-	case "wgos":
-		return probe.ReceiveWireGuardOSToWriter(ctx, conn, io.Discard, serverWireGuardConfig(cfg))
 	case "blast":
 		if cfg.flags.SizeBytes <= 0 {
 			return probe.TransferStats{}, fmt.Errorf("size bytes is required for blast server mode")
@@ -190,20 +171,6 @@ func receiveServerTransfer(ctx context.Context, conn net.PacketConn, conns []net
 		}, cfg.flags.SizeBytes)
 	default:
 		return probe.ReceiveToWriter(ctx, conn, "", io.Discard, probe.ReceiveConfig{Raw: cfg.mode == "raw", Blast: cfg.mode == "blast", Transport: cfg.transport})
-	}
-}
-
-func serverWireGuardConfig(cfg serverRunConfig) probe.WireGuardConfig {
-	return probe.WireGuardConfig{
-		Transport:      cfg.transport,
-		PrivateKeyHex:  cfg.flags.WGPrivateKey,
-		PeerPublicHex:  cfg.flags.WGPeerPublic,
-		LocalAddr:      cfg.flags.WGLocalAddr,
-		PeerAddr:       cfg.flags.WGPeerAddr,
-		PeerCandidates: cfg.peerCandidates,
-		Port:           uint16(cfg.flags.WGPort),
-		Streams:        cfg.flags.Parallel,
-		SizeBytes:      cfg.flags.SizeBytes,
 	}
 }
 
@@ -379,11 +346,6 @@ type serverFlags struct {
 	Mode           string `flag:"mode" help:"Probe mode"`
 	Transport      string `flag:"transport" help:"UDP transport: legacy or batched" default:"legacy"`
 	PeerCandidates string `flag:"peer-candidates" help:"Comma-separated peer candidate addresses"`
-	WGPrivateKey   string `flag:"wg-private" help:"WireGuard private key hex"`
-	WGPeerPublic   string `flag:"wg-peer-public" help:"WireGuard peer public key hex"`
-	WGLocalAddr    string `flag:"wg-local-addr" help:"WireGuard local IP"`
-	WGPeerAddr     string `flag:"wg-peer-addr" help:"WireGuard peer IP"`
-	WGPort         int    `flag:"wg-port" help:"WireGuard TCP port" default:"7000"`
-	SizeBytes      int64  `flag:"size-bytes" help:"Expected payload size for parallel WireGuard tunnel modes"`
-	Parallel       int    `flag:"parallel" help:"Parallel blast sockets or TCP streams for WireGuard tunnel modes" default:"1"`
+	SizeBytes      int64  `flag:"size-bytes" help:"Expected payload size for blast server mode"`
+	Parallel       int    `flag:"parallel" help:"Parallel blast sockets" default:"1"`
 }

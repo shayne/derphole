@@ -22,8 +22,6 @@ import (
 
 var clientTimeout = 5 * time.Minute
 var probeSend = probe.Send
-var probeSendWireGuard = probe.SendWireGuard
-var probeSendWireGuardOS = probe.SendWireGuardOS
 
 type clientDone struct {
 	BytesSent         int64 `json:"bytes_sent,omitempty"`
@@ -148,7 +146,7 @@ func validateClientMode(mode string, stderr io.Writer) (int, bool) {
 		_, _ = fmt.Fprint(stderr, subcommandUsageLine("client"))
 		return 2, true
 	}
-	if mode != "raw" && mode != "blast" && mode != "wg" && mode != "wgos" {
+	if mode != "raw" && mode != "blast" {
 		_, _ = fmt.Fprintln(stderr, "unsupported mode:", mode)
 		_, _ = fmt.Fprint(stderr, subcommandUsageLine("client"))
 		return 2, true
@@ -157,7 +155,7 @@ func validateClientMode(mode string, stderr io.Writer) (int, bool) {
 }
 
 func validateClientTarget(mode string, remoteAddr string, sizeBytes int64, stderr io.Writer) (int, bool) {
-	if remoteAddr == "" && mode != "wg" && mode != "wgos" {
+	if remoteAddr == "" {
 		_, _ = fmt.Fprint(stderr, subcommandUsageLine("client"))
 		return 2, true
 	}
@@ -206,33 +204,7 @@ func runClientTransfer(ctx context.Context, conn net.PacketConn, conns []net.Pac
 	src := sizedReader(cfg.flags.SizeBytes)
 	var stats probe.TransferStats
 	var err error
-	if cfg.mode == "wg" {
-		stats, err = probeSendWireGuard(ctx, conn, &src, probe.WireGuardConfig{
-			Transport:      cfg.transport,
-			PrivateKeyHex:  cfg.flags.WGPrivateKey,
-			PeerPublicHex:  cfg.flags.WGPeerPublic,
-			LocalAddr:      cfg.flags.WGLocalAddr,
-			PeerAddr:       cfg.flags.WGPeerAddr,
-			DirectEndpoint: cfg.remoteAddr,
-			PeerCandidates: cfg.peerCandidates,
-			Port:           uint16(cfg.flags.WGPort),
-			Streams:        cfg.flags.Parallel,
-			SizeBytes:      cfg.flags.SizeBytes,
-		})
-	} else if cfg.mode == "wgos" {
-		stats, err = probeSendWireGuardOS(ctx, conn, &src, probe.WireGuardConfig{
-			Transport:      cfg.transport,
-			PrivateKeyHex:  cfg.flags.WGPrivateKey,
-			PeerPublicHex:  cfg.flags.WGPeerPublic,
-			LocalAddr:      cfg.flags.WGLocalAddr,
-			PeerAddr:       cfg.flags.WGPeerAddr,
-			DirectEndpoint: cfg.remoteAddr,
-			PeerCandidates: cfg.peerCandidates,
-			Port:           uint16(cfg.flags.WGPort),
-			Streams:        cfg.flags.Parallel,
-			SizeBytes:      cfg.flags.SizeBytes,
-		})
-	} else if cfg.mode == "blast" && len(conns) > 1 {
+	if cfg.mode == "blast" && len(conns) > 1 {
 		stats, err = sendBlastParallelClient(ctx, conns, cfg.remoteAddr, cfg.peerCandidates, cfg.flags.SizeBytes, probe.SendConfig{
 			Blast:          true,
 			Transport:      cfg.transport,
@@ -482,12 +454,7 @@ type clientFlags struct {
 	WindowSize     int    `flag:"window-size" help:"Reliable raw-mode in-flight window"`
 	RateMbps       int    `flag:"rate-mbps" help:"Paced blast send rate in Mbps; 0 sends as fast as possible"`
 	PeerCandidates string `flag:"peer-candidates" help:"Comma-separated peer candidate addresses"`
-	WGPrivateKey   string `flag:"wg-private" help:"WireGuard private key hex"`
-	WGPeerPublic   string `flag:"wg-peer-public" help:"WireGuard peer public key hex"`
-	WGLocalAddr    string `flag:"wg-local-addr" help:"WireGuard local IP"`
-	WGPeerAddr     string `flag:"wg-peer-addr" help:"WireGuard peer IP"`
-	WGPort         int    `flag:"wg-port" help:"WireGuard TCP port" default:"7000"`
-	Parallel       int    `flag:"parallel" help:"Parallel raw stripes or WireGuard TCP streams" default:"1"`
+	Parallel       int    `flag:"parallel" help:"Parallel raw/blast stripes" default:"1"`
 }
 
 type sizedReader int64

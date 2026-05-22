@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -107,7 +106,6 @@ func TestRemoteCommandsIncludeBlastParallel(t *testing.T) {
 
 func TestSSHRunnerDefaultsAndEnvironmentInjection(t *testing.T) {
 	t.Setenv("HOME", "/tmp/test-home")
-	t.Setenv("DERPHOLE_PROBE_WG_TRACE", "1")
 	t.Setenv("DERPHOLE_PROBE_TRACE", "yes")
 	t.Setenv("DERPHOLE_PROBE_RATE_MBPS", "750")
 	t.Setenv("DERPHOLE_PROBE_REQUIRE_COMPLETE", "true")
@@ -125,7 +123,7 @@ func TestSSHRunnerDefaultsAndEnvironmentInjection(t *testing.T) {
 	joined := strings.Join(cmd, " ")
 	for _, want := range []string{
 		"UserKnownHostsFile=/tmp/test-home/.ssh/known_hosts",
-		"env DERPHOLE_PROBE_WG_TRACE=1",
+		"env DERPHOLE_PROBE_TRACE=yes",
 		"DERPHOLE_PROBE_TRACE=yes",
 		"DERPHOLE_PROBE_RATE_MBPS=750",
 		"DERPHOLE_PROBE_REQUIRE_COMPLETE=true",
@@ -176,7 +174,7 @@ func TestCommandHelpersValidateDefaultsAndOptionalFlags(t *testing.T) {
 	if got := appendParallelFlag([]string{"server"}, "aead", 8); len(got) != 1 {
 		t.Fatalf("appendParallelFlag(unsupported) = %#v, want unchanged", got)
 	}
-	for _, mode := range []string{"raw", "blast", "wg", "wgos"} {
+	for _, mode := range []string{"raw", "blast"} {
 		if !modeSupportsParallelFlag(mode) {
 			t.Fatalf("modeSupportsParallelFlag(%q) = false, want true", mode)
 		}
@@ -261,41 +259,6 @@ func TestPreferredRemoteEndpointFallbacks(t *testing.T) {
 	}
 	if candidates := remoteCandidatesFromAddr("bad address"); candidates != nil {
 		t.Fatalf("remoteCandidatesFromAddr(invalid) = %#v, want nil", candidates)
-	}
-}
-
-func TestWireGuardPlanApplicationAndConfigs(t *testing.T) {
-	plan := wireGuardPlan{
-		listenerPrivHex: "listener-private",
-		listenerPubHex:  "listener-public",
-		senderPrivHex:   "sender-private",
-		senderPubHex:    "sender-public",
-		listenerAddr:    netip.MustParseAddr("100.64.0.1"),
-		senderAddr:      netip.MustParseAddr("100.64.0.2"),
-		port:            7777,
-	}
-
-	var serverCfg ServerConfig
-	applyServerWireGuardPlan(&serverCfg, plan)
-	if serverCfg.WGPrivateKeyHex != "listener-private" || serverCfg.WGPeerPublicHex != "sender-public" || serverCfg.WGLocalAddr != "100.64.0.1" || serverCfg.WGPeerAddr != "100.64.0.2" || serverCfg.WGPort != 7777 {
-		t.Fatalf("applyServerWireGuardPlan() = %#v", serverCfg)
-	}
-
-	var clientCfg ClientConfig
-	applyClientWireGuardPlan(&clientCfg, plan)
-	if clientCfg.WGPrivateKeyHex != "sender-private" || clientCfg.WGPeerPublicHex != "listener-public" || clientCfg.WGLocalAddr != "100.64.0.2" || clientCfg.WGPeerAddr != "100.64.0.1" || clientCfg.WGPort != 7777 {
-		t.Fatalf("applyClientWireGuardPlan() = %#v", clientCfg)
-	}
-
-	candidate := &net.UDPAddr{IP: net.ParseIP("198.51.100.10"), Port: 9000}
-	cfg := OrchestrateConfig{Transport: "batched", Parallel: 4, SizeBytes: 1024}
-	forward := forwardWireGuardConfig(cfg, plan, remoteEndpoint{addr: "198.51.100.10:9000", candidates: []net.Addr{candidate}})
-	if forward.PrivateKeyHex != "sender-private" || forward.PeerPublicHex != "listener-public" || forward.DirectEndpoint != "198.51.100.10:9000" || forward.Port != 7777 || forward.Streams != 4 || forward.SizeBytes != 1024 {
-		t.Fatalf("forwardWireGuardConfig() = %#v", forward)
-	}
-	reverse := reverseWireGuardConfig(cfg, plan, []net.Addr{candidate})
-	if reverse.PrivateKeyHex != "listener-private" || reverse.PeerPublicHex != "sender-public" || reverse.DirectEndpoint != "" || reverse.Port != 7777 || reverse.Streams != 4 || reverse.SizeBytes != 1024 {
-		t.Fatalf("reverseWireGuardConfig() = %#v", reverse)
 	}
 }
 
@@ -392,78 +355,6 @@ DONE {"bytes_received":42,"duration_ms":7}
 	}
 	if ev, ok := parseRemoteLine("READY {"); !ok || ev.err == nil {
 		t.Fatalf("parseRemoteLine(invalid ready) = %#v, %v; want error event", ev, ok)
-	}
-}
-
-func TestRemoteServerCommandIncludesWireGuardArgs(t *testing.T) {
-	runner := SSHRunner{User: "root", Host: "ktzlxc", RemotePath: "/tmp/derphole-probe"}
-	cmd := runner.ServerCommand(ServerConfig{
-		ListenAddr:        ":0",
-		Mode:              "wg",
-		Transport:         "legacy",
-		PeerCandidatesCSV: "198.51.100.10:40000",
-		WGPrivateKeyHex:   "privhex",
-		WGPeerPublicHex:   "pubhex",
-		WGLocalAddr:       "fd00::1",
-		WGPeerAddr:        "fd00::2",
-		WGPort:            7000,
-		Parallel:          8,
-	})
-
-	joined := strings.Join(cmd, " ")
-	for _, want := range []string{
-		"/tmp/derphole-probe",
-		"server",
-		"--listen :0",
-		"--mode wg",
-		"--transport legacy",
-		"--peer-candidates 198.51.100.10:40000",
-		"--wg-private privhex",
-		"--wg-peer-public pubhex",
-		"--wg-local-addr fd00::1",
-		"--wg-peer-addr fd00::2",
-		"--wg-port 7000",
-		"--parallel 8",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("server command missing %q: %#v", want, cmd)
-		}
-	}
-}
-
-func TestRemoteClientCommandIncludesWireGuardArgs(t *testing.T) {
-	runner := SSHRunner{User: "root", Host: "ktzlxc", RemotePath: "/tmp/derphole-probe"}
-	cmd := runner.ClientCommand(ClientConfig{
-		Mode:              "wg",
-		Transport:         "legacy",
-		SizeBytes:         1024,
-		PeerCandidatesCSV: "198.51.100.10:40000",
-		WGPrivateKeyHex:   "privhex",
-		WGPeerPublicHex:   "pubhex",
-		WGLocalAddr:       "fd00::2",
-		WGPeerAddr:        "fd00::1",
-		WGPort:            7000,
-		Parallel:          8,
-	})
-
-	joined := strings.Join(cmd, " ")
-	for _, want := range []string{
-		"/tmp/derphole-probe",
-		"client",
-		"--mode wg",
-		"--transport legacy",
-		"--size-bytes 1024",
-		"--peer-candidates 198.51.100.10:40000",
-		"--wg-private privhex",
-		"--wg-peer-public pubhex",
-		"--wg-local-addr fd00::2",
-		"--wg-peer-addr fd00::1",
-		"--wg-port 7000",
-		"--parallel 8",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("client command missing %q: %#v", want, cmd)
-		}
 	}
 }
 
@@ -620,139 +511,6 @@ func TestRunOrchestrateForwardDoesNotInventMeasuredFirstByteFromZeroDone(t *test
 	}
 	if report.FirstByteMeasured != nil {
 		t.Fatalf("report.FirstByteMeasured = %#v, want nil", report.FirstByteMeasured)
-	}
-	if report.FirstByteMS != 0 {
-		t.Fatalf("report.FirstByteMS = %d, want 0", report.FirstByteMS)
-	}
-}
-
-func TestRunOrchestrateForwardWgPrefersRemoteDoneFirstByte(t *testing.T) {
-	oldListenPacket := listenPacket
-	oldDiscoverCandidates := orchestrateDiscoverCandidates
-	oldLaunchRemoteServer := launchRemoteServer
-	oldSendWg := orchestrateSendWireGuard
-	defer func() {
-		listenPacket = oldListenPacket
-		orchestrateDiscoverCandidates = oldDiscoverCandidates
-		launchRemoteServer = oldLaunchRemoteServer
-		orchestrateSendWireGuard = oldSendWg
-	}()
-
-	localConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer localConn.Close()
-	listenPacket = func(network, address string) (net.PacketConn, error) {
-		return localConn, nil
-	}
-	orchestrateDiscoverCandidates = func(ctx context.Context, conn net.PacketConn) ([]net.Addr, error) {
-		addr, err := net.ResolveUDPAddr("udp", "198.51.100.10:40000")
-		if err != nil {
-			return nil, err
-		}
-		return []net.Addr{addr}, nil
-	}
-	launchRemoteServer = func(ctx context.Context, runner SSHRunner, cfg ServerConfig) (*remoteServerHandle, error) {
-		return &remoteServerHandle{
-			stdout: io.NopCloser(strings.NewReader("READY {\"addr\":\"203.0.113.10:50000\",\"candidates\":[\"203.0.113.10:50000\"],\"transport\":{\"kind\":\"batched\",\"requested_kind\":\"batched\"}}\nDONE {\"bytes_received\":1024,\"duration_ms\":2000,\"first_byte_ms\":9,\"first_byte_measured\":true,\"retransmits\":0,\"packets_sent\":0,\"packets_acked\":0}\n")),
-			stderr: io.NopCloser(strings.NewReader("")),
-			wait:   func() error { return nil },
-		}, nil
-	}
-	orchestrateSendWireGuard = func(ctx context.Context, conn net.PacketConn, src io.Reader, cfg WireGuardConfig) (TransferStats, error) {
-		startedAt := time.Unix(0, 0)
-		return TransferStats{
-			BytesSent:    1024,
-			StartedAt:    startedAt,
-			FirstByteAt:  startedAt.Add(5 * time.Millisecond),
-			CompletedAt:  startedAt.Add(2 * time.Second),
-			Transport:    TransportCaps{Kind: "legacy", RequestedKind: "batched"},
-			PacketsSent:  12,
-			PacketsAcked: 8,
-		}, nil
-	}
-
-	report, err := RunOrchestrate(context.Background(), OrchestrateConfig{
-		Host:      "ktzlxc",
-		User:      "root",
-		Mode:      "wg",
-		Transport: "batched",
-		Direction: "forward",
-		SizeBytes: 1024,
-	})
-	if err != nil {
-		t.Fatalf("RunOrchestrate() error = %v", err)
-	}
-	if report.FirstByteMS != 9 {
-		t.Fatalf("report.FirstByteMS = %d, want 9", report.FirstByteMS)
-	}
-	if report.FirstByteMeasured == nil || !*report.FirstByteMeasured {
-		t.Fatalf("report.FirstByteMeasured = %#v, want true", report.FirstByteMeasured)
-	}
-}
-
-func TestRunOrchestrateWgiperfReportsSuccessWithoutMeasuredFirstByte(t *testing.T) {
-	oldListenPacket := listenPacket
-	oldDiscoverCandidates := orchestrateDiscoverCandidates
-	oldLaunchRemoteServer := launchRemoteServer
-	oldSendWgIperf := orchestrateSendWireGuardOSIperf
-	defer func() {
-		listenPacket = oldListenPacket
-		orchestrateDiscoverCandidates = oldDiscoverCandidates
-		launchRemoteServer = oldLaunchRemoteServer
-		orchestrateSendWireGuardOSIperf = oldSendWgIperf
-	}()
-
-	localConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer localConn.Close()
-	listenPacket = func(network, address string) (net.PacketConn, error) {
-		return localConn, nil
-	}
-	orchestrateDiscoverCandidates = func(ctx context.Context, conn net.PacketConn) ([]net.Addr, error) {
-		addr, err := net.ResolveUDPAddr("udp", "198.51.100.10:40000")
-		if err != nil {
-			return nil, err
-		}
-		return []net.Addr{addr}, nil
-	}
-	launchRemoteServer = func(ctx context.Context, runner SSHRunner, cfg ServerConfig) (*remoteServerHandle, error) {
-		return &remoteServerHandle{
-			stdout: io.NopCloser(strings.NewReader("READY {\"addr\":\"203.0.113.10:50000\",\"candidates\":[\"203.0.113.10:50000\"],\"transport\":{\"kind\":\"batched\",\"requested_kind\":\"batched\"}}\nDONE {\"bytes_received\":1024,\"duration_ms\":2000,\"first_byte_measured\":false,\"retransmits\":0,\"packets_sent\":0,\"packets_acked\":0}\n")),
-			stderr: io.NopCloser(strings.NewReader("")),
-			wait:   func() error { return nil },
-		}, nil
-	}
-	orchestrateSendWireGuardOSIperf = func(ctx context.Context, conn net.PacketConn, cfg WireGuardConfig) (TransferStats, error) {
-		startedAt := time.Unix(0, 0)
-		return TransferStats{
-			BytesSent:     1024,
-			BytesReceived: 1024,
-			StartedAt:     startedAt,
-			CompletedAt:   startedAt.Add(2 * time.Second),
-			Transport:     TransportCaps{Kind: "batched", RequestedKind: "batched"},
-		}, nil
-	}
-
-	report, err := RunOrchestrate(context.Background(), OrchestrateConfig{
-		Host:      "ktzlxc",
-		User:      "root",
-		Mode:      "wgiperf",
-		Transport: "batched",
-		Direction: "forward",
-		SizeBytes: 1024,
-	})
-	if err != nil {
-		t.Fatalf("RunOrchestrate() error = %v", err)
-	}
-	if report.Success == nil || !*report.Success {
-		t.Fatalf("report.Success = %#v, want true", report.Success)
-	}
-	if report.FirstByteMeasured == nil || *report.FirstByteMeasured {
-		t.Fatalf("report.FirstByteMeasured = %#v, want false", report.FirstByteMeasured)
 	}
 	if report.FirstByteMS != 0 {
 		t.Fatalf("report.FirstByteMS = %d, want 0", report.FirstByteMS)

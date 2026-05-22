@@ -11,7 +11,6 @@ import (
 	"errors"
 	"hash/crc32"
 	"io"
-	"net/netip"
 	"time"
 )
 
@@ -35,9 +34,6 @@ type Token struct {
 	QUICPublic      [32]byte
 	BearerSecret    [32]byte
 	Capabilities    uint32
-	bootstrapIP     [16]byte
-	bootstrapPort   uint16
-	bootstrapFamily uint8
 }
 
 var (
@@ -48,19 +44,13 @@ var (
 )
 
 const (
-	SupportedVersion uint8 = 4
+	SupportedVersion uint8 = 5
 	legacyVersion    uint8 = 3
 )
 
 const (
-	bootstrapFamilyNone uint8 = 0
-	bootstrapFamilyV4   uint8 = 4
-	bootstrapFamilyV6   uint8 = 6
-)
-
-const (
-	fixedPayloadSizeV3 = 1 + 16 + 8 + 2 + 32 + 32 + 32 + 4
-	fixedPayloadSizeV4 = fixedPayloadSizeV3 + 1 + 16 + 2
+	fixedPayloadSizeV3      = 1 + 16 + 8 + 2 + 32 + 32 + 32 + 4
+	fixedPayloadSizeCurrent = fixedPayloadSizeV3
 )
 
 func Encode(tok Token) (string, error) {
@@ -100,9 +90,6 @@ type payloadWriter struct {
 func encodePayload(tok Token) (bytes.Buffer, error) {
 	var payload payloadWriter
 	writeTokenFixedPayload(&payload, tok)
-	if tok.Version >= SupportedVersion {
-		writeTokenBootstrapPayload(&payload, tok)
-	}
 	return payload.Buffer, payload.err
 }
 
@@ -115,12 +102,6 @@ func writeTokenFixedPayload(payload *payloadWriter, tok Token) {
 	payload.writeBytes(tok.QUICPublic[:])
 	payload.writeBytes(tok.BearerSecret[:])
 	payload.write(tok.Capabilities)
-}
-
-func writeTokenBootstrapPayload(payload *payloadWriter, tok Token) {
-	payload.write(tok.bootstrapFamily)
-	payload.writeBytes(tok.bootstrapIP[:])
-	payload.write(tok.bootstrapPort)
 }
 
 func (w *payloadWriter) write(value any) {
@@ -182,7 +163,7 @@ func tokenWireSize(version uint8) (int, bool) {
 	case legacyVersion:
 		return fixedPayloadSizeV3 + 4, true
 	case SupportedVersion:
-		return fixedPayloadSizeV4 + 4, true
+		return fixedPayloadSizeCurrent + 4, true
 	default:
 		return 0, false
 	}
@@ -196,9 +177,6 @@ type payloadReader struct {
 func decodePayload(tok *Token, payload []byte) error {
 	reader := payloadReader{Reader: bytes.NewReader(payload[1:])}
 	readTokenFixedPayload(&reader, tok)
-	if tok.Version >= SupportedVersion {
-		readTokenBootstrapPayload(&reader, tok)
-	}
 	return reader.result()
 }
 
@@ -210,12 +188,6 @@ func readTokenFixedPayload(reader *payloadReader, tok *Token) {
 	reader.readBytes(tok.QUICPublic[:])
 	reader.readBytes(tok.BearerSecret[:])
 	reader.read(&tok.Capabilities)
-}
-
-func readTokenBootstrapPayload(reader *payloadReader, tok *Token) {
-	reader.read(&tok.bootstrapFamily)
-	reader.readBytes(tok.bootstrapIP[:])
-	reader.read(&tok.bootstrapPort)
 }
 
 func (r *payloadReader) read(value any) {
@@ -244,45 +216,4 @@ func (r *payloadReader) result() error {
 
 func tokenExpired(tok Token, now time.Time) bool {
 	return now.Unix() >= tok.ExpiresUnix
-}
-
-func (tok *Token) SetNativeTCPBootstrapAddr(addr netip.AddrPort) {
-	if !addr.IsValid() {
-		tok.bootstrapFamily = bootstrapFamilyNone
-		tok.bootstrapIP = [16]byte{}
-		tok.bootstrapPort = 0
-		return
-	}
-	ip := addr.Addr().Unmap()
-	tok.bootstrapIP = [16]byte{}
-	if ip.Is4() {
-		tok.bootstrapFamily = bootstrapFamilyV4
-		tok.bootstrapIP = [16]byte{}
-		copy(tok.bootstrapIP[:4], ip.AsSlice())
-	} else {
-		tok.bootstrapFamily = bootstrapFamilyV6
-		tok.bootstrapIP = ip.As16()
-	}
-	tok.bootstrapPort = addr.Port()
-}
-
-func (tok Token) NativeTCPBootstrapAddr() (netip.AddrPort, bool) {
-	switch tok.bootstrapFamily {
-	case bootstrapFamilyV4:
-		var raw [4]byte
-		copy(raw[:], tok.bootstrapIP[:4])
-		addr := netip.AddrFrom4(raw)
-		if !addr.IsValid() || tok.bootstrapPort == 0 {
-			return netip.AddrPort{}, false
-		}
-		return netip.AddrPortFrom(addr, tok.bootstrapPort), true
-	case bootstrapFamilyV6:
-		addr := netip.AddrFrom16(tok.bootstrapIP)
-		if !addr.IsValid() || tok.bootstrapPort == 0 {
-			return netip.AddrPort{}, false
-		}
-		return netip.AddrPortFrom(addr, tok.bootstrapPort), true
-	default:
-		return netip.AddrPort{}, false
-	}
 }

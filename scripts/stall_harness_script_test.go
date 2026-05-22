@@ -81,7 +81,6 @@ func TestTransferStallHarnessCapturesProgressAndCounters(t *testing.T) {
 		"leak-check",
 		"DERPHOLE_IPERF_PORT",
 		"DERPHOLE_IPERF_SERVER_HOST",
-		"DERPHOLE_DIRECT_TRANSPORT",
 	}
 	for _, want := range required {
 		if !strings.Contains(body, want) {

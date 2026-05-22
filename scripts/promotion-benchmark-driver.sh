@@ -43,12 +43,6 @@ parallel_args_remote=""
 if [[ "${DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES:-}" == "1" ]]; then
   remote_env+=(DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1)
 fi
-if [[ -n "${DERPHOLE_NATIVE_QUIC_CONNS:-}" ]]; then
-  remote_env+=(DERPHOLE_NATIVE_QUIC_CONNS="${DERPHOLE_NATIVE_QUIC_CONNS}")
-fi
-if [[ -n "${DERPHOLE_NATIVE_TCP_CONNS:-}" ]]; then
-  remote_env+=(DERPHOLE_NATIVE_TCP_CONNS="${DERPHOLE_NATIVE_TCP_CONNS}")
-fi
 if [[ "${DERPHOLE_TRACE_HANDOFF:-}" == "1" ]]; then
   remote_env+=(DERPHOLE_TRACE_HANDOFF=1)
 fi

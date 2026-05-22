@@ -390,47 +390,29 @@ func TestRunOrchestrateAcceptsBlastMode(t *testing.T) {
 	}
 }
 
-func TestRunOrchestrateAcceptsWireGuardMode(t *testing.T) {
-	oldRunOrchestrateProbe := runOrchestrateProbe
-	defer func() { runOrchestrateProbe = oldRunOrchestrateProbe }()
-	runOrchestrateProbe = func(ctx context.Context, cfg probe.OrchestrateConfig) (probe.RunReport, error) {
-		return probe.RunReport{Host: cfg.Host, Mode: cfg.Mode, Direction: "forward", SizeBytes: cfg.SizeBytes, Direct: true}, nil
-	}
-
+func TestRunOrchestrateRejectsWireGuardMode(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
 	code := runOrchestrate([]string{"--host", "ktzlxc", "--mode", "wg", "--size-bytes", "1024"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("runOrchestrate() code = %d, want 0; stderr=%s", code, stderr.String())
+	if code != 2 {
+		t.Fatalf("runOrchestrate() code = %d, want 2", code)
 	}
-	if stderr.Len() != 0 {
-		t.Fatalf("stderr = %q, want empty", stderr.String())
-	}
-	if !strings.Contains(stdout.String(), "\"mode\": \"wg\"") {
-		t.Fatalf("stdout missing wg JSON: %s", stdout.String())
+	if !strings.Contains(stderr.String(), "unsupported mode: wg") {
+		t.Fatalf("stderr = %q, want unsupported wg", stderr.String())
 	}
 }
 
-func TestRunOrchestrateAcceptsWireGuardIperfMode(t *testing.T) {
-	oldRunOrchestrateProbe := runOrchestrateProbe
-	defer func() { runOrchestrateProbe = oldRunOrchestrateProbe }()
-	runOrchestrateProbe = func(ctx context.Context, cfg probe.OrchestrateConfig) (probe.RunReport, error) {
-		return probe.RunReport{Host: cfg.Host, Mode: cfg.Mode, Direction: "forward", SizeBytes: cfg.SizeBytes, Direct: true}, nil
-	}
-
+func TestRunOrchestrateRejectsWireGuardIperfMode(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
 	code := runOrchestrate([]string{"--host", "ktzlxc", "--mode", "wgiperf", "--size-bytes", "1024"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("runOrchestrate() code = %d, want 0; stderr=%s", code, stderr.String())
+	if code != 2 {
+		t.Fatalf("runOrchestrate() code = %d, want 2", code)
 	}
-	if stderr.Len() != 0 {
-		t.Fatalf("stderr = %q, want empty", stderr.String())
-	}
-	if !strings.Contains(stdout.String(), "\"mode\": \"wgiperf\"") {
-		t.Fatalf("stdout missing wgiperf JSON: %s", stdout.String())
+	if !strings.Contains(stderr.String(), "unsupported mode: wgiperf") {
+		t.Fatalf("stderr = %q, want unsupported wgiperf", stderr.String())
 	}
 }
 

@@ -9,7 +9,7 @@ size_bytes_values=(10240 1048576 10485760 52428800 134217728 1073741824)
 probe_mode="${DERPHOLE_PROBE_MODE:-raw}"
 probe_transport="${DERPHOLE_PROBE_TRANSPORT:-}"
 if [[ -z "${probe_transport}" ]]; then
-  if [[ "${probe_mode}" == "wg" ]]; then
+  if [[ "${probe_mode}" == "raw" || "${probe_mode}" == "blast" ]]; then
     probe_transport="batched"
   else
     probe_transport="legacy"

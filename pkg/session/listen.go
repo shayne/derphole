@@ -49,8 +49,6 @@ type relaySession struct {
 	gate         *rendezvous.Gate
 	derpMap      *tailcfg.DERPMap
 	quicIdentity quicpath.SessionIdentity
-	wgPrivate    [32]byte
-	wgPublic     [32]byte
 	claimMu      sync.Mutex
 	claimed      bool
 	shareClaimCh chan shareClaim

@@ -11,10 +11,7 @@ import (
 
 func Offer(ctx context.Context, cfg OfferConfig) (string, error) {
 	if cfg.UsePublicDERP {
-		if externalTransferProtocolFromEnv() == externalTransferProtocolV2 {
-			return offerExternalViaV2Fn(ctx, cfg)
-		}
-		return offerExternal(ctx, cfg)
+		return offerExternalViaV2Fn(ctx, cfg)
 	}
 	return offerLocal(ctx, cfg)
 }
@@ -93,7 +90,7 @@ func Receive(ctx context.Context, cfg ReceiveConfig) error {
 	if externalOfferTokenUsesV2(cfg.Token) {
 		return receiveExternalOfferViaV2Fn(ctx, cfg)
 	}
-	return receiveExternal(ctx, cfg)
+	return ErrUnknownSession
 }
 
 func openOfferSource(ctx context.Context, cfg OfferConfig) (io.ReadCloser, error) {

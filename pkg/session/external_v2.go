@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"time"
 
 	"go4.org/mem"
@@ -72,6 +71,7 @@ type externalV2ListenTransport struct {
 	ctx             context.Context
 	manager         *transport.Manager
 	localCandidates []string
+	relayOnly       bool
 	cleanup         func()
 }
 
@@ -217,7 +217,7 @@ func (rt *externalV2SendRuntime) run(ctx context.Context) (retErr error) {
 	}
 	pathEmitter.Emit(StateClaimed)
 
-	manager, cleanup, accept, err := rt.acceptAndStartTransport(ctx, pathEmitter, metrics)
+	manager, cleanup, accept, relayOnly, err := rt.acceptAndStartTransport(ctx, pathEmitter, metrics)
 	if err != nil {
 		return err
 	}
@@ -225,15 +225,7 @@ func (rt *externalV2SendRuntime) run(ctx context.Context) (retErr error) {
 	metrics.SetTransportManager(manager)
 	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
 	policy := externalV2ParallelPolicy(accept)
-	if handled, err := rt.sendNativeTCP(ctx, manager, src, metrics, pathEmitter, policy); handled || err != nil {
-		if err != nil {
-			return err
-		}
-		metrics.Complete(time.Now())
-		pathEmitter.Complete(manager)
-		return nil
-	}
-	if err := rt.sendStream(ctx, manager, src, metrics, externalV2StreamCount(policy)); err != nil {
+	if err := rt.sendStream(ctx, manager, relayOnly, src, metrics, externalV2StreamCount(policy)); err != nil {
 		return err
 	}
 	metrics.Complete(time.Now())
@@ -241,27 +233,27 @@ func (rt *externalV2SendRuntime) run(ctx context.Context) (retErr error) {
 	return nil
 }
 
-func (rt *externalV2SendRuntime) acceptAndStartTransport(ctx context.Context, pathEmitter *transportPathEmitter, metrics *externalTransferMetrics) (*transport.Manager, func(), externalV2Accept, error) {
+func (rt *externalV2SendRuntime) acceptAndStartTransport(ctx context.Context, pathEmitter *transportPathEmitter, metrics *externalTransferMetrics) (*transport.Manager, func(), externalV2Accept, bool, error) {
 	accept, err := rt.receiveAccept(ctx)
 	if err != nil {
-		return nil, nil, externalV2Accept{}, err
+		return nil, nil, externalV2Accept{}, false, err
 	}
 	if err := validateExternalV2Accept(accept); err != nil {
-		return nil, nil, externalV2Accept{}, err
+		return nil, nil, externalV2Accept{}, false, err
 	}
 	transferCtx, cancel := context.WithCancel(ctx)
 	relayOnly := !externalV2DirectEnabled(rt.cfg.ForceRelay, accept.RelayCapable)
 	manager, cleanup, err := startExternalTransportManager(transferCtx, rt.tok, rt.probeConn, rt.dm, rt.derp, rt.listenerDERP, parseCandidateStrings(rt.candidates), rt.pm, relayOnly)
 	if err != nil {
 		cancel()
-		return nil, nil, externalV2Accept{}, err
+		return nil, nil, externalV2Accept{}, false, err
 	}
 	pathEmitter.Watch(transferCtx, manager)
 	pathEmitter.Flush(manager)
 	if !relayOnly {
 		pathEmitter.Emit(StateTryingDirect)
 	}
-	stopDirectMetrics := externalDirectQUICWatchDirectPath(transferCtx, manager, metrics)
+	stopDirectMetrics := watchExternalDirectPath(transferCtx, manager, metrics)
 	remoteCandidates := parseRemoteCandidateStrings(accept.Candidates)
 	emitExternalV2Debug(rt.cfg.Emitter, fmt.Sprintf("v2-remote-candidates=%d", len(remoteCandidates)))
 	if len(remoteCandidates) > 0 {
@@ -277,64 +269,14 @@ func (rt *externalV2SendRuntime) acceptAndStartTransport(ctx context.Context, pa
 		stopDirectMetrics()
 		cleanup()
 		cancel()
-	}, accept, nil
+	}, accept, relayOnly, nil
 }
 
-func (rt *externalV2SendRuntime) sendNativeTCP(ctx context.Context, manager *transport.Manager, src io.Reader, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter, policy ParallelPolicy) (bool, error) {
-	if !externalV2NativeTCPEnabled() {
-		return false, nil
-	}
-	auth := externalV2NativeTCPAuth(rt.tok, rt.identity.Public, rt.tok.QUICPublic)
-	conns, _, err := requestExternalTCPMode(
-		ctx,
-		rt.derp,
-		rt.listenerDERP,
-		manager,
-		parseCandidateStrings(rt.candidates),
-		rt.cfg.Emitter,
-		quicpath.ClientTLSConfig(rt.identity, rt.tok.QUICPublic),
-		quicpath.ServerTLSConfig(rt.identity, rt.tok.QUICPublic),
-		auth,
-		policy,
-		rt.cfg.ForceRelay,
-		rt.auth,
-	)
-	if err != nil || len(conns) == 0 {
-		return false, err
-	}
-	emitExternalV2Debug(rt.cfg.Emitter, "v2-native-tcp=true")
-	now := time.Now()
-	metrics.MarkDirectValidated(now)
-	metrics.MarkDirectTCP(now)
-	pathEmitter.Emit(StateDirect)
-	abortErrCh, stopAbortWatch := rt.watchAbort(ctx, func() {
-		closeExternalNativeTCPConns(conns)
-	})
-	defer stopAbortWatch()
-	meteredSrc := externalTransferMetricsReader{
-		r:      src,
-		record: metrics.RecordDirectWrite,
-	}
-	if err := sendExternalNativeTCPDirect(ctx, meteredSrc, conns); err != nil {
-		if abortErr := waitExternalV2Abort(abortErrCh); abortErr != nil {
-			return true, abortErr
-		}
-		return true, err
-	}
-	complete, err := rt.receiveComplete(ctx, abortErrCh)
-	if err != nil {
-		return true, err
-	}
-	metrics.RecordPeerProgress(complete.BytesReceived, 0, time.Now())
-	if complete.BytesReceived < 0 {
-		return true, fmt.Errorf("invalid v2 complete bytes %d", complete.BytesReceived)
-	}
-	return true, nil
-}
-
-func (rt *externalV2SendRuntime) sendStream(ctx context.Context, manager *transport.Manager, src io.Reader, metrics *externalTransferMetrics, streamCount int) error {
+func (rt *externalV2SendRuntime) sendStream(ctx context.Context, manager *transport.Manager, relayOnly bool, src io.Reader, metrics *externalTransferMetrics, streamCount int) error {
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
 	client := dataplane.NewQUICClient(manager, rt.identity, rt.tok.QUICPublic)
-	path, err := negotiateExternalV2DirectPacketPath(ctx, rt.derp, rt.listenerDERP, manager, rt.dm, rt.auth, rt.cfg.Emitter, streamCount, externalV2DataPlaneSenderPunchDelay)
+	path, err := negotiateExternalV2DirectPacketPath(streamCtx, rt.derp, rt.listenerDERP, manager, rt.dm, rt.auth, rt.cfg.Emitter, streamCount, externalV2DataPlaneSenderPunchDelay, relayOnly)
 	if err != nil {
 		return err
 	}
@@ -342,15 +284,16 @@ func (rt *externalV2SendRuntime) sendStream(ctx context.Context, manager *transp
 	if path.raw {
 		client = dataplane.NewQUICClientOnPacketConns(path.conns, path.addrs, rt.identity, rt.tok.QUICPublic)
 	}
-	streams, err := client.OpenStreams(ctx, streamCount)
-	if err != nil {
-		return err
-	}
 	abortErrCh, stopAbortWatch := rt.watchAbort(ctx, func() {
+		cancelStream()
 		_ = client.CloseWithError(1, "peer aborted transfer")
 	})
 	defer stopAbortWatch()
-	if err := copyExternalV2SendStreams(ctx, src, streams, metrics); err != nil {
+	streams, err := client.OpenStreams(streamCtx, streamCount)
+	if err != nil {
+		return externalV2PreferPeerAbort(ctx, abortErrCh, err)
+	}
+	if err := copyExternalV2SendStreams(streamCtx, src, streams, metrics); err != nil {
 		return externalV2SendQUICStreamError(ctx, client, abortErrCh, err)
 	}
 	complete, err := rt.receiveComplete(ctx, abortErrCh)
@@ -409,7 +352,7 @@ func (rt *externalV2SendRuntime) sendClaim(ctx context.Context) error {
 		Protocol:     externalV2Protocol,
 		QUICPublic:   rt.identity.Public,
 		Candidates:   rt.candidates,
-		RelayCapable: true,
+		RelayCapable: !rt.cfg.ForceRelay,
 	}
 	claim.ParallelMode, claim.ParallelInitial, claim.ParallelCap = externalV2SetParallelPolicy(rt.cfg.ParallelPolicy)
 	return sendAuthenticatedEnvelope(ctx, rt.derp, rt.listenerDERP, envelope{
@@ -626,30 +569,19 @@ func (rt *externalV2ListenRuntime) receive(ctx context.Context, accepted externa
 	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
 
 	policy := externalV2ParallelPolicy(accepted.claim)
-	modeCh, unsubscribeMode := rt.subscribeNativeModeRequests(accepted.peerDERP)
-	defer unsubscribeMode()
 	if err := rt.sendAccept(ctx, accepted.peerDERP, tr.localCandidates, policy); err != nil {
 		return err
-	}
-	if handled, nativeBytesReceived, err := rt.receiveNativeTCP(ctx, accepted, tr, modeCh, dst, metrics, pathEmitter); handled || err != nil {
-		if err != nil {
-			return err
-		}
-		if err := rt.sendComplete(ctx, accepted.peerDERP, nativeBytesReceived); err != nil {
-			return err
-		}
-		metrics.Complete(time.Now())
-		pathEmitter.Complete(tr.manager)
-		return nil
 	}
 
 	return rt.receiveQUIC(ctx, accepted, tr, policy, dst, metrics, pathEmitter)
 }
 
 func (rt *externalV2ListenRuntime) receiveQUIC(ctx context.Context, accepted externalV2AcceptedClaim, tr externalV2ListenTransport, policy ParallelPolicy, dst io.Writer, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter) error {
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
 	server := dataplane.NewQUICServer(tr.manager, rt.session.quicIdentity, accepted.claim.QUICPublic)
 	streamCount := externalV2StreamCount(policy)
-	rawPath, err := negotiateExternalV2DirectPacketPath(ctx, rt.session.derp, accepted.peerDERP, tr.manager, rt.session.derpMap, rt.auth, rt.cfg.Emitter, streamCount, 0)
+	rawPath, err := negotiateExternalV2DirectPacketPath(streamCtx, rt.session.derp, accepted.peerDERP, tr.manager, rt.session.derpMap, rt.auth, rt.cfg.Emitter, streamCount, 0, tr.relayOnly)
 	if err != nil {
 		return err
 	}
@@ -658,14 +590,15 @@ func (rt *externalV2ListenRuntime) receiveQUIC(ctx context.Context, accepted ext
 		server = dataplane.NewQUICServerOnPacketConns(rawPath.conns, rt.session.quicIdentity, accepted.claim.QUICPublic)
 	}
 	abortErrCh, stopAbortWatch := rt.watchAbort(ctx, accepted.peerDERP, func() {
+		cancelStream()
 		_ = server.CloseWithError(1, "peer aborted transfer")
 	})
 	defer stopAbortWatch()
-	streams, err := server.AcceptStreamsWithReady(tr.ctx, streamCount, nil)
+	streams, err := server.AcceptStreamsWithReady(streamCtx, streamCount, nil)
 	if err != nil {
-		return err
+		return externalV2PreferPeerAbort(ctx, abortErrCh, err)
 	}
-	bytesReceived, err := copyExternalV2ReceiveStreams(ctx, dst, streams, metrics)
+	bytesReceived, err := copyExternalV2ReceiveStreams(streamCtx, dst, streams, metrics)
 	if err != nil {
 		_ = server.CloseWithError(1, err.Error())
 		return externalV2PreferPeerAbort(ctx, abortErrCh, err)
@@ -747,71 +680,6 @@ func receiveExternalV2Abort(ctx context.Context, abortCh <-chan derpbind.Packet,
 	}
 }
 
-func (rt *externalV2ListenRuntime) subscribeNativeModeRequests(peerDERP key.NodePublic) (<-chan derpbind.Packet, func()) {
-	modeCh, unsubscribe := rt.session.derp.SubscribeLossless(func(pkt derpbind.Packet) bool {
-		return pkt.From == peerDERP && isQUICModeRequestPayload(pkt.Payload)
-	})
-	return modeCh, unsubscribe
-}
-
-func (rt *externalV2ListenRuntime) receiveNativeTCP(ctx context.Context, accepted externalV2AcceptedClaim, tr externalV2ListenTransport, modeCh <-chan derpbind.Packet, dst io.WriteCloser, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter) (bool, int64, error) {
-	if !externalV2NativeTCPEnabled() {
-		return false, 0, nil
-	}
-	nativeQUIC, conns, _, _, err := acceptExternalQUICMode(
-		ctx,
-		rt.session.derp,
-		modeCh,
-		accepted.peerDERP,
-		tr.manager,
-		parseCandidateStrings(tr.localCandidates),
-		rt.cfg.ForceRelay,
-		rt.cfg.Emitter,
-		quicpath.ClientTLSConfig(rt.session.quicIdentity, accepted.claim.QUICPublic),
-		quicpath.ServerTLSConfig(rt.session.quicIdentity, accepted.claim.QUICPublic),
-		externalV2NativeTCPAuth(rt.session.token, rt.session.quicIdentity.Public, accepted.claim.QUICPublic),
-		rt.auth,
-	)
-	if err != nil || len(conns) == 0 {
-		if nativeQUIC {
-			emitExternalV2Debug(rt.cfg.Emitter, "v2-native-quic-ignored=true")
-		}
-		return false, 0, err
-	}
-	emitExternalV2Debug(rt.cfg.Emitter, "v2-native-tcp=true")
-	now := time.Now()
-	metrics.MarkDirectValidated(now)
-	metrics.MarkDirectTCP(now)
-	pathEmitter.Emit(StateDirect)
-
-	countingDst := &byteCountingWriter{w: dst}
-	meteredDst := io.Writer(countingDst)
-	if metrics != nil {
-		meteredDst = externalTransferMetricsWriter{
-			w:      meteredDst,
-			record: metrics.RecordDirectWrite,
-		}
-	}
-	if err := receiveExternalNativeTCPDirect(ctx, nopWriteCloser{Writer: meteredDst}, conns); err != nil {
-		return true, countingDst.n, err
-	}
-	return true, countingDst.n, nil
-}
-
-func externalV2NativeTCPAuth(tok token.Token, localPublic, peerPublic [32]byte) externalNativeTCPAuth {
-	return externalNativeTCPAuth{
-		Enabled:      true,
-		SessionID:    tok.SessionID,
-		BearerSecret: tok.BearerSecret,
-		LocalPublic:  localPublic,
-		PeerPublic:   peerPublic,
-	}
-}
-
-func externalV2NativeTCPEnabled() bool {
-	return os.Getenv("DERPHOLE_V2_NATIVE_TCP") == "1"
-}
-
 func (rt *externalV2ListenRuntime) startReceiveTransport(ctx context.Context, accepted externalV2AcceptedClaim, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter) (externalV2ListenTransport, error) {
 	transferCtx, cancel := context.WithCancel(ctx)
 	localCandidates := externalV2ProbeCandidates(ctx, rt.cfg.ForceRelay, rt.session.probeConn, rt.session.derpMap, publicSessionPortmap(rt.session))
@@ -827,7 +695,7 @@ func (rt *externalV2ListenRuntime) startReceiveTransport(ctx context.Context, ac
 	if !relayOnly {
 		pathEmitter.Emit(StateTryingDirect)
 	}
-	stopDirectMetrics := externalDirectQUICWatchDirectPath(transferCtx, manager, metrics)
+	stopDirectMetrics := watchExternalDirectPath(transferCtx, manager, metrics)
 	remoteCandidates := parseRemoteCandidateStrings(accepted.claim.Candidates)
 	emitExternalV2Debug(rt.cfg.Emitter, fmt.Sprintf("v2-remote-candidates=%d", len(remoteCandidates)))
 	if len(remoteCandidates) > 0 {
@@ -840,6 +708,7 @@ func (rt *externalV2ListenRuntime) startReceiveTransport(ctx context.Context, ac
 		ctx:             transferCtx,
 		manager:         manager,
 		localCandidates: localCandidates,
+		relayOnly:       relayOnly,
 		cleanup: func() {
 			punchCancel()
 			nudgeCancel()
@@ -872,7 +741,7 @@ func (rt *externalV2ListenRuntime) sendAccept(ctx context.Context, peerDERP key.
 		Protocol:     externalV2Protocol,
 		Accepted:     true,
 		Candidates:   candidates,
-		RelayCapable: true,
+		RelayCapable: !rt.cfg.ForceRelay,
 	}
 	accept.ParallelMode, accept.ParallelInitial, accept.ParallelCap = externalV2SetParallelPolicy(policy)
 	return sendAuthenticatedEnvelope(ctx, rt.session.derp, peerDERP, envelope{

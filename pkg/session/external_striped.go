@@ -5,13 +5,11 @@
 package session
 
 import (
-	"bufio"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"sync"
 )
 
@@ -336,58 +334,4 @@ func closeExternalStripedReaders(readers []io.ReadCloser) {
 	for _, reader := range readers {
 		_ = reader.Close()
 	}
-}
-
-func newExternalStripedBufferedWriteClosers(conns []net.Conn, chunkSize int) []io.WriteCloser {
-	writers := make([]io.WriteCloser, 0, len(conns))
-	bufSize := chunkSize + externalStripedFrameHeaderSize
-	for _, conn := range conns {
-		writers = append(writers, externalStripedBufferedWriteCloser{
-			conn: conn,
-			buf:  bufio.NewWriterSize(conn, bufSize),
-		})
-	}
-	return writers
-}
-
-func newExternalStripedBufferedReadClosers(conns []net.Conn, chunkSize int) []io.ReadCloser {
-	readers := make([]io.ReadCloser, 0, len(conns))
-	bufSize := chunkSize + externalStripedFrameHeaderSize
-	for _, conn := range conns {
-		readers = append(readers, externalStripedBufferedReadCloser{
-			conn: conn,
-			buf:  bufio.NewReaderSize(conn, bufSize),
-		})
-	}
-	return readers
-}
-
-type externalStripedBufferedWriteCloser struct {
-	conn io.Closer
-	buf  *bufio.Writer
-}
-
-func (w externalStripedBufferedWriteCloser) Write(p []byte) (int, error) {
-	return w.buf.Write(p)
-}
-
-func (w externalStripedBufferedWriteCloser) Close() error {
-	if err := w.buf.Flush(); err != nil {
-		_ = w.conn.Close()
-		return err
-	}
-	return w.conn.Close()
-}
-
-type externalStripedBufferedReadCloser struct {
-	conn io.Closer
-	buf  *bufio.Reader
-}
-
-func (r externalStripedBufferedReadCloser) Read(p []byte) (int, error) {
-	return r.buf.Read(p)
-}
-
-func (r externalStripedBufferedReadCloser) Close() error {
-	return r.conn.Close()
 }

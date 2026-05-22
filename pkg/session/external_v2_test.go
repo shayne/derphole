@@ -199,11 +199,11 @@ func TestExternalV2OfferReceivePromotesToDirectWhenBothSidesReady(t *testing.T) 
 	if got := receiverStatus.String(); !strings.Contains(got, string(StateTryingDirect)) || !strings.Contains(got, string(StateDirect)) {
 		t.Fatalf("receiver status = %q, want v2 offer direct promotion", got)
 	}
-	if got := senderStatus.String(); !strings.Contains(got, "v2-native-tcp=true") {
-		t.Fatalf("sender status = %q, want native TCP v2 offer promotion", got)
+	if got := senderStatus.String(); strings.Contains(got, "v2-native-tcp=true") {
+		t.Fatalf("sender status = %q, native TCP should be ignored by v2 offer transfer", got)
 	}
-	if got := receiverStatus.String(); !strings.Contains(got, "v2-native-tcp=true") {
-		t.Fatalf("receiver status = %q, want native TCP v2 offer promotion", got)
+	if got := receiverStatus.String(); strings.Contains(got, "v2-native-tcp=true") {
+		t.Fatalf("receiver status = %q, native TCP should be ignored by v2 offer transfer", got)
 	}
 }
 
@@ -476,11 +476,11 @@ func TestExternalV2PromotesToDirectWhenBothSidesReady(t *testing.T) {
 	if got := listenerStatus.String(); !strings.Contains(got, string(StateTryingDirect)) || !strings.Contains(got, string(StateDirect)) {
 		t.Fatalf("listener status = %q, want v2 direct promotion", got)
 	}
-	if got := senderStatus.String(); !strings.Contains(got, "v2-native-tcp=true") {
-		t.Fatalf("sender status = %q, want native TCP v2 promotion", got)
+	if got := senderStatus.String(); strings.Contains(got, "v2-native-tcp=true") {
+		t.Fatalf("sender status = %q, native TCP should be ignored by v2 transfer", got)
 	}
-	if got := listenerStatus.String(); !strings.Contains(got, "v2-native-tcp=true") {
-		t.Fatalf("listener status = %q, want native TCP v2 promotion", got)
+	if got := listenerStatus.String(); strings.Contains(got, "v2-native-tcp=true") {
+		t.Fatalf("listener status = %q, native TCP should be ignored by v2 transfer", got)
 	}
 }
 

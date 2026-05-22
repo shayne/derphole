@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"net"
 	"strings"
 	"testing"
@@ -44,25 +43,11 @@ func TestServerRunConfigValidationAndDefaults(t *testing.T) {
 	}
 }
 
-func TestServerWireGuardConfigAndReceiveValidation(t *testing.T) {
-	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9999}
+func TestServerBlastReceiveRequiresSize(t *testing.T) {
 	cfg := serverRunConfig{
-		mode:           "blast",
-		transport:      "batched",
-		peerCandidates: []net.Addr{peer},
-		flags: serverFlags{
-			WGPrivateKey: "priv",
-			WGPeerPublic: "peer",
-			WGLocalAddr:  "169.254.1.1",
-			WGPeerAddr:   "169.254.1.2",
-			WGPort:       1234,
-			Parallel:     4,
-			SizeBytes:    0,
-		},
-	}
-	wg := serverWireGuardConfig(cfg)
-	if wg.Transport != "batched" || wg.PrivateKeyHex != "priv" || wg.PeerPublicHex != "peer" || wg.Port != 1234 || wg.Streams != 4 || len(wg.PeerCandidates) != 1 {
-		t.Fatalf("serverWireGuardConfig() = %+v, want copied config", wg)
+		mode:      "blast",
+		transport: "batched",
+		flags:     serverFlags{Parallel: 4, SizeBytes: 0},
 	}
 
 	if _, err := receiveServerTransfer(context.Background(), nil, nil, cfg); err == nil || !strings.Contains(err.Error(), "size bytes is required") {
@@ -93,13 +78,6 @@ func TestRunServerTransferWritesReadyBeforeReceiveError(t *testing.T) {
 	}
 	if ready.Addr == "" {
 		t.Fatal("READY addr empty")
-	}
-}
-
-func TestRunWGIPerfServerReportsStartupFailure(t *testing.T) {
-	_, err := runWGIPerfServer(context.Background(), nil, serverRunConfig{}, nil, io.Discard)
-	if err == nil {
-		t.Fatal("runWGIPerfServer(nil conn) error = nil, want startup failure")
 	}
 }
 

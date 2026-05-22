@@ -337,7 +337,7 @@ func acceptExternalAttachQUICConn(
 		cleanupSession()
 		return nil, err
 	}
-	streamConn, err := openExternalNativeQUICStreamForConn(ctx, quicConn, false)
+	streamConn, err := openExternalQUICStreamForConn(ctx, quicConn, false)
 	if err != nil {
 		_ = quicConn.CloseWithError(1, "accept attach stream failed")
 		cleanupExternalAttachListener(quicListener, adapter)
@@ -539,7 +539,7 @@ func (r *attachDialRuntime) dial(ctx context.Context, cfg AttachDialConfig, deci
 		transportCancel()
 		return nil, err
 	}
-	streamConn, err := openExternalNativeQUICStreamForConn(ctx, quicConn, true)
+	streamConn, err := openExternalQUICStreamForConn(ctx, quicConn, true)
 	if err != nil {
 		_ = quicConn.CloseWithError(1, "open attach stream failed")
 		_ = adapter.Close()

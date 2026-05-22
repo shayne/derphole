@@ -27,48 +27,28 @@ Measure raw network capacity separately before blaming tunnel overhead.
 
 Keep source payload size, host pair, and direction fixed when comparing variants. Record duration, throughput, final path state, and whether the session upgraded from `connected-relay` to `connected-direct`.
 
-## Direct UDP Diagnostic Comparison
+## V2 Transport Diagnostic Comparison
 
-Use `scripts/direct-udp-diagnostic-benchmark.sh` when a transfer completes but runs below expected line rate.
-
-```bash
-DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/direct-udp-diagnostic-benchmark.sh <sender-host> <receiver-host> 1024
-```
-
-When comparing against a forwarded iperf3 endpoint instead of the receiver host, start the iperf3 server separately and set the external host:
+Use `scripts/transfer-stall-harness.sh` when a transfer completes below expected line rate or stalls. Pair it with `iperf3` between the same endpoints when you need a raw network baseline.
 
 ```bash
-DERPHOLE_DIAG_IPERF_EXTERNAL_HOST=<forwarded-ip> DERPHOLE_IPERF_PORT=8321 DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/direct-udp-diagnostic-benchmark.sh <sender-host> <receiver-host> 1024
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/transfer-stall-harness.sh <sender-host> <receiver-host> 1024
 ```
 
-The script writes `diagnostic-summary.env` with:
+The harness writes per-side logs, transfer traces, `samples.csv`, SHA checks, and leak snapshots. Key fields to compare are:
 
-- `diagnostic-iperf-tcp-goodput-mbps`
-- `diagnostic-iperf-udp-goodput-mbps`
-- `diagnostic-transfer-sender-goodput-mbps`
-- `diagnostic-transfer-receiver-goodput-mbps`
-- `diagnostic-transport-max-peer-recv-queue-depth`
-- `diagnostic-probe-samples`
+- sender and receiver trace `app_bytes`
+- `local_sent_bytes` versus receiver-confirmed progress
+- `v2-data-plane`
+- direct and relay byte counters
+- `transport-max-peer-recv-queue-depth`
+- preflight and postrun process/socket leak checks
 
 Interpretation:
 
-- high iperf and low probe points at packet engine or UDP socket behavior
-- high probe and low transfer points at stream, replay, repair, queue, or controller behavior
-- low sender and receiver transfer goodput with high queue depth points at backpressure
-
-## Direct Transport QUIC Comparison
-
-Use this when validating the QUIC direct data plane:
-
-```bash
-: "${DERPHOLE_BENCH_SENDER:?set sender host}"
-: "${DERPHOLE_BENCH_RECEIVER:?set receiver host}"
-DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/direct-transport-benchmark.sh "${DERPHOLE_BENCH_SENDER}" "${DERPHOLE_BENCH_RECEIVER}" 1024
-```
-
-The script forces `DERPHOLE_DIRECT_TRANSPORT=quic`, runs the existing iperf-plus-transfer diagnostic flow, and writes `diagnostic-direct-transport=quic` in `diagnostic-summary.env`.
-
-Do not compare QUIC runs to blast runs unless the same host pair, direction, payload size, and Tailscale-candidate setting are used.
+- high iperf and low transfer goodput points at packet engine, stream, replay, queue, or controller behavior
+- sender-side enqueue progress ahead of receiver progress indicates buffering or backpressure
+- low sender and receiver goodput with high queue depth points at receiver or stream backpressure
 
 ## Phase 1 Public Transport Gate
 

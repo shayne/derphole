@@ -31,11 +31,8 @@ const (
 var listenPacket = net.ListenPacket
 var orchestrateDiscoverCandidates = DiscoverCandidates
 var orchestrateSend = Send
-var orchestrateSendWireGuard = SendWireGuard
-var orchestrateSendWireGuardOS = SendWireGuardOS
 var orchestrateReceive = ReceiveToWriter
 var orchestrateReceiveBlastParallel = ReceiveBlastParallelToWriter
-var orchestrateSendWireGuardOSIperf = SendWireGuardOSIperf
 var orchestrateChildRun func(context.Context, OrchestrateConfig) (RunReport, error)
 
 func init() {
@@ -59,11 +56,6 @@ type ServerConfig struct {
 	Mode              string
 	Transport         string
 	PeerCandidatesCSV string
-	WGPrivateKeyHex   string
-	WGPeerPublicHex   string
-	WGLocalAddr       string
-	WGPeerAddr        string
-	WGPort            int
 	SizeBytes         int64
 	Parallel          int
 }
@@ -74,11 +66,6 @@ type ClientConfig struct {
 	Transport         string
 	SizeBytes         int64
 	PeerCandidatesCSV string
-	WGPrivateKeyHex   string
-	WGPeerPublicHex   string
-	WGLocalAddr       string
-	WGPeerAddr        string
-	WGPort            int
 	Parallel          int
 }
 
@@ -195,9 +182,6 @@ func (r SSHRunner) binaryPath() string {
 
 func sshProbeEnvVars() []string {
 	var env []string
-	if trace := strings.TrimSpace(os.Getenv("DERPHOLE_PROBE_WG_TRACE")); trace != "" {
-		env = append(env, "DERPHOLE_PROBE_WG_TRACE="+trace)
-	}
 	if trace := strings.TrimSpace(os.Getenv("DERPHOLE_PROBE_TRACE")); trace != "" {
 		env = append(env, "DERPHOLE_PROBE_TRACE="+trace)
 	}
@@ -228,7 +212,6 @@ func (r SSHRunner) ServerCommand(cfg ServerConfig) []string {
 		"--transport", defaultProbeTransport(cfg.Transport),
 	)
 	argv = appendOptionalStringFlag(argv, "--peer-candidates", cfg.PeerCandidatesCSV)
-	argv = appendWireGuardConfigFlags(argv, cfg.WGPrivateKeyHex, cfg.WGPeerPublicHex, cfg.WGLocalAddr, cfg.WGPeerAddr, cfg.WGPort)
 	argv = appendOptionalInt64Flag(argv, "--size-bytes", cfg.SizeBytes)
 	return appendParallelFlag(argv, mode, cfg.Parallel)
 }
@@ -288,17 +271,6 @@ func appendOptionalInt64Flag(argv []string, flag string, value int64) []string {
 	return argv
 }
 
-func appendWireGuardConfigFlags(argv []string, privateHex string, peerPublicHex string, localAddr string, peerAddr string, port int) []string {
-	argv = appendOptionalStringFlag(argv, "--wg-private", privateHex)
-	argv = appendOptionalStringFlag(argv, "--wg-peer-public", peerPublicHex)
-	argv = appendOptionalStringFlag(argv, "--wg-local-addr", localAddr)
-	argv = appendOptionalStringFlag(argv, "--wg-peer-addr", peerAddr)
-	if port > 0 {
-		argv = append(argv, "--wg-port", strconv.Itoa(port))
-	}
-	return argv
-}
-
 func appendParallelFlag(argv []string, mode string, parallel int) []string {
 	if parallel > 1 && modeSupportsParallelFlag(mode) {
 		return append(argv, "--parallel", strconv.Itoa(parallel))
@@ -307,7 +279,7 @@ func appendParallelFlag(argv []string, mode string, parallel int) []string {
 }
 
 func modeSupportsParallelFlag(mode string) bool {
-	return mode == "raw" || mode == "blast" || mode == "wg" || mode == "wgos"
+	return mode == "raw" || mode == "blast"
 }
 
 func (r SSHRunner) ClientCommand(cfg ClientConfig) []string {
@@ -322,7 +294,6 @@ func (r SSHRunner) ClientCommand(cfg ClientConfig) []string {
 	argv = appendOptionalInt64Flag(argv, "--size-bytes", cfg.SizeBytes)
 	argv = appendOptionalStringFlag(argv, "--host", cfg.Host)
 	argv = appendOptionalStringFlag(argv, "--peer-candidates", cfg.PeerCandidatesCSV)
-	argv = appendWireGuardConfigFlags(argv, cfg.WGPrivateKeyHex, cfg.WGPeerPublicHex, cfg.WGLocalAddr, cfg.WGPeerAddr, cfg.WGPort)
 	argv = appendParallelFlag(argv, mode, cfg.Parallel)
 	return appendBlastClientRateFlag(argv, mode)
 }
@@ -462,7 +433,7 @@ func normalizeOrchestrateConfig(cfg OrchestrateConfig) (OrchestrateConfig, error
 
 func validateOrchestrateMode(mode string) error {
 	switch mode {
-	case "raw", "blast", "wg", "wgos", "wgiperf":
+	case "raw", "blast":
 		return nil
 	case "aead":
 		return errors.New("aead not implemented yet")
@@ -494,9 +465,6 @@ func runSingleOrchestrate(ctx context.Context, cfg OrchestrateConfig) (RunReport
 	}
 	localCandidates = preferredCandidates(localCandidates, 8)
 	runner := cfg.sshRunner()
-	if cfg.Mode == "wgiperf" {
-		return runWireGuardOSIperfOrchestrate(runCtx, cfg, localConn, localCandidates, runner)
-	}
 	if cfg.Direction == "reverse" {
 		return runReverseOrchestrate(runCtx, cfg, localConn, localCandidates, runner)
 	}
@@ -1104,33 +1072,6 @@ func perShareRateMbps(totalRateMbps int, shares int) int {
 	return rate
 }
 
-func wireGuardProbeMode(mode string) bool {
-	return mode == "wg" || mode == "wgos"
-}
-
-func wireGuardPlanForMode(mode string) (wireGuardPlan, error) {
-	if !wireGuardProbeMode(mode) {
-		return wireGuardPlan{}, nil
-	}
-	return newWireGuardPlan()
-}
-
-func applyServerWireGuardPlan(serverCfg *ServerConfig, wgPlan wireGuardPlan) {
-	serverCfg.WGPrivateKeyHex = wgPlan.listenerPrivHex
-	serverCfg.WGPeerPublicHex = wgPlan.senderPubHex
-	serverCfg.WGLocalAddr = wgPlan.listenerAddr.String()
-	serverCfg.WGPeerAddr = wgPlan.senderAddr.String()
-	serverCfg.WGPort = wgPlan.port
-}
-
-func applyClientWireGuardPlan(clientCfg *ClientConfig, wgPlan wireGuardPlan) {
-	clientCfg.WGPrivateKeyHex = wgPlan.senderPrivHex
-	clientCfg.WGPeerPublicHex = wgPlan.listenerPubHex
-	clientCfg.WGLocalAddr = wgPlan.senderAddr.String()
-	clientCfg.WGPeerAddr = wgPlan.listenerAddr.String()
-	clientCfg.WGPort = wgPlan.port
-}
-
 type remoteEndpoint struct {
 	addr       string
 	candidates []net.Addr
@@ -1215,39 +1156,17 @@ func remoteCandidatesFromAddr(rawAddr string) []net.Addr {
 	return []net.Addr{addr}
 }
 
-func runForwardSend(runCtx context.Context, cfg OrchestrateConfig, localConn net.PacketConn, src io.Reader, wgPlan wireGuardPlan, endpoint remoteEndpoint) (TransferStats, error) {
-	switch cfg.Mode {
-	case "wg":
-		return orchestrateSendWireGuard(runCtx, localConn, src, forwardWireGuardConfig(cfg, wgPlan, endpoint))
-	case "wgos":
-		return orchestrateSendWireGuardOS(runCtx, localConn, src, forwardWireGuardConfig(cfg, wgPlan, endpoint))
-	default:
-		return orchestrateSend(runCtx, localConn, endpoint.addr, src, SendConfig{
-			Raw:            cfg.Mode == "raw",
-			Blast:          cfg.Mode == "blast",
-			Transport:      cfg.Transport,
-			ChunkSize:      probeChunkSize(),
-			WindowSize:     probeWindowSize(cfg.Mode, cfg.Transport),
-			Parallel:       cfg.Parallel,
-			RateMbps:       probeRateMbps(),
-			RepairPayloads: probeRepairPayloads(),
-		})
-	}
-}
-
-func forwardWireGuardConfig(cfg OrchestrateConfig, wgPlan wireGuardPlan, endpoint remoteEndpoint) WireGuardConfig {
-	return WireGuardConfig{
+func runForwardSend(runCtx context.Context, cfg OrchestrateConfig, localConn net.PacketConn, src io.Reader, endpoint remoteEndpoint) (TransferStats, error) {
+	return orchestrateSend(runCtx, localConn, endpoint.addr, src, SendConfig{
+		Raw:            cfg.Mode == "raw",
+		Blast:          cfg.Mode == "blast",
 		Transport:      cfg.Transport,
-		PrivateKeyHex:  wgPlan.senderPrivHex,
-		PeerPublicHex:  wgPlan.listenerPubHex,
-		LocalAddr:      wgPlan.senderAddr.String(),
-		PeerAddr:       wgPlan.listenerAddr.String(),
-		DirectEndpoint: endpoint.addr,
-		PeerCandidates: endpoint.candidates,
-		Port:           uint16(wgPlan.port),
-		Streams:        cfg.Parallel,
-		SizeBytes:      cfg.SizeBytes,
-	}
+		ChunkSize:      probeChunkSize(),
+		WindowSize:     probeWindowSize(cfg.Mode, cfg.Transport),
+		Parallel:       cfg.Parallel,
+		RateMbps:       probeRateMbps(),
+		RepairPayloads: probeRepairPayloads(),
+	})
 }
 
 func forwardOrchestrateReport(cfg OrchestrateConfig, ready remoteReady, done remoteDone, sendStats TransferStats) (RunReport, error) {
@@ -1386,43 +1305,7 @@ func reverseParallelBlastReport(cfg OrchestrateConfig, ready remoteReady, done r
 	}, nil
 }
 
-func wireGuardOSIperfReport(cfg OrchestrateConfig, ready remoteReady, done remoteDone, sendStats TransferStats) (RunReport, error) {
-	durationMS := elapsedMS(sendStats.StartedAt, sendStats.CompletedAt)
-	if durationMS <= 0 {
-		durationMS = done.DurationMS
-	}
-	bytesReceived := sendStats.BytesReceived
-	if bytesReceived <= 0 {
-		bytesReceived = done.BytesReceived
-	}
-	if err := requireExpectedBytes(bytesReceived, cfg.SizeBytes); err != nil {
-		return RunReport{}, err
-	}
-	firstByte := firstByteMetrics(sendStats.StartedAt, sendStats.FirstByteAt, done.FirstByteMS, done.FirstByteMeasured)
-	return RunReport{
-		Host:              cfg.Host,
-		Mode:              cfg.Mode,
-		Transport:         cfg.Transport,
-		Direction:         cfg.Direction,
-		SizeBytes:         cfg.SizeBytes,
-		BytesReceived:     bytesReceived,
-		DurationMS:        durationMS,
-		GoodputMbps:       goodputMbps(bytesReceived, durationMS),
-		PeakGoodputMbps:   sendStats.PeakGoodputMbps,
-		Direct:            true,
-		FirstByteMS:       firstByte.ms,
-		FirstByteMeasured: firstByte.measured,
-		Success:           boolPtr(true),
-		Local:             sendStats.Transport,
-		Remote:            ready.Transport,
-	}, nil
-}
-
 func runForwardOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localConn net.PacketConn, localCandidates []net.Addr, runner SSHRunner) (RunReport, error) {
-	wgPlan, err := wireGuardPlanForMode(cfg.Mode)
-	if err != nil {
-		return RunReport{}, err
-	}
 	serverCfg := ServerConfig{
 		ListenAddr:        cfg.ListenAddr,
 		Mode:              cfg.Mode,
@@ -1430,9 +1313,6 @@ func runForwardOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localC
 		PeerCandidatesCSV: strings.Join(CandidateStrings(localCandidates), ","),
 		SizeBytes:         cfg.SizeBytes,
 		Parallel:          cfg.Parallel,
-	}
-	if wireGuardProbeMode(cfg.Mode) {
-		applyServerWireGuardPlan(&serverCfg, wgPlan)
 	}
 	handle, err := launchRemoteServer(runCtx, runner, serverCfg)
 	if err != nil {
@@ -1455,7 +1335,7 @@ func runForwardOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localC
 	go PunchAddrs(punchCtx, localConn, endpoint.candidates, []byte(defaultPunchPayload), defaultPunchInterval)
 
 	src := newSizedReader(cfg.SizeBytes)
-	sendStats, err := runForwardSend(runCtx, cfg, localConn, src, wgPlan, endpoint)
+	sendStats, err := runForwardSend(runCtx, cfg, localConn, src, endpoint)
 	punchCancel()
 	if err != nil {
 		return RunReport{}, err
@@ -1527,12 +1407,8 @@ func firstByteMetrics(primaryStart, primaryFirstByteAt time.Time, fallbackFirstB
 	return firstByteMetricsResult{}
 }
 
-func runReverseReceive(recvCtx context.Context, cfg OrchestrateConfig, localConn net.PacketConn, wgPlan wireGuardPlan, remoteCandidates []net.Addr) (TransferStats, error) {
+func runReverseReceive(recvCtx context.Context, cfg OrchestrateConfig, localConn net.PacketConn, remoteCandidates []net.Addr) (TransferStats, error) {
 	switch cfg.Mode {
-	case "wg":
-		return ReceiveWireGuardToWriter(recvCtx, localConn, io.Discard, reverseWireGuardConfig(cfg, wgPlan, remoteCandidates))
-	case "wgos":
-		return ReceiveWireGuardOSToWriter(recvCtx, localConn, io.Discard, reverseWireGuardConfig(cfg, wgPlan, remoteCandidates))
 	case "blast":
 		return orchestrateReceiveBlastParallel(recvCtx, []net.PacketConn{localConn}, io.Discard, ReceiveConfig{
 			Blast:           true,
@@ -1547,34 +1423,13 @@ func runReverseReceive(recvCtx context.Context, cfg OrchestrateConfig, localConn
 	}
 }
 
-func reverseWireGuardConfig(cfg OrchestrateConfig, wgPlan wireGuardPlan, remoteCandidates []net.Addr) WireGuardConfig {
-	return WireGuardConfig{
-		Transport:      cfg.Transport,
-		PrivateKeyHex:  wgPlan.listenerPrivHex,
-		PeerPublicHex:  wgPlan.senderPubHex,
-		LocalAddr:      wgPlan.listenerAddr.String(),
-		PeerAddr:       wgPlan.senderAddr.String(),
-		PeerCandidates: remoteCandidates,
-		Port:           uint16(wgPlan.port),
-		Streams:        cfg.Parallel,
-		SizeBytes:      cfg.SizeBytes,
-	}
-}
-
 func runReverseOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localConn net.PacketConn, localCandidates []net.Addr, runner SSHRunner) (RunReport, error) {
-	wgPlan, err := wireGuardPlanForMode(cfg.Mode)
-	if err != nil {
-		return RunReport{}, err
-	}
 	clientCfg := ClientConfig{
 		Mode:              cfg.Mode,
 		Transport:         cfg.Transport,
 		SizeBytes:         cfg.SizeBytes,
 		PeerCandidatesCSV: strings.Join(CandidateStrings(localCandidates), ","),
 		Parallel:          cfg.Parallel,
-	}
-	if wireGuardProbeMode(cfg.Mode) {
-		applyClientWireGuardPlan(&clientCfg, wgPlan)
 	}
 	handle, err := launchRemoteClient(runCtx, runner, clientCfg)
 	if err != nil {
@@ -1599,7 +1454,7 @@ func runReverseOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localC
 	recvCh := make(chan orchestrateReceiveResult, 1)
 	doneCh := make(chan orchestrateDoneResult, 1)
 	go func() {
-		stats, err := runReverseReceive(recvCtx, cfg, localConn, wgPlan, remoteCandidates)
+		stats, err := runReverseReceive(recvCtx, cfg, localConn, remoteCandidates)
 		recvCh <- orchestrateReceiveResult{stats: stats, err: err}
 	}()
 	go func() {
@@ -1617,67 +1472,6 @@ func runReverseOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localC
 	}
 
 	return reverseOrchestrateReport(cfg, ready, done, recvStats)
-}
-
-func runWireGuardOSIperfOrchestrate(runCtx context.Context, cfg OrchestrateConfig, localConn net.PacketConn, localCandidates []net.Addr, runner SSHRunner) (RunReport, error) {
-	wgPlan, err := newWireGuardPlan()
-	if err != nil {
-		return RunReport{}, err
-	}
-	serverCfg := ServerConfig{
-		ListenAddr:        cfg.ListenAddr,
-		Mode:              cfg.Mode,
-		Transport:         cfg.Transport,
-		PeerCandidatesCSV: strings.Join(CandidateStrings(localCandidates), ","),
-		SizeBytes:         cfg.SizeBytes,
-		Parallel:          cfg.Parallel,
-		WGPrivateKeyHex:   wgPlan.listenerPrivHex,
-		WGPeerPublicHex:   wgPlan.senderPubHex,
-		WGLocalAddr:       wgPlan.listenerAddr.String(),
-		WGPeerAddr:        wgPlan.senderAddr.String(),
-		WGPort:            wgPlan.port,
-	}
-	handle, err := launchRemoteServer(runCtx, runner, serverCfg)
-	if err != nil {
-		return RunReport{}, err
-	}
-	remote := newRemoteProcessSession(handle, false)
-	defer remote.cleanup()
-
-	ready, err := remote.ready(runCtx)
-	if err != nil {
-		return RunReport{}, err
-	}
-	endpoint, err := preferredRemoteEndpoint(ready)
-	if err != nil {
-		return RunReport{}, err
-	}
-
-	sendStats, err := orchestrateSendWireGuardOSIperf(runCtx, localConn, WireGuardConfig{
-		Transport:      cfg.Transport,
-		PrivateKeyHex:  wgPlan.senderPrivHex,
-		PeerPublicHex:  wgPlan.listenerPubHex,
-		LocalAddr:      wgPlan.senderAddr.String(),
-		PeerAddr:       wgPlan.listenerAddr.String(),
-		DirectEndpoint: endpoint.addr,
-		PeerCandidates: endpoint.candidates,
-		Port:           uint16(wgPlan.port),
-		Streams:        cfg.Parallel,
-		SizeBytes:      cfg.SizeBytes,
-		Reverse:        cfg.Direction == "reverse",
-	})
-	if err != nil {
-		return RunReport{}, err
-	}
-	done, err := remote.done(runCtx)
-	if err != nil {
-		return RunReport{}, err
-	}
-	if err := remote.finish("remote server failed"); err != nil {
-		return RunReport{}, err
-	}
-
-	return wireGuardOSIperfReport(cfg, ready, done, sendStats)
 }
 
 func waitForRemoteReady(ctx context.Context, events <-chan outputEvent, stderr *bytes.Buffer) (remoteReady, error) {

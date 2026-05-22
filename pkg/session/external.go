@@ -2,17 +2,14 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//lint:file-ignore U1000 Retired public QUIC handoff helpers pending deletion after the WG cutover settles.
 package session
 
 import (
 	"context"
 	"crypto/rand"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -31,55 +28,26 @@ import (
 	"github.com/shayne/derphole/pkg/token"
 	"github.com/shayne/derphole/pkg/transport"
 	"github.com/shayne/derphole/pkg/traversal"
-	wgtransport "github.com/shayne/derphole/pkg/wg"
 	"tailscale.com/net/batching"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
 
 const (
-	envelopeClaim              = "claim"
-	envelopeDecision           = "decision"
-	envelopeControl            = "control"
-	envelopeAck                = "ack"
-	envelopeProgress           = "progress"
-	envelopeAbort              = "abort"
-	envelopeHeartbeat          = "heartbeat"
-	envelopeV2Claim            = "v2_claim"
-	envelopeV2Accept           = "v2_accept"
-	envelopeV2Complete         = "v2_complete"
-	envelopeV2DataPlaneReady   = "v2_data_plane_ready"
-	envelopeDirectUDPReady     = "direct_udp_ready"
-	envelopeDirectUDPReadyAck  = "direct_udp_ready_ack"
-	envelopeDirectUDPStart     = "direct_udp_start"
-	envelopeDirectUDPStartAck  = "direct_udp_start_ack"
-	envelopeDirectUDPRateProbe = "direct_udp_rate_probe"
-	envelopeQUICModeReq        = "quic_mode_request"
-	envelopeQUICModeResp       = "quic_mode_response"
-	envelopeQUICModeAck        = "quic_mode_ack"
-	envelopeQUICModeReady      = "quic_mode_ready"
-	envelopeParallelGrowReq    = "parallel_grow_request"
-	envelopeParallelGrowAck    = "parallel_grow_ack"
-	envelopeParallelGrowResult = "parallel_grow_result"
-	maxEnvelopeBytes           = 16 << 10
+	envelopeClaim            = "claim"
+	envelopeDecision         = "decision"
+	envelopeControl          = "control"
+	envelopeProgress         = "progress"
+	envelopeAbort            = "abort"
+	envelopeV2Claim          = "v2_claim"
+	envelopeV2Accept         = "v2_accept"
+	envelopeV2Complete       = "v2_complete"
+	envelopeV2DataPlaneReady = "v2_data_plane_ready"
+	maxEnvelopeBytes         = 16 << 10
 )
-
-const externalNativeQUICWait = 5 * time.Second
-const externalNativeQUICConnectWait = externalNativeQUICWait
-const externalNativeTCPDirectStartWait = 750 * time.Millisecond
-const externalNativeQUICAckRetryInterval = 250 * time.Millisecond
-const externalNativeQUICNackWait = 1 * time.Second
-const externalNativeQUICSetupGraceWait = 0
-const externalNativeQUICSetupSkipRelayTailBytes = 256 << 10
-const externalNativeQUICRelayTailPeerAckWait = 250 * time.Millisecond
-const externalPublicCandidateRefreshWait = 750 * time.Millisecond
-const externalDirectUDPCandidateGatherWait = 250 * time.Millisecond
 const externalCopyBufferSize = 256 << 10
-const defaultExternalNativeQUICConns = 4
+const externalPublicCandidateRefreshWait = 750 * time.Millisecond
 const externalClaimRetryInterval = 250 * time.Millisecond
-
-var peerHeartbeatInterval = 2 * time.Second
-var peerHeartbeatTimeout = 30 * time.Second
 
 var (
 	publicProbeTailscaleCGNATPrefix = netip.MustParsePrefix("100.64.0.0/10")
@@ -94,10 +62,6 @@ var newPublicPortmap = func(emitter *telemetry.Emitter) publicPortmap {
 	return portmap.New(emitter)
 }
 var newTransportManager = transport.NewManager
-var sendExternalViaDirectUDPFn = sendExternalViaDirectUDP
-var listenExternalViaDirectUDPFn = listenExternalViaDirectUDP
-var sendExternalViaDirectQUICFn = sendExternalViaDirectQUIC
-var listenExternalViaDirectQUICFn = listenExternalViaDirectQUIC
 var sendExternalViaV2Fn = sendExternalViaV2
 var listenExternalViaV2Fn = listenExternalViaV2
 var offerExternalViaV2Fn = offerExternalViaV2
@@ -111,37 +75,17 @@ type publicPortmap interface {
 }
 
 type envelope struct {
-	Type               string                    `json:"type"`
-	MAC                string                    `json:"mac,omitempty"`
-	Claim              *rendezvous.Claim         `json:"claim,omitempty"`
-	Decision           *rendezvous.Decision      `json:"decision,omitempty"`
-	Control            *transport.ControlMessage `json:"control,omitempty"`
-	Ack                *peerAck                  `json:"ack,omitempty"`
-	Progress           *peerProgress             `json:"progress,omitempty"`
-	Abort              *peerAbort                `json:"abort,omitempty"`
-	Heartbeat          *peerHeartbeat            `json:"heartbeat,omitempty"`
-	V2Claim            *externalV2Claim          `json:"v2_claim,omitempty"`
-	V2Accept           *externalV2Accept         `json:"v2_accept,omitempty"`
-	V2Complete         *externalV2Complete       `json:"v2_complete,omitempty"`
-	V2DataPlaneReady   *externalV2DataPlaneReady `json:"v2_data_plane_ready,omitempty"`
-	DirectUDPReadyAck  *directUDPReadyAck        `json:"direct_udp_ready_ack,omitempty"`
-	DirectUDPStart     *directUDPStart           `json:"direct_udp_start,omitempty"`
-	DirectUDPRateProbe *directUDPRateProbeResult `json:"direct_udp_rate_probe,omitempty"`
-	QUICModeReq        *quicModeRequest          `json:"quic_mode_request,omitempty"`
-	QUICModeResp       *quicModeResponse         `json:"quic_mode_response,omitempty"`
-	QUICModeAck        *quicModeAck              `json:"quic_mode_ack,omitempty"`
-	QUICModeReady      *quicModeReady            `json:"quic_mode_ready,omitempty"`
-	ParallelGrowReq    *parallelGrowRequest      `json:"parallel_grow_request,omitempty"`
-	ParallelGrowAck    *parallelGrowAck          `json:"parallel_grow_ack,omitempty"`
-	ParallelGrowResult *parallelGrowResult       `json:"parallel_grow_result,omitempty"`
-}
-
-type peerAck struct {
-	BytesReceived *int64 `json:"bytes_received,omitempty"`
-}
-
-func newPeerAck(bytesReceived int64) *peerAck {
-	return &peerAck{BytesReceived: &bytesReceived}
+	Type             string                    `json:"type"`
+	MAC              string                    `json:"mac,omitempty"`
+	Claim            *rendezvous.Claim         `json:"claim,omitempty"`
+	Decision         *rendezvous.Decision      `json:"decision,omitempty"`
+	Control          *transport.ControlMessage `json:"control,omitempty"`
+	Progress         *peerProgress             `json:"progress,omitempty"`
+	Abort            *peerAbort                `json:"abort,omitempty"`
+	V2Claim          *externalV2Claim          `json:"v2_claim,omitempty"`
+	V2Accept         *externalV2Accept         `json:"v2_accept,omitempty"`
+	V2Complete       *externalV2Complete       `json:"v2_complete,omitempty"`
+	V2DataPlaneReady *externalV2DataPlaneReady `json:"v2_data_plane_ready,omitempty"`
 }
 
 type peerProgress struct {
@@ -176,94 +120,6 @@ func newPeerAbort(reason string, bytesTransferred int64) *peerAbort {
 	}
 }
 
-type peerHeartbeat struct {
-	BytesTransferred *int64 `json:"bytes_transferred,omitempty"`
-	Sequence         uint64 `json:"sequence,omitempty"`
-	MAC              string `json:"mac,omitempty"`
-}
-
-func newPeerHeartbeat(bytesTransferred int64) *peerHeartbeat {
-	return &peerHeartbeat{BytesTransferred: &bytesTransferred}
-}
-
-type directUDPReadyAck struct {
-	FastDiscard               bool   `json:"fast_discard,omitempty"`
-	TransportKind             string `json:"transport_kind,omitempty"`
-	TransportBatchSize        int    `json:"transport_batch_size,omitempty"`
-	TransportReadBufferBytes  int    `json:"transport_read_buffer_bytes,omitempty"`
-	TransportWriteBufferBytes int    `json:"transport_write_buffer_bytes,omitempty"`
-	TransportTXOffload        bool   `json:"transport_tx_offload,omitempty"`
-	TransportRXQOverflow      bool   `json:"transport_rxq_overflow,omitempty"`
-}
-
-type directUDPStart struct {
-	ExpectedBytes     int64    `json:"expected_bytes,omitempty"`
-	RelayPrefixOffset int64    `json:"relay_prefix_offset,omitempty"`
-	SectionSizes      []int64  `json:"section_sizes,omitempty"`
-	SectionAddrs      []string `json:"section_addrs,omitempty"`
-	ProbeRates        []int    `json:"probe_rates,omitempty"`
-	ProbeNonce        string   `json:"probe_nonce,omitempty"`
-	Stream            bool     `json:"stream,omitempty"`
-	StripedBlast      bool     `json:"striped_blast,omitempty"`
-}
-
-type directUDPRateProbeResult struct {
-	Samples []directUDPRateProbeSample `json:"samples,omitempty"`
-}
-
-type directUDPRateProbeSample struct {
-	RateMbps       int   `json:"rate_mbps,omitempty"`
-	BytesSent      int64 `json:"bytes_sent,omitempty"`
-	BytesReceived  int64 `json:"bytes_received,omitempty"`
-	DurationMillis int64 `json:"duration_millis,omitempty"`
-}
-
-type quicModeRequest struct {
-	NativeDirect    bool   `json:"native_direct"`
-	NativeTCP       bool   `json:"native_tcp,omitempty"`
-	DirectAddr      string `json:"direct_addr,omitempty"`
-	NativeTCPConns  int    `json:"native_tcp_conns,omitempty"`
-	ParallelMode    string `json:"parallel_mode,omitempty"`
-	ParallelInitial int    `json:"parallel_initial,omitempty"`
-	ParallelCap     int    `json:"parallel_cap,omitempty"`
-}
-
-type quicModeResponse struct {
-	NativeDirect    bool   `json:"native_direct"`
-	NativeTCP       bool   `json:"native_tcp,omitempty"`
-	DirectAddr      string `json:"direct_addr,omitempty"`
-	NativeTCPConns  int    `json:"native_tcp_conns,omitempty"`
-	ParallelMode    string `json:"parallel_mode,omitempty"`
-	ParallelInitial int    `json:"parallel_initial,omitempty"`
-	ParallelCap     int    `json:"parallel_cap,omitempty"`
-}
-
-type quicModeAck struct {
-	NativeDirect bool `json:"native_direct"`
-	NativeTCP    bool `json:"native_tcp,omitempty"`
-}
-
-type quicModeReady struct {
-	NativeDirect bool `json:"native_direct"`
-}
-
-type parallelGrowRequest struct {
-	Target        int        `json:"target"`
-	CandidateSets [][]string `json:"candidate_sets,omitempty"`
-}
-
-type parallelGrowAck struct {
-	Target        int        `json:"target"`
-	Ready         bool       `json:"ready"`
-	CandidateSets [][]string `json:"candidate_sets,omitempty"`
-}
-
-type parallelGrowResult struct {
-	Target  int  `json:"target"`
-	Ready   bool `json:"ready"`
-	Applied int  `json:"applied,omitempty"`
-}
-
 type remoteCandidateSeeder interface {
 	SeedRemoteCandidates(context.Context, []net.Addr)
 }
@@ -290,29 +146,15 @@ func issuePublicSessionWithCapabilities(ctx context.Context, capabilities uint32
 		_ = derpClient.Close()
 		return "", nil, err
 	}
-	wgPrivate, wgPublic, err := wgtransport.GenerateKeypair()
-	if err != nil {
-		_ = derpClient.Close()
-		return "", nil, err
-	}
-
-	peerPublic := wgPublic
-	if capabilities&token.CapabilityDirectQUIC != 0 {
-		peerPublic = quicIdentity.Public
-	}
-
 	tokValue := token.Token{
 		Version:         token.SupportedVersion,
 		SessionID:       sessionID,
 		ExpiresUnix:     time.Now().Add(time.Hour).Unix(),
 		BootstrapRegion: uint16(node.RegionID),
 		DERPPublic:      derpPublicKeyRaw32(derpClient.PublicKey()),
-		QUICPublic:      peerPublic,
+		QUICPublic:      quicIdentity.Public,
 		BearerSecret:    bearerSecret,
 		Capabilities:    capabilities,
-	}
-	if bootstrapAddr, ok := externalNativeTCPTokenBootstrapAddr(); ok {
-		tokValue.SetNativeTCPBootstrapAddr(bootstrapAddr)
 	}
 	tok, err := token.Encode(tokValue)
 	if err != nil {
@@ -334,8 +176,6 @@ func issuePublicSessionWithCapabilities(ctx context.Context, capabilities uint32
 		gate:         rendezvous.NewGate(tokValue),
 		derpMap:      dm,
 		quicIdentity: quicIdentity,
-		wgPrivate:    wgPrivate,
-		wgPublic:     wgPublic,
 	}
 	attachPublicPortmap(session, newBoundPublicPortmap(probeConn, nil))
 	return tok, session, nil
@@ -374,196 +214,11 @@ func issuePublicSession(ctx context.Context) (string, *relaySession, error) {
 }
 
 func sendExternal(ctx context.Context, cfg SendConfig) error {
-	if externalTransferProtocolFromEnv() == externalTransferProtocolV2 {
-		return sendExternalViaV2Fn(ctx, cfg)
-	}
-	switch externalDirectTransportFromEnv() {
-	case externalDirectTransportQUIC:
-		return sendExternalViaDirectQUICFn(ctx, cfg)
-	default:
-		return sendExternalViaDirectUDPFn(ctx, cfg)
-	}
-}
-
-type externalNativeDirectModeResult struct {
-	nativeQUIC     bool
-	nativeQUICAddr net.Addr
-	nativeTCPConns []net.Conn
-	parallelPolicy ParallelPolicy
-	err            error
-}
-
-func requestExternalDirectModeAsync(
-	ctx context.Context,
-	client *derpbind.Client,
-	peerDERP key.NodePublic,
-	manager *transport.Manager,
-	localCandidates []net.Addr,
-	dm *tailcfg.DERPMap,
-	probeConn net.PacketConn,
-	emitter *telemetry.Emitter,
-	clientTLSConfig *tls.Config,
-	serverTLSConfig *tls.Config,
-	nativeTCPAuth externalNativeTCPAuth,
-	parallelPolicy ParallelPolicy,
-	forceRelay bool,
-) <-chan externalNativeDirectModeResult {
-	_ = dm
-	_ = probeConn
-	resultCh := make(chan externalNativeDirectModeResult, 1)
-	go func() {
-		nativeQUIC, nativeTCPConns, nativeQUICAddr, resolvedPolicy, err := requestExternalQUICMode(ctx, client, peerDERP, manager, localCandidates, emitter, clientTLSConfig, serverTLSConfig, nativeTCPAuth, parallelPolicy, forceRelay)
-		resultCh <- externalNativeDirectModeResult{
-			nativeQUIC:     nativeQUIC,
-			nativeQUICAddr: nativeQUICAddr,
-			nativeTCPConns: nativeTCPConns,
-			parallelPolicy: resolvedPolicy,
-			err:            err,
-		}
-	}()
-	return resultCh
-}
-
-func acceptExternalDirectModeAsync(
-	ctx context.Context,
-	client *derpbind.Client,
-	modeCh <-chan derpbind.Packet,
-	peerDERP key.NodePublic,
-	manager *transport.Manager,
-	localCandidates []net.Addr,
-	forceRelay bool,
-	emitter *telemetry.Emitter,
-	clientTLSConfig *tls.Config,
-	serverTLSConfig *tls.Config,
-	nativeTCPAuth externalNativeTCPAuth,
-) <-chan externalNativeDirectModeResult {
-	resultCh := make(chan externalNativeDirectModeResult, 1)
-	go func() {
-		nativeQUIC, nativeTCPConns, nativeQUICAddr, resolvedPolicy, err := acceptExternalQUICMode(
-			ctx,
-			client,
-			modeCh,
-			peerDERP,
-			manager,
-			localCandidates,
-			forceRelay,
-			emitter,
-			clientTLSConfig,
-			serverTLSConfig,
-			nativeTCPAuth,
-		)
-		resultCh <- externalNativeDirectModeResult{
-			nativeQUIC:     nativeQUIC,
-			nativeQUICAddr: nativeQUICAddr,
-			nativeTCPConns: nativeTCPConns,
-			parallelPolicy: resolvedPolicy,
-			err:            err,
-		}
-	}()
-	return resultCh
-}
-
-func waitExternalNativeDirectModeResult(resultCh <-chan externalNativeDirectModeResult) externalNativeDirectModeResult {
-	if resultCh == nil {
-		return externalNativeDirectModeResult{}
-	}
-	return <-resultCh
-}
-
-func sendExternalHandoffCarriers(ctx context.Context, carriers []io.ReadWriteCloser, spool *externalHandoffSpool) error {
-	if len(carriers) == 0 {
-		return nil
-	}
-	errCh := make(chan error, len(carriers))
-	var wg sync.WaitGroup
-	for _, carrier := range carriers {
-		wg.Add(1)
-		go func(carrier io.ReadWriteCloser) {
-			defer wg.Done()
-			errCh <- sendExternalHandoffCarrier(ctx, carrier, spool, nil)
-		}(carrier)
-	}
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func sendExternalHandoffNativeTCPConns(ctx context.Context, conns []net.Conn, spool *externalHandoffSpool) error {
-	carriers := make([]io.ReadWriteCloser, 0, len(conns))
-	for _, conn := range conns {
-		carriers = append(carriers, conn)
-	}
-	return sendExternalHandoffCarriers(ctx, carriers, spool)
-}
-
-func receiveExternalHandoffNativeTCPConns(ctx context.Context, conns []net.Conn, rx *externalHandoffReceiver) error {
-	carriers := make([]io.ReadWriteCloser, 0, len(conns))
-	for _, conn := range conns {
-		carriers = append(carriers, conn)
-	}
-	return receiveExternalHandoffCarriers(ctx, carriers, rx)
-}
-
-func receiveExternalHandoffCarriers(ctx context.Context, carriers []io.ReadWriteCloser, rx *externalHandoffReceiver) error {
-	if len(carriers) == 0 {
-		return nil
-	}
-	errCh := make(chan error, len(carriers))
-	var wg sync.WaitGroup
-	for _, carrier := range carriers {
-		wg.Add(1)
-		go func(carrier io.ReadWriteCloser) {
-			defer wg.Done()
-			errCh <- receiveExternalHandoffCarrier(ctx, carrier, rx, externalCopyBufferSize)
-		}(carrier)
-	}
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return sendExternalViaV2Fn(ctx, cfg)
 }
 
 func listenExternal(ctx context.Context, cfg ListenConfig) (string, error) {
-	if externalTransferProtocolFromEnv() == externalTransferProtocolV2 {
-		return listenExternalViaV2Fn(ctx, cfg)
-	}
-	switch externalDirectTransportFromEnv() {
-	case externalDirectTransportQUIC:
-		return listenExternalViaDirectQUICFn(ctx, cfg)
-	default:
-		return listenExternalViaDirectUDPFn(ctx, cfg)
-	}
-}
-
-func sendExternalNativeTCPDirect(ctx context.Context, src io.Reader, conns []net.Conn) error {
-	defer closeExternalNativeTCPConns(conns)
-	writers := newExternalStripedBufferedWriteClosers(conns, externalNativeTCPCopyChunkSize())
-	copyErr := sendExternalStripedCopy(ctx, src, writers, externalNativeTCPCopyChunkSize())
-	if copyErr != nil {
-		closeExternalNativeTCPConns(conns)
-		return copyErr
-	}
-	return nil
-}
-
-func receiveExternalNativeTCPDirect(ctx context.Context, dst io.WriteCloser, conns []net.Conn) error {
-	defer closeExternalNativeTCPConns(conns)
-	readers := newExternalStripedBufferedReadClosers(conns, externalNativeTCPCopyChunkSize())
-	copyErr := receiveExternalStripedCopy(ctx, dst, readers, externalNativeTCPCopyChunkSize())
-	if copyErr != nil {
-		closeExternalNativeTCPConns(conns)
-		return copyErr
-	}
-	return nil
+	return listenExternalViaV2Fn(ctx, cfg)
 }
 
 func startExternalTransportManager(
@@ -678,1133 +333,6 @@ func publicDirectBatchConn(conn net.PacketConn) transport.DirectBatchConn {
 	return directBatchConn
 }
 
-func requestExternalQUICMode(
-	ctx context.Context,
-	client *derpbind.Client,
-	peerDERP key.NodePublic,
-	manager *transport.Manager,
-	localCandidates []net.Addr,
-	emitter *telemetry.Emitter,
-	clientTLSConfig *tls.Config,
-	serverTLSConfig *tls.Config,
-	nativeTCPAuth externalNativeTCPAuth,
-	parallelPolicy ParallelPolicy,
-	forceRelay bool,
-	authOpt ...externalPeerControlAuth,
-) (bool, []net.Conn, net.Addr, ParallelPolicy, error) {
-	if !externalQUICModeRequestAllowed(forceRelay, manager) {
-		return false, nil, nil, ParallelPolicy{}, nil
-	}
-	auth := optionalPeerControlAuth(authOpt)
-	parallelPolicy = parallelPolicy.normalized()
-
-	tcpOffer := openExternalQUICModeTCPRequest(localCandidates, serverTLSConfig)
-	defer tcpOffer.Close()
-	emitExternalQUICModeTCPRequest(emitter, tcpOffer)
-
-	subs := subscribeExternalQUICModeRequest(client, peerDERP)
-	defer subs.Close()
-
-	if err := sendExternalQUICModeRequest(ctx, client, peerDERP, tcpOffer, parallelPolicy, auth); err != nil {
-		return false, nil, nil, ParallelPolicy{}, err
-	}
-
-	modeCtx, cancel := context.WithTimeout(ctx, externalNativeQUICWait)
-	defer cancel()
-	resp, ok, err := receiveExternalQUICModeResponseOrNack(modeCtx, client, peerDERP, subs.modeCh, emitter, auth)
-	if err != nil {
-		return false, nil, nil, ParallelPolicy{}, err
-	}
-	if !ok {
-		return false, nil, nil, ParallelPolicy{}, nil
-	}
-	emitExternalQUICModeTCPResponse(emitter, resp)
-
-	resolvedPolicy := externalQUICModeResolvedPolicy(resp, parallelPolicy)
-	addr, ok := externalQUICModeResponseDirectAddr(ctx, manager, resp)
-	nativeTCPConns, nativeTCP := connectExternalQUICModeNativeTCP(modeCtx, tcpOffer, addr, resp, clientTLSConfig, nativeTCPAuth, parallelPolicy, emitter)
-	ackEnv := envelope{
-		Type: envelopeQUICModeAck,
-		QUICModeAck: &quicModeAck{
-			NativeDirect: resp.NativeDirect && ok && addr != nil,
-			NativeTCP:    nativeTCP && len(nativeTCPConns) > 0,
-		},
-	}
-	return finishExternalQUICModeRequest(ctx, client, peerDERP, subs.readyCh, ackEnv, resp, addr, ok, nativeTCPConns, resolvedPolicy, auth)
-}
-
-func requestExternalTCPMode(
-	ctx context.Context,
-	client *derpbind.Client,
-	peerDERP key.NodePublic,
-	manager *transport.Manager,
-	localCandidates []net.Addr,
-	emitter *telemetry.Emitter,
-	clientTLSConfig *tls.Config,
-	serverTLSConfig *tls.Config,
-	nativeTCPAuth externalNativeTCPAuth,
-	parallelPolicy ParallelPolicy,
-	forceRelay bool,
-	authOpt ...externalPeerControlAuth,
-) ([]net.Conn, ParallelPolicy, error) {
-	if !externalQUICModeRequestAllowed(forceRelay, manager) {
-		return nil, ParallelPolicy{}, nil
-	}
-	auth := optionalPeerControlAuth(authOpt)
-	parallelPolicy = parallelPolicy.normalized()
-
-	tcpOffer := openExternalQUICModeTCPRequest(localCandidates, serverTLSConfig)
-	defer tcpOffer.Close()
-	emitExternalQUICModeTCPRequest(emitter, tcpOffer)
-	if !tcpOffer.requested {
-		return nil, ParallelPolicy{}, nil
-	}
-
-	subs := subscribeExternalQUICModeRequest(client, peerDERP)
-	defer subs.Close()
-
-	if err := sendExternalTCPModeRequest(ctx, client, peerDERP, tcpOffer, parallelPolicy, auth); err != nil {
-		return nil, ParallelPolicy{}, err
-	}
-
-	modeCtx, cancel := context.WithTimeout(ctx, externalNativeQUICWait)
-	defer cancel()
-	resp, ok, err := receiveExternalQUICModeResponseOrNack(modeCtx, client, peerDERP, subs.modeCh, emitter, auth)
-	if err != nil {
-		return nil, ParallelPolicy{}, err
-	}
-	if !ok || !resp.NativeTCP {
-		return nil, externalQUICModeResolvedPolicy(resp, parallelPolicy), nil
-	}
-	emitExternalQUICModeTCPResponse(emitter, resp)
-
-	resolvedPolicy := externalQUICModeResolvedPolicy(resp, parallelPolicy)
-	addr, addrOK := externalQUICModeResponseDirectAddr(ctx, manager, resp)
-	nativeTCPConns, nativeTCP := connectExternalQUICModeNativeTCP(modeCtx, tcpOffer, addr, resp, clientTLSConfig, nativeTCPAuth, parallelPolicy, emitter)
-	ackEnv := envelope{
-		Type: envelopeQUICModeAck,
-		QUICModeAck: &quicModeAck{
-			NativeDirect: false,
-			NativeTCP:    nativeTCP && len(nativeTCPConns) > 0,
-		},
-	}
-	_, conns, _, policy, err := finishExternalQUICModeRequest(ctx, client, peerDERP, subs.readyCh, ackEnv, quicModeResponse{NativeTCP: resp.NativeTCP}, addr, addrOK, nativeTCPConns, resolvedPolicy, auth)
-	return conns, policy, err
-}
-
-func sendExternalTCPModeRequest(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, tcpOffer externalQUICModeTCPRequest, parallelPolicy ParallelPolicy, auth externalPeerControlAuth) error {
-	return sendAuthenticatedEnvelope(ctx, client, peerDERP, envelope{
-		Type: envelopeQUICModeReq,
-		QUICModeReq: &quicModeRequest{
-			NativeDirect:    false,
-			NativeTCP:       tcpOffer.requested,
-			DirectAddr:      tcpOffer.addr,
-			NativeTCPConns:  externalParallelTCPConnCount(parallelPolicy),
-			ParallelMode:    string(parallelPolicy.Mode),
-			ParallelInitial: parallelPolicy.Initial,
-			ParallelCap:     parallelPolicy.Cap,
-		},
-	}, auth)
-}
-
-type externalQUICModeTCPRequest struct {
-	listener  net.Listener
-	addr      string
-	requested bool
-}
-
-func (r *externalQUICModeTCPRequest) Close() {
-	if r != nil && r.listener != nil {
-		_ = r.listener.Close()
-	}
-}
-
-func externalQUICModeRequestAllowed(forceRelay bool, manager *transport.Manager) bool {
-	return !forceRelay && manager != nil
-}
-
-func emitExternalQUICModeTCPRequest(emitter *telemetry.Emitter, tcpOffer externalQUICModeTCPRequest) {
-	if emitter != nil {
-		emitter.Debug("sender-tcp-offer=" + strconv.FormatBool(tcpOffer.requested) + " addr=" + tcpOffer.addr)
-	}
-}
-
-type externalQUICModeRequestSubscriptions struct {
-	modeCh           <-chan derpbind.Packet
-	readyCh          <-chan derpbind.Packet
-	unsubscribeMode  func()
-	unsubscribeReady func()
-}
-
-func (s externalQUICModeRequestSubscriptions) Close() {
-	if s.unsubscribeMode != nil {
-		s.unsubscribeMode()
-	}
-	if s.unsubscribeReady != nil {
-		s.unsubscribeReady()
-	}
-}
-
-func subscribeExternalQUICModeRequest(client *derpbind.Client, peerDERP key.NodePublic) externalQUICModeRequestSubscriptions {
-	modeCh, unsubscribeMode := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
-		return pkt.From == peerDERP && isQUICModeResponsePayload(pkt.Payload)
-	})
-	readyCh, unsubscribeReady := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
-		return pkt.From == peerDERP && isQUICModeReadyPayload(pkt.Payload)
-	})
-	return externalQUICModeRequestSubscriptions{
-		modeCh:           modeCh,
-		readyCh:          readyCh,
-		unsubscribeMode:  unsubscribeMode,
-		unsubscribeReady: unsubscribeReady,
-	}
-}
-
-func emitExternalQUICModeTCPResponse(emitter *telemetry.Emitter, resp quicModeResponse) {
-	if emitter != nil {
-		emitter.Debug("sender-tcp-response=" + strconv.FormatBool(resp.NativeTCP) + " addr=" + resp.DirectAddr)
-	}
-}
-
-func openExternalQUICModeTCPRequest(localCandidates []net.Addr, serverTLSConfig *tls.Config) externalQUICModeTCPRequest {
-	ln, ok := listenExternalNativeTCPOnCandidates(localCandidates, serverTLSConfig)
-	if !ok {
-		return externalQUICModeTCPRequest{}
-	}
-	return externalQUICModeTCPRequest{
-		listener:  ln,
-		addr:      quicModeDirectAddrString(externalNativeTCPAdvertiseAddr(ln.Addr(), nil)),
-		requested: true,
-	}
-}
-
-func sendExternalQUICModeRequest(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, tcpOffer externalQUICModeTCPRequest, parallelPolicy ParallelPolicy, auth externalPeerControlAuth) error {
-	return sendAuthenticatedEnvelope(ctx, client, peerDERP, envelope{
-		Type: envelopeQUICModeReq,
-		QUICModeReq: &quicModeRequest{
-			NativeDirect:    true,
-			NativeTCP:       tcpOffer.requested,
-			DirectAddr:      tcpOffer.addr,
-			NativeTCPConns:  externalParallelTCPConnCount(parallelPolicy),
-			ParallelMode:    string(parallelPolicy.Mode),
-			ParallelInitial: parallelPolicy.Initial,
-			ParallelCap:     parallelPolicy.Cap,
-		},
-	}, auth)
-}
-
-func receiveExternalQUICModeResponseOrNack(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, modeCh <-chan derpbind.Packet, emitter *telemetry.Emitter, auth externalPeerControlAuth) (quicModeResponse, bool, error) {
-	resp, err := receiveQUICModeResponse(ctx, modeCh, auth)
-	if err == nil && (resp.NativeDirect || resp.NativeTCP) {
-		return resp, true, nil
-	}
-	if errors.Is(err, context.Canceled) {
-		sendExternalQUICModeNack(client, peerDERP, auth)
-	}
-	if emitter != nil {
-		emitter.Debug("sender-tcp-response=none")
-	}
-	return quicModeResponse{}, false, nil
-}
-
-func sendExternalQUICModeNack(client *derpbind.Client, peerDERP key.NodePublic, auth externalPeerControlAuth) {
-	nackCtx, nackCancel := context.WithTimeout(context.Background(), externalNativeQUICNackWait)
-	defer nackCancel()
-	_ = sendAuthenticatedEnvelope(nackCtx, client, peerDERP, envelope{
-		Type: envelopeQUICModeAck,
-		QUICModeAck: &quicModeAck{
-			NativeDirect: false,
-			NativeTCP:    false,
-		},
-	}, auth)
-}
-
-func externalQUICModeResolvedPolicy(resp quicModeResponse, fallback ParallelPolicy) ParallelPolicy {
-	resolvedPolicy := quicModeParallelPolicy(resp)
-	if resolvedPolicy.Mode == "" {
-		return fallback
-	}
-	return resolvedPolicy
-}
-
-func externalQUICModeResponseDirectAddr(ctx context.Context, manager *transport.Manager, resp quicModeResponse) (net.Addr, bool) {
-	if parsed := parseCandidateStrings([]string{resp.DirectAddr}); len(parsed) == 1 {
-		return parsed[0], true
-	}
-	if addr, ok := manager.DirectAddr(); ok && addr != nil {
-		return addr, true
-	}
-	return waitForExternalDirectAddr(ctx, manager, externalNativeQUICWait)
-}
-
-func connectExternalQUICModeNativeTCP(ctx context.Context, tcpOffer externalQUICModeTCPRequest, addr net.Addr, resp quicModeResponse, clientTLSConfig *tls.Config, nativeTCPAuth externalNativeTCPAuth, parallelPolicy ParallelPolicy, emitter *telemetry.Emitter) ([]net.Conn, bool) {
-	if !resp.NativeTCP || addr == nil || !externalNativeTCPAddrAllowed(addr) {
-		return nil, false
-	}
-	conns, err := connectExternalQUICModeNativeTCPConns(ctx, tcpOffer, addr, resp, clientTLSConfig, nativeTCPAuth, parallelPolicy, emitter)
-	if err != nil {
-		if emitter != nil {
-			emitter.Debug("sender-tcp-connect-failed=" + err.Error())
-		}
-		return nil, false
-	}
-	return conns, true
-}
-
-func connectExternalQUICModeNativeTCPConns(ctx context.Context, tcpOffer externalQUICModeTCPRequest, addr net.Addr, resp quicModeResponse, clientTLSConfig *tls.Config, nativeTCPAuth externalNativeTCPAuth, parallelPolicy ParallelPolicy, emitter *telemetry.Emitter) ([]net.Conn, error) {
-	tcpTLSConfig := clientTLSConfig
-	connCount := externalNativeTCPHandshakeConnCount(resp.NativeTCPConns, externalParallelTCPConnCount(parallelPolicy))
-	if tcpOffer.listener != nil {
-		if externalNativeTCPUseBearerAuth(tcpOffer.listener.Addr(), addr) {
-			tcpTLSConfig = nil
-		}
-		return connectExternalQUICModeNativeTCPFromListener(ctx, tcpOffer.listener, addr, tcpTLSConfig, nativeTCPAuth, connCount, emitter)
-	}
-	return dialExternalQUICModeNativeTCP(ctx, addr, tcpTLSConfig, nativeTCPAuth, connCount, emitter)
-}
-
-func connectExternalQUICModeNativeTCPFromListener(ctx context.Context, listener net.Listener, addr net.Addr, tcpTLSConfig *tls.Config, nativeTCPAuth externalNativeTCPAuth, connCount int, emitter *telemetry.Emitter) ([]net.Conn, error) {
-	if connCount > 1 {
-		conns, err := connectExternalNativeTCPConns(ctx, listener, addr, tcpTLSConfig, nativeTCPAuth, 0, connCount)
-		emitExternalQUICModeTCPStripeCount(emitter, conns, err)
-		return conns, err
-	}
-	conn, err := connectExternalNativeTCPSender(ctx, listener, addr, tcpTLSConfig, nativeTCPAuth)
-	return externalQUICModeSingleTCPConn(conn), err
-}
-
-func dialExternalQUICModeNativeTCP(ctx context.Context, addr net.Addr, tcpTLSConfig *tls.Config, nativeTCPAuth externalNativeTCPAuth, connCount int, emitter *telemetry.Emitter) ([]net.Conn, error) {
-	if connCount > 1 {
-		conns, err := dialExternalNativeTCPConns(ctx, addr, tcpTLSConfig, nativeTCPAuth, connCount)
-		emitExternalQUICModeTCPStripeCount(emitter, conns, err)
-		return conns, err
-	}
-	conn, err := dialExternalNativeTCP(ctx, addr, tcpTLSConfig, nativeTCPAuth)
-	return externalQUICModeSingleTCPConn(conn), err
-}
-
-func externalQUICModeSingleTCPConn(conn net.Conn) []net.Conn {
-	if conn == nil {
-		return nil
-	}
-	return []net.Conn{conn}
-}
-
-func emitExternalQUICModeTCPStripeCount(emitter *telemetry.Emitter, conns []net.Conn, err error) {
-	if err == nil && emitter != nil {
-		emitter.Debug("native-tcp-stripes=" + strconv.Itoa(len(conns)))
-	}
-}
-
-func finishExternalQUICModeRequest(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, readyCh <-chan derpbind.Packet, ackEnv envelope, resp quicModeResponse, addr net.Addr, ok bool, nativeTCPConns []net.Conn, resolvedPolicy ParallelPolicy, auth externalPeerControlAuth) (bool, []net.Conn, net.Addr, ParallelPolicy, error) {
-	if err := sendAuthenticatedEnvelope(ctx, client, peerDERP, ackEnv, auth); err != nil {
-		closeExternalNativeTCPConns(nativeTCPConns)
-		return false, nil, nil, resolvedPolicy, err
-	}
-	if !resp.NativeDirect || !ok || addr == nil {
-		if len(nativeTCPConns) > 0 {
-			return false, nativeTCPConns, nil, resolvedPolicy, nil
-		}
-		closeExternalNativeTCPConns(nativeTCPConns)
-		return false, nil, nil, resolvedPolicy, nil
-	}
-	if len(nativeTCPConns) > 0 {
-		return true, nativeTCPConns, cloneSessionAddr(addr), resolvedPolicy, nil
-	}
-	readyCtx, readyCancel := context.WithTimeout(ctx, externalNativeQUICWait)
-	defer readyCancel()
-	ready, err := receiveQUICModeReadyWithAckRetry(readyCtx, readyCh, func(ctx context.Context) error {
-		return sendAuthenticatedEnvelope(ctx, client, peerDERP, ackEnv, auth)
-	}, auth)
-	if err != nil || !ready.NativeDirect {
-		closeExternalNativeTCPConns(nativeTCPConns)
-		if errors.Is(err, context.Canceled) {
-			return false, nil, nil, resolvedPolicy, ctx.Err()
-		}
-		return false, nil, nil, resolvedPolicy, nil
-	}
-	return true, nativeTCPConns, cloneSessionAddr(addr), resolvedPolicy, nil
-}
-
-func acceptExternalQUICMode(
-	ctx context.Context,
-	client *derpbind.Client,
-	modeCh <-chan derpbind.Packet,
-	peerDERP key.NodePublic,
-	manager *transport.Manager,
-	localCandidates []net.Addr,
-	forceRelay bool,
-	emitter *telemetry.Emitter,
-	clientTLSConfig *tls.Config,
-	serverTLSConfig *tls.Config,
-	nativeTCPAuth externalNativeTCPAuth,
-	authOpt ...externalPeerControlAuth,
-) (bool, []net.Conn, net.Addr, ParallelPolicy, error) {
-	modeCtx, cancel := context.WithTimeout(ctx, externalNativeQUICWait)
-	defer cancel()
-	auth := optionalPeerControlAuth(authOpt)
-
-	subs := subscribeExternalQUICModeAccept(client, peerDERP)
-	defer subs.Close()
-
-	req, ok, err := receiveExternalQUICModeAcceptRequest(ctx, modeCtx, modeCh, auth)
-	if err != nil {
-		return false, nil, nil, ParallelPolicy{}, err
-	}
-	if !ok {
-		return false, nil, nil, ParallelPolicy{}, nil
-	}
-
-	state := newExternalQUICModeAcceptState(ctx, client, peerDERP, manager, localCandidates, req, emitter, clientTLSConfig, serverTLSConfig, nativeTCPAuth, auth)
-	if state.prepareNativeOffer(forceRelay, subs.modeAbortCh) {
-		return false, nil, nil, ParallelPolicy{}, nil
-	}
-	if err := state.sendResponse(ctx); err != nil {
-		return false, nil, nil, state.resolvedPolicy, err
-	}
-	if !state.hasNativePath() {
-		return false, nil, nil, state.resolvedPolicy, nil
-	}
-	state.startNativeTCPHandshake()
-	return state.receiveAckAndFinish(ctx, subs.ackCh)
-}
-
-type externalQUICModeAcceptSubscriptions struct {
-	ackCh                <-chan derpbind.Packet
-	modeAbortCh          <-chan derpbind.Packet
-	unsubscribeAck       func()
-	unsubscribeModeAbort func()
-}
-
-func (s externalQUICModeAcceptSubscriptions) Close() {
-	if s.unsubscribeAck != nil {
-		s.unsubscribeAck()
-	}
-	if s.unsubscribeModeAbort != nil {
-		s.unsubscribeModeAbort()
-	}
-}
-
-func subscribeExternalQUICModeAccept(client *derpbind.Client, peerDERP key.NodePublic) externalQUICModeAcceptSubscriptions {
-	ackCh, unsubscribeAck := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
-		return pkt.From == peerDERP && isQUICModeAckPayload(pkt.Payload)
-	})
-	modeAbortCh, unsubscribeModeAbort := client.SubscribeLossless(func(pkt derpbind.Packet) bool {
-		return pkt.From == peerDERP && isQUICModeAbortAckPayload(pkt.Payload)
-	})
-	return externalQUICModeAcceptSubscriptions{
-		ackCh:                ackCh,
-		modeAbortCh:          modeAbortCh,
-		unsubscribeAck:       unsubscribeAck,
-		unsubscribeModeAbort: unsubscribeModeAbort,
-	}
-}
-
-func receiveExternalQUICModeAcceptRequest(parentCtx, modeCtx context.Context, modeCh <-chan derpbind.Packet, auth externalPeerControlAuth) (quicModeRequest, bool, error) {
-	req, err := receiveQUICModeRequest(modeCtx, modeCh, auth)
-	if err == nil {
-		return req, true, nil
-	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, net.ErrClosed) {
-		return quicModeRequest{}, false, nil
-	}
-	if errors.Is(err, context.Canceled) {
-		return quicModeRequest{}, false, parentCtx.Err()
-	}
-	return quicModeRequest{}, false, nil
-}
-
-type externalQUICModeNativeTCPResult struct {
-	conns []net.Conn
-	err   error
-}
-
-type externalQUICModeAcceptState struct {
-	ctx             context.Context
-	client          *derpbind.Client
-	peerDERP        key.NodePublic
-	manager         *transport.Manager
-	localCandidates []net.Addr
-	req             quicModeRequest
-	resolvedPolicy  ParallelPolicy
-	emitter         *telemetry.Emitter
-	clientTLSConfig *tls.Config
-	serverTLSConfig *tls.Config
-	nativeTCPAuth   externalNativeTCPAuth
-	auth            externalPeerControlAuth
-
-	nativeQUIC         bool
-	nativeQUICAddr     net.Addr
-	nativeQUICPeerAddr net.Addr
-	nativeTCPListener  net.Listener
-	nativeTCPPeerAddr  net.Addr
-	nativeTCPBindAddr  net.Addr
-	nativeTCPAddr      net.Addr
-	nativeTCPConnCh    chan externalQUICModeNativeTCPResult
-	nativeTCPCancel    context.CancelFunc
-}
-
-func newExternalQUICModeAcceptState(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, manager *transport.Manager, localCandidates []net.Addr, req quicModeRequest, emitter *telemetry.Emitter, clientTLSConfig *tls.Config, serverTLSConfig *tls.Config, nativeTCPAuth externalNativeTCPAuth, auth externalPeerControlAuth) *externalQUICModeAcceptState {
-	emitExternalQUICModeAcceptRequest(emitter, req)
-	return &externalQUICModeAcceptState{
-		ctx:             ctx,
-		client:          client,
-		peerDERP:        peerDERP,
-		manager:         manager,
-		localCandidates: localCandidates,
-		req:             req,
-		resolvedPolicy:  externalQUICModeAcceptPolicy(req),
-		emitter:         emitter,
-		clientTLSConfig: clientTLSConfig,
-		serverTLSConfig: serverTLSConfig,
-		nativeTCPAuth:   nativeTCPAuth,
-		auth:            auth,
-	}
-}
-
-func emitExternalQUICModeAcceptRequest(emitter *telemetry.Emitter, req quicModeRequest) {
-	if emitter != nil {
-		emitter.Debug("listener-tcp-request=" + strconv.FormatBool(req.NativeTCP) + " addr=" + req.DirectAddr)
-	}
-}
-
-func externalQUICModeAcceptPolicy(req quicModeRequest) ParallelPolicy {
-	policy := quicModeParallelPolicy(req)
-	if policy.Mode == "" {
-		return DefaultParallelPolicy()
-	}
-	return policy
-}
-
-func (s *externalQUICModeAcceptState) prepareNativeOffer(forceRelay bool, modeAbortCh <-chan derpbind.Packet) bool {
-	if !forceRelay && (s.req.NativeDirect || s.req.NativeTCP) {
-		s.prepareInitialNativeTCP()
-	}
-	if s.prepareNativeQUIC(forceRelay, modeAbortCh) {
-		return true
-	}
-	s.emitSelectedTCPWithoutQUIC()
-	s.resolveParallelPolicy()
-	return false
-}
-
-func (s *externalQUICModeAcceptState) prepareInitialNativeTCP() {
-	if !s.req.NativeTCP {
-		return
-	}
-	if peerCandidate, ok := externalQUICModeTCPPeerCandidate(s.req); ok {
-		s.selectInitialNativeTCPResponseAddr(peerCandidate)
-	} else {
-		s.selectInitialNativeTCPOfferAddr()
-		if s.nativeTCPBindAddr == nil {
-			s.emitDebug("listener-tcp-peer-rejected")
-		}
-	}
-	s.openNativeTCPListener()
-}
-
-func externalQUICModeTCPPeerCandidate(req quicModeRequest) (net.Addr, bool) {
-	parsed := parseCandidateStrings([]string{req.DirectAddr})
-	if len(parsed) != 1 || !externalNativeTCPAddrAllowed(parsed[0]) {
-		return nil, false
-	}
-	return parsed[0], true
-}
-
-func (s *externalQUICModeAcceptState) selectInitialNativeTCPResponseAddr(peerCandidate net.Addr) {
-	bindAddr := selectExternalNativeTCPResponseAddr(peerCandidate, nil, s.localCandidates)
-	if bindAddr == nil {
-		return
-	}
-	s.nativeTCPPeerAddr = peerCandidate
-	s.nativeTCPBindAddr = bindAddr
-	s.nativeTCPAddr = externalNativeTCPAdvertiseAddr(bindAddr, peerCandidate)
-}
-
-func (s *externalQUICModeAcceptState) selectInitialNativeTCPOfferAddr() {
-	s.nativeTCPBindAddr = selectExternalNativeTCPOfferAddr(s.localCandidates)
-	s.nativeTCPAddr = externalNativeTCPAdvertiseAddr(s.nativeTCPBindAddr, nil)
-}
-
-func (s *externalQUICModeAcceptState) openNativeTCPListener() {
-	if s.nativeTCPBindAddr == nil || !externalNativeTCPAddrAllowed(s.nativeTCPBindAddr) {
-		if s.req.NativeTCP {
-			s.emitDebug("listener-tcp-offer-rejected")
-		}
-		return
-	}
-	listener, boundAddr, err := listenExternalNativeTCPWithPortFallback(s.nativeTCPBindAddr, s.serverNativeTCPTLSConfig())
-	if err != nil {
-		s.emitDebug("listener-tcp-listen-failed=" + err.Error())
-		s.nativeTCPPeerAddr = nil
-		s.nativeTCPAddr = nil
-		s.nativeTCPListener = nil
-		return
-	}
-	s.nativeTCPBindAddr = boundAddr
-	s.nativeTCPAddr = externalNativeTCPAdvertiseAddr(boundAddr, s.nativeTCPPeerAddr)
-	s.nativeTCPListener = listener
-}
-
-func (s *externalQUICModeAcceptState) serverNativeTCPTLSConfig() *tls.Config {
-	if externalNativeTCPUseBearerAuth(s.nativeTCPBindAddr, s.nativeTCPPeerAddr) {
-		return nil
-	}
-	return s.serverTLSConfig
-}
-
-func (s *externalQUICModeAcceptState) prepareNativeQUIC(forceRelay bool, modeAbortCh <-chan derpbind.Packet) bool {
-	if !s.shouldWaitForNativeQUIC(forceRelay) {
-		return false
-	}
-	peerDirectAddr, ok, aborted := waitForExternalDirectAddrOrModeAbort(s.ctx, s.manager, modeAbortCh, externalNativeQUICWait, s.auth)
-	if aborted {
-		return true
-	}
-	if !ok {
-		return false
-	}
-	s.nativeQUIC = true
-	s.nativeQUICPeerAddr = cloneSessionAddr(peerDirectAddr)
-	s.nativeQUICAddr = selectExternalQUICModeResponseAddr(peerDirectAddr, s.localCandidates)
-	s.reselectNativeTCPForDirectAddr(peerDirectAddr)
-	s.emitDebug("listener-tcp-selected=" + quicModeDirectAddrString(s.nativeTCPAddr))
-	s.openNativeTCPListener()
-	return false
-}
-
-func (s *externalQUICModeAcceptState) shouldWaitForNativeQUIC(forceRelay bool) bool {
-	return s.req.NativeDirect && !forceRelay && s.nativeTCPListener == nil
-}
-
-func (s *externalQUICModeAcceptState) reselectNativeTCPForDirectAddr(peerDirectAddr net.Addr) {
-	if s.nativeTCPPeerAddr == nil {
-		return
-	}
-	s.nativeTCPBindAddr = selectExternalNativeTCPResponseAddr(s.nativeTCPPeerAddr, peerDirectAddr, s.localCandidates)
-	s.nativeTCPAddr = externalNativeTCPAdvertiseAddr(s.nativeTCPBindAddr, s.nativeTCPPeerAddr)
-}
-
-func (s *externalQUICModeAcceptState) emitSelectedTCPWithoutQUIC() {
-	if s.nativeTCPListener != nil && !s.nativeQUIC {
-		s.emitDebug("listener-tcp-selected=" + quicModeDirectAddrString(s.nativeTCPAddr))
-	}
-}
-
-func (s *externalQUICModeAcceptState) resolveParallelPolicy() {
-	if !s.nativeQUIC || s.nativeQUICPeerAddr == nil {
-		return
-	}
-	s.resolvedPolicy.Initial = externalNativeQUICConnCountForPeer(s.nativeQUICPeerAddr, s.resolvedPolicy.Initial)
-	s.resolvedPolicy.Cap = externalNativeQUICConnCountForPeer(s.nativeQUICPeerAddr, s.resolvedPolicy.Cap)
-	if s.resolvedPolicy.Cap < s.resolvedPolicy.Initial {
-		s.resolvedPolicy.Cap = s.resolvedPolicy.Initial
-	}
-}
-
-func (s *externalQUICModeAcceptState) sendResponse(ctx context.Context) error {
-	nativeTCPOffered := s.nativeTCPListener != nil
-	if err := sendAuthenticatedEnvelope(ctx, s.client, s.peerDERP, envelope{
-		Type: envelopeQUICModeResp,
-		QUICModeResp: &quicModeResponse{
-			NativeDirect:    s.nativeQUIC,
-			NativeTCP:       nativeTCPOffered,
-			DirectAddr:      quicModeDirectAddrString(nativeQUICModeResponseAddr(s.nativeQUICAddr, s.nativeTCPAddr, nativeTCPOffered)),
-			NativeTCPConns:  s.nativeTCPConnCount(),
-			ParallelMode:    string(s.resolvedPolicy.Mode),
-			ParallelInitial: s.resolvedPolicy.Initial,
-			ParallelCap:     s.resolvedPolicy.Cap,
-		},
-	}, s.auth); err != nil {
-		s.closeNativeTCPListener()
-		return err
-	}
-	return nil
-}
-
-func (s *externalQUICModeAcceptState) hasNativePath() bool {
-	return s.nativeQUIC || s.nativeTCPListener != nil
-}
-
-func (s *externalQUICModeAcceptState) nativeTCPConnCount() int {
-	return externalNativeTCPPassiveConnCount(s.req.NativeTCPConns)
-}
-
-func (s *externalQUICModeAcceptState) closeNativeTCPListener() {
-	if s.nativeTCPListener != nil {
-		_ = s.nativeTCPListener.Close()
-	}
-}
-
-func (s *externalQUICModeAcceptState) startNativeTCPHandshake() {
-	if s.nativeTCPListener == nil {
-		return
-	}
-	nativeTCPCtx, cancel := context.WithCancel(s.ctx)
-	s.nativeTCPCancel = cancel
-	s.nativeTCPConnCh = make(chan externalQUICModeNativeTCPResult, 1)
-	if s.nativeTCPPeerAddr != nil {
-		go s.connectNativeTCP(nativeTCPCtx)
-		return
-	}
-	go s.acceptNativeTCP(nativeTCPCtx)
-}
-
-func (s *externalQUICModeAcceptState) connectNativeTCP(ctx context.Context) {
-	tcpTLSConfig := s.clientNativeTCPTLSConfig()
-	connCount := s.nativeTCPConnCount()
-	if connCount > 1 {
-		conns, err := connectExternalNativeTCPConns(ctx, s.nativeTCPListener, s.nativeTCPPeerAddr, tcpTLSConfig, s.nativeTCPAuth, externalNativeTCPDialFallbackDelay, connCount)
-		emitExternalQUICModeTCPStripeCount(s.emitter, conns, err)
-		s.nativeTCPConnCh <- externalQUICModeNativeTCPResult{conns: conns, err: err}
-		return
-	}
-	conn, err := connectExternalNativeTCPListener(ctx, s.nativeTCPListener, s.nativeTCPPeerAddr, tcpTLSConfig, s.nativeTCPAuth)
-	s.nativeTCPConnCh <- externalQUICModeNativeTCPResult{conns: externalQUICModeSingleTCPConn(conn), err: err}
-}
-
-func (s *externalQUICModeAcceptState) clientNativeTCPTLSConfig() *tls.Config {
-	if externalNativeTCPUseBearerAuth(s.nativeTCPListener.Addr(), s.nativeTCPPeerAddr) {
-		return nil
-	}
-	return s.clientTLSConfig
-}
-
-func (s *externalQUICModeAcceptState) acceptNativeTCP(ctx context.Context) {
-	connCount := s.nativeTCPConnCount()
-	if connCount > 1 {
-		conns, err := acceptExternalNativeTCPConns(ctx, s.nativeTCPListener, s.nativeTCPAuth, connCount)
-		emitExternalQUICModeTCPStripeCount(s.emitter, conns, err)
-		s.nativeTCPConnCh <- externalQUICModeNativeTCPResult{conns: conns, err: err}
-		return
-	}
-	conn, err := acceptExternalNativeTCP(ctx, s.nativeTCPListener, s.nativeTCPAuth)
-	s.nativeTCPConnCh <- externalQUICModeNativeTCPResult{conns: externalQUICModeSingleTCPConn(conn), err: err}
-}
-
-func (s *externalQUICModeAcceptState) receiveAckAndFinish(ctx context.Context, ackCh <-chan derpbind.Packet) (bool, []net.Conn, net.Addr, ParallelPolicy, error) {
-	ack, ok := receiveExternalQUICModeAcceptAck(ctx, ackCh, s.auth)
-	if !ok {
-		s.cancelAndDrainNativeTCP()
-		return false, nil, nil, s.resolvedPolicy, nil
-	}
-	if s.nativeTCPListener != nil && !ack.NativeTCP {
-		return s.finishTCPAckRejected(ctx)
-	}
-	if s.nativeTCPListener == nil {
-		return s.finishNativeQUICOnly(ctx)
-	}
-	result := <-s.nativeTCPConnCh
-	if result.err != nil {
-		return false, nil, nil, s.resolvedPolicy, result.err
-	}
-	return s.nativeQUIC, result.conns, cloneSessionAddr(s.nativeQUICPeerAddr), s.resolvedPolicy, nil
-}
-
-func receiveExternalQUICModeAcceptAck(ctx context.Context, ackCh <-chan derpbind.Packet, auth externalPeerControlAuth) (quicModeAck, bool) {
-	ackCtx, ackCancel := context.WithTimeout(ctx, externalNativeQUICWait)
-	defer ackCancel()
-	ack, err := receiveQUICModeAck(ackCtx, ackCh, auth)
-	if err != nil || (!ack.NativeDirect && !ack.NativeTCP) {
-		return quicModeAck{}, false
-	}
-	return ack, true
-}
-
-func (s *externalQUICModeAcceptState) cancelAndDrainNativeTCP() {
-	if s.nativeTCPCancel != nil {
-		s.nativeTCPCancel()
-	}
-	if s.nativeTCPConnCh != nil {
-		result := <-s.nativeTCPConnCh
-		closeExternalNativeTCPConns(result.conns)
-	}
-}
-
-func (s *externalQUICModeAcceptState) finishTCPAckRejected(ctx context.Context) (bool, []net.Conn, net.Addr, ParallelPolicy, error) {
-	s.emitDebug("listener-tcp-ack-rejected")
-	s.cancelAndDrainNativeTCP()
-	return s.finishNativeQUICOnly(ctx)
-}
-
-func (s *externalQUICModeAcceptState) finishNativeQUICOnly(ctx context.Context) (bool, []net.Conn, net.Addr, ParallelPolicy, error) {
-	if !s.nativeQUIC {
-		return false, nil, nil, s.resolvedPolicy, nil
-	}
-	if _, err := sendExternalQUICModeReady(ctx, s.client, s.peerDERP, s.manager, s.nativeQUICAddr, s.auth); err != nil {
-		return false, nil, nil, s.resolvedPolicy, err
-	}
-	return s.nativeQUIC, nil, cloneSessionAddr(s.nativeQUICPeerAddr), s.resolvedPolicy, nil
-}
-
-func (s *externalQUICModeAcceptState) emitDebug(msg string) {
-	if s.emitter != nil {
-		s.emitter.Debug(msg)
-	}
-}
-
-func sendExternalQUICModeReady(
-	ctx context.Context,
-	client *derpbind.Client,
-	peerDERP key.NodePublic,
-	manager *transport.Manager,
-	nativeQUICAddr net.Addr,
-	authOpt ...externalPeerControlAuth,
-) (net.Addr, error) {
-	auth := optionalPeerControlAuth(authOpt)
-	readyAddr := cloneSessionAddr(nativeQUICAddr)
-	if manager != nil {
-		if readyAddr == nil {
-			readyAddr, _ = manager.DirectAddr()
-		}
-	}
-	if err := sendAuthenticatedEnvelope(ctx, client, peerDERP, envelope{
-		Type:          envelopeQUICModeReady,
-		QUICModeReady: &quicModeReady{NativeDirect: true},
-	}, auth); err != nil {
-		return nil, err
-	}
-	externalTransferTracef("listener-native-quic-ready-sent addr=%v", readyAddr)
-	return cloneSessionAddr(readyAddr), nil
-}
-
-func waitExternalNativeQUICSetupGrace(relayErrCh <-chan error, graceWait time.Duration) (error, bool) {
-	if graceWait <= 0 {
-		return nil, false
-	}
-	graceTimer := time.NewTimer(graceWait)
-	defer graceTimer.Stop()
-	select {
-	case relayErr := <-relayErrCh:
-		return relayErr, true
-	case <-graceTimer.C:
-		return nil, false
-	}
-}
-
-func externalNativeQUICSetupGraceWaitForSpool(spool *externalHandoffSpool) time.Duration {
-	return 0
-}
-
-func externalNativeQUICSetupShouldSkipForSpool(spool *externalHandoffSpool) bool {
-	if spool == nil {
-		return false
-	}
-
-	spool.mu.Lock()
-	defer spool.mu.Unlock()
-
-	if !spool.eof {
-		externalTransferTracef(
-			"sender-native-quic-setup-skip-check eof=%v source=%d read=%d acked=%d tail=%d cutoff=%d skip=false",
-			spool.eof,
-			spool.sourceOffset,
-			spool.readOffset,
-			spool.ackedWatermark,
-			spool.sourceOffset-spool.ackedWatermark,
-			externalNativeQUICSetupSkipRelayTailBytes,
-		)
-		return false
-	}
-	tail := spool.sourceOffset - spool.ackedWatermark
-	skip := tail <= externalNativeQUICSetupSkipRelayTailBytes
-	externalTransferTracef(
-		"sender-native-quic-setup-skip-check eof=%v source=%d read=%d acked=%d tail=%d cutoff=%d skip=%v",
-		spool.eof,
-		spool.sourceOffset,
-		spool.readOffset,
-		spool.ackedWatermark,
-		tail,
-		externalNativeQUICSetupSkipRelayTailBytes,
-		skip,
-	)
-	return skip
-}
-
-func waitExternalNativeQUICRelayTailPeerAck(ctx context.Context, spool *externalHandoffSpool, ackCh <-chan derpbind.Packet) (bool, error) {
-	if !externalNativeQUICSetupShouldSkipForSpool(spool) {
-		return false, nil
-	}
-
-	ackCtx, cancel := context.WithTimeout(ctx, externalNativeQUICRelayTailPeerAckWait)
-	defer cancel()
-
-	if err := waitForPeerAck(ackCtx, ackCh, spool.sourceOffset); err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
-}
-
-func selectExternalQUICModeResponseAddr(peerAddr net.Addr, localCandidates []net.Addr) net.Addr {
-	for _, candidate := range localCandidates {
-		if externalNativeQUICStripeCanUseLocalAddrCandidate(candidate, peerAddr) {
-			return cloneSessionAddr(candidate)
-		}
-	}
-	for _, candidate := range localCandidates {
-		if externalQUICModeGlobalCandidate(candidate) {
-			return cloneSessionAddr(candidate)
-		}
-	}
-	return nil
-}
-
-func externalQUICModeGlobalCandidate(candidate net.Addr) bool {
-	udpAddr, ok := candidate.(*net.UDPAddr)
-	if !ok || udpAddr == nil {
-		return false
-	}
-	ip, ok := netip.AddrFromSlice(udpAddr.IP)
-	if !ok {
-		return false
-	}
-	ip = ip.Unmap()
-	if ip.IsLoopback() || ip.IsPrivate() {
-		return false
-	}
-	if publicProbeTailscaleCGNATPrefix.Contains(ip) || publicProbeTailscaleULAPrefix.Contains(ip) {
-		return false
-	}
-	return ip.IsGlobalUnicast()
-}
-
-func nativeQUICModeResponseAddr(nativeQUICAddr, nativeTCPAddr net.Addr, nativeTCP bool) net.Addr {
-	if nativeTCP && nativeTCPAddr != nil {
-		return nativeTCPAddr
-	}
-	return nativeQUICAddr
-}
-
-func quicModeDirectAddrString(addr net.Addr) string {
-	if addr == nil {
-		return ""
-	}
-	return addr.String()
-}
-
-func receiveQUICModeRequest(ctx context.Context, ch <-chan derpbind.Packet, authOpt ...externalPeerControlAuth) (quicModeRequest, error) {
-	auth := optionalPeerControlAuth(authOpt)
-	for {
-		select {
-		case pkt, ok := <-ch:
-			if !ok {
-				return quicModeRequest{}, net.ErrClosed
-			}
-			env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
-			if ignoreAuthenticatedEnvelopeError(err, auth) {
-				continue
-			}
-			if err != nil || env.Type != envelopeQUICModeReq || env.QUICModeReq == nil {
-				return quicModeRequest{}, errors.New("unexpected quic mode request")
-			}
-			return *env.QUICModeReq, nil
-		case <-ctx.Done():
-			return quicModeRequest{}, ctx.Err()
-		}
-	}
-}
-
-func receiveQUICModeResponse(ctx context.Context, ch <-chan derpbind.Packet, authOpt ...externalPeerControlAuth) (quicModeResponse, error) {
-	auth := optionalPeerControlAuth(authOpt)
-	for {
-		select {
-		case pkt, ok := <-ch:
-			if !ok {
-				return quicModeResponse{}, net.ErrClosed
-			}
-			env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
-			if ignoreAuthenticatedEnvelopeError(err, auth) {
-				continue
-			}
-			if err != nil || env.Type != envelopeQUICModeResp || env.QUICModeResp == nil {
-				return quicModeResponse{}, errors.New("unexpected quic mode response")
-			}
-			return *env.QUICModeResp, nil
-		case <-ctx.Done():
-			return quicModeResponse{}, ctx.Err()
-		}
-	}
-}
-
-func receiveQUICModeAck(ctx context.Context, ch <-chan derpbind.Packet, authOpt ...externalPeerControlAuth) (quicModeAck, error) {
-	auth := optionalPeerControlAuth(authOpt)
-	for {
-		select {
-		case pkt, ok := <-ch:
-			if !ok {
-				return quicModeAck{}, net.ErrClosed
-			}
-			env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
-			if ignoreAuthenticatedEnvelopeError(err, auth) {
-				continue
-			}
-			if err != nil || env.Type != envelopeQUICModeAck || env.QUICModeAck == nil {
-				return quicModeAck{}, errors.New("unexpected quic mode ack")
-			}
-			return *env.QUICModeAck, nil
-		case <-ctx.Done():
-			return quicModeAck{}, ctx.Err()
-		}
-	}
-}
-
-func receiveQUICModeReadyWithAckRetry(
-	ctx context.Context,
-	readyCh <-chan derpbind.Packet,
-	sendAck func(context.Context) error,
-	authOpt ...externalPeerControlAuth,
-) (quicModeReady, error) {
-	auth := optionalPeerControlAuth(authOpt)
-	retry := time.NewTicker(externalNativeQUICAckRetryInterval)
-	defer retry.Stop()
-
-	for {
-		select {
-		case pkt, ok := <-readyCh:
-			if !ok {
-				return quicModeReady{}, net.ErrClosed
-			}
-			ready, handled, err := decodeQUICModeReadyPacket(pkt, auth)
-			if handled {
-				continue
-			}
-			if err != nil {
-				return quicModeReady{}, err
-			}
-			return ready, nil
-		case <-retry.C:
-			if err := retryQUICModeReadyAck(ctx, sendAck); err != nil {
-				return quicModeReady{}, err
-			}
-		case <-ctx.Done():
-			return quicModeReady{}, ctx.Err()
-		}
-	}
-}
-
-func decodeQUICModeReadyPacket(pkt derpbind.Packet, auth externalPeerControlAuth) (quicModeReady, bool, error) {
-	env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
-	if ignoreAuthenticatedEnvelopeError(err, auth) {
-		return quicModeReady{}, true, nil
-	}
-	if err != nil || env.Type != envelopeQUICModeReady || env.QUICModeReady == nil {
-		return quicModeReady{}, false, errors.New("unexpected quic mode ready")
-	}
-	return *env.QUICModeReady, false, nil
-}
-
-func retryQUICModeReadyAck(ctx context.Context, sendAck func(context.Context) error) error {
-	if sendAck == nil {
-		return nil
-	}
-	return sendAck(ctx)
-}
-
-func waitForExternalDirectAddr(ctx context.Context, manager *transport.Manager, timeout time.Duration) (net.Addr, bool) {
-	addr, ok, _ := waitForExternalDirectAddrOrModeAbort(ctx, manager, nil, timeout)
-	return addr, ok
-}
-
-func waitForExternalDirectAddrOrModeAbort(
-	ctx context.Context,
-	manager *transport.Manager,
-	modeAckCh <-chan derpbind.Packet,
-	timeout time.Duration,
-	authOpt ...externalPeerControlAuth,
-) (net.Addr, bool, bool) {
-	if manager == nil {
-		return nil, false, false
-	}
-	auth := optionalPeerControlAuth(authOpt)
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		if addr, ok := pollExternalDirectAddr(manager); ok {
-			return addr, true, false
-		}
-		result := waitExternalDirectAddrEvent(ctx, modeAckCh, timer.C, ticker.C, auth)
-		if result.done {
-			return result.addr, result.ready, result.modeAbort
-		}
-	}
-}
-
-type externalDirectAddrWaitResult struct {
-	addr      net.Addr
-	ready     bool
-	modeAbort bool
-	done      bool
-}
-
-func pollExternalDirectAddr(manager *transport.Manager) (net.Addr, bool) {
-	if addr, ok := manager.DirectAddr(); ok && addr != nil {
-		externalTransferTracef("wait-direct-addr-ready path=%v addr=%v", manager.PathState(), addr)
-		return cloneSessionAddr(addr), true
-	}
-	externalTransferTracef("wait-direct-addr-pending path=%v", manager.PathState())
-	return nil, false
-}
-
-func waitExternalDirectAddrEvent(ctx context.Context, modeAckCh <-chan derpbind.Packet, timeout <-chan time.Time, tick <-chan time.Time, auth externalPeerControlAuth) externalDirectAddrWaitResult {
-	select {
-	case <-ctx.Done():
-		externalTransferTracef("wait-direct-addr-context-done err=%v", ctx.Err())
-		return externalDirectAddrWaitResult{done: true}
-	case pkt, ok := <-modeAckCh:
-		return handleExternalDirectModeAck(pkt, ok, auth)
-	case <-timeout:
-		externalTransferTracef("wait-direct-addr-timeout")
-		return externalDirectAddrWaitResult{done: true}
-	case <-tick:
-		return externalDirectAddrWaitResult{}
-	}
-}
-
-func handleExternalDirectModeAck(pkt derpbind.Packet, ok bool, auth externalPeerControlAuth) externalDirectAddrWaitResult {
-	if !ok {
-		externalTransferTracef("wait-direct-addr-mode-ack-closed")
-		return externalDirectAddrWaitResult{modeAbort: true, done: true}
-	}
-	abort, ignored := externalDirectModeAckAborts(pkt, auth)
-	if ignored {
-		return externalDirectAddrWaitResult{}
-	}
-	if abort {
-		externalTransferTracef("wait-direct-addr-mode-abort")
-		return externalDirectAddrWaitResult{modeAbort: true, done: true}
-	}
-	return externalDirectAddrWaitResult{}
-}
-
-func externalDirectModeAckAborts(pkt derpbind.Packet, auth externalPeerControlAuth) (bool, bool) {
-	ackEnv, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
-	if ignoreAuthenticatedEnvelopeError(err, auth) {
-		return false, true
-	}
-	if err != nil {
-		return false, false
-	}
-	return externalQUICModeAckAborts(ackEnv), false
-}
-
-func externalQUICModeAckAborts(ackEnv envelope) bool {
-	if ackEnv.Type != envelopeQUICModeAck || ackEnv.QUICModeAck == nil {
-		return false
-	}
-	return !ackEnv.QUICModeAck.NativeDirect && !ackEnv.QUICModeAck.NativeTCP
-}
-
-func sendPeerAck(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, bytesReceived int64, authOpt ...externalPeerControlAuth) error {
-	auth := optionalPeerControlAuth(authOpt)
-	return sendAuthenticatedEnvelope(ctx, client, peerDERP, envelope{Type: envelopeAck, Ack: newPeerAck(bytesReceived)}, auth)
-}
-
 func sendPeerProgress(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, bytesReceived, transferElapsedMS int64, sequence uint64, auth externalPeerControlAuth) error {
 	if client == nil || peerDERP.IsZero() {
 		return nil
@@ -1829,165 +357,6 @@ func sendPeerAbortBestEffort(client *derpbind.Client, peerDERP key.NodePublic, r
 		Type:  envelopeAbort,
 		Abort: newPeerAbort(reason, bytesTransferred),
 	}, auth)
-}
-
-func sendPeerHeartbeat(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, bytesTransferred int64, sequence uint64, auth externalPeerControlAuth) error {
-	if client == nil || peerDERP.IsZero() {
-		return nil
-	}
-	return sendAuthenticatedEnvelope(ctx, client, peerDERP, envelope{
-		Type:      envelopeHeartbeat,
-		Heartbeat: newAuthenticatedPeerHeartbeat(bytesTransferred, sequence, auth),
-	}, auth)
-}
-
-func withPeerControlContext(parent context.Context, client *derpbind.Client, peerDERP key.NodePublic, abortCh <-chan derpbind.Packet, heartbeatCh <-chan derpbind.Packet, bytesTransferred func() int64, auth externalPeerControlAuth) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancelCause(parent)
-	stopCh, stop := newPeerControlStop(cancel)
-	currentBytes := peerControlBytesFunc(bytesTransferred)
-	if abortCh != nil {
-		go watchPeerControlAbort(ctx, cancel, stopCh, abortCh, auth)
-	}
-	if heartbeatCh != nil {
-		go watchPeerControlHeartbeats(ctx, cancel, stopCh, heartbeatCh, auth)
-	}
-	if client != nil && !peerDERP.IsZero() {
-		go sendPeerControlHeartbeats(ctx, stopCh, client, peerDERP, currentBytes, auth)
-	}
-
-	return ctx, stop
-}
-
-func newPeerControlStop(cancel context.CancelCauseFunc) (<-chan struct{}, context.CancelFunc) {
-	var stopOnce sync.Once
-	stopCh := make(chan struct{})
-	stop := func() {
-		stopOnce.Do(func() {
-			close(stopCh)
-			cancel(context.Canceled)
-		})
-	}
-	return stopCh, stop
-}
-
-func peerControlBytesFunc(bytesTransferred func() int64) func() int64 {
-	return func() int64 {
-		if bytesTransferred == nil {
-			return 0
-		}
-		return bytesTransferred()
-	}
-}
-
-func watchPeerControlAbort(ctx context.Context, cancel context.CancelCauseFunc, stopCh <-chan struct{}, abortCh <-chan derpbind.Packet, auth externalPeerControlAuth) {
-	for {
-		select {
-		case pkt, ok := <-abortCh:
-			if !ok {
-				return
-			}
-			if peerControlAbortReceived(pkt, auth) {
-				cancel(ErrPeerAborted)
-				return
-			}
-		case <-ctx.Done():
-			return
-		case <-stopCh:
-			return
-		}
-	}
-}
-
-func watchPeerControlHeartbeats(ctx context.Context, cancel context.CancelCauseFunc, stopCh <-chan struct{}, heartbeatCh <-chan derpbind.Packet, auth externalPeerControlAuth) {
-	timer, timerC := newPeerHeartbeatTimer(heartbeatCh)
-	defer timer.Stop()
-	var lastHeartbeatSequence uint64
-	for {
-		select {
-		case pkt, ok := <-heartbeatCh:
-			if !ok {
-				return
-			}
-			if peerControlHeartbeatReceived(pkt, auth, &lastHeartbeatSequence) {
-				resetPeerHeartbeatTimer(timer)
-			}
-		case <-timerC:
-			cancel(ErrPeerDisconnected)
-			return
-		case <-ctx.Done():
-			return
-		case <-stopCh:
-			return
-		}
-	}
-}
-
-func newPeerHeartbeatTimer(heartbeatCh <-chan derpbind.Packet) (*time.Timer, <-chan time.Time) {
-	if heartbeatCh == nil {
-		return nil, nil
-	}
-	timer := time.NewTimer(peerHeartbeatTimeoutOrDefault())
-	return timer, timer.C
-}
-
-func peerHeartbeatTimeoutOrDefault() time.Duration {
-	if peerHeartbeatTimeout <= 0 {
-		return 30 * time.Second
-	}
-	return peerHeartbeatTimeout
-}
-
-func resetPeerHeartbeatTimer(timer *time.Timer) {
-	if timer == nil {
-		return
-	}
-	if !timer.Stop() {
-		select {
-		case <-timer.C:
-		default:
-		}
-	}
-	timer.Reset(peerHeartbeatTimeoutOrDefault())
-}
-
-func peerControlAbortReceived(pkt derpbind.Packet, auth externalPeerControlAuth) bool {
-	env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
-	if ignoreAuthenticatedEnvelopeError(err, auth) {
-		return false
-	}
-	return err == nil && env.Type == envelopeAbort
-}
-
-func peerControlHeartbeatReceived(pkt derpbind.Packet, auth externalPeerControlAuth, lastHeartbeatSequence *uint64) bool {
-	env, err := decodeEnvelope(pkt.Payload)
-	if err != nil || env.Type != envelopeHeartbeat {
-		return false
-	}
-	return verifyPeerHeartbeat(env.Heartbeat, auth, lastHeartbeatSequence)
-}
-
-func sendPeerControlHeartbeats(ctx context.Context, stopCh <-chan struct{}, client *derpbind.Client, peerDERP key.NodePublic, currentBytes func() int64, auth externalPeerControlAuth) {
-	ticker := time.NewTicker(peerHeartbeatIntervalOrDefault())
-	defer ticker.Stop()
-	var heartbeatSequence uint64
-	for {
-		heartbeatSequence++
-		_ = sendPeerHeartbeat(ctx, client, peerDERP, currentBytes(), heartbeatSequence, auth)
-		select {
-		case <-ticker.C:
-		case <-ctx.Done():
-			return
-		case <-stopCh:
-			return
-		}
-	}
-}
-
-func peerHeartbeatIntervalOrDefault() time.Duration {
-	if peerHeartbeatInterval <= 0 {
-		return 2 * time.Second
-	}
-	return peerHeartbeatInterval
 }
 
 func normalizePeerAbortError(ctx context.Context, err error) error {
@@ -2052,48 +421,6 @@ func peerAbortReason(err error) string {
 	}
 }
 
-func waitForPeerAck(ctx context.Context, ch <-chan derpbind.Packet, bytesSent int64, authOpt ...externalPeerControlAuth) error {
-	auth := optionalPeerControlAuth(authOpt)
-	for {
-		select {
-		case pkt, ok := <-ch:
-			if !ok {
-				return net.ErrClosed
-			}
-			handled, err := verifyPeerAckPacket(pkt, auth, bytesSent)
-			if handled {
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-}
-
-func verifyPeerAckPacket(pkt derpbind.Packet, auth externalPeerControlAuth, bytesSent int64) (bool, error) {
-	env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
-	if ignoreAuthenticatedEnvelopeError(err, auth) {
-		return true, nil
-	}
-	if err == nil && env.Type == envelopeAbort {
-		return false, ErrPeerAborted
-	}
-	if err != nil || env.Type != envelopeAck {
-		return false, errors.New("unexpected peer ack payload")
-	}
-	if env.Ack == nil || env.Ack.BytesReceived == nil {
-		return false, errors.New("peer ack missing bytes_received")
-	}
-	if *env.Ack.BytesReceived != bytesSent {
-		return false, fmt.Errorf("peer received %d bytes, sent %d", *env.Ack.BytesReceived, bytesSent)
-	}
-	return false, nil
-}
-
 func verifyPeerProgressPacket(pkt derpbind.Packet, auth externalPeerControlAuth, lastSequence *uint64) (peerProgress, bool, error) {
 	env, err := decodeAuthenticatedEnvelope(pkt.Payload, auth)
 	if ignoreAuthenticatedEnvelopeError(err, auth) {
@@ -2126,15 +453,6 @@ func peerProgressReplayed(progress *peerProgress, lastSequence *uint64) bool {
 	}
 	*lastSequence = progress.Sequence
 	return false
-}
-
-func waitForPeerAckWithTimeout(ctx context.Context, ch <-chan derpbind.Packet, bytesSent int64, timeout time.Duration, authOpt ...externalPeerControlAuth) error {
-	if timeout <= 0 {
-		return waitForPeerAck(ctx, ch, bytesSent, authOpt...)
-	}
-	waitCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	return waitForPeerAck(waitCtx, ch, bytesSent, authOpt...)
 }
 
 func firstDERPNode(dm *tailcfg.DERPMap, regionID int) *tailcfg.DERPNode {
@@ -2281,14 +599,6 @@ func sendTransportControl(ctx context.Context, client *derpbind.Client, dst key.
 	return sendAuthenticatedEnvelope(ctx, client, dst, envelope{Type: envelopeControl, Control: &msg}, optionalPeerControlAuth(authOpt))
 }
 
-func quicModeParallelPolicy(msg interface {
-	getParallelMode() string
-	getParallelInitial() int
-	getParallelCap() int
-}) ParallelPolicy {
-	return parallelPolicyFromFields(msg.getParallelMode(), msg.getParallelInitial(), msg.getParallelCap())
-}
-
 func parallelPolicyFromFields(mode string, initial, cap int) ParallelPolicy {
 	switch ParallelMode(mode) {
 	case ParallelModeFixed:
@@ -2307,50 +617,9 @@ func parallelPolicyFromFields(mode string, initial, cap int) ParallelPolicy {
 	}
 }
 
-func (m quicModeRequest) getParallelMode() string  { return m.ParallelMode }
-func (m quicModeRequest) getParallelInitial() int  { return m.ParallelInitial }
-func (m quicModeRequest) getParallelCap() int      { return m.ParallelCap }
-func (m quicModeResponse) getParallelMode() string { return m.ParallelMode }
-func (m quicModeResponse) getParallelInitial() int { return m.ParallelInitial }
-func (m quicModeResponse) getParallelCap() int     { return m.ParallelCap }
-
 func externalParallelQUICConnCount(policy ParallelPolicy) int {
 	policy = policy.normalized()
 	return policy.Initial
-}
-
-func externalParallelTCPConnCount(policy ParallelPolicy) int {
-	policy = policy.normalized()
-	return policy.Initial
-}
-
-func waitInitialExternalNativeDirectMode(
-	ctx context.Context,
-	ch <-chan externalNativeDirectModeResult,
-	wait time.Duration,
-) (externalNativeDirectModeResult, bool) {
-	if os.Getenv("DERPHOLE_NATIVE_TCP_DIRECT_START") != "1" {
-		return externalNativeDirectModeResult{}, false
-	}
-	if wait <= 0 {
-		return externalNativeDirectModeResult{}, false
-	}
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
-	select {
-	case result := <-ch:
-		return result, true
-	case <-timer.C:
-		return externalNativeDirectModeResult{}, false
-	case <-ctx.Done():
-		return externalNativeDirectModeResult{}, false
-	}
-}
-
-func singleExternalNativeDirectModeResult(result externalNativeDirectModeResult) <-chan externalNativeDirectModeResult {
-	ch := make(chan externalNativeDirectModeResult, 1)
-	ch <- result
-	return ch
 }
 
 func receiveTransportControl(ctx context.Context, ch <-chan derpbind.Packet, authOpt ...externalPeerControlAuth) (transport.ControlMessage, error) {
@@ -2373,14 +642,6 @@ func receiveTransportControl(ctx context.Context, ch <-chan derpbind.Packet, aut
 			return transport.ControlMessage{}, ctx.Err()
 		}
 	}
-}
-
-func sendEnvelope(ctx context.Context, client *derpbind.Client, dst key.NodePublic, env envelope) error {
-	payload, err := json.Marshal(env)
-	if err != nil {
-		return err
-	}
-	return client.Send(ctx, dst, payload)
 }
 
 func sendAuthenticatedEnvelope(ctx context.Context, client *derpbind.Client, dst key.NodePublic, env envelope, auth externalPeerControlAuth) error {
@@ -2677,37 +938,6 @@ func parseRemoteCandidateStrings(raw []string) []net.Addr {
 	return candidate.ParsePeerAddrs(raw)
 }
 
-func externalRelayOnlyRequested(parallel int, candidates []string) bool {
-	return parallel == 0 && len(candidates) == 0
-}
-
-func externalClaimRelayOnly(claim rendezvous.Claim) bool {
-	return externalRelayOnlyRequested(claim.Parallel, claim.Candidates)
-}
-
-func externalDecisionRelayOnly(decision rendezvous.Decision) bool {
-	return decision.Accept != nil && externalRelayOnlyRequested(decision.Accept.Parallel, decision.Accept.Candidates)
-}
-
-func cloneSessionAddr(addr net.Addr) net.Addr {
-	switch v := addr.(type) {
-	case *net.UDPAddr:
-		cp := *v
-		if v.IP != nil {
-			cp.IP = append(net.IP(nil), v.IP...)
-		}
-		return &cp
-	case *net.TCPAddr:
-		cp := *v
-		if v.IP != nil {
-			cp.IP = append(net.IP(nil), v.IP...)
-		}
-		return &cp
-	default:
-		return addr
-	}
-}
-
 func seedAcceptedDecisionCandidates(ctx context.Context, seeder remoteCandidateSeeder, decision rendezvous.Decision) {
 	if seeder == nil || decision.Accept == nil || len(decision.Accept.Candidates) == 0 {
 		return
@@ -2738,14 +968,6 @@ func isClaimPayload(payload []byte) bool {
 	return err == nil && env.Type == envelopeClaim && env.Claim != nil
 }
 
-func isAckPayload(payload []byte) bool {
-	if len(payload) == 0 || payload[0] != '{' {
-		return false
-	}
-	env, err := decodeEnvelope(payload)
-	return err == nil && env.Type == envelopeAck
-}
-
 func isProgressPayload(payload []byte) bool {
 	if len(payload) == 0 || payload[0] != '{' {
 		return false
@@ -2754,104 +976,12 @@ func isProgressPayload(payload []byte) bool {
 	return err == nil && env.Type == envelopeProgress
 }
 
-func isAckOrAbortPayload(payload []byte) bool {
-	if len(payload) == 0 || payload[0] != '{' {
-		return false
-	}
-	env, err := decodeEnvelope(payload)
-	return err == nil && (env.Type == envelopeAck || env.Type == envelopeAbort)
-}
-
 func isAbortPayload(payload []byte) bool {
 	if len(payload) == 0 || payload[0] != '{' {
 		return false
 	}
 	env, err := decodeEnvelope(payload)
 	return err == nil && env.Type == envelopeAbort
-}
-
-func isHeartbeatPayload(payload []byte) bool {
-	if len(payload) == 0 || payload[0] != '{' {
-		return false
-	}
-	env, err := decodeEnvelope(payload)
-	return err == nil && env.Type == envelopeHeartbeat
-}
-
-func isDirectUDPReadyAckPayload(payload []byte) bool {
-	if len(payload) == 0 || payload[0] != '{' {
-		return false
-	}
-	env, err := decodeEnvelope(payload)
-	return err == nil && env.Type == envelopeDirectUDPReadyAck
-}
-
-func isQUICModeRequestPayload(payload []byte) bool {
-	if len(payload) == 0 || payload[0] != '{' {
-		return false
-	}
-	env, err := decodeEnvelope(payload)
-	return err == nil && env.Type == envelopeQUICModeReq && env.QUICModeReq != nil
-}
-
-func isQUICModeResponsePayload(payload []byte) bool {
-	if len(payload) == 0 || payload[0] != '{' {
-		return false
-	}
-	env, err := decodeEnvelope(payload)
-	return err == nil && env.Type == envelopeQUICModeResp && env.QUICModeResp != nil
-}
-
-func isQUICModeAckPayload(payload []byte) bool {
-	if len(payload) == 0 || payload[0] != '{' {
-		return false
-	}
-	env, err := decodeEnvelope(payload)
-	return err == nil && env.Type == envelopeQUICModeAck && env.QUICModeAck != nil
-}
-
-func isQUICModeAbortAckPayload(payload []byte) bool {
-	if len(payload) == 0 || payload[0] != '{' {
-		return false
-	}
-	env, err := decodeEnvelope(payload)
-	return err == nil &&
-		env.Type == envelopeQUICModeAck &&
-		env.QUICModeAck != nil &&
-		!env.QUICModeAck.NativeDirect &&
-		!env.QUICModeAck.NativeTCP
-}
-
-func isQUICModeReadyPayload(payload []byte) bool {
-	if len(payload) == 0 || payload[0] != '{' {
-		return false
-	}
-	env, err := decodeEnvelope(payload)
-	return err == nil && env.Type == envelopeQUICModeReady && env.QUICModeReady != nil
-}
-
-func isParallelGrowRequestPayload(payload []byte) bool {
-	if len(payload) == 0 || payload[0] != '{' {
-		return false
-	}
-	env, err := decodeEnvelope(payload)
-	return err == nil && env.Type == envelopeParallelGrowReq && env.ParallelGrowReq != nil
-}
-
-func isParallelGrowAckPayload(payload []byte) bool {
-	if len(payload) == 0 || payload[0] != '{' {
-		return false
-	}
-	env, err := decodeEnvelope(payload)
-	return err == nil && env.Type == envelopeParallelGrowAck && env.ParallelGrowAck != nil
-}
-
-func isParallelGrowResultPayload(payload []byte) bool {
-	if len(payload) == 0 || payload[0] != '{' {
-		return false
-	}
-	env, err := decodeEnvelope(payload)
-	return err == nil && env.Type == envelopeParallelGrowResult && env.ParallelGrowResult != nil
 }
 
 func isDecisionPayload(payload []byte) bool {
@@ -2871,7 +1001,7 @@ func isDecisionOrAbortPayload(payload []byte) bool {
 }
 
 func isTransportDataPayload(payload []byte) bool {
-	if isTransportControlPayload(payload) || externalRelayPrefixDERPFrameKindOf(payload) != 0 {
+	if isTransportControlPayload(payload) {
 		return false
 	}
 	for _, isControlPayload := range transportDataPayloadExclusions {
@@ -2883,27 +1013,13 @@ func isTransportDataPayload(payload []byte) bool {
 }
 
 var transportDataPayloadExclusions = []func([]byte) bool{
-	isAckPayload,
 	isProgressPayload,
 	isAbortPayload,
-	isHeartbeatPayload,
 	isV2ClaimPayload,
 	isV2AcceptPayload,
 	isV2CompletePayload,
-	isDirectUDPReadyPayload,
-	isDirectUDPReadyAckPayload,
-	isDirectUDPStartPayload,
-	isDirectUDPStartAckPayload,
-	isDirectUDPRateProbePayload,
 	isClaimPayload,
 	isDecisionPayload,
-	isQUICModeRequestPayload,
-	isQUICModeResponsePayload,
-	isQUICModeAckPayload,
-	isQUICModeReadyPayload,
-	isParallelGrowRequestPayload,
-	isParallelGrowAckPayload,
-	isParallelGrowResultPayload,
 }
 
 func relayTransportAddr() net.Addr {
@@ -2927,17 +1043,4 @@ func fakeTransportCandidatesBlocked() bool {
 
 func fakeTransportEnabled() bool {
 	return os.Getenv("DERPHOLE_FAKE_TRANSPORT") == "1"
-}
-
-func externalNativeQUICConnCount() int {
-	if fakeTransportEnabled() {
-		return 1
-	}
-	if raw := os.Getenv("DERPHOLE_NATIVE_QUIC_CONNS"); raw != "" {
-		count, err := strconv.Atoi(raw)
-		if err == nil && count > 0 {
-			return count
-		}
-	}
-	return defaultExternalNativeQUICConns
 }

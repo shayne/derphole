@@ -649,29 +649,6 @@ func TestExternalTransferMetricsSenderZeroPeerProgressSetsReceiverAnchoredState(
 	}
 }
 
-func TestExternalDirectUDPSendProgressRecorderCanSkipProbeByteProgress(t *testing.T) {
-	start := time.Unix(50, 0)
-	metrics := newExternalTransferMetrics(start)
-	metrics.RecordDirectWrite(123, start.Add(100*time.Millisecond))
-	progressCalled := false
-	recorder := externalDirectUDPSendProgressRecorder(func(probe.TransferStats) {
-		progressCalled = true
-	}, metrics, false)
-
-	recorder(probe.TransferStats{
-		BytesSent:      999,
-		Retransmits:    3,
-		MaxReplayBytes: 4096,
-	})
-
-	if !progressCalled {
-		t.Fatal("progress callback was not preserved")
-	}
-	if got := metrics.DirectBytes(); got != 123 {
-		t.Fatalf("DirectBytes() = %d, want source-tracked value 123", got)
-	}
-}
-
 func TestListenConfigTraceUpdatesReceiveRelayPrefixTrace(t *testing.T) {
 	var out bytes.Buffer
 	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleReceive, time.Unix(20, 0))

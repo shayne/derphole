@@ -448,36 +448,6 @@ func withExternalTransferMetrics(ctx context.Context, metrics *externalTransferM
 	return context.WithValue(ctx, externalTransferMetricsContextKey{}, metrics)
 }
 
-func externalTransferMetricsFromContext(ctx context.Context) *externalTransferMetrics {
-	if ctx == nil {
-		return nil
-	}
-	metrics, _ := ctx.Value(externalTransferMetricsContextKey{}).(*externalTransferMetrics)
-	return metrics
-}
-
-func emitExternalTransferMetricsComplete(metrics *externalTransferMetrics, emitter *telemetry.Emitter, prefix string, stats probe.TransferStats, at time.Time) {
-	if metrics == nil {
-		return
-	}
-	if at.IsZero() {
-		at = time.Now()
-	}
-	metrics.Complete(at)
-	metrics.Emit(emitter, prefix, stats)
-}
-
-func completeExternalSendMetricsAfterPeerAck(metrics *externalTransferMetrics, bytesReceived int64, at time.Time) {
-	if metrics == nil {
-		return
-	}
-	if at.IsZero() {
-		at = time.Now()
-	}
-	metrics.RecordPeerProgress(bytesReceived, 0, at)
-	metrics.CompleteAfterPeerAck(at)
-}
-
 type externalTransferMetricsWriter struct {
 	w      io.Writer
 	record func(int64, time.Time)
@@ -487,19 +457,6 @@ func (w externalTransferMetricsWriter) Write(p []byte) (int, error) {
 	n, err := w.w.Write(p)
 	if n > 0 && w.record != nil {
 		w.record(int64(n), time.Now())
-	}
-	return n, err
-}
-
-type externalTransferMetricsReader struct {
-	r      io.Reader
-	record func(int64, time.Time)
-}
-
-func (r externalTransferMetricsReader) Read(p []byte) (int, error) {
-	n, err := r.r.Read(p)
-	if n > 0 && r.record != nil {
-		r.record(int64(n), time.Now())
 	}
 	return n, err
 }

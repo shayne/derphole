@@ -209,20 +209,8 @@ remote_env_prefix() {
     prefix+=(DERPHOLE_TRACE_HANDOFF=1)
     prefix+=(DERPHOLE_PROBE_TRACE=1)
   fi
-  if [[ -n "${DERPHOLE_NATIVE_QUIC_CONNS:-}" ]]; then
-    prefix+=(DERPHOLE_NATIVE_QUIC_CONNS="$(quote "${DERPHOLE_NATIVE_QUIC_CONNS}")")
-  fi
-  if [[ -n "${DERPHOLE_NATIVE_TCP_CONNS:-}" ]]; then
-    prefix+=(DERPHOLE_NATIVE_TCP_CONNS="$(quote "${DERPHOLE_NATIVE_TCP_CONNS}")")
-  fi
-  if [[ -n "${DERPHOLE_V2_NATIVE_TCP:-}" ]]; then
-    prefix+=(DERPHOLE_V2_NATIVE_TCP="$(quote "${DERPHOLE_V2_NATIVE_TCP}")")
-  fi
   if [[ -n "${DERPHOLE_V2_RAW_DIRECT:-}" ]]; then
     prefix+=(DERPHOLE_V2_RAW_DIRECT="$(quote "${DERPHOLE_V2_RAW_DIRECT}")")
-  fi
-  if [[ -n "${DERPHOLE_DIRECT_TRANSPORT:-}" ]]; then
-    prefix+=(DERPHOLE_DIRECT_TRANSPORT="$(quote "${DERPHOLE_DIRECT_TRANSPORT}")")
   fi
   printf '%s ' "${prefix[@]}"
 }
@@ -485,7 +473,6 @@ remote_sh "${receiver_target}" "
   echo "tool_name=${tool_name}"
   echo "iperf_port=${iperf_port}"
   echo "iperf_server_host=${iperf_server_host}"
-  echo "direct_transport=${DERPHOLE_DIRECT_TRANSPORT:-}"
 } >"${log_dir}/metadata.env"
 
 start_ms="$(now_ms)"

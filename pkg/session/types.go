@@ -41,11 +41,6 @@ type SendConfig struct {
 	ParallelPolicy     ParallelPolicy
 	Trace              *transfertrace.Recorder
 	Progress           func(bytesReceived int64, transferElapsedMS int64)
-
-	// Relay-prefix upgrades already have a live payload path. Blocking pre-data
-	// UDP probes would create an app-visible stall, so the data path ramps using
-	// real transfer feedback instead.
-	skipDirectUDPRateProbes bool
 }
 
 type OfferConfig struct {

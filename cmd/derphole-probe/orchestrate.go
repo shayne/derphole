@@ -100,7 +100,7 @@ func validateOrchestrateFlags(flags orchestrateFlags, stderr io.Writer) (int, bo
 
 func supportedOrchestrateMode(mode string) bool {
 	switch mode {
-	case "raw", "blast", "wg", "wgos", "wgiperf":
+	case "raw", "blast":
 		return true
 	default:
 		return false
@@ -120,9 +120,9 @@ func writeOrchestrateUsageError(stderr io.Writer, msg string) int {
 type orchestrateFlags struct {
 	Host      string `flag:"host" help:"Remote host to benchmark"`
 	User      string `flag:"user" help:"SSH user" default:"root"`
-	Mode      string `flag:"mode" help:"Probe mode: raw, blast, wg, wgos, or wgiperf; AEAD lands in Task 5" default:"raw"`
+	Mode      string `flag:"mode" help:"Probe mode: raw or blast; AEAD lands in Task 5" default:"raw"`
 	Transport string `flag:"transport" help:"UDP transport: legacy or batched" default:"legacy"`
 	Direction string `flag:"direction" help:"Transfer direction" default:"forward"`
 	SizeBytes int64  `flag:"size-bytes" help:"Payload size in bytes" default:"1048576"`
-	Parallel  int    `flag:"parallel" help:"Parallel TCP streams for WireGuard tunnel modes" default:"1"`
+	Parallel  int    `flag:"parallel" help:"Parallel raw/blast stripes" default:"1"`
 }
