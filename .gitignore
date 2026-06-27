@@ -6,6 +6,7 @@
 .DS_Store
 .agents/
 .claude/
+.superpowers/
 skills-lock.json
 *.xcuserstate
 xcuserdata/
