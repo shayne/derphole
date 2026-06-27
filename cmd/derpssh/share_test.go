@@ -6,6 +6,9 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 
@@ -26,16 +29,20 @@ func TestRunShareHelpPrintsUsage(t *testing.T) {
 	}
 }
 
-func TestRunShareReturnsNotWired(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	code := runShare(nil, telemetry.LevelDefault, strings.NewReader(""), &stdout, &stderr)
-	if code != 1 {
-		t.Fatalf("runShare() = %d, want 1", code)
+func TestRunSharePrintsConnectCommand(t *testing.T) {
+	old := runShareSession
+	defer func() { runShareSession = old }()
+	runShareSession = func(ctx context.Context, cfg shareSessionConfig) error {
+		_ = ctx
+		_, _ = fmt.Fprintln(cfg.Stderr, "npx -y derpssh@latest connect DSH1test")
+		return nil
 	}
-	if got := stderr.String(); !strings.Contains(got, "derpssh share is not wired yet") {
-		t.Fatalf("stderr = %q, want not wired error", got)
+	var stderr bytes.Buffer
+	code := runShare(nil, telemetry.LevelDefault, strings.NewReader(""), io.Discard, &stderr)
+	if code != 0 {
+		t.Fatalf("runShare() = %d, want 0", code)
 	}
-	if stdout.Len() != 0 {
-		t.Fatalf("stdout = %q, want empty", stdout.String())
+	if !strings.Contains(stderr.String(), "npx -y derpssh@latest connect DSH1test") {
+		t.Fatalf("stderr missing connect command:\n%s", stderr.String())
 	}
 }

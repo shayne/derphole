@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 
@@ -26,16 +27,30 @@ func TestRunConnectHelpPrintsUsage(t *testing.T) {
 	}
 }
 
-func TestRunConnectReturnsNotWired(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	code := runConnect([]string{"invite"}, telemetry.LevelDefault, strings.NewReader(""), &stdout, &stderr)
-	if code != 1 {
-		t.Fatalf("runConnect() = %d, want 1", code)
+func TestRunConnectNamePassesDisplayName(t *testing.T) {
+	old := runConnectSession
+	defer func() { runConnectSession = old }()
+	var got connectSessionConfig
+	runConnectSession = func(ctx context.Context, cfg connectSessionConfig) error {
+		_ = ctx
+		got = cfg
+		return nil
 	}
-	if got := stderr.String(); !strings.Contains(got, "derpssh connect is not wired yet") {
-		t.Fatalf("stderr = %q, want not wired error", got)
+	var stdout, stderr bytes.Buffer
+	code := runConnect([]string{"--name", "Alex", "DSH1test"}, telemetry.LevelDefault, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("runConnect() = %d, want 0; stderr:\n%s", code, stderr.String())
+	}
+	if got.DisplayName != "Alex" {
+		t.Fatalf("DisplayName = %q, want Alex", got.DisplayName)
+	}
+	if got.Invite != "DSH1test" {
+		t.Fatalf("Invite = %q, want DSH1test", got.Invite)
 	}
 	if stdout.Len() != 0 {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 }
