@@ -250,27 +250,20 @@ func (r *HostRuntime) CloseReason() string {
 }
 
 func (r *HostRuntime) acceptApprovedStreams(ctx context.Context) {
-	terminalIn, err := acceptStream(ctx, r.cfg.Mux, protocol.StreamTerminalIn)
+	streams, err := r.acceptGuestStreams(ctx)
 	if err != nil {
 		closeReady(r.terminalInReady)
-		return
-	}
-	r.mu.Lock()
-	r.terminalIn = terminalIn
-	r.mu.Unlock()
-	r.terminalInReady <- terminalIn
-	go r.readTerminalInput(ctx, terminalIn)
-
-	chatConn, err := acceptStream(ctx, r.cfg.Mux, protocol.StreamChat)
-	if err != nil {
 		closeReady(r.chatReady)
 		return
 	}
 	r.mu.Lock()
-	r.chatConn = chatConn
+	r.terminalIn = streams.terminalIn
+	r.chatConn = streams.chat
 	r.mu.Unlock()
-	r.chatReady <- chatConn
-	go r.readChat(ctx, chatConn)
+	r.terminalInReady <- streams.terminalIn
+	r.chatReady <- streams.chat
+	go r.readTerminalInput(ctx, streams.terminalIn)
+	go r.readChat(ctx, streams.chat)
 
 	terminalOut, err := openStream(ctx, r.cfg.Mux, protocol.StreamTerminalOut, r.cfg.HostID)
 	if err != nil {
@@ -281,6 +274,48 @@ func (r *HostRuntime) acceptApprovedStreams(ctx context.Context) {
 	r.terminalOut = terminalOut
 	r.mu.Unlock()
 	r.terminalOutReady <- terminalOut
+}
+
+type guestStreams struct {
+	terminalIn net.Conn
+	chat       net.Conn
+}
+
+func (r *HostRuntime) acceptGuestStreams(ctx context.Context) (guestStreams, error) {
+	var streams guestStreams
+	for streams.terminalIn == nil || streams.chat == nil {
+		stream, err := acceptAnyStream(ctx, r.cfg.Mux)
+		if err != nil {
+			closeGuestStreams(streams)
+			return guestStreams{}, err
+		}
+		switch stream.kind {
+		case protocol.StreamTerminalIn:
+			if streams.terminalIn != nil {
+				_ = stream.conn.Close()
+				continue
+			}
+			streams.terminalIn = stream.conn
+		case protocol.StreamChat:
+			if streams.chat != nil {
+				_ = stream.conn.Close()
+				continue
+			}
+			streams.chat = stream.conn
+		default:
+			_ = stream.conn.Close()
+		}
+	}
+	return streams, nil
+}
+
+func closeGuestStreams(streams guestStreams) {
+	if streams.terminalIn != nil {
+		_ = streams.terminalIn.Close()
+	}
+	if streams.chat != nil {
+		_ = streams.chat.Close()
+	}
 }
 
 func (r *HostRuntime) readTerminalInput(ctx context.Context, conn net.Conn) {

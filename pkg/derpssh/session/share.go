@@ -64,8 +64,10 @@ func Share(ctx context.Context, cfg ShareConfig) error {
 			if err != nil {
 				return err
 			}
-			defer func() { _ = terminal.Close() }()
-			go func() { _ = terminal.Wait() }()
+			defer func() {
+				_ = terminal.Close()
+				_ = terminal.Wait()
+			}()
 
 			hostName, _ := os.Hostname()
 			if hostName == "" {

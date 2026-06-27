@@ -31,21 +31,45 @@ func (w lockedWriter) write(msg protocol.Message) error {
 	return protocol.WriteFrame(w.conn, msg)
 }
 
+type acceptedStream struct {
+	conn net.Conn
+	kind protocol.StreamKind
+}
+
 func acceptStream(ctx context.Context, mux *derptun.Mux, kind protocol.StreamKind) (net.Conn, error) {
-	conn, err := mux.Accept(ctx)
+	stream, err := acceptAnyStream(ctx, mux)
 	if err != nil {
 		return nil, err
+	}
+	if stream.kind != kind {
+		_ = stream.conn.Close()
+		return nil, fmt.Errorf("unexpected %s stream hello: %s", kind, stream.kind)
+	}
+	return stream.conn, nil
+}
+
+func acceptAnyStream(ctx context.Context, mux *derptun.Mux) (acceptedStream, error) {
+	conn, err := mux.Accept(ctx)
+	if err != nil {
+		return acceptedStream{}, err
 	}
 	msg, err := protocol.ReadFrame(conn)
 	if err != nil {
 		_ = conn.Close()
-		return nil, err
+		return acceptedStream{}, err
 	}
-	if msg.Type != protocol.MessageHello || msg.Hello == nil || msg.Hello.DisplayName != string(kind) {
+	if msg.Type != protocol.MessageHello || msg.Hello == nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("unexpected %s stream hello: %#v", kind, msg)
+		return acceptedStream{}, fmt.Errorf("unexpected stream hello: %#v", msg)
 	}
-	return conn, nil
+	kind := protocol.StreamKind(msg.Hello.DisplayName)
+	switch kind {
+	case protocol.StreamTerminalIn, protocol.StreamTerminalOut, protocol.StreamChat:
+		return acceptedStream{conn: conn, kind: kind}, nil
+	default:
+		_ = conn.Close()
+		return acceptedStream{}, fmt.Errorf("unexpected stream kind: %s", kind)
+	}
 }
 
 func openStream(ctx context.Context, mux *derptun.Mux, kind protocol.StreamKind, participantID string) (net.Conn, error) {

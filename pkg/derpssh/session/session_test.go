@@ -122,6 +122,68 @@ func TestGuestReceivesHostTerminalOutput(t *testing.T) {
 	waitRuntimeExit(t, errCh, 2)
 }
 
+func TestHostAcceptsApprovedGuestStreamsOutOfOrder(t *testing.T) {
+	hostMux, guestMux, cleanup := newTestMuxPair(t)
+	defer cleanup()
+
+	input := newCaptureWriter()
+	host := NewHostRuntime(HostConfig{
+		Mux:         hostMux,
+		HostID:      "host",
+		HostName:    "host",
+		InitialCols: 80,
+		InitialRows: 24,
+		PTYInput:    input,
+		PTYOutput:   strings.NewReader("ready\n"),
+		Approval:    StaticApproval{Role: protocol.RoleWrite},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	hostErrCh := make(chan error, 1)
+	go func() { hostErrCh <- host.Run(ctx) }()
+
+	control, err := openGuestControl(ctx, guestMux, "guest-1", "Alex")
+	if err != nil {
+		t.Fatalf("open guest control: %v", err)
+	}
+	defer control.Close()
+	if got := readGuestDecisionRole(t, control); got != protocol.RoleWrite {
+		t.Fatalf("decision role = %q, want %q", got, protocol.RoleWrite)
+	}
+
+	chatConn, err := openStream(ctx, guestMux, protocol.StreamChat, "guest-1")
+	if err != nil {
+		t.Fatalf("open chat stream first: %v", err)
+	}
+	defer chatConn.Close()
+	terminalIn, err := openStream(ctx, guestMux, protocol.StreamTerminalIn, "guest-1")
+	if err != nil {
+		t.Fatalf("open terminal-in stream second: %v", err)
+	}
+	defer terminalIn.Close()
+
+	terminalOut, err := acceptStream(ctx, guestMux, protocol.StreamTerminalOut)
+	if err != nil {
+		t.Fatalf("accept terminal-out stream: %v", err)
+	}
+	defer terminalOut.Close()
+	if got := readTerminalOutput(t, terminalOut); got != "ready\n" {
+		t.Fatalf("terminal output = %q, want ready", got)
+	}
+
+	if err := protocol.WriteFrame(terminalIn, protocol.Message{
+		Type:     protocol.MessageTerminal,
+		Terminal: &protocol.TerminalEvent{Data: []byte("whoami\n")},
+	}); err != nil {
+		t.Fatalf("write terminal input: %v", err)
+	}
+	waitForCapturedWrite(t, ctx, input, "whoami\n")
+
+	cancel()
+	waitRuntimeExit(t, hostErrCh, 1)
+}
+
 func TestDeniedGuestCannotOpenApprovedStreams(t *testing.T) {
 	hostMux, guestMux, cleanup := newTestMuxPair(t)
 	defer cleanup()
@@ -368,6 +430,59 @@ func waitForCapturedWrite(t *testing.T, ctx context.Context, writer *captureWrit
 	case <-ctx.Done():
 		t.Fatalf("captured write missing before timeout")
 	}
+}
+
+func openGuestControl(ctx context.Context, mux *derptun.Mux, participantID, displayName string) (net.Conn, error) {
+	control, err := mux.OpenStream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := protocol.WriteFrame(control, protocol.Message{
+		Type: protocol.MessageHello,
+		Hello: &protocol.Hello{
+			ProtocolVersion: protocol.ProtocolVersion,
+			ParticipantID:   participantID,
+			DisplayName:     displayName,
+			Role:            protocol.RolePending,
+		},
+	}); err != nil {
+		_ = control.Close()
+		return nil, err
+	}
+	return control, nil
+}
+
+func readGuestDecisionRole(t *testing.T, conn net.Conn) protocol.Role {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set control read deadline: %v", err)
+	}
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+	for {
+		msg, err := protocol.ReadFrame(conn)
+		if err != nil {
+			t.Fatalf("read decision: %v", err)
+		}
+		if msg.Type == protocol.MessageDecision && msg.Decision != nil && msg.Decision.Accepted {
+			return msg.Decision.Role
+		}
+	}
+}
+
+func readTerminalOutput(t *testing.T, conn net.Conn) string {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set terminal read deadline: %v", err)
+	}
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+	msg, err := protocol.ReadFrame(conn)
+	if err != nil {
+		t.Fatalf("read terminal output: %v", err)
+	}
+	if msg.Type != protocol.MessageTerminal || msg.Terminal == nil {
+		t.Fatalf("terminal output message = %#v", msg)
+	}
+	return string(msg.Terminal.Data)
 }
 
 func waitForChatText(t *testing.T, ctx context.Context, messages func() []ChatMessage, name, text string) {
