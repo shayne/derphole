@@ -40,7 +40,8 @@ type HostConfig struct {
 }
 
 type GuestConfig struct {
-	Mux           *derptun.Mux
-	ParticipantID string
-	DisplayName   string
+	Mux            *derptun.Mux
+	ParticipantID  string
+	DisplayName    string
+	TerminalOutput io.Writer
 }

@@ -6,6 +6,7 @@ package session
 
 import (
 	"context"
+	"io"
 	"net"
 	"sync"
 
@@ -37,6 +38,9 @@ type GuestRuntime struct {
 }
 
 func NewGuestRuntime(cfg GuestConfig) *GuestRuntime {
+	if cfg.TerminalOutput == nil {
+		cfg.TerminalOutput = io.Discard
+	}
 	return &GuestRuntime{
 		cfg:             cfg,
 		role:            protocol.RolePending,
@@ -276,7 +280,18 @@ func (r *GuestRuntime) acceptTerminalOut(ctx context.Context) {
 		if err != nil {
 			return
 		}
-		if msg.Type == protocol.MessageClose && msg.Close != nil {
+		switch msg.Type {
+		case protocol.MessageTerminal:
+			if msg.Terminal != nil && len(msg.Terminal.Data) > 0 {
+				if _, err := r.cfg.TerminalOutput.Write(msg.Terminal.Data); err != nil {
+					r.setCloseReason(err.Error())
+					return
+				}
+			}
+		case protocol.MessageClose:
+			if msg.Close == nil {
+				continue
+			}
 			r.setCloseReason(msg.Close.Reason)
 			return
 		}

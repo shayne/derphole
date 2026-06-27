@@ -88,6 +88,40 @@ func TestHostAcceptsWriteGuestInput(t *testing.T) {
 	waitRuntimeExit(t, errCh, 2)
 }
 
+func TestGuestReceivesHostTerminalOutput(t *testing.T) {
+	hostMux, guestMux, cleanup := newTestMuxPair(t)
+	defer cleanup()
+
+	output := newCaptureWriter()
+	host := NewHostRuntime(HostConfig{
+		Mux:         hostMux,
+		HostID:      "host",
+		HostName:    "host",
+		InitialCols: 80,
+		InitialRows: 24,
+		PTYInput:    io.Discard,
+		PTYOutput:   strings.NewReader("ready\n"),
+		Approval:    StaticApproval{Role: protocol.RoleWrite},
+	})
+	guest := NewGuestRuntime(GuestConfig{
+		Mux:            guestMux,
+		ParticipantID:  "guest-1",
+		DisplayName:    "Alex",
+		TerminalOutput: output,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	errCh := make(chan error, 2)
+	go func() { errCh <- host.Run(ctx) }()
+	go func() { errCh <- guest.Run(ctx) }()
+
+	waitForGuestRole(t, ctx, guest, protocol.RoleWrite)
+	waitForCapturedWrite(t, ctx, output, "ready\n")
+	cancel()
+	waitRuntimeExit(t, errCh, 2)
+}
+
 func TestHostClosesPTYOutputOnShutdown(t *testing.T) {
 	hostMux, guestMux, cleanup := newTestMuxPair(t)
 	defer cleanup()
