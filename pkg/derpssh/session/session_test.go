@@ -5,12 +5,12 @@
 package session
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -56,14 +56,14 @@ func TestHostAcceptsWriteGuestInput(t *testing.T) {
 	hostMux, guestMux, cleanup := newTestMuxPair(t)
 	defer cleanup()
 
-	var input bytes.Buffer
+	input := newCaptureWriter()
 	host := NewHostRuntime(HostConfig{
 		Mux:         hostMux,
 		HostID:      "host",
 		HostName:    "host",
 		InitialCols: 80,
 		InitialRows: 24,
-		PTYInput:    &input,
+		PTYInput:    input,
 		PTYOutput:   strings.NewReader("ready\n"),
 		Approval:    StaticApproval{Role: protocol.RoleWrite},
 	})
@@ -83,9 +83,43 @@ func TestHostAcceptsWriteGuestInput(t *testing.T) {
 	if err := guest.SendInput(ctx, []byte("whoami\n")); err != nil {
 		t.Fatalf("SendInput(write) error = %v", err)
 	}
-	waitForBuffer(t, ctx, &input, "whoami\n")
+	waitForCapturedWrite(t, ctx, input, "whoami\n")
 	cancel()
 	waitRuntimeExit(t, errCh, 2)
+}
+
+func TestHostClosesPTYOutputOnShutdown(t *testing.T) {
+	hostMux, guestMux, cleanup := newTestMuxPair(t)
+	defer cleanup()
+
+	output := newBlockingPTYOutput()
+	host := NewHostRuntime(HostConfig{
+		Mux:         hostMux,
+		HostID:      "host",
+		HostName:    "host",
+		InitialCols: 80,
+		InitialRows: 24,
+		PTYInput:    io.Discard,
+		PTYOutput:   output,
+		Approval:    StaticApproval{Role: protocol.RoleWrite},
+	})
+	guest := NewGuestRuntime(GuestConfig{
+		Mux:           guestMux,
+		ParticipantID: "guest-1",
+		DisplayName:   "Alex",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	errCh := make(chan error, 2)
+	go func() { errCh <- host.Run(ctx) }()
+	go func() { errCh <- guest.Run(ctx) }()
+
+	waitForGuestRole(t, ctx, guest, protocol.RoleWrite)
+	waitForBlockingRead(t, ctx, output)
+	cancel()
+	waitRuntimeExit(t, errCh, 2)
+	waitForOutputClosed(t, context.Background(), output)
+	waitForOutputReadReturned(t, context.Background(), output)
 }
 
 func TestChatMessagesRoundTrip(t *testing.T) {
@@ -239,17 +273,15 @@ func waitForGuestRole(t *testing.T, ctx context.Context, guest *GuestRuntime, wa
 	}
 }
 
-func waitForBuffer(t *testing.T, ctx context.Context, buf *bytes.Buffer, want string) {
+func waitForCapturedWrite(t *testing.T, ctx context.Context, writer *captureWriter, want string) {
 	t.Helper()
-	for {
-		if buf.String() == want {
-			return
+	select {
+	case got := <-writer.writes:
+		if got != want {
+			t.Fatalf("captured write = %q, want %q", got, want)
 		}
-		select {
-		case <-time.After(10 * time.Millisecond):
-		case <-ctx.Done():
-			t.Fatalf("buffer = %q, want %q before timeout", buf.String(), want)
-		}
+	case <-ctx.Done():
+		t.Fatalf("captured write missing before timeout")
 	}
 }
 
@@ -296,5 +328,80 @@ func waitRuntimeExit(t *testing.T, errCh <-chan error, count int) {
 		case <-time.After(time.Second):
 			t.Fatal("runtime did not exit")
 		}
+	}
+}
+
+type captureWriter struct {
+	writes chan string
+}
+
+func newCaptureWriter() *captureWriter {
+	return &captureWriter{writes: make(chan string, 1)}
+}
+
+func (w *captureWriter) Write(p []byte) (int, error) {
+	w.writes <- string(p)
+	return len(p), nil
+}
+
+type blockingPTYOutput struct {
+	reading chan struct{}
+	closed  chan struct{}
+	done    chan struct{}
+	once    sync.Once
+}
+
+func newBlockingPTYOutput() *blockingPTYOutput {
+	return &blockingPTYOutput{
+		reading: make(chan struct{}),
+		closed:  make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+}
+
+func (r *blockingPTYOutput) Read([]byte) (int, error) {
+	r.once.Do(func() { close(r.reading) })
+	<-r.closed
+	close(r.done)
+	return 0, io.ErrClosedPipe
+}
+
+func (r *blockingPTYOutput) Close() error {
+	select {
+	case <-r.closed:
+	default:
+		close(r.closed)
+	}
+	return nil
+}
+
+func waitForBlockingRead(t *testing.T, ctx context.Context, output *blockingPTYOutput) {
+	t.Helper()
+	select {
+	case <-output.reading:
+	case <-ctx.Done():
+		t.Fatal("PTYOutput.Read was not reached before timeout")
+	}
+}
+
+func waitForOutputClosed(t *testing.T, ctx context.Context, output *blockingPTYOutput) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	select {
+	case <-output.closed:
+	case <-ctx.Done():
+		t.Fatal("PTYOutput was not closed")
+	}
+}
+
+func waitForOutputReadReturned(t *testing.T, ctx context.Context, output *blockingPTYOutput) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	select {
+	case <-output.done:
+	case <-ctx.Done():
+		t.Fatal("PTYOutput.Read did not return after Close")
 	}
 }

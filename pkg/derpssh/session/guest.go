@@ -308,7 +308,13 @@ func (r *GuestRuntime) setControl(conn net.Conn) {
 }
 
 func (r *GuestRuntime) writeControl(msg protocol.Message) error {
-	return lockedWriter{conn: r.control, mu: &r.controlMu}.write(msg)
+	r.mu.Lock()
+	conn := r.control
+	r.mu.Unlock()
+	if conn == nil {
+		return net.ErrClosed
+	}
+	return lockedWriter{conn: conn, mu: &r.controlMu}.write(msg)
 }
 
 func (r *GuestRuntime) writeControlCtx(ctx context.Context, msg protocol.Message) error {

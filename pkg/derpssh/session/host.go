@@ -69,6 +69,7 @@ func (r *HostRuntime) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	defer func() { _ = r.cfg.Mux.Close() }()
+	defer r.closePTYOutput()
 
 	go func() {
 		<-ctx.Done()
@@ -347,7 +348,13 @@ func (r *HostRuntime) setControl(conn net.Conn) {
 }
 
 func (r *HostRuntime) writeControl(msg protocol.Message) error {
-	return lockedWriter{conn: r.control, mu: &r.controlMu}.write(msg)
+	r.mu.Lock()
+	conn := r.control
+	r.mu.Unlock()
+	if conn == nil {
+		return net.ErrClosed
+	}
+	return lockedWriter{conn: conn, mu: &r.controlMu}.write(msg)
 }
 
 func (r *HostRuntime) writeControlCtx(ctx context.Context, msg protocol.Message) error {
@@ -375,6 +382,14 @@ func (r *HostRuntime) setCloseReason(reason string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.closeReason = reason
+}
+
+func (r *HostRuntime) closePTYOutput() {
+	closer, ok := r.cfg.PTYOutput.(io.Closer)
+	if !ok {
+		return
+	}
+	_ = closer.Close()
 }
 
 type emptyReader struct{}
