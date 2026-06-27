@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/shayne/derphole/pkg/derpssh/protocol"
@@ -59,14 +60,12 @@ func Share(ctx context.Context, cfg ShareConfig) error {
 		Emitter:     cfg.Emitter,
 		ForceRelay:  cfg.ForceRelay,
 		OnMux: func(ctx context.Context, mux *derptun.Mux) error {
-			ptySession, err := startPTY(pty.StartConfig{
-				Size: pty.Size{Cols: 80, Rows: 24},
-			})
+			terminal, err := startShareTerminal()
 			if err != nil {
 				return err
 			}
-			defer func() { _ = ptySession.Close() }()
-			go func() { _ = ptySession.Wait() }()
+			defer func() { _ = terminal.Close() }()
+			go func() { _ = terminal.Wait() }()
 
 			hostName, _ := os.Hostname()
 			if hostName == "" {
@@ -78,8 +77,8 @@ func Share(ctx context.Context, cfg ShareConfig) error {
 				HostName:    hostName,
 				InitialCols: 80,
 				InitialRows: 24,
-				PTYInput:    ptySession.File,
-				PTYOutput:   ptySession.File,
+				PTYInput:    terminal.Input,
+				PTYOutput:   terminal.Output,
 				Approval:    newShareApproval(cfg),
 			})
 		},
@@ -109,6 +108,14 @@ func newTerminalShareApproval(cfg ShareConfig) Approval {
 }
 
 func (a terminalShareApproval) Approve(req JoinRequest) protocol.Role {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DERPSSH_TEST_AUTO_APPROVE"))) {
+	case "read":
+		return protocol.RoleRead
+	case "write":
+		return protocol.RoleWrite
+	case "deny":
+		return protocol.RoleDenied
+	}
 	name := strings.TrimSpace(req.DisplayName)
 	if name == "" {
 		name = req.ParticipantID
@@ -127,6 +134,64 @@ func (a terminalShareApproval) Approve(req JoinRequest) protocol.Role {
 	default:
 		return protocol.RoleDenied
 	}
+}
+
+type shareTerminal struct {
+	Input  io.Writer
+	Output io.Reader
+	close  func() error
+	wait   func() error
+}
+
+func startShareTerminal() (*shareTerminal, error) {
+	if command := strings.TrimSpace(os.Getenv("DERPSSH_TEST_COMMAND")); command != "" {
+		cmd := exec.Command("/bin/sh", "-c", command)
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			return nil, err
+		}
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			return nil, err
+		}
+		cmd.Stderr = io.Discard
+		if err := cmd.Start(); err != nil {
+			return nil, err
+		}
+		return &shareTerminal{
+			Input:  stdin,
+			Output: stdout,
+			close:  stdin.Close,
+			wait:   cmd.Wait,
+		}, nil
+	}
+
+	ptySession, err := startPTY(pty.StartConfig{
+		Size: pty.Size{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &shareTerminal{
+		Input:  ptySession.File,
+		Output: ptySession.File,
+		close:  ptySession.Close,
+		wait:   ptySession.Wait,
+	}, nil
+}
+
+func (t *shareTerminal) Close() error {
+	if t == nil || t.close == nil {
+		return nil
+	}
+	return t.close()
+}
+
+func (t *shareTerminal) Wait() error {
+	if t == nil || t.wait == nil {
+		return nil
+	}
+	return t.wait()
 }
 
 func randomID(prefix string) string {

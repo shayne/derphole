@@ -292,6 +292,9 @@ bash ./tools/packaging/build-web.sh
 [tasks.smoke-local]
 run = "./scripts/smoke-local.sh"
 
+[tasks.smoke-derpssh-local]
+run = "./scripts/smoke-derpssh-local.sh"
+
 [tasks.smoke-remote]
 shell = "bash -c"
 run = """

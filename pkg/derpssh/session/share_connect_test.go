@@ -68,6 +68,72 @@ func TestTerminalShareApprovalDeniesByDefault(t *testing.T) {
 	}
 }
 
+func TestShareAutoApproveEnvSkipsPrompt(t *testing.T) {
+	t.Setenv("DERPSSH_TEST_AUTO_APPROVE", "write")
+	approval := newTerminalShareApproval(ShareConfig{
+		Stdin:  strings.NewReader(""),
+		Stderr: io.Discard,
+	})
+	if got := approval.Approve(JoinRequest{ParticipantID: "guest-1", DisplayName: "Alex"}); got != protocol.RoleWrite {
+		t.Fatalf("Approve(test auto approve) = %q, want %q", got, protocol.RoleWrite)
+	}
+}
+
+func TestShareTestCommandBacksHostTerminal(t *testing.T) {
+	t.Setenv("DERPSSH_TEST_COMMAND", `read line; printf input:%s "$line"`)
+
+	oldGenerateServerToken := generateServerToken
+	oldGenerateClientToken := generateClientToken
+	oldServe := serveAppMux
+	oldStartPTY := startPTY
+	oldNewApproval := newShareApproval
+	oldRunHost := runHostSession
+	defer func() {
+		generateServerToken = oldGenerateServerToken
+		generateClientToken = oldGenerateClientToken
+		serveAppMux = oldServe
+		startPTY = oldStartPTY
+		newShareApproval = oldNewApproval
+		runHostSession = oldRunHost
+	}()
+	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	startPTY = func(pty.StartConfig) (*pty.Session, error) {
+		t.Fatal("startPTY called for DERPSSH_TEST_COMMAND")
+		return nil, nil
+	}
+	newShareApproval = func(ShareConfig) Approval {
+		return StaticApproval{Role: protocol.RoleWrite}
+	}
+	serveAppMux = func(ctx context.Context, cfg appsession.DerptunAppServeConfig) error {
+		return cfg.OnMux(ctx, nil)
+	}
+	runHostSession = func(ctx context.Context, cfg HostConfig) error {
+		_ = ctx
+		if _, err := io.WriteString(cfg.PTYInput, "hello\n"); err != nil {
+			t.Fatalf("write command input: %v", err)
+		}
+		if closer, ok := cfg.PTYInput.(io.Closer); ok {
+			if err := closer.Close(); err != nil {
+				t.Fatalf("close command input: %v", err)
+			}
+		}
+		raw, err := io.ReadAll(cfg.PTYOutput)
+		if err != nil {
+			t.Fatalf("read command output: %v", err)
+		}
+		if got := string(raw); got != "input:hello" {
+			t.Fatalf("command output = %q, want input:hello", got)
+		}
+		return errors.New("stop")
+	}
+
+	err := Share(context.Background(), ShareConfig{Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: io.Discard})
+	if err == nil || err.Error() != "stop" {
+		t.Fatalf("Share() error = %v, want stop", err)
+	}
+}
+
 func TestShareUsesApprovalSeam(t *testing.T) {
 	oldGenerateServerToken := generateServerToken
 	oldGenerateClientToken := generateClientToken
