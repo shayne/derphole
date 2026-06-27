@@ -76,9 +76,12 @@ func (r *HostRuntime) Run(ctx context.Context) error {
 		_ = r.cfg.Mux.Close()
 	}()
 
-	guestID, err := r.handshake(ctx)
+	guestID, approved, err := r.handshake(ctx)
 	if err != nil {
 		return err
+	}
+	if !approved {
+		return r.readDeniedControlLoop(ctx)
 	}
 
 	go func() {
@@ -91,32 +94,32 @@ func (r *HostRuntime) Run(ctx context.Context) error {
 	return r.readControlLoop(ctx, guestID)
 }
 
-func (r *HostRuntime) handshake(ctx context.Context) (string, error) {
+func (r *HostRuntime) handshake(ctx context.Context) (string, bool, error) {
 	control, err := r.cfg.Mux.Accept(ctx)
 	if err != nil {
-		return "", ignoreContextErr(ctx, err)
+		return "", false, ignoreContextErr(ctx, err)
 	}
 	r.setControl(control)
 
 	hello, err := protocol.ReadFrame(control)
 	if err != nil {
-		return "", ignoreContextErr(ctx, err)
+		return "", false, ignoreContextErr(ctx, err)
 	}
 	guestID, guestName, err := guestFromHello(hello)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	role, err := r.approveGuest(guestID, guestName)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if !roleGranted(role) {
-		return "", r.writeControl(protocol.Message{
+		return "", false, r.writeControl(protocol.Message{
 			Type:     protocol.MessageDecision,
 			Decision: &protocol.Decision{Accepted: false, Role: protocol.RoleDenied, Reason: "join denied"},
 		})
 	}
-	return guestID, r.sendApproval(role)
+	return guestID, true, r.sendApproval(role)
 }
 
 func (r *HostRuntime) approveGuest(guestID, guestName string) (protocol.Role, error) {
@@ -166,6 +169,25 @@ func (r *HostRuntime) readControlLoop(ctx context.Context, guestID string) error
 				r.mu.Unlock()
 			}
 		case protocol.MessageClose:
+			if msg.Close != nil {
+				r.setCloseReason(msg.Close.Reason)
+			}
+			return nil
+		}
+	}
+}
+
+func (r *HostRuntime) readDeniedControlLoop(ctx context.Context) error {
+	r.mu.Lock()
+	control := r.control
+	r.mu.Unlock()
+	defer func() { _ = control.Close() }()
+	for {
+		msg, err := protocol.ReadFrame(control)
+		if err != nil {
+			return ignoreContextErr(ctx, err)
+		}
+		if msg.Type == protocol.MessageClose {
 			if msg.Close != nil {
 				r.setCloseReason(msg.Close.Reason)
 			}
@@ -403,7 +425,7 @@ func ignoreContextErr(ctx context.Context, err error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
 		return nil
 	}
 	if strings.Contains(err.Error(), "read/write on closed pipe") {

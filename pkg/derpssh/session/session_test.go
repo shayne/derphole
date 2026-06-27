@@ -122,6 +122,57 @@ func TestGuestReceivesHostTerminalOutput(t *testing.T) {
 	waitRuntimeExit(t, errCh, 2)
 }
 
+func TestDeniedGuestCannotOpenApprovedStreams(t *testing.T) {
+	hostMux, guestMux, cleanup := newTestMuxPair(t)
+	defer cleanup()
+
+	host := NewHostRuntime(HostConfig{
+		Mux:         hostMux,
+		HostID:      "host",
+		HostName:    "host",
+		InitialCols: 80,
+		InitialRows: 24,
+		PTYInput:    io.Discard,
+		PTYOutput:   strings.NewReader("ready\n"),
+		Approval:    StaticApproval{Role: protocol.RoleDenied},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	hostErrCh := make(chan error, 1)
+	go func() { hostErrCh <- host.Run(ctx) }()
+
+	control, err := guestMux.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream(control) error = %v", err)
+	}
+	defer control.Close()
+	if err := protocol.WriteFrame(control, protocol.Message{
+		Type: protocol.MessageHello,
+		Hello: &protocol.Hello{
+			ProtocolVersion: protocol.ProtocolVersion,
+			ParticipantID:   "guest-1",
+			DisplayName:     "Alex",
+			Role:            protocol.RolePending,
+		},
+	}); err != nil {
+		t.Fatalf("WriteFrame(control hello) error = %v", err)
+	}
+	decision, err := protocol.ReadFrame(control)
+	if err != nil {
+		t.Fatalf("ReadFrame(denial) error = %v", err)
+	}
+	if decision.Type != protocol.MessageDecision || decision.Decision == nil || decision.Decision.Accepted {
+		t.Fatalf("denial decision = %#v, want rejected decision", decision)
+	}
+
+	if got, ok := maliciousDeniedTerminalOutput(ctx, guestMux); ok {
+		t.Fatalf("denied guest received terminal output %q", got)
+	}
+	_ = control.Close()
+	waitRuntimeExit(t, hostErrCh, 1)
+}
+
 func TestHostClosesPTYOutputOnShutdown(t *testing.T) {
 	hostMux, guestMux, cleanup := newTestMuxPair(t)
 	defer cleanup()
@@ -363,6 +414,56 @@ func waitRuntimeExit(t *testing.T, errCh <-chan error, count int) {
 			t.Fatal("runtime did not exit")
 		}
 	}
+}
+
+func maliciousDeniedTerminalOutput(ctx context.Context, mux *derptun.Mux) (string, bool) {
+	attemptCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	if conn, err := openMaliciousStream(attemptCtx, mux, protocol.StreamTerminalIn); err == nil {
+		defer conn.Close()
+	}
+	if conn, err := openMaliciousStream(attemptCtx, mux, protocol.StreamChat); err == nil {
+		defer conn.Close()
+	}
+	conn, err := mux.Accept(attemptCtx)
+	if err != nil {
+		return "", false
+	}
+	defer conn.Close()
+	if _, err := protocol.ReadFrame(conn); err != nil {
+		return "", false
+	}
+	msg, err := protocol.ReadFrame(conn)
+	if err != nil || msg.Type != protocol.MessageTerminal || msg.Terminal == nil {
+		return "", false
+	}
+	return string(msg.Terminal.Data), true
+}
+
+func openMaliciousStream(ctx context.Context, mux *derptun.Mux, kind protocol.StreamKind) (net.Conn, error) {
+	conn, err := mux.OpenStream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	err = protocol.WriteFrame(conn, protocol.Message{
+		Type: protocol.MessageHello,
+		Hello: &protocol.Hello{
+			ProtocolVersion: protocol.ProtocolVersion,
+			ParticipantID:   "guest-1",
+			DisplayName:     string(kind),
+			Role:            protocol.RolePending,
+		},
+	})
+	_ = conn.SetWriteDeadline(time.Time{})
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
 }
 
 type captureWriter struct {
