@@ -173,6 +173,161 @@ func TestShareTestCommandRequiresHarness(t *testing.T) {
 	}
 }
 
+func TestShareRunsInvitePreflightBeforeTerminal(t *testing.T) {
+	oldGenerateServerToken := generateServerToken
+	oldGenerateClientToken := generateClientToken
+	oldShowPreflight := showShareInvitePreflight
+	oldStartPTY := startPTY
+	defer func() {
+		generateServerToken = oldGenerateServerToken
+		generateClientToken = oldGenerateClientToken
+		showShareInvitePreflight = oldShowPreflight
+		startPTY = oldStartPTY
+	}()
+
+	sentinel := errors.New("preflight sentinel")
+	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	showShareInvitePreflight = func(stdin io.Reader, stdout io.Writer, command string) (bool, error) {
+		if !strings.Contains(command, "npx -y derpssh@latest connect DSH1") {
+			t.Fatalf("preflight command = %q, want derpssh connect invite", command)
+		}
+		return true, sentinel
+	}
+	startPTY = func(pty.StartConfig) (*pty.Session, error) {
+		t.Fatal("startPTY called before preflight completed")
+		return nil, nil
+	}
+
+	err := Share(context.Background(), ShareConfig{Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: io.Discard})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Share() error = %v, want %v", err, sentinel)
+	}
+}
+
+func TestInvitePreflightScreenContainsPlainFullCommand(t *testing.T) {
+	command := "npx -y derpssh@latest connect DSH1verysecretinvitetoken1234567890"
+	screen := invitePreflightScreen(command)
+	if !strings.Contains(screen, command) {
+		t.Fatalf("preflight screen missing full command:\n%s", screen)
+	}
+	if strings.Contains(screen, "\x1b[") {
+		t.Fatalf("preflight screen contains ANSI styling:\n%q", screen)
+	}
+}
+
+func TestReadInvitePreflightInputContinuesOnEnter(t *testing.T) {
+	shown, err := readInvitePreflightInput(strings.NewReader("\n"))
+	if err != nil {
+		t.Fatalf("readInvitePreflightInput() error = %v", err)
+	}
+	if !shown {
+		t.Fatal("readInvitePreflightInput() shown = false, want true")
+	}
+}
+
+func TestReadInvitePreflightInputQuitsOnQ(t *testing.T) {
+	shown, err := readInvitePreflightInput(strings.NewReader("q"))
+	if !errors.Is(err, errInvitePreflightQuit) {
+		t.Fatalf("readInvitePreflightInput() error = %v, want invite quit", err)
+	}
+	if !shown {
+		t.Fatal("readInvitePreflightInput() shown = false, want true")
+	}
+}
+
+func TestReadInvitePreflightInputQuitsOnCtrlC(t *testing.T) {
+	shown, err := readInvitePreflightInput(strings.NewReader("\x03"))
+	if !errors.Is(err, errInvitePreflightQuit) {
+		t.Fatalf("readInvitePreflightInput() error = %v, want invite quit", err)
+	}
+	if !shown {
+		t.Fatal("readInvitePreflightInput() shown = false, want true")
+	}
+}
+
+func TestWaitingShareConsoleBuffersChatUntilHostCallbacks(t *testing.T) {
+	pending := newPendingShareChats()
+	callbacks := waitingShareConsoleCallbacks(nil, func() {}, pending)
+
+	if err := callbacks.Chat(context.Background(), "host-side"); err != nil {
+		t.Fatalf("waiting Chat() error = %v", err)
+	}
+
+	var got []string
+	pending.flush(context.Background(), func(ctx context.Context, body string) error {
+		_ = ctx
+		got = append(got, body)
+		return nil
+	})
+	if len(got) != 1 || got[0] != "host-side" {
+		t.Fatalf("flushed chats = %#v, want host-side", got)
+	}
+}
+
+func TestShareStartsTerminalBeforeGuestMux(t *testing.T) {
+	oldGenerateServerToken := generateServerToken
+	oldGenerateClientToken := generateClientToken
+	oldServe := serveAppMux
+	oldStartPTY := startPTY
+	defer func() {
+		generateServerToken = oldGenerateServerToken
+		generateClientToken = oldGenerateClientToken
+		serveAppMux = oldServe
+		startPTY = oldStartPTY
+	}()
+
+	sentinel := errors.New("pty start sentinel")
+	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	startPTY = func(pty.StartConfig) (*pty.Session, error) {
+		return nil, sentinel
+	}
+	serveAppMux = func(ctx context.Context, cfg appsession.DerptunAppServeConfig) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := Share(ctx, ShareConfig{Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: io.Discard})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Share() error = %v, want %v", err, sentinel)
+	}
+}
+
+func TestShareRendersHostTerminalBeforeGuestMux(t *testing.T) {
+	t.Setenv("DERPSSH_TEST_HARNESS", "1")
+	t.Setenv("DERPSSH_TEST_COMMAND", `printf ready; sleep 10`)
+
+	oldGenerateServerToken := generateServerToken
+	oldGenerateClientToken := generateClientToken
+	oldServe := serveAppMux
+	defer func() {
+		generateServerToken = oldGenerateServerToken
+		generateClientToken = oldGenerateClientToken
+		serveAppMux = oldServe
+	}()
+	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	serveAppMux = func(ctx context.Context, cfg appsession.DerptunAppServeConfig) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stdout := newStringCapture()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Share(ctx, ShareConfig{Stdin: strings.NewReader(""), Stdout: stdout, Stderr: io.Discard})
+	}()
+
+	waitForString(t, ctx, stdout.String, "terminal: ready")
+	cancel()
+	<-errCh
+}
+
 func TestShareUsesApprovalSeam(t *testing.T) {
 	oldGenerateServerToken := generateServerToken
 	oldGenerateClientToken := generateClientToken

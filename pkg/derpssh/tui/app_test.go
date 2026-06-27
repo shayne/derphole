@@ -180,15 +180,20 @@ func TestApprovalEscapeWinsOverHiddenKick(t *testing.T) {
 
 func TestViewDoesNotExposeFullInviteTokenInMainLayout(t *testing.T) {
 	invite := "npx -y derpssh@latest connect DSH1verysecretinvitetoken1234567890"
-	app := NewApp(Options{Side: "host", InviteCommand: invite, Terminal: &fakePane{view: "ok"}})
+	app := NewApp(Options{Side: "host", InviteCommand: invite, Terminal: &fakePane{view: "shell$"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
 	view := app.View()
 	if strings.Contains(view, invite) || strings.Contains(view, "DSH1verysecretinvitetoken1234567890") {
 		t.Fatalf("View() exposes full invite token:\n%s", view)
 	}
-	if !strings.Contains(view, "Invite ready") {
-		t.Fatalf("View() missing redacted invite status:\n%s", view)
+	for _, want := range []string{"Invite ready", "Ctrl-X I"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("View() missing invite affordance %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "DSH1...") {
+		t.Fatalf("View() renders invite token in sidebar:\n%s", view)
 	}
 }
 
@@ -197,10 +202,67 @@ func TestViewRendersModernControls(t *testing.T) {
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
 	view := app.View()
-	for _, want := range []string{"Terminal", "Sidechat", "Ctrl-X S", "Ctrl-X C", "Ctrl-X ?"} {
+	for _, want := range []string{"Terminal", "Sidechat", "Ctrl-X S", "Ctrl-X C", "Ctrl-X I", "Ctrl-X Q", "Ctrl-X ?"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("View() missing modern control %q:\n%s", want, view)
 		}
+	}
+}
+
+func TestLocalChatAuthorDefaultsToUser(t *testing.T) {
+	t.Setenv("USER", "shayne")
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	for _, r := range "hello" {
+		app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	view := app.View()
+	if !strings.Contains(view, "shayne: hello") {
+		t.Fatalf("View() missing USER chat author:\n%s", view)
+	}
+	if strings.Contains(view, "me: hello") {
+		t.Fatalf("View() used generic me author:\n%s", view)
+	}
+}
+
+func TestInviteShortcutShowsFullScreenPlainInvite(t *testing.T) {
+	invite := "npx -y derpssh@latest connect DSH1verysecretinvitetoken1234567890"
+	app := NewApp(Options{Side: "host", InviteCommand: invite, Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 40, Height: 12})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+
+	view := app.View()
+	if !strings.Contains(view, invite) {
+		t.Fatalf("invite view missing full command:\n%s", view)
+	}
+	if strings.Contains(view, "\x1b[") {
+		t.Fatalf("invite view contains ANSI styling:\n%q", view)
+	}
+	if strings.Contains(view, "shell$") || strings.Contains(view, "Sidechat") {
+		t.Fatalf("invite view did not replace main TUI:\n%s", view)
+	}
+}
+
+func TestInviteScreenEscapeReturnsToTerminal(t *testing.T) {
+	app := NewApp(Options{Side: "host", InviteCommand: "npx -y derpssh@latest connect DSH1test", Terminal: &fakePane{view: "shell$"}})
+	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	view := app.View()
+	if !strings.Contains(view, "shell$") {
+		t.Fatalf("Esc did not return to terminal view:\n%s", view)
+	}
+	if strings.Contains(view, "npx -y derpssh@latest connect") {
+		t.Fatalf("invite command still visible after Esc:\n%s", view)
 	}
 }
 

@@ -122,6 +122,60 @@ func TestGuestReceivesHostTerminalOutput(t *testing.T) {
 	waitRuntimeExit(t, errCh, 2)
 }
 
+func TestGuestReceivesFanoutTerminalOutputAfterEarlyHostStart(t *testing.T) {
+	hostMux, guestMux, cleanup := newTestMuxPair(t)
+	defer cleanup()
+
+	ptyReader, ptyWriter := io.Pipe()
+	localOutput := newCaptureWriter()
+	fanout := newTerminalFanout(ptyReader, localOutput)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() { _ = fanout.Run(ctx) }()
+	if _, err := ptyWriter.Write([]byte("ready")); err != nil {
+		t.Fatalf("write initial output: %v", err)
+	}
+	waitForCapturedWrite(t, ctx, localOutput, "ready")
+
+	hostInput := writerFunc(func(p []byte) (int, error) {
+		if string(p) == "hello\n" {
+			_, _ = ptyWriter.Write([]byte("input:hello"))
+		}
+		return len(p), nil
+	})
+	guestOutput := newCaptureWriter()
+	host := NewHostRuntime(HostConfig{
+		Mux:         hostMux,
+		HostID:      "host",
+		HostName:    "host",
+		InitialCols: 80,
+		InitialRows: 24,
+		PTYInput:    hostInput,
+		PTYOutput:   fanout.Reader(),
+		LocalOutput: io.Discard,
+		Approval:    StaticApproval{Role: protocol.RoleWrite},
+	})
+	guest := NewGuestRuntime(GuestConfig{
+		Mux:            guestMux,
+		ParticipantID:  "guest-1",
+		DisplayName:    "Alex",
+		TerminalOutput: guestOutput,
+	})
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- host.Run(ctx) }()
+	go func() { errCh <- guest.Run(ctx) }()
+
+	waitForGuestRole(t, ctx, guest, protocol.RoleWrite)
+	waitForCapturedWrite(t, ctx, guestOutput, "ready")
+	if err := guest.SendInput(ctx, []byte("hello\n")); err != nil {
+		t.Fatalf("SendInput() error = %v", err)
+	}
+	waitForCapturedWrite(t, ctx, guestOutput, "input:hello")
+	cancel()
+	waitRuntimeExit(t, errCh, 2)
+}
+
 func TestHostReceivesLocalTerminalOutput(t *testing.T) {
 	hostMux, guestMux, cleanup := newTestMuxPair(t)
 	defer cleanup()
@@ -547,6 +601,22 @@ func waitForCapturedWrite(t *testing.T, ctx context.Context, writer *captureWrit
 	}
 }
 
+func waitForString(t *testing.T, ctx context.Context, value func() string, want string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	for {
+		if strings.Contains(value(), want) {
+			return
+		}
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatalf("output missing %q before timeout:\n%s", want, value())
+		}
+	}
+}
+
 func openGuestControl(ctx context.Context, mux *derptun.Mux, participantID, displayName string) (net.Conn, error) {
 	control, err := mux.OpenStream(ctx)
 	if err != nil {
@@ -697,6 +767,8 @@ func openMaliciousStream(ctx context.Context, mux *derptun.Mux, kind protocol.St
 }
 
 type captureWriter struct {
+	mu     sync.Mutex
+	buffer strings.Builder
 	writes chan string
 }
 
@@ -705,8 +777,45 @@ func newCaptureWriter() *captureWriter {
 }
 
 func (w *captureWriter) Write(p []byte) (int, error) {
-	w.writes <- string(p)
+	data := string(p)
+	w.mu.Lock()
+	w.buffer.WriteString(data)
+	w.mu.Unlock()
+	w.writes <- data
 	return len(p), nil
+}
+
+func (w *captureWriter) Contains(s string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return strings.Contains(w.buffer.String(), s)
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) {
+	return f(p)
+}
+
+type stringCapture struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func newStringCapture() *stringCapture {
+	return &stringCapture{}
+}
+
+func (w *stringCapture) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.Write(p)
+}
+
+func (w *stringCapture) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.String()
 }
 
 type blockingPTYOutput struct {

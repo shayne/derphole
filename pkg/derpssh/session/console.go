@@ -34,6 +34,7 @@ type tuiConsoleCallbacks struct {
 	RoleChange    func(context.Context, string, protocol.Role) error
 	Kick          func(context.Context, string, string) error
 	Resize        func(context.Context, int, int) error
+	Quit          func()
 }
 
 type tuiConsoleOptions struct {
@@ -374,6 +375,8 @@ func (c *tuiConsole) handleCommand(ctx context.Context, cmd tui.Command) {
 		c.handleTerminalInputCommand(ctx, cmd)
 	case tui.ChatSendCommand:
 		c.handleChatCommand(ctx, cmd)
+	case tui.QuitCommand:
+		c.handleQuitCommand()
 	case tui.RoleChangeCommand:
 		c.handleRoleChangeCommand(ctx, cmd)
 	case tui.KickCommand:
@@ -381,6 +384,15 @@ func (c *tuiConsole) handleCommand(ctx context.Context, cmd tui.Command) {
 	case tui.TerminalResizeCommand:
 		c.handleResizeCommand(ctx, cmd)
 	}
+}
+
+func (c *tuiConsole) handleQuitCommand() {
+	callbacks := c.currentCallbacks()
+	if callbacks.Quit != nil {
+		callbacks.Quit()
+		return
+	}
+	c.Stop()
 }
 
 func (c *tuiConsole) handleTerminalInputCommand(ctx context.Context, cmd tui.TerminalInputCommand) {

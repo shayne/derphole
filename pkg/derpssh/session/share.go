@@ -8,11 +8,14 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/shayne/derphole/pkg/derpssh/protocol"
 	"github.com/shayne/derphole/pkg/derpssh/pty"
@@ -35,6 +38,7 @@ var generateClientToken = derptun.GenerateClientToken
 var serveAppMux = appsession.DerptunAppServe
 var startPTY = pty.Start
 var newShareApproval = newTerminalShareApproval
+var showShareInvitePreflight = showInvitePreflight
 var runHostSession = func(ctx context.Context, cfg HostConfig, bindConsole func(*HostRuntime)) error {
 	host := NewHostRuntime(cfg)
 	if bindConsole != nil {
@@ -45,20 +49,47 @@ var runHostSession = func(ctx context.Context, cfg HostConfig, bindConsole func(
 
 func Share(ctx context.Context, cfg ShareConfig) error {
 	cfg = normalizeShareConfig(cfg)
-	serverToken, err := generateServerToken(derptun.ServerTokenOptions{})
+	serverToken, connectCommand, err := newShareInviteCommand()
 	if err != nil {
 		return err
+	}
+	if err := presentShareInvite(cfg, connectCommand); err != nil {
+		if errors.Is(err, errInvitePreflightQuit) {
+			return nil
+		}
+		return err
+	}
+	return runShare(ctx, cfg, serverToken, connectCommand)
+}
+
+func newShareInviteCommand() (string, string, error) {
+	serverToken, err := generateServerToken(derptun.ServerTokenOptions{})
+	if err != nil {
+		return "", "", err
 	}
 	clientToken, err := generateClientToken(derptun.ClientTokenOptions{ServerToken: serverToken})
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	invite, err := EncodeInvite(Invite{ClientToken: clientToken})
 	if err != nil {
+		return "", "", err
+	}
+	return serverToken, fmt.Sprintf("npx -y derpssh@latest connect %s", invite), nil
+}
+
+func presentShareInvite(cfg ShareConfig, connectCommand string) error {
+	preflightShown, err := showShareInvitePreflight(cfg.Stdin, cfg.Stdout, connectCommand)
+	if err != nil {
 		return err
 	}
-	connectCommand := fmt.Sprintf("npx -y derpssh@latest connect %s", invite)
-	_, _ = fmt.Fprintln(cfg.Stderr, connectCommand)
+	if !preflightShown {
+		_, _ = fmt.Fprintln(cfg.Stderr, connectCommand)
+	}
+	return nil
+}
+
+func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand string) error {
 	size := terminalSize(cfg.Stdout)
 	console := newTerminalConsoleWithOptions(tuiConsoleOptions{
 		Mode:          tui.ModeHost,
@@ -69,23 +100,40 @@ func Share(ctx context.Context, cfg ShareConfig) error {
 		InviteCommand: connectCommand,
 	})
 	terminalSize := console.TerminalSize()
-	console.Start(ctx)
-	defer console.Stop()
+	terminal, err := startShareTerminal(terminalSize)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = terminal.Close()
+		_ = terminal.Wait()
+	}()
 
-	return serveAppMux(ctx, appsession.DerptunAppServeConfig{
+	shareCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var hostStarted atomic.Bool
+	fanout := newTerminalFanout(terminal.Output, console)
+	go func() {
+		_ = fanout.Run(shareCtx)
+		if !hostStarted.Load() {
+			cancel()
+		}
+	}()
+
+	pendingChats := newPendingShareChats()
+	console.SetCommandCallbacks(waitingShareConsoleCallbacks(terminal, cancel, pendingChats))
+	console.Start(shareCtx)
+	defer console.Stop()
+	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventStatus, Message: "waiting for guest"})
+	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventResize, Cols: terminalSize.Cols, Rows: terminalSize.Rows})
+
+	return serveAppMux(shareCtx, appsession.DerptunAppServeConfig{
 		ServerToken: serverToken,
 		Emitter:     cfg.Emitter,
 		ForceRelay:  cfg.ForceRelay,
 		OnMux: func(ctx context.Context, mux *derptun.Mux) error {
-			terminal, err := startShareTerminal(terminalSize)
-			if err != nil {
-				return err
-			}
-			defer func() {
-				_ = terminal.Close()
-				_ = terminal.Wait()
-			}()
-
+			hostStarted.Store(true)
 			hostName, _ := os.Hostname()
 			if hostName == "" {
 				hostName = "host"
@@ -101,20 +149,172 @@ func Share(ctx context.Context, cfg ShareConfig) error {
 				InitialCols: terminalSize.Cols,
 				InitialRows: terminalSize.Rows,
 				PTYInput:    terminal.Input,
-				PTYOutput:   terminal.Output,
+				PTYOutput:   fanout.LazyReader(),
 				PTYResize: func(cols int, rows int) error {
 					return terminal.Resize(pty.Size{Cols: cols, Rows: rows})
 				},
 				LocalInput:  emptyReader{},
-				LocalOutput: console,
+				LocalOutput: io.Discard,
 				Approval:    approval,
 				Observer:    console,
 			}
 			return runHostSession(ctx, hostCfg, func(host *HostRuntime) {
-				console.SetCommandCallbacks(hostConsoleCallbacks(host))
+				callbacks := hostConsoleCallbacks(host)
+				callbacks.Quit = cancel
+				console.SetCommandCallbacks(callbacks)
+				go pendingChats.flush(ctx, callbacks.Chat)
 			})
 		},
 	})
+}
+
+func waitingShareConsoleCallbacks(terminal *shareTerminal, cancel context.CancelFunc, pendingChats *pendingShareChats) tuiConsoleCallbacks {
+	return tuiConsoleCallbacks{
+		TerminalInput: func(ctx context.Context, data []byte) error {
+			_ = ctx
+			if terminal == nil || terminal.Input == nil {
+				return io.ErrClosedPipe
+			}
+			_, err := terminal.Input.Write(data)
+			return err
+		},
+		Resize: func(ctx context.Context, cols int, rows int) error {
+			_ = ctx
+			if terminal == nil {
+				return nil
+			}
+			return terminal.Resize(pty.Size{Cols: cols, Rows: rows})
+		},
+		Chat: func(ctx context.Context, body string) error {
+			_ = ctx
+			if pendingChats != nil {
+				pendingChats.append(body)
+			}
+			return nil
+		},
+		Quit: cancel,
+	}
+}
+
+type pendingShareChats struct {
+	mu     sync.Mutex
+	bodies []string
+}
+
+func newPendingShareChats() *pendingShareChats {
+	return &pendingShareChats{}
+}
+
+func (p *pendingShareChats) append(body string) {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.bodies = append(p.bodies, body)
+}
+
+func (p *pendingShareChats) flush(ctx context.Context, send func(context.Context, string) error) {
+	if p == nil || send == nil {
+		return
+	}
+	p.mu.Lock()
+	bodies := append([]string(nil), p.bodies...)
+	p.bodies = nil
+	p.mu.Unlock()
+	for _, body := range bodies {
+		if ctx.Err() != nil {
+			return
+		}
+		_ = send(ctx, body)
+	}
+}
+
+var errInvitePreflightQuit = errors.New("invite preflight quit")
+
+func showInvitePreflight(stdin io.Reader, stdout io.Writer, command string) (bool, error) {
+	inFile, ok := invitePreflightFiles(stdin, stdout)
+	if !ok {
+		return false, nil
+	}
+	if err := renderInvitePreflight(stdout, command); err != nil {
+		return true, err
+	}
+	return readRawInvitePreflightInput(inFile)
+}
+
+func invitePreflightFiles(stdin io.Reader, stdout io.Writer) (*os.File, bool) {
+	inFile, inOK := stdin.(*os.File)
+	outFile, outOK := stdout.(*os.File)
+	if !inOK || !outOK || !pty.IsTerminal(inFile.Fd()) || !pty.IsTerminal(outFile.Fd()) {
+		return nil, false
+	}
+	return inFile, true
+}
+
+func renderInvitePreflight(stdout io.Writer, command string) error {
+	_, err := io.WriteString(stdout, "\x1b[2J\x1b[H"+invitePreflightScreen(command))
+	return err
+}
+
+func readRawInvitePreflightInput(inFile *os.File) (bool, error) {
+	state, err := pty.MakeRaw(inFile.Fd())
+	if err != nil {
+		return true, err
+	}
+	defer func() { _ = pty.Restore(inFile.Fd(), state) }()
+	return readInvitePreflightInput(inFile)
+}
+
+func readInvitePreflightInput(r io.Reader) (bool, error) {
+	var b [1]byte
+	for {
+		n, err := r.Read(b[:])
+		if n > 0 {
+			switch invitePreflightKeyAction(b[0]) {
+			case invitePreflightContinue:
+				return true, nil
+			case invitePreflightQuit:
+				return true, errInvitePreflightQuit
+			}
+		}
+		if err != nil {
+			return true, err
+		}
+	}
+}
+
+type invitePreflightAction int
+
+const (
+	invitePreflightIgnore invitePreflightAction = iota
+	invitePreflightContinue
+	invitePreflightQuit
+)
+
+func invitePreflightKeyAction(b byte) invitePreflightAction {
+	switch b {
+	case '\r', '\n':
+		return invitePreflightContinue
+	case 'q', 'Q', 0x03:
+		return invitePreflightQuit
+	default:
+		return invitePreflightIgnore
+	}
+}
+
+func invitePreflightScreen(command string) string {
+	return strings.Join([]string{
+		"derpssh invite",
+		"",
+		"Copy this command and send it to the other person:",
+		"",
+		strings.TrimSpace(command),
+		"",
+		"Press Enter to start sharing. Press q to quit.",
+		"",
+	}, "\n")
 }
 
 func normalizeShareConfig(cfg ShareConfig) ShareConfig {

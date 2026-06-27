@@ -81,7 +81,9 @@ func Connect(ctx context.Context, cfg ConnectConfig) error {
 		Observer:       console,
 	}
 	guest := NewGuestRuntime(guestCfg)
-	console.SetCommandCallbacks(guestConsoleCallbacks(guest))
+	callbacks := guestConsoleCallbacks(guest)
+	callbacks.Quit = cancel
+	console.SetCommandCallbacks(callbacks)
 	console.Start(runCtx)
 	defer console.Stop()
 	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventStatus, Message: "waiting for host approval"})

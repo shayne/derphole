@@ -6,6 +6,7 @@ package tui
 
 import (
 	"fmt"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -110,13 +111,29 @@ func (a *App) handleTopBarMouse(msg tea.MouseMsg) bool {
 
 func (a *App) handleContentMouse(msg tea.MouseMsg) {
 	switch a.layout.Hit(msg.X, msg.Y) {
-	case HitComposer, HitSidebar:
+	case HitSidebar:
+		if msg.Action == tea.MouseActionPress {
+			if a.sidebarInviteHit(msg.X, msg.Y) {
+				a.openInvite()
+				return
+			}
+			a.focusChat()
+		}
+	case HitComposer:
 		if msg.Action == tea.MouseActionPress {
 			a.focusChat()
 		}
 	case HitTerminal:
 		a.handleTerminalMouse(msg)
 	}
+}
+
+func (a *App) sidebarInviteHit(x int, y int) bool {
+	if strings.TrimSpace(a.inviteCommand) == "" || !a.layout.Sidebar.contains(x, y) {
+		return false
+	}
+	relativeY := y - a.layout.Sidebar.Y
+	return relativeY >= 1 && relativeY <= 2
 }
 
 func (a *App) handleTerminalMouse(msg tea.MouseMsg) {

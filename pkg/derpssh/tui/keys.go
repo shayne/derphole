@@ -83,6 +83,10 @@ func (a *App) handleGlobalPrefix(key string) {
 		a.focusChat()
 	case "t":
 		a.focusTerminal()
+	case "i":
+		a.openInvite()
+	case "q":
+		a.emit(QuitCommand{})
 	case "r":
 		a.changeFirstPeerRole(RoleRead)
 	case "w":

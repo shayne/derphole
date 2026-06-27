@@ -6,6 +6,7 @@ package tui
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 
@@ -42,6 +43,7 @@ type App struct {
 	approvalPeer   string
 	kickPeerID     string
 	kickPeer       string
+	inviteOpen     bool
 
 	localRole    Role
 	transport    string
@@ -124,6 +126,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (a *App) View() string {
 	if a.width <= 0 || a.height <= 0 {
 		return ""
+	}
+	if a.inviteOpen {
+		return a.inviteView()
 	}
 	a.applyLayout()
 
@@ -226,20 +231,17 @@ func (a *App) emitTerminalResizeIfChanged(oldTerminal Rect) {
 }
 
 func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
+	if a.inviteOpen {
+		return a.handleInviteKey(msg)
+	}
 	if a.handleEscapeKey(msg) {
 		return nil
 	}
 	if a.helpOpen {
 		return nil
 	}
-	if a.approvalActive() {
-		if a.prefix {
-			return HandlePrefixKey(a, msg)
-		}
-		if msg.Type == tea.KeyCtrlX {
-			a.prefix = true
-		}
-		return nil
+	if cmd, handled := a.handleApprovalKey(msg); handled {
+		return cmd
 	}
 	if a.kickPeer != "" {
 		return a.handleKickOverlayKey(msg)
@@ -257,6 +259,31 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 	}
 
 	return a.handleTerminalKey(msg)
+}
+
+func (a *App) handleApprovalKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	if !a.approvalActive() {
+		return nil, false
+	}
+	if a.prefix {
+		return HandlePrefixKey(a, msg), true
+	}
+	if msg.Type == tea.KeyCtrlX {
+		a.prefix = true
+	}
+	return nil, true
+}
+
+func (a *App) handleInviteKey(msg tea.KeyMsg) tea.Cmd {
+	switch {
+	case msg.Type == tea.KeyEsc || msg.Type == tea.KeyEnter:
+		a.inviteOpen = false
+	case msg.Type == tea.KeyRunes && strings.EqualFold(string(msg.Runes), "q"):
+		a.emit(QuitCommand{})
+	default:
+		return nil
+	}
+	return nil
 }
 
 func (a *App) handleEscapeKey(msg tea.KeyMsg) bool {
@@ -297,7 +324,7 @@ func (a *App) handleChatKey(msg tea.KeyMsg) tea.Cmd {
 		body := strings.TrimSpace(a.composer.Value())
 		if body != "" {
 			a.emit(ChatSendCommand{Body: body})
-			a.chatMessages = append(a.chatMessages, ChatMessage{Author: valueOr(a.displayName, "me"), Body: body, Local: true})
+			a.chatMessages = append(a.chatMessages, ChatMessage{Author: a.localDisplayName(), Body: body, Local: true})
 			a.composer.Reset()
 		}
 		return nil
@@ -341,6 +368,19 @@ func (a *App) topBar() string {
 	return strings.Join(parts, " | ")
 }
 
+func (a *App) localDisplayName() string {
+	if name := strings.TrimSpace(a.displayName); name != "" {
+		return name
+	}
+	if name := strings.TrimSpace(os.Getenv("USER")); name != "" {
+		return name
+	}
+	if side := strings.TrimSpace(a.side); side != "" {
+		return side
+	}
+	return "local"
+}
+
 func (a *App) contentLines() []string {
 	if !a.sidebarOpen || a.layout.Sidebar.empty() {
 		return padLines(splitAndFit(a.terminal.View(a.layout.Terminal.W, a.layout.Terminal.H), a.layout.Terminal.W, a.layout.Terminal.H), a.layout.Terminal.H, a.layout.Terminal.W)
@@ -363,7 +403,8 @@ func (a *App) sidebarLines(width int, height int) []string {
 	contentW := sidebarContentWidth(width)
 	content := make([]string, height)
 	a.writeSidebarHeader(content, contentW)
-	a.writeSidebarMessages(content, contentW, height)
+	messageStart := a.writeSidebarInvite(content, contentW, height)
+	a.writeSidebarMessages(content, contentW, height, messageStart)
 	a.writeSidebarComposer(content, contentW, height)
 	for i := range lines {
 		lines[i] = fitLine(separatorStyle.Render(" ")+sidebarStyle.Render(fitLine(content[i], contentW)), width)
@@ -382,8 +423,21 @@ func (a *App) writeSidebarHeader(content []string, width int) {
 	content[0] = fitLine(labelStyle.Render("Sidechat")+" "+dimStyle.Render("Ctrl-X C"), width)
 }
 
-func (a *App) writeSidebarMessages(content []string, width int, height int) {
+func (a *App) writeSidebarInvite(content []string, width int, height int) int {
 	row := 1
+	if strings.TrimSpace(a.inviteCommand) == "" || row >= height-3 {
+		return row
+	}
+	content[row] = fitLine(labelStyle.Render("Invite ready")+" "+dimStyle.Render("Ctrl-X I"), width)
+	row++
+	if row < height-3 {
+		content[row] = ""
+		row++
+	}
+	return row
+}
+
+func (a *App) writeSidebarMessages(content []string, width int, height int, row int) {
 	for _, msg := range a.chatMessages {
 		if row >= height-3 {
 			return
@@ -426,9 +480,9 @@ func (a *App) statusBar() string {
 	if a.focus == FocusApproval {
 		focus = "Approval"
 	}
-	state := fmt.Sprintf("Status %s | Ctrl-X ? Help | Ctrl-X S Sidechat | Ctrl-X C Chat | Ctrl-X T Terminal | Ctrl-X R/W Role | Ctrl-X K Kick | Focus %s", valueOr(a.transport, "starting"), focus)
+	state := fmt.Sprintf("Status %s | %s | Ctrl-X ? | Ctrl-X Q | Ctrl-X I | Ctrl-X S | Ctrl-X C | Ctrl-X T | Ctrl-X R/W | Ctrl-X K", valueOr(a.transport, "starting"), focus)
 	if a.prefix {
-		state = "Status prefix | S Sidechat | C Chat | T Terminal | ? Help"
+		state = "Status prefix | S Sidechat | C Chat | T Terminal | I Invite | Q Quit | ? Help"
 	}
 	return state
 }
@@ -449,6 +503,8 @@ func (a *App) helpLines() []string {
 		"Ctrl-X S toggles Sidechat",
 		"Ctrl-X C focuses Chat",
 		"Ctrl-X T focuses Terminal",
+		"Ctrl-X I shows Invite",
+		"Ctrl-X Q quits",
 		"Ctrl-X R grants Read",
 		"Ctrl-X W grants Write",
 		"Ctrl-X K kicks peer",
@@ -542,6 +598,37 @@ func (a *App) changeFirstPeerRole(role Role) {
 	}
 	peer := a.peers[0]
 	a.emit(RoleChangeCommand{PeerID: peer.ID, Peer: valueOr(peer.Name, peer.ID), Role: role})
+}
+
+func (a *App) openInvite() {
+	if strings.TrimSpace(a.inviteCommand) == "" {
+		return
+	}
+	a.inviteOpen = true
+}
+
+func (a *App) inviteView() string {
+	lines := []string{
+		"derpssh invite",
+		"",
+		"Copy this command and send it to the other person:",
+		"",
+		strings.TrimSpace(a.inviteCommand),
+		"",
+		"Press Enter or Esc to return. Press q to quit.",
+	}
+	if a.height <= 0 {
+		return strings.Join(lines, "\n")
+	}
+	padded := make([]string, 0, a.height)
+	padded = append(padded, lines...)
+	for len(padded) < a.height {
+		padded = append(padded, "")
+	}
+	if len(padded) > a.height {
+		padded = padded[:a.height]
+	}
+	return strings.Join(padded, "\n")
 }
 
 func (a *App) emit(cmd Command) {

@@ -27,6 +27,10 @@ type ChatSendCommand struct {
 
 func (ChatSendCommand) command() {}
 
+type QuitCommand struct{}
+
+func (QuitCommand) command() {}
+
 type RoleChangeCommand struct {
 	PeerID string
 	Peer   string
