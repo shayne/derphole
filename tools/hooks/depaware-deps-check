@@ -26,10 +26,17 @@ check_no_dependency() {
 }
 
 check_no_dependency cmd/derphole/depaware.txt 'github\.com/shayne/derphole/cmd/derptun' "cmd/derphole depends on cmd/derptun (not allowed)."
+check_no_dependency cmd/derphole/depaware.txt 'github\.com/shayne/derphole/cmd/derpssh' "cmd/derphole depends on cmd/derpssh (not allowed)."
 check_no_dependency cmd/derphole/depaware.txt 'github\.com/shayne/derphole/cmd/derphole-probe' "cmd/derphole depends on cmd/derphole-probe (not allowed)."
 check_no_dependency cmd/derptun/depaware.txt 'github\.com/shayne/derphole/cmd/derphole' "cmd/derptun depends on cmd/derphole (not allowed)."
+check_no_dependency cmd/derptun/depaware.txt 'github\.com/shayne/derphole/cmd/derpssh' "cmd/derptun depends on cmd/derpssh (not allowed)."
 check_no_dependency cmd/derptun/depaware.txt 'github\.com/shayne/derphole/cmd/derphole-probe' "cmd/derptun depends on cmd/derphole-probe (not allowed)."
+check_no_dependency cmd/derpssh/depaware.txt 'github\.com/shayne/derphole/cmd/derphole' "cmd/derpssh depends on cmd/derphole (not allowed)."
+check_no_dependency cmd/derpssh/depaware.txt 'github\.com/shayne/derphole/cmd/derptun' "cmd/derpssh depends on cmd/derptun (not allowed)."
+check_no_dependency cmd/derpssh/depaware.txt 'github\.com/shayne/derphole/cmd/derphole-probe' "cmd/derpssh depends on cmd/derphole-probe (not allowed)."
 check_no_dependency cmd/derphole-probe/depaware.txt 'github\.com/shayne/derphole/cmd/derphole' "cmd/derphole-probe depends on cmd/derphole (not allowed)."
 check_no_dependency cmd/derphole-probe/depaware.txt 'github\.com/shayne/derphole/cmd/derptun' "cmd/derphole-probe depends on cmd/derptun (not allowed)."
+check_no_dependency cmd/derphole-probe/depaware.txt 'github\.com/shayne/derphole/cmd/derpssh' "cmd/derphole-probe depends on cmd/derpssh (not allowed)."
 check_no_dependency cmd/derphole-web/depaware.txt 'github\.com/shayne/derphole/cmd/derphole' "cmd/derphole-web depends on cmd/derphole (not allowed)."
 check_no_dependency cmd/derphole-web/depaware.txt 'github\.com/shayne/derphole/cmd/derptun' "cmd/derphole-web depends on cmd/derptun (not allowed)."
+check_no_dependency cmd/derphole-web/depaware.txt 'github\.com/shayne/derphole/cmd/derpssh' "cmd/derphole-web depends on cmd/derpssh (not allowed)."

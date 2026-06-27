@@ -17,6 +17,7 @@ fi
 targets=(
   ./cmd/derphole
   ./cmd/derptun
+  ./cmd/derpssh
   ./cmd/derphole-probe
   ./cmd/derphole-web
 )
@@ -24,6 +25,7 @@ targets=(
 depaware_files=(
   cmd/derphole/depaware.txt
   cmd/derptun/depaware.txt
+  cmd/derpssh/depaware.txt
   cmd/derphole-probe/depaware.txt
   cmd/derphole-web/depaware.txt
 )

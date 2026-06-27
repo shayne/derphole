@@ -85,6 +85,7 @@ set -euo pipefail
 mkdir -p dist
 go build -o dist/derphole ./cmd/derphole
 go build -o dist/derptun ./cmd/derptun
+go build -o dist/derpssh ./cmd/derpssh
 """
 
 [tasks."apple:build"]
@@ -236,6 +237,7 @@ set -euo pipefail
 mkdir -p dist
 GOOS=linux GOARCH=amd64 go build -o dist/derphole-linux-amd64 ./cmd/derphole
 GOOS=linux GOARCH=amd64 go build -o dist/derptun-linux-amd64 ./cmd/derptun
+GOOS=linux GOARCH=amd64 go build -o dist/derpssh-linux-amd64 ./cmd/derpssh
 """
 
 [tasks."release:build-vendor"]
