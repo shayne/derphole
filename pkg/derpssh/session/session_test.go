@@ -381,6 +381,7 @@ func TestHostResizeBroadcastsCanonicalSize(t *testing.T) {
 	hostMux, guestMux, cleanup := newTestMuxPair(t)
 	defer cleanup()
 
+	var resizedCols, resizedRows int
 	host := NewHostRuntime(HostConfig{
 		Mux:         hostMux,
 		HostID:      "host",
@@ -389,7 +390,11 @@ func TestHostResizeBroadcastsCanonicalSize(t *testing.T) {
 		InitialRows: 24,
 		PTYInput:    io.Discard,
 		PTYOutput:   strings.NewReader(""),
-		Approval:    StaticApproval{Role: protocol.RoleWrite},
+		PTYResize: func(cols int, rows int) error {
+			resizedCols, resizedRows = cols, rows
+			return nil
+		},
+		Approval: StaticApproval{Role: protocol.RoleWrite},
 	})
 	guest := NewGuestRuntime(GuestConfig{
 		Mux:           guestMux,
@@ -406,6 +411,9 @@ func TestHostResizeBroadcastsCanonicalSize(t *testing.T) {
 	waitForGuestRole(t, ctx, guest, protocol.RoleWrite)
 	if err := host.Resize(ctx, 100, 32); err != nil {
 		t.Fatalf("host Resize() error = %v", err)
+	}
+	if resizedCols != 100 || resizedRows != 32 {
+		t.Fatalf("PTYResize = %dx%d, want 100x32", resizedCols, resizedRows)
 	}
 	if err := guest.ReportSize(ctx, 200, 60); err != nil {
 		t.Fatalf("guest ReportSize() error = %v", err)

@@ -75,6 +75,30 @@ remote_path_trace() {
   remote "grep -E 'connected-(relay|direct)|v2-data-plane=raw-direct|v2-raw-direct-active=[1-9][0-9]*' '${file}' 2>/dev/null || true"
 }
 
+wait_for_contains() {
+  local file="$1"
+  local want="$2"
+  for _ in $(seq 1 180); do
+    if grep -F "${want}" "${file}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+wait_for_remote_contains() {
+  local file="$1"
+  local want="$2"
+  for _ in $(seq 1 180); do
+    if remote "grep -F '${want}' '${file}' >/dev/null 2>&1"; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
 dump_logs() {
   echo '--- local connect err' >&2
   sed -n '1,220p' "${connect_err}" >&2 || true
@@ -92,7 +116,7 @@ scp "${root_dir}/dist/derpssh-linux-amd64" "${remote_target}:${remote_upload}" >
 remote "install -m 0755 '${remote_upload}' '${remote_bin}' && rm -f '${remote_upload}' && '${remote_bin}' version >/dev/null"
 
 echo "starting remote derpssh share on ${remote_target}" >&2
-remote "rm -f '${remote_base}.share.pid' '${remote_base}.share.out' '${remote_base}.share.err' '${remote_base}.share.in'; mkfifo '${remote_base}.share.in'; exec 9<>'${remote_base}.share.in'; env DERPSSH_TEST_AUTO_APPROVE=read DERPSSH_TEST_COMMAND='printf ready; read line; printf input:%s \"\$line\"' nohup '${remote_bin}' --verbose share <&9 >'${remote_base}.share.out' 2>'${remote_base}.share.err' & echo \$! >'${remote_base}.share.pid'"
+remote "rm -f '${remote_base}.share.pid' '${remote_base}.share.out' '${remote_base}.share.err' '${remote_base}.share.in'; mkfifo '${remote_base}.share.in'; exec 9<>'${remote_base}.share.in'; env DERPSSH_TEST_HARNESS=1 DERPSSH_TEST_AUTO_APPROVE=write DERPSSH_TEST_COMMAND='printf ready; read line; printf input:%s \"\$line\"' DERPSSH_TEST_HOST_ACTIONS='chat host-side' nohup '${remote_bin}' --verbose share <&9 >'${remote_base}.share.out' 2>'${remote_base}.share.err' & echo \$! >'${remote_base}.share.pid'"
 
 connect_line="$(wait_for_remote_invite)" || {
   echo "failed to capture remote derpssh connect command" >&2
@@ -108,14 +132,13 @@ fi
 
 mkfifo "${connect_in}"
 exec {connect_fd}<>"${connect_in}"
-"${root_dir}/dist/derpssh" --verbose connect --name smoke "${invite}" <&$connect_fd >"${connect_out}" 2>"${connect_err}" &
+DERPSSH_TEST_HARNESS=1 \
+DERPSSH_TEST_GUEST_ACTIONS=$'chat guest-side\ninput hello\\n\n' \
+  "${root_dir}/dist/derpssh" --verbose connect --name smoke "${invite}" <&$connect_fd >"${connect_out}" 2>"${connect_err}" &
 connect_pid=$!
 
-printf ':chat guest-side\n' >&$connect_fd
-remote "printf '%s\n' ':chat host-side' ':write' > '${remote_base}.share.in'"
-
 for _ in $(seq 1 180); do
-  if grep -F 'role write' "${connect_out}" >/dev/null 2>&1; then
+  if grep -F 'role: write' "${connect_out}" >/dev/null 2>&1; then
     break
   fi
   if ! kill -0 "${connect_pid}" 2>/dev/null; then
@@ -123,13 +146,11 @@ for _ in $(seq 1 180); do
   fi
   sleep 0.25
 done
-if ! grep -F 'role write' "${connect_out}" >/dev/null 2>&1; then
+if ! grep -F 'role: write' "${connect_out}" >/dev/null 2>&1; then
   echo "failed to observe remote derpssh write promotion" >&2
   dump_logs
   exit 1
 fi
-
-printf 'hello\n' >&$connect_fd
 
 for _ in $(seq 1 180); do
   if grep -F 'input:hello' "${connect_out}" >/dev/null 2>&1; then
@@ -145,12 +166,12 @@ for _ in $(seq 1 180); do
       exit 1
     fi
     for want in 'terminal' 'sidechat' 'status' 'guest-side' 'host-side'; do
-      if ! grep -F "${want}" "${connect_out}" >/dev/null 2>&1; then
+      if ! wait_for_contains "${connect_out}" "${want}"; then
         echo "local connect TUI missing ${want}" >&2
         dump_logs
         exit 1
       fi
-      if ! remote "grep -F '${want}' '${remote_base}.share.out' >/dev/null 2>&1"; then
+      if ! wait_for_remote_contains "${remote_base}.share.out" "${want}"; then
         echo "remote share TUI missing ${want}" >&2
         dump_logs
         exit 1

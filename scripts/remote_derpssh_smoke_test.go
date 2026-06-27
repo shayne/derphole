@@ -21,18 +21,27 @@ func TestRemoteDerpsshSmokeScriptExercisesShareConnect(t *testing.T) {
 	body := string(raw)
 	for _, want := range []string{
 		"dist/derpssh-linux-amd64",
-		"DERPSSH_TEST_AUTO_APPROVE=read",
+		"DERPSSH_TEST_HARNESS=1",
+		"DERPSSH_TEST_AUTO_APPROVE=write",
 		"DERPSSH_TEST_COMMAND=",
+		"DERPSSH_TEST_HOST_ACTIONS=",
+		"DERPSSH_TEST_GUEST_ACTIONS=",
+		"input hello\\\\n",
 		"derpssh share",
 		"connect --name smoke",
 		"input:hello",
 		"sidechat",
-		"role write",
+		"role: write",
 		"host terminal echo",
 		"remote_target",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("remote derpssh smoke script missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{":chat", ":write", ":read", ":kick"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("remote derpssh smoke script still writes old stdin command %q", forbidden)
 		}
 	}
 }

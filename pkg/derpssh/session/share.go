@@ -35,8 +35,12 @@ var generateClientToken = derptun.GenerateClientToken
 var serveAppMux = appsession.DerptunAppServe
 var startPTY = pty.Start
 var newShareApproval = newTerminalShareApproval
-var runHostSession = func(ctx context.Context, cfg HostConfig) error {
-	return NewHostRuntime(cfg).Run(ctx)
+var runHostSession = func(ctx context.Context, cfg HostConfig, bindConsole func(*HostRuntime)) error {
+	host := NewHostRuntime(cfg)
+	if bindConsole != nil {
+		bindConsole(host)
+	}
+	return host.Run(ctx)
 }
 
 func Share(ctx context.Context, cfg ShareConfig) error {
@@ -56,15 +60,24 @@ func Share(ctx context.Context, cfg ShareConfig) error {
 	connectCommand := fmt.Sprintf("npx -y derpssh@latest connect %s", invite)
 	_, _ = fmt.Fprintln(cfg.Stderr, connectCommand)
 	size := terminalSize(cfg.Stdout)
-	console := newTerminalConsole(tui.ModeHost, size.Cols, size.Rows, cfg.Stdin, cfg.Stdout)
-	console.SetInviteCommand(connectCommand)
+	console := newTerminalConsoleWithOptions(tuiConsoleOptions{
+		Mode:          tui.ModeHost,
+		Cols:          size.Cols,
+		Rows:          size.Rows,
+		Stdin:         cfg.Stdin,
+		Stdout:        cfg.Stdout,
+		InviteCommand: connectCommand,
+	})
+	terminalSize := console.TerminalSize()
+	console.Start(ctx)
+	defer console.Stop()
 
 	return serveAppMux(ctx, appsession.DerptunAppServeConfig{
 		ServerToken: serverToken,
 		Emitter:     cfg.Emitter,
 		ForceRelay:  cfg.ForceRelay,
 		OnMux: func(ctx context.Context, mux *derptun.Mux) error {
-			terminal, err := startShareTerminal(size)
+			terminal, err := startShareTerminal(terminalSize)
 			if err != nil {
 				return err
 			}
@@ -81,18 +94,24 @@ func Share(ctx context.Context, cfg ShareConfig) error {
 			if _, ok := approval.(terminalShareApproval); ok {
 				approval = console
 			}
-			return runHostSession(ctx, HostConfig{
+			hostCfg := HostConfig{
 				Mux:         mux,
 				HostID:      randomID("host"),
 				HostName:    hostName,
-				InitialCols: size.Cols,
-				InitialRows: size.Rows,
+				InitialCols: terminalSize.Cols,
+				InitialRows: terminalSize.Rows,
 				PTYInput:    terminal.Input,
 				PTYOutput:   terminal.Output,
-				LocalInput:  cfg.Stdin,
+				PTYResize: func(cols int, rows int) error {
+					return terminal.Resize(pty.Size{Cols: cols, Rows: rows})
+				},
+				LocalInput:  emptyReader{},
 				LocalOutput: console,
 				Approval:    approval,
 				Observer:    console,
+			}
+			return runHostSession(ctx, hostCfg, func(host *HostRuntime) {
+				console.SetCommandCallbacks(hostConsoleCallbacks(host))
 			})
 		},
 	})
@@ -121,13 +140,8 @@ func newTerminalShareApproval(cfg ShareConfig) Approval {
 }
 
 func (a terminalShareApproval) Approve(req JoinRequest) protocol.Role {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("DERPSSH_TEST_AUTO_APPROVE"))) {
-	case "read":
-		return protocol.RoleRead
-	case "write":
-		return protocol.RoleWrite
-	case "deny":
-		return protocol.RoleDenied
+	if role, ok := envApprovalRole(); ok {
+		return role
 	}
 	name := strings.TrimSpace(req.DisplayName)
 	if name == "" {
@@ -154,10 +168,11 @@ type shareTerminal struct {
 	Output io.Reader
 	close  func() error
 	wait   func() error
+	resize func(pty.Size) error
 }
 
 func startShareTerminal(size pty.Size) (*shareTerminal, error) {
-	if command := strings.TrimSpace(os.Getenv("DERPSSH_TEST_COMMAND")); command != "" {
+	if command := strings.TrimSpace(testHarnessEnv("DERPSSH_TEST_COMMAND")); command != "" {
 		cmd := exec.Command("/bin/sh", "-c", command)
 		stdin, err := cmd.StdinPipe()
 		if err != nil {
@@ -176,6 +191,7 @@ func startShareTerminal(size pty.Size) (*shareTerminal, error) {
 			Output: stdout,
 			close:  stdin.Close,
 			wait:   cmd.Wait,
+			resize: func(pty.Size) error { return nil },
 		}, nil
 	}
 
@@ -190,6 +206,7 @@ func startShareTerminal(size pty.Size) (*shareTerminal, error) {
 		Output: ptySession.File,
 		close:  ptySession.Close,
 		wait:   ptySession.Wait,
+		resize: ptySession.Resize,
 	}, nil
 }
 
@@ -218,6 +235,13 @@ func (t *shareTerminal) Wait() error {
 		return nil
 	}
 	return t.wait()
+}
+
+func (t *shareTerminal) Resize(size pty.Size) error {
+	if t == nil || t.resize == nil {
+		return nil
+	}
+	return t.resize(size)
 }
 
 func randomID(prefix string) string {

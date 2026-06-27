@@ -69,6 +69,7 @@ func TestTerminalShareApprovalDeniesByDefault(t *testing.T) {
 }
 
 func TestShareAutoApproveEnvSkipsPrompt(t *testing.T) {
+	t.Setenv("DERPSSH_TEST_HARNESS", "1")
 	t.Setenv("DERPSSH_TEST_AUTO_APPROVE", "write")
 	approval := newTerminalShareApproval(ShareConfig{
 		Stdin:  strings.NewReader(""),
@@ -79,7 +80,19 @@ func TestShareAutoApproveEnvSkipsPrompt(t *testing.T) {
 	}
 }
 
+func TestShareAutoApproveEnvRequiresHarness(t *testing.T) {
+	t.Setenv("DERPSSH_TEST_AUTO_APPROVE", "write")
+	approval := newTerminalShareApproval(ShareConfig{
+		Stdin:  strings.NewReader(""),
+		Stderr: io.Discard,
+	})
+	if got := approval.Approve(JoinRequest{ParticipantID: "guest-1", DisplayName: "Alex"}); got != protocol.RoleDenied {
+		t.Fatalf("Approve(test auto approve without harness) = %q, want %q", got, protocol.RoleDenied)
+	}
+}
+
 func TestShareTestCommandBacksHostTerminal(t *testing.T) {
+	t.Setenv("DERPSSH_TEST_HARNESS", "1")
 	t.Setenv("DERPSSH_TEST_COMMAND", `read line; printf input:%s "$line"`)
 
 	oldGenerateServerToken := generateServerToken
@@ -108,7 +121,8 @@ func TestShareTestCommandBacksHostTerminal(t *testing.T) {
 	serveAppMux = func(ctx context.Context, cfg appsession.DerptunAppServeConfig) error {
 		return cfg.OnMux(ctx, nil)
 	}
-	runHostSession = func(ctx context.Context, cfg HostConfig) error {
+	runHostSession = func(ctx context.Context, cfg HostConfig, bindConsole func(*HostRuntime)) error {
+		_ = bindConsole
 		_ = ctx
 		if _, err := io.WriteString(cfg.PTYInput, "hello\n"); err != nil {
 			t.Fatalf("write command input: %v", err)
@@ -131,6 +145,31 @@ func TestShareTestCommandBacksHostTerminal(t *testing.T) {
 	err := Share(context.Background(), ShareConfig{Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: io.Discard})
 	if err == nil || err.Error() != "stop" {
 		t.Fatalf("Share() error = %v, want stop", err)
+	}
+}
+
+func TestShareTestCommandRequiresHarness(t *testing.T) {
+	t.Setenv("DERPSSH_TEST_COMMAND", `printf ignored`)
+
+	oldStartPTY := startPTY
+	defer func() { startPTY = oldStartPTY }()
+	sentinel := errors.New("pty sentinel")
+	called := 0
+	startPTY = func(pty.StartConfig) (*pty.Session, error) {
+		called++
+		return nil, sentinel
+	}
+
+	terminal, err := startShareTerminal(pty.Size{Cols: 80, Rows: 24})
+	if terminal != nil {
+		_ = terminal.Close()
+		_ = terminal.Wait()
+	}
+	if called != 1 {
+		t.Fatalf("DERPSSH_TEST_COMMAND was honored without harness; startPTY calls = %d, want 1", called)
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("startShareTerminal() error = %v, want %v", err, sentinel)
 	}
 }
 
@@ -158,10 +197,103 @@ func TestShareUsesApprovalSeam(t *testing.T) {
 	serveAppMux = func(ctx context.Context, cfg appsession.DerptunAppServeConfig) error {
 		return cfg.OnMux(ctx, nil)
 	}
-	runHostSession = func(ctx context.Context, cfg HostConfig) error {
+	runHostSession = func(ctx context.Context, cfg HostConfig, bindConsole func(*HostRuntime)) error {
+		_ = bindConsole
 		_ = ctx
 		if got := cfg.Approval.Approve(JoinRequest{ParticipantID: "guest-1", DisplayName: "Alex"}); got != protocol.RoleRead {
 			t.Fatalf("approval role = %q, want %q", got, protocol.RoleRead)
+		}
+		return errors.New("stop")
+	}
+
+	err := Share(context.Background(), ShareConfig{Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: io.Discard})
+	if err == nil || err.Error() != "stop" {
+		t.Fatalf("Share() error = %v, want stop", err)
+	}
+}
+
+func TestShareDoesNotPassStdinToHostLocalInputWhenUsingTUI(t *testing.T) {
+	t.Setenv("DERPSSH_TEST_HARNESS", "1")
+	t.Setenv("DERPSSH_TEST_COMMAND", `printf ready`)
+
+	oldGenerateServerToken := generateServerToken
+	oldGenerateClientToken := generateClientToken
+	oldServe := serveAppMux
+	oldNewApproval := newShareApproval
+	oldRunHost := runHostSession
+	defer func() {
+		generateServerToken = oldGenerateServerToken
+		generateClientToken = oldGenerateClientToken
+		serveAppMux = oldServe
+		newShareApproval = oldNewApproval
+		runHostSession = oldRunHost
+	}()
+	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	newShareApproval = func(ShareConfig) Approval {
+		return StaticApproval{Role: protocol.RoleRead}
+	}
+	serveAppMux = func(ctx context.Context, cfg appsession.DerptunAppServeConfig) error {
+		return cfg.OnMux(ctx, nil)
+	}
+	stdin := strings.NewReader("whoami\n")
+	runHostSession = func(ctx context.Context, cfg HostConfig, bindConsole func(*HostRuntime)) error {
+		_ = bindConsole
+		_ = ctx
+		if cfg.LocalInput == stdin {
+			t.Fatal("HostConfig.LocalInput is original stdin; TUI should own interactive input")
+		}
+		if _, ok := cfg.LocalInput.(emptyReader); !ok {
+			t.Fatalf("HostConfig.LocalInput = %T, want emptyReader", cfg.LocalInput)
+		}
+		return errors.New("stop")
+	}
+
+	err := Share(context.Background(), ShareConfig{Stdin: stdin, Stdout: io.Discard, Stderr: io.Discard})
+	if err == nil || err.Error() != "stop" {
+		t.Fatalf("Share() error = %v, want stop", err)
+	}
+}
+
+func TestShareStartsPTYAtTerminalPaneSize(t *testing.T) {
+	oldGenerateServerToken := generateServerToken
+	oldGenerateClientToken := generateClientToken
+	oldServe := serveAppMux
+	oldStartPTY := startPTY
+	oldNewApproval := newShareApproval
+	oldRunHost := runHostSession
+	defer func() {
+		generateServerToken = oldGenerateServerToken
+		generateClientToken = oldGenerateClientToken
+		serveAppMux = oldServe
+		startPTY = oldStartPTY
+		newShareApproval = oldNewApproval
+		runHostSession = oldRunHost
+	}()
+	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	var startedSize pty.Size
+	startPTY = func(cfg pty.StartConfig) (*pty.Session, error) {
+		startedSize = cfg.Size
+		return &pty.Session{}, nil
+	}
+	newShareApproval = func(ShareConfig) Approval {
+		return StaticApproval{Role: protocol.RoleRead}
+	}
+	serveAppMux = func(ctx context.Context, cfg appsession.DerptunAppServeConfig) error {
+		return cfg.OnMux(ctx, nil)
+	}
+	runHostSession = func(ctx context.Context, cfg HostConfig, bindConsole func(*HostRuntime)) error {
+		_ = bindConsole
+		_ = ctx
+		if startedSize != (pty.Size{Cols: 54, Rows: 22}) {
+			t.Fatalf("started PTY size = %+v, want 54x22 terminal pane", startedSize)
+		}
+		if cfg.InitialCols != 54 || cfg.InitialRows != 22 {
+			t.Fatalf("HostConfig initial size = %dx%d, want 54x22", cfg.InitialCols, cfg.InitialRows)
+		}
+		if cfg.PTYResize == nil {
+			t.Fatal("HostConfig.PTYResize = nil, want resize hook")
 		}
 		return errors.New("stop")
 	}
@@ -268,6 +400,90 @@ func TestConnectClosesStdinWhenGuestRunExits(t *testing.T) {
 	}
 }
 
+func TestConnectStartsConsoleBeforeInitialStatus(t *testing.T) {
+	oldDial := dialAppMux
+	oldRunGuest := runGuestSession
+	oldNewConsole := newConnectConsole
+	defer func() {
+		dialAppMux = oldDial
+		runGuestSession = oldRunGuest
+		newConnectConsole = oldNewConsole
+	}()
+	invite, err := EncodeInvite(Invite{ClientToken: "dtc1_test"})
+	if err != nil {
+		t.Fatalf("EncodeInvite() error = %v", err)
+	}
+	console := &connectStartOrderConsole{}
+	newConnectConsole = func(tuiConsoleOptions) connectConsole {
+		return console
+	}
+	dialAppMux = func(context.Context, appsession.DerptunAppDialConfig) (*derptun.Mux, func(), error) {
+		return &derptun.Mux{}, func() {}, nil
+	}
+	runGuestSession = func(context.Context, *GuestRuntime) error {
+		return errors.New("stop")
+	}
+
+	err = Connect(context.Background(), ConnectConfig{
+		Invite:      invite,
+		DisplayName: "Alex",
+		Stdin:       strings.NewReader(""),
+		Stdout:      io.Discard,
+		Stderr:      io.Discard,
+	})
+	if err == nil || err.Error() != "stop" {
+		t.Fatalf("Connect() error = %v, want stop", err)
+	}
+	if console.statusBeforeStart {
+		t.Fatal("initial status event was sent before console.Start")
+	}
+	if !console.sawWaitingStatus {
+		t.Fatal("waiting status event was not sent")
+	}
+}
+
+func TestConnectStartsGuestCommandPumpInsteadOfRawStdinPump(t *testing.T) {
+	oldDial := dialAppMux
+	oldRunGuest := runGuestSession
+	defer func() {
+		dialAppMux = oldDial
+		runGuestSession = oldRunGuest
+	}()
+	invite, err := EncodeInvite(Invite{ClientToken: "dtc1_test"})
+	if err != nil {
+		t.Fatalf("EncodeInvite() error = %v", err)
+	}
+	stdin := newReadTrackingReader()
+	dialAppMux = func(context.Context, appsession.DerptunAppDialConfig) (*derptun.Mux, func(), error) {
+		return &derptun.Mux{}, func() {}, nil
+	}
+	runGuestSession = func(context.Context, *GuestRuntime) error {
+		select {
+		case <-stdin.readStarted:
+			return errors.New("raw stdin pump used")
+		case <-time.After(50 * time.Millisecond):
+			return errors.New("stop")
+		}
+	}
+
+	err = Connect(context.Background(), ConnectConfig{
+		Invite:      invite,
+		DisplayName: "Alex",
+		Stdin:       stdin,
+		Stdout:      io.Discard,
+		Stderr:      io.Discard,
+	})
+	if err == nil {
+		t.Fatal("Connect() error = nil, want stop")
+	}
+	if err.Error() == "raw stdin pump used" {
+		t.Fatal("Connect started the old raw stdin pump; TUI command callbacks should own input")
+	}
+	if err.Error() != "stop" {
+		t.Fatalf("Connect() error = %v, want stop", err)
+	}
+}
+
 func TestSendGuestInputWaitsForWriteBeforeSending(t *testing.T) {
 	guest := &fakeInputGuest{role: protocol.RolePending, sent: make(chan []byte, 1)}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -304,6 +520,59 @@ type closeAwareReader struct {
 	closed atomic.Bool
 	done   chan struct{}
 	once   sync.Once
+}
+
+type readTrackingReader struct {
+	readStarted chan struct{}
+	done        chan struct{}
+	readOnce    sync.Once
+	closeOnce   sync.Once
+}
+
+type connectStartOrderConsole struct {
+	started           bool
+	statusBeforeStart bool
+	sawWaitingStatus  bool
+}
+
+func (c *connectStartOrderConsole) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
+func (c *connectStartOrderConsole) OnRuntimeEvent(event RuntimeEvent) {
+	if event.Kind != RuntimeEventStatus || event.Message != "waiting for host approval" {
+		return
+	}
+	c.sawWaitingStatus = true
+	if !c.started {
+		c.statusBeforeStart = true
+	}
+}
+
+func (c *connectStartOrderConsole) Start(context.Context) {
+	c.started = true
+}
+
+func (c *connectStartOrderConsole) Stop() {}
+
+func (c *connectStartOrderConsole) SetCommandCallbacks(tuiConsoleCallbacks) {}
+
+func newReadTrackingReader() *readTrackingReader {
+	return &readTrackingReader{
+		readStarted: make(chan struct{}),
+		done:        make(chan struct{}),
+	}
+}
+
+func (r *readTrackingReader) Read([]byte) (int, error) {
+	r.readOnce.Do(func() { close(r.readStarted) })
+	<-r.done
+	return 0, io.ErrClosedPipe
+}
+
+func (r *readTrackingReader) Close() error {
+	r.closeOnce.Do(func() { close(r.done) })
+	return nil
 }
 
 func newCloseAwareReader() *closeAwareReader {

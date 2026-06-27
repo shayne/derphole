@@ -210,6 +210,14 @@ func (r *HostRuntime) readDeniedControlLoop(ctx context.Context) error {
 }
 
 func (r *HostRuntime) Resize(ctx context.Context, cols, rows int) error {
+	if cols <= 0 || rows <= 0 {
+		return nil
+	}
+	if r.cfg.PTYResize != nil {
+		if err := r.cfg.PTYResize(cols, rows); err != nil {
+			return err
+		}
+	}
 	r.mu.Lock()
 	r.state.SetHostSize(cols, rows)
 	r.mu.Unlock()

@@ -31,6 +31,17 @@ var dialAppMux = appsession.DerptunAppDial
 var runGuestSession = func(ctx context.Context, guest *GuestRuntime) error {
 	return guest.Run(ctx)
 }
+var newConnectConsole = func(opts tuiConsoleOptions) connectConsole {
+	return newTerminalConsoleWithOptions(opts)
+}
+
+type connectConsole interface {
+	io.Writer
+	RuntimeObserver
+	Start(context.Context)
+	Stop()
+	SetCommandCallbacks(tuiConsoleCallbacks)
+}
 
 func Connect(ctx context.Context, cfg ConnectConfig) error {
 	cfg = normalizeConnectConfig(cfg)
@@ -54,8 +65,14 @@ func Connect(ctx context.Context, cfg ConnectConfig) error {
 	}
 
 	size := terminalSize(cfg.Stdout)
-	console := newTerminalConsole(tui.ModeGuest, size.Cols, size.Rows, cfg.Stdin, cfg.Stdout)
-	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventStatus, Message: "waiting for host approval"})
+	console := newConnectConsole(tuiConsoleOptions{
+		Mode:        tui.ModeGuest,
+		Cols:        size.Cols,
+		Rows:        size.Rows,
+		Stdin:       cfg.Stdin,
+		Stdout:      cfg.Stdout,
+		DisplayName: cfg.DisplayName,
+	})
 	guestCfg := GuestConfig{
 		Mux:            mux,
 		ParticipantID:  randomID("guest"),
@@ -64,7 +81,10 @@ func Connect(ctx context.Context, cfg ConnectConfig) error {
 		Observer:       console,
 	}
 	guest := NewGuestRuntime(guestCfg)
-	go pumpGuestInput(runCtx, guest, cfg.Stdin)
+	console.SetCommandCallbacks(guestConsoleCallbacks(guest))
+	console.Start(runCtx)
+	defer console.Stop()
+	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventStatus, Message: "waiting for host approval"})
 	return runGuestSession(runCtx, guest)
 }
 
@@ -86,10 +106,6 @@ func normalizeConnectConfig(cfg ConnectConfig) ConnectConfig {
 		}
 	}
 	return cfg
-}
-
-func pumpGuestInput(ctx context.Context, guest *GuestRuntime, stdin io.Reader) {
-	_ = pumpRoutedInput(ctx, stdin, guestInputSink(guest))
 }
 
 type guestInputSender interface {
