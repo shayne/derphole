@@ -15,7 +15,7 @@ export VERSION COMMIT BUILD_DATE
 bash "${ROOT_DIR}/tools/packaging/build-vendor.sh"
 bash "${ROOT_DIR}/tools/packaging/build-npm.sh"
 
-for product in derphole derptun; do
+for product in derphole derptun derpssh; do
   test -x "${ROOT_DIR}/dist/vendor/x86_64-unknown-linux-musl/${product}/${product}"
   test -x "${ROOT_DIR}/dist/vendor/aarch64-unknown-linux-musl/${product}/${product}"
   test -x "${ROOT_DIR}/dist/vendor/x86_64-apple-darwin/${product}/${product}"
@@ -24,7 +24,7 @@ done
 
 rm -rf "${ROOT_DIR}/dist/raw"
 mkdir -p "${ROOT_DIR}/dist/raw"
-for product in derphole derptun; do
+for product in derphole derptun derpssh; do
   cp "${ROOT_DIR}/dist/vendor/x86_64-unknown-linux-musl/${product}/${product}" "${ROOT_DIR}/dist/raw/${product}-linux-amd64"
   cp "${ROOT_DIR}/dist/vendor/aarch64-unknown-linux-musl/${product}/${product}" "${ROOT_DIR}/dist/raw/${product}-linux-arm64"
   cp "${ROOT_DIR}/dist/vendor/x86_64-apple-darwin/${product}/${product}" "${ROOT_DIR}/dist/raw/${product}-darwin-amd64"
@@ -33,7 +33,7 @@ done
 
 bash "${ROOT_DIR}/tools/packaging/build-release-assets.sh"
 
-for product in derphole derptun; do
+for product in derphole derptun derpssh; do
   test -f "${ROOT_DIR}/dist/release/${product}-linux-amd64.tar.gz"
   test -f "${ROOT_DIR}/dist/release/${product}-linux-amd64.tar.gz.sha256"
   test -f "${ROOT_DIR}/dist/release/${product}-linux-arm64.tar.gz"
@@ -44,7 +44,7 @@ for product in derphole derptun; do
   test -f "${ROOT_DIR}/dist/release/${product}-darwin-arm64.tar.gz.sha256"
 done
 
-for product in derphole derptun; do
+for product in derphole derptun derpssh; do
   node -e "const fs=require('fs'); const pkg=JSON.parse(fs.readFileSync('${ROOT_DIR}/dist/npm-${product}/package.json','utf8')); if (pkg.version !== process.env.VERSION.replace(/^v/,'')) { process.exit(1); }"
   npm_launcher_version="$(node "${ROOT_DIR}/dist/npm-${product}/bin/${product}.js" version)"
   if [ "${npm_launcher_version}" != "${VERSION}" ]; then

@@ -1,10 +1,10 @@
 # Manual npm Bootstrap Publish
 
-This runbook covers the first npm publish before GitHub trusted publishing is configured. The repository now ships one npm package: `derphole`.
+This runbook covers the first npm publish before GitHub trusted publishing is configured. The repository ships three npm packages: `derphole`, `derptun`, and `derpssh`.
 
 ## Prerequisites
 
-- npm account that can claim and publish the `derphole` package name
+- npm account that can claim and publish the `derphole`, `derptun`, and `derpssh` package names
 - local `npm whoami` succeeds
 - run from the repository root
 - `mise` and the release toolchain are available locally
@@ -23,12 +23,14 @@ Validate the npm payload with an unpublished prerelease version. This avoids dry
 ```bash
 VERSION=v0.0.1-dev.$(date -u +%Y%m%d%H%M%S) mise run release:npm-dry-run
 node ./dist/npm-derphole/bin/derphole.js version
+node ./dist/npm-derptun/bin/derptun.js version
+node ./dist/npm-derpssh/bin/derpssh.js version
 ```
 
 Expected output:
 
-- `npm publish --dry-run` succeeds for `dist/npm-derphole`
-- `node ./dist/npm-derphole/bin/derphole.js version` prints `v0.0.1`
+- `npm publish --dry-run` succeeds for `dist/npm-derphole`, `dist/npm-derptun`, and `dist/npm-derpssh`
+- each packaged launcher `version` command prints `v0.0.1`
 
 ## Publish
 
@@ -36,6 +38,8 @@ Publish the package if it is being bootstrapped:
 
 ```bash
 npm publish ./dist/npm-derphole --access public
+npm publish ./dist/npm-derptun --access public
+npm publish ./dist/npm-derpssh --access public
 ```
 
 ## After trusted publisher setup

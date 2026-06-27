@@ -4,6 +4,8 @@
 
 [`derptun`](#long-lived-tcp-tunnels) is its companion for long-lived TCP tunnels. Use it when a tunnel needs stable tokens, restartable endpoints, and repeated client reconnects.
 
+[`derpssh`](#share-a-terminal) is its companion for interactive terminal sharing. Use it when two people need one shared PTY with host approval and no open ports.
+
 `derphole` supports:
 
 - raw byte streams with `listen` and `pipe`
@@ -30,6 +32,7 @@ Session tokens carry authorization. Public sessions fetch the DERP map at runtim
 - Use `send` and `receive` for text, files, directories, progress, and receive-code UX.
 - Use `share` and `open` for temporary access to a local TCP service.
 - Use `ssh invite` and `ssh accept` for SSH public key exchange.
+- Use [`derpssh`](#share-a-terminal) for approved terminal sharing.
 - Use [`derptun`](#long-lived-tcp-tunnels) for long-lived TCP tunnels with reusable tokens.
 
 ## Quick Start
@@ -124,6 +127,22 @@ Bind `open` to a specific local port:
 npx -y derphole@latest open <token> 127.0.0.1:8080
 ```
 
+### Share a Terminal
+
+Host:
+
+```bash
+npx -y derpssh@latest share
+```
+
+`share` prints a connect command. Send it to the guest:
+
+```bash
+npx -y derpssh@latest connect <invite>
+```
+
+The host approves the guest as read-only or read/write. The session uses the derptun transport path, so neither side needs an inbound port.
+
 ### Long-Lived TCP Tunnels
 
 `derptun` is the long-lived TCP tunnel companion to `derphole`. It uses stable tokens, survives restarts on either side, and lets one client reconnect many times without opening ports on `vps-server`. It fits SSH well.
@@ -171,6 +190,7 @@ Use the development channel for the latest commit from `main`:
 ```bash
 npx -y derphole@dev version
 npx -y derptun@dev version
+npx -y derpssh@dev version
 ```
 
 Default output stays quiet: tokens, bind addresses, receive commands, and progress only. Use `--hide-progress` to suppress progress, or `--verbose` to see transitions like `connected-relay` and `connected-direct`:
@@ -205,6 +225,7 @@ The data plane is selected per session:
 
 - `share/open` uses multiplexed QUIC streams over `derphole`'s relay/direct UDP transport. One claimed session can carry many TCP connections to the shared service.
 - `derptun` uses a stable tunnel token and the same transport for reconnectable TCP streams. It is built for longer-lived access, such as SSH to a host behind NAT.
+- `derpssh` uses the derptun app mux for approved terminal streams and side-channel control.
 - `listen/pipe` uses a one-shot byte stream. It coordinates through DERP, promotes to rate-adaptive direct UDP when traversal succeeds, and stays on encrypted relay fallback when direct paths fail.
 - `send/receive` wraps the same one-shot stream with text, file, directory, and progress metadata.
 
@@ -253,6 +274,7 @@ Payload bytes are always end-to-end encrypted between token holders. Session and
 - Relay-prefix startup frames leave frame kind and byte offsets visible for flow control, but encrypt user payload bytes.
 - On `share/open`, stream traffic uses authenticated QUIC streams for the claimed session.
 - On `derptun`, stream traffic uses authenticated QUIC streams pinned to the stable tunnel identity in the token.
+- On `derpssh`, terminal streams use authenticated QUIC streams pinned to the invite identity.
 
 Simple rule: token possession authorizes the session. Relays move packets; they do not hold decrypt keys for user payloads.
 
@@ -276,7 +298,7 @@ mise run check
 mise run build
 ```
 
-`mise run build` writes `dist/derphole` and `dist/derptun`.
+`mise run build` writes `dist/derphole`, `dist/derptun`, and `dist/derpssh`.
 
 ## Verification
 
@@ -292,14 +314,15 @@ Remote smoke tests against a host you control:
 REMOTE_HOST=my-server.example.com mise run smoke-remote
 REMOTE_HOST=my-server.example.com mise run smoke-remote-share
 REMOTE_HOST=my-server.example.com mise run smoke-remote-derptun
+REMOTE_HOST=my-server.example.com mise run smoke-remote-derpssh
 REMOTE_HOST=my-server.example.com mise run promotion-1g
 ```
 
 ## Releases
 
-- npm packages: `derphole`, `derptun`
-- production channels: `derphole@latest`, `derptun@latest`
-- development channels: `derphole@dev`, `derptun@dev`
+- npm packages: `derphole`, `derptun`, `derpssh`
+- production channels: `derphole@latest`, `derptun@latest`, `derpssh@latest`
+- development channels: `derphole@dev`, `derptun@dev`, `derpssh@dev`
 
 ## What Is DERP?
 

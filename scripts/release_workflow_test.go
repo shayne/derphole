@@ -24,12 +24,36 @@ func TestReleaseWorkflowNpmPublishesSkipUnclaimedUntilBootstrap(t *testing.T) {
 	commands := []string{
 		"bash ./tools/packaging/publish-npm-if-missing.sh --skip-unclaimed ./dist/npm-derphole",
 		"bash ./tools/packaging/publish-npm-if-missing.sh --skip-unclaimed ./dist/npm-derptun",
+		"bash ./tools/packaging/publish-npm-if-missing.sh --skip-unclaimed ./dist/npm-derpssh",
 		"bash ./tools/packaging/publish-npm-if-missing.sh --tag dev --skip-unclaimed ./dist/npm-derphole",
 		"bash ./tools/packaging/publish-npm-if-missing.sh --tag dev --skip-unclaimed ./dist/npm-derptun",
+		"bash ./tools/packaging/publish-npm-if-missing.sh --tag dev --skip-unclaimed ./dist/npm-derpssh",
 	}
 	for _, command := range commands {
 		if !strings.Contains(body, command) {
 			t.Fatalf("release workflow does not tolerate npm bootstrap state with command %q", command)
+		}
+	}
+}
+
+func TestReleaseWorkflowIncludesDerpsshArtifacts(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join("..", ".github", "workflows", "release.yml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read release workflow: %v", err)
+	}
+
+	body := string(data)
+	for _, asset := range []string{
+		"derpssh-linux-amd64",
+		"derpssh-linux-arm64",
+		"derpssh-darwin-amd64",
+		"derpssh-darwin-arm64",
+	} {
+		if !strings.Contains(body, asset) {
+			t.Fatalf("release workflow missing derpssh artifact %q", asset)
 		}
 	}
 }

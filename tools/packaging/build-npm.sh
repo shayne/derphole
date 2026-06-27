@@ -20,7 +20,7 @@ fi
 
 rm -rf "${ROOT_DIR}"/dist/npm-*
 
-products=(derphole derptun)
+products=(derphole derptun derpssh)
 triples=(
   x86_64-unknown-linux-musl
   aarch64-unknown-linux-musl
