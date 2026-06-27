@@ -6,6 +6,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -39,5 +40,7 @@ func TestDerptunAppMuxStillBridgesStdio(t *testing.T) {
 		t.Fatalf("stdout = %q, want echo: hello", out.String())
 	}
 	cancel()
-	<-serveErr
+	if err := <-serveErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("DerptunServe() after cancel error = %v, want nil or context cancellation", err)
+	}
 }

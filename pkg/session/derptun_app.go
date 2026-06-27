@@ -7,26 +7,34 @@ package session
 import (
 	"context"
 	"net"
+	"sync"
 
 	"github.com/shayne/derphole/pkg/derptun"
 	"github.com/shayne/derphole/pkg/telemetry"
 )
 
 type DerptunAppServeConfig struct {
-	ServerToken   string
-	Emitter       *telemetry.Emitter
-	ForceRelay    bool
+	ServerToken string
+	Emitter     *telemetry.Emitter
+	ForceRelay  bool
+	// UsePublicDERP is reserved for parity with TCP derptun config; current
+	// app-mux setup preserves existing DERP selection and does not branch on it.
 	UsePublicDERP bool
 	OnMux         func(context.Context, *derptun.Mux) error
 }
 
 type DerptunAppDialConfig struct {
-	ClientToken   string
-	Emitter       *telemetry.Emitter
-	ForceRelay    bool
+	ClientToken string
+	Emitter     *telemetry.Emitter
+	ForceRelay  bool
+	// UsePublicDERP is reserved for parity with TCP derptun config; current
+	// app-mux setup preserves existing DERP selection and does not branch on it.
 	UsePublicDERP bool
 }
 
+// DerptunAppServe serves one derptun app mux at a time and passes each claimed
+// mux to cfg.OnMux. The helper owns the mux and closes it when OnMux returns or
+// the session shuts down.
 func DerptunAppServe(ctx context.Context, cfg DerptunAppServeConfig) error {
 	return serveDerptunApp(ctx, derptunServeMuxConfig{
 		ServerToken:   cfg.ServerToken,
@@ -37,6 +45,9 @@ func DerptunAppServe(ctx context.Context, cfg DerptunAppServeConfig) error {
 	})
 }
 
+// DerptunAppDial claims a derptun app session and returns a connected mux. The
+// returned cleanup function closes the mux and releases the underlying transport
+// resources; callers should call cleanup once they are done with the mux.
 func DerptunAppDial(ctx context.Context, cfg DerptunAppDialConfig) (*derptun.Mux, func(), error) {
 	runtime, err := newDerptunDialRuntime(ctx, cfg.ClientToken, cfg.Emitter, cfg.ForceRelay)
 	if err != nil {
@@ -57,9 +68,18 @@ func DerptunAppDial(ctx context.Context, cfg DerptunAppDialConfig) (*derptun.Mux
 		runtime.closeBase()
 		return nil, nil, err
 	}
-	return mux, cleanup, nil
+	var cleanupOnce sync.Once
+	return mux, func() {
+		cleanupOnce.Do(func() {
+			_ = mux.Close()
+			cleanup()
+		})
+	}, nil
 }
 
+// DerptunAppDialStream claims a derptun app session and opens one stream on the
+// returned mux. The returned cleanup function closes the mux and transport; the
+// caller still owns the returned stream and may close it independently.
 func DerptunAppDialStream(ctx context.Context, cfg DerptunAppDialConfig) (net.Conn, func(), error) {
 	mux, cleanup, err := DerptunAppDial(ctx, cfg)
 	if err != nil {
@@ -68,11 +88,7 @@ func DerptunAppDialStream(ctx context.Context, cfg DerptunAppDialConfig) (net.Co
 	conn, err := mux.OpenStream(ctx)
 	if err != nil {
 		cleanup()
-		_ = mux.Close()
 		return nil, nil, err
 	}
-	return conn, func() {
-		_ = mux.Close()
-		cleanup()
-	}, nil
+	return conn, cleanup, nil
 }

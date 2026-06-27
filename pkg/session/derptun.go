@@ -902,7 +902,6 @@ func DerptunOpen(ctx context.Context, cfg DerptunOpenConfig) error {
 		return err
 	}
 	defer cleanup()
-	defer func() { _ = mux.Close() }()
 
 	listenAddr := cfg.ListenAddr
 	if listenAddr == "" {
