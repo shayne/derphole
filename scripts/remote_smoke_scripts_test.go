@@ -19,6 +19,7 @@ func TestRemoteSmokeScriptsUseRemoteMktemp(t *testing.T) {
 		"smoke-remote-share.sh",
 		"smoke-remote-relay.sh",
 		"smoke-remote-derptun.sh",
+		"smoke-remote-derpssh.sh",
 	}
 	for _, name := range scripts {
 		name := name
