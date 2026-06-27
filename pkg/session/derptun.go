@@ -52,6 +52,14 @@ type DerptunConnectConfig struct {
 	UsePublicDERP bool
 }
 
+type derptunServeMuxConfig struct {
+	ServerToken   string
+	Emitter       *telemetry.Emitter
+	ForceRelay    bool
+	UsePublicDERP bool
+	onMux         func(context.Context, *derptun.Mux) error
+}
+
 func decodeDerptunServer(raw string) (derptun.ServerCredential, error) {
 	return derptun.DecodeServerToken(raw, time.Now())
 }
@@ -73,6 +81,21 @@ var (
 )
 
 func DerptunServe(ctx context.Context, cfg DerptunServeConfig) error {
+	return DerptunAppServe(ctx, DerptunAppServeConfig{
+		ServerToken:   cfg.ServerToken,
+		Emitter:       cfg.Emitter,
+		ForceRelay:    cfg.ForceRelay,
+		UsePublicDERP: cfg.UsePublicDERP,
+		OnMux: func(ctx context.Context, mux *derptun.Mux) error {
+			return serveDerptunMuxTarget(ctx, mux, cfg.TargetAddr, cfg.Emitter)
+		},
+	})
+}
+
+func serveDerptunApp(ctx context.Context, cfg derptunServeMuxConfig) error {
+	if cfg.onMux == nil {
+		return errors.New("derptun app mux handler is required")
+	}
 	runtime, err := newDerptunServeRuntime(ctx, cfg)
 	if err != nil {
 		return err
@@ -99,7 +122,7 @@ type derptunServeRuntime struct {
 	pm         publicPortmap
 }
 
-func newDerptunServeRuntime(ctx context.Context, cfg DerptunServeConfig) (*derptunServeRuntime, error) {
+func newDerptunServeRuntime(ctx context.Context, cfg derptunServeMuxConfig) (*derptunServeRuntime, error) {
 	server, tok, identity, err := loadDerptunServeIdentity(cfg.ServerToken)
 	if err != nil {
 		return nil, err
@@ -432,7 +455,7 @@ func derptunServeTunnelErr(err error) error {
 
 func serveDerptunClaims(
 	ctx context.Context,
-	cfg DerptunServeConfig,
+	cfg derptunServeMuxConfig,
 	runtime *derptunServeRuntime,
 	gate *derptunClientGate,
 ) error {
@@ -452,7 +475,7 @@ func serveDerptunClaims(
 }
 
 type derptunClaimServer struct {
-	cfg     DerptunServeConfig
+	cfg     derptunServeMuxConfig
 	runtime *derptunServeRuntime
 	gate    *derptunClientGate
 	active  *derptunServeActive
@@ -535,12 +558,20 @@ func handleDerptunServeClaim(
 		probeConn:  probeConn,
 		pm:         pm,
 	}
-	return handleDerptunServeRuntimeClaim(ctx, cfg, runtime, gate, active, pkt)
+	return handleDerptunServeRuntimeClaim(ctx, derptunServeMuxConfig{
+		ServerToken:   cfg.ServerToken,
+		Emitter:       cfg.Emitter,
+		ForceRelay:    cfg.ForceRelay,
+		UsePublicDERP: cfg.UsePublicDERP,
+		onMux: func(ctx context.Context, mux *derptun.Mux) error {
+			return serveDerptunMuxTarget(ctx, mux, cfg.TargetAddr, cfg.Emitter)
+		},
+	}, runtime, gate, active, pkt)
 }
 
 func handleDerptunServeRuntimeClaim(
 	ctx context.Context,
-	cfg DerptunServeConfig,
+	cfg derptunServeMuxConfig,
 	runtime *derptunServeRuntime,
 	gate *derptunClientGate,
 	active *derptunServeActive,
@@ -580,7 +611,7 @@ type derptunServeClaimToken struct {
 	now   time.Time
 }
 
-func readDerptunServeClaim(cfg DerptunServeConfig, runtime *derptunServeRuntime, pkt derpbind.Packet) (derptunServeClaimRequest, bool) {
+func readDerptunServeClaim(cfg derptunServeMuxConfig, runtime *derptunServeRuntime, pkt derpbind.Packet) (derptunServeClaimRequest, bool) {
 	env, err := decodeEnvelope(pkt.Payload)
 	if err != nil || env.Type != envelopeClaim || env.Claim == nil {
 		return derptunServeClaimRequest{}, false
@@ -618,7 +649,7 @@ func issueDerptunServeClaimToken(ctx context.Context, runtime *derptunServeRunti
 
 func acceptDerptunServeClaim(
 	ctx context.Context,
-	cfg DerptunServeConfig,
+	cfg derptunServeMuxConfig,
 	gate *derptunClientGate,
 	active *derptunServeActive,
 	claim rendezvous.Claim,
@@ -661,7 +692,7 @@ func resendDerptunActiveDecision(ctx context.Context, runtime *derptunServeRunti
 	return true, sendDerptunServeDecisionWithAuth(ctx, runtime, request.peerDERP, auth, retryDecision)
 }
 
-func enrichDerptunServeDecision(ctx context.Context, cfg DerptunServeConfig, runtime *derptunServeRuntime, decision *rendezvous.Decision) {
+func enrichDerptunServeDecision(ctx context.Context, cfg derptunServeMuxConfig, runtime *derptunServeRuntime, decision *rendezvous.Decision) {
 	if decision.Accept == nil || cfg.ForceRelay {
 		return
 	}
@@ -670,7 +701,7 @@ func enrichDerptunServeDecision(ctx context.Context, cfg DerptunServeConfig, run
 
 func startDerptunServeClaimTunnel(
 	ctx context.Context,
-	cfg DerptunServeConfig,
+	cfg derptunServeMuxConfig,
 	runtime *derptunServeRuntime,
 	gate *derptunClientGate,
 	request derptunServeClaimRequest,
@@ -709,7 +740,7 @@ func startDerptunServeClaimTunnel(
 
 func startDerptunServeTransport(
 	ctx context.Context,
-	cfg DerptunServeConfig,
+	cfg derptunServeMuxConfig,
 	runtime *derptunServeRuntime,
 	peerDERP key.NodePublic,
 	claimToken sessiontoken.Token,
@@ -772,7 +803,7 @@ func cleanupDerptunServeTransport(pathEmitter *transportPathEmitter, transportMa
 }
 
 func runDerptunServeTunnel(
-	cfg DerptunServeConfig,
+	cfg derptunServeMuxConfig,
 	active *derptunServeActive,
 	tunnelCtx context.Context,
 	tunnelCancel context.CancelFunc,
@@ -813,7 +844,7 @@ func runDerptunServeTunnel(
 		return
 	}
 	active.mux.ReplaceCarrier(quicpath.WrapStream(quicConn, carrier))
-	err = serveDerptunMuxTarget(tunnelCtx, active.mux, cfg.TargetAddr, cfg.Emitter)
+	err = cfg.onMux(tunnelCtx, active.mux)
 }
 
 func watchDerptunServeQUICConn(tunnelCtx context.Context, tunnelCancel context.CancelFunc, quicConn *quic.Conn) {
@@ -861,7 +892,12 @@ func serveDerptunMuxTarget(ctx context.Context, mux *derptun.Mux, targetAddr str
 }
 
 func DerptunOpen(ctx context.Context, cfg DerptunOpenConfig) error {
-	mux, cleanup, err := dialDerptunMux(ctx, cfg.ClientToken, cfg.Emitter, cfg.ForceRelay)
+	mux, cleanup, err := DerptunAppDial(ctx, DerptunAppDialConfig{
+		ClientToken:   cfg.ClientToken,
+		Emitter:       cfg.Emitter,
+		ForceRelay:    cfg.ForceRelay,
+		UsePublicDERP: cfg.UsePublicDERP,
+	})
 	if err != nil {
 		return err
 	}
@@ -885,7 +921,12 @@ func DerptunOpen(ctx context.Context, cfg DerptunOpenConfig) error {
 }
 
 func DerptunConnect(ctx context.Context, cfg DerptunConnectConfig) error {
-	conn, cleanup, err := dialDerptunMuxStream(ctx, cfg.ClientToken, cfg.Emitter, cfg.ForceRelay)
+	conn, cleanup, err := DerptunAppDialStream(ctx, DerptunAppDialConfig{
+		ClientToken:   cfg.ClientToken,
+		Emitter:       cfg.Emitter,
+		ForceRelay:    cfg.ForceRelay,
+		UsePublicDERP: cfg.UsePublicDERP,
+	})
 	if err != nil {
 		return err
 	}
@@ -957,46 +998,6 @@ func closeDerptunStdioInput(in io.Reader) {
 type emptyReader struct{}
 
 func (*emptyReader) Read([]byte) (int, error) { return 0, io.EOF }
-
-func dialDerptunMuxStream(ctx context.Context, clientToken string, emitter *telemetry.Emitter, forceRelay bool) (net.Conn, func(), error) {
-	mux, cleanup, err := dialDerptunMux(ctx, clientToken, emitter, forceRelay)
-	if err != nil {
-		return nil, nil, err
-	}
-	conn, err := mux.OpenStream(ctx)
-	if err != nil {
-		cleanup()
-		_ = mux.Close()
-		return nil, nil, err
-	}
-	return conn, func() {
-		_ = mux.Close()
-		cleanup()
-	}, nil
-}
-
-func dialDerptunMux(ctx context.Context, clientToken string, emitter *telemetry.Emitter, forceRelay bool) (*derptun.Mux, func(), error) {
-	runtime, err := newDerptunDialRuntime(ctx, clientToken, emitter, forceRelay)
-	if err != nil {
-		return nil, nil, err
-	}
-	claim := runtime.claim()
-	decision, err := runtime.sendClaim(ctx, claim)
-	if err != nil {
-		runtime.closeBase()
-		return nil, nil, err
-	}
-	if err := derptunClaimDecisionErr(decision); err != nil {
-		runtime.closeBase()
-		return nil, nil, err
-	}
-	mux, cleanup, err := runtime.dialMux(ctx, emitter, forceRelay, decision)
-	if err != nil {
-		runtime.closeBase()
-		return nil, nil, err
-	}
-	return mux, cleanup, nil
-}
 
 type derptunDialRuntime struct {
 	cred            derptun.ClientCredential
