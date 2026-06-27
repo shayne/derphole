@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+
+	"github.com/shayne/derphole/pkg/derptun"
 )
 
 const InvitePrefix = "DSH1"
@@ -42,8 +44,13 @@ func DecodeInvite(raw string) (Invite, error) {
 	if err := json.Unmarshal(payload, &inv); err != nil {
 		return Invite{}, ErrInvalidInvite
 	}
-	if strings.TrimSpace(inv.ClientToken) == "" {
+	if !validInviteClientToken(inv.ClientToken) {
 		return Invite{}, ErrInvalidInvite
 	}
 	return inv, nil
+}
+
+func validInviteClientToken(token string) bool {
+	token = strings.TrimSpace(token)
+	return token != "" && strings.HasPrefix(token, derptun.ClientTokenPrefix)
 }

@@ -5,12 +5,14 @@
 package session
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/shayne/derphole/pkg/derpssh/protocol"
 	"github.com/shayne/derphole/pkg/derpssh/pty"
@@ -31,6 +33,10 @@ var generateServerToken = derptun.GenerateServerToken
 var generateClientToken = derptun.GenerateClientToken
 var serveAppMux = appsession.DerptunAppServe
 var startPTY = pty.Start
+var newShareApproval = newTerminalShareApproval
+var runHostSession = func(ctx context.Context, cfg HostConfig) error {
+	return NewHostRuntime(cfg).Run(ctx)
+}
 
 func Share(ctx context.Context, cfg ShareConfig) error {
 	cfg = normalizeShareConfig(cfg)
@@ -66,7 +72,7 @@ func Share(ctx context.Context, cfg ShareConfig) error {
 			if hostName == "" {
 				hostName = "host"
 			}
-			host := NewHostRuntime(HostConfig{
+			return runHostSession(ctx, HostConfig{
 				Mux:         mux,
 				HostID:      randomID("host"),
 				HostName:    hostName,
@@ -74,9 +80,8 @@ func Share(ctx context.Context, cfg ShareConfig) error {
 				InitialRows: 24,
 				PTYInput:    ptySession.File,
 				PTYOutput:   ptySession.File,
-				Approval:    StaticApproval{Role: protocol.RoleWrite},
+				Approval:    newShareApproval(cfg),
 			})
-			return host.Run(ctx)
 		},
 	})
 }
@@ -92,6 +97,36 @@ func normalizeShareConfig(cfg ShareConfig) ShareConfig {
 		cfg.Stderr = io.Discard
 	}
 	return cfg
+}
+
+type terminalShareApproval struct {
+	stdin  io.Reader
+	stderr io.Writer
+}
+
+func newTerminalShareApproval(cfg ShareConfig) Approval {
+	return terminalShareApproval{stdin: cfg.Stdin, stderr: cfg.Stderr}
+}
+
+func (a terminalShareApproval) Approve(req JoinRequest) protocol.Role {
+	name := strings.TrimSpace(req.DisplayName)
+	if name == "" {
+		name = req.ParticipantID
+	}
+	_, _ = fmt.Fprintf(a.stderr, "Allow %s to join? [r]ead/[w]rite/[n]o: ", name)
+	line, err := bufio.NewReader(a.stdin).ReadString('\n')
+	if err != nil && strings.TrimSpace(line) == "" {
+		_, _ = fmt.Fprintln(a.stderr)
+		return protocol.RoleDenied
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "r":
+		return protocol.RoleRead
+	case "w":
+		return protocol.RoleWrite
+	default:
+		return protocol.RoleDenied
+	}
 }
 
 func randomID(prefix string) string {

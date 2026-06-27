@@ -27,6 +27,9 @@ type ConnectConfig struct {
 }
 
 var dialAppMux = appsession.DerptunAppDial
+var runGuestSession = func(ctx context.Context, guest *GuestRuntime) error {
+	return guest.Run(ctx)
+}
 
 func Connect(ctx context.Context, cfg ConnectConfig) error {
 	cfg = normalizeConnectConfig(cfg)
@@ -43,15 +46,21 @@ func Connect(ctx context.Context, cfg ConnectConfig) error {
 		return err
 	}
 	defer cleanup()
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if closer, ok := cfg.Stdin.(io.Closer); ok {
+		defer func() { _ = closer.Close() }()
+	}
 
-	guest := NewGuestRuntime(GuestConfig{
+	guestCfg := GuestConfig{
 		Mux:            mux,
 		ParticipantID:  randomID("guest"),
 		DisplayName:    cfg.DisplayName,
 		TerminalOutput: cfg.Stdout,
-	})
-	go pumpGuestInput(ctx, guest, cfg.Stdin)
-	return guest.Run(ctx)
+	}
+	guest := NewGuestRuntime(guestCfg)
+	go pumpGuestInput(runCtx, guest, cfg.Stdin)
+	return runGuestSession(runCtx, guest)
 }
 
 func normalizeConnectConfig(cfg ConnectConfig) ConnectConfig {
@@ -87,7 +96,12 @@ func pumpGuestInput(ctx context.Context, guest *GuestRuntime, stdin io.Reader) {
 	}
 }
 
-func sendGuestInput(ctx context.Context, guest *GuestRuntime, data []byte) {
+type guestInputSender interface {
+	Role() protocol.Role
+	SendInput(context.Context, []byte) error
+}
+
+func sendGuestInput(ctx context.Context, guest guestInputSender, data []byte) {
 	for {
 		if ctx.Err() != nil {
 			return

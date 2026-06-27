@@ -10,8 +10,13 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/shayne/derphole/pkg/derpssh/protocol"
+	"github.com/shayne/derphole/pkg/derpssh/pty"
 	"github.com/shayne/derphole/pkg/derptun"
 	appsession "github.com/shayne/derphole/pkg/session"
 )
@@ -46,6 +51,61 @@ func TestDecodeInviteRejectsEmptyClientToken(t *testing.T) {
 	}
 }
 
+func TestDecodeInviteRejectsNonClientTokenPrefix(t *testing.T) {
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"client_token":"not-a-client-token"}`))
+	if _, err := DecodeInvite(InvitePrefix + payload); err == nil {
+		t.Fatal("DecodeInvite(non-client token) error = nil, want error")
+	}
+}
+
+func TestTerminalShareApprovalDeniesByDefault(t *testing.T) {
+	approval := newTerminalShareApproval(ShareConfig{
+		Stdin:  strings.NewReader(""),
+		Stderr: io.Discard,
+	})
+	if got := approval.Approve(JoinRequest{ParticipantID: "guest-1", DisplayName: "Alex"}); got != protocol.RoleDenied {
+		t.Fatalf("Approve(EOF) = %q, want %q", got, protocol.RoleDenied)
+	}
+}
+
+func TestShareUsesApprovalSeam(t *testing.T) {
+	oldGenerateServerToken := generateServerToken
+	oldGenerateClientToken := generateClientToken
+	oldServe := serveAppMux
+	oldStartPTY := startPTY
+	oldNewApproval := newShareApproval
+	oldRunHost := runHostSession
+	defer func() {
+		generateServerToken = oldGenerateServerToken
+		generateClientToken = oldGenerateClientToken
+		serveAppMux = oldServe
+		startPTY = oldStartPTY
+		newShareApproval = oldNewApproval
+		runHostSession = oldRunHost
+	}()
+	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	startPTY = func(pty.StartConfig) (*pty.Session, error) { return &pty.Session{}, nil }
+	newShareApproval = func(ShareConfig) Approval {
+		return StaticApproval{Role: protocol.RoleRead}
+	}
+	serveAppMux = func(ctx context.Context, cfg appsession.DerptunAppServeConfig) error {
+		return cfg.OnMux(ctx, nil)
+	}
+	runHostSession = func(ctx context.Context, cfg HostConfig) error {
+		_ = ctx
+		if got := cfg.Approval.Approve(JoinRequest{ParticipantID: "guest-1", DisplayName: "Alex"}); got != protocol.RoleRead {
+			t.Fatalf("approval role = %q, want %q", got, protocol.RoleRead)
+		}
+		return errors.New("stop")
+	}
+
+	err := Share(context.Background(), ShareConfig{Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: io.Discard})
+	if err == nil || err.Error() != "stop" {
+		t.Fatalf("Share() error = %v, want stop", err)
+	}
+}
+
 func TestSharePrintsConnectCommandBeforeServing(t *testing.T) {
 	oldGenerateServerToken := generateServerToken
 	oldGenerateClientToken := generateClientToken
@@ -62,7 +122,7 @@ func TestSharePrintsConnectCommandBeforeServing(t *testing.T) {
 		if opts.ServerToken != "server-token" {
 			t.Fatalf("ServerToken = %q, want server-token", opts.ServerToken)
 		}
-		return "client-token", nil
+		return "dtc1_test", nil
 	}
 	serveErr := errors.New("stop")
 	serveAppMux = func(ctx context.Context, cfg appsession.DerptunAppServeConfig) error {
@@ -84,14 +144,14 @@ func TestConnectDecodesInviteAndDials(t *testing.T) {
 	oldDial := dialAppMux
 	defer func() { dialAppMux = oldDial }()
 
-	invite, err := EncodeInvite(Invite{ClientToken: "client-token"})
+	invite, err := EncodeInvite(Invite{ClientToken: "dtc1_test"})
 	if err != nil {
 		t.Fatalf("EncodeInvite() error = %v", err)
 	}
 	dialAppMux = func(ctx context.Context, cfg appsession.DerptunAppDialConfig) (*derptun.Mux, func(), error) {
 		_, _ = ctx, cfg.Emitter
-		if cfg.ClientToken != "client-token" {
-			t.Fatalf("ClientToken = %q, want client-token", cfg.ClientToken)
+		if cfg.ClientToken != "dtc1_test" {
+			t.Fatalf("ClientToken = %q, want dtc1_test", cfg.ClientToken)
 		}
 		return nil, func() {}, errors.New("stop")
 	}
@@ -106,4 +166,114 @@ func TestConnectDecodesInviteAndDials(t *testing.T) {
 	if err == nil || err.Error() != "stop" {
 		t.Fatalf("Connect() error = %v, want stop", err)
 	}
+}
+
+func TestConnectClosesStdinWhenGuestRunExits(t *testing.T) {
+	oldDial := dialAppMux
+	oldRunGuest := runGuestSession
+	defer func() {
+		dialAppMux = oldDial
+		runGuestSession = oldRunGuest
+	}()
+	invite, err := EncodeInvite(Invite{ClientToken: "dtc1_test"})
+	if err != nil {
+		t.Fatalf("EncodeInvite() error = %v", err)
+	}
+	stdin := newCloseAwareReader()
+	dialAppMux = func(context.Context, appsession.DerptunAppDialConfig) (*derptun.Mux, func(), error) {
+		return &derptun.Mux{}, func() {}, nil
+	}
+	runGuestSession = func(context.Context, *GuestRuntime) error {
+		return errors.New("stop")
+	}
+
+	err = Connect(context.Background(), ConnectConfig{
+		Invite:      invite,
+		DisplayName: "Alex",
+		Stdin:       stdin,
+		Stdout:      io.Discard,
+		Stderr:      io.Discard,
+	})
+	if err == nil || err.Error() != "stop" {
+		t.Fatalf("Connect() error = %v, want stop", err)
+	}
+	if !stdin.closed.Load() {
+		t.Fatal("stdin was not closed when guest run exited")
+	}
+}
+
+func TestSendGuestInputWaitsForWriteBeforeSending(t *testing.T) {
+	guest := &fakeInputGuest{role: protocol.RolePending, sent: make(chan []byte, 1)}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		sendGuestInput(ctx, guest, []byte("whoami\n"))
+		close(done)
+	}()
+
+	select {
+	case got := <-guest.sent:
+		t.Fatalf("SendInput called while role pending with %q", string(got))
+	case <-time.After(50 * time.Millisecond):
+	}
+	guest.setRole(protocol.RoleWrite)
+
+	select {
+	case got := <-guest.sent:
+		if string(got) != "whoami\n" {
+			t.Fatalf("sent input = %q, want whoami", string(got))
+		}
+	case <-ctx.Done():
+		t.Fatal("SendInput was not called after write approval")
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("sendGuestInput did not return after sending")
+	}
+}
+
+type closeAwareReader struct {
+	closed atomic.Bool
+	done   chan struct{}
+	once   sync.Once
+}
+
+func newCloseAwareReader() *closeAwareReader {
+	return &closeAwareReader{done: make(chan struct{})}
+}
+
+func (r *closeAwareReader) Read([]byte) (int, error) {
+	<-r.done
+	return 0, io.ErrClosedPipe
+}
+
+func (r *closeAwareReader) Close() error {
+	r.closed.Store(true)
+	r.once.Do(func() { close(r.done) })
+	return nil
+}
+
+type fakeInputGuest struct {
+	mu   sync.Mutex
+	role protocol.Role
+	sent chan []byte
+}
+
+func (g *fakeInputGuest) Role() protocol.Role {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.role
+}
+
+func (g *fakeInputGuest) setRole(role protocol.Role) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.role = role
+}
+
+func (g *fakeInputGuest) SendInput(_ context.Context, data []byte) error {
+	g.sent <- append([]byte(nil), data...)
+	return nil
 }
