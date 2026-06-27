@@ -14,18 +14,29 @@ import (
 func TestApprovalKeysChangePendingGuest(t *testing.T) {
 	m := NewModel(ModeHost, 100, 30)
 	m.SetPendingGuest("guest-1", "Alex")
-	m = m.HandleKey("r")
+	m.HandleKey("r")
 	if m.Decision().Role != protocol.RoleRead {
 		t.Fatalf("Decision role = %q, want read", m.Decision().Role)
 	}
 	m.SetPendingGuest("guest-1", "Alex")
-	m = m.HandleKey("w")
+	m.HandleKey("w")
 	if m.Decision().Role != protocol.RoleWrite {
 		t.Fatalf("Decision role = %q, want write", m.Decision().Role)
 	}
 }
 
-func TestViewShowsHostSizeAndRole(t *testing.T) {
+func TestHandleKeyMutatesModelInPlace(t *testing.T) {
+	m := NewModel(ModeHost, 100, 30)
+	m.SetPendingGuest("guest-1", "Alex")
+
+	m.HandleKey("r")
+
+	if got := m.Decision(); got.GuestID != "guest-1" || got.Role != protocol.RoleRead {
+		t.Fatalf("Decision() = %+v, want guest-1 read", got)
+	}
+}
+
+func TestViewShowsGuestSizeAndRole(t *testing.T) {
 	m := NewModel(ModeGuest, 96, 28)
 	m.SetRole(protocol.RoleRead)
 	view := m.View()

@@ -6,9 +6,9 @@ package tui
 
 import "github.com/shayne/derphole/pkg/derpssh/protocol"
 
-func (m Model) HandleKey(key string) Model {
+func (m *Model) HandleKey(key string) {
 	if m.mode != ModeHost || m.pendingGuest.id == "" {
-		return m
+		return
 	}
 
 	switch key {
@@ -17,7 +17,6 @@ func (m Model) HandleKey(key string) Model {
 	case "w", "W":
 		m.decide(protocol.RoleWrite)
 	}
-	return m
 }
 
 func (m *Model) decide(role protocol.Role) {
