@@ -12,7 +12,18 @@ import (
 func (m Model) View() string {
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "derpssh %s | %dx%d | role %s\n", m.mode, m.cols, m.rows, m.role)
+	fmt.Fprintf(&b, "derpssh %s | host %dx%d | role %s | transport %s", m.mode, m.cols, m.rows, m.role, valueOr(m.transport, "starting"))
+	if m.peerName != "" {
+		fmt.Fprintf(&b, " | peer %s/%s", m.peerName, m.peerRole)
+	}
+	fmt.Fprintf(&b, " | focus %s\n", valueOr(m.focus, "terminal"))
+
+	if m.inviteCommand != "" {
+		fmt.Fprintf(&b, "invite: %s\n", m.inviteCommand)
+	}
+
+	b.WriteString("\nterminal\n")
+	b.WriteString(strings.Repeat("-", 72))
 	b.WriteString("\n")
 
 	if m.terminalText == "" {
@@ -25,6 +36,8 @@ func (m Model) View() string {
 	}
 
 	b.WriteString("\nsidechat\n")
+	b.WriteString(strings.Repeat("-", 72))
+	b.WriteString("\n")
 	if len(m.sidechatLines) == 0 {
 		b.WriteString("(no messages)\n")
 	} else {
@@ -36,9 +49,21 @@ func (m Model) View() string {
 		}
 	}
 
+	b.WriteString("\nstatus\n")
+	b.WriteString(strings.Repeat("-", 72))
+	b.WriteString("\n")
+	b.WriteString(":chat MESSAGE sends sidechat | host: :read :write :kick | terminal input goes to shared PTY\n")
+
 	if m.pendingGuest.id != "" {
-		fmt.Fprintf(&b, "\napprove %s (%s): [r]ead [w]rite\n", m.pendingGuest.name, m.pendingGuest.id)
+		fmt.Fprintf(&b, "\napprove %s (%s): [r]ead [w]rite [n]o\n", m.pendingGuest.name, m.pendingGuest.id)
 	}
 
 	return b.String()
+}
+
+func valueOr(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
 }

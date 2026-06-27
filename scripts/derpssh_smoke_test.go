@@ -17,7 +17,7 @@ func TestDerpsshLocalSmokeScriptUsesBuiltBinary(t *testing.T) {
 		t.Fatalf("read smoke script: %v", err)
 	}
 	body := string(raw)
-	for _, want := range []string{"dist/derpssh", "derpssh share", "derpssh connect", "host terminal echo"} {
+	for _, want := range []string{"dist/derpssh", "derpssh share", "derpssh connect", "host terminal echo", "sidechat", "role write"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("smoke script missing %q", want)
 		}

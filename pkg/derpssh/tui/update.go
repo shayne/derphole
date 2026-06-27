@@ -16,6 +16,8 @@ func (m *Model) HandleKey(key string) {
 		m.decide(protocol.RoleRead)
 	case "w", "W":
 		m.decide(protocol.RoleWrite)
+	case "n", "N":
+		m.deny()
 	}
 }
 
@@ -25,6 +27,16 @@ func (m *Model) decide(role protocol.Role) {
 		GuestName: m.pendingGuest.name,
 		Accepted:  true,
 		Role:      role,
+	}
+	m.pendingGuest = pendingGuest{}
+}
+
+func (m *Model) deny() {
+	m.decision = Decision{
+		GuestID:   m.pendingGuest.id,
+		GuestName: m.pendingGuest.name,
+		Accepted:  false,
+		Role:      protocol.RoleDenied,
 	}
 	m.pendingGuest = pendingGuest{}
 }

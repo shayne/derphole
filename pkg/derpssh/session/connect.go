@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/shayne/derphole/pkg/derpssh/protocol"
+	"github.com/shayne/derphole/pkg/derpssh/tui"
 	appsession "github.com/shayne/derphole/pkg/session"
 	"github.com/shayne/derphole/pkg/telemetry"
 )
@@ -52,11 +53,15 @@ func Connect(ctx context.Context, cfg ConnectConfig) error {
 		defer func() { _ = closer.Close() }()
 	}
 
+	size := terminalSize(cfg.Stdout)
+	console := newTerminalConsole(tui.ModeGuest, size.Cols, size.Rows, cfg.Stdin, cfg.Stdout)
+	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventStatus, Message: "waiting for host approval"})
 	guestCfg := GuestConfig{
 		Mux:            mux,
 		ParticipantID:  randomID("guest"),
 		DisplayName:    cfg.DisplayName,
-		TerminalOutput: cfg.Stdout,
+		TerminalOutput: console,
+		Observer:       console,
 	}
 	guest := NewGuestRuntime(guestCfg)
 	go pumpGuestInput(runCtx, guest, cfg.Stdin)
@@ -84,16 +89,7 @@ func normalizeConnectConfig(cfg ConnectConfig) ConnectConfig {
 }
 
 func pumpGuestInput(ctx context.Context, guest *GuestRuntime, stdin io.Reader) {
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := stdin.Read(buf)
-		if n > 0 {
-			sendGuestInput(ctx, guest, buf[:n])
-		}
-		if err != nil {
-			return
-		}
-	}
+	_ = pumpRoutedInput(ctx, stdin, guestInputSink(guest))
 }
 
 type guestInputSender interface {

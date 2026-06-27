@@ -130,6 +130,7 @@ func (r *GuestRuntime) applyDecision(decision *protocol.Decision) bool {
 		if decision != nil {
 			r.setCloseReason(decision.Reason)
 		}
+		r.notify(RuntimeEvent{Kind: RuntimeEventRole, Role: protocol.RoleDenied})
 		return false
 	}
 	r.setRole(decision.Role)
@@ -215,6 +216,7 @@ func (r *GuestRuntime) SendChat(ctx context.Context, text string) error {
 }
 
 func (r *GuestRuntime) ReportSize(ctx context.Context, cols, rows int) error {
+	r.notify(RuntimeEvent{Kind: RuntimeEventResize, Cols: cols, Rows: rows})
 	return r.writeControlCtx(ctx, protocol.Message{
 		Type:   protocol.MessageResize,
 		Resize: &protocol.Resize{Cols: cols, Rows: rows},
@@ -349,24 +351,34 @@ func (r *GuestRuntime) writeControlCtx(ctx context.Context, msg protocol.Message
 
 func (r *GuestRuntime) setRole(role protocol.Role) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.role = role
+	r.mu.Unlock()
+	r.notify(RuntimeEvent{Kind: RuntimeEventRole, Role: role})
 }
 
 func (r *GuestRuntime) setSize(cols, rows int) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.cols, r.rows = cols, rows
+	r.mu.Unlock()
+	r.notify(RuntimeEvent{Kind: RuntimeEventResize, Cols: cols, Rows: rows})
 }
 
 func (r *GuestRuntime) setCloseReason(reason string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.closeReason = reason
+	r.mu.Unlock()
+	r.notify(RuntimeEvent{Kind: RuntimeEventClose, Message: reason})
 }
 
 func (r *GuestRuntime) appendChat(msg model.ChatMessage) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.chat.Append(msg)
+	r.mu.Unlock()
+	r.notify(RuntimeEvent{Kind: RuntimeEventChat, Chat: msg})
+}
+
+func (r *GuestRuntime) notify(event RuntimeEvent) {
+	if r.cfg.Observer != nil {
+		r.cfg.Observer.OnRuntimeEvent(event)
+	}
 }

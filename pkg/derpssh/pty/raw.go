@@ -19,3 +19,11 @@ func Restore(fd uintptr, state *RawState) error {
 func IsTerminal(fd uintptr) bool {
 	return term.IsTerminal(int(fd))
 }
+
+func GetSize(fd uintptr) (Size, error) {
+	cols, rows, err := term.GetSize(int(fd))
+	if err != nil {
+		return Size{}, err
+	}
+	return Size{Cols: cols, Rows: rows}, nil
+}

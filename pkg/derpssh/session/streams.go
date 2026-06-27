@@ -16,7 +16,10 @@ import (
 	"github.com/shayne/derphole/pkg/derptun"
 )
 
-var ErrReadOnly = errors.New("guest is read-only")
+var (
+	ErrReadOnly    = errors.New("guest is read-only")
+	ErrInvalidRole = errors.New("invalid guest role")
+)
 
 type ChatMessage = model.ChatMessage
 

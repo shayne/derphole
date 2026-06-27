@@ -39,6 +39,7 @@ type HostConfig struct {
 	LocalInput  io.Reader
 	LocalOutput io.Writer
 	Approval    Approval
+	Observer    RuntimeObserver
 }
 
 type GuestConfig struct {
@@ -46,4 +47,5 @@ type GuestConfig struct {
 	ParticipantID  string
 	DisplayName    string
 	TerminalOutput io.Writer
+	Observer       RuntimeObserver
 }

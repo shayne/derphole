@@ -23,6 +23,11 @@ func TestApprovalKeysChangePendingGuest(t *testing.T) {
 	if m.Decision().Role != protocol.RoleWrite {
 		t.Fatalf("Decision role = %q, want write", m.Decision().Role)
 	}
+	m.SetPendingGuest("guest-1", "Alex")
+	m.HandleKey("n")
+	if got := m.Decision(); got.Accepted || got.Role != protocol.RoleDenied {
+		t.Fatalf("Decision() = %+v, want denied", got)
+	}
 }
 
 func TestHandleKeyMutatesModelInPlace(t *testing.T) {
@@ -40,7 +45,35 @@ func TestViewShowsGuestSizeAndRole(t *testing.T) {
 	m := NewModel(ModeGuest, 96, 28)
 	m.SetRole(protocol.RoleRead)
 	view := m.View()
-	for _, want := range []string{"96x28", "read"} {
+	for _, want := range []string{"96x28", "read", "terminal", "sidechat", "status"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("View() missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestViewShowsSharedUISurface(t *testing.T) {
+	m := NewModel(ModeHost, 100, 30)
+	m.SetRole(protocol.RoleWrite)
+	m.SetPeer("Alex", protocol.RoleRead)
+	m.SetTransportStatus("connected-relay")
+	m.SetInviteCommand("npx -y derpssh@latest connect DSH1test")
+	m.SetTerminalText("ready\n")
+	m.AddSidechatLine("Alex: hello")
+	m.SetPendingGuest("guest-1", "Alex")
+
+	view := m.View()
+	for _, want := range []string{
+		"npx -y derpssh@latest connect DSH1test",
+		"terminal",
+		"ready",
+		"sidechat",
+		"Alex: hello",
+		"status",
+		"connected-relay",
+		"peer Alex/read",
+		"[r]ead [w]rite [n]o",
+	} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("View() missing %q:\n%s", want, view)
 		}

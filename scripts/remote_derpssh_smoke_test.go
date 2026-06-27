@@ -21,11 +21,13 @@ func TestRemoteDerpsshSmokeScriptExercisesShareConnect(t *testing.T) {
 	body := string(raw)
 	for _, want := range []string{
 		"dist/derpssh-linux-amd64",
-		"DERPSSH_TEST_AUTO_APPROVE=write",
+		"DERPSSH_TEST_AUTO_APPROVE=read",
 		"DERPSSH_TEST_COMMAND=",
 		"derpssh share",
 		"connect --name smoke",
 		"input:hello",
+		"sidechat",
+		"role write",
 		"host terminal echo",
 		"remote_target",
 	} {

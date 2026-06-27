@@ -5,7 +5,6 @@
 package session
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -17,6 +16,7 @@ import (
 
 	"github.com/shayne/derphole/pkg/derpssh/protocol"
 	"github.com/shayne/derphole/pkg/derpssh/pty"
+	"github.com/shayne/derphole/pkg/derpssh/tui"
 	"github.com/shayne/derphole/pkg/derptun"
 	appsession "github.com/shayne/derphole/pkg/session"
 	"github.com/shayne/derphole/pkg/telemetry"
@@ -53,14 +53,18 @@ func Share(ctx context.Context, cfg ShareConfig) error {
 	if err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(cfg.Stderr, "npx -y derpssh@latest connect %s\n", invite)
+	connectCommand := fmt.Sprintf("npx -y derpssh@latest connect %s", invite)
+	_, _ = fmt.Fprintln(cfg.Stderr, connectCommand)
+	size := terminalSize(cfg.Stdout)
+	console := newTerminalConsole(tui.ModeHost, size.Cols, size.Rows, cfg.Stdin, cfg.Stdout)
+	console.SetInviteCommand(connectCommand)
 
 	return serveAppMux(ctx, appsession.DerptunAppServeConfig{
 		ServerToken: serverToken,
 		Emitter:     cfg.Emitter,
 		ForceRelay:  cfg.ForceRelay,
 		OnMux: func(ctx context.Context, mux *derptun.Mux) error {
-			terminal, err := startShareTerminal()
+			terminal, err := startShareTerminal(size)
 			if err != nil {
 				return err
 			}
@@ -73,17 +77,22 @@ func Share(ctx context.Context, cfg ShareConfig) error {
 			if hostName == "" {
 				hostName = "host"
 			}
+			approval := newShareApproval(cfg)
+			if _, ok := approval.(terminalShareApproval); ok {
+				approval = console
+			}
 			return runHostSession(ctx, HostConfig{
 				Mux:         mux,
 				HostID:      randomID("host"),
 				HostName:    hostName,
-				InitialCols: 80,
-				InitialRows: 24,
+				InitialCols: size.Cols,
+				InitialRows: size.Rows,
 				PTYInput:    terminal.Input,
 				PTYOutput:   terminal.Output,
 				LocalInput:  cfg.Stdin,
-				LocalOutput: cfg.Stdout,
-				Approval:    newShareApproval(cfg),
+				LocalOutput: console,
+				Approval:    approval,
+				Observer:    console,
 			})
 		},
 	})
@@ -125,7 +134,7 @@ func (a terminalShareApproval) Approve(req JoinRequest) protocol.Role {
 		name = req.ParticipantID
 	}
 	_, _ = fmt.Fprintf(a.stderr, "Allow %s to join? [r]ead/[w]rite/[n]o: ", name)
-	line, err := bufio.NewReader(a.stdin).ReadString('\n')
+	line, err := readApprovalLine(a.stdin)
 	if err != nil && strings.TrimSpace(line) == "" {
 		_, _ = fmt.Fprintln(a.stderr)
 		return protocol.RoleDenied
@@ -147,7 +156,7 @@ type shareTerminal struct {
 	wait   func() error
 }
 
-func startShareTerminal() (*shareTerminal, error) {
+func startShareTerminal(size pty.Size) (*shareTerminal, error) {
 	if command := strings.TrimSpace(os.Getenv("DERPSSH_TEST_COMMAND")); command != "" {
 		cmd := exec.Command("/bin/sh", "-c", command)
 		stdin, err := cmd.StdinPipe()
@@ -171,7 +180,7 @@ func startShareTerminal() (*shareTerminal, error) {
 	}
 
 	ptySession, err := startPTY(pty.StartConfig{
-		Size: pty.Size{Cols: 80, Rows: 24},
+		Size: size,
 	})
 	if err != nil {
 		return nil, err
@@ -182,6 +191,19 @@ func startShareTerminal() (*shareTerminal, error) {
 		close:  ptySession.Close,
 		wait:   ptySession.Wait,
 	}, nil
+}
+
+func terminalSize(output io.Writer) pty.Size {
+	size := pty.Size{Cols: 80, Rows: 24}
+	file, ok := output.(*os.File)
+	if !ok || !pty.IsTerminal(file.Fd()) {
+		return size
+	}
+	got, err := pty.GetSize(file.Fd())
+	if err != nil || got.Cols <= 0 || got.Rows <= 0 {
+		return size
+	}
+	return got
 }
 
 func (t *shareTerminal) Close() error {

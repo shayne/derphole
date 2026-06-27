@@ -415,6 +415,45 @@ func TestHostResizeBroadcastsCanonicalSize(t *testing.T) {
 	waitRuntimeExit(t, errCh, 2)
 }
 
+func TestHostRoleChangeBroadcastsToGuest(t *testing.T) {
+	hostMux, guestMux, cleanup := newTestMuxPair(t)
+	defer cleanup()
+
+	host := NewHostRuntime(HostConfig{
+		Mux:         hostMux,
+		HostID:      "host",
+		HostName:    "host",
+		InitialCols: 80,
+		InitialRows: 24,
+		PTYInput:    io.Discard,
+		PTYOutput:   strings.NewReader(""),
+		Approval:    StaticApproval{Role: protocol.RoleRead},
+	})
+	guest := NewGuestRuntime(GuestConfig{
+		Mux:           guestMux,
+		ParticipantID: "guest-1",
+		DisplayName:   "Alex",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	errCh := make(chan error, 2)
+	go func() { errCh <- host.Run(ctx) }()
+	go func() { errCh <- guest.Run(ctx) }()
+
+	waitForGuestRole(t, ctx, guest, protocol.RoleRead)
+	if err := host.SetGuestRole(ctx, "guest-1", protocol.RoleWrite); err != nil {
+		t.Fatalf("host SetGuestRole(write) error = %v", err)
+	}
+	waitForGuestRole(t, ctx, guest, protocol.RoleWrite)
+	if err := host.SetGuestRole(ctx, "guest-1", protocol.RoleRead); err != nil {
+		t.Fatalf("host SetGuestRole(read) error = %v", err)
+	}
+	waitForGuestRole(t, ctx, guest, protocol.RoleRead)
+	cancel()
+	waitRuntimeExit(t, errCh, 2)
+}
+
 func TestKickClosesGuestCleanly(t *testing.T) {
 	hostMux, guestMux, cleanup := newTestMuxPair(t)
 	defer cleanup()

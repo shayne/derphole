@@ -109,6 +109,7 @@ func (r *HostRuntime) handshake(ctx context.Context) (string, bool, error) {
 		return "", false, ignoreContextErr(ctx, err)
 	}
 	r.setControl(control)
+	r.notify(RuntimeEvent{Kind: RuntimeEventStatus, Message: "guest pending"})
 
 	hello, err := protocol.ReadFrame(control)
 	if err != nil {
@@ -123,11 +124,13 @@ func (r *HostRuntime) handshake(ctx context.Context) (string, bool, error) {
 		return "", false, err
 	}
 	if !roleGranted(role) {
+		r.notify(RuntimeEvent{Kind: RuntimeEventPeer, ParticipantID: guestID, DisplayName: guestName, Role: protocol.RoleDenied})
 		return "", false, r.writeControl(protocol.Message{
 			Type:     protocol.MessageDecision,
 			Decision: &protocol.Decision{Accepted: false, Role: protocol.RoleDenied, Reason: "join denied"},
 		})
 	}
+	r.notify(RuntimeEvent{Kind: RuntimeEventPeer, ParticipantID: guestID, DisplayName: guestName, Role: role})
 	return guestID, true, r.sendApproval(role)
 }
 
@@ -176,6 +179,7 @@ func (r *HostRuntime) readControlLoop(ctx context.Context, guestID string) error
 				r.mu.Lock()
 				r.state.NoteGuestSize(guestID, msg.Resize.Cols, msg.Resize.Rows)
 				r.mu.Unlock()
+				r.notify(RuntimeEvent{Kind: RuntimeEventResize, ParticipantID: guestID, Cols: msg.Resize.Cols, Rows: msg.Resize.Rows})
 			}
 		case protocol.MessageClose:
 			if msg.Close != nil {
@@ -209,7 +213,29 @@ func (r *HostRuntime) Resize(ctx context.Context, cols, rows int) error {
 	r.mu.Lock()
 	r.state.SetHostSize(cols, rows)
 	r.mu.Unlock()
+	r.notify(RuntimeEvent{Kind: RuntimeEventResize, Cols: cols, Rows: rows})
 	return r.writeControlCtx(ctx, r.resizeMessage())
+}
+
+func (r *HostRuntime) SetGuestRole(ctx context.Context, participantID string, role protocol.Role) error {
+	if role != protocol.RoleRead && role != protocol.RoleWrite {
+		return ErrInvalidRole
+	}
+	r.mu.Lock()
+	if participantID == "" {
+		participantID = r.guestID
+	}
+	guestName := r.guestName
+	err := r.state.SetGuestRole(participantID, role)
+	r.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	r.notify(RuntimeEvent{Kind: RuntimeEventPeer, ParticipantID: participantID, DisplayName: guestName, Role: role})
+	return r.writeControlCtx(ctx, protocol.Message{
+		Type:       protocol.MessageRoleChange,
+		RoleChange: &protocol.RoleChange{ParticipantID: participantID, Role: role},
+	})
 }
 
 func (r *HostRuntime) Kick(ctx context.Context, participantID, reason string) error {
@@ -217,9 +243,13 @@ func (r *HostRuntime) Kick(ctx context.Context, participantID, reason string) er
 		reason = "kicked"
 	}
 	r.mu.Lock()
+	if participantID == "" {
+		participantID = r.guestID
+	}
 	_ = r.state.KickGuest(participantID)
 	r.closeReason = reason
 	r.mu.Unlock()
+	r.notify(RuntimeEvent{Kind: RuntimeEventPeer, ParticipantID: participantID, Role: protocol.RoleKicked})
 	if err := r.writeControlCtx(ctx, protocol.Message{
 		Type: protocol.MessageKick,
 		Kick: &protocol.Kick{ParticipantID: participantID, Reason: reason},
@@ -405,25 +435,7 @@ func (r *HostRuntime) pumpPTYOutput(ctx context.Context) error {
 }
 
 func (r *HostRuntime) pumpLocalInput(ctx context.Context) error {
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := r.cfg.LocalInput.Read(buf)
-		if n > 0 {
-			if _, writeErr := r.cfg.PTYInput.Write(buf[:n]); writeErr != nil {
-				_ = r.writeControlCtx(ctx, protocol.Message{
-					Type:  protocol.MessageClose,
-					Close: &protocol.Close{Reason: writeErr.Error()},
-				})
-				return writeErr
-			}
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		}
-	}
+	return pumpRoutedInput(ctx, r.cfg.LocalInput, hostInputSink(r))
 }
 
 func (r *HostRuntime) resizeMessage() protocol.Message {
@@ -466,14 +478,22 @@ func (r *HostRuntime) writeControlCtx(ctx context.Context, msg protocol.Message)
 
 func (r *HostRuntime) appendChat(msg model.ChatMessage) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.chat.Append(msg)
+	r.mu.Unlock()
+	r.notify(RuntimeEvent{Kind: RuntimeEventChat, Chat: msg})
 }
 
 func (r *HostRuntime) setCloseReason(reason string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.closeReason = reason
+	r.mu.Unlock()
+	r.notify(RuntimeEvent{Kind: RuntimeEventClose, Message: reason})
+}
+
+func (r *HostRuntime) notify(event RuntimeEvent) {
+	if r.cfg.Observer != nil {
+		r.cfg.Observer.OnRuntimeEvent(event)
+	}
 }
 
 func (r *HostRuntime) closePTYOutput() {
