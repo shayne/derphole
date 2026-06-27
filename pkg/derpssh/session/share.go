@@ -81,6 +81,8 @@ func Share(ctx context.Context, cfg ShareConfig) error {
 				InitialRows: 24,
 				PTYInput:    terminal.Input,
 				PTYOutput:   terminal.Output,
+				LocalInput:  cfg.Stdin,
+				LocalOutput: cfg.Stdout,
 				Approval:    newShareApproval(cfg),
 			})
 		},

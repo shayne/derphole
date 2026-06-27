@@ -36,6 +36,8 @@ type HostConfig struct {
 	InitialRows int
 	PTYInput    io.Writer
 	PTYOutput   io.Reader
+	LocalInput  io.Reader
+	LocalOutput io.Writer
 	Approval    Approval
 }
 

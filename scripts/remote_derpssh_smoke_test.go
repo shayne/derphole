@@ -26,6 +26,7 @@ func TestRemoteDerpsshSmokeScriptExercisesShareConnect(t *testing.T) {
 		"derpssh share",
 		"connect --name smoke",
 		"input:hello",
+		"host terminal echo",
 		"remote_target",
 	} {
 		if !strings.Contains(body, want) {

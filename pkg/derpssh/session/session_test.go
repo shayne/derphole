@@ -122,6 +122,74 @@ func TestGuestReceivesHostTerminalOutput(t *testing.T) {
 	waitRuntimeExit(t, errCh, 2)
 }
 
+func TestHostReceivesLocalTerminalOutput(t *testing.T) {
+	hostMux, guestMux, cleanup := newTestMuxPair(t)
+	defer cleanup()
+
+	localOutput := newCaptureWriter()
+	host := NewHostRuntime(HostConfig{
+		Mux:         hostMux,
+		HostID:      "host",
+		HostName:    "host",
+		InitialCols: 80,
+		InitialRows: 24,
+		PTYInput:    io.Discard,
+		PTYOutput:   strings.NewReader("ready\n"),
+		LocalOutput: localOutput,
+		Approval:    StaticApproval{Role: protocol.RoleWrite},
+	})
+	guest := NewGuestRuntime(GuestConfig{
+		Mux:           guestMux,
+		ParticipantID: "guest-1",
+		DisplayName:   "Alex",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	errCh := make(chan error, 2)
+	go func() { errCh <- host.Run(ctx) }()
+	go func() { errCh <- guest.Run(ctx) }()
+
+	waitForGuestRole(t, ctx, guest, protocol.RoleWrite)
+	waitForCapturedWrite(t, ctx, localOutput, "ready\n")
+	cancel()
+	waitRuntimeExit(t, errCh, 2)
+}
+
+func TestHostLocalInputWritesPTY(t *testing.T) {
+	hostMux, guestMux, cleanup := newTestMuxPair(t)
+	defer cleanup()
+
+	input := newCaptureWriter()
+	host := NewHostRuntime(HostConfig{
+		Mux:         hostMux,
+		HostID:      "host",
+		HostName:    "host",
+		InitialCols: 80,
+		InitialRows: 24,
+		PTYInput:    input,
+		PTYOutput:   strings.NewReader("ready\n"),
+		LocalInput:  strings.NewReader("from-host\n"),
+		Approval:    StaticApproval{Role: protocol.RoleWrite},
+	})
+	guest := NewGuestRuntime(GuestConfig{
+		Mux:           guestMux,
+		ParticipantID: "guest-1",
+		DisplayName:   "Alex",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	errCh := make(chan error, 2)
+	go func() { errCh <- host.Run(ctx) }()
+	go func() { errCh <- guest.Run(ctx) }()
+
+	waitForGuestRole(t, ctx, guest, protocol.RoleWrite)
+	waitForCapturedWrite(t, ctx, input, "from-host\n")
+	cancel()
+	waitRuntimeExit(t, errCh, 2)
+}
+
 func TestHostAcceptsApprovedGuestStreamsOutOfOrder(t *testing.T) {
 	hostMux, guestMux, cleanup := newTestMuxPair(t)
 	defer cleanup()

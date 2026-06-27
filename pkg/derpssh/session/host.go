@@ -52,6 +52,12 @@ func NewHostRuntime(cfg HostConfig) *HostRuntime {
 	if cfg.PTYOutput == nil {
 		cfg.PTYOutput = emptyReader{}
 	}
+	if cfg.LocalInput == nil {
+		cfg.LocalInput = emptyReader{}
+	}
+	if cfg.LocalOutput == nil {
+		cfg.LocalOutput = io.Discard
+	}
 	if cfg.Approval == nil {
 		cfg.Approval = StaticApproval{Role: protocol.RoleRead}
 	}
@@ -84,6 +90,9 @@ func (r *HostRuntime) Run(ctx context.Context) error {
 		return r.readDeniedControlLoop(ctx)
 	}
 
+	go func() {
+		_ = r.pumpLocalInput(ctx)
+	}()
 	go func() {
 		r.acceptApprovedStreams(ctx)
 	}()
@@ -375,10 +384,36 @@ func (r *HostRuntime) pumpPTYOutput(ctx context.Context) error {
 	for {
 		n, err := r.cfg.PTYOutput.Read(buf)
 		if n > 0 {
+			data := append([]byte(nil), buf[:n]...)
+			if _, writeErr := r.cfg.LocalOutput.Write(data); writeErr != nil {
+				return writeErr
+			}
 			if writeErr := protocol.WriteFrame(conn, protocol.Message{
 				Type:     protocol.MessageTerminal,
-				Terminal: &protocol.TerminalEvent{Data: append([]byte(nil), buf[:n]...)},
+				Terminal: &protocol.TerminalEvent{Data: data},
 			}); writeErr != nil {
+				return writeErr
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func (r *HostRuntime) pumpLocalInput(ctx context.Context) error {
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := r.cfg.LocalInput.Read(buf)
+		if n > 0 {
+			if _, writeErr := r.cfg.PTYInput.Write(buf[:n]); writeErr != nil {
+				_ = r.writeControlCtx(ctx, protocol.Message{
+					Type:  protocol.MessageClose,
+					Close: &protocol.Close{Reason: writeErr.Error()},
+				})
 				return writeErr
 			}
 		}

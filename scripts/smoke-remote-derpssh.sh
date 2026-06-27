@@ -108,6 +108,17 @@ connect_pid=$!
 
 for _ in $(seq 1 180); do
   if grep -F 'input:hello' "${connect_out}" >/dev/null 2>&1; then
+    for _ in $(seq 1 180); do
+      if remote "grep -F 'input:hello' '${remote_base}.share.out' >/dev/null 2>&1"; then
+        break
+      fi
+      sleep 0.25
+    done
+    if ! remote "grep -F 'input:hello' '${remote_base}.share.out' >/dev/null 2>&1"; then
+      echo "failed to observe remote derpssh host terminal echo" >&2
+      dump_logs
+      exit 1
+    fi
     connect_trace="$(path_trace "${connect_err}")"
     share_trace="$(remote_path_trace "${remote_base}.share.err")"
     if [[ -n "${connect_trace}" ]]; then

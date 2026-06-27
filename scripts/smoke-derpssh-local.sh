@@ -54,13 +54,26 @@ connect_pid=$!
 
 for _ in $(seq 1 100); do
   if grep -F 'input:hello' "$connect_out" >/dev/null 2>&1; then
-    exit 0
+    break
   fi
   if ! kill -0 "$connect_pid" 2>/dev/null; then
     break
   fi
   sleep 0.1
 done
+
+if grep -F 'input:hello' "$connect_out" >/dev/null 2>&1; then
+  for _ in $(seq 1 100); do
+    if grep -F 'input:hello' "$share_out" >/dev/null 2>&1; then
+      exit 0
+    fi
+    sleep 0.1
+  done
+  echo "failed to observe derpssh host terminal echo" >&2
+  cat "$share_out" >&2
+  cat "$share_err" >&2
+  exit 1
+fi
 
 echo "failed to observe derpssh terminal echo" >&2
 cat "$connect_out" >&2
