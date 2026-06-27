@@ -30,7 +30,9 @@ func (h *ChatHistory) Append(msg ChatMessage) {
 	}
 	h.messages = append(h.messages, msg)
 	if len(h.messages) > h.limit {
-		h.messages = h.messages[len(h.messages)-h.limit:]
+		tail := h.messages[len(h.messages)-h.limit:]
+		h.messages = make([]ChatMessage, len(tail))
+		copy(h.messages, tail)
 	}
 }
 

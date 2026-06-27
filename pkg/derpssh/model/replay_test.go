@@ -18,3 +18,22 @@ func TestReplayBufferKeepsBoundedTail(t *testing.T) {
 		t.Fatalf("NextSeq() = %d, want 3", buf.NextSeq())
 	}
 }
+
+func TestReplayBufferCopiesTrimmedTail(t *testing.T) {
+	buf := NewReplayBuffer(5)
+	buf.Append([]byte("abc"))
+	buf.Append([]byte("def"))
+	if got := cap(buf.buf); got != 5 {
+		t.Fatalf("internal buffer cap = %d, want 5", got)
+	}
+}
+
+func TestReplayBufferBytesReturnsCopy(t *testing.T) {
+	buf := NewReplayBuffer(5)
+	buf.Append([]byte("abc"))
+	got := buf.Bytes()
+	got[0] = 'z'
+	if string(buf.Bytes()) != "abc" {
+		t.Fatalf("Bytes() returned mutable internal buffer")
+	}
+}

@@ -25,7 +25,9 @@ func (b *ReplayBuffer) Append(data []byte) {
 		return
 	}
 	if len(b.buf) > b.limit {
-		b.buf = b.buf[len(b.buf)-b.limit:]
+		tail := b.buf[len(b.buf)-b.limit:]
+		b.buf = make([]byte, len(tail))
+		copy(b.buf, tail)
 	}
 }
 

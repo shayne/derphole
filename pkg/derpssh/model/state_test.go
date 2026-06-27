@@ -39,6 +39,24 @@ func TestGuestResizeDoesNotChangeHostSize(t *testing.T) {
 	}
 }
 
+func TestGuestResizeIgnoresUnknownGuest(t *testing.T) {
+	s := NewHostState("host", 100, 30)
+	s.NoteGuestSize("guest-1", 200, 60)
+	if got, ok := s.Guest("guest-1"); ok {
+		t.Fatalf("Guest() = %#v, true; want unknown guest ignored", got)
+	}
+}
+
+func TestApproveGuestRejectsNonGrantedRoles(t *testing.T) {
+	s := NewHostState("host", 100, 30)
+	s.AddPendingGuest("guest-1", "Alex")
+	for _, role := range []protocol.Role{protocol.RolePending, protocol.RoleDenied, protocol.RoleKicked} {
+		if err := s.ApproveGuest("guest-1", role); err == nil {
+			t.Fatalf("ApproveGuest(%q) error = nil, want error", role)
+		}
+	}
+}
+
 func TestKickGuestMarksRoleKicked(t *testing.T) {
 	s := NewHostState("host", 100, 30)
 	s.AddPendingGuest("guest-1", "Alex")

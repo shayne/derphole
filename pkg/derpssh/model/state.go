@@ -65,7 +65,10 @@ func (s *HostState) KickGuest(id string) error {
 }
 
 func (s *HostState) NoteGuestSize(id string, cols, rows int) {
-	p := s.guests[id]
+	p, ok := s.guests[id]
+	if !ok {
+		return
+	}
 	p.ID = id
 	p.Cols = cols
 	p.Rows = rows
