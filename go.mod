@@ -3,6 +3,7 @@ module github.com/shayne/derphole
 go 1.26.1
 
 require (
+	github.com/creack/pty v1.1.24
 	github.com/google/addlicense v1.2.0
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/pion/webrtc/v4 v4.2.11
@@ -12,6 +13,7 @@ require (
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745
 	golang.org/x/crypto v0.52.0
 	golang.org/x/net v0.54.0
+	golang.org/x/term v0.43.0
 	tailscale.com v1.96.5
 )
 
@@ -58,7 +60,6 @@ require (
 	golang.org/x/mod v0.30.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
-	golang.org/x/term v0.43.0 // indirect
 	golang.org/x/time v0.12.0 // indirect
 	golang.org/x/tools v0.39.0 // indirect
 	golang.zx2c4.com/wireguard/windows v0.5.3 // indirect
