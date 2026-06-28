@@ -45,6 +45,23 @@ func TestVTTerminalPanePreservesStyledSpaces(t *testing.T) {
 	}
 }
 
+func TestVTTerminalPaneSuppressesUnderlineOnlyBlankCells(t *testing.T) {
+	pane := NewVTTerminalPane(20, 4)
+
+	if _, err := pane.Write([]byte("vim\x1b[4m          \x1b[0m\x1b[?25l")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	view := pane.View(20, 4)
+	firstLine := strings.Split(view, "\n")[0]
+	if strings.Contains(firstLine, "\x1b[4m") {
+		t.Fatalf("View() rendered underline-only blank cells as visible rules: %q", view)
+	}
+	if width := visibleWidth(firstLine); width != len("vim") {
+		t.Fatalf("first line visible width = %d, want %d: %q", width, len("vim"), view)
+	}
+}
+
 func TestVTTerminalPaneHandlesCursorMovement(t *testing.T) {
 	pane := NewVTTerminalPane(10, 3)
 

@@ -150,6 +150,9 @@ func renderTerminalRow(term vt10x.Terminal, width int, y int, cursor terminalCur
 }
 
 func writeTerminalCell(b *strings.Builder, glyph vt10x.Glyph, style terminalCellStyle, activeStyle *terminalCellStyle, styleActive *bool) {
+	if terminalBlankCellShouldUseDefaultStyle(glyph, style) {
+		style = defaultTerminalCellStyle()
+	}
 	if !style.equal(*activeStyle) {
 		resetTerminalStyle(b, styleActive)
 		if style.active() {
@@ -198,11 +201,19 @@ func terminalLastRenderableColumn(term vt10x.Terminal, width int, y int) int {
 		if glyph.Char != 0 && glyph.Char != ' ' {
 			return x
 		}
-		if glyph.Char != 0 && terminalStyleFromGlyph(glyph).active() {
+		if terminalBlankCellHasVisibleStyle(glyph) {
 			return x
 		}
 	}
 	return -1
+}
+
+func terminalBlankCellShouldUseDefaultStyle(glyph vt10x.Glyph, style terminalCellStyle) bool {
+	return glyph.Char == ' ' && !style.visibleOnBlankCell()
+}
+
+func terminalBlankCellHasVisibleStyle(glyph vt10x.Glyph) bool {
+	return glyph.Char == ' ' && terminalStyleFromAttr(glyph).visibleOnBlankCell()
 }
 
 func terminalStyleFromGlyph(glyph vt10x.Glyph) terminalCellStyle {
@@ -239,6 +250,10 @@ func (s terminalCellStyle) equal(other terminalCellStyle) bool {
 
 func (s terminalCellStyle) active() bool {
 	return s.mode != 0 || s.fg != vt10x.DefaultFG || s.bg != vt10x.DefaultBG || s.reverse
+}
+
+func (s terminalCellStyle) visibleOnBlankCell() bool {
+	return s.reverse || s.bg != vt10x.DefaultBG
 }
 
 func (s terminalCellStyle) sgr() string {

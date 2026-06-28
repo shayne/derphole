@@ -79,6 +79,9 @@ func supportedMouseAction(action tea.MouseAction) bool {
 }
 
 func (a *App) handleModalMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
+	if cmd, handled := a.handleShellExitMouse(msg); handled {
+		return cmd, true
+	}
 	if cmd, handled := a.handleQuitMouse(msg); handled {
 		return cmd, true
 	}
@@ -95,6 +98,19 @@ func (a *App) handleModalMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
 		return nil, true
 	}
 	return nil, false
+}
+
+func (a *App) handleShellExitMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
+	if !a.shellExitOpen {
+		return nil, false
+	}
+	if msg.Action == tea.MouseActionPress {
+		if choice := a.shellExitHit(msg.X, msg.Y); choice >= 0 {
+			a.shellExitChoice = choice
+			a.confirmShellExitChoice()
+		}
+	}
+	return nil, true
 }
 
 func (a *App) handleQuitMouse(msg tea.MouseMsg) (tea.Cmd, bool) {

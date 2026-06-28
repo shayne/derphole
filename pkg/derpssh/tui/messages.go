@@ -31,6 +31,10 @@ type QuitCommand struct{}
 
 func (QuitCommand) command() {}
 
+type RestartShellCommand struct{}
+
+func (RestartShellCommand) command() {}
+
 type CopyInviteCommand struct {
 	Command string
 }

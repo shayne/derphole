@@ -163,6 +163,25 @@ func TestTUIConsoleHostShellExitShowsQuitConfirm(t *testing.T) {
 	}
 }
 
+func TestTUIConsoleRestartShellCommandCallsCallback(t *testing.T) {
+	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, &recordingTerminalPane{view: "shell$"})
+	called := make(chan struct{}, 1)
+	console.SetCommandCallbacks(tuiConsoleCallbacks{
+		RestartShell: func(context.Context) error {
+			called <- struct{}{}
+			return nil
+		},
+	})
+
+	console.handleCommand(context.Background(), tui.RestartShellCommand{})
+
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("restart shell callback was not called")
+	}
+}
+
 func TestTUIConsoleProgramRequiresInputAndOutputTTY(t *testing.T) {
 	stdin, stdout := openPipeFiles(t)
 	oldIsTerminalFD := isTerminalFD

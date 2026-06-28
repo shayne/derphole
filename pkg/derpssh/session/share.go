@@ -117,7 +117,7 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 		InitialInviteOpen: false,
 	})
 	terminalSize := console.TerminalSize()
-	terminal, err := startShareTerminal(terminalSize)
+	terminal, err := newRestartableShareTerminal(terminalSize, startShareTerminal)
 	if err != nil {
 		return err
 	}
@@ -138,6 +138,7 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 			cancel()
 		}
 	}()
+	go watchShareTerminalEvents(shareCtx, terminal, console, fanout)
 
 	pendingChats := newPendingShareChats()
 	preflight, plainInvite, err := prepareShareInvitePreflight(shareCtx, cfg, connectCommand, plainInvite)
@@ -151,7 +152,10 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 		}()
 	}
 	starter := newShareConsoleStarter(console, shareCtx, preflight)
-	console.SetCommandCallbacks(waitingShareConsoleCallbacks(terminal, cancel, pendingChats))
+	restartShell := newShareRestartShellCallback(console, terminal, fanout)
+	waitingCallbacks := waitingShareConsoleCallbacks(terminal, cancel, pendingChats)
+	waitingCallbacks.RestartShell = restartShell
+	console.SetCommandCallbacks(waitingCallbacks)
 	var preflightErr atomic.Value
 	var preflightExit <-chan struct{}
 	if plainInvite {
@@ -182,6 +186,7 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 			Size:         terminalSize,
 			Cancel:       cancel,
 			HostStarted:  &hostStarted,
+			RestartShell: restartShell,
 		}
 		serveErr <- serveAppMux(shareCtx, appsession.DerptunAppServeConfig{
 			ServerToken: serverToken,
@@ -203,7 +208,7 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 type shareHostMuxOptions struct {
 	Config       ShareConfig
 	Console      *tuiConsole
-	Terminal     *shareTerminal
+	Terminal     *restartableShareTerminal
 	Fanout       *terminalFanout
 	Starter      *shareConsoleStarter
 	PendingChats *pendingShareChats
@@ -211,6 +216,7 @@ type shareHostMuxOptions struct {
 	Size         pty.Size
 	Cancel       context.CancelFunc
 	HostStarted  *atomic.Bool
+	RestartShell func(context.Context) error
 }
 
 func runShareHostMux(ctx context.Context, mux *derptun.Mux, opts shareHostMuxOptions) error {
@@ -222,6 +228,7 @@ func runShareHostMux(ctx context.Context, mux *derptun.Mux, opts shareHostMuxOpt
 	err := runHostSession(ctx, hostCfg, func(host *HostRuntime) {
 		hostRuntime = host
 		callbacks := hostConsoleCallbacks(host)
+		callbacks.RestartShell = opts.RestartShell
 		callbacks.Quit = func(ctx context.Context) error {
 			err := host.Close(ctx, hostQuitReason)
 			_ = opts.Terminal.Close()
@@ -287,7 +294,7 @@ func prepareShareInvitePreflight(ctx context.Context, cfg ShareConfig, command s
 func watchShareInvitePreflight(
 	preflight shareInvitePreflight,
 	starter *shareConsoleStarter,
-	terminal *shareTerminal,
+	terminal *restartableShareTerminal,
 	cancel context.CancelFunc,
 	quitBeforeGuest *atomic.Bool,
 	preflightErr *atomic.Value,
@@ -314,6 +321,64 @@ func watchShareInvitePreflight(
 		}
 	}()
 	return exited
+}
+
+func watchShareTerminalEvents(ctx context.Context, terminal *restartableShareTerminal, console *tuiConsole, fanout *terminalFanout) {
+	if terminal == nil {
+		return
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event := <-terminal.Events():
+			if event.Kind != shareTerminalShellExited {
+				continue
+			}
+			notifyShareTerminalStatus(console, fanout, "shell exited; restart or quit from the host")
+			if console != nil {
+				console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventClose, Message: hostShellExitedReason})
+			}
+		}
+	}
+}
+
+func newShareRestartShellCallback(console *tuiConsole, terminal *restartableShareTerminal, fanout *terminalFanout) func(context.Context) error {
+	return func(context.Context) error {
+		if terminal == nil {
+			return io.ErrClosedPipe
+		}
+		size := pty.Size{Cols: 80, Rows: 24}
+		if console != nil {
+			size = console.TerminalSize()
+		}
+		if err := terminal.Restart(size); err != nil {
+			if console != nil {
+				console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventClose, Message: "restart failed: " + err.Error()})
+			}
+			return err
+		}
+		notifyShareTerminalStatus(console, fanout, "shell restarted")
+		if console != nil {
+			console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventStatus, Message: "shell restarted"})
+			console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventResize, Cols: size.Cols, Rows: size.Rows})
+		}
+		return nil
+	}
+}
+
+func notifyShareTerminalStatus(console *tuiConsole, fanout *terminalFanout, message string) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return
+	}
+	data := []byte("\r\n[derpssh] " + message + "\r\n")
+	if console != nil {
+		_, _ = console.Write(data)
+	}
+	if fanout != nil {
+		fanout.broadcast(data)
+	}
 }
 
 func finishShareError(err error, ctx context.Context, quitBeforeGuest *atomic.Bool, preflightErr *atomic.Value) error {
@@ -346,7 +411,7 @@ func joinUserHost(user, host string) string {
 	}
 }
 
-func waitingShareConsoleCallbacks(terminal *shareTerminal, cancel context.CancelFunc, pendingChats *pendingShareChats) tuiConsoleCallbacks {
+func waitingShareConsoleCallbacks(terminal *restartableShareTerminal, cancel context.CancelFunc, pendingChats *pendingShareChats) tuiConsoleCallbacks {
 	return tuiConsoleCallbacks{
 		TerminalInput: func(ctx context.Context, data []byte) error {
 			_ = ctx

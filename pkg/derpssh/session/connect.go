@@ -6,6 +6,7 @@ package session
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -110,12 +111,14 @@ func Connect(ctx context.Context, cfg ConnectConfig) error {
 	statusConsole = console
 	initialTransportStatus := lastTransportStatus
 	statusMu.Unlock()
-	defer console.Stop()
 	if initialTransportStatus != "" {
 		console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventStatus, Message: initialTransportStatus})
 	}
 	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventStatus, Message: "waiting for host approval"})
-	return runGuestSession(runCtx, guest)
+	err = runGuestSession(runCtx, guest)
+	console.Stop()
+	reportGuestCloseReason(cfg.Stderr, guest.CloseReason())
+	return err
 }
 
 func normalizeConnectConfig(cfg ConnectConfig) ConnectConfig {
@@ -136,6 +139,14 @@ func normalizeConnectConfig(cfg ConnectConfig) ConnectConfig {
 		}
 	}
 	return cfg
+}
+
+func reportGuestCloseReason(w io.Writer, reason string) {
+	reason = strings.TrimSpace(reason)
+	if w == nil || reason == "" {
+		return
+	}
+	_, _ = fmt.Fprintf(w, "derpssh: session closed: %s\n", reason)
 }
 
 type guestInputSender interface {

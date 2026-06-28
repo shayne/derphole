@@ -47,6 +47,30 @@ func TestTerminalDataUpdatesTerminalPane(t *testing.T) {
 	}
 }
 
+func TestShellExitedNoticeShowsRestartDialog(t *testing.T) {
+	app := NewApp(Options{Side: string(ModeHost), DisplayName: "root@hetz", Terminal: NewVTTerminalPane(80, 24)})
+	app.SetWindowSize(100, 30)
+	app.Update(NoticeMsg{Title: "Shell exited", Body: "The shared shell exited."})
+
+	view := app.View()
+	for _, want := range []string{"Shell exited", "Restart Shell", "Quit"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("view missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestShellExitedRestartChoiceEmitsRestartCommand(t *testing.T) {
+	app := NewApp(Options{Side: string(ModeHost), DisplayName: "root@hetz", Terminal: NewVTTerminalPane(80, 24)})
+	app.SetWindowSize(100, 30)
+	app.Update(NoticeMsg{Title: "Shell exited", Body: "The shared shell exited."})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if _, ok := readCommand(app).(RestartShellCommand); !ok {
+		t.Fatal("command is not RestartShellCommand")
+	}
+}
+
 func TestRuntimeStateUpdatesTopBar(t *testing.T) {
 	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
@@ -607,6 +631,44 @@ func TestChatComposerGrowsToThreeRows(t *testing.T) {
 	}
 }
 
+func TestChatComposerShowsAllRowsWhileGrowingToThree(t *testing.T) {
+	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	app.View()
+	width := app.layout.Composer.W
+	if width < 10 {
+		t.Fatalf("composer width = %d, want useful test width", width)
+	}
+
+	first := strings.Repeat("a", width)
+	second := strings.Repeat("b", width)
+	third := strings.Repeat("c", width)
+	typeRunes(app, first)
+	typeRunes(app, second)
+	view := ansiPattern.ReplaceAllString(app.View(), "")
+	if app.layout.Composer.H != 2 {
+		t.Fatalf("composer height after two wrapped rows = %d, want 2", app.layout.Composer.H)
+	}
+	for _, want := range []string{first, second} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("composer missing wrapped row %q while growing to two rows:\n%s", want, view)
+		}
+	}
+
+	typeRunes(app, third)
+	view = ansiPattern.ReplaceAllString(app.View(), "")
+	if app.layout.Composer.H != 3 {
+		t.Fatalf("composer height after three wrapped rows = %d, want 3", app.layout.Composer.H)
+	}
+	for _, want := range []string{first, second, third} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("composer missing wrapped row %q while growing to three rows:\n%s", want, view)
+		}
+	}
+}
+
 func TestClosedChatShowsUnreadNotification(t *testing.T) {
 	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
@@ -763,6 +825,12 @@ var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 
 func visibleWidth(line string) int {
 	return runewidth.StringWidth(ansiPattern.ReplaceAllString(line, ""))
+}
+
+func typeRunes(app *App, text string) {
+	for _, r := range text {
+		app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
 }
 
 type fakePane struct {

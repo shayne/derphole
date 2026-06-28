@@ -133,7 +133,8 @@ func TestShareTestCommandBacksHostTerminal(t *testing.T) {
 				t.Fatalf("close command input: %v", err)
 			}
 		}
-		raw, err := io.ReadAll(cfg.PTYOutput)
+		raw := make([]byte, len("input:hello"))
+		_, err := io.ReadFull(cfg.PTYOutput, raw)
 		if err != nil {
 			t.Fatalf("read command output: %v", err)
 		}
@@ -925,6 +926,41 @@ func TestConnectClosesStdinWhenGuestRunExits(t *testing.T) {
 	}
 	if !stdin.closed.Load() {
 		t.Fatal("stdin was not closed when guest run exited")
+	}
+}
+
+func TestConnectReportsGuestCloseReason(t *testing.T) {
+	oldDial := dialAppMux
+	oldRunGuest := runGuestSession
+	defer func() {
+		dialAppMux = oldDial
+		runGuestSession = oldRunGuest
+	}()
+	invite, err := EncodeInvite(Invite{ClientToken: "dtc1_test"})
+	if err != nil {
+		t.Fatalf("EncodeInvite() error = %v", err)
+	}
+	dialAppMux = func(context.Context, appsession.DerptunAppDialConfig) (*derptun.Mux, func(), error) {
+		return &derptun.Mux{}, func() {}, nil
+	}
+	runGuestSession = func(_ context.Context, guest *GuestRuntime) error {
+		guest.setCloseReason(hostQuitReason)
+		return nil
+	}
+	var stderr strings.Builder
+
+	err = Connect(context.Background(), ConnectConfig{
+		Invite:      invite,
+		DisplayName: "Alex",
+		Stdin:       strings.NewReader(""),
+		Stdout:      io.Discard,
+		Stderr:      &stderr,
+	})
+	if err != nil {
+		t.Fatalf("Connect() error = %v, want nil", err)
+	}
+	if got := stderr.String(); !strings.Contains(got, "host quit") {
+		t.Fatalf("stderr = %q, want host quit reason", got)
 	}
 }
 

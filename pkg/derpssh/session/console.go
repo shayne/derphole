@@ -37,6 +37,7 @@ type tuiConsoleCallbacks struct {
 	RoleChange    func(context.Context, string, protocol.Role) error
 	Kick          func(context.Context, string, string) error
 	Resize        func(context.Context, int, int) error
+	RestartShell  func(context.Context) error
 	Quit          func(context.Context) error
 }
 
@@ -459,6 +460,8 @@ func (c *tuiConsole) handleCommand(ctx context.Context, cmd tui.Command) {
 		c.handleKickCommand(ctx, cmd)
 	case tui.TerminalResizeCommand:
 		c.handleResizeCommand(ctx, cmd)
+	case tui.RestartShellCommand:
+		c.handleRestartShellCommand(ctx)
 	}
 }
 
@@ -517,6 +520,13 @@ func (c *tuiConsole) handleResizeCommand(ctx context.Context, cmd tui.TerminalRe
 	callbacks := c.currentCallbacks()
 	if callbacks.Resize != nil {
 		_ = callbacks.Resize(ctx, cmd.Cols, cmd.Rows)
+	}
+}
+
+func (c *tuiConsole) handleRestartShellCommand(ctx context.Context) {
+	callbacks := c.currentCallbacks()
+	if callbacks.RestartShell != nil {
+		_ = callbacks.RestartShell(ctx)
 	}
 }
 

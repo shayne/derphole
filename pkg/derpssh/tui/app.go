@@ -50,6 +50,18 @@ var quitChoiceOrder = []quitChoice{
 	quitChoiceCancel,
 }
 
+type shellExitChoice int
+
+const (
+	shellExitChoiceRestart shellExitChoice = iota
+	shellExitChoiceQuit
+)
+
+var shellExitChoiceOrder = []shellExitChoice{
+	shellExitChoiceRestart,
+	shellExitChoiceQuit,
+}
+
 type topBarAction int
 
 const (
@@ -122,6 +134,8 @@ type App struct {
 	quitChoice      quitChoice
 	quitTitle       string
 	quitBody        string
+	shellExitOpen   bool
+	shellExitChoice shellExitChoice
 	noticeTitle     string
 	noticeBody      string
 	topBarHits      []topBarHit
@@ -239,10 +253,9 @@ func (a *App) applyNotice(msg NoticeMsg) {
 	if strings.EqualFold(title, "Shell exited") {
 		a.noticeTitle = ""
 		a.noticeBody = ""
-		a.quitTitle = title
-		a.quitBody = valueOr(body, "The shared shell exited.")
-		a.quitOpen = true
-		a.quitChoice = quitChoiceQuit
+		a.quitOpen = false
+		a.shellExitOpen = true
+		a.shellExitChoice = shellExitChoiceRestart
 		return
 	}
 	a.noticeTitle = title
@@ -298,6 +311,9 @@ func (a *App) applyOverlays(lines []string) {
 	}
 	if a.quitOpen {
 		a.overlay(lines, a.quitLines())
+	}
+	if a.shellExitOpen {
+		a.overlay(lines, a.shellExitLines())
 	}
 	if a.noticeOpen() {
 		a.overlay(lines, a.noticeLines())
@@ -452,6 +468,9 @@ func (a *App) handleScreenKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	if a.noticeOpen() {
 		return a.handleNoticeKey(msg), true
 	}
+	if cmd, handled := a.handleShellExitKey(msg); handled {
+		return cmd, true
+	}
 	if cmd, handled := a.handleQuitKey(msg); handled {
 		return cmd, true
 	}
@@ -581,6 +600,22 @@ func (a *App) handleQuitKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	return nil, true
 }
 
+func (a *App) handleShellExitKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	if !a.shellExitOpen {
+		return nil, false
+	}
+	if a.prefix {
+		a.prefix = false
+		if msg.Type == tea.KeyRunes && strings.EqualFold(string(msg.Runes), "q") {
+			a.shellExitChoice = shellExitChoiceQuit
+			a.confirmShellExitChoice()
+			return nil, true
+		}
+	}
+	a.dispatchShellExitKey(msg)
+	return nil, true
+}
+
 func (a *App) dispatchQuitKey(msg tea.KeyMsg) {
 	switch msg.Type {
 	case tea.KeyEnter, tea.KeySpace:
@@ -598,6 +633,21 @@ func (a *App) dispatchQuitKey(msg tea.KeyMsg) {
 	}
 }
 
+func (a *App) dispatchShellExitKey(msg tea.KeyMsg) {
+	switch msg.Type {
+	case tea.KeyEnter, tea.KeySpace:
+		a.confirmShellExitChoice()
+	case tea.KeyTab, tea.KeyRight, tea.KeyDown:
+		a.moveShellExitChoice(1)
+	case tea.KeyShiftTab, tea.KeyLeft, tea.KeyUp:
+		a.moveShellExitChoice(-1)
+	case tea.KeyRunes:
+		a.handleShellExitRune(string(msg.Runes))
+	case tea.KeyCtrlX:
+		a.prefix = true
+	}
+}
+
 func (a *App) handleQuitRune(key string) {
 	switch strings.ToLower(key) {
 	case "y":
@@ -605,6 +655,17 @@ func (a *App) handleQuitRune(key string) {
 		a.confirmQuitChoice()
 	case "n", "q":
 		a.closeQuitConfirm()
+	}
+}
+
+func (a *App) handleShellExitRune(key string) {
+	switch strings.ToLower(key) {
+	case "r":
+		a.shellExitChoice = shellExitChoiceRestart
+		a.confirmShellExitChoice()
+	case "q":
+		a.shellExitChoice = shellExitChoiceQuit
+		a.confirmShellExitChoice()
 	}
 }
 
@@ -617,6 +678,8 @@ func (a *App) handleEscapeKey(msg tea.KeyMsg) bool {
 		a.approve("", true)
 	case a.quitOpen:
 		a.closeQuitConfirm()
+	case a.shellExitOpen:
+		return true
 	case a.prefix:
 		a.prefix = false
 	case a.helpOpen:
@@ -1036,7 +1099,7 @@ func (a *App) writeSidebarComposer(content []string, width int, height int) {
 		content[borderY] = fitLine(composerBorderStyle.Width(width).Render(strings.Repeat(" ", width)), width)
 	}
 	start := height - rows
-	composerLines := splitAndFit(a.composer.View(), width, rows)
+	composerLines := a.composerVisibleLines(width, rows)
 	for i := 0; i < rows && start+i < height; i++ {
 		if i < len(composerLines) {
 			content[start+i] = fitLine(composerStyle.Width(width).Render(fitLine(composerLines[i], width)), width)
@@ -1044,6 +1107,20 @@ func (a *App) writeSidebarComposer(content []string, width int, height int) {
 			content[start+i] = fitLine(composerStyle.Width(width).Render(strings.Repeat(" ", width)), width)
 		}
 	}
+}
+
+func (a *App) composerVisibleLines(width int, rows int) []string {
+	width = maxInt(width, 1)
+	rows = clampInt(rows, 1, 3)
+	value := a.composer.Value()
+	if value == "" {
+		return []string{dimStyle.Render(a.composer.Placeholder)}
+	}
+	lines := wrapPlainLines(value, width)
+	if len(lines) > rows {
+		lines = lines[len(lines)-rows:]
+	}
+	return lines
 }
 
 func (a *App) sidebarComposerRows(height int) int {
@@ -1073,6 +1150,17 @@ func (a *App) quitLines() []string {
 		fitLine(dimStyle.Render(body), width),
 		fitLine("", width),
 		a.quitButtonLine(width),
+	}
+}
+
+func (a *App) shellExitLines() []string {
+	width := a.shellExitContentWidth()
+	return []string{
+		fitLine(labelStyle.Render("Shell exited"), width),
+		fitLine(dimStyle.Render("The shared shell exited."), width),
+		fitLine(dimStyle.Render("Restart it or close the session for everyone."), width),
+		fitLine("", width),
+		a.shellExitButtonLine(width),
 	}
 }
 
@@ -1262,6 +1350,18 @@ func (a *App) quitHit(x int, y int) quitChoice {
 	}
 }
 
+func (a *App) shellExitHit(x int, y int) shellExitChoice {
+	restart, quit := a.shellExitButtonRects()
+	switch {
+	case restart.contains(x, y):
+		return shellExitChoiceRestart
+	case quit.contains(x, y):
+		return shellExitChoiceQuit
+	default:
+		return -1
+	}
+}
+
 func (a *App) quitButtonRects() (Rect, Rect) {
 	contentW := a.quitContentWidth()
 	contentX, contentY := a.quitContentOrigin()
@@ -1274,8 +1374,29 @@ func (a *App) quitButtonRects() (Rect, Rect) {
 	return quit, cancel
 }
 
+func (a *App) shellExitButtonRects() (Rect, Rect) {
+	contentW := a.shellExitContentWidth()
+	contentX, contentY := a.shellExitContentOrigin()
+	buttonLineW := shellExitButtonsWidth()
+	startX := contentX + maxInt((contentW-buttonLineW)/2, 0)
+	y := contentY + shellExitButtonLineIndex
+
+	restart := Rect{X: startX, Y: y, W: shellExitButtonWidth(shellExitChoiceRestart), H: 1}
+	quit := Rect{X: restart.X + restart.W + shellExitButtonGap, Y: y, W: shellExitButtonWidth(shellExitChoiceQuit), H: 1}
+	return restart, quit
+}
+
 func (a *App) quitContentOrigin() (int, int) {
 	box := renderModalBox(a.quitLines())
+	boxW := a.overlayWidth(box)
+	boxX := (a.width - boxW) / 2
+	boxY := a.overlayY(len(box))
+	return boxX + modalStyle.GetBorderLeftSize() + modalStyle.GetPaddingLeft(),
+		boxY + modalStyle.GetBorderTopSize() + modalStyle.GetPaddingTop()
+}
+
+func (a *App) shellExitContentOrigin() (int, int) {
+	box := renderModalBox(a.shellExitLines())
 	boxW := a.overlayWidth(box)
 	boxX := (a.width - boxW) / 2
 	boxY := a.overlayY(len(box))
@@ -1289,6 +1410,18 @@ func (a *App) quitContentWidth() int {
 	width := maxInt(displayWidth(title), displayWidth(body))
 	width = maxInt(width, 44)
 	width = maxInt(width, quitButtonsWidth())
+	if a.width > 0 {
+		maxWidth := a.width - modalStyle.GetHorizontalBorderSize() - modalStyle.GetHorizontalPadding() - 2
+		width = minInt(width, maxInt(maxWidth, 1))
+	}
+	return maxInt(width, 1)
+}
+
+func (a *App) shellExitContentWidth() int {
+	width := maxInt(44, displayWidth("Shell exited"))
+	width = maxInt(width, displayWidth("The shared shell exited."))
+	width = maxInt(width, displayWidth("Restart it or close the session for everyone."))
+	width = maxInt(width, shellExitButtonsWidth())
 	if a.width > 0 {
 		maxWidth := a.width - modalStyle.GetHorizontalBorderSize() - modalStyle.GetHorizontalPadding() - 2
 		width = minInt(width, maxInt(maxWidth, 1))
@@ -1363,6 +1496,16 @@ func (a *App) quitButtonLine(width int) string {
 	return fitLine(pad+strings.Join(parts, strings.Repeat(" ", quitButtonGap)), width)
 }
 
+func (a *App) shellExitButtonLine(width int) string {
+	lineW := shellExitButtonsWidth()
+	pad := strings.Repeat(" ", maxInt((width-lineW)/2, 0))
+	parts := []string{
+		a.renderShellExitButton(shellExitChoiceRestart),
+		a.renderShellExitButton(shellExitChoiceQuit),
+	}
+	return fitLine(pad+strings.Join(parts, strings.Repeat(" ", shellExitButtonGap)), width)
+}
+
 func (a *App) noticeContentWidth() int {
 	width := maxInt(34, displayWidth(valueOr(a.noticeTitle, "Notice")))
 	for _, line := range wrapPlainLines(strings.TrimSpace(a.noticeBody), 54) {
@@ -1402,6 +1545,14 @@ func (a *App) waitingApprovalContentWidth() int {
 func (a *App) renderQuitButton(choice quitChoice) string {
 	text := quitButtonText(choice)
 	if a.quitChoice == choice {
+		return approvalButtonSelectedStyle.Render(text)
+	}
+	return approvalButtonStyle.Render(text)
+}
+
+func (a *App) renderShellExitButton(choice shellExitChoice) string {
+	text := shellExitButtonText(choice)
+	if a.shellExitChoice == choice {
 		return approvalButtonSelectedStyle.Render(text)
 	}
 	return approvalButtonStyle.Render(text)
@@ -1501,6 +1652,17 @@ func (a *App) confirmQuitChoice() {
 	a.closeQuitConfirm()
 }
 
+func (a *App) confirmShellExitChoice() {
+	switch a.shellExitChoice {
+	case shellExitChoiceRestart:
+		a.shellExitOpen = false
+		a.shellExitChoice = shellExitChoiceRestart
+		a.emit(RestartShellCommand{})
+	case shellExitChoiceQuit:
+		a.emit(QuitCommand{})
+	}
+}
+
 func (a *App) moveQuitChoice(delta int) {
 	idx := 0
 	for i, choice := range quitChoiceOrder {
@@ -1514,6 +1676,21 @@ func (a *App) moveQuitChoice(delta int) {
 		next += len(quitChoiceOrder)
 	}
 	a.quitChoice = quitChoiceOrder[next]
+}
+
+func (a *App) moveShellExitChoice(delta int) {
+	idx := 0
+	for i, choice := range shellExitChoiceOrder {
+		if choice == a.shellExitChoice {
+			idx = i
+			break
+		}
+	}
+	next := (idx + delta) % len(shellExitChoiceOrder)
+	if next < 0 {
+		next += len(shellExitChoiceOrder)
+	}
+	a.shellExitChoice = shellExitChoiceOrder[next]
 }
 
 func (a *App) noticeOpen() bool {
@@ -1550,7 +1727,7 @@ func (a *App) setTerminalCursorActive(active bool) {
 }
 
 func (a *App) modalActive() bool {
-	return a.helpOpen || a.resizeWarningOpen() || a.waitingApprovalOpen() || a.approvalActive() || a.kickPeer != "" || a.quitOpen || a.noticeOpen()
+	return a.helpOpen || a.resizeWarningOpen() || a.waitingApprovalOpen() || a.approvalActive() || a.kickPeer != "" || a.quitOpen || a.shellExitOpen || a.noticeOpen()
 }
 
 func (a *App) resizeWarningOpen() bool {
@@ -1644,10 +1821,12 @@ func (a *App) pumpCommands() {
 }
 
 const (
-	approvalButtonGap       = 3
-	approvalButtonLineIndex = 3
-	quitButtonGap           = 3
-	quitButtonLineIndex     = 3
+	approvalButtonGap        = 3
+	approvalButtonLineIndex  = 3
+	quitButtonGap            = 3
+	quitButtonLineIndex      = 3
+	shellExitButtonGap       = 3
+	shellExitButtonLineIndex = 4
 )
 
 func approvalButtonsWidth() int {
@@ -1692,6 +1871,27 @@ func quitButtonText(choice quitChoice) string {
 		return " Cancel "
 	default:
 		return "        "
+	}
+}
+
+func shellExitButtonsWidth() int {
+	return shellExitButtonWidth(shellExitChoiceRestart) +
+		shellExitButtonWidth(shellExitChoiceQuit) +
+		shellExitButtonGap
+}
+
+func shellExitButtonWidth(choice shellExitChoice) int {
+	return displayWidth(shellExitButtonText(choice))
+}
+
+func shellExitButtonText(choice shellExitChoice) string {
+	switch choice {
+	case shellExitChoiceRestart:
+		return " Restart Shell "
+	case shellExitChoiceQuit:
+		return " Quit "
+	default:
+		return "                "
 	}
 }
 
