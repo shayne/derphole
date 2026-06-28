@@ -265,6 +265,49 @@ func TestInvitePreflightScreenContainsPlainFullCommand(t *testing.T) {
 	}
 }
 
+func TestPresentShareInviteClearsPreflightBeforeTUI(t *testing.T) {
+	oldShowPreflight := showShareInvitePreflight
+	defer func() { showShareInvitePreflight = oldShowPreflight }()
+
+	showShareInvitePreflight = func(stdin io.Reader, stdout io.Writer, command string) (bool, error) {
+		_, _, _ = stdin, stdout, command
+		return true, nil
+	}
+	var stdout strings.Builder
+	if err := presentShareInvite(ShareConfig{
+		Stdin:  strings.NewReader(""),
+		Stdout: &stdout,
+		Stderr: io.Discard,
+	}, "npx -y derpssh@latest connect DSH1test"); err != nil {
+		t.Fatalf("presentShareInvite() error = %v", err)
+	}
+	if !strings.Contains(stdout.String(), "\x1b[3J") {
+		t.Fatalf("stdout missing clear-screen sequence: %q", stdout.String())
+	}
+}
+
+func TestPresentShareInviteClearsPreflightOnQuit(t *testing.T) {
+	oldShowPreflight := showShareInvitePreflight
+	defer func() { showShareInvitePreflight = oldShowPreflight }()
+
+	showShareInvitePreflight = func(stdin io.Reader, stdout io.Writer, command string) (bool, error) {
+		_, _, _ = stdin, stdout, command
+		return true, errInvitePreflightQuit
+	}
+	var stdout strings.Builder
+	err := presentShareInvite(ShareConfig{
+		Stdin:  strings.NewReader(""),
+		Stdout: &stdout,
+		Stderr: io.Discard,
+	}, "npx -y derpssh@latest connect DSH1test")
+	if !errors.Is(err, errInvitePreflightQuit) {
+		t.Fatalf("presentShareInvite() error = %v, want invite quit", err)
+	}
+	if !strings.Contains(stdout.String(), "\x1b[3J") {
+		t.Fatalf("stdout missing scrollback clear on quit: %q", stdout.String())
+	}
+}
+
 func TestReadInvitePreflightInputContinuesOnEnter(t *testing.T) {
 	shown, err := readInvitePreflightInput(strings.NewReader("\n"))
 	if err != nil {
@@ -490,11 +533,11 @@ func TestShareStartsPTYAtTerminalPaneSize(t *testing.T) {
 	runHostSession = func(ctx context.Context, cfg HostConfig, bindConsole func(*HostRuntime)) error {
 		_ = bindConsole
 		_ = ctx
-		if startedSize != (pty.Size{Cols: 80, Rows: 22}) {
-			t.Fatalf("started PTY size = %+v, want 80x22 terminal pane", startedSize)
+		if startedSize != (pty.Size{Cols: 80, Rows: 23}) {
+			t.Fatalf("started PTY size = %+v, want 80x23 terminal pane", startedSize)
 		}
-		if cfg.InitialCols != 80 || cfg.InitialRows != 22 {
-			t.Fatalf("HostConfig initial size = %dx%d, want 80x22", cfg.InitialCols, cfg.InitialRows)
+		if cfg.InitialCols != 80 || cfg.InitialRows != 23 {
+			t.Fatalf("HostConfig initial size = %dx%d, want 80x23", cfg.InitialCols, cfg.InitialRows)
 		}
 		if cfg.PTYResize == nil {
 			t.Fatal("HostConfig.PTYResize = nil, want resize hook")
@@ -667,7 +710,8 @@ func TestConnectStartsConsoleBeforeInitialStatus(t *testing.T) {
 	newConnectConsole = func(tuiConsoleOptions) connectConsole {
 		return console
 	}
-	dialAppMux = func(context.Context, appsession.DerptunAppDialConfig) (*derptun.Mux, func(), error) {
+	dialAppMux = func(_ context.Context, cfg appsession.DerptunAppDialConfig) (*derptun.Mux, func(), error) {
+		cfg.Emitter.Status("connected-relay")
 		return &derptun.Mux{}, func() {}, nil
 	}
 	runGuestSession = func(context.Context, *GuestRuntime) error {
@@ -687,8 +731,14 @@ func TestConnectStartsConsoleBeforeInitialStatus(t *testing.T) {
 	if console.statusBeforeStart {
 		t.Fatal("initial status event was sent before console.Start")
 	}
+	if console.transportBeforeStart {
+		t.Fatal("transport status event was sent before console.Start")
+	}
 	if !console.sawWaitingStatus {
 		t.Fatal("waiting status event was not sent")
+	}
+	if !console.sawTransportStatus {
+		t.Fatal("transport status event was not replayed after console.Start")
 	}
 }
 
@@ -780,9 +830,11 @@ type readTrackingReader struct {
 }
 
 type connectStartOrderConsole struct {
-	started           bool
-	statusBeforeStart bool
-	sawWaitingStatus  bool
+	started              bool
+	statusBeforeStart    bool
+	transportBeforeStart bool
+	sawWaitingStatus     bool
+	sawTransportStatus   bool
 }
 
 func (c *connectStartOrderConsole) Write(p []byte) (int, error) {
@@ -790,12 +842,20 @@ func (c *connectStartOrderConsole) Write(p []byte) (int, error) {
 }
 
 func (c *connectStartOrderConsole) OnRuntimeEvent(event RuntimeEvent) {
-	if event.Kind != RuntimeEventStatus || event.Message != "waiting for host approval" {
+	if event.Kind != RuntimeEventStatus {
 		return
 	}
-	c.sawWaitingStatus = true
-	if !c.started {
-		c.statusBeforeStart = true
+	switch event.Message {
+	case "waiting for host approval":
+		c.sawWaitingStatus = true
+		if !c.started {
+			c.statusBeforeStart = true
+		}
+	case "connected-relay":
+		c.sawTransportStatus = true
+		if !c.started {
+			c.transportBeforeStart = true
+		}
 	}
 }
 

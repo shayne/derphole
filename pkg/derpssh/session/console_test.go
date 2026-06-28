@@ -45,7 +45,7 @@ func TestTUIConsoleSendBeforeStartDoesNotCallProgramSend(t *testing.T) {
 	if program.sends != 0 {
 		t.Fatalf("Program.Send called %d time(s) before Run", program.sends)
 	}
-	if view := console.View(); !strings.Contains(view, "waiting for host approval") {
+	if view := console.View(); !strings.Contains(view, "waiting approval") {
 		t.Fatalf("console view missing startup status:\n%s", view)
 	}
 }
@@ -60,7 +60,7 @@ func TestTUIConsoleApprovalStatusClearsWhenRoleGranted(t *testing.T) {
 	if strings.Contains(view, "waiting for host approval") {
 		t.Fatalf("view still shows stale approval status after role grant:\n%s", view)
 	}
-	if !strings.Contains(view, "role write") || !strings.Contains(view, "approved") {
+	if !strings.Contains(view, "write") || !strings.Contains(view, "connected") {
 		t.Fatalf("view missing granted role/approval state:\n%s", view)
 	}
 }
@@ -80,7 +80,7 @@ func TestTUIConsoleGuestPendingStatusClearsWhenPeerApproved(t *testing.T) {
 	if strings.Contains(view, "guest pending") {
 		t.Fatalf("view still shows stale pending status after peer approval:\n%s", view)
 	}
-	if !strings.Contains(view, "guest connected") || !strings.Contains(view, "shayne/write") {
+	if !strings.Contains(view, "connected") || !strings.Contains(view, "shayne/write") {
 		t.Fatalf("view missing connected peer state:\n%s", view)
 	}
 }
@@ -211,7 +211,7 @@ func TestTUIConsoleNonTTYTranscriptWritesSnapshots(t *testing.T) {
 		"terminal: ready",
 		"status: connected-relay",
 		"role: write",
-		"sidechat: Alex: hello",
+		"chat: Alex: hello",
 	} {
 		if !strings.Contains(transcript, want) {
 			t.Fatalf("transcript missing %q:\n%s", want, transcript)
@@ -464,7 +464,7 @@ func TestTUIConsoleRuntimeEventsUpdateApp(t *testing.T) {
 	console.send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
 
 	view := console.View()
-	for _, want := range []string{"closed: done", "120x40", "role write", "Alex", "read", "Blair", "denied", "Alex: hello"} {
+	for _, want := range []string{"closed: done", "120x40", "write", "Alex", "read", "Blair", "denied", "Alex: hello"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("console view missing %q:\n%s", want, view)
 		}

@@ -111,7 +111,7 @@ for _ in $(seq 1 100); do
 done
 
 if grep -F 'input:hello' "$connect_out" >/dev/null 2>&1; then
-  for want in 'terminal' 'sidechat' 'status' 'guest-side' 'host-side'; do
+  for want in 'terminal:' 'chat:' 'guest-side' 'host-side'; do
     if ! wait_for_contains "$connect_out" "$want"; then
       echo "connect TUI missing $want" >&2
       cat "$connect_out" >&2
@@ -123,6 +123,16 @@ if grep -F 'input:hello' "$connect_out" >/dev/null 2>&1; then
       exit 1
     fi
   done
+  if ! wait_for_contains "$connect_out" 'role: write'; then
+    echo "connect TUI missing role: write" >&2
+    cat "$connect_out" >&2
+    exit 1
+  fi
+  if ! wait_for_contains "$share_out" 'peer: smoke/write'; then
+    echo "share TUI missing peer: smoke/write" >&2
+    cat "$share_out" >&2
+    exit 1
+  fi
   for _ in $(seq 1 100); do
     if grep -F 'input:hello' "$share_out" >/dev/null 2>&1; then
       exit 0

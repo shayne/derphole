@@ -28,8 +28,9 @@ func TestDerpsshLocalSmokeScriptUsesBuiltBinary(t *testing.T) {
 		"DERPSSH_TEST_GUEST_ACTIONS=",
 		"input hello\\\\n",
 		"host terminal echo",
-		"sidechat",
+		"chat:",
 		"role: write",
+		"peer: smoke/write",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("smoke script missing %q", want)

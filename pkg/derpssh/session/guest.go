@@ -53,10 +53,12 @@ func NewGuestRuntime(cfg GuestConfig) *GuestRuntime {
 func (r *GuestRuntime) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	defer r.closeSessionConns()
 	defer func() { _ = r.cfg.Mux.Close() }()
 
 	go func() {
 		<-ctx.Done()
+		r.closeSessionConns()
 		_ = r.cfg.Mux.Close()
 	}()
 
@@ -70,9 +72,9 @@ func (r *GuestRuntime) Run(ctx context.Context) error {
 	if err := r.openApprovedStreams(ctx); err != nil {
 		return err
 	}
-	go r.acceptTerminalOut(ctx)
+	terminalOutErrCh := r.startTerminalOut(ctx)
 
-	return r.readControlLoop(ctx)
+	return r.runUntilControlOrTerminalOutExit(ctx, terminalOutErrCh)
 }
 
 func (r *GuestRuntime) openControl(ctx context.Context) error {
@@ -269,25 +271,34 @@ func (r *GuestRuntime) openApprovedStreams(ctx context.Context) error {
 	return nil
 }
 
-func (r *GuestRuntime) acceptTerminalOut(ctx context.Context) {
+func (r *GuestRuntime) startTerminalOut(ctx context.Context) <-chan error {
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- r.acceptTerminalOut(ctx)
+	}()
+	return errCh
+}
+
+func (r *GuestRuntime) acceptTerminalOut(ctx context.Context) error {
 	conn, err := acceptStream(ctx, r.cfg.Mux, protocol.StreamTerminalOut)
 	if err != nil {
-		return
+		return ignoreContextErr(ctx, err)
 	}
 	r.mu.Lock()
 	r.terminalOut = conn
 	r.mu.Unlock()
+	defer func() { _ = conn.Close() }()
 	for {
 		msg, err := protocol.ReadFrame(conn)
 		if err != nil {
-			return
+			return ignoreContextErr(ctx, err)
 		}
 		switch msg.Type {
 		case protocol.MessageTerminal:
 			if msg.Terminal != nil && len(msg.Terminal.Data) > 0 {
 				if _, err := r.cfg.TerminalOutput.Write(msg.Terminal.Data); err != nil {
 					r.setCloseReason(err.Error())
-					return
+					return err
 				}
 			}
 		case protocol.MessageClose:
@@ -295,7 +306,32 @@ func (r *GuestRuntime) acceptTerminalOut(ctx context.Context) {
 				continue
 			}
 			r.setCloseReason(msg.Close.Reason)
-			return
+			return nil
+		}
+	}
+}
+
+func (r *GuestRuntime) runUntilControlOrTerminalOutExit(ctx context.Context, terminalOutErrCh <-chan error) error {
+	controlErrCh := make(chan error, 1)
+	go func() {
+		controlErrCh <- r.readControlLoop(ctx)
+	}()
+
+	for {
+		select {
+		case err := <-controlErrCh:
+			return err
+		case err := <-terminalOutErrCh:
+			if err == nil {
+				r.closeSessionConns()
+				_ = r.cfg.Mux.Close()
+				return nil
+			}
+			terminalOutErrCh = nil
+		case <-ctx.Done():
+			r.closeSessionConns()
+			_ = r.cfg.Mux.Close()
+			return nil
 		}
 	}
 }
@@ -322,6 +358,17 @@ func (r *GuestRuntime) setControl(conn net.Conn) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.control = conn
+}
+
+func (r *GuestRuntime) closeSessionConns() {
+	r.mu.Lock()
+	conns := []net.Conn{r.control, r.terminalIn, r.terminalOut, r.chatConn}
+	r.mu.Unlock()
+	for _, conn := range conns {
+		if conn != nil {
+			_ = conn.Close()
+		}
+	}
 }
 
 func (r *GuestRuntime) writeControl(msg protocol.Message) error {

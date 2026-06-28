@@ -88,6 +88,7 @@ type tuiConsole struct {
 
 	transcriptMu      sync.Mutex
 	transcriptStarted bool
+	transcriptLast    string
 
 	allowHeadlessApprovalWait bool
 }
@@ -420,7 +421,6 @@ func (c *tuiConsole) handleQuitCommand() {
 	callbacks := c.currentCallbacks()
 	if callbacks.Quit != nil {
 		callbacks.Quit()
-		return
 	}
 	c.Stop()
 }
@@ -637,9 +637,9 @@ func (c *tuiConsole) writePeerTranscript(peer tui.Peer) {
 func (c *tuiConsole) writeChatTranscript(msg tui.ChatMsg) {
 	author := strings.TrimSpace(msg.Author)
 	if author == "" {
-		author = "sidechat"
+		author = "chat"
 	}
-	c.writeTranscriptLine("sidechat: " + author + ": " + msg.Body)
+	c.writeTranscriptLine("chat: " + author + ": " + msg.Body)
 }
 
 func (c *tuiConsole) writeApprovalTranscript(msg tui.ApprovalRequestMsg) {
@@ -667,11 +667,15 @@ func (c *tuiConsole) writeTranscriptLine(line string) {
 	}
 	c.transcriptMu.Lock()
 	defer c.transcriptMu.Unlock()
+	if c.transcriptLast == line {
+		return
+	}
 	if !c.transcriptStarted {
 		_, _ = io.WriteString(c.output, "derpssh transcript\n")
 		c.transcriptStarted = true
 	}
 	_, _ = io.WriteString(c.output, line+"\n")
+	c.transcriptLast = line
 }
 
 func intString(v int) string {

@@ -29,18 +29,19 @@ func (a StaticApproval) Approve(JoinRequest) protocol.Role {
 }
 
 type HostConfig struct {
-	Mux         *derptun.Mux
-	HostID      string
-	HostName    string
-	InitialCols int
-	InitialRows int
-	PTYInput    io.Writer
-	PTYOutput   io.Reader
-	PTYResize   func(cols int, rows int) error
-	LocalInput  io.Reader
-	LocalOutput io.Writer
-	Approval    Approval
-	Observer    RuntimeObserver
+	Mux           *derptun.Mux
+	HostID        string
+	HostName      string
+	InitialCols   int
+	InitialRows   int
+	PTYInput      io.Writer
+	PTYOutput     io.Reader
+	CloseOnPTYEOF bool
+	PTYResize     func(cols int, rows int) error
+	LocalInput    io.Reader
+	LocalOutput   io.Writer
+	Approval      Approval
+	Observer      RuntimeObserver
 }
 
 type GuestConfig struct {

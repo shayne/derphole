@@ -17,6 +17,7 @@ const (
 	HitNone HitTarget = iota
 	HitTopBar
 	HitTerminal
+	HitDivider
 	HitSidebar
 	HitStatus
 	HitComposer
@@ -29,6 +30,7 @@ type Layout struct {
 	Outer       Rect
 	TopBar      Rect
 	Terminal    Rect
+	Divider     Rect
 	Sidebar     Rect
 	Status      Rect
 	Composer    Rect
@@ -36,6 +38,10 @@ type Layout struct {
 }
 
 func ComputeLayout(cols int, rows int, sidebarOpen bool) Layout {
+	return ComputeLayoutWithSidebarWidth(cols, rows, sidebarOpen, 0)
+}
+
+func ComputeLayoutWithSidebarWidth(cols int, rows int, sidebarOpen bool, preferredSidebarWidth int) Layout {
 	cols = nonNegative(cols)
 	rows = nonNegative(rows)
 
@@ -51,7 +57,6 @@ func ComputeLayout(cols int, rows int, sidebarOpen bool) Layout {
 	if rows == 1 {
 		return l
 	}
-	l.Status = Rect{Y: rows - 1, W: cols, H: 1}
 	contentY, contentH := contentRect(rows)
 
 	if shouldCollapseSidebar(cols, sidebarOpen) {
@@ -60,12 +65,13 @@ func ComputeLayout(cols int, rows int, sidebarOpen bool) Layout {
 		return l
 	}
 
-	sidebarW := computeSidebarWidth(cols)
-	terminalW := cols - sidebarW
+	sidebarW := computeSidebarWidth(cols, preferredSidebarWidth)
+	terminalW := cols - sidebarW - 1
 	l.Terminal = Rect{X: 0, Y: contentY, W: terminalW, H: contentH}
-	l.Sidebar = Rect{X: terminalW, Y: contentY, W: sidebarW, H: contentH}
-	if sidebarW > 0 && contentH >= 3 {
-		l.Composer = Rect{X: l.Sidebar.X, Y: l.Status.Y - 3, W: sidebarW, H: 3}
+	l.Divider = Rect{X: terminalW, Y: contentY, W: 1, H: contentH}
+	l.Sidebar = Rect{X: terminalW + 1, Y: contentY, W: sidebarW, H: contentH}
+	if sidebarW > 0 && contentH >= 1 {
+		l.Composer = Rect{X: l.Sidebar.X, Y: rows - 1, W: sidebarW, H: 1}
 	}
 	return l
 }
@@ -78,19 +84,40 @@ func nonNegative(v int) int {
 }
 
 func contentRect(rows int) (int, int) {
-	return 1, nonNegative(rows - 2)
+	return 1, nonNegative(rows - 1)
 }
 
 func shouldCollapseSidebar(cols int, open bool) bool {
 	return !open || cols < 56
 }
 
-func computeSidebarWidth(cols int) int {
-	sidebarW := cols / 3
-	sidebarW = clampMin(sidebarW, 24)
-	sidebarW = clampMax(sidebarW, 36)
-	sidebarW = clampMax(sidebarW, cols-20)
+func computeSidebarWidth(cols int, preferred int) int {
+	sidebarW := preferred
+	if sidebarW <= 0 {
+		sidebarW = cols / 3
+	}
+	sidebarW = clampMin(sidebarW, minSidebarWidth(cols))
+	sidebarW = clampMax(sidebarW, maxSidebarWidth(cols))
 	return nonNegative(sidebarW)
+}
+
+func clampSidebarWidth(cols int, width int) int {
+	return computeSidebarWidth(cols, width)
+}
+
+func minSidebarWidth(cols int) int {
+	if cols < 72 {
+		return 24
+	}
+	return 28
+}
+
+func maxSidebarWidth(cols int) int {
+	max := cols - 24
+	if max < 24 {
+		return max
+	}
+	return max
 }
 
 func clampMin(v int, min int) int {
@@ -117,6 +144,8 @@ func (l Layout) Hit(x int, y int) HitTarget {
 		return HitStatus
 	case l.Composer.contains(x, y):
 		return HitComposer
+	case l.Divider.contains(x, y):
+		return HitDivider
 	case l.Sidebar.contains(x, y):
 		return HitSidebar
 	case l.Terminal.contains(x, y):

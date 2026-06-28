@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/shayne/derphole/pkg/derpssh/model"
 	"github.com/shayne/derphole/pkg/derpssh/protocol"
@@ -32,6 +33,22 @@ func (w lockedWriter) write(msg protocol.Message) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return protocol.WriteFrame(w.conn, msg)
+}
+
+func (w lockedWriter) writeWithDeadline(msg protocol.Message, timeout time.Duration) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return writeFrameWithDeadline(w.conn, msg, timeout)
+}
+
+func writeFrameWithDeadline(conn net.Conn, msg protocol.Message, timeout time.Duration) error {
+	if timeout > 0 {
+		if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+			return err
+		}
+		defer func() { _ = conn.SetWriteDeadline(time.Time{}) }()
+	}
+	return protocol.WriteFrame(conn, msg)
 }
 
 type acceptedStream struct {

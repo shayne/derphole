@@ -25,7 +25,7 @@ func TestMouseClickSidebarToggle(t *testing.T) {
 	if !ok {
 		t.Fatalf("command = %T, want TerminalResizeCommand", got)
 	}
-	want := TerminalResizeCommand{Cols: 67, Rows: 28}
+	want := TerminalResizeCommand{Cols: 66, Rows: 29}
 	if got != want {
 		t.Fatalf("resize command = %+v, want %+v", got, want)
 	}
@@ -43,9 +43,29 @@ func TestMouseClickFocusesTerminalAndChat(t *testing.T) {
 		t.Fatalf("focus after terminal click = %v, want terminal", app.focus)
 	}
 
-	app.Update(leftClick(app.layout.Composer.X+1, app.layout.Composer.Y+1))
+	app.Update(leftClick(app.layout.Composer.X+1, app.layout.Composer.Y))
 	if app.focus != FocusChat {
 		t.Fatalf("focus after composer click = %v, want chat", app.focus)
+	}
+}
+
+func TestMouseDragDividerResizesChat(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	drainCommands(app)
+	start := app.layout.Divider.X
+
+	app.Update(leftClick(start, app.layout.Divider.Y+2))
+	app.Update(tea.MouseMsg{X: 70, Y: app.layout.Divider.Y + 2, Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft})
+	app.Update(tea.MouseMsg{X: 70, Y: app.layout.Divider.Y + 2, Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft})
+
+	if app.layout.Sidebar.W != 49 {
+		t.Fatalf("Sidebar.W = %d, want 49 after dragging divider", app.layout.Sidebar.W)
+	}
+	if !app.sidebarOpen {
+		t.Fatalf("sidebarOpen = false after divider drag")
 	}
 }
 

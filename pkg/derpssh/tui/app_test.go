@@ -24,12 +24,12 @@ func TestAppUsesAltScreenCompatibleView(t *testing.T) {
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
 	view := app.View()
-	for _, want := range []string{"derpssh", "host", "shell$ ready", "Status", "Ctrl-X"} {
+	for _, want := range []string{"derpssh", "host", "shell$ ready"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("View() missing %q:\n%s", want, view)
 		}
 	}
-	for _, old := range []string{"terminal\n-----", "sidechat\n-----", "status\n-----"} {
+	for _, old := range []string{"terminal\n-----", "sidechat\n-----", "status\n-----", "Status "} {
 		if strings.Contains(view, old) {
 			t.Fatalf("View() contains old dashboard section %q:\n%s", old, view)
 		}
@@ -59,10 +59,13 @@ func TestRuntimeStateUpdatesTopBar(t *testing.T) {
 	})
 
 	view := app.View()
-	for _, want := range []string{"connected-relay", "120x40", "Alex", "read", "role read"} {
+	for _, want := range []string{"relay", "120x40", "Alex", "read"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("View() missing %q:\n%s", want, view)
 		}
+	}
+	if strings.Contains(view, "connected-relay") || strings.Contains(view, "role read") {
+		t.Fatalf("View() renders noisy raw status:\n%s", view)
 	}
 }
 
@@ -76,12 +79,12 @@ func TestWindowResizeEmitsTerminalPaneSize(t *testing.T) {
 	if !ok {
 		t.Fatalf("command = %T, want TerminalResizeCommand", got)
 	}
-	want := TerminalResizeCommand{Cols: 100, Rows: 28}
+	want := TerminalResizeCommand{Cols: 100, Rows: 29}
 	if got != want {
 		t.Fatalf("resize command = %+v, want %+v", got, want)
 	}
-	if pane.cols != 100 || pane.rows != 28 {
-		t.Fatalf("pane size = %dx%d, want 100x28", pane.cols, pane.rows)
+	if pane.cols != 100 || pane.rows != 29 {
+		t.Fatalf("pane size = %dx%d, want 100x29", pane.cols, pane.rows)
 	}
 }
 
@@ -248,27 +251,26 @@ func TestViewDoesNotExposeFullInviteTokenInMainLayout(t *testing.T) {
 	if strings.Contains(view, invite) || strings.Contains(view, "DSH1verysecretinvitetoken1234567890") {
 		t.Fatalf("View() exposes full invite token:\n%s", view)
 	}
-	for _, want := range []string{"invite ready"} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("View() missing invite affordance %q:\n%s", want, view)
-		}
-	}
-	if strings.Contains(view, "DSH1...") {
-		t.Fatalf("View() renders invite token in sidebar:\n%s", view)
+	if strings.Contains(view, "invite ready") || strings.Contains(view, "DSH1...") {
+		t.Fatalf("View() renders invite status in main session chrome:\n%s", view)
 	}
 }
 
-func TestViewRendersQuietControls(t *testing.T) {
+func TestViewRendersSingleQuietTopBar(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
 	view := app.View()
-	for _, want := range []string{"terminal", "Ctrl-X actions", "? help"} {
+	firstLine := strings.Split(view, "\n")[0]
+	for _, want := range []string{"derpssh", "host"} {
 		if !strings.Contains(view, want) {
-			t.Fatalf("View() missing quiet control %q:\n%s", want, view)
+			t.Fatalf("View() missing top-bar item %q:\n%s", want, view)
 		}
 	}
-	for _, noisy := range []string{"Ctrl-X S", "Ctrl-X C", "Ctrl-X I", "Ctrl-X Q", "Ctrl-X T"} {
+	if !strings.Contains(firstLine, "Ctrl-X") || !strings.Contains(firstLine, "?") {
+		t.Fatalf("top bar missing compact help affordance:\n%s", view)
+	}
+	for _, noisy := range []string{"Status approved", "Status ", "role write", "chat open", "Ctrl-X S", "Ctrl-X C", "Ctrl-X I", "Ctrl-X Q", "Ctrl-X T"} {
 		if strings.Contains(view, noisy) {
 			t.Fatalf("View() renders noisy shortcut %q:\n%s", noisy, view)
 		}
@@ -308,7 +310,10 @@ func TestLocalChatEchoIsDeduplicated(t *testing.T) {
 	app.Update(ChatMsg{Author: "root@hetz", Body: "hello"})
 
 	view := app.View()
-	if got := strings.Count(view, "root@hetz: hello"); got != 1 {
+	if got := strings.Count(view, "root@hetz: hello"); got != 0 {
+		t.Fatalf("chat message rendered with host-qualified local name %d times, want compact username:\n%s", got, view)
+	}
+	if got := strings.Count(view, "root: hello"); got != 1 {
 		t.Fatalf("chat message rendered %d times, want once:\n%s", got, view)
 	}
 	if got := strings.Count(view, "Message"); got > 1 {
@@ -328,11 +333,107 @@ func TestInviteShortcutShowsFullScreenPlainInvite(t *testing.T) {
 	if !strings.Contains(view, invite) {
 		t.Fatalf("invite view missing full command:\n%s", view)
 	}
+	for _, line := range strings.Split(view, "\n") {
+		if strings.Contains(line, invite) {
+			continue
+		}
+		if visibleWidth(line) > 40 {
+			t.Fatalf("invite line width = %d, want <= 40: %q", visibleWidth(line), line)
+		}
+	}
 	if strings.Contains(view, "\x1b[") {
 		t.Fatalf("invite view contains ANSI styling:\n%q", view)
 	}
 	if strings.Contains(view, "shell$") || strings.Contains(view, "Sidechat") {
 		t.Fatalf("invite view did not replace main TUI:\n%s", view)
+	}
+}
+
+func TestChatPaneUsesChatLabelAndWrapsMessages(t *testing.T) {
+	app := NewApp(Options{Side: "guest", DisplayName: "shayne", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 72, Height: 12})
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	app.Update(ChatMsg{Author: "eric@Erics-mini.local", Body: "this message should wrap instead of disappearing off the side of the chat pane"})
+
+	view := app.View()
+	if !strings.Contains(view, "Chat") {
+		t.Fatalf("View() missing Chat label:\n%s", view)
+	}
+	if strings.Contains(view, "Sidechat") {
+		t.Fatalf("View() still says Sidechat:\n%s", view)
+	}
+	if !strings.Contains(view, "disappearing") || !strings.Contains(view, "pane") {
+		t.Fatalf("wrapped chat text missing expected fragments:\n%s", view)
+	}
+	for i, line := range strings.Split(view, "\n") {
+		if got := visibleWidth(line); got > 72 {
+			t.Fatalf("line %d width = %d, want <= 72: %q", i+1, got, line)
+		}
+	}
+}
+
+func TestChatAutoScrollsToNewestMessages(t *testing.T) {
+	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 80, Height: 9})
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	for i := 0; i < 12; i++ {
+		app.Update(ChatMsg{Author: "alex", Body: "message " + intStringForTest(i)})
+	}
+
+	view := app.View()
+	if strings.Contains(view, "message 0") {
+		t.Fatalf("chat did not scroll away from oldest message:\n%s", view)
+	}
+	if !strings.Contains(view, "message 11") {
+		t.Fatalf("chat did not auto-scroll to newest message:\n%s", view)
+	}
+}
+
+func TestClosedChatShowsUnreadNotification(t *testing.T) {
+	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+
+	app.Update(ChatMsg{Author: "alex", Body: "ping"})
+
+	view := app.View()
+	if !strings.Contains(strings.Split(view, "\n")[0], "1 new") || !strings.Contains(view, "Ctrl-X S") {
+		t.Fatalf("closed chat missing unread top-bar notification:\n%s", view)
+	}
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	if strings.Contains(strings.Split(app.View(), "\n")[0], "1 new") {
+		t.Fatalf("unread notification did not clear after opening chat:\n%s", app.View())
+	}
+}
+
+func TestTransportStatusIsReducedToPath(t *testing.T) {
+	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+
+	app.Update(RuntimeStateMsg{Transport: "connected-relay"})
+
+	view := app.View()
+	if !strings.Contains(strings.Split(view, "\n")[0], "relay") {
+		t.Fatalf("top bar missing relay status:\n%s", view)
+	}
+	if strings.Contains(view, "connected-relay") {
+		t.Fatalf("top bar did not reduce raw transport status:\n%s", view)
+	}
+}
+
+func TestTerminalCursorSuppressedWhenChatFocused(t *testing.T) {
+	pane := &focusPane{fakePane: fakePane{view: "ok"}}
+	app := NewApp(Options{Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	app.View()
+
+	if pane.cursorActive {
+		t.Fatalf("terminal cursor active while chat is focused")
 	}
 }
 
@@ -350,6 +451,20 @@ func TestInviteScreenEscapeReturnsToTerminal(t *testing.T) {
 	}
 	if strings.Contains(view, "npx -y derpssh@latest connect") {
 		t.Fatalf("invite command still visible after Esc:\n%s", view)
+	}
+}
+
+func TestInviteScreenQEmitsQuit(t *testing.T) {
+	app := NewApp(Options{Side: "host", InviteCommand: "npx -y derpssh@latest connect DSH1test", Terminal: &fakePane{view: "shell$"}})
+	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
+	drainCommands(app)
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+
+	if _, ok := readCommandEventually(t, app).(QuitCommand); !ok {
+		t.Fatalf("invite q did not emit QuitCommand")
 	}
 }
 
@@ -437,4 +552,27 @@ func (p *fakePane) MouseMode() MouseMode {
 
 func (p *fakePane) InputMode() TerminalInputMode {
 	return p.input
+}
+
+type focusPane struct {
+	fakePane
+	cursorActive bool
+}
+
+func (p *focusPane) SetCursorActive(active bool) {
+	p.cursorActive = active
+}
+
+func intStringForTest(v int) string {
+	if v == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	i := len(buf)
+	for v > 0 {
+		i--
+		buf[i] = byte('0' + v%10)
+		v /= 10
+	}
+	return string(buf[i:])
 }

@@ -11,6 +11,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/shayne/derphole/pkg/derpssh/model"
 	"github.com/shayne/derphole/pkg/derpssh/protocol"
@@ -38,6 +39,9 @@ type HostRuntime struct {
 	terminalOutReady chan net.Conn
 	chatReady        chan net.Conn
 }
+
+const hostShellExitedReason = "host shell exited"
+const hostCloseNotifyTimeout = 300 * time.Millisecond
 
 func NewHostRuntime(cfg HostConfig) *HostRuntime {
 	if cfg.InitialCols == 0 {
@@ -96,11 +100,12 @@ func (r *HostRuntime) Run(ctx context.Context) error {
 	go func() {
 		r.acceptApprovedStreams(ctx)
 	}()
-	go func() {
-		_ = r.pumpPTYOutput(ctx)
-	}()
+	ptyErrCh := r.startPTYOutputPump(ctx)
 
-	return r.readControlLoop(ctx, guestID)
+	if !r.cfg.CloseOnPTYEOF {
+		return r.readControlLoop(ctx, guestID)
+	}
+	return r.runUntilControlOrPTYExit(ctx, cancel, guestID, ptyErrCh)
 }
 
 func (r *HostRuntime) handshake(ctx context.Context) (string, bool, error) {
@@ -435,10 +440,77 @@ func (r *HostRuntime) pumpPTYOutput(ctx context.Context) error {
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				if r.cfg.CloseOnPTYEOF {
+					r.notifyTerminalOutputClosed(conn, hostShellExitedReason)
+					_ = conn.Close()
+				}
 				return nil
 			}
 			return err
 		}
+	}
+}
+
+func (r *HostRuntime) notifyTerminalOutputClosed(conn net.Conn, reason string) {
+	if !r.cfg.CloseOnPTYEOF {
+		return
+	}
+	_ = writeFrameWithDeadline(conn, protocol.Message{
+		Type:  protocol.MessageClose,
+		Close: &protocol.Close{Reason: reason},
+	}, hostCloseNotifyTimeout)
+}
+
+func (r *HostRuntime) startPTYOutputPump(ctx context.Context) <-chan error {
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- r.pumpPTYOutput(ctx)
+	}()
+	return errCh
+}
+
+func (r *HostRuntime) runUntilControlOrPTYExit(ctx context.Context, cancel context.CancelFunc, guestID string, ptyErrCh <-chan error) error {
+	controlErrCh := make(chan error, 1)
+	go func() {
+		controlErrCh <- r.readControlLoop(ctx, guestID)
+	}()
+
+	select {
+	case err := <-controlErrCh:
+		return err
+	case err := <-ptyErrCh:
+		return r.closeAfterPTYOutputExit(ctx, cancel, err, controlErrCh)
+	case <-ctx.Done():
+		r.closeSessionConns()
+		_ = r.cfg.Mux.Close()
+		r.closePTYOutput()
+		return nil
+	}
+}
+
+func (r *HostRuntime) closeAfterPTYOutputExit(ctx context.Context, cancel context.CancelFunc, err error, controlErrCh <-chan error) error {
+	if err != nil {
+		cancel()
+		return ignoreContextErr(ctx, err)
+	}
+	r.setCloseReason(hostShellExitedReason)
+	_ = r.writeControlWithDeadline(protocol.Message{
+		Type:  protocol.MessageClose,
+		Close: &protocol.Close{Reason: hostShellExitedReason},
+	}, hostCloseNotifyTimeout)
+	waitForControlClose(ctx, controlErrCh, hostCloseNotifyTimeout)
+	cancel()
+	_ = r.cfg.Mux.Close()
+	return nil
+}
+
+func waitForControlClose(ctx context.Context, controlErrCh <-chan error, timeout time.Duration) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-controlErrCh:
+	case <-ctx.Done():
+	case <-timer.C:
 	}
 }
 
@@ -484,6 +556,16 @@ func (r *HostRuntime) writeControlCtx(ctx context.Context, msg protocol.Message)
 	return lockedWriter{conn: conn, mu: &r.controlMu}.write(msg)
 }
 
+func (r *HostRuntime) writeControlWithDeadline(msg protocol.Message, timeout time.Duration) error {
+	r.mu.Lock()
+	conn := r.control
+	r.mu.Unlock()
+	if conn == nil {
+		return net.ErrClosed
+	}
+	return lockedWriter{conn: conn, mu: &r.controlMu}.writeWithDeadline(msg, timeout)
+}
+
 func (r *HostRuntime) appendChat(msg model.ChatMessage) {
 	r.mu.Lock()
 	r.chat.Append(msg)
@@ -510,6 +592,17 @@ func (r *HostRuntime) closePTYOutput() {
 		return
 	}
 	_ = closer.Close()
+}
+
+func (r *HostRuntime) closeSessionConns() {
+	r.mu.Lock()
+	conns := []net.Conn{r.control, r.terminalIn, r.terminalOut, r.chatConn}
+	r.mu.Unlock()
+	for _, conn := range conns {
+		if conn != nil {
+			_ = conn.Close()
+		}
+	}
 }
 
 type emptyReader struct{}

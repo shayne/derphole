@@ -77,3 +77,20 @@ func TestEmitterDebugEnabled(t *testing.T) {
 		t.Fatal("default DebugEnabled() = true, want false")
 	}
 }
+
+func TestWithStatusHookSeesQuietStatusWithoutOutput(t *testing.T) {
+	var buf bytes.Buffer
+	var got string
+	e := WithStatusHook(New(&buf, LevelQuiet), func(msg string) {
+		got = msg
+	})
+
+	e.Status("connected-relay")
+
+	if got != "connected-relay" {
+		t.Fatalf("hook status = %q, want connected-relay", got)
+	}
+	if buf.String() != "" {
+		t.Fatalf("quiet output = %q, want empty", buf.String())
+	}
+}

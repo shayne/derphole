@@ -32,11 +32,12 @@ type TerminalInputMode struct {
 }
 
 type vtTerminalPane struct {
-	mu        sync.Mutex
-	term      vt10x.Terminal
-	mouse     MouseMode
-	inputMode TerminalInputMode
-	modeTail  string
+	mu           sync.Mutex
+	term         vt10x.Terminal
+	mouse        MouseMode
+	inputMode    TerminalInputMode
+	modeTail     string
+	cursorActive bool
 }
 
 func NewVTTerminalPane(cols int, rows int) TerminalPane {
@@ -46,7 +47,7 @@ func NewVTTerminalPane(cols int, rows int) TerminalPane {
 	if rows <= 0 {
 		rows = 24
 	}
-	return &vtTerminalPane{term: vt10x.New(vt10x.WithSize(cols, rows))}
+	return &vtTerminalPane{term: vt10x.New(vt10x.WithSize(cols, rows)), cursorActive: true}
 }
 
 func (p *vtTerminalPane) Write(b []byte) (int, error) {
@@ -78,7 +79,7 @@ func (p *vtTerminalPane) View(width int, height int) string {
 	defer p.term.Unlock()
 
 	lines := make([]string, 0, height)
-	cursor := terminalCursorView{cursor: p.term.Cursor(), visible: p.term.CursorVisible()}
+	cursor := terminalCursorView{cursor: p.term.Cursor(), visible: p.term.CursorVisible() && p.cursorActive}
 	for y := 0; y < height; y++ {
 		lines = append(lines, renderTerminalRow(p.term, width, y, cursor))
 	}
@@ -95,6 +96,12 @@ func (p *vtTerminalPane) InputMode() TerminalInputMode {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.inputMode
+}
+
+func (p *vtTerminalPane) SetCursorActive(active bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cursorActive = active
 }
 
 const (

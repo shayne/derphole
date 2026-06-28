@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shayne/derphole/pkg/derpssh/protocol"
@@ -49,9 +50,25 @@ func Connect(ctx context.Context, cfg ConnectConfig) error {
 	if err != nil {
 		return err
 	}
+	var statusMu sync.Mutex
+	var statusConsole connectConsole
+	var lastTransportStatus string
+	statusEmitter := telemetry.WithStatusHook(cfg.Emitter, func(msg string) {
+		msg = strings.TrimSpace(msg)
+		if msg == "" {
+			return
+		}
+		statusMu.Lock()
+		lastTransportStatus = msg
+		console := statusConsole
+		statusMu.Unlock()
+		if console != nil {
+			console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventStatus, Message: msg})
+		}
+	})
 	mux, cleanup, err := dialAppMux(ctx, appsession.DerptunAppDialConfig{
 		ClientToken: inv.ClientToken,
-		Emitter:     cfg.Emitter,
+		Emitter:     statusEmitter,
 		ForceRelay:  cfg.ForceRelay,
 	})
 	if err != nil {
@@ -85,7 +102,14 @@ func Connect(ctx context.Context, cfg ConnectConfig) error {
 	callbacks.Quit = cancel
 	console.SetCommandCallbacks(callbacks)
 	console.Start(runCtx)
+	statusMu.Lock()
+	statusConsole = console
+	initialTransportStatus := lastTransportStatus
+	statusMu.Unlock()
 	defer console.Stop()
+	if initialTransportStatus != "" {
+		console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventStatus, Message: initialTransportStatus})
+	}
 	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventStatus, Message: "waiting for host approval"})
 	return runGuestSession(runCtx, guest)
 }
@@ -101,9 +125,9 @@ func normalizeConnectConfig(cfg ConnectConfig) ConnectConfig {
 		cfg.Stderr = io.Discard
 	}
 	if strings.TrimSpace(cfg.DisplayName) == "" {
-		if user := strings.TrimSpace(os.Getenv("USER")); user != "" {
-			cfg.DisplayName = user
-		} else {
+		host, _ := os.Hostname()
+		cfg.DisplayName = joinUserHost(os.Getenv("USER"), host)
+		if strings.TrimSpace(cfg.DisplayName) == "" {
 			cfg.DisplayName = "guest"
 		}
 	}

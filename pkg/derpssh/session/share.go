@@ -39,6 +39,7 @@ var serveAppMux = appsession.DerptunAppServe
 var startPTY = pty.Start
 var newShareApproval = newTerminalShareApproval
 var showShareInvitePreflight = showInvitePreflight
+var clearInvitePreflightScreen = "\x1b[H\x1b[2J\x1b[3J"
 var runHostSession = func(ctx context.Context, cfg HostConfig, bindConsole func(*HostRuntime)) error {
 	host := NewHostRuntime(cfg)
 	if bindConsole != nil {
@@ -80,12 +81,16 @@ func newShareInviteCommand() (string, string, error) {
 
 func presentShareInvite(cfg ShareConfig, connectCommand string) error {
 	preflightShown, err := showShareInvitePreflight(cfg.Stdin, cfg.Stdout, connectCommand)
+	if preflightShown {
+		_, _ = io.WriteString(cfg.Stdout, clearInvitePreflightScreen)
+	}
 	if err != nil {
 		return err
 	}
-	if !preflightShown {
-		_, _ = fmt.Fprintln(cfg.Stderr, connectCommand)
+	if preflightShown {
+		return nil
 	}
+	_, _ = fmt.Fprintln(cfg.Stderr, connectCommand)
 	return nil
 }
 
@@ -129,10 +134,16 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 	defer console.Stop()
 	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventStatus, Message: "waiting for guest"})
 	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventResize, Cols: terminalSize.Cols, Rows: terminalSize.Rows})
+	sessionEmitter := telemetry.WithStatusHook(cfg.Emitter, func(msg string) {
+		msg = strings.TrimSpace(msg)
+		if msg != "" {
+			console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventStatus, Message: msg})
+		}
+	})
 
 	return serveAppMux(shareCtx, appsession.DerptunAppServeConfig{
 		ServerToken: serverToken,
-		Emitter:     cfg.Emitter,
+		Emitter:     sessionEmitter,
 		ForceRelay:  cfg.ForceRelay,
 		OnMux: func(ctx context.Context, mux *derptun.Mux) error {
 			hostStarted.Store(true)
@@ -141,13 +152,14 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 				approval = console
 			}
 			hostCfg := HostConfig{
-				Mux:         mux,
-				HostID:      randomID("host"),
-				HostName:    displayName,
-				InitialCols: terminalSize.Cols,
-				InitialRows: terminalSize.Rows,
-				PTYInput:    terminal.Input,
-				PTYOutput:   fanout.LazyReader(),
+				Mux:           mux,
+				HostID:        randomID("host"),
+				HostName:      displayName,
+				InitialCols:   terminalSize.Cols,
+				InitialRows:   terminalSize.Rows,
+				PTYInput:      terminal.Input,
+				PTYOutput:     fanout.LazyReader(),
+				CloseOnPTYEOF: true,
 				PTYResize: func(cols int, rows int) error {
 					return terminal.Resize(pty.Size{Cols: cols, Rows: rows})
 				},
@@ -272,7 +284,7 @@ func invitePreflightFiles(stdin io.Reader, stdout io.Writer) (*os.File, bool) {
 }
 
 func renderInvitePreflight(stdout io.Writer, command string) error {
-	_, err := io.WriteString(stdout, "\x1b[2J\x1b[H"+invitePreflightScreen(command))
+	_, err := io.WriteString(stdout, clearInvitePreflightScreen+invitePreflightScreen(command))
 	return err
 }
 

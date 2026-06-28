@@ -391,6 +391,46 @@ func TestHostClosesPTYOutputOnShutdown(t *testing.T) {
 	waitForOutputReadReturned(t, context.Background(), output)
 }
 
+func TestHostPTYEOFClosesSessionAndGuest(t *testing.T) {
+	hostMux, guestMux, cleanup := newTestMuxPair(t)
+	defer cleanup()
+
+	output := newBlockingEOFPTYOutput()
+	host := NewHostRuntime(HostConfig{
+		Mux:           hostMux,
+		HostID:        "host",
+		HostName:      "host",
+		InitialCols:   80,
+		InitialRows:   24,
+		PTYInput:      io.Discard,
+		PTYOutput:     output,
+		CloseOnPTYEOF: true,
+		Approval:      StaticApproval{Role: protocol.RoleWrite},
+	})
+	guest := NewGuestRuntime(GuestConfig{
+		Mux:           guestMux,
+		ParticipantID: "guest-1",
+		DisplayName:   "Alex",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	hostErrCh := make(chan error, 1)
+	guestErrCh := make(chan error, 1)
+	go func() { hostErrCh <- host.Run(ctx) }()
+	go func() { guestErrCh <- guest.Run(ctx) }()
+
+	waitForGuestRole(t, ctx, guest, protocol.RoleWrite)
+	waitForBlockingEOFRead(t, ctx, output)
+	output.CloseWithEOF()
+
+	waitRuntimeExit(t, hostErrCh, 1)
+	waitRuntimeExit(t, guestErrCh, 1)
+	if reason := guest.CloseReason(); !strings.Contains(reason, "shell exited") {
+		t.Fatalf("guest CloseReason() = %q, want shell exited", reason)
+	}
+}
+
 func TestChatMessagesRoundTrip(t *testing.T) {
 	hostMux, guestMux, cleanup := newTestMuxPair(t)
 	defer cleanup()
@@ -877,5 +917,41 @@ func waitForOutputReadReturned(t *testing.T, ctx context.Context, output *blocki
 	case <-output.done:
 	case <-ctx.Done():
 		t.Fatal("PTYOutput.Read did not return after Close")
+	}
+}
+
+type blockingEOFPTYOutput struct {
+	reading chan struct{}
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func newBlockingEOFPTYOutput() *blockingEOFPTYOutput {
+	return &blockingEOFPTYOutput{
+		reading: make(chan struct{}),
+		closed:  make(chan struct{}),
+	}
+}
+
+func (r *blockingEOFPTYOutput) Read([]byte) (int, error) {
+	r.once.Do(func() { close(r.reading) })
+	<-r.closed
+	return 0, io.EOF
+}
+
+func (r *blockingEOFPTYOutput) CloseWithEOF() {
+	select {
+	case <-r.closed:
+	default:
+		close(r.closed)
+	}
+}
+
+func waitForBlockingEOFRead(t *testing.T, ctx context.Context, output *blockingEOFPTYOutput) {
+	t.Helper()
+	select {
+	case <-output.reading:
+	case <-ctx.Done():
+		t.Fatal("PTYOutput.Read was not reached before timeout")
 	}
 }

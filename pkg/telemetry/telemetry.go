@@ -19,15 +19,34 @@ const (
 )
 
 type Emitter struct {
-	w     io.Writer
-	level Level
+	w          io.Writer
+	level      Level
+	statusHook func(string)
 }
 
 func New(w io.Writer, level Level) *Emitter {
+	if w == nil {
+		w = io.Discard
+	}
 	return &Emitter{w: w, level: level}
 }
 
+func WithStatusHook(e *Emitter, hook func(string)) *Emitter {
+	if e == nil {
+		return &Emitter{w: io.Discard, level: LevelQuiet, statusHook: hook}
+	}
+	next := *e
+	next.statusHook = hook
+	return &next
+}
+
 func (e *Emitter) Status(msg string) {
+	if e == nil {
+		return
+	}
+	if e.statusHook != nil {
+		e.statusHook(msg)
+	}
 	if e.level == LevelQuiet || e.level == LevelSilent {
 		return
 	}
@@ -35,6 +54,9 @@ func (e *Emitter) Status(msg string) {
 }
 
 func (e *Emitter) Debug(msg string) {
+	if e == nil {
+		return
+	}
 	if e.level != LevelVerbose {
 		return
 	}

@@ -165,7 +165,7 @@ for _ in $(seq 1 180); do
       dump_logs
       exit 1
     fi
-    for want in 'terminal' 'sidechat' 'status' 'guest-side' 'host-side'; do
+    for want in 'terminal:' 'chat:' 'guest-side' 'host-side'; do
       if ! wait_for_contains "${connect_out}" "${want}"; then
         echo "local connect TUI missing ${want}" >&2
         dump_logs
@@ -177,6 +177,16 @@ for _ in $(seq 1 180); do
         exit 1
       fi
     done
+    if ! wait_for_contains "${connect_out}" 'role: write'; then
+      echo "local connect TUI missing role: write" >&2
+      dump_logs
+      exit 1
+    fi
+    if ! wait_for_remote_contains "${remote_base}.share.out" 'peer: smoke/write'; then
+      echo "remote share TUI missing peer: smoke/write" >&2
+      dump_logs
+      exit 1
+    fi
     connect_trace="$(path_trace "${connect_err}")"
     share_trace="$(remote_path_trace "${remote_base}.share.err")"
     if [[ -n "${connect_trace}" ]]; then

@@ -6,7 +6,6 @@ package tui
 
 import (
 	"fmt"
-	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -45,6 +44,9 @@ func HandleMouse(app *App, msg tea.MouseMsg) tea.Cmd {
 	if app == nil {
 		return nil
 	}
+	if app.copyMode {
+		return nil
+	}
 	if !supportedMouseAction(msg.Action) {
 		return nil
 	}
@@ -56,6 +58,9 @@ func HandleMouse(app *App, msg tea.MouseMsg) tea.Cmd {
 		return nil
 	}
 	if app.handleTopBarMouse(msg) {
+		return nil
+	}
+	if app.handleDividerMouse(msg) {
 		return nil
 	}
 
@@ -102,24 +107,46 @@ func (a *App) handleTopBarMouse(msg tea.MouseMsg) bool {
 	if msg.Action != tea.MouseActionPress || !a.layout.TopBar.contains(msg.X, msg.Y) {
 		return false
 	}
-	if msg.X < a.layout.Outer.W-12 {
+	if msg.X < a.layout.Outer.W-24 {
 		return false
 	}
 	a.setSidebarOpen(!a.sidebarOpen)
 	return true
 }
 
+func (a *App) handleDividerMouse(msg tea.MouseMsg) bool {
+	if a.draggingDivider {
+		switch msg.Action {
+		case tea.MouseActionMotion:
+			a.setSidebarWidth(a.width - msg.X - 1)
+		case tea.MouseActionRelease:
+			a.draggingDivider = false
+		}
+		return true
+	}
+	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
+		return false
+	}
+	if a.layout.Hit(msg.X, msg.Y) != HitDivider {
+		return false
+	}
+	a.draggingDivider = true
+	return true
+}
+
 func (a *App) handleContentMouse(msg tea.MouseMsg) {
 	switch a.layout.Hit(msg.X, msg.Y) {
 	case HitSidebar:
+		if a.handleChatScrollMouse(msg) {
+			return
+		}
 		if msg.Action == tea.MouseActionPress {
-			if a.sidebarInviteHit(msg.X, msg.Y) {
-				a.openInvite()
-				return
-			}
 			a.focusChat()
 		}
 	case HitComposer:
+		if a.handleChatScrollMouse(msg) {
+			return
+		}
 		if msg.Action == tea.MouseActionPress {
 			a.focusChat()
 		}
@@ -128,12 +155,22 @@ func (a *App) handleContentMouse(msg tea.MouseMsg) {
 	}
 }
 
-func (a *App) sidebarInviteHit(x int, y int) bool {
-	if strings.TrimSpace(a.inviteCommand) == "" || !a.layout.Sidebar.contains(x, y) {
+func (a *App) handleChatScrollMouse(msg tea.MouseMsg) bool {
+	if msg.Action != tea.MouseActionPress {
 		return false
 	}
-	relativeY := y - a.layout.Sidebar.Y
-	return relativeY >= 1 && relativeY <= 2
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		a.chatScroll++
+		return true
+	case tea.MouseButtonWheelDown:
+		if a.chatScroll > 0 {
+			a.chatScroll--
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *App) handleTerminalMouse(msg tea.MouseMsg) {

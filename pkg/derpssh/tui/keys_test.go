@@ -123,7 +123,7 @@ func TestPrefixSidebarToggleEmitsTerminalResize(t *testing.T) {
 	if !ok {
 		t.Fatalf("command = %T, want TerminalResizeCommand", got)
 	}
-	want := TerminalResizeCommand{Cols: 67, Rows: 28}
+	want := TerminalResizeCommand{Cols: 66, Rows: 29}
 	if got != want {
 		t.Fatalf("resize command = %+v, want %+v", got, want)
 	}
@@ -141,7 +141,7 @@ func TestPrefixChatOpenEmitsTerminalResize(t *testing.T) {
 	if !ok {
 		t.Fatalf("command = %T, want TerminalResizeCommand", got)
 	}
-	want := TerminalResizeCommand{Cols: 67, Rows: 28}
+	want := TerminalResizeCommand{Cols: 66, Rows: 29}
 	if got != want {
 		t.Fatalf("resize command = %+v, want %+v", got, want)
 	}
@@ -301,6 +301,23 @@ func TestPrefixInviteOpensInviteScreen(t *testing.T) {
 	}
 	if !app.inviteOpen {
 		t.Fatalf("inviteOpen = false, want true")
+	}
+}
+
+func TestPrefixCopyModeTogglesSelectionMode(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+
+	_, cmd := app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	if cmd != nil {
+		t.Fatalf("Ctrl-X command = %T, want nil", cmd)
+	}
+	_, cmd = app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+
+	if !app.copyMode {
+		t.Fatalf("copyMode = false, want true")
+	}
+	if cmd == nil {
+		t.Fatalf("copy mode toggle returned nil command, want mouse disable command")
 	}
 }
 

@@ -46,19 +46,22 @@ type App struct {
 	commandQueue  []Command
 	commandPump   bool
 
-	width          int
-	height         int
-	layout         Layout
-	sidebarOpen    bool
-	focus          Focus
-	prefix         bool
-	helpOpen       bool
-	approvalPeerID string
-	approvalPeer   string
-	approvalChoice approvalChoice
-	kickPeerID     string
-	kickPeer       string
-	inviteOpen     bool
+	width           int
+	height          int
+	layout          Layout
+	sidebarOpen     bool
+	sidebarWidth    int
+	draggingDivider bool
+	focus           Focus
+	prefix          bool
+	copyMode        bool
+	helpOpen        bool
+	approvalPeerID  string
+	approvalPeer    string
+	approvalChoice  approvalChoice
+	kickPeerID      string
+	kickPeer        string
+	inviteOpen      bool
 
 	localRole    Role
 	transport    string
@@ -66,6 +69,8 @@ type App struct {
 	hostRows     int
 	peers        []Peer
 	chatMessages []ChatMessage
+	chatScroll   int
+	unreadChat   int
 	composer     textarea.Model
 }
 
@@ -84,7 +89,7 @@ func NewApp(opts Options) *App {
 	composer.Placeholder = "Message"
 	composer.ShowLineNumbers = false
 	composer.CharLimit = 4096
-	composer.SetHeight(3)
+	composer.SetHeight(1)
 
 	app := &App{
 		side:          side,
@@ -161,10 +166,9 @@ func (a *App) baseViewLines() []string {
 	}
 
 	content := a.contentLines()
-	for i := 0; i < a.layout.Terminal.H && i < len(content) && i+1 < a.height-1; i++ {
+	for i := 0; i < len(content) && i+1 < a.height; i++ {
 		lines[i+1] = content[i]
 	}
-	lines[a.height-1] = fitLine(statusBarStyle.Width(a.width).Render(a.statusBar()), a.width)
 	return lines
 }
 
@@ -218,7 +222,10 @@ func (a *App) resize(cols int, rows int, emitResize bool) {
 }
 
 func (a *App) applyLayout() {
-	a.layout = ComputeLayout(a.width, a.height, a.sidebarOpen)
+	a.layout = ComputeLayoutWithSidebarWidth(a.width, a.height, a.sidebarOpen, a.sidebarWidth)
+	if a.layout.SidebarOpen && a.layout.Sidebar.W > 0 {
+		a.sidebarWidth = a.layout.Sidebar.W
+	}
 	if !a.layout.Terminal.empty() {
 		a.terminal.Resize(a.layout.Terminal.W, a.layout.Terminal.H)
 	}
@@ -231,6 +238,18 @@ func (a *App) applyLayout() {
 func (a *App) setSidebarOpen(open bool) {
 	oldTerminal := a.layout.Terminal
 	a.sidebarOpen = open
+	if open {
+		a.unreadChat = 0
+	}
+	a.applyLayout()
+	a.emitTerminalResizeIfChanged(oldTerminal)
+}
+
+func (a *App) setSidebarWidth(width int) {
+	oldTerminal := a.layout.Terminal
+	a.sidebarWidth = clampSidebarWidth(a.width, width)
+	a.sidebarOpen = true
+	a.unreadChat = 0
 	a.applyLayout()
 	a.emitTerminalResizeIfChanged(oldTerminal)
 }
@@ -316,6 +335,9 @@ func (a *App) handleInviteKey(msg tea.KeyMsg) tea.Cmd {
 	switch {
 	case msg.Type == tea.KeyEsc || msg.Type == tea.KeyEnter:
 		a.inviteOpen = false
+		if !a.copyMode {
+			return tea.EnableMouseCellMotion
+		}
 	case msg.Type == tea.KeyRunes && strings.EqualFold(string(msg.Runes), "q"):
 		a.emit(QuitCommand{})
 	default:
@@ -377,6 +399,12 @@ func (a *App) appendChatMessage(msg ChatMessage) {
 		return
 	}
 	a.chatMessages = append(a.chatMessages, msg)
+	if msg.Local {
+		a.chatScroll = 0
+	}
+	if !a.sidebarOpen && !msg.Local {
+		a.unreadChat++
+	}
 }
 
 func (a *App) isLocalEcho(msg ChatMessage) bool {
@@ -409,31 +437,67 @@ func (a *App) handleTerminalKey(msg tea.KeyMsg) tea.Cmd {
 }
 
 func (a *App) topBar() string {
+	return strings.Join(a.topBarSegments(), " | ")
+}
+
+func (a *App) topBarSegments() []string {
+	parts := []string{"derpssh"}
+	parts = append(parts, a.identityTopBarSegments()...)
+	parts = append(parts, a.stateTopBarSegments()...)
+	parts = append(parts, a.chatTopBarSegments()...)
+	parts = append(parts, a.actionTopBarSegments()...)
+	return parts
+}
+
+func (a *App) identityTopBarSegments() []string {
 	var parts []string
-	parts = append(parts, "derpssh", a.side)
-	if a.displayName != "" {
-		parts = append(parts, a.displayName)
+	if side := strings.TrimSpace(a.side); side != "" {
+		parts = append(parts, side)
 	}
+	if name := a.displayHandle(a.displayName, 18); name != "" {
+		parts = append(parts, name)
+	}
+	return parts
+}
+
+func (a *App) stateTopBarSegments() []string {
+	var parts []string
 	if a.hostCols > 0 && a.hostRows > 0 {
-		parts = append(parts, fmt.Sprintf("host %dx%d", a.hostCols, a.hostRows))
+		parts = append(parts, fmt.Sprintf("%dx%d", a.hostCols, a.hostRows))
 	}
 	if a.localRole != "" && a.localRole != RolePending {
-		parts = append(parts, "role "+string(a.localRole))
+		parts = append(parts, string(a.localRole))
 	}
-	parts = append(parts, valueOr(a.transport, "starting"))
+	if transport := compactTransportStatus(a.transport); transport != "" {
+		parts = append(parts, transport)
+	}
 	if len(a.peers) > 0 {
-		parts = append(parts, "peer "+peerSummary(a.peers))
+		parts = append(parts, peerSummary(a.peers, a.identityCounts()))
 	}
 	if a.approvalActive() {
-		parts = append(parts, "guest pending "+a.approvalPeer)
+		parts = append(parts, "approve "+a.displayHandle(a.approvalPeer, 18))
 	}
-	if a.inviteCommand != "" {
-		parts = append(parts, "invite ready")
-	}
+	return parts
+}
+
+func (a *App) chatTopBarSegments() []string {
 	if a.sidebarOpen {
-		parts = append(parts, "chat open")
+		return []string{"chat"}
 	}
-	return strings.Join(parts, " | ")
+	if a.unreadChat > 0 {
+		return []string{fmt.Sprintf("%d new Ctrl-X S", a.unreadChat)}
+	}
+	return nil
+}
+
+func (a *App) actionTopBarSegments() []string {
+	if a.copyMode {
+		return []string{"select mode", "Ctrl-X actions", "? help"}
+	}
+	if a.prefix {
+		return []string{"S chat I invite Y select Q quit"}
+	}
+	return []string{"Ctrl-X actions", "? help"}
 }
 
 func (a *App) localDisplayName() string {
@@ -450,6 +514,7 @@ func (a *App) localDisplayName() string {
 }
 
 func (a *App) contentLines() []string {
+	a.setTerminalCursorActive(a.focus == FocusTerminal && !a.copyMode)
 	if !a.sidebarOpen || a.layout.Sidebar.empty() {
 		return padLines(splitAndFit(a.terminal.View(a.layout.Terminal.W, a.layout.Terminal.H), a.layout.Terminal.W, a.layout.Terminal.H), a.layout.Terminal.H, a.layout.Terminal.W)
 	}
@@ -458,7 +523,8 @@ func (a *App) contentLines() []string {
 	sidebarLines := a.sidebarLines(a.layout.Sidebar.W, a.layout.Sidebar.H)
 	lines := make([]string, a.layout.Terminal.H)
 	for i := range lines {
-		lines[i] = fitLine(terminalLines[i], a.layout.Terminal.W) + fitLine(sidebarLines[i], a.layout.Sidebar.W)
+		divider := separatorStyle.Render(" ")
+		lines[i] = fitLine(terminalLines[i], a.layout.Terminal.W) + fitLine(divider, a.layout.Divider.W) + fitLine(sidebarLines[i], a.layout.Sidebar.W)
 	}
 	return lines
 }
@@ -471,90 +537,106 @@ func (a *App) sidebarLines(width int, height int) []string {
 	contentW := sidebarContentWidth(width)
 	content := make([]string, height)
 	a.writeSidebarHeader(content, contentW)
-	messageStart := a.writeSidebarInvite(content, contentW, height)
+	messageStart := 1
 	a.writeSidebarMessages(content, contentW, height, messageStart)
 	a.writeSidebarComposer(content, contentW, height)
 	for i := range lines {
-		lines[i] = fitLine(separatorStyle.Render(" ")+sidebarStyle.Render(fitLine(content[i], contentW)), width)
+		lines[i] = fitLine(sidebarStyle.Render(fitLine(content[i], contentW)), width)
 	}
 	return lines
 }
 
 func sidebarContentWidth(width int) int {
-	return nonNegative(width - 1)
+	return nonNegative(width)
 }
 
 func (a *App) writeSidebarHeader(content []string, width int) {
 	if len(content) == 0 {
 		return
 	}
-	content[0] = fitLine(labelStyle.Render("Sidechat"), width)
-}
-
-func (a *App) writeSidebarInvite(content []string, width int, height int) int {
-	row := 1
-	if strings.TrimSpace(a.inviteCommand) == "" || row >= height-3 {
-		return row
-	}
-	content[row] = fitLine(labelStyle.Render("invite ready"), width)
-	row++
-	if row < height-3 {
-		content[row] = ""
-		row++
-	}
-	return row
+	content[0] = fitLine(labelStyle.Render("Chat"), width)
 }
 
 func (a *App) writeSidebarMessages(content []string, width int, height int, row int) {
-	for _, msg := range a.chatMessages {
-		if row >= height-3 {
+	messageRows := a.chatRenderLines(width)
+	available := maxInt(0, height-a.layout.Composer.H-row)
+	start := chatWindowStart(len(messageRows), available, a.chatScroll)
+	for _, line := range messageRows[start:minInt(start+available, len(messageRows))] {
+		if row >= height-a.layout.Composer.H {
 			return
 		}
-		content[row] = fitLine(renderChatMessage(msg), width)
+		content[row] = fitLine(line, width)
 		row++
 	}
 }
 
-func renderChatMessage(msg ChatMessage) string {
-	prefix := strings.TrimSpace(msg.Author)
+func (a *App) chatRenderLines(width int) []string {
+	counts := a.identityCounts()
+	lines := make([]string, 0, len(a.chatMessages))
+	for _, msg := range a.chatMessages {
+		lines = append(lines, a.renderChatMessageLines(msg, width, counts)...)
+	}
+	return lines
+}
+
+func (a *App) renderChatMessageLines(msg ChatMessage, width int, counts map[string]int) []string {
+	prefix := a.displayHandleWithCounts(msg.Author, 16, counts)
 	body := msg.Body
 	if prefix != "" && !strings.HasPrefix(body, prefix+":") {
 		body = prefix + ": " + body
 	}
+	wrapped := wrapPlainLines(body, width)
 	if msg.Local {
-		body = localChatStyle.Render(body)
+		for i := range wrapped {
+			wrapped[i] = localChatStyle.Render(wrapped[i])
+		}
 	}
-	return body
+	return wrapped
+}
+
+func wrapPlainLines(s string, width int) []string {
+	width = maxInt(width, 1)
+	raw := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
+	out := make([]string, 0, len(raw))
+	for _, line := range raw {
+		wrapped := ansi.Wrap(line, width, " ")
+		parts := strings.Split(wrapped, "\n")
+		if len(parts) == 0 {
+			out = append(out, "")
+			continue
+		}
+		out = append(out, parts...)
+	}
+	if len(out) == 0 {
+		return []string{""}
+	}
+	return out
+}
+
+func chatWindowStart(total int, available int, scroll int) int {
+	if available <= 0 || total <= available {
+		return 0
+	}
+	maxStart := total - available
+	if scroll < 0 {
+		scroll = 0
+	}
+	if scroll > maxStart {
+		scroll = maxStart
+	}
+	return maxStart - scroll
 }
 
 func (a *App) writeSidebarComposer(content []string, width int, height int) {
-	if height < 4 {
+	if height < 2 {
 		return
 	}
-	composerLines := splitAndFit(a.composer.View(), width, 2)
-	for i := 0; i < 2 && height-2+i < height; i++ {
+	composerLines := splitAndFit(a.composer.View(), width, 1)
+	for i := 0; i < 1 && height-1+i < height; i++ {
 		if i < len(composerLines) {
-			content[height-2+i] = fitLine(composerLines[i], width)
+			content[height-1+i] = fitLine(composerLines[i], width)
 		}
 	}
-}
-
-func (a *App) statusBar() string {
-	focus := "terminal"
-	if a.focus == FocusChat {
-		focus = "chat"
-	}
-	if a.focus == FocusApproval {
-		focus = "approval"
-	}
-	state := fmt.Sprintf("Status %s | %s | Ctrl-X actions | ? help", valueOr(a.transport, "starting"), focus)
-	if a.approvalActive() {
-		state = "Status approval | Enter accept | arrows choose | Esc deny | Ctrl-X Q quit"
-	}
-	if a.prefix {
-		state = "Status actions | S sidechat | C chat | T terminal | I invite | Q quit | ? help"
-	}
-	return state
 }
 
 func (a *App) approvalLines() []string {
@@ -570,10 +652,12 @@ func (a *App) approvalLines() []string {
 func (a *App) helpLines() []string {
 	return []string{
 		"derpssh help",
-		"Ctrl-X S toggles Sidechat",
+		"Ctrl-X S toggles Chat",
 		"Ctrl-X C focuses Chat",
 		"Ctrl-X T focuses Terminal",
 		"Ctrl-X I shows Invite",
+		"Ctrl-X Y toggles native selection",
+		"Ctrl-X Left/Right resizes Chat",
 		"Ctrl-X Q quits",
 		"Ctrl-X R grants Read",
 		"Ctrl-X W grants Write",
@@ -736,6 +820,7 @@ func (a *App) focusTerminal() {
 func (a *App) focusChat() {
 	a.focus = FocusChat
 	_ = a.composer.Focus()
+	a.unreadChat = 0
 }
 
 func (a *App) changeFirstPeerRole(role Role) {
@@ -749,23 +834,34 @@ func (a *App) changeFirstPeerRole(role Role) {
 	a.emit(RoleChangeCommand{PeerID: peer.ID, Peer: valueOr(peer.Name, peer.ID), Role: role})
 }
 
-func (a *App) openInvite() {
+func (a *App) openInvite() tea.Cmd {
 	if strings.TrimSpace(a.inviteCommand) == "" {
-		return
+		return nil
 	}
 	a.inviteOpen = true
+	return tea.DisableMouse
+}
+
+type terminalCursorController interface {
+	SetCursorActive(active bool)
+}
+
+func (a *App) setTerminalCursorActive(active bool) {
+	if cursor, ok := a.terminal.(terminalCursorController); ok {
+		cursor.SetCursorActive(active)
+	}
 }
 
 func (a *App) inviteView() string {
+	width := maxInt(a.width, 1)
+	command := strings.TrimSpace(a.inviteCommand)
 	lines := []string{
 		"derpssh invite",
 		"",
-		"Copy this command and send it to the other person:",
-		"",
-		strings.TrimSpace(a.inviteCommand),
-		"",
-		"Press Enter or Esc to return. Press q to quit.",
 	}
+	lines = append(lines, wrapPlainLines("Copy this command and send it to the other person:", width)...)
+	lines = append(lines, "", command, "")
+	lines = append(lines, wrapPlainLines("Press Enter or Esc to return. Press q to quit.", width)...)
 	if a.height <= 0 {
 		return strings.Join(lines, "\n")
 	}
@@ -853,13 +949,115 @@ func approvalButtonText(choice approvalChoice) string {
 	}
 }
 
-func peerSummary(peers []Peer) string {
+func (a *App) identityCounts() map[string]int {
+	return identityCounts(a.displayName, a.peers, a.chatMessages)
+}
+
+func identityCounts(local string, peers []Peer, messages []ChatMessage) map[string]int {
+	counts := make(map[string]int)
+	seen := make(map[string]map[string]struct{})
+	add := func(name string) {
+		user, _ := splitUserHost(name)
+		if user != "" {
+			if seen[user] == nil {
+				seen[user] = make(map[string]struct{})
+			}
+			seen[user][strings.TrimSpace(name)] = struct{}{}
+			counts[user] = len(seen[user])
+		}
+	}
+	add(local)
+	for _, peer := range peers {
+		add(peer.Name)
+	}
+	for _, msg := range messages {
+		add(msg.Author)
+	}
+	return counts
+}
+
+func (a *App) displayHandle(name string, maxWidth int) string {
+	return a.displayHandleWithCounts(name, maxWidth, a.identityCounts())
+}
+
+func (a *App) displayHandleWithCounts(name string, maxWidth int, counts map[string]int) string {
+	return displayHandleWithCounts(name, maxWidth, counts)
+}
+
+func displayHandleWithCounts(name string, maxWidth int, counts map[string]int) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	user, host := splitUserHost(name)
+	out := name
+	if user != "" {
+		out = user
+		if host != "" && counts[user] > 1 {
+			out = user + "@" + compactHost(host)
+		}
+	}
+	if maxWidth > 0 {
+		out = ansi.Truncate(out, maxWidth, "...")
+	}
+	return out
+}
+
+func splitUserHost(name string) (string, string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", ""
+	}
+	user, host, ok := strings.Cut(name, "@")
+	if !ok {
+		return name, ""
+	}
+	return strings.TrimSpace(user), strings.TrimSpace(host)
+}
+
+func compactHost(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	host = strings.TrimSuffix(host, ".local")
+	return host
+}
+
+func compactTransportStatus(status string) string {
+	status = strings.TrimSpace(status)
+	if status == "" {
+		return "starting"
+	}
+	if compact, ok := compactTransportStatuses[status]; ok {
+		return compact
+	}
+	return status
+}
+
+var compactTransportStatuses = map[string]string{
+	"connected-relay":           "relay",
+	"connected-direct":          "direct",
+	"direct-fallback-relay":     "relay fallback",
+	"trying-direct":             "trying direct",
+	"probing-direct":            "probing direct",
+	"waiting for host approval": "waiting approval",
+	"waiting for guest":         "waiting guest",
+	"waiting-for-claim":         "waiting guest",
+	"guest pending":             "guest pending",
+	"claimed":                   "guest pending",
+	"guest connected":           "connected",
+	"approved":                  "connected",
+	"stream-complete":           "complete",
+}
+
+func peerSummary(peers []Peer, counts map[string]int) string {
 	parts := make([]string, 0, len(peers))
 	for _, peer := range peers {
 		if strings.TrimSpace(peer.Name) == "" {
 			continue
 		}
-		parts = append(parts, fmt.Sprintf("%s/%s", peer.Name, peer.Role))
+		parts = append(parts, fmt.Sprintf("%s/%s", displayHandleWithCounts(peer.Name, 18, counts), peer.Role))
 	}
 	return strings.Join(parts, ", ")
 }

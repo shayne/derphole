@@ -85,8 +85,7 @@ func HandlePrefixKey(app *App, msg tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 
-	app.handleGlobalPrefix(key)
-	return nil
+	return app.handleGlobalPrefix(key)
 }
 
 func (a *App) handleApprovalPrefix(key string) {
@@ -100,28 +99,95 @@ func (a *App) handleApprovalPrefix(key string) {
 	}
 }
 
-func (a *App) handleGlobalPrefix(key string) {
-	switch key {
-	case "s":
-		a.setSidebarOpen(!a.sidebarOpen)
-	case "c":
-		a.setSidebarOpen(true)
-		a.focusChat()
-	case "t":
-		a.focusTerminal()
-	case "i":
-		a.openInvite()
-	case "q":
-		a.emit(QuitCommand{})
-	case "r":
-		a.changeFirstPeerRole(RoleRead)
-	case "w":
-		a.changeFirstPeerRole(RoleWrite)
-	case "k":
-		a.beginKickFirstPeer()
-	case "?":
-		a.helpOpen = true
+func (a *App) handleGlobalPrefix(key string) tea.Cmd {
+	if action, ok := globalPrefixActions[key]; ok {
+		return action(a)
 	}
+	return nil
+}
+
+var globalPrefixActions = map[string]func(*App) tea.Cmd{
+	"s":     toggleSidebarAction,
+	"c":     focusChatAction,
+	"t":     focusTerminalAction,
+	"i":     inviteAction,
+	"y":     copyModeAction,
+	"left":  widenChatAction,
+	"[":     widenChatAction,
+	"right": narrowChatAction,
+	"]":     narrowChatAction,
+	"q":     quitAction,
+	"r":     readRoleAction,
+	"w":     writeRoleAction,
+	"k":     kickPeerAction,
+	"?":     helpAction,
+}
+
+func toggleSidebarAction(a *App) tea.Cmd {
+	a.setSidebarOpen(!a.sidebarOpen)
+	return nil
+}
+
+func focusChatAction(a *App) tea.Cmd {
+	a.setSidebarOpen(true)
+	a.focusChat()
+	return nil
+}
+
+func focusTerminalAction(a *App) tea.Cmd {
+	a.focusTerminal()
+	return nil
+}
+
+func inviteAction(a *App) tea.Cmd {
+	return a.openInvite()
+}
+
+func copyModeAction(a *App) tea.Cmd {
+	a.copyMode = !a.copyMode
+	if a.copyMode {
+		return tea.DisableMouse
+	}
+	return tea.EnableMouseCellMotion
+}
+
+func widenChatAction(a *App) tea.Cmd {
+	if a.sidebarOpen {
+		a.setSidebarWidth(a.layout.Sidebar.W + 4)
+	}
+	return nil
+}
+
+func narrowChatAction(a *App) tea.Cmd {
+	if a.sidebarOpen {
+		a.setSidebarWidth(a.layout.Sidebar.W - 4)
+	}
+	return nil
+}
+
+func quitAction(a *App) tea.Cmd {
+	a.emit(QuitCommand{})
+	return nil
+}
+
+func readRoleAction(a *App) tea.Cmd {
+	a.changeFirstPeerRole(RoleRead)
+	return nil
+}
+
+func writeRoleAction(a *App) tea.Cmd {
+	a.changeFirstPeerRole(RoleWrite)
+	return nil
+}
+
+func kickPeerAction(a *App) tea.Cmd {
+	a.beginKickFirstPeer()
+	return nil
+}
+
+func helpAction(a *App) tea.Cmd {
+	a.helpOpen = true
+	return nil
 }
 
 func (a *App) beginKickFirstPeer() {

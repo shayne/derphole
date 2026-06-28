@@ -30,8 +30,9 @@ func TestRemoteDerpsshSmokeScriptExercisesShareConnect(t *testing.T) {
 		"derpssh share",
 		"connect --name smoke",
 		"input:hello",
-		"sidechat",
+		"chat:",
 		"role: write",
+		"peer: smoke/write",
 		"host terminal echo",
 		"remote_target",
 	} {
