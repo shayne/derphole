@@ -51,14 +51,17 @@ func HandleMouse(app *App, msg tea.MouseMsg) tea.Cmd {
 		return nil
 	}
 
+	if cmd, handled := app.handleQuitMouse(msg); handled {
+		return cmd
+	}
 	if app.handleApprovalMouse(msg) {
 		return nil
 	}
 	if app.handleKickMouse(msg) {
 		return nil
 	}
-	if app.handleTopBarMouse(msg) {
-		return nil
+	if cmd, handled := app.handleTopBarMouse(msg); handled {
+		return cmd
 	}
 	if app.handleDividerMouse(msg) {
 		return nil
@@ -70,6 +73,19 @@ func HandleMouse(app *App, msg tea.MouseMsg) tea.Cmd {
 
 func supportedMouseAction(action tea.MouseAction) bool {
 	return action == tea.MouseActionPress || action == tea.MouseActionRelease || action == tea.MouseActionMotion
+}
+
+func (a *App) handleQuitMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
+	if !a.quitOpen {
+		return nil, false
+	}
+	if msg.Action == tea.MouseActionPress {
+		if choice := a.quitHit(msg.X, msg.Y); choice >= 0 {
+			a.quitChoice = choice
+			a.confirmQuitChoice()
+		}
+	}
+	return nil, true
 }
 
 func (a *App) handleApprovalMouse(msg tea.MouseMsg) bool {
@@ -103,15 +119,31 @@ func (a *App) handleKickMouse(msg tea.MouseMsg) bool {
 	return true
 }
 
-func (a *App) handleTopBarMouse(msg tea.MouseMsg) bool {
+func (a *App) handleTopBarMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
 	if msg.Action != tea.MouseActionPress || !a.layout.TopBar.contains(msg.X, msg.Y) {
-		return false
+		return nil, false
 	}
-	if msg.X < a.layout.Outer.W-24 {
-		return false
+	_ = a.renderTopBar()
+	switch a.topBarActionAt(msg.X, msg.Y) {
+	case topBarActionQuit:
+		a.openQuitConfirm()
+	case topBarActionChat:
+		a.setSidebarOpen(!a.sidebarOpen)
+	case topBarActionInvite:
+		return a.openInvite(), true
+	case topBarActionHelp:
+		a.helpOpen = true
 	}
-	a.setSidebarOpen(!a.sidebarOpen)
-	return true
+	return nil, true
+}
+
+func (a *App) topBarActionAt(x int, y int) topBarAction {
+	for _, hit := range a.topBarHits {
+		if hit.rect.contains(x, y) {
+			return hit.action
+		}
+	}
+	return topBarActionNone
 }
 
 func (a *App) handleDividerMouse(msg tea.MouseMsg) bool {

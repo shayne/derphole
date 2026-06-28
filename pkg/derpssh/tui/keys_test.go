@@ -321,15 +321,21 @@ func TestPrefixCopyModeTogglesSelectionMode(t *testing.T) {
 	}
 }
 
-func TestPrefixQuitCommand(t *testing.T) {
+func TestPrefixQuitOpensConfirmation(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 
 	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
 	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 
-	cmd := readCommand(app)
-	if _, ok := cmd.(QuitCommand); !ok {
-		t.Fatalf("command = %T, want QuitCommand", cmd)
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("Ctrl-X Q emitted command %+v before confirmation", cmd)
+	}
+	if !app.quitOpen {
+		t.Fatalf("quitOpen = false, want true")
+	}
+	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if _, ok := readCommand(app).(QuitCommand); !ok {
+		t.Fatalf("confirmed quit did not emit QuitCommand")
 	}
 }
 
@@ -340,12 +346,18 @@ func TestPrefixQuitWorksDuringApproval(t *testing.T) {
 	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
 	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 
-	cmd := readCommand(app)
-	if _, ok := cmd.(QuitCommand); !ok {
-		t.Fatalf("command = %T, want QuitCommand", cmd)
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("Ctrl-X Q emitted command %+v before confirmation", cmd)
+	}
+	if !app.quitOpen {
+		t.Fatalf("quitOpen = false, want true")
 	}
 	if !app.approvalActive() {
 		t.Fatalf("approval should remain active until shutdown resolves it")
+	}
+	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if _, ok := readCommand(app).(QuitCommand); !ok {
+		t.Fatalf("confirmed quit did not emit QuitCommand")
 	}
 }
 
@@ -357,9 +369,31 @@ func TestPrefixQuitWorksDuringHelp(t *testing.T) {
 	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
 	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 
-	cmd := readCommand(app)
-	if _, ok := cmd.(QuitCommand); !ok {
-		t.Fatalf("command = %T, want QuitCommand", cmd)
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("Ctrl-X Q emitted command %+v before confirmation", cmd)
+	}
+	if !app.quitOpen {
+		t.Fatalf("quitOpen = false, want true")
+	}
+	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if _, ok := readCommand(app).(QuitCommand); !ok {
+		t.Fatalf("confirmed quit did not emit QuitCommand")
+	}
+}
+
+func TestQuitConfirmationCancel(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	app.Update(tea.KeyMsg{Type: tea.KeyRight})
+	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("cancel emitted command %+v, want none", cmd)
+	}
+	if app.quitOpen {
+		t.Fatalf("quit confirmation still open after cancel")
 	}
 }
 

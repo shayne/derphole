@@ -12,6 +12,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -34,6 +35,39 @@ var approvalChoiceOrder = []approvalChoice{
 	approvalChoiceRead,
 	approvalChoiceWrite,
 	approvalChoiceDeny,
+}
+
+type quitChoice int
+
+const (
+	quitChoiceQuit quitChoice = iota
+	quitChoiceCancel
+)
+
+var quitChoiceOrder = []quitChoice{
+	quitChoiceQuit,
+	quitChoiceCancel,
+}
+
+type topBarAction int
+
+const (
+	topBarActionNone topBarAction = iota
+	topBarActionQuit
+	topBarActionChat
+	topBarActionInvite
+	topBarActionHelp
+)
+
+type topBarSegment struct {
+	text   string
+	style  lipgloss.Style
+	action topBarAction
+}
+
+type topBarHit struct {
+	rect   Rect
+	action topBarAction
 }
 
 type App struct {
@@ -62,6 +96,9 @@ type App struct {
 	kickPeerID      string
 	kickPeer        string
 	inviteOpen      bool
+	quitOpen        bool
+	quitChoice      quitChoice
+	topBarHits      []topBarHit
 
 	localRole    Role
 	transport    string
@@ -160,7 +197,7 @@ func (a *App) View() string {
 
 func (a *App) baseViewLines() []string {
 	lines := make([]string, a.height)
-	lines[0] = fitLine(topBarStyle.Width(a.width).Render(a.topBar()), a.width)
+	lines[0] = a.renderTopBar()
 	if a.height == 1 {
 		return lines
 	}
@@ -184,6 +221,9 @@ func (a *App) applyOverlays(lines []string) {
 	}
 	if a.approvalActive() {
 		a.overlay(lines, a.approvalLines())
+	}
+	if a.quitOpen {
+		a.overlay(lines, a.quitLines())
 	}
 }
 
@@ -269,6 +309,9 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 	if a.inviteOpen {
 		return a.handleInviteKey(msg)
 	}
+	if cmd, handled := a.handleQuitKey(msg); handled {
+		return cmd
+	}
 	if a.handleEscapeKey(msg) {
 		return nil
 	}
@@ -339,11 +382,52 @@ func (a *App) handleInviteKey(msg tea.KeyMsg) tea.Cmd {
 			return tea.EnableMouseCellMotion
 		}
 	case msg.Type == tea.KeyRunes && strings.EqualFold(string(msg.Runes), "q"):
-		a.emit(QuitCommand{})
+		a.inviteOpen = false
+		if !a.copyMode {
+			return tea.EnableMouseCellMotion
+		}
 	default:
 		return nil
 	}
 	return nil
+}
+
+func (a *App) handleQuitKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	if !a.quitOpen {
+		return nil, false
+	}
+	if a.prefix {
+		a.prefix = false
+	}
+	a.dispatchQuitKey(msg)
+	return nil, true
+}
+
+func (a *App) dispatchQuitKey(msg tea.KeyMsg) {
+	switch msg.Type {
+	case tea.KeyEnter, tea.KeySpace:
+		a.confirmQuitChoice()
+	case tea.KeyEsc:
+		a.closeQuitConfirm()
+	case tea.KeyTab, tea.KeyRight, tea.KeyDown:
+		a.moveQuitChoice(1)
+	case tea.KeyShiftTab, tea.KeyLeft, tea.KeyUp:
+		a.moveQuitChoice(-1)
+	case tea.KeyRunes:
+		a.handleQuitRune(string(msg.Runes))
+	case tea.KeyCtrlX:
+		a.prefix = true
+	}
+}
+
+func (a *App) handleQuitRune(key string) {
+	switch strings.ToLower(key) {
+	case "y":
+		a.quitChoice = quitChoiceQuit
+		a.confirmQuitChoice()
+	case "n", "q":
+		a.closeQuitConfirm()
+	}
 }
 
 func (a *App) handleEscapeKey(msg tea.KeyMsg) bool {
@@ -353,6 +437,8 @@ func (a *App) handleEscapeKey(msg tea.KeyMsg) bool {
 	switch {
 	case a.approvalActive():
 		a.approve("", true)
+	case a.quitOpen:
+		a.closeQuitConfirm()
 	case a.prefix:
 		a.prefix = false
 	case a.helpOpen:
@@ -436,68 +522,140 @@ func (a *App) handleTerminalKey(msg tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-func (a *App) topBar() string {
-	return strings.Join(a.topBarSegments(), " | ")
+func (a *App) renderTopBar() string {
+	width := maxInt(a.width, 1)
+	left := a.leftTopBarSegments()
+	right := a.rightTopBarSegments()
+	rightLine, rightHits := a.renderTopBarSegments(right, width)
+	rightW := displayWidth(rightLine)
+	leftMax := maxInt(width-rightW-1, 0)
+	leftLine, leftHits := a.renderTopBarSegments(left, leftMax)
+	leftW := displayWidth(leftLine)
+	gapW := maxInt(width-leftW-rightW, 0)
+	gap := topBarStyle.Render(strings.Repeat(" ", gapW))
+
+	a.topBarHits = append(leftHits[:0:0], leftHits...)
+	rightX := leftW + gapW
+	for _, hit := range rightHits {
+		hit.rect.X += rightX
+		a.topBarHits = append(a.topBarHits, hit)
+	}
+
+	return fitLine(leftLine+gap+rightLine, width)
 }
 
-func (a *App) topBarSegments() []string {
-	parts := []string{"derpssh"}
-	parts = append(parts, a.identityTopBarSegments()...)
-	parts = append(parts, a.stateTopBarSegments()...)
-	parts = append(parts, a.chatTopBarSegments()...)
-	parts = append(parts, a.actionTopBarSegments()...)
-	return parts
+func (a *App) renderTopBarSegments(segments []topBarSegment, maxWidth int) (string, []topBarHit) {
+	if maxWidth <= 0 {
+		return "", nil
+	}
+	var b strings.Builder
+	hits := make([]topBarHit, 0, len(segments))
+	x := 0
+	for _, segment := range segments {
+		if strings.TrimSpace(segment.text) == "" {
+			continue
+		}
+		sep := ""
+		sepW := 0
+		if x > 0 {
+			sep = topBarSeparatorStyle.Render("›")
+			sepW = displayWidth(sep)
+		}
+		part := segment.style.Render(" " + segment.text + " ")
+		partW := displayWidth(part)
+		if x+sepW+partW > maxWidth {
+			continue
+		}
+		if sep != "" {
+			b.WriteString(sep)
+			x += sepW
+		}
+		start := x
+		b.WriteString(part)
+		x += partW
+		if segment.action != topBarActionNone {
+			hits = append(hits, topBarHit{
+				rect:   Rect{X: start, Y: 0, W: partW, H: 1},
+				action: segment.action,
+			})
+		}
+	}
+	return b.String(), hits
 }
 
-func (a *App) identityTopBarSegments() []string {
-	var parts []string
+func (a *App) leftTopBarSegments() []topBarSegment {
+	segments := []topBarSegment{
+		{text: "×", style: topBarQuitStyle, action: topBarActionQuit},
+		{text: "derpssh", style: topBarBrandStyle},
+	}
+	segments = append(segments, a.identityTopBarSegments()...)
+	segments = append(segments, a.stateTopBarSegments()...)
+	return segments
+}
+
+func (a *App) rightTopBarSegments() []topBarSegment {
+	segments := a.chatTopBarSegments()
+	segments = append(segments, a.actionTopBarSegments()...)
+	return segments
+}
+
+func (a *App) identityTopBarSegments() []topBarSegment {
+	var parts []topBarSegment
 	if side := strings.TrimSpace(a.side); side != "" {
-		parts = append(parts, side)
-	}
-	if name := a.displayHandle(a.displayName, 18); name != "" {
-		parts = append(parts, name)
+		label := side
+		if name := a.displayHandle(a.displayName, 16); name != "" {
+			label += " " + name
+		}
+		parts = append(parts, topBarSegment{text: label, style: topBarChipStyle})
 	}
 	return parts
 }
 
-func (a *App) stateTopBarSegments() []string {
-	var parts []string
+func (a *App) stateTopBarSegments() []topBarSegment {
+	var parts []topBarSegment
+	if transport := compactTransportStatus(a.transport); transport != "" {
+		parts = append(parts, topBarSegment{text: transport, style: topBarMutedStyle})
+	}
 	if a.hostCols > 0 && a.hostRows > 0 {
-		parts = append(parts, fmt.Sprintf("%dx%d", a.hostCols, a.hostRows))
+		parts = append(parts, topBarSegment{text: fmt.Sprintf("%dx%d", a.hostCols, a.hostRows), style: topBarMutedStyle})
 	}
 	if a.localRole != "" && a.localRole != RolePending {
-		parts = append(parts, string(a.localRole))
-	}
-	if transport := compactTransportStatus(a.transport); transport != "" {
-		parts = append(parts, transport)
+		parts = append(parts, topBarSegment{text: string(a.localRole), style: topBarChipStyle})
 	}
 	if len(a.peers) > 0 {
-		parts = append(parts, peerSummary(a.peers, a.identityCounts()))
+		parts = append(parts, topBarSegment{text: peerSummary(a.peers, a.identityCounts()), style: topBarChipStyle})
 	}
 	if a.approvalActive() {
-		parts = append(parts, "approve "+a.displayHandle(a.approvalPeer, 18))
+		parts = append(parts, topBarSegment{text: "approve " + a.displayHandle(a.approvalPeer, 18), style: topBarWarnStyle})
 	}
 	return parts
 }
 
-func (a *App) chatTopBarSegments() []string {
+func (a *App) chatTopBarSegments() []topBarSegment {
 	if a.sidebarOpen {
-		return []string{"chat"}
+		return []topBarSegment{{text: "Chat", style: topBarActionStyle, action: topBarActionChat}}
 	}
 	if a.unreadChat > 0 {
-		return []string{fmt.Sprintf("%d new Ctrl-X S", a.unreadChat)}
+		return []topBarSegment{{text: fmt.Sprintf("Chat %d", a.unreadChat), style: topBarWarnStyle, action: topBarActionChat}}
 	}
-	return nil
+	return []topBarSegment{{text: "Chat", style: topBarMutedStyle, action: topBarActionChat}}
 }
 
-func (a *App) actionTopBarSegments() []string {
+func (a *App) actionTopBarSegments() []topBarSegment {
+	segments := []topBarSegment{}
+	if strings.TrimSpace(a.inviteCommand) != "" {
+		segments = append(segments, topBarSegment{text: "Invite", style: topBarMutedStyle, action: topBarActionInvite})
+	}
+	segments = append(segments, topBarSegment{text: "?", style: topBarMutedStyle, action: topBarActionHelp})
 	if a.copyMode {
-		return []string{"select mode", "Ctrl-X actions", "? help"}
+		segments = append([]topBarSegment{{text: "select", style: topBarWarnStyle}}, segments...)
+		return segments
 	}
 	if a.prefix {
-		return []string{"S chat I invite Y select Q quit"}
+		segments = append([]topBarSegment{{text: "S Chat · I Invite · Y Select · Q Quit", style: topBarWarnStyle}}, segments...)
+		return segments
 	}
-	return []string{"Ctrl-X actions", "? help"}
+	return segments
 }
 
 func (a *App) localDisplayName() string {
@@ -514,7 +672,7 @@ func (a *App) localDisplayName() string {
 }
 
 func (a *App) contentLines() []string {
-	a.setTerminalCursorActive(a.focus == FocusTerminal && !a.copyMode)
+	a.setTerminalCursorActive(a.focus == FocusTerminal && !a.copyMode && !a.modalActive())
 	if !a.sidebarOpen || a.layout.Sidebar.empty() {
 		return padLines(splitAndFit(a.terminal.View(a.layout.Terminal.W, a.layout.Terminal.H), a.layout.Terminal.W, a.layout.Terminal.H), a.layout.Terminal.H, a.layout.Terminal.W)
 	}
@@ -541,7 +699,7 @@ func (a *App) sidebarLines(width int, height int) []string {
 	a.writeSidebarMessages(content, contentW, height, messageStart)
 	a.writeSidebarComposer(content, contentW, height)
 	for i := range lines {
-		lines[i] = fitLine(sidebarStyle.Render(fitLine(content[i], contentW)), width)
+		lines[i] = fitLine(sidebarStyle.Width(width).Render(fitLine(content[i], width)), width)
 	}
 	return lines
 }
@@ -554,7 +712,7 @@ func (a *App) writeSidebarHeader(content []string, width int) {
 	if len(content) == 0 {
 		return
 	}
-	content[0] = fitLine(labelStyle.Render("Chat"), width)
+	content[0] = fitLine(sidebarHeaderStyle.Width(width).Render(" Chat"), width)
 }
 
 func (a *App) writeSidebarMessages(content []string, width int, height int, row int) {
@@ -605,12 +763,44 @@ func wrapPlainLines(s string, width int) []string {
 			out = append(out, "")
 			continue
 		}
-		out = append(out, parts...)
+		for _, part := range parts {
+			out = append(out, hardWrapPlainLine(part, width)...)
+		}
 	}
 	if len(out) == 0 {
 		return []string{""}
 	}
 	return out
+}
+
+func hardWrapPlainLine(line string, width int) []string {
+	if width <= 0 {
+		return []string{""}
+	}
+	if displayWidth(line) <= width {
+		return []string{line}
+	}
+	lines := make([]string, 0, displayWidth(line)/width+1)
+	var b strings.Builder
+	used := 0
+	for _, r := range line {
+		rw := displayWidth(string(r))
+		if rw == 0 {
+			b.WriteRune(r)
+			continue
+		}
+		if used+rw > width && b.Len() > 0 {
+			lines = append(lines, b.String())
+			b.Reset()
+			used = 0
+		}
+		b.WriteRune(r)
+		used += rw
+	}
+	if b.Len() > 0 || len(lines) == 0 {
+		lines = append(lines, b.String())
+	}
+	return lines
 }
 
 func chatWindowStart(total int, available int, scroll int) int {
@@ -646,6 +836,16 @@ func (a *App) approvalLines() []string {
 		fitLine(dimStyle.Render("Select access, then press Enter."), width),
 		"",
 		a.approvalButtonLine(width),
+	}
+}
+
+func (a *App) quitLines() []string {
+	width := a.quitContentWidth()
+	return []string{
+		fitLine(labelStyle.Render("Quit derpssh?"), width),
+		fitLine(dimStyle.Render("This closes the shared terminal for everyone."), width),
+		"",
+		a.quitButtonLine(width),
 	}
 }
 
@@ -702,7 +902,8 @@ func (a *App) overlayLine(lines []string, row int, x int, line string, width int
 		return
 	}
 	prefix := fitLine(lines[row], x)
-	lines[row] = prefix + fitLine(line, width)
+	suffix := fitLine("", maxInt(a.width-x-width, 0))
+	lines[row] = fitLine(prefix+fitLine(line, width)+suffix, a.width)
 }
 
 func (a *App) approvalHit(x int, y int) HitTarget {
@@ -761,6 +962,67 @@ func (a *App) approvalButtonLine(width int) string {
 		a.renderApprovalButton(approvalChoiceDeny),
 	}
 	return fitLine(pad+strings.Join(parts, strings.Repeat(" ", approvalButtonGap)), width)
+}
+
+func (a *App) quitHit(x int, y int) quitChoice {
+	quit, cancel := a.quitButtonRects()
+	switch {
+	case quit.contains(x, y):
+		return quitChoiceQuit
+	case cancel.contains(x, y):
+		return quitChoiceCancel
+	default:
+		return -1
+	}
+}
+
+func (a *App) quitButtonRects() (Rect, Rect) {
+	contentW := a.quitContentWidth()
+	contentX, contentY := a.quitContentOrigin()
+	buttonLineW := quitButtonsWidth()
+	startX := contentX + maxInt((contentW-buttonLineW)/2, 0)
+	y := contentY + quitButtonLineIndex
+
+	quit := Rect{X: startX, Y: y, W: quitButtonWidth(quitChoiceQuit), H: 1}
+	cancel := Rect{X: quit.X + quit.W + quitButtonGap, Y: y, W: quitButtonWidth(quitChoiceCancel), H: 1}
+	return quit, cancel
+}
+
+func (a *App) quitContentOrigin() (int, int) {
+	box := strings.Split(modalStyle.Render(strings.Join(a.quitLines(), "\n")), "\n")
+	boxW := a.overlayWidth(box)
+	boxX := (a.width - boxW) / 2
+	boxY := a.overlayY(len(box))
+	return boxX + modalStyle.GetBorderLeftSize() + modalStyle.GetPaddingLeft(),
+		boxY + modalStyle.GetBorderTopSize() + modalStyle.GetPaddingTop()
+}
+
+func (a *App) quitContentWidth() int {
+	width := maxInt(44, displayWidth("This closes the shared terminal for everyone."))
+	width = maxInt(width, quitButtonsWidth())
+	if a.width > 0 {
+		maxWidth := a.width - modalStyle.GetHorizontalBorderSize() - modalStyle.GetHorizontalPadding() - 2
+		width = minInt(width, maxInt(maxWidth, 1))
+	}
+	return maxInt(width, 1)
+}
+
+func (a *App) quitButtonLine(width int) string {
+	lineW := quitButtonsWidth()
+	pad := strings.Repeat(" ", maxInt((width-lineW)/2, 0))
+	parts := []string{
+		a.renderQuitButton(quitChoiceQuit),
+		a.renderQuitButton(quitChoiceCancel),
+	}
+	return fitLine(pad+strings.Join(parts, strings.Repeat(" ", quitButtonGap)), width)
+}
+
+func (a *App) renderQuitButton(choice quitChoice) string {
+	text := quitButtonText(choice)
+	if a.quitChoice == choice {
+		return approvalButtonSelectedStyle.Render(text)
+	}
+	return approvalButtonStyle.Render(text)
 }
 
 func (a *App) renderApprovalButton(choice approvalChoice) string {
@@ -834,6 +1096,40 @@ func (a *App) changeFirstPeerRole(role Role) {
 	a.emit(RoleChangeCommand{PeerID: peer.ID, Peer: valueOr(peer.Name, peer.ID), Role: role})
 }
 
+func (a *App) openQuitConfirm() {
+	a.prefix = false
+	a.quitOpen = true
+	a.quitChoice = quitChoiceQuit
+}
+
+func (a *App) closeQuitConfirm() {
+	a.quitOpen = false
+	a.quitChoice = quitChoiceQuit
+}
+
+func (a *App) confirmQuitChoice() {
+	if a.quitChoice == quitChoiceQuit {
+		a.emit(QuitCommand{})
+		return
+	}
+	a.closeQuitConfirm()
+}
+
+func (a *App) moveQuitChoice(delta int) {
+	idx := 0
+	for i, choice := range quitChoiceOrder {
+		if choice == a.quitChoice {
+			idx = i
+			break
+		}
+	}
+	next := (idx + delta) % len(quitChoiceOrder)
+	if next < 0 {
+		next += len(quitChoiceOrder)
+	}
+	a.quitChoice = quitChoiceOrder[next]
+}
+
 func (a *App) openInvite() tea.Cmd {
 	if strings.TrimSpace(a.inviteCommand) == "" {
 		return nil
@@ -852,6 +1148,10 @@ func (a *App) setTerminalCursorActive(active bool) {
 	}
 }
 
+func (a *App) modalActive() bool {
+	return a.helpOpen || a.approvalActive() || a.kickPeer != "" || a.quitOpen
+}
+
 func (a *App) inviteView() string {
 	width := maxInt(a.width, 1)
 	command := strings.TrimSpace(a.inviteCommand)
@@ -860,8 +1160,10 @@ func (a *App) inviteView() string {
 		"",
 	}
 	lines = append(lines, wrapPlainLines("Copy this command and send it to the other person:", width)...)
-	lines = append(lines, "", command, "")
-	lines = append(lines, wrapPlainLines("Press Enter or Esc to return. Press q to quit.", width)...)
+	lines = append(lines, "")
+	lines = append(lines, wrapPlainLines(command, width)...)
+	lines = append(lines, "")
+	lines = append(lines, wrapPlainLines("Press Enter, Esc, or q to return.", width)...)
 	if a.height <= 0 {
 		return strings.Join(lines, "\n")
 	}
@@ -923,6 +1225,8 @@ func (a *App) pumpCommands() {
 const (
 	approvalButtonGap       = 3
 	approvalButtonLineIndex = 3
+	quitButtonGap           = 3
+	quitButtonLineIndex     = 3
 )
 
 func approvalButtonsWidth() int {
@@ -946,6 +1250,27 @@ func approvalButtonText(choice approvalChoice) string {
 		return " Deny "
 	default:
 		return "      "
+	}
+}
+
+func quitButtonsWidth() int {
+	return quitButtonWidth(quitChoiceQuit) +
+		quitButtonWidth(quitChoiceCancel) +
+		quitButtonGap
+}
+
+func quitButtonWidth(choice quitChoice) int {
+	return displayWidth(quitButtonText(choice))
+}
+
+func quitButtonText(choice quitChoice) string {
+	switch choice {
+	case quitChoiceQuit:
+		return " Quit "
+	case quitChoiceCancel:
+		return " Cancel "
+	default:
+		return "        "
 	}
 }
 

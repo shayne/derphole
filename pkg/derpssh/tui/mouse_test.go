@@ -11,15 +11,16 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-func TestMouseClickSidebarToggle(t *testing.T) {
+func TestMouseClickTopBarChatToggle(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	drainCommands(app)
+	chat := topBarActionRect(t, app, topBarActionChat)
 
-	app.Update(leftClick(99, 0))
+	app.Update(leftClick(chat.X+chat.W/2, chat.Y))
 
 	if !app.sidebarOpen {
-		t.Fatalf("sidebarOpen = false, want true after top-bar toggle click")
+		t.Fatalf("sidebarOpen = false, want true after top-bar chat click")
 	}
 	got, ok := readCommand(app).(TerminalResizeCommand)
 	if !ok {
@@ -28,6 +29,49 @@ func TestMouseClickSidebarToggle(t *testing.T) {
 	want := TerminalResizeCommand{Cols: 66, Rows: 29}
 	if got != want {
 		t.Fatalf("resize command = %+v, want %+v", got, want)
+	}
+}
+
+func TestMouseClickTopBarQuitOpensConfirmation(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	quit := topBarActionRect(t, app, topBarActionQuit)
+
+	app.Update(leftClick(quit.X+quit.W/2, quit.Y))
+
+	if !app.quitOpen {
+		t.Fatalf("quitOpen = false, want true after top-bar X click")
+	}
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("top-bar X emitted command before confirmation: %+v", cmd)
+	}
+}
+
+func TestMouseClickQuitConfirmationButtons(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	app.openQuitConfirm()
+	quit, _ := app.quitButtonRects()
+
+	app.Update(leftClick(quit.X+quit.W/2, quit.Y))
+
+	if _, ok := readCommand(app).(QuitCommand); !ok {
+		t.Fatalf("quit confirmation click did not emit QuitCommand")
+	}
+}
+
+func TestMouseClickTopBarInviteOpensInvite(t *testing.T) {
+	app := NewApp(Options{InviteCommand: "npx -y derpssh@latest connect DSH1copyme", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	invite := topBarActionRect(t, app, topBarActionInvite)
+
+	app.Update(leftClick(invite.X+invite.W/2, invite.Y))
+
+	if !app.inviteOpen {
+		t.Fatalf("inviteOpen = false, want true after top-bar invite click")
 	}
 }
 
@@ -196,6 +240,18 @@ func leftClick(x int, y int) tea.MouseMsg {
 		Action: tea.MouseActionPress,
 		Button: tea.MouseButtonLeft,
 	}
+}
+
+func topBarActionRect(t *testing.T, app *App, action topBarAction) Rect {
+	t.Helper()
+	app.renderTopBar()
+	for _, hit := range app.topBarHits {
+		if hit.action == action {
+			return hit.rect
+		}
+	}
+	t.Fatalf("missing top-bar action %v in hits %+v", action, app.topBarHits)
+	return Rect{}
 }
 
 func drainCommands(app *App) {

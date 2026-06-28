@@ -262,13 +262,13 @@ func TestViewRendersSingleQuietTopBar(t *testing.T) {
 
 	view := app.View()
 	firstLine := strings.Split(view, "\n")[0]
-	for _, want := range []string{"derpssh", "host"} {
+	for _, want := range []string{"derpssh", "host", "Chat", "?"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("View() missing top-bar item %q:\n%s", want, view)
 		}
 	}
-	if !strings.Contains(firstLine, "Ctrl-X") || !strings.Contains(firstLine, "?") {
-		t.Fatalf("top bar missing compact help affordance:\n%s", view)
+	if strings.Contains(firstLine, "Ctrl-X") {
+		t.Fatalf("top bar should keep keyboard hints out of normal chrome:\n%s", view)
 	}
 	for _, noisy := range []string{"Status approved", "Status ", "role write", "chat open", "Ctrl-X S", "Ctrl-X C", "Ctrl-X I", "Ctrl-X Q", "Ctrl-X T"} {
 		if strings.Contains(view, noisy) {
@@ -330,13 +330,12 @@ func TestInviteShortcutShowsFullScreenPlainInvite(t *testing.T) {
 	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
 
 	view := app.View()
-	if !strings.Contains(view, invite) {
-		t.Fatalf("invite view missing full command:\n%s", view)
+	for _, want := range []string{"npx -y derpssh@latest connect", "DSH1verysecretinvitetoken1234567890"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("invite view missing command fragment %q:\n%s", want, view)
+		}
 	}
 	for _, line := range strings.Split(view, "\n") {
-		if strings.Contains(line, invite) {
-			continue
-		}
 		if visibleWidth(line) > 40 {
 			t.Fatalf("invite line width = %d, want <= 40: %q", visibleWidth(line), line)
 		}
@@ -373,6 +372,34 @@ func TestChatPaneUsesChatLabelAndWrapsMessages(t *testing.T) {
 	}
 }
 
+func TestHardWrapPlainLine(t *testing.T) {
+	tests := []struct {
+		name  string
+		line  string
+		width int
+		want  []string
+	}{
+		{name: "fits", line: "abc", width: 5, want: []string{"abc"}},
+		{name: "long token", line: "abcdef", width: 2, want: []string{"ab", "cd", "ef"}},
+		{name: "wide glyph", line: "界界", width: 2, want: []string{"界", "界"}},
+		{name: "zero width", line: "abc", width: 0, want: []string{""}},
+		{name: "empty", line: "", width: 4, want: []string{""}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hardWrapPlainLine(tt.line, tt.width)
+			if strings.Join(got, "\n") != strings.Join(tt.want, "\n") {
+				t.Fatalf("hardWrapPlainLine() = %#v, want %#v", got, tt.want)
+			}
+			for _, line := range got {
+				if tt.width > 0 && visibleWidth(line) > tt.width {
+					t.Fatalf("wrapped line width = %d, want <= %d: %q", visibleWidth(line), tt.width, line)
+				}
+			}
+		})
+	}
+}
+
 func TestChatAutoScrollsToNewestMessages(t *testing.T) {
 	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 9})
@@ -398,12 +425,12 @@ func TestClosedChatShowsUnreadNotification(t *testing.T) {
 	app.Update(ChatMsg{Author: "alex", Body: "ping"})
 
 	view := app.View()
-	if !strings.Contains(strings.Split(view, "\n")[0], "1 new") || !strings.Contains(view, "Ctrl-X S") {
+	if !strings.Contains(strings.Split(view, "\n")[0], "Chat 1") {
 		t.Fatalf("closed chat missing unread top-bar notification:\n%s", view)
 	}
 	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
 	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
-	if strings.Contains(strings.Split(app.View(), "\n")[0], "1 new") {
+	if strings.Contains(strings.Split(app.View(), "\n")[0], "Chat 1") {
 		t.Fatalf("unread notification did not clear after opening chat:\n%s", app.View())
 	}
 }
@@ -454,7 +481,7 @@ func TestInviteScreenEscapeReturnsToTerminal(t *testing.T) {
 	}
 }
 
-func TestInviteScreenQEmitsQuit(t *testing.T) {
+func TestInviteScreenQReturnsToTerminal(t *testing.T) {
 	app := NewApp(Options{Side: "host", InviteCommand: "npx -y derpssh@latest connect DSH1test", Terminal: &fakePane{view: "shell$"}})
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
 	drainCommands(app)
@@ -463,8 +490,11 @@ func TestInviteScreenQEmitsQuit(t *testing.T) {
 
 	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 
-	if _, ok := readCommandEventually(t, app).(QuitCommand); !ok {
-		t.Fatalf("invite q did not emit QuitCommand")
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("invite q emitted command %+v, want none", cmd)
+	}
+	if !strings.Contains(app.View(), "shell$") {
+		t.Fatalf("invite q did not return to terminal:\n%s", app.View())
 	}
 }
 

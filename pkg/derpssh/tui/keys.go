@@ -73,7 +73,7 @@ func HandlePrefixKey(app *App, msg tea.KeyMsg) tea.Cmd {
 
 	switch key {
 	case "q":
-		app.emit(QuitCommand{})
+		app.openQuitConfirm()
 		return nil
 	case "?":
 		app.helpOpen = true
@@ -166,7 +166,7 @@ func narrowChatAction(a *App) tea.Cmd {
 }
 
 func quitAction(a *App) tea.Cmd {
-	a.emit(QuitCommand{})
+	a.openQuitConfirm()
 	return nil
 }
 
