@@ -397,6 +397,7 @@ func startShareTerminal(size pty.Size) (*shareTerminal, error) {
 
 	ptySession, err := startPTY(pty.StartConfig{
 		Size: size,
+		Term: sharePTYTerm(),
 	})
 	if err != nil {
 		return nil, err
@@ -408,6 +409,15 @@ func startShareTerminal(size pty.Size) (*shareTerminal, error) {
 		wait:   ptySession.Wait,
 		resize: ptySession.Resize,
 	}, nil
+}
+
+func sharePTYTerm() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("TERM"))) {
+	case "", "dumb", "unknown":
+		return "xterm-256color"
+	default:
+		return ""
+	}
 }
 
 func terminalSize(output io.Writer) pty.Size {

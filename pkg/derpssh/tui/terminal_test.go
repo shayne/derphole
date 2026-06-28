@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestVTTerminalPaneRendersANSIOutput(t *testing.T) {
+func TestVTTerminalPanePreservesANSIStyleOutput(t *testing.T) {
 	pane := NewVTTerminalPane(20, 4)
 
 	if _, err := pane.Write([]byte("plain \x1b[31mred\x1b[0m")); err != nil {
@@ -17,11 +17,31 @@ func TestVTTerminalPaneRendersANSIOutput(t *testing.T) {
 	}
 
 	view := pane.View(20, 4)
-	if !strings.Contains(view, "plain red") {
-		t.Fatalf("View() = %q, want rendered ANSI text without escape bytes", view)
+	stripped := ansiPattern.ReplaceAllString(view, "")
+	if !strings.Contains(stripped, "plain red") {
+		t.Fatalf("View() = %q, want rendered ANSI text", view)
 	}
-	if strings.Contains(view, "\x1b[31m") {
-		t.Fatalf("View() exposes raw ANSI sequence: %q", view)
+	if !strings.Contains(view, "\x1b[31mred\x1b[0m") {
+		t.Fatalf("View() stripped terminal color styling: %q", view)
+	}
+	if width := visibleWidth(strings.Split(view, "\n")[0]); width != len("plain red") {
+		t.Fatalf("first line visible width = %d, want %d: %q", width, len("plain red"), view)
+	}
+}
+
+func TestVTTerminalPanePreservesStyledSpaces(t *testing.T) {
+	pane := NewVTTerminalPane(20, 4)
+
+	if _, err := pane.Write([]byte("load \x1b[48;5;34m  \x1b[0m done")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	view := pane.View(20, 4)
+	if !strings.Contains(view, "\x1b[48;5;34m  \x1b[0m") {
+		t.Fatalf("View() stripped styled spaces used by rich TUIs: %q", view)
+	}
+	if !strings.Contains(view, "load ") || !strings.Contains(view, " done") {
+		t.Fatalf("View() missing plain text around styled cells: %q", view)
 	}
 }
 

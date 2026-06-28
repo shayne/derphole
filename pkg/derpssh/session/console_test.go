@@ -425,6 +425,8 @@ func TestTUIConsoleRuntimeEventsUpdateApp(t *testing.T) {
 		Chat: ChatMessage{ParticipantID: "guest-1", DisplayName: "Alex", Text: "hello"},
 	})
 	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventClose, Message: "done"})
+	console.send(tea.KeyMsg{Type: tea.KeyCtrlX})
+	console.send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
 
 	view := console.View()
 	for _, want := range []string{"closed: done", "120x40", "role write", "Alex", "read", "Blair", "denied", "Alex: hello"} {
@@ -464,7 +466,7 @@ func TestTUIConsoleApprovalWaitsForDecision(t *testing.T) {
 		done <- console.Approve(JoinRequest{ParticipantID: "guest-1", DisplayName: "Alex"})
 	}()
 
-	waitForView(t, console, "Approve Alex")
+	waitForView(t, console, "Alex wants to join")
 	console.handleCommand(context.Background(), tui.ApprovalDecisionCommand{
 		PeerID: "other-guest",
 		Peer:   "Other",
@@ -498,7 +500,7 @@ func TestTUIConsoleApprovalStopReturnsDenied(t *testing.T) {
 		done <- console.Approve(JoinRequest{ParticipantID: "guest-1", DisplayName: "Alex"})
 	}()
 
-	waitForView(t, console, "Approve Alex")
+	waitForView(t, console, "Alex wants to join")
 	console.Stop()
 
 	assertApprovalRole(t, done, protocol.RoleDenied)
@@ -513,7 +515,7 @@ func TestTUIConsoleApprovalContextCancelReturnsDenied(t *testing.T) {
 		done <- console.Approve(JoinRequest{ParticipantID: "guest-1", DisplayName: "Alex"})
 	}()
 
-	waitForView(t, console, "Approve Alex")
+	waitForView(t, console, "Alex wants to join")
 	cancel()
 
 	assertApprovalRole(t, done, protocol.RoleDenied)

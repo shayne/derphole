@@ -18,14 +18,14 @@ func TestMouseClickSidebarToggle(t *testing.T) {
 
 	app.Update(leftClick(99, 0))
 
-	if app.sidebarOpen {
-		t.Fatalf("sidebarOpen = true, want false after top-bar toggle click")
+	if !app.sidebarOpen {
+		t.Fatalf("sidebarOpen = false, want true after top-bar toggle click")
 	}
 	got, ok := readCommand(app).(TerminalResizeCommand)
 	if !ok {
 		t.Fatalf("command = %T, want TerminalResizeCommand", got)
 	}
-	want := TerminalResizeCommand{Cols: 100, Rows: 28}
+	want := TerminalResizeCommand{Cols: 67, Rows: 28}
 	if got != want {
 		t.Fatalf("resize command = %+v, want %+v", got, want)
 	}
@@ -34,6 +34,9 @@ func TestMouseClickSidebarToggle(t *testing.T) {
 func TestMouseClickFocusesTerminalAndChat(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	drainCommands(app)
 
 	app.Update(leftClick(app.layout.Terminal.X+1, app.layout.Terminal.Y+1))
 	if app.focus != FocusTerminal {
@@ -49,20 +52,22 @@ func TestMouseClickFocusesTerminalAndChat(t *testing.T) {
 func TestMouseClickApprovalButtons(t *testing.T) {
 	tests := []struct {
 		name string
-		x    int
+		pick func(read Rect, write Rect, deny Rect) Rect
 		want ApprovalDecisionCommand
 	}{
-		{name: "read", x: 28, want: ApprovalDecisionCommand{Peer: "Alex", Role: RoleRead}},
-		{name: "write", x: 38, want: ApprovalDecisionCommand{Peer: "Alex", Role: RoleWrite}},
-		{name: "deny", x: 49, want: ApprovalDecisionCommand{Peer: "Alex", Deny: true}},
+		{name: "read", pick: func(read Rect, write Rect, deny Rect) Rect { return read }, want: ApprovalDecisionCommand{Peer: "Alex", Role: RoleRead}},
+		{name: "write", pick: func(read Rect, write Rect, deny Rect) Rect { return write }, want: ApprovalDecisionCommand{Peer: "Alex", Role: RoleWrite}},
+		{name: "deny", pick: func(read Rect, write Rect, deny Rect) Rect { return deny }, want: ApprovalDecisionCommand{Peer: "Alex", Deny: true}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 			app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 			app.Update(ApprovalRequestMsg{Peer: "Alex"})
+			read, write, deny := app.approvalButtonRects()
+			button := tt.pick(read, write, deny)
 
-			app.Update(leftClick(tt.x, 14))
+			app.Update(leftClick(button.X+button.W/2, button.Y))
 
 			got, ok := readCommand(app).(ApprovalDecisionCommand)
 			if !ok {
@@ -96,8 +101,9 @@ func TestApprovalDecisionIncludesPeerIDForDuplicateNames(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	app.Update(ApprovalRequestMsg{PeerID: "guest-2", Peer: "Alex"})
+	read, _, _ := app.approvalButtonRects()
 
-	app.Update(leftClick(28, 14))
+	app.Update(leftClick(read.X+read.W/2, read.Y))
 
 	got, ok := readCommand(app).(ApprovalDecisionCommand)
 	if !ok {

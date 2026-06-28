@@ -27,6 +27,13 @@ var (
 			Background(lipgloss.AdaptiveColor{Light: "#F8FAFC", Dark: "#0F172A"})
 	localChatStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.AdaptiveColor{Light: "#166534", Dark: "#BBF7D0"})
+	approvalButtonStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.AdaptiveColor{Light: "#334155", Dark: "#CBD5E1"}).
+				Background(lipgloss.AdaptiveColor{Light: "#F1F5F9", Dark: "#1F2937"})
+	approvalButtonSelectedStyle = lipgloss.NewStyle().
+					Bold(true).
+					Foreground(lipgloss.AdaptiveColor{Light: "#FFFFFF", Dark: "#08111F"}).
+					Background(lipgloss.AdaptiveColor{Light: "#0E7490", Dark: "#67E8F9"})
 	modalStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.AdaptiveColor{Light: "#111827", Dark: "#F8FAFC"}).
 			Background(lipgloss.AdaptiveColor{Light: "#FFFFFF", Dark: "#111827"}).

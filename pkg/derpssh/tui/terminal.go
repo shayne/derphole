@@ -5,6 +5,7 @@
 package tui
 
 import (
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -72,15 +73,33 @@ func (p *vtTerminalPane) View(width int, height int) string {
 	lines := make([]string, 0, height)
 	for y := 0; y < height; y++ {
 		var b strings.Builder
-		for x := 0; x < width; x++ {
+		activeStyle := defaultTerminalCellStyle()
+		styleActive := false
+		last := terminalLastRenderableColumn(p.term, width, y)
+		for x := 0; x <= last; x++ {
 			glyph := p.term.Cell(x, y)
+			style := terminalStyleFromGlyph(glyph)
+			if !style.equal(activeStyle) {
+				if styleActive {
+					b.WriteString("\x1b[0m")
+					styleActive = false
+				}
+				if style.active() {
+					b.WriteString(style.sgr())
+					styleActive = true
+				}
+				activeStyle = style
+			}
 			if glyph.Char == 0 {
 				b.WriteByte(' ')
 			} else {
 				b.WriteRune(glyph.Char)
 			}
 		}
-		lines = append(lines, strings.TrimRight(b.String(), " "))
+		if styleActive {
+			b.WriteString("\x1b[0m")
+		}
+		lines = append(lines, b.String())
 	}
 	return strings.Join(lines, "\n")
 }
@@ -89,6 +108,119 @@ func (p *vtTerminalPane) MouseMode() MouseMode {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.mouse
+}
+
+const (
+	_ int16 = 1 << iota
+	vtAttrUnderline
+	vtAttrBold
+	_
+	vtAttrItalic
+	vtAttrBlink
+)
+
+const vtRenderedAttrMask = vtAttrUnderline | vtAttrBold | vtAttrItalic | vtAttrBlink
+
+type terminalCellStyle struct {
+	mode int16
+	fg   vt10x.Color
+	bg   vt10x.Color
+}
+
+func terminalLastRenderableColumn(term vt10x.Terminal, width int, y int) int {
+	for x := width - 1; x >= 0; x-- {
+		glyph := term.Cell(x, y)
+		if glyph.Char != 0 && glyph.Char != ' ' {
+			return x
+		}
+		if glyph.Char != 0 && terminalStyleFromGlyph(glyph).active() {
+			return x
+		}
+	}
+	return -1
+}
+
+func terminalStyleFromGlyph(glyph vt10x.Glyph) terminalCellStyle {
+	if glyph.Char == 0 {
+		return defaultTerminalCellStyle()
+	}
+	return terminalCellStyle{
+		mode: glyph.Mode & vtRenderedAttrMask,
+		fg:   glyph.FG,
+		bg:   glyph.BG,
+	}
+}
+
+func defaultTerminalCellStyle() terminalCellStyle {
+	return terminalCellStyle{fg: vt10x.DefaultFG, bg: vt10x.DefaultBG}
+}
+
+func (s terminalCellStyle) equal(other terminalCellStyle) bool {
+	return s.mode == other.mode && s.fg == other.fg && s.bg == other.bg
+}
+
+func (s terminalCellStyle) active() bool {
+	return s.mode != 0 || s.fg != vt10x.DefaultFG || s.bg != vt10x.DefaultBG
+}
+
+func (s terminalCellStyle) sgr() string {
+	codes := make([]string, 0, 6)
+	if s.mode&vtAttrBold != 0 {
+		codes = append(codes, "1")
+	}
+	if s.mode&vtAttrItalic != 0 {
+		codes = append(codes, "3")
+	}
+	if s.mode&vtAttrUnderline != 0 {
+		codes = append(codes, "4")
+	}
+	if s.mode&vtAttrBlink != 0 {
+		codes = append(codes, "5")
+	}
+	appendTerminalColorCodes(&codes, s.fg, true)
+	appendTerminalColorCodes(&codes, s.bg, false)
+	if len(codes) == 0 {
+		return ""
+	}
+	return "\x1b[" + strings.Join(codes, ";") + "m"
+}
+
+func appendTerminalColorCodes(codes *[]string, color vt10x.Color, foreground bool) {
+	if color == vt10x.DefaultFG || color == vt10x.DefaultBG || color > 0xFFFFFF {
+		return
+	}
+	n := int(color)
+	if color < 16 {
+		base := 30
+		brightBase := 90
+		if !foreground {
+			base = 40
+			brightBase = 100
+		}
+		if n < 8 {
+			*codes = append(*codes, strconv.Itoa(base+n))
+		} else {
+			*codes = append(*codes, strconv.Itoa(brightBase+n-8))
+		}
+		return
+	}
+	if color < 256 {
+		target := 38
+		if !foreground {
+			target = 48
+		}
+		*codes = append(*codes, fmt.Sprintf("%d;5;%d", target, n))
+		return
+	}
+
+	target := 38
+	if !foreground {
+		target = 48
+	}
+	r := int((color >> 16) & 0xff)
+	g := int((color >> 8) & 0xff)
+	b := int(color & 0xff)
+	*codes = append(*codes, fmt.Sprintf("%d;2;%d;%d;%d", target, r, g, b))
 }
 
 type staticTerminalPane struct {

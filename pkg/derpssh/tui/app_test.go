@@ -76,12 +76,12 @@ func TestWindowResizeEmitsTerminalPaneSize(t *testing.T) {
 	if !ok {
 		t.Fatalf("command = %T, want TerminalResizeCommand", got)
 	}
-	want := TerminalResizeCommand{Cols: 67, Rows: 28}
+	want := TerminalResizeCommand{Cols: 100, Rows: 28}
 	if got != want {
 		t.Fatalf("resize command = %+v, want %+v", got, want)
 	}
-	if pane.cols != 67 || pane.rows != 28 {
-		t.Fatalf("pane size = %dx%d, want 67x28", pane.cols, pane.rows)
+	if pane.cols != 100 || pane.rows != 28 {
+		t.Fatalf("pane size = %dx%d, want 100x28", pane.cols, pane.rows)
 	}
 }
 
@@ -91,7 +91,7 @@ func TestApprovalRequestRendersModal(t *testing.T) {
 	app.Update(ApprovalRequestMsg{Peer: "Alex"})
 
 	view := app.View()
-	for _, want := range []string{"Approve Alex", "Read", "Write", "Deny"} {
+	for _, want := range []string{"Alex wants to join", "Read", "Write", "Deny"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("View() missing %q:\n%s", want, view)
 		}
@@ -136,7 +136,7 @@ func TestApprovalEscapeDeniesPendingRequest(t *testing.T) {
 	}
 }
 
-func TestApprovalEnterDoesNotConfirmHiddenKick(t *testing.T) {
+func TestApprovalEnterConfirmsSelectedAccessNotHiddenKick(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 	app.Update(RuntimeStateMsg{Peers: []Peer{{ID: "guest-1", Name: "Alex", Role: RoleRead}}})
 	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
@@ -145,11 +145,72 @@ func TestApprovalEnterDoesNotConfirmHiddenKick(t *testing.T) {
 
 	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
 
-	if cmd := readCommand(app); cmd != nil {
-		t.Fatalf("Enter during approval emitted %+v, want no command", cmd)
+	got, ok := readCommand(app).(ApprovalDecisionCommand)
+	if !ok {
+		t.Fatalf("command = %T, want ApprovalDecisionCommand", got)
 	}
-	if !app.approvalActive() {
-		t.Fatalf("approval inactive after Enter, want still active")
+	want := ApprovalDecisionCommand{PeerID: "guest-2", Peer: "Blair", Role: RoleWrite}
+	if got != want {
+		t.Fatalf("approval command = %+v, want %+v", got, want)
+	}
+	if app.approvalActive() {
+		t.Fatalf("approval still active after Enter")
+	}
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("extra command after approval = %+v", cmd)
+	}
+}
+
+func TestApprovalKeyboardSelection(t *testing.T) {
+	tests := []struct {
+		name string
+		keys []tea.KeyMsg
+		want ApprovalDecisionCommand
+	}{
+		{
+			name: "default write",
+			keys: []tea.KeyMsg{{Type: tea.KeyEnter}},
+			want: ApprovalDecisionCommand{PeerID: "guest-2", Peer: "Alex", Role: RoleWrite},
+		},
+		{
+			name: "left selects read",
+			keys: []tea.KeyMsg{{Type: tea.KeyLeft}, {Type: tea.KeyEnter}},
+			want: ApprovalDecisionCommand{PeerID: "guest-2", Peer: "Alex", Role: RoleRead},
+		},
+		{
+			name: "right selects deny",
+			keys: []tea.KeyMsg{{Type: tea.KeyRight}, {Type: tea.KeyEnter}},
+			want: ApprovalDecisionCommand{PeerID: "guest-2", Peer: "Alex", Deny: true},
+		},
+		{
+			name: "tab wraps selection",
+			keys: []tea.KeyMsg{{Type: tea.KeyTab}, {Type: tea.KeyTab}, {Type: tea.KeyEnter}},
+			want: ApprovalDecisionCommand{PeerID: "guest-2", Peer: "Alex", Role: RoleRead},
+		},
+		{
+			name: "shift tab wraps backward",
+			keys: []tea.KeyMsg{{Type: tea.KeyShiftTab}, {Type: tea.KeyEnter}},
+			want: ApprovalDecisionCommand{PeerID: "guest-2", Peer: "Alex", Role: RoleRead},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+			app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+			app.Update(ApprovalRequestMsg{PeerID: "guest-2", Peer: "Alex"})
+
+			for _, key := range tt.keys {
+				app.Update(key)
+			}
+
+			got, ok := readCommand(app).(ApprovalDecisionCommand)
+			if !ok {
+				t.Fatalf("command = %T, want ApprovalDecisionCommand", got)
+			}
+			if got != tt.want {
+				t.Fatalf("approval command = %+v, want %+v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -187,7 +248,7 @@ func TestViewDoesNotExposeFullInviteTokenInMainLayout(t *testing.T) {
 	if strings.Contains(view, invite) || strings.Contains(view, "DSH1verysecretinvitetoken1234567890") {
 		t.Fatalf("View() exposes full invite token:\n%s", view)
 	}
-	for _, want := range []string{"Invite ready", "Ctrl-X I"} {
+	for _, want := range []string{"invite ready"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("View() missing invite affordance %q:\n%s", want, view)
 		}
@@ -197,14 +258,19 @@ func TestViewDoesNotExposeFullInviteTokenInMainLayout(t *testing.T) {
 	}
 }
 
-func TestViewRendersModernControls(t *testing.T) {
+func TestViewRendersQuietControls(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
 	view := app.View()
-	for _, want := range []string{"Terminal", "Sidechat", "Ctrl-X S", "Ctrl-X C", "Ctrl-X I", "Ctrl-X Q", "Ctrl-X ?"} {
+	for _, want := range []string{"terminal", "Ctrl-X actions", "? help"} {
 		if !strings.Contains(view, want) {
-			t.Fatalf("View() missing modern control %q:\n%s", want, view)
+			t.Fatalf("View() missing quiet control %q:\n%s", want, view)
+		}
+	}
+	for _, noisy := range []string{"Ctrl-X S", "Ctrl-X C", "Ctrl-X I", "Ctrl-X Q", "Ctrl-X T"} {
+		if strings.Contains(view, noisy) {
+			t.Fatalf("View() renders noisy shortcut %q:\n%s", noisy, view)
 		}
 	}
 }

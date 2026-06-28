@@ -53,13 +53,23 @@ func HandlePrefixKey(app *App, msg tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 	app.prefix = false
+	key := strings.ToLower(msg.String())
 
-	if app.approvalActive() {
-		app.handleApprovalPrefix(strings.ToLower(msg.String()))
+	switch key {
+	case "q":
+		app.emit(QuitCommand{})
+		return nil
+	case "?":
+		app.helpOpen = true
 		return nil
 	}
 
-	app.handleGlobalPrefix(strings.ToLower(msg.String()))
+	if app.approvalActive() {
+		app.handleApprovalPrefix(key)
+		return nil
+	}
+
+	app.handleGlobalPrefix(key)
 	return nil
 }
 

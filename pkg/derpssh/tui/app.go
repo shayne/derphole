@@ -22,6 +22,20 @@ type Options struct {
 	Terminal      TerminalPane
 }
 
+type approvalChoice int
+
+const (
+	approvalChoiceRead approvalChoice = iota
+	approvalChoiceWrite
+	approvalChoiceDeny
+)
+
+var approvalChoiceOrder = []approvalChoice{
+	approvalChoiceRead,
+	approvalChoiceWrite,
+	approvalChoiceDeny,
+}
+
 type App struct {
 	side          string
 	displayName   string
@@ -41,6 +55,7 @@ type App struct {
 	helpOpen       bool
 	approvalPeerID string
 	approvalPeer   string
+	approvalChoice approvalChoice
 	kickPeerID     string
 	kickPeer       string
 	inviteOpen     bool
@@ -79,7 +94,7 @@ func NewApp(opts Options) *App {
 		commands:      make(chan Command, 64),
 		width:         80,
 		height:        24,
-		sidebarOpen:   true,
+		sidebarOpen:   false,
 		focus:         FocusTerminal,
 		localRole:     RolePending,
 		transport:     "starting",
@@ -114,6 +129,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.approvalPeer = strings.TrimSpace(valueOr(msg.Peer, msg.PeerID))
 		if a.approvalActive() {
 			a.focus = FocusApproval
+			a.approvalChoice = approvalChoiceWrite
 		}
 	case tea.KeyMsg:
 		return a, a.handleKey(msg)
@@ -237,8 +253,8 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 	if a.handleEscapeKey(msg) {
 		return nil
 	}
-	if a.helpOpen {
-		return nil
+	if cmd, handled := a.handleHelpKey(msg); handled {
+		return cmd
 	}
 	if cmd, handled := a.handleApprovalKey(msg); handled {
 		return cmd
@@ -261,6 +277,19 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 	return a.handleTerminalKey(msg)
 }
 
+func (a *App) handleHelpKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	if !a.helpOpen {
+		return nil, false
+	}
+	if a.prefix {
+		return HandlePrefixKey(a, msg), true
+	}
+	if msg.Type == tea.KeyCtrlX {
+		a.prefix = true
+	}
+	return nil, true
+}
+
 func (a *App) handleApprovalKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	if !a.approvalActive() {
 		return nil, false
@@ -270,6 +299,15 @@ func (a *App) handleApprovalKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	}
 	if msg.Type == tea.KeyCtrlX {
 		a.prefix = true
+		return nil, true
+	}
+	switch msg.Type {
+	case tea.KeyEnter, tea.KeySpace:
+		a.approveSelected()
+	case tea.KeyTab, tea.KeyRight, tea.KeyDown:
+		a.moveApprovalChoice(1)
+	case tea.KeyShiftTab, tea.KeyLeft, tea.KeyUp:
+		a.moveApprovalChoice(-1)
 	}
 	return nil, true
 }
@@ -357,13 +395,14 @@ func (a *App) topBar() string {
 	if len(a.peers) > 0 {
 		parts = append(parts, "peer "+peerSummary(a.peers))
 	}
+	if a.approvalActive() {
+		parts = append(parts, "guest pending "+a.approvalPeer)
+	}
 	if a.inviteCommand != "" {
-		parts = append(parts, "Invite ready")
+		parts = append(parts, "invite ready")
 	}
 	if a.sidebarOpen {
-		parts = append(parts, "sidechat open")
-	} else {
-		parts = append(parts, "sidechat hidden")
+		parts = append(parts, "chat open")
 	}
 	return strings.Join(parts, " | ")
 }
@@ -420,7 +459,7 @@ func (a *App) writeSidebarHeader(content []string, width int) {
 	if len(content) == 0 {
 		return
 	}
-	content[0] = fitLine(labelStyle.Render("Sidechat")+" "+dimStyle.Render("Ctrl-X C"), width)
+	content[0] = fitLine(labelStyle.Render("Sidechat"), width)
 }
 
 func (a *App) writeSidebarInvite(content []string, width int, height int) int {
@@ -428,7 +467,7 @@ func (a *App) writeSidebarInvite(content []string, width int, height int) int {
 	if strings.TrimSpace(a.inviteCommand) == "" || row >= height-3 {
 		return row
 	}
-	content[row] = fitLine(labelStyle.Render("Invite ready")+" "+dimStyle.Render("Ctrl-X I"), width)
+	content[row] = fitLine(labelStyle.Render("invite ready"), width)
 	row++
 	if row < height-3 {
 		content[row] = ""
@@ -463,7 +502,7 @@ func (a *App) writeSidebarComposer(content []string, width int, height int) {
 	if height < 4 {
 		return
 	}
-	content[height-3] = fitLine(labelStyle.Render("Composer")+" "+dimStyle.Render("Enter sends"), width)
+	content[height-3] = fitLine(labelStyle.Render("Message"), width)
 	composerLines := splitAndFit(a.composer.View(), width, 2)
 	for i := 0; i < 2 && height-2+i < height; i++ {
 		if i < len(composerLines) {
@@ -473,27 +512,30 @@ func (a *App) writeSidebarComposer(content []string, width int, height int) {
 }
 
 func (a *App) statusBar() string {
-	focus := "Terminal"
+	focus := "terminal"
 	if a.focus == FocusChat {
-		focus = "Chat"
+		focus = "chat"
 	}
 	if a.focus == FocusApproval {
-		focus = "Approval"
+		focus = "approval"
 	}
-	state := fmt.Sprintf("Status %s | %s | Ctrl-X ? | Ctrl-X Q | Ctrl-X I | Ctrl-X S | Ctrl-X C | Ctrl-X T | Ctrl-X R/W | Ctrl-X K", valueOr(a.transport, "starting"), focus)
+	state := fmt.Sprintf("Status %s | %s | Ctrl-X actions | ? help", valueOr(a.transport, "starting"), focus)
+	if a.approvalActive() {
+		state = "Status approval | Enter accept | arrows choose | Esc deny | Ctrl-X Q quit"
+	}
 	if a.prefix {
-		state = "Status prefix | S Sidechat | C Chat | T Terminal | I Invite | Q Quit | ? Help"
+		state = "Status actions | S sidechat | C chat | T terminal | I invite | Q quit | ? help"
 	}
 	return state
 }
 
 func (a *App) approvalLines() []string {
+	width := a.approvalContentWidth()
 	return []string{
-		"Approve " + a.approvalPeer,
-		"approve " + a.approvalPeer + " access request",
-		"Choose access for this guest.",
+		fitLine(labelStyle.Render(a.approvalPeer+" wants to join"), width),
+		fitLine(dimStyle.Render("Select access, then press Enter."), width),
 		"",
-		" [Read]   [Write]   [Deny] ",
+		a.approvalButtonLine(width),
 	}
 }
 
@@ -552,7 +594,7 @@ func (a *App) overlayLine(lines []string, row int, x int, line string, width int
 }
 
 func (a *App) approvalHit(x int, y int) HitTarget {
-	read, write, deny := approvalButtonRects(a.layout)
+	read, write, deny := a.approvalButtonRects()
 	switch {
 	case read.contains(x, y):
 		return HitApprovalRead
@@ -563,6 +605,58 @@ func (a *App) approvalHit(x int, y int) HitTarget {
 	default:
 		return HitNone
 	}
+}
+
+func (a *App) approvalButtonRects() (Rect, Rect, Rect) {
+	contentW := a.approvalContentWidth()
+	contentX, contentY := a.approvalContentOrigin()
+	buttonLineW := approvalButtonsWidth()
+	startX := contentX + maxInt((contentW-buttonLineW)/2, 0)
+	y := contentY + approvalButtonLineIndex
+
+	read := Rect{X: startX, Y: y, W: approvalButtonWidth(approvalChoiceRead), H: 1}
+	write := Rect{X: read.X + read.W + approvalButtonGap, Y: y, W: approvalButtonWidth(approvalChoiceWrite), H: 1}
+	deny := Rect{X: write.X + write.W + approvalButtonGap, Y: y, W: approvalButtonWidth(approvalChoiceDeny), H: 1}
+	return read, write, deny
+}
+
+func (a *App) approvalContentOrigin() (int, int) {
+	box := strings.Split(modalStyle.Render(strings.Join(a.approvalLines(), "\n")), "\n")
+	boxW := a.overlayWidth(box)
+	boxX := (a.width - boxW) / 2
+	boxY := a.overlayY(len(box))
+	return boxX + modalStyle.GetBorderLeftSize() + modalStyle.GetPaddingLeft(),
+		boxY + modalStyle.GetBorderTopSize() + modalStyle.GetPaddingTop()
+}
+
+func (a *App) approvalContentWidth() int {
+	width := maxInt(42, displayWidth(a.approvalPeer+" wants to join"))
+	width = maxInt(width, displayWidth("Select access, then press Enter."))
+	width = maxInt(width, approvalButtonsWidth())
+	if a.width > 0 {
+		maxWidth := a.width - modalStyle.GetHorizontalBorderSize() - modalStyle.GetHorizontalPadding() - 2
+		width = minInt(width, maxInt(maxWidth, 1))
+	}
+	return maxInt(width, 1)
+}
+
+func (a *App) approvalButtonLine(width int) string {
+	lineW := approvalButtonsWidth()
+	pad := strings.Repeat(" ", maxInt((width-lineW)/2, 0))
+	parts := []string{
+		a.renderApprovalButton(approvalChoiceRead),
+		a.renderApprovalButton(approvalChoiceWrite),
+		a.renderApprovalButton(approvalChoiceDeny),
+	}
+	return fitLine(pad+strings.Join(parts, strings.Repeat(" ", approvalButtonGap)), width)
+}
+
+func (a *App) renderApprovalButton(choice approvalChoice) string {
+	text := approvalButtonText(choice)
+	if a.approvalChoice == choice {
+		return approvalButtonSelectedStyle.Render(text)
+	}
+	return approvalButtonStyle.Render(text)
 }
 
 func (a *App) approvalActive() bool {
@@ -576,7 +670,34 @@ func (a *App) approve(role Role, deny bool) {
 	a.emit(ApprovalDecisionCommand{PeerID: a.approvalPeerID, Peer: a.approvalPeer, Role: role, Deny: deny})
 	a.approvalPeerID = ""
 	a.approvalPeer = ""
+	a.approvalChoice = approvalChoiceWrite
 	a.focusTerminal()
+}
+
+func (a *App) approveSelected() {
+	switch a.approvalChoice {
+	case approvalChoiceRead:
+		a.approve(RoleRead, false)
+	case approvalChoiceWrite:
+		a.approve(RoleWrite, false)
+	case approvalChoiceDeny:
+		a.approve("", true)
+	}
+}
+
+func (a *App) moveApprovalChoice(delta int) {
+	idx := 0
+	for i, choice := range approvalChoiceOrder {
+		if choice == a.approvalChoice {
+			idx = i
+			break
+		}
+	}
+	next := (idx + delta) % len(approvalChoiceOrder)
+	if next < 0 {
+		next += len(approvalChoiceOrder)
+	}
+	a.approvalChoice = approvalChoiceOrder[next]
 }
 
 func (a *App) focusTerminal() {
@@ -675,23 +796,33 @@ func (a *App) pumpCommands() {
 	}
 }
 
-func approvalButtonRects(l Layout) (Rect, Rect, Rect) {
-	w := 44
-	if l.Outer.W > 0 && w > l.Outer.W-4 {
-		w = l.Outer.W - 4
+const (
+	approvalButtonGap       = 3
+	approvalButtonLineIndex = 3
+)
+
+func approvalButtonsWidth() int {
+	return approvalButtonWidth(approvalChoiceRead) +
+		approvalButtonWidth(approvalChoiceWrite) +
+		approvalButtonWidth(approvalChoiceDeny) +
+		approvalButtonGap*2
+}
+
+func approvalButtonWidth(choice approvalChoice) int {
+	return displayWidth(approvalButtonText(choice))
+}
+
+func approvalButtonText(choice approvalChoice) string {
+	switch choice {
+	case approvalChoiceRead:
+		return " Read "
+	case approvalChoiceWrite:
+		return " Write "
+	case approvalChoiceDeny:
+		return " Deny "
+	default:
+		return "      "
 	}
-	if w < 1 {
-		w = 1
-	}
-	h := 9
-	x := (l.Outer.W - w) / 2
-	y := (l.Outer.H - h) / 2
-	if y < 1 {
-		y = 1
-	}
-	return Rect{X: x + 10, Y: y + 7, W: 8, H: 1},
-		Rect{X: x + 20, Y: y + 7, W: 9, H: 1},
-		Rect{X: x + 31, Y: y + 7, W: 8, H: 1}
 }
 
 func peerSummary(peers []Peer) string {

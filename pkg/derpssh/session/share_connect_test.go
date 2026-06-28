@@ -173,6 +173,54 @@ func TestShareTestCommandRequiresHarness(t *testing.T) {
 	}
 }
 
+func TestStartShareTerminalUsesRichTermFallback(t *testing.T) {
+	t.Setenv("TERM", "dumb")
+
+	oldStartPTY := startPTY
+	defer func() { startPTY = oldStartPTY }()
+	var got pty.StartConfig
+	startPTY = func(cfg pty.StartConfig) (*pty.Session, error) {
+		got = cfg
+		return nil, errors.New("stop")
+	}
+
+	terminal, err := startShareTerminal(pty.Size{Cols: 80, Rows: 24})
+	if terminal != nil {
+		_ = terminal.Close()
+		_ = terminal.Wait()
+	}
+	if err == nil || err.Error() != "stop" {
+		t.Fatalf("startShareTerminal() error = %v, want stop", err)
+	}
+	if got.Term != "xterm-256color" {
+		t.Fatalf("StartConfig.Term = %q, want xterm-256color fallback", got.Term)
+	}
+}
+
+func TestStartShareTerminalPreservesCapableParentTerm(t *testing.T) {
+	t.Setenv("TERM", "xterm-kitty")
+
+	oldStartPTY := startPTY
+	defer func() { startPTY = oldStartPTY }()
+	var got pty.StartConfig
+	startPTY = func(cfg pty.StartConfig) (*pty.Session, error) {
+		got = cfg
+		return nil, errors.New("stop")
+	}
+
+	terminal, err := startShareTerminal(pty.Size{Cols: 80, Rows: 24})
+	if terminal != nil {
+		_ = terminal.Close()
+		_ = terminal.Wait()
+	}
+	if err == nil || err.Error() != "stop" {
+		t.Fatalf("startShareTerminal() error = %v, want stop", err)
+	}
+	if got.Term != "" {
+		t.Fatalf("StartConfig.Term = %q, want parent TERM preserved by pty.Start", got.Term)
+	}
+}
+
 func TestShareRunsInvitePreflightBeforeTerminal(t *testing.T) {
 	oldGenerateServerToken := generateServerToken
 	oldGenerateClientToken := generateClientToken
@@ -441,11 +489,11 @@ func TestShareStartsPTYAtTerminalPaneSize(t *testing.T) {
 	runHostSession = func(ctx context.Context, cfg HostConfig, bindConsole func(*HostRuntime)) error {
 		_ = bindConsole
 		_ = ctx
-		if startedSize != (pty.Size{Cols: 54, Rows: 22}) {
-			t.Fatalf("started PTY size = %+v, want 54x22 terminal pane", startedSize)
+		if startedSize != (pty.Size{Cols: 80, Rows: 22}) {
+			t.Fatalf("started PTY size = %+v, want 80x22 terminal pane", startedSize)
 		}
-		if cfg.InitialCols != 54 || cfg.InitialRows != 22 {
-			t.Fatalf("HostConfig initial size = %dx%d, want 54x22", cfg.InitialCols, cfg.InitialRows)
+		if cfg.InitialCols != 80 || cfg.InitialRows != 22 {
+			t.Fatalf("HostConfig initial size = %dx%d, want 80x22", cfg.InitialCols, cfg.InitialRows)
 		}
 		if cfg.PTYResize == nil {
 			t.Fatal("HostConfig.PTYResize = nil, want resize hook")

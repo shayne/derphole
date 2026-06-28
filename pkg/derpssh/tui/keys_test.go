@@ -85,8 +85,8 @@ func TestPrefixDoesNotReachPTY(t *testing.T) {
 	if _, ok := cmd.(TerminalResizeCommand); !ok {
 		t.Fatalf("prefix command = %T, want TerminalResizeCommand only", cmd)
 	}
-	if app.sidebarOpen {
-		t.Fatalf("sidebarOpen = true, want false after Ctrl-X S toggle")
+	if !app.sidebarOpen {
+		t.Fatalf("sidebarOpen = false, want true after Ctrl-X S toggle")
 	}
 }
 
@@ -102,7 +102,7 @@ func TestPrefixSidebarToggleEmitsTerminalResize(t *testing.T) {
 	if !ok {
 		t.Fatalf("command = %T, want TerminalResizeCommand", got)
 	}
-	want := TerminalResizeCommand{Cols: 100, Rows: 28}
+	want := TerminalResizeCommand{Cols: 67, Rows: 28}
 	if got != want {
 		t.Fatalf("resize command = %+v, want %+v", got, want)
 	}
@@ -111,8 +111,6 @@ func TestPrefixSidebarToggleEmitsTerminalResize(t *testing.T) {
 func TestPrefixChatOpenEmitsTerminalResize(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
 	drainCommands(app)
 
 	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
@@ -272,6 +270,36 @@ func TestPrefixInviteOpensInviteScreen(t *testing.T) {
 
 func TestPrefixQuitCommand(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+
+	cmd := readCommand(app)
+	if _, ok := cmd.(QuitCommand); !ok {
+		t.Fatalf("command = %T, want QuitCommand", cmd)
+	}
+}
+
+func TestPrefixQuitWorksDuringApproval(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+	app.Update(ApprovalRequestMsg{PeerID: "guest-1", Peer: "Alex"})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+
+	cmd := readCommand(app)
+	if _, ok := cmd.(QuitCommand); !ok {
+		t.Fatalf("command = %T, want QuitCommand", cmd)
+	}
+	if !app.approvalActive() {
+		t.Fatalf("approval should remain active until shutdown resolves it")
+	}
+}
+
+func TestPrefixQuitWorksDuringHelp(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
 
 	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
 	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
