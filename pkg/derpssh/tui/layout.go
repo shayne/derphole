@@ -134,6 +134,16 @@ func clampMax(v int, max int) int {
 	return v
 }
 
+func clampInt(v int, min int, max int) int {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
 func (l Layout) Hit(x int, y int) HitTarget {
 	switch {
 	case !l.Outer.contains(x, y):

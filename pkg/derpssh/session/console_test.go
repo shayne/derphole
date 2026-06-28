@@ -107,6 +107,24 @@ func TestTUIConsoleGuestPendingStatusClearsWhenPeerApproved(t *testing.T) {
 	}
 }
 
+func TestTUIConsoleHostPeerReconnectReplacesStaleGuest(t *testing.T) {
+	console := newHeadlessTUIConsole(tui.ModeHost, 120, 30, &recordingTerminalPane{view: "shell$"})
+
+	for _, id := range []string{"guest-1", "guest-2", "guest-3"} {
+		console.OnRuntimeEvent(RuntimeEvent{
+			Kind:          RuntimeEventPeer,
+			ParticipantID: id,
+			DisplayName:   "shayne",
+			Role:          protocol.RoleWrite,
+		})
+	}
+
+	firstLine := strings.Split(console.View(), "\n")[0]
+	if got := strings.Count(firstLine, "shayne/write"); got != 1 {
+		t.Fatalf("top bar rendered %d shayne/write peers, want one:\n%s", got, firstLine)
+	}
+}
+
 func TestTUIConsoleHostCloseEventClearsPeerAndShowsNotice(t *testing.T) {
 	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, &recordingTerminalPane{view: "shell$"})
 	console.OnRuntimeEvent(RuntimeEvent{
@@ -129,6 +147,19 @@ func TestTUIConsoleHostCloseEventClearsPeerAndShowsNotice(t *testing.T) {
 	}
 	if strings.Contains(strings.Split(view, "\n")[0], "shayne/write") {
 		t.Fatalf("top bar still shows departed peer:\n%s", view)
+	}
+}
+
+func TestTUIConsoleHostShellExitShowsQuitConfirm(t *testing.T) {
+	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, &recordingTerminalPane{view: "shell$"})
+
+	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventClose, Message: "host shell exited"})
+
+	view := console.View()
+	for _, want := range []string{"Shell exited", "The shared shell exited", "Quit"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("view missing shell-exit quit confirm %q:\n%s", want, view)
+		}
 	}
 }
 
@@ -557,6 +588,7 @@ func TestTUIConsoleRuntimeEventsUpdateApp(t *testing.T) {
 		Chat: ChatMessage{ParticipantID: "guest-1", DisplayName: "Alex", Text: "hello"},
 	})
 	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventClose, Message: "done"})
+	console.send(tea.KeyMsg{Type: tea.KeyEnter})
 	console.send(tea.KeyMsg{Type: tea.KeyCtrlX})
 	console.send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
 

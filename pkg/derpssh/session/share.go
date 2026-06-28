@@ -171,44 +171,24 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 
 	serveErr := make(chan error, 1)
 	go func() {
+		hostOptions := shareHostMuxOptions{
+			Config:       cfg,
+			Console:      console,
+			Terminal:     terminal,
+			Fanout:       fanout,
+			Starter:      starter,
+			PendingChats: pendingChats,
+			DisplayName:  displayName,
+			Size:         terminalSize,
+			Cancel:       cancel,
+			HostStarted:  &hostStarted,
+		}
 		serveErr <- serveAppMux(shareCtx, appsession.DerptunAppServeConfig{
 			ServerToken: serverToken,
 			Emitter:     sessionEmitter,
 			ForceRelay:  cfg.ForceRelay,
 			OnMux: func(ctx context.Context, mux *derptun.Mux) error {
-				hostStarted.Store(true)
-				approval := newShareApproval(cfg)
-				if _, ok := approval.(terminalShareApproval); ok {
-					approval = startingShareApproval{Approval: console, Start: starter.Start}
-				}
-				hostCfg := HostConfig{
-					Mux:           mux,
-					HostID:        randomID("host"),
-					HostName:      displayName,
-					InitialCols:   terminalSize.Cols,
-					InitialRows:   terminalSize.Rows,
-					PTYInput:      terminal.Input,
-					PTYOutput:     fanout.LazyReader(),
-					CloseOnPTYEOF: true,
-					PTYResize: func(cols int, rows int) error {
-						return terminal.Resize(pty.Size{Cols: cols, Rows: rows})
-					},
-					LocalInput:  emptyReader{},
-					LocalOutput: io.Discard,
-					Approval:    approval,
-					Observer:    console,
-				}
-				return runHostSession(ctx, hostCfg, func(host *HostRuntime) {
-					callbacks := hostConsoleCallbacks(host)
-					callbacks.Quit = func(ctx context.Context) error {
-						err := host.Close(ctx, hostQuitReason)
-						_ = terminal.Close()
-						cancel()
-						return err
-					}
-					console.SetCommandCallbacks(callbacks)
-					go pendingChats.flush(ctx, callbacks.Chat)
-				})
+				return runShareHostMux(ctx, mux, hostOptions)
 			},
 		})
 	}()
@@ -218,6 +198,79 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 		err = context.Canceled
 	}
 	return finishShareError(err, shareCtx, &quitBeforeGuest, &preflightErr)
+}
+
+type shareHostMuxOptions struct {
+	Config       ShareConfig
+	Console      *tuiConsole
+	Terminal     *shareTerminal
+	Fanout       *terminalFanout
+	Starter      *shareConsoleStarter
+	PendingChats *pendingShareChats
+	DisplayName  string
+	Size         pty.Size
+	Cancel       context.CancelFunc
+	HostStarted  *atomic.Bool
+}
+
+func runShareHostMux(ctx context.Context, mux *derptun.Mux, opts shareHostMuxOptions) error {
+	if opts.HostStarted != nil {
+		opts.HostStarted.Store(true)
+	}
+	hostCfg := shareHostConfig(mux, opts)
+	var hostRuntime *HostRuntime
+	err := runHostSession(ctx, hostCfg, func(host *HostRuntime) {
+		hostRuntime = host
+		callbacks := hostConsoleCallbacks(host)
+		callbacks.Quit = func(ctx context.Context) error {
+			err := host.Close(ctx, hostQuitReason)
+			_ = opts.Terminal.Close()
+			opts.Cancel()
+			return err
+		}
+		opts.Console.SetCommandCallbacks(callbacks)
+		go opts.PendingChats.flush(ctx, callbacks.Chat)
+	})
+	if shouldEndShareAfterHostSession(hostRuntime, err) {
+		opts.Cancel()
+	}
+	return err
+}
+
+func shareHostConfig(mux *derptun.Mux, opts shareHostMuxOptions) HostConfig {
+	approval := newShareApproval(opts.Config)
+	if _, ok := approval.(terminalShareApproval); ok {
+		approval = startingShareApproval{Approval: opts.Console, Start: opts.Starter.Start}
+	}
+	return HostConfig{
+		Mux:           mux,
+		HostID:        randomID("host"),
+		HostName:      opts.DisplayName,
+		InitialCols:   opts.Size.Cols,
+		InitialRows:   opts.Size.Rows,
+		PTYInput:      opts.Terminal.Input,
+		PTYOutput:     opts.Fanout.LazyReader(),
+		CloseOnPTYEOF: true,
+		PTYResize: func(cols int, rows int) error {
+			return opts.Terminal.Resize(pty.Size{Cols: cols, Rows: rows})
+		},
+		LocalInput:  emptyReader{},
+		LocalOutput: io.Discard,
+		Approval:    approval,
+		Observer:    opts.Console,
+	}
+}
+
+func shouldEndShareAfterHostSession(host *HostRuntime, err error) bool {
+	if err != nil || host == nil {
+		return false
+	}
+	switch host.CloseReason() {
+	case hostQuitReason:
+		return true
+	default:
+		return false
+	}
 }
 
 func prepareShareInvitePreflight(ctx context.Context, cfg ShareConfig, command string, enabled bool) (shareInvitePreflight, bool, error) {

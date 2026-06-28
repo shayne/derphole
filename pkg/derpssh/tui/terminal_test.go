@@ -129,6 +129,23 @@ func TestVTTerminalPaneRendersVisibleCursorOnBlankCell(t *testing.T) {
 	}
 }
 
+func TestVTTerminalPaneViewClampsReadsToBufferSize(t *testing.T) {
+	pane := NewVTTerminalPane(101, 30)
+
+	if _, err := pane.Write([]byte("root@host:~# ")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	view := pane.View(131, 33)
+	lines := strings.Split(view, "\n")
+	if len(lines) != 33 {
+		t.Fatalf("View line count = %d, want 33", len(lines))
+	}
+	if !strings.Contains(ansiPattern.ReplaceAllString(lines[0], ""), "root@host") {
+		t.Fatalf("View() lost terminal content:\n%s", view)
+	}
+}
+
 func TestVTTerminalPaneHidesCursorWhenDECTCEMDisabled(t *testing.T) {
 	pane := NewVTTerminalPane(10, 3)
 

@@ -802,6 +802,70 @@ func TestShareGuestApprovalInterruptsPlainInvite(t *testing.T) {
 	}
 }
 
+func TestShareCancelsServerAfterHostQuit(t *testing.T) {
+	t.Setenv("DERPSSH_TEST_COMMAND", "cat")
+	oldGenerateServerToken := generateServerToken
+	oldGenerateClientToken := generateClientToken
+	oldServe := serveAppMux
+	oldRunHost := runHostSession
+	defer func() {
+		generateServerToken = oldGenerateServerToken
+		generateClientToken = oldGenerateClientToken
+		serveAppMux = oldServe
+		runHostSession = oldRunHost
+	}()
+	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	serveAppMux = func(ctx context.Context, cfg appsession.DerptunAppServeConfig) error {
+		if err := cfg.OnMux(ctx, nil); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+			return errors.New("share server kept running after host quit")
+		}
+	}
+	runHostSession = func(ctx context.Context, cfg HostConfig, bindConsole func(*HostRuntime)) error {
+		_ = ctx
+		host := NewHostRuntime(cfg)
+		if bindConsole != nil {
+			bindConsole(host)
+		}
+		host.setCloseReason(hostQuitReason)
+		return nil
+	}
+
+	if err := Share(context.Background(), ShareConfig{Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: io.Discard}); err != nil {
+		t.Fatalf("Share() error = %v, want nil", err)
+	}
+}
+
+func TestStartShareTerminalCloseStopsTestCommand(t *testing.T) {
+	t.Setenv("DERPSSH_TEST_COMMAND", "sleep 1")
+
+	terminal, err := startShareTerminal(pty.Size{Cols: 80, Rows: 24})
+	if err != nil {
+		t.Fatalf("startShareTerminal() error = %v", err)
+	}
+
+	if err := terminal.Close(); err != nil {
+		t.Fatalf("terminal.Close() error = %v", err)
+	}
+
+	waitErr := make(chan error, 1)
+	go func() {
+		waitErr <- terminal.Wait()
+	}()
+
+	select {
+	case <-waitErr:
+	case <-time.After(150 * time.Millisecond):
+		t.Fatal("terminal.Wait() did not return promptly after Close")
+	}
+}
+
 func TestConnectDecodesInviteAndDials(t *testing.T) {
 	oldDial := dialAppMux
 	defer func() { dialAppMux = oldDial }()

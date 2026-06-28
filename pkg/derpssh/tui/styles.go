@@ -55,12 +55,13 @@ var (
 			Background(catSurface0)
 	labelStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(catSapphire)
+			Foreground(catSapphire).
+			Background(catBase)
 	dimStyle = lipgloss.NewStyle().
-			Foreground(catSubtext)
+			Foreground(catSubtext).
+			Background(catBase)
 	separatorStyle = lipgloss.NewStyle().
-			Foreground(catSurface2).
-			Background(catSurface2)
+			Foreground(catSurface2)
 	sidebarStyle = lipgloss.NewStyle().
 			Foreground(catText).
 			Background(catMantle)

@@ -176,6 +176,21 @@ func TestTerminalFocusEscapeReachesPTY(t *testing.T) {
 	}
 }
 
+func TestTerminalFocusCtrlRReachesPTY(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+
+	cmd := readCommand(app)
+	got, ok := cmd.(TerminalInputCommand)
+	if !ok {
+		t.Fatalf("command = %T, want TerminalInputCommand", cmd)
+	}
+	if !bytes.Equal(got.Data, []byte{0x12}) {
+		t.Fatalf("TerminalInputCommand.Data = %v, want ctrl-r byte", got.Data)
+	}
+}
+
 func TestTerminalFocusUsesApplicationCursorMode(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok", input: TerminalInputMode{ApplicationCursor: true}}})
 
@@ -393,6 +408,18 @@ func TestPrefixQuitWorksDuringHelp(t *testing.T) {
 	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	if _, ok := readCommand(app).(QuitCommand); !ok {
 		t.Fatalf("confirmed quit did not emit QuitCommand")
+	}
+}
+
+func TestPrefixQuitWorksDuringNotice(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+	app.Update(NoticeMsg{Title: "Shell exited", Body: "Press Ctrl-X Q to quit."})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+
+	if _, ok := readCommand(app).(QuitCommand); !ok {
+		t.Fatalf("Ctrl-X Q during shell-exit quit confirm did not emit QuitCommand")
 	}
 }
 

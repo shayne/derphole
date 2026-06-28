@@ -80,8 +80,14 @@ func (p *vtTerminalPane) View(width int, height int) string {
 
 	lines := make([]string, 0, height)
 	cursor := terminalCursorView{cursor: p.term.Cursor(), visible: p.term.CursorVisible() && p.cursorActive}
+	cols, rows := p.term.Size()
+	renderWidth := minInt(width, cols)
 	for y := 0; y < height; y++ {
-		lines = append(lines, renderTerminalRow(p.term, width, y, cursor))
+		if y >= rows || renderWidth <= 0 {
+			lines = append(lines, "")
+			continue
+		}
+		lines = append(lines, renderTerminalRow(p.term, renderWidth, y, cursor))
 	}
 	return strings.Join(lines, "\n")
 }

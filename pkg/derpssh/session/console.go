@@ -353,19 +353,28 @@ func (c *tuiConsole) applyPeerRuntimeEvent(event RuntimeEvent) {
 
 func (c *tuiConsole) applyCloseRuntimeEvent(event RuntimeEvent) {
 	message := strings.TrimSpace(event.Message)
+	participantID := strings.TrimSpace(event.ParticipantID)
 	c.updateRuntimeState(func() {
 		c.transport = closedTransportStatus(message)
-		if c.mode == tui.ModeHost && strings.TrimSpace(event.ParticipantID) != "" {
+		if c.mode == tui.ModeHost && participantID != "" {
 			c.clearPeersLocked()
 		}
 	})
-	if c.mode == tui.ModeHost && strings.TrimSpace(event.ParticipantID) != "" {
-		name := displayNameOrID(event.DisplayName, event.ParticipantID)
+	if c.mode == tui.ModeHost && participantID != "" {
+		name := displayNameOrID(event.DisplayName, participantID)
 		body := message
 		if body == "" {
 			body = name + " disconnected"
 		}
 		c.send(tui.NoticeMsg{Title: "Guest left", Body: body})
+		return
+	}
+	if c.mode == tui.ModeHost && message == hostShellExitedReason {
+		c.send(tui.NoticeMsg{Title: "Shell exited", Body: "The shared shell exited. Press Ctrl-X Q to quit derpssh."})
+		return
+	}
+	if message != "" {
+		c.send(tui.NoticeMsg{Title: "Shared terminal closed", Body: message})
 	}
 }
 
@@ -941,6 +950,9 @@ func (c *tuiConsole) setPeerLocked(id, name string, role protocol.Role) {
 	if id == "" {
 		return
 	}
+	if c.mode == tui.ModeHost {
+		c.removeStaleHostPeersLocked(id, name, role)
+	}
 	if existing, ok := c.peers[id]; ok {
 		if name == "" {
 			name = existing.Name
@@ -950,6 +962,41 @@ func (c *tuiConsole) setPeerLocked(id, name string, role protocol.Role) {
 	}
 	name = displayNameOrID(name, id)
 	c.peers[id] = tui.Peer{ID: id, Name: name, Role: tuiRoleFromProtocol(role)}
+}
+
+func (c *tuiConsole) removeStaleHostPeersLocked(id, name string, role protocol.Role) {
+	if !roleGranted(role) && role != protocol.RolePending {
+		return
+	}
+	for _, existingID := range c.peerOrder {
+		if existingID == id {
+			continue
+		}
+		existing := c.peers[existingID]
+		if roleGranted(role) || samePeerDisplayName(existing.Name, name) {
+			delete(c.peers, existingID)
+		}
+	}
+	c.compactPeerOrderLocked()
+}
+
+func samePeerDisplayName(left, right string) bool {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	return left != "" && right != "" && left == right
+}
+
+func (c *tuiConsole) compactPeerOrderLocked() {
+	if len(c.peerOrder) == 0 {
+		return
+	}
+	compact := c.peerOrder[:0]
+	for _, id := range c.peerOrder {
+		if _, ok := c.peers[id]; ok {
+			compact = append(compact, id)
+		}
+	}
+	c.peerOrder = compact
 }
 
 func (c *tuiConsole) clearPeersLocked() {

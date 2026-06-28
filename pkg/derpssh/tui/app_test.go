@@ -101,6 +101,24 @@ func TestApprovalRequestRendersModal(t *testing.T) {
 	}
 }
 
+func TestGuestPendingRoleRendersWaitingApprovalModal(t *testing.T) {
+	app := NewApp(Options{Side: "guest", DisplayName: "shayne", Terminal: &fakePane{view: ""}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	app.Update(RuntimeStateMsg{Transport: "direct", LocalRole: RolePending})
+
+	view := app.View()
+	for _, want := range []string{"Waiting for host approval", "The host will choose read or write access."} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("View() missing %q:\n%s", want, view)
+		}
+	}
+
+	app.Update(RuntimeStateMsg{Transport: "direct", LocalRole: RoleWrite})
+	if view := app.View(); strings.Contains(view, "Waiting for host approval") {
+		t.Fatalf("waiting approval modal still visible after approval:\n%s", view)
+	}
+}
+
 func TestNoticeMsgRendersDismissibleModal(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "shell$"}})
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
@@ -382,6 +400,60 @@ func TestGuestSidebarDoesNotResizeHostTerminalBuffer(t *testing.T) {
 	}
 }
 
+func TestGuestChatOverlayDoesNotShrinkEffectiveTerminalViewport(t *testing.T) {
+	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "shell$"}})
+	app.Update(tea.WindowSizeMsg{Width: 120, Height: 31})
+	drainCommands(app)
+	app.Update(RuntimeStateMsg{Transport: "direct", HostCols: 101, HostRows: 30, LocalRole: RoleWrite})
+	if view := app.View(); strings.Contains(view, "Resize terminal") {
+		t.Fatalf("unexpected resize warning before chat opens:\n%s", view)
+	}
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("guest chat overlay emitted resize command %+v, want none", cmd)
+	}
+	cols, rows := app.TerminalSize()
+	if cols != 120 || rows != 30 {
+		t.Fatalf("TerminalSize with guest chat = %dx%d, want 120x30", cols, rows)
+	}
+	if view := app.View(); strings.Contains(view, "Resize terminal") {
+		t.Fatalf("guest chat overlay triggered resize warning:\n%s", view)
+	}
+}
+
+func TestOverlayLinePreservesContentAfterModal(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 40, Height: 5})
+	lines := []string{fitLine("abcdefghijklmnopqrstuvwxyz", 40)}
+
+	app.overlayLine(lines, 0, 10, "BOX", 3)
+
+	got := ansiPattern.ReplaceAllString(lines[0], "")
+	want := "abcdefghijBOXnopqrstuvwxyz              "
+	if got != want {
+		t.Fatalf("overlay line = %q, want %q", got, want)
+	}
+}
+
+func TestModalBoxUsesConsistentFilledWidth(t *testing.T) {
+	box := renderModalBox([]string{
+		labelStyle.Render("Resize terminal"),
+		dimStyle.Render("short"),
+	})
+	if len(box) == 0 {
+		t.Fatal("renderModalBox returned no rows")
+	}
+	want := displayWidth(box[0])
+	for i, line := range box {
+		if got := displayWidth(line); got != want {
+			t.Fatalf("modal row %d width = %d, want %d: %q", i, got, want, line)
+		}
+	}
+}
+
 func TestLocalChatAuthorDefaultsToUser(t *testing.T) {
 	t.Setenv("USER", "shayne")
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
@@ -510,6 +582,28 @@ func TestChatAutoScrollsToNewestMessages(t *testing.T) {
 	}
 	if !strings.Contains(view, "message 11") {
 		t.Fatalf("chat did not auto-scroll to newest message:\n%s", view)
+	}
+}
+
+func TestChatComposerGrowsToThreeRows(t *testing.T) {
+	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+
+	for _, r := range "this message is long enough to wrap across multiple visible composer rows" {
+		app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	app.View()
+
+	if app.layout.Composer.H != 3 {
+		t.Fatalf("composer height = %d, want 3", app.layout.Composer.H)
+	}
+	view := app.View()
+	for _, want := range []string{"this message is long", "composer rows"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("composer missing visible text fragment %q:\n%s", want, view)
+		}
 	}
 }
 

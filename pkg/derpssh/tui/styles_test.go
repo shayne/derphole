@@ -17,7 +17,6 @@ func TestStructuralStylesUseAdaptiveBackgrounds(t *testing.T) {
 	}{
 		{name: "top bar", style: topBarStyle},
 		{name: "status bar", style: statusBarStyle},
-		{name: "separator", style: separatorStyle},
 		{name: "sidebar", style: sidebarStyle},
 		{name: "modal", style: modalStyle},
 	}
@@ -27,5 +26,16 @@ func TestStructuralStylesUseAdaptiveBackgrounds(t *testing.T) {
 				t.Fatalf("%s background = %T, want lipgloss.AdaptiveColor", tt.name, tt.style.GetBackground())
 			}
 		})
+	}
+}
+
+func TestSeparatorStyleUsesAdaptiveForegroundOnly(t *testing.T) {
+	if _, ok := separatorStyle.GetForeground().(lipgloss.AdaptiveColor); !ok {
+		t.Fatalf("separator foreground = %T, want lipgloss.AdaptiveColor", separatorStyle.GetForeground())
+	}
+	if got := separatorStyle.GetBackground(); got != nil {
+		if _, ok := got.(lipgloss.NoColor); !ok {
+			t.Fatalf("separator background = %T, want foreground-only divider", got)
+		}
 	}
 }

@@ -120,6 +120,8 @@ type App struct {
 	inviteOpen      bool
 	quitOpen        bool
 	quitChoice      quitChoice
+	quitTitle       string
+	quitBody        string
 	noticeTitle     string
 	noticeBody      string
 	topBarHits      []topBarHit
@@ -232,8 +234,19 @@ func (a *App) applyApprovalRequest(msg ApprovalRequestMsg) {
 }
 
 func (a *App) applyNotice(msg NoticeMsg) {
-	a.noticeTitle = strings.TrimSpace(msg.Title)
-	a.noticeBody = strings.TrimSpace(msg.Body)
+	title := strings.TrimSpace(msg.Title)
+	body := strings.TrimSpace(msg.Body)
+	if strings.EqualFold(title, "Shell exited") {
+		a.noticeTitle = ""
+		a.noticeBody = ""
+		a.quitTitle = title
+		a.quitBody = valueOr(body, "The shared shell exited.")
+		a.quitOpen = true
+		a.quitChoice = quitChoiceQuit
+		return
+	}
+	a.noticeTitle = title
+	a.noticeBody = body
 }
 
 func (a *App) View() string {
@@ -267,6 +280,9 @@ func (a *App) baseViewLines() []string {
 func (a *App) applyOverlays(lines []string) {
 	if a.resizeWarningOpen() {
 		a.overlay(lines, a.resizeWarningLines())
+	}
+	if a.waitingApprovalOpen() {
+		a.overlay(lines, a.waitingApprovalLines())
 	}
 	if a.helpOpen {
 		a.overlay(lines, a.helpLines())
@@ -305,11 +321,12 @@ func (a *App) SetWindowSize(cols int, rows int) {
 
 func (a *App) TerminalSize() (int, int) {
 	a.applyLayout()
-	return a.layout.Terminal.W, a.layout.Terminal.H
+	terminal := a.currentTerminalRect()
+	return terminal.W, terminal.H
 }
 
 func (a *App) resize(cols int, rows int, emitResize bool) {
-	oldTerminal := a.layout.Terminal
+	oldTerminal := a.currentTerminalRect()
 	if cols > 0 {
 		a.width = cols
 	}
@@ -326,8 +343,16 @@ func (a *App) applyLayout() {
 	a.layout = ComputeLayoutWithSidebarWidth(a.width, a.height, a.sidebarOpen, a.sidebarWidth)
 	if a.layout.SidebarOpen && a.layout.Sidebar.W > 0 {
 		a.sidebarWidth = a.layout.Sidebar.W
+		composerRows := a.desiredComposerRows(a.layout.Sidebar.W)
+		composerRows = minInt(composerRows, maxInt(a.layout.Sidebar.H-1, 1))
+		a.layout.Composer = Rect{
+			X: a.layout.Sidebar.X,
+			Y: a.layout.Sidebar.Y + maxInt(a.layout.Sidebar.H-composerRows, 0),
+			W: a.layout.Sidebar.W,
+			H: composerRows,
+		}
 	}
-	if !a.layout.Terminal.empty() {
+	if !a.currentTerminalRect().empty() {
 		cols, rows := a.terminalBufferSize()
 		a.terminal.Resize(cols, rows)
 	}
@@ -338,14 +363,41 @@ func (a *App) applyLayout() {
 }
 
 func (a *App) terminalBufferSize() (int, int) {
-	if strings.EqualFold(strings.TrimSpace(a.side), string(ModeGuest)) && a.hostCols > 0 && a.hostRows > 0 {
+	if a.isGuest() && a.hostCols > 0 && a.hostRows > 0 {
 		return a.hostCols, a.hostRows
 	}
-	return a.layout.Terminal.W, a.layout.Terminal.H
+	terminal := a.currentTerminalRect()
+	return terminal.W, terminal.H
+}
+
+func (a *App) currentTerminalRect() Rect {
+	if a.guestChatOverlay() {
+		_, contentH := contentRect(a.height)
+		return Rect{X: 0, Y: 1, W: a.width, H: contentH}
+	}
+	return a.layout.Terminal
+}
+
+func (a *App) desiredComposerRows(width int) int {
+	width = maxInt(width, 1)
+	value := a.composer.Value()
+	if strings.TrimSpace(value) == "" {
+		return 1
+	}
+	rows := len(wrapPlainLines(value, width))
+	return clampInt(rows, 1, 3)
+}
+
+func (a *App) guestChatOverlay() bool {
+	return a.isGuest() && a.hostCols > 0 && a.hostRows > 0 && a.sidebarOpen && !a.layout.Sidebar.empty()
+}
+
+func (a *App) isGuest() bool {
+	return strings.EqualFold(strings.TrimSpace(a.side), string(ModeGuest))
 }
 
 func (a *App) setSidebarOpen(open bool) {
-	oldTerminal := a.layout.Terminal
+	oldTerminal := a.currentTerminalRect()
 	a.sidebarOpen = open
 	if open {
 		a.unreadChat = 0
@@ -355,7 +407,7 @@ func (a *App) setSidebarOpen(open bool) {
 }
 
 func (a *App) setSidebarWidth(width int) {
-	oldTerminal := a.layout.Terminal
+	oldTerminal := a.currentTerminalRect()
 	a.sidebarWidth = clampSidebarWidth(a.width, width)
 	a.sidebarOpen = true
 	a.unreadChat = 0
@@ -364,7 +416,7 @@ func (a *App) setSidebarWidth(width int) {
 }
 
 func (a *App) emitTerminalResizeIfChanged(oldTerminal Rect) {
-	nextTerminal := a.layout.Terminal
+	nextTerminal := a.currentTerminalRect()
 	if nextTerminal.empty() {
 		return
 	}
@@ -409,6 +461,9 @@ func (a *App) handleScreenKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	if cmd, handled := a.handleHelpKey(msg); handled {
 		return cmd, true
 	}
+	if cmd, handled := a.handleWaitingApprovalKey(msg); handled {
+		return cmd, true
+	}
 	if cmd, handled := a.handleApprovalKey(msg); handled {
 		return cmd, true
 	}
@@ -419,6 +474,16 @@ func (a *App) handleScreenKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 }
 
 func (a *App) handleNoticeKey(msg tea.KeyMsg) tea.Cmd {
+	if a.prefix {
+		if strings.EqualFold(msg.String(), "q") {
+			a.closeNotice()
+		}
+		return HandlePrefixKey(a, msg)
+	}
+	if msg.Type == tea.KeyCtrlX {
+		a.prefix = true
+		return nil
+	}
 	switch msg.Type {
 	case tea.KeyEnter, tea.KeyEsc, tea.KeySpace:
 		a.closeNotice()
@@ -440,6 +505,20 @@ func (a *App) handleHelpKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	}
 	if msg.Type == tea.KeyCtrlX {
 		a.prefix = true
+	}
+	return nil, true
+}
+
+func (a *App) handleWaitingApprovalKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	if !a.waitingApprovalOpen() {
+		return nil, false
+	}
+	if a.prefix {
+		return HandlePrefixKey(a, msg), true
+	}
+	if msg.Type == tea.KeyCtrlX {
+		a.prefix = true
+		return nil, true
 	}
 	return nil, true
 }
@@ -492,6 +571,11 @@ func (a *App) handleQuitKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	}
 	if a.prefix {
 		a.prefix = false
+		if msg.Type == tea.KeyRunes && strings.EqualFold(string(msg.Runes), "q") {
+			a.quitChoice = quitChoiceQuit
+			a.confirmQuitChoice()
+			return nil, true
+		}
 	}
 	a.dispatchQuitKey(msg)
 	return nil, true
@@ -773,16 +857,39 @@ func (a *App) localDisplayName() string {
 
 func (a *App) contentLines() []string {
 	a.setTerminalCursorActive(a.focus == FocusTerminal && !a.copyMode && !a.modalActive())
+	terminal := a.currentTerminalRect()
+	if terminal.empty() {
+		return nil
+	}
 	if !a.sidebarOpen || a.layout.Sidebar.empty() {
-		return padLines(splitAndFit(a.terminal.View(a.layout.Terminal.W, a.layout.Terminal.H), a.layout.Terminal.W, a.layout.Terminal.H), a.layout.Terminal.H, a.layout.Terminal.W)
+		return a.terminalLines(terminal)
+	}
+	if a.guestChatOverlay() {
+		return a.contentLinesWithSidebarOverlay(terminal)
 	}
 
-	terminalLines := padLines(splitAndFit(a.terminal.View(a.layout.Terminal.W, a.layout.Terminal.H), a.layout.Terminal.W, a.layout.Terminal.H), a.layout.Terminal.H, a.layout.Terminal.W)
+	terminalLines := a.terminalLines(terminal)
 	sidebarLines := a.sidebarLines(a.layout.Sidebar.W, a.layout.Sidebar.H)
-	lines := make([]string, a.layout.Terminal.H)
+	lines := make([]string, terminal.H)
 	for i := range lines {
-		divider := separatorStyle.Render(" ")
-		lines[i] = fitLine(terminalLines[i], a.layout.Terminal.W) + fitLine(divider, a.layout.Divider.W) + fitLine(sidebarLines[i], a.layout.Sidebar.W)
+		divider := separatorStyle.Render("│")
+		lines[i] = fitLine(terminalLines[i], terminal.W) + fitLine(divider, a.layout.Divider.W) + fitLine(sidebarLines[i], a.layout.Sidebar.W)
+	}
+	return lines
+}
+
+func (a *App) terminalLines(terminal Rect) []string {
+	return padLines(splitAndFit(a.terminal.View(terminal.W, terminal.H), terminal.W, terminal.H), terminal.H, terminal.W)
+}
+
+func (a *App) contentLinesWithSidebarOverlay(terminal Rect) []string {
+	terminalLines := a.terminalLines(terminal)
+	sidebarLines := a.sidebarLines(a.layout.Sidebar.W, a.layout.Sidebar.H)
+	lines := make([]string, terminal.H)
+	for i := range lines {
+		divider := separatorStyle.Render("│")
+		panel := fitLine(divider, a.layout.Divider.W) + fitLine(sidebarLines[i], a.layout.Sidebar.W)
+		lines[i] = overlayFromColumn(terminalLines[i], a.layout.Divider.X, panel, terminal.W)
 	}
 	return lines
 }
@@ -922,22 +1029,29 @@ func (a *App) writeSidebarComposer(content []string, width int, height int) {
 	if height < 2 {
 		return
 	}
-	if height >= 3 {
-		content[height-2] = fitLine(composerBorderStyle.Width(width).Render(strings.Repeat(" ", width)), width)
+	rows := clampInt(a.layout.Composer.H, 1, 3)
+	rows = minInt(rows, height)
+	borderY := height - rows - 1
+	if borderY >= 0 {
+		content[borderY] = fitLine(composerBorderStyle.Width(width).Render(strings.Repeat(" ", width)), width)
 	}
-	composerLines := splitAndFit(a.composer.View(), width, 1)
-	for i := 0; i < 1 && height-1+i < height; i++ {
+	start := height - rows
+	composerLines := splitAndFit(a.composer.View(), width, rows)
+	for i := 0; i < rows && start+i < height; i++ {
 		if i < len(composerLines) {
-			content[height-1+i] = fitLine(composerStyle.Width(width).Render(fitLine(composerLines[i], width)), width)
+			content[start+i] = fitLine(composerStyle.Width(width).Render(fitLine(composerLines[i], width)), width)
+		} else {
+			content[start+i] = fitLine(composerStyle.Width(width).Render(strings.Repeat(" ", width)), width)
 		}
 	}
 }
 
 func (a *App) sidebarComposerRows(height int) int {
-	if height >= 3 {
-		return a.layout.Composer.H + 1
+	rows := clampInt(a.layout.Composer.H, 1, 3)
+	if height > rows {
+		return rows + 1
 	}
-	return a.layout.Composer.H
+	return rows
 }
 
 func (a *App) approvalLines() []string {
@@ -945,17 +1059,19 @@ func (a *App) approvalLines() []string {
 	return []string{
 		fitLine(labelStyle.Render(a.approvalPeer+" wants to join"), width),
 		fitLine(dimStyle.Render("Select access, then press Enter."), width),
-		"",
+		fitLine("", width),
 		a.approvalButtonLine(width),
 	}
 }
 
 func (a *App) quitLines() []string {
 	width := a.quitContentWidth()
+	title := valueOr(a.quitTitle, "Quit derpssh?")
+	body := valueOr(a.quitBody, "This closes the shared terminal for everyone.")
 	return []string{
-		fitLine(labelStyle.Render("Quit derpssh?"), width),
-		fitLine(dimStyle.Render("This closes the shared terminal for everyone."), width),
-		"",
+		fitLine(labelStyle.Render(title), width),
+		fitLine(dimStyle.Render(body), width),
+		fitLine("", width),
 		a.quitButtonLine(width),
 	}
 }
@@ -968,13 +1084,14 @@ func (a *App) noticeLines() []string {
 	}
 	lines := []string{fitLine(labelStyle.Render(valueOr(a.noticeTitle, "Notice")), width)}
 	lines = append(lines, wrapPlainLines(body, width)...)
-	lines = append(lines, "", fitLine(dimStyle.Render("Enter or Esc closes this."), width))
+	lines = append(lines, fitLine("", width), fitLine(dimStyle.Render("Enter or Esc closes this."), width))
 	return lines
 }
 
 func (a *App) resizeWarningLines() []string {
 	width := a.resizeWarningContentWidth()
-	current := fmt.Sprintf("%dx%d", a.layout.Terminal.W, a.layout.Terminal.H)
+	terminal := a.currentTerminalRect()
+	current := fmt.Sprintf("%dx%d", terminal.W, terminal.H)
 	required := fmt.Sprintf("%dx%d", a.hostCols, a.hostRows)
 	lines := []string{fitLine(labelStyle.Render("Resize terminal"), width)}
 	lines = append(lines, wrapPlainLines("The host terminal is "+required+". Your current view is "+current+".", width)...)
@@ -982,13 +1099,23 @@ func (a *App) resizeWarningLines() []string {
 	return lines
 }
 
+func (a *App) waitingApprovalLines() []string {
+	width := a.waitingApprovalContentWidth()
+	return []string{
+		fitLine(labelStyle.Render("Waiting for host approval"), width),
+		fitLine(dimStyle.Render("The host will choose read or write access."), width),
+		fitLine("", width),
+		fitLine(dimStyle.Render("Ctrl-X Q quits"), width),
+	}
+}
+
 func (a *App) helpLines() []string {
 	width := a.helpContentWidth()
-	lines := []string{fitLine(labelStyle.Render("derpssh menu"), width), ""}
+	lines := []string{fitLine(labelStyle.Render("derpssh menu"), width), fitLine("", width)}
 	for _, entry := range a.menuEntries() {
 		lines = append(lines, a.menuEntryLine(entry, width))
 	}
-	lines = append(lines, "", fitLine(dimStyle.Render("Esc closes"), width))
+	lines = append(lines, fitLine("", width), fitLine(dimStyle.Render("Esc closes"), width))
 	return lines
 }
 
@@ -996,7 +1123,7 @@ func (a *App) overlay(lines []string, body []string) {
 	if !a.canOverlay(lines) {
 		return
 	}
-	box := strings.Split(modalStyle.Render(strings.Join(body, "\n")), "\n")
+	box := renderModalBox(body)
 	boxW := a.overlayWidth(box)
 	x := (a.width - boxW) / 2
 	y := a.overlayY(len(box))
@@ -1004,6 +1131,41 @@ func (a *App) overlay(lines []string, body []string) {
 		row := y + i
 		a.overlayLine(lines, row, x, line, boxW)
 	}
+}
+
+func renderModalBox(body []string) []string {
+	width := modalBodyWidth(body)
+	border := lipgloss.RoundedBorder()
+	borderStyle := lipgloss.NewStyle().Foreground(catSapphire)
+	interiorStyle := lipgloss.NewStyle().
+		Foreground(catText).
+		Background(catBase)
+
+	innerWidth := width + 2
+	box := make([]string, 0, len(body)+2)
+	box = append(box, borderStyle.Render(border.TopLeft+strings.Repeat(border.Top, innerWidth)+border.TopRight))
+	for _, line := range body {
+		line = strings.TrimRight(line, " ")
+		line = ansi.Truncate(line, width, "")
+		pad := strings.Repeat(" ", maxInt(width-displayWidth(line), 0))
+		box = append(box,
+			borderStyle.Render(border.Left)+
+				interiorStyle.Render(" ")+
+				line+
+				interiorStyle.Render(pad+" ")+
+				borderStyle.Render(border.Right),
+		)
+	}
+	box = append(box, borderStyle.Render(border.BottomLeft+strings.Repeat(border.Bottom, innerWidth)+border.BottomRight))
+	return box
+}
+
+func modalBodyWidth(body []string) int {
+	width := 1
+	for _, line := range body {
+		width = maxInt(width, displayWidth(strings.TrimRight(line, " ")))
+	}
+	return width
 }
 
 func (a *App) canOverlay(lines []string) bool {
@@ -1027,9 +1189,7 @@ func (a *App) overlayLine(lines []string, row int, x int, line string, width int
 	if row < 0 || row >= len(lines) {
 		return
 	}
-	prefix := fitLine(lines[row], x)
-	suffix := fitLine("", maxInt(a.width-x-width, 0))
-	lines[row] = fitLine(prefix+fitLine(line, width)+suffix, a.width)
+	lines[row] = replaceRange(lines[row], x, width, fitLine(line, width), a.width)
 }
 
 func (a *App) approvalHit(x int, y int) HitTarget {
@@ -1060,7 +1220,7 @@ func (a *App) approvalButtonRects() (Rect, Rect, Rect) {
 }
 
 func (a *App) approvalContentOrigin() (int, int) {
-	box := strings.Split(modalStyle.Render(strings.Join(a.approvalLines(), "\n")), "\n")
+	box := renderModalBox(a.approvalLines())
 	boxW := a.overlayWidth(box)
 	boxX := (a.width - boxW) / 2
 	boxY := a.overlayY(len(box))
@@ -1115,7 +1275,7 @@ func (a *App) quitButtonRects() (Rect, Rect) {
 }
 
 func (a *App) quitContentOrigin() (int, int) {
-	box := strings.Split(modalStyle.Render(strings.Join(a.quitLines(), "\n")), "\n")
+	box := renderModalBox(a.quitLines())
 	boxW := a.overlayWidth(box)
 	boxX := (a.width - boxW) / 2
 	boxY := a.overlayY(len(box))
@@ -1124,7 +1284,10 @@ func (a *App) quitContentOrigin() (int, int) {
 }
 
 func (a *App) quitContentWidth() int {
-	width := maxInt(44, displayWidth("This closes the shared terminal for everyone."))
+	title := valueOr(a.quitTitle, "Quit derpssh?")
+	body := valueOr(a.quitBody, "This closes the shared terminal for everyone.")
+	width := maxInt(displayWidth(title), displayWidth(body))
+	width = maxInt(width, 44)
 	width = maxInt(width, quitButtonsWidth())
 	if a.width > 0 {
 		maxWidth := a.width - modalStyle.GetHorizontalBorderSize() - modalStyle.GetHorizontalPadding() - 2
@@ -1134,7 +1297,7 @@ func (a *App) quitContentWidth() int {
 }
 
 func (a *App) helpContentOrigin() (int, int) {
-	box := strings.Split(modalStyle.Render(strings.Join(a.helpLines(), "\n")), "\n")
+	box := renderModalBox(a.helpLines())
 	boxW := a.overlayWidth(box)
 	boxX := (a.width - boxW) / 2
 	boxY := a.overlayY(len(box))
@@ -1215,8 +1378,20 @@ func (a *App) noticeContentWidth() int {
 
 func (a *App) resizeWarningContentWidth() int {
 	width := maxInt(44, displayWidth("Resize terminal"))
-	width = maxInt(width, displayWidth(fmt.Sprintf("The host terminal is %dx%d. Your current view is %dx%d.", a.hostCols, a.hostRows, a.layout.Terminal.W, a.layout.Terminal.H)))
+	terminal := a.currentTerminalRect()
+	width = maxInt(width, displayWidth(fmt.Sprintf("The host terminal is %dx%d. Your current view is %dx%d.", a.hostCols, a.hostRows, terminal.W, terminal.H)))
 	width = maxInt(width, displayWidth("Resize this window until the shared terminal fits."))
+	if a.width > 0 {
+		maxWidth := a.width - modalStyle.GetHorizontalBorderSize() - modalStyle.GetHorizontalPadding() - 2
+		width = minInt(width, maxInt(maxWidth, 1))
+	}
+	return maxInt(width, 1)
+}
+
+func (a *App) waitingApprovalContentWidth() int {
+	width := maxInt(38, displayWidth("Waiting for host approval"))
+	width = maxInt(width, displayWidth("The host will choose read or write access."))
+	width = maxInt(width, displayWidth("Ctrl-X Q quits"))
 	if a.width > 0 {
 		maxWidth := a.width - modalStyle.GetHorizontalBorderSize() - modalStyle.GetHorizontalPadding() - 2
 		width = minInt(width, maxInt(maxWidth, 1))
@@ -1307,11 +1482,15 @@ func (a *App) openQuitConfirm() {
 	a.prefix = false
 	a.quitOpen = true
 	a.quitChoice = quitChoiceQuit
+	a.quitTitle = ""
+	a.quitBody = ""
 }
 
 func (a *App) closeQuitConfirm() {
 	a.quitOpen = false
 	a.quitChoice = quitChoiceQuit
+	a.quitTitle = ""
+	a.quitBody = ""
 }
 
 func (a *App) confirmQuitChoice() {
@@ -1371,18 +1550,27 @@ func (a *App) setTerminalCursorActive(active bool) {
 }
 
 func (a *App) modalActive() bool {
-	return a.helpOpen || a.resizeWarningOpen() || a.approvalActive() || a.kickPeer != "" || a.quitOpen || a.noticeOpen()
+	return a.helpOpen || a.resizeWarningOpen() || a.waitingApprovalOpen() || a.approvalActive() || a.kickPeer != "" || a.quitOpen || a.noticeOpen()
 }
 
 func (a *App) resizeWarningOpen() bool {
-	if !strings.EqualFold(strings.TrimSpace(a.side), string(ModeGuest)) {
+	if !a.isGuest() {
 		return false
 	}
 	if a.hostCols <= 0 || a.hostRows <= 0 {
 		return false
 	}
 	a.applyLayout()
-	return a.layout.Terminal.W < a.hostCols || a.layout.Terminal.H < a.hostRows
+	terminal := a.currentTerminalRect()
+	return terminal.W < a.hostCols || terminal.H < a.hostRows
+}
+
+func (a *App) waitingApprovalOpen() bool {
+	if !a.isGuest() || a.localRole != RolePending {
+		return false
+	}
+	transport := strings.TrimSpace(a.transport)
+	return transport != "" && !strings.EqualFold(transport, "starting")
 }
 
 func (a *App) inviteView() string {
@@ -1655,6 +1843,38 @@ func fitLine(s string, width int) string {
 		fitted += strings.Repeat(" ", width-used)
 	}
 	return fitted
+}
+
+func overlayFromColumn(base string, x int, overlay string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	x = clampMin(x, 0)
+	x = clampMax(x, width)
+	prefix := fitLine(base, x)
+	return fitLine(prefix+fitLine(overlay, width-x), width)
+}
+
+func replaceRange(base string, x int, span int, replacement string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if x < 0 {
+		x = 0
+	}
+	if x > width {
+		x = width
+	}
+	if span < 0 {
+		span = 0
+	}
+	end := x + span
+	if end > width {
+		end = width
+	}
+	prefix := ansi.Cut(base, 0, x)
+	suffix := ansi.Cut(base, end, width)
+	return fitLine(fitLine(prefix, x)+fitLine(replacement, end-x)+suffix, width)
 }
 
 func displayWidth(s string) int {
