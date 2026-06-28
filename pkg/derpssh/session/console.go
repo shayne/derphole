@@ -6,10 +6,13 @@ package session
 
 import (
 	"context"
+	"encoding/base64"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/shayne/derphole/pkg/derpssh/protocol"
@@ -34,7 +37,18 @@ type tuiConsoleCallbacks struct {
 	RoleChange    func(context.Context, string, protocol.Role) error
 	Kick          func(context.Context, string, string) error
 	Resize        func(context.Context, int, int) error
-	Quit          func()
+	Quit          func(context.Context) error
+}
+
+type harnessActionHandler func(*tuiConsole, context.Context, string)
+
+var harnessActionHandlers = map[string]harnessActionHandler{
+	"input": runHarnessInputAction,
+	"chat":  runHarnessChatAction,
+	"role":  runHarnessRoleAction,
+	"kick":  runHarnessKickAction,
+	"quit":  runHarnessQuitAction,
+	"sleep": runHarnessSleepAction,
 }
 
 type tuiConsoleOptions struct {
@@ -45,6 +59,7 @@ type tuiConsoleOptions struct {
 	Stdout                    io.Writer
 	DisplayName               string
 	InviteCommand             string
+	InitialInviteOpen         bool
 	Terminal                  tui.TerminalPane
 	ForceHeadless             bool
 	AllowHeadlessApprovalWait bool
@@ -115,10 +130,11 @@ func newTUIConsole(opts tuiConsoleOptions) *tuiConsole {
 		terminal = tui.NewVTTerminalPane(opts.Cols, opts.Rows)
 	}
 	app := tui.NewApp(tui.Options{
-		Side:          string(opts.Mode),
-		DisplayName:   opts.DisplayName,
-		InviteCommand: opts.InviteCommand,
-		Terminal:      terminal,
+		Side:              string(opts.Mode),
+		DisplayName:       opts.DisplayName,
+		InviteCommand:     opts.InviteCommand,
+		InitialInviteOpen: opts.InitialInviteOpen,
+		Terminal:          terminal,
 	})
 	app.SetWindowSize(opts.Cols, opts.Rows)
 
@@ -316,7 +332,7 @@ func (c *tuiConsole) OnRuntimeEvent(event RuntimeEvent) {
 	case RuntimeEventChat:
 		c.sendChatRuntimeEvent(event)
 	case RuntimeEventClose:
-		c.updateRuntimeState(func() { c.transport = closedTransportStatus(event.Message) })
+		c.applyCloseRuntimeEvent(event)
 	}
 }
 
@@ -333,6 +349,24 @@ func (c *tuiConsole) applyPeerRuntimeEvent(event RuntimeEvent) {
 		c.setPeerLocked(event.ParticipantID, event.DisplayName, event.Role)
 		c.transport = transportAfterPeerRole(c.transport, event.Role)
 	})
+}
+
+func (c *tuiConsole) applyCloseRuntimeEvent(event RuntimeEvent) {
+	message := strings.TrimSpace(event.Message)
+	c.updateRuntimeState(func() {
+		c.transport = closedTransportStatus(message)
+		if c.mode == tui.ModeHost && strings.TrimSpace(event.ParticipantID) != "" {
+			c.clearPeersLocked()
+		}
+	})
+	if c.mode == tui.ModeHost && strings.TrimSpace(event.ParticipantID) != "" {
+		name := displayNameOrID(event.DisplayName, event.ParticipantID)
+		body := message
+		if body == "" {
+			body = name + " disconnected"
+		}
+		c.send(tui.NoticeMsg{Title: "Guest left", Body: body})
+	}
 }
 
 func transportAfterPeerRole(current string, role protocol.Role) string {
@@ -407,7 +441,9 @@ func (c *tuiConsole) handleCommand(ctx context.Context, cmd tui.Command) {
 	case tui.ChatSendCommand:
 		c.handleChatCommand(ctx, cmd)
 	case tui.QuitCommand:
-		c.handleQuitCommand()
+		c.handleQuitCommand(ctx)
+	case tui.CopyInviteCommand:
+		c.handleCopyInviteCommand(cmd)
 	case tui.RoleChangeCommand:
 		c.handleRoleChangeCommand(ctx, cmd)
 	case tui.KickCommand:
@@ -417,12 +453,20 @@ func (c *tuiConsole) handleCommand(ctx context.Context, cmd tui.Command) {
 	}
 }
 
-func (c *tuiConsole) handleQuitCommand() {
+func (c *tuiConsole) handleQuitCommand(ctx context.Context) {
 	callbacks := c.currentCallbacks()
 	if callbacks.Quit != nil {
-		callbacks.Quit()
+		_ = callbacks.Quit(ctx)
 	}
 	c.Stop()
+}
+
+func (c *tuiConsole) handleCopyInviteCommand(cmd tui.CopyInviteCommand) {
+	command := strings.TrimSpace(cmd.Command)
+	if command == "" || c.output == nil {
+		return
+	}
+	_, _ = io.WriteString(c.output, osc52(command))
 }
 
 func (c *tuiConsole) handleTerminalInputCommand(ctx context.Context, cmd tui.TerminalInputCommand) {
@@ -493,6 +537,10 @@ func (c *tuiConsole) currentCallbacks() tuiConsoleCallbacks {
 	return c.callbacks
 }
 
+func osc52(text string) string {
+	return "\x1b]52;c;" + base64.StdEncoding.EncodeToString([]byte(text)) + "\x07"
+}
+
 func hostConsoleCallbacks(host *HostRuntime) tuiConsoleCallbacks {
 	sink := hostInputSink(host)
 	return tuiConsoleCallbacks{
@@ -509,6 +557,9 @@ func hostConsoleCallbacks(host *HostRuntime) tuiConsoleCallbacks {
 		Resize: func(ctx context.Context, cols int, rows int) error {
 			return host.Resize(ctx, cols, rows)
 		},
+		Quit: func(ctx context.Context) error {
+			return host.Close(ctx, hostQuitReason)
+		},
 	}
 }
 
@@ -523,6 +574,9 @@ func guestConsoleCallbacks(guest *GuestRuntime) tuiConsoleCallbacks {
 		},
 		Resize: func(ctx context.Context, cols int, rows int) error {
 			return guest.ReportSize(ctx, cols, rows)
+		},
+		Quit: func(ctx context.Context) error {
+			return guest.Close(ctx, guestQuitReason)
 		},
 	}
 }
@@ -746,28 +800,81 @@ func (c *tuiConsole) runHarnessAction(ctx context.Context, line string) {
 		return
 	}
 	name, arg, _ := strings.Cut(line, " ")
-	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "input":
-		c.handleCommand(ctx, tui.TerminalInputCommand{Data: []byte(unescapeHarnessAction(arg))})
-	case "chat":
-		c.handleCommand(ctx, tui.ChatSendCommand{Body: strings.TrimSpace(arg)})
-	case "role":
-		fields := strings.Fields(arg)
-		if len(fields) < 2 {
-			return
-		}
-		role := tui.Role(fields[1])
-		if _, ok := protocolRoleFromTUI(role); !ok {
-			return
-		}
-		c.handleCommand(ctx, tui.RoleChangeCommand{PeerID: fields[0], Role: role})
-	case "kick":
-		fields := strings.Fields(arg)
-		if len(fields) == 0 {
-			return
-		}
-		c.handleCommand(ctx, tui.KickCommand{PeerID: fields[0]})
+	handler := harnessActionHandlers[strings.ToLower(strings.TrimSpace(name))]
+	if handler == nil {
+		return
 	}
+	handler(c, ctx, arg)
+}
+
+func runHarnessInputAction(c *tuiConsole, ctx context.Context, arg string) {
+	c.handleCommand(ctx, tui.TerminalInputCommand{Data: []byte(unescapeHarnessAction(arg))})
+}
+
+func runHarnessChatAction(c *tuiConsole, ctx context.Context, arg string) {
+	c.handleCommand(ctx, tui.ChatSendCommand{Body: strings.TrimSpace(arg)})
+}
+
+func runHarnessRoleAction(c *tuiConsole, ctx context.Context, arg string) {
+	fields := strings.Fields(arg)
+	if len(fields) < 2 {
+		return
+	}
+	role := tui.Role(fields[1])
+	if _, ok := protocolRoleFromTUI(role); !ok {
+		return
+	}
+	c.handleCommand(ctx, tui.RoleChangeCommand{PeerID: fields[0], Role: role})
+}
+
+func runHarnessKickAction(c *tuiConsole, ctx context.Context, arg string) {
+	fields := strings.Fields(arg)
+	if len(fields) == 0 {
+		return
+	}
+	c.handleCommand(ctx, tui.KickCommand{PeerID: fields[0]})
+}
+
+func runHarnessQuitAction(c *tuiConsole, ctx context.Context, _ string) {
+	c.handleCommand(ctx, tui.QuitCommand{})
+}
+
+func runHarnessSleepAction(_ *tuiConsole, ctx context.Context, arg string) {
+	sleepHarnessAction(ctx, arg)
+}
+
+func sleepHarnessAction(ctx context.Context, raw string) {
+	d, ok := parseHarnessSleepDuration(raw)
+	if !ok {
+		return
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+}
+
+func parseHarnessSleepDuration(raw string) (time.Duration, bool) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		value = "1s"
+	}
+	if d, err := time.ParseDuration(value); err == nil {
+		return d, true
+	}
+	if isBareDurationNumber(value) {
+		if d, err := time.ParseDuration(value + "s"); err == nil {
+			return d, true
+		}
+	}
+	return 0, false
+}
+
+func isBareDurationNumber(value string) bool {
+	_, err := strconv.ParseFloat(value, 64)
+	return err == nil
 }
 
 func unescapeHarnessAction(raw string) string {
@@ -837,6 +944,11 @@ func (c *tuiConsole) setPeerLocked(id, name string, role protocol.Role) {
 	}
 	name = displayNameOrID(name, id)
 	c.peers[id] = tui.Peer{ID: id, Name: name, Role: tuiRoleFromProtocol(role)}
+}
+
+func (c *tuiConsole) clearPeersLocked() {
+	clear(c.peers)
+	c.peerOrder = nil
 }
 
 func (c *tuiConsole) runtimeStateLocked() tui.RuntimeStateMsg {

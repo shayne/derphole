@@ -431,6 +431,94 @@ func TestHostPTYEOFClosesSessionAndGuest(t *testing.T) {
 	}
 }
 
+func TestHostCloseNotifiesGuestAndStopsBothRuntimes(t *testing.T) {
+	hostMux, guestMux, cleanup := newTestMuxPair(t)
+	defer cleanup()
+
+	output := newBlockingPTYOutput()
+	host := NewHostRuntime(HostConfig{
+		Mux:           hostMux,
+		HostID:        "host",
+		HostName:      "host",
+		InitialCols:   80,
+		InitialRows:   24,
+		PTYInput:      io.Discard,
+		PTYOutput:     output,
+		CloseOnPTYEOF: true,
+		Approval:      StaticApproval{Role: protocol.RoleWrite},
+	})
+	guest := NewGuestRuntime(GuestConfig{
+		Mux:           guestMux,
+		ParticipantID: "guest-1",
+		DisplayName:   "Alex",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	hostErrCh := make(chan error, 1)
+	guestErrCh := make(chan error, 1)
+	go func() { hostErrCh <- host.Run(ctx) }()
+	go func() { guestErrCh <- guest.Run(ctx) }()
+
+	waitForGuestRole(t, ctx, guest, protocol.RoleWrite)
+	waitForBlockingRead(t, ctx, output)
+	if err := host.Close(ctx, "host quit"); err != nil {
+		t.Fatalf("host Close() error = %v", err)
+	}
+
+	waitRuntimeExit(t, hostErrCh, 1)
+	waitRuntimeExit(t, guestErrCh, 1)
+	if reason := guest.CloseReason(); !strings.Contains(reason, "host quit") {
+		t.Fatalf("guest CloseReason() = %q, want host quit", reason)
+	}
+	waitForOutputClosed(t, context.Background(), output)
+	waitForOutputReadReturned(t, context.Background(), output)
+}
+
+func TestGuestCloseNotifiesHostAndStopsBothRuntimes(t *testing.T) {
+	hostMux, guestMux, cleanup := newTestMuxPair(t)
+	defer cleanup()
+
+	output := newBlockingPTYOutput()
+	host := NewHostRuntime(HostConfig{
+		Mux:           hostMux,
+		HostID:        "host",
+		HostName:      "host",
+		InitialCols:   80,
+		InitialRows:   24,
+		PTYInput:      io.Discard,
+		PTYOutput:     output,
+		CloseOnPTYEOF: true,
+		Approval:      StaticApproval{Role: protocol.RoleWrite},
+	})
+	guest := NewGuestRuntime(GuestConfig{
+		Mux:           guestMux,
+		ParticipantID: "guest-1",
+		DisplayName:   "Alex",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	hostErrCh := make(chan error, 1)
+	guestErrCh := make(chan error, 1)
+	go func() { hostErrCh <- host.Run(ctx) }()
+	go func() { guestErrCh <- guest.Run(ctx) }()
+
+	waitForGuestRole(t, ctx, guest, protocol.RoleWrite)
+	waitForBlockingRead(t, ctx, output)
+	if err := guest.Close(ctx, "guest quit"); err != nil {
+		t.Fatalf("guest Close() error = %v", err)
+	}
+
+	waitRuntimeExit(t, guestErrCh, 1)
+	waitRuntimeExit(t, hostErrCh, 1)
+	if reason := host.CloseReason(); !strings.Contains(reason, "guest quit") {
+		t.Fatalf("host CloseReason() = %q, want guest quit", reason)
+	}
+	waitForOutputClosed(t, context.Background(), output)
+	waitForOutputReadReturned(t, context.Background(), output)
+}
+
 func TestChatMessagesRoundTrip(t *testing.T) {
 	hostMux, guestMux, cleanup := newTestMuxPair(t)
 	defer cleanup()

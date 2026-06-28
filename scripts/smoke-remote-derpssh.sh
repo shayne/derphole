@@ -99,6 +99,31 @@ wait_for_remote_contains() {
   return 1
 }
 
+wait_for_local_exit() {
+  local pid="$1"
+  local name="$2"
+  for _ in $(seq 1 180); do
+    if ! jobs -pr | grep -qx "${pid}"; then
+      wait "${pid}" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "${name} did not exit after host quit" >&2
+  return 1
+}
+
+wait_for_remote_share_exit() {
+  for _ in $(seq 1 180); do
+    if remote "pid=\$(cat '${remote_base}.share.pid' 2>/dev/null || true); [[ -z \"\${pid}\" ]] || ! kill -0 \"\${pid}\" 2>/dev/null"; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "remote share did not exit after host quit" >&2
+  return 1
+}
+
 dump_logs() {
   echo '--- local connect err' >&2
   sed -n '1,220p' "${connect_err}" >&2 || true
@@ -116,7 +141,7 @@ scp "${root_dir}/dist/derpssh-linux-amd64" "${remote_target}:${remote_upload}" >
 remote "install -m 0755 '${remote_upload}' '${remote_bin}' && rm -f '${remote_upload}' && '${remote_bin}' version >/dev/null"
 
 echo "starting remote derpssh share on ${remote_target}" >&2
-remote "rm -f '${remote_base}.share.pid' '${remote_base}.share.out' '${remote_base}.share.err' '${remote_base}.share.in'; mkfifo '${remote_base}.share.in'; exec 9<>'${remote_base}.share.in'; env DERPSSH_TEST_HARNESS=1 DERPSSH_TEST_AUTO_APPROVE=write DERPSSH_TEST_COMMAND='printf ready; read line; printf input:%s \"\$line\"' DERPSSH_TEST_HOST_ACTIONS='chat host-side' nohup '${remote_bin}' --verbose share <&9 >'${remote_base}.share.out' 2>'${remote_base}.share.err' & echo \$! >'${remote_base}.share.pid'"
+remote "rm -f '${remote_base}.share.pid' '${remote_base}.share.out' '${remote_base}.share.err' '${remote_base}.share.in'; mkfifo '${remote_base}.share.in'; exec 9<>'${remote_base}.share.in'; env DERPSSH_TEST_HARNESS=1 DERPSSH_TEST_AUTO_APPROVE=write DERPSSH_TEST_COMMAND='printf ready; read line; printf input:%s \"\$line\"' DERPSSH_TEST_HOST_ACTIONS=\$'chat host-side\nsleep 12s\nquit' nohup '${remote_bin}' --verbose share <&9 >'${remote_base}.share.out' 2>'${remote_base}.share.err' & echo \$! >'${remote_base}.share.pid'"
 
 connect_line="$(wait_for_remote_invite)" || {
   echo "failed to capture remote derpssh connect command" >&2
@@ -194,6 +219,15 @@ for _ in $(seq 1 180); do
     fi
     if [[ -n "${share_trace}" ]]; then
       printf 'share path trace:\n%s\n' "${share_trace}" >&2
+    fi
+    if ! wait_for_local_exit "${connect_pid}" "local connect"; then
+      dump_logs
+      exit 1
+    fi
+    connect_pid=""
+    if ! wait_for_remote_share_exit; then
+      dump_logs
+      exit 1
     fi
     exit 0
   fi

@@ -37,6 +37,8 @@ type GuestRuntime struct {
 	chatReady       chan net.Conn
 }
 
+const guestQuitReason = "guest quit"
+
 func NewGuestRuntime(cfg GuestConfig) *GuestRuntime {
 	if cfg.TerminalOutput == nil {
 		cfg.TerminalOutput = io.Discard
@@ -54,12 +56,18 @@ func (r *GuestRuntime) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	defer r.closeSessionConns()
-	defer func() { _ = r.cfg.Mux.Close() }()
+	defer func() {
+		if r.cfg.Mux != nil {
+			_ = r.cfg.Mux.Close()
+		}
+	}()
 
 	go func() {
 		<-ctx.Done()
 		r.closeSessionConns()
-		_ = r.cfg.Mux.Close()
+		if r.cfg.Mux != nil {
+			_ = r.cfg.Mux.Close()
+		}
 	}()
 
 	if err := r.openControl(ctx); err != nil {
@@ -217,8 +225,24 @@ func (r *GuestRuntime) SendChat(ctx context.Context, text string) error {
 	})
 }
 
+func (r *GuestRuntime) Close(ctx context.Context, reason string) error {
+	if reason == "" {
+		reason = guestQuitReason
+	}
+	r.setCloseReason(reason)
+	err := r.writeControlCtx(ctx, protocol.Message{
+		Type:  protocol.MessageClose,
+		Close: &protocol.Close{Reason: reason},
+	})
+	_ = r.writeTerminalInClose(reason)
+	_ = r.writeChatClose(reason)
+	gracefullyDrainCloseNotice()
+	r.closeSessionConns()
+	return ignoreContextErr(ctx, err)
+}
+
 func (r *GuestRuntime) ReportSize(ctx context.Context, cols, rows int) error {
-	r.notify(RuntimeEvent{Kind: RuntimeEventResize, Cols: cols, Rows: rows})
+	r.notify(RuntimeEvent{Kind: RuntimeEventResize, ParticipantID: r.cfg.ParticipantID, Cols: cols, Rows: rows})
 	return r.writeControlCtx(ctx, protocol.Message{
 		Type:   protocol.MessageResize,
 		Resize: &protocol.Resize{Cols: cols, Rows: rows},
@@ -324,13 +348,21 @@ func (r *GuestRuntime) runUntilControlOrTerminalOutExit(ctx context.Context, ter
 		case err := <-terminalOutErrCh:
 			if err == nil {
 				r.closeSessionConns()
-				_ = r.cfg.Mux.Close()
+				if r.cfg.Mux != nil {
+					_ = r.cfg.Mux.Close()
+				}
 				return nil
 			}
-			terminalOutErrCh = nil
+			r.closeSessionConns()
+			if r.cfg.Mux != nil {
+				_ = r.cfg.Mux.Close()
+			}
+			return ignoreContextErr(ctx, err)
 		case <-ctx.Done():
 			r.closeSessionConns()
-			_ = r.cfg.Mux.Close()
+			if r.cfg.Mux != nil {
+				_ = r.cfg.Mux.Close()
+			}
 			return nil
 		}
 	}
@@ -394,6 +426,32 @@ func (r *GuestRuntime) writeControlCtx(ctx context.Context, msg protocol.Message
 		}
 	}
 	return lockedWriter{conn: conn, mu: &r.controlMu}.write(msg)
+}
+
+func (r *GuestRuntime) writeTerminalInClose(reason string) error {
+	r.mu.Lock()
+	conn := r.terminalIn
+	r.mu.Unlock()
+	if conn == nil {
+		return net.ErrClosed
+	}
+	return lockedWriter{conn: conn, mu: &r.terminalMu}.writeWithDeadline(protocol.Message{
+		Type:  protocol.MessageClose,
+		Close: &protocol.Close{Reason: reason},
+	}, hostCloseNotifyTimeout)
+}
+
+func (r *GuestRuntime) writeChatClose(reason string) error {
+	r.mu.Lock()
+	conn := r.chatConn
+	r.mu.Unlock()
+	if conn == nil {
+		return net.ErrClosed
+	}
+	return lockedWriter{conn: conn, mu: &r.chatMu}.writeWithDeadline(protocol.Message{
+		Type:  protocol.MessageClose,
+		Close: &protocol.Close{Reason: reason},
+	}, hostCloseNotifyTimeout)
 }
 
 func (r *GuestRuntime) setRole(role protocol.Role) {

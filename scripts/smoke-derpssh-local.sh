@@ -50,6 +50,20 @@ wait_for_contains() {
   return 1
 }
 
+wait_for_local_exit() {
+  local pid="$1"
+  local name="$2"
+  for _ in $(seq 1 150); do
+    if ! jobs -pr | grep -qx "$pid"; then
+      wait "$pid" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "${name} did not exit after host quit" >&2
+  return 1
+}
+
 mkfifo "$share_in" "$connect_in"
 exec {share_fd}<>"$share_in"
 exec {connect_fd}<>"$connect_in"
@@ -57,7 +71,7 @@ exec {connect_fd}<>"$connect_in"
 DERPSSH_TEST_HARNESS=1 \
 DERPSSH_TEST_AUTO_APPROVE=write \
 DERPSSH_TEST_COMMAND="printf ready; read line; printf input:%s \"\$line\"" \
-DERPSSH_TEST_HOST_ACTIONS="chat host-side" \
+DERPSSH_TEST_HOST_ACTIONS=$'chat host-side\nsleep 5s\nquit' \
   dist/derpssh share <&$share_fd >"$share_out" 2>"$share_err" &
 share_pid=$!
 
@@ -135,6 +149,18 @@ if grep -F 'input:hello' "$connect_out" >/dev/null 2>&1; then
   fi
   for _ in $(seq 1 100); do
     if grep -F 'input:hello' "$share_out" >/dev/null 2>&1; then
+      if ! wait_for_local_exit "$connect_pid" "connect"; then
+        cat "$connect_out" >&2
+        cat "$connect_err" >&2
+        exit 1
+      fi
+      connect_pid=""
+      if ! wait_for_local_exit "$share_pid" "share"; then
+        cat "$share_out" >&2
+        cat "$share_err" >&2
+        exit 1
+      fi
+      share_pid=""
       exit 0
     fi
     sleep 0.1

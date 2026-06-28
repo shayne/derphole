@@ -54,13 +54,16 @@ func Share(ctx context.Context, cfg ShareConfig) error {
 	if err != nil {
 		return err
 	}
-	if err := presentShareInvite(cfg, connectCommand); err != nil {
-		if errors.Is(err, errInvitePreflightQuit) {
-			return nil
+	initialInviteOpen := canUseTUIInvite(cfg)
+	if !initialInviteOpen {
+		if err := presentShareInvite(cfg, connectCommand); err != nil {
+			if errors.Is(err, errInvitePreflightQuit) {
+				return nil
+			}
+			return err
 		}
-		return err
 	}
-	return runShare(ctx, cfg, serverToken, connectCommand)
+	return runShare(ctx, cfg, serverToken, connectCommand, initialInviteOpen)
 }
 
 func newShareInviteCommand() (string, string, error) {
@@ -94,17 +97,23 @@ func presentShareInvite(cfg ShareConfig, connectCommand string) error {
 	return nil
 }
 
-func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand string) error {
+func canUseTUIInvite(cfg ShareConfig) bool {
+	_, ok := invitePreflightFiles(cfg.Stdin, cfg.Stdout)
+	return ok
+}
+
+func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand string, initialInviteOpen bool) error {
 	size := terminalSize(cfg.Stdout)
 	displayName := shareDisplayName()
 	console := newTerminalConsoleWithOptions(tuiConsoleOptions{
-		Mode:          tui.ModeHost,
-		Cols:          size.Cols,
-		Rows:          size.Rows,
-		Stdin:         cfg.Stdin,
-		Stdout:        cfg.Stdout,
-		DisplayName:   displayName,
-		InviteCommand: connectCommand,
+		Mode:              tui.ModeHost,
+		Cols:              size.Cols,
+		Rows:              size.Rows,
+		Stdin:             cfg.Stdin,
+		Stdout:            cfg.Stdout,
+		DisplayName:       displayName,
+		InviteCommand:     connectCommand,
+		InitialInviteOpen: initialInviteOpen,
 	})
 	terminalSize := console.TerminalSize()
 	terminal, err := startShareTerminal(terminalSize)
@@ -170,7 +179,12 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 			}
 			return runHostSession(ctx, hostCfg, func(host *HostRuntime) {
 				callbacks := hostConsoleCallbacks(host)
-				callbacks.Quit = cancel
+				callbacks.Quit = func(ctx context.Context) error {
+					err := host.Close(ctx, hostQuitReason)
+					_ = terminal.Close()
+					cancel()
+					return err
+				}
 				console.SetCommandCallbacks(callbacks)
 				go pendingChats.flush(ctx, callbacks.Chat)
 			})
@@ -222,7 +236,13 @@ func waitingShareConsoleCallbacks(terminal *shareTerminal, cancel context.Cancel
 			}
 			return nil
 		},
-		Quit: cancel,
+		Quit: func(context.Context) error {
+			if terminal != nil {
+				_ = terminal.Close()
+			}
+			cancel()
+			return nil
+		},
 	}
 }
 

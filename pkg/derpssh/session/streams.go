@@ -22,7 +22,13 @@ var (
 	ErrInvalidRole = errors.New("invalid guest role")
 )
 
+const closeNoticeDrain = 50 * time.Millisecond
+
 type ChatMessage = model.ChatMessage
+
+func gracefullyDrainCloseNotice() {
+	time.Sleep(closeNoticeDrain)
+}
 
 type lockedWriter struct {
 	conn net.Conn

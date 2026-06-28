@@ -304,6 +304,21 @@ func TestPrefixInviteOpensInviteScreen(t *testing.T) {
 	}
 }
 
+func TestPrefixInviteIgnoredForGuest(t *testing.T) {
+	invite := "npx -y derpssh@latest connect DSH1copyme"
+	app := NewApp(Options{Side: "guest", InviteCommand: invite, Terminal: &fakePane{view: "ok"}})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+
+	if app.inviteOpen {
+		t.Fatalf("guest inviteOpen = true, want false")
+	}
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("guest Ctrl-X I emitted command %+v, want none", cmd)
+	}
+}
+
 func TestPrefixCopyModeTogglesSelectionMode(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 

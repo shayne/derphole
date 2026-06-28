@@ -31,6 +31,12 @@ type QuitCommand struct{}
 
 func (QuitCommand) command() {}
 
+type CopyInviteCommand struct {
+	Command string
+}
+
+func (CopyInviteCommand) command() {}
+
 type RoleChangeCommand struct {
 	PeerID string
 	Peer   string
@@ -70,4 +76,9 @@ type ChatMsg ChatMessage
 type ApprovalRequestMsg struct {
 	PeerID string
 	Peer   string
+}
+
+type NoticeMsg struct {
+	Title string
+	Body  string
 }

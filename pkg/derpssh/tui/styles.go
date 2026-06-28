@@ -7,65 +7,90 @@ package tui
 import "github.com/charmbracelet/lipgloss"
 
 var (
+	catText     = adaptive("#4C4F69", "#CDD6F4")
+	catSubtext  = adaptive("#6C6F85", "#A6ADC8")
+	catOverlay  = adaptive("#9CA0B0", "#6C7086")
+	catSurface0 = adaptive("#CCD0DA", "#313244")
+	catSurface1 = adaptive("#BCC0CC", "#45475A")
+	catSurface2 = adaptive("#ACB0BE", "#585B70")
+	catBase     = adaptive("#EFF1F5", "#1E1E2E")
+	catMantle   = adaptive("#E6E9EF", "#181825")
+	catSapphire = adaptive("#209FB5", "#74C7EC")
+	catGreen    = adaptive("#40A02B", "#A6E3A1")
+	catYellow   = adaptive("#DF8E1D", "#F9E2AF")
+	catRed      = adaptive("#D20F39", "#F38BA8")
+)
+
+var (
 	topBarStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.AdaptiveColor{Light: "#0F172A", Dark: "#E2E8F0"}).
-			Background(lipgloss.AdaptiveColor{Light: "#E2E8F0", Dark: "#1E293B"})
+			Foreground(catText).
+			Background(catSurface0)
 	topBarBrandStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.AdaptiveColor{Light: "#083344", Dark: "#F8FAFC"}).
-				Background(lipgloss.AdaptiveColor{Light: "#A5F3FC", Dark: "#155E75"})
+				Foreground(adaptive("#EFF1F5", "#11111B")).
+				Background(catSapphire)
 	topBarQuitStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.AdaptiveColor{Light: "#7F1D1D", Dark: "#FEE2E2"}).
-			Background(lipgloss.AdaptiveColor{Light: "#FECACA", Dark: "#7F1D1D"})
+			Foreground(adaptive("#EFF1F5", "#11111B")).
+			Background(catRed)
 	topBarChipStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.AdaptiveColor{Light: "#0F172A", Dark: "#E2E8F0"}).
-			Background(lipgloss.AdaptiveColor{Light: "#E0F2FE", Dark: "#1E3A5F"})
+			Foreground(catText).
+			Background(catSurface1)
 	topBarMutedStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.AdaptiveColor{Light: "#334155", Dark: "#CBD5E1"}).
-				Background(lipgloss.AdaptiveColor{Light: "#E2E8F0", Dark: "#243044"})
+				Foreground(catSubtext).
+				Background(catSurface0)
 	topBarWarnStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.AdaptiveColor{Light: "#713F12", Dark: "#FEF3C7"}).
-			Background(lipgloss.AdaptiveColor{Light: "#FEF3C7", Dark: "#92400E"})
+			Foreground(adaptive("#4C4F69", "#11111B")).
+			Background(catYellow)
 	topBarActionStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.AdaptiveColor{Light: "#064E3B", Dark: "#D1FAE5"}).
-				Background(lipgloss.AdaptiveColor{Light: "#CCFBF1", Dark: "#065F46"})
+				Foreground(adaptive("#EFF1F5", "#11111B")).
+				Background(catGreen)
 	topBarSeparatorStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.AdaptiveColor{Light: "#64748B", Dark: "#94A3B8"}).
-				Background(lipgloss.AdaptiveColor{Light: "#E2E8F0", Dark: "#1E293B"})
+				Foreground(catOverlay).
+				Background(catSurface0)
 	statusBarStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.AdaptiveColor{Light: "#0F172A", Dark: "#E2E8F0"}).
-			Background(lipgloss.AdaptiveColor{Light: "#E2E8F0", Dark: "#1E293B"})
+			Foreground(catText).
+			Background(catSurface0)
 	labelStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.AdaptiveColor{Light: "#0E7490", Dark: "#22D3EE"})
+			Foreground(catSapphire)
 	dimStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.AdaptiveColor{Light: "#64748B", Dark: "#94A3B8"})
+			Foreground(catSubtext)
 	separatorStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.AdaptiveColor{Light: "#CBD5E1", Dark: "#334155"}).
-			Background(lipgloss.AdaptiveColor{Light: "#F8FAFC", Dark: "#0F172A"})
+			Foreground(catSurface2).
+			Background(catSurface2)
 	sidebarStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.AdaptiveColor{Light: "#1E293B", Dark: "#E2E8F0"}).
-			Background(lipgloss.AdaptiveColor{Light: "#F8FAFC", Dark: "#0F172A"})
+			Foreground(catText).
+			Background(catMantle)
 	sidebarHeaderStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.AdaptiveColor{Light: "#0E7490", Dark: "#22D3EE"}).
-				Background(lipgloss.AdaptiveColor{Light: "#F8FAFC", Dark: "#0F172A"})
+				Foreground(catSapphire).
+				Background(catSurface0)
+	composerBorderStyle = lipgloss.NewStyle().
+				Foreground(catSurface2).
+				Background(catMantle)
+	composerStyle = lipgloss.NewStyle().
+			Foreground(catText).
+			Background(catSurface0)
 	localChatStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.AdaptiveColor{Light: "#166534", Dark: "#BBF7D0"})
+			Foreground(catGreen)
 	approvalButtonStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.AdaptiveColor{Light: "#334155", Dark: "#CBD5E1"}).
-				Background(lipgloss.AdaptiveColor{Light: "#F1F5F9", Dark: "#1F2937"})
+				Foreground(catText).
+				Background(catSurface0)
 	approvalButtonSelectedStyle = lipgloss.NewStyle().
 					Bold(true).
-					Foreground(lipgloss.AdaptiveColor{Light: "#FFFFFF", Dark: "#08111F"}).
-					Background(lipgloss.AdaptiveColor{Light: "#0E7490", Dark: "#67E8F9"})
+					Foreground(adaptive("#EFF1F5", "#11111B")).
+					Background(catSapphire)
 	modalStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.AdaptiveColor{Light: "#111827", Dark: "#F8FAFC"}).
-			Background(lipgloss.AdaptiveColor{Light: "#FFFFFF", Dark: "#111827"}).
+			Foreground(catText).
+			Background(catBase).
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.AdaptiveColor{Light: "#0284C7", Dark: "#38BDF8"}).
+			BorderForeground(catSapphire).
 			Padding(0, 1)
 )
+
+func adaptive(light string, dark string) lipgloss.AdaptiveColor {
+	return lipgloss.AdaptiveColor{Light: light, Dark: dark}
+}

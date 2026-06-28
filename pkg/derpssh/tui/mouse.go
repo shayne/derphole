@@ -18,6 +18,18 @@ var mouseButtonCodes = map[tea.MouseButton]int{
 	tea.MouseButtonWheelDown: 65,
 }
 
+var menuActionHandlers = map[menuAction]func(*App) tea.Cmd{
+	menuActionChat:          toggleSidebarAction,
+	menuActionFocusChat:     focusChatAction,
+	menuActionFocusTerminal: focusTerminalAction,
+	menuActionInvite:        inviteAction,
+	menuActionCopyMode:      copyModeAction,
+	menuActionQuit:          quitAction,
+	menuActionRead:          readRoleAction,
+	menuActionWrite:         writeRoleAction,
+	menuActionKick:          kickPeerAction,
+}
+
 func EncodeSGRMouse(msg tea.MouseMsg, terminal Rect) ([]byte, bool) {
 	if !terminal.contains(msg.X, msg.Y) {
 		return nil, false
@@ -41,24 +53,11 @@ func EncodeSGRMouse(msg tea.MouseMsg, terminal Rect) ([]byte, bool) {
 }
 
 func HandleMouse(app *App, msg tea.MouseMsg) tea.Cmd {
-	if app == nil {
+	if ignoreMouse(app, msg) {
 		return nil
 	}
-	if app.copyMode {
-		return nil
-	}
-	if !supportedMouseAction(msg.Action) {
-		return nil
-	}
-
-	if cmd, handled := app.handleQuitMouse(msg); handled {
+	if cmd, handled := app.handleModalMouse(msg); handled {
 		return cmd
-	}
-	if app.handleApprovalMouse(msg) {
-		return nil
-	}
-	if app.handleKickMouse(msg) {
-		return nil
 	}
 	if cmd, handled := app.handleTopBarMouse(msg); handled {
 		return cmd
@@ -71,8 +70,31 @@ func HandleMouse(app *App, msg tea.MouseMsg) tea.Cmd {
 	return nil
 }
 
+func ignoreMouse(app *App, msg tea.MouseMsg) bool {
+	return app == nil || app.copyMode || !supportedMouseAction(msg.Action)
+}
+
 func supportedMouseAction(action tea.MouseAction) bool {
 	return action == tea.MouseActionPress || action == tea.MouseActionRelease || action == tea.MouseActionMotion
+}
+
+func (a *App) handleModalMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
+	if cmd, handled := a.handleQuitMouse(msg); handled {
+		return cmd, true
+	}
+	if cmd, handled := a.handleHelpMouse(msg); handled {
+		return cmd, true
+	}
+	if a.handleNoticeMouse(msg) {
+		return nil, true
+	}
+	if a.handleApprovalMouse(msg) {
+		return nil, true
+	}
+	if a.handleKickMouse(msg) {
+		return nil, true
+	}
+	return nil, false
 }
 
 func (a *App) handleQuitMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
@@ -86,6 +108,53 @@ func (a *App) handleQuitMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
 		}
 	}
 	return nil, true
+}
+
+func (a *App) handleHelpMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
+	if !a.helpOpen {
+		return nil, false
+	}
+	if msg.Action == tea.MouseActionPress {
+		action := a.helpActionAt(msg.X, msg.Y)
+		if action == menuActionNone {
+			a.helpOpen = false
+			return nil, true
+		}
+		return a.runMenuAction(action), true
+	}
+	return nil, true
+}
+
+func (a *App) helpActionAt(x int, y int) menuAction {
+	contentX, contentY := a.helpContentOrigin()
+	width := a.helpContentWidth()
+	row := contentY + 2
+	for _, entry := range a.menuEntries() {
+		if y == row && x >= contentX && x < contentX+width {
+			return entry.action
+		}
+		row++
+	}
+	return menuActionNone
+}
+
+func (a *App) runMenuAction(action menuAction) tea.Cmd {
+	a.helpOpen = false
+	handler := menuActionHandlers[action]
+	if handler == nil {
+		return nil
+	}
+	return handler(a)
+}
+
+func (a *App) handleNoticeMouse(msg tea.MouseMsg) bool {
+	if !a.noticeOpen() {
+		return false
+	}
+	if msg.Action == tea.MouseActionPress {
+		a.closeNotice()
+	}
+	return true
 }
 
 func (a *App) handleApprovalMouse(msg tea.MouseMsg) bool {

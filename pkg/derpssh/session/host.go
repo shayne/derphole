@@ -38,9 +38,15 @@ type HostRuntime struct {
 	terminalInReady  chan net.Conn
 	terminalOutReady chan net.Conn
 	chatReady        chan net.Conn
+	peerClosed       chan struct{}
+	peerCloseOnce    sync.Once
 }
 
-const hostShellExitedReason = "host shell exited"
+const (
+	hostShellExitedReason = "host shell exited"
+	hostQuitReason        = "host quit"
+)
+
 const hostCloseNotifyTimeout = 300 * time.Millisecond
 
 func NewHostRuntime(cfg HostConfig) *HostRuntime {
@@ -72,18 +78,25 @@ func NewHostRuntime(cfg HostConfig) *HostRuntime {
 		terminalInReady:  make(chan net.Conn, 1),
 		terminalOutReady: make(chan net.Conn, 1),
 		chatReady:        make(chan net.Conn, 1),
+		peerClosed:       make(chan struct{}),
 	}
 }
 
 func (r *HostRuntime) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	defer func() { _ = r.cfg.Mux.Close() }()
+	defer func() {
+		if r.cfg.Mux != nil {
+			_ = r.cfg.Mux.Close()
+		}
+	}()
 	defer r.closePTYOutput()
 
 	go func() {
 		<-ctx.Done()
-		_ = r.cfg.Mux.Close()
+		if r.cfg.Mux != nil {
+			_ = r.cfg.Mux.Close()
+		}
 	}()
 
 	guestID, approved, err := r.handshake(ctx)
@@ -188,7 +201,7 @@ func (r *HostRuntime) readControlLoop(ctx context.Context, guestID string) error
 			}
 		case protocol.MessageClose:
 			if msg.Close != nil {
-				r.setCloseReason(msg.Close.Reason)
+				r.setPeerCloseReason(guestID, msg.Close.Reason)
 			}
 			return nil
 		}
@@ -275,6 +288,22 @@ func (r *HostRuntime) Kick(ctx context.Context, participantID, reason string) er
 	})
 }
 
+func (r *HostRuntime) Close(ctx context.Context, reason string) error {
+	if reason == "" {
+		reason = hostQuitReason
+	}
+	r.setCloseReason(reason)
+	err := r.writeControlWithDeadline(protocol.Message{
+		Type:  protocol.MessageClose,
+		Close: &protocol.Close{Reason: reason},
+	}, hostCloseNotifyTimeout)
+	_ = r.writeTerminalOutClose(reason)
+	gracefullyDrainCloseNotice()
+	r.closeSessionConns()
+	r.closePTYOutput()
+	return ignoreContextErr(ctx, err)
+}
+
 func (r *HostRuntime) SendChat(ctx context.Context, text string) error {
 	conn, err := waitConn(ctx, r.chatReady)
 	if err != nil {
@@ -305,6 +334,7 @@ func (r *HostRuntime) acceptApprovedStreams(ctx context.Context) {
 	streams, err := r.acceptGuestStreams(ctx)
 	if err != nil {
 		closeReady(r.terminalInReady)
+		closeReady(r.terminalOutReady)
 		closeReady(r.chatReady)
 		return
 	}
@@ -374,13 +404,22 @@ func (r *HostRuntime) readTerminalInput(ctx context.Context, conn net.Conn) {
 	for {
 		msg, err := protocol.ReadFrame(conn)
 		if err != nil {
+			if ctx.Err() == nil {
+				r.noteGuestStreamClosed("guest disconnected")
+			}
 			return
-		}
-		if msg.Type != protocol.MessageTerminal || msg.Terminal == nil {
-			continue
 		}
 		r.mu.Lock()
 		guestID := r.guestID
+		r.mu.Unlock()
+		if msg.Type != protocol.MessageTerminal || msg.Terminal == nil {
+			if msg.Type == protocol.MessageClose && msg.Close != nil {
+				r.setPeerCloseReason(guestID, msg.Close.Reason)
+				return
+			}
+			continue
+		}
+		r.mu.Lock()
 		canWrite := r.state.GuestCanWrite(guestID)
 		r.mu.Unlock()
 		if !canWrite {
@@ -401,10 +440,16 @@ func (r *HostRuntime) readTerminalInput(ctx context.Context, conn net.Conn) {
 }
 
 func (r *HostRuntime) readChat(ctx context.Context, conn net.Conn) {
-	_ = ctx
 	for {
 		msg, err := protocol.ReadFrame(conn)
 		if err != nil {
+			if ctx.Err() == nil {
+				r.noteGuestStreamClosed("guest disconnected")
+			}
+			return
+		}
+		if msg.Type == protocol.MessageClose && msg.Close != nil {
+			r.noteGuestStreamClosed(msg.Close.Reason)
 			return
 		}
 		if msg.Type == protocol.MessageChat && msg.Chat != nil {
@@ -461,6 +506,19 @@ func (r *HostRuntime) notifyTerminalOutputClosed(conn net.Conn, reason string) {
 	}, hostCloseNotifyTimeout)
 }
 
+func (r *HostRuntime) writeTerminalOutClose(reason string) error {
+	r.mu.Lock()
+	conn := r.terminalOut
+	r.mu.Unlock()
+	if conn == nil {
+		return net.ErrClosed
+	}
+	return writeFrameWithDeadline(conn, protocol.Message{
+		Type:  protocol.MessageClose,
+		Close: &protocol.Close{Reason: reason},
+	}, hostCloseNotifyTimeout)
+}
+
 func (r *HostRuntime) startPTYOutputPump(ctx context.Context) <-chan error {
 	errCh := make(chan error, 1)
 	go func() {
@@ -480,9 +538,19 @@ func (r *HostRuntime) runUntilControlOrPTYExit(ctx context.Context, cancel conte
 		return err
 	case err := <-ptyErrCh:
 		return r.closeAfterPTYOutputExit(ctx, cancel, err, controlErrCh)
+	case <-r.peerClosed:
+		cancel()
+		r.closeSessionConns()
+		r.closePTYOutput()
+		if r.cfg.Mux != nil {
+			_ = r.cfg.Mux.Close()
+		}
+		return nil
 	case <-ctx.Done():
 		r.closeSessionConns()
-		_ = r.cfg.Mux.Close()
+		if r.cfg.Mux != nil {
+			_ = r.cfg.Mux.Close()
+		}
 		r.closePTYOutput()
 		return nil
 	}
@@ -500,7 +568,9 @@ func (r *HostRuntime) closeAfterPTYOutputExit(ctx context.Context, cancel contex
 	}, hostCloseNotifyTimeout)
 	waitForControlClose(ctx, controlErrCh, hostCloseNotifyTimeout)
 	cancel()
-	_ = r.cfg.Mux.Close()
+	if r.cfg.Mux != nil {
+		_ = r.cfg.Mux.Close()
+	}
 	return nil
 }
 
@@ -578,6 +648,36 @@ func (r *HostRuntime) setCloseReason(reason string) {
 	r.closeReason = reason
 	r.mu.Unlock()
 	r.notify(RuntimeEvent{Kind: RuntimeEventClose, Message: reason})
+}
+
+func (r *HostRuntime) setPeerCloseReason(participantID, reason string) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "guest disconnected"
+	}
+	r.mu.Lock()
+	if r.closeReason != "" && r.closeReason != reason {
+		r.mu.Unlock()
+		return
+	}
+	r.closeReason = reason
+	name := participantID
+	if guest, ok := r.state.Guest(participantID); ok {
+		name = guest.DisplayName
+	}
+	r.mu.Unlock()
+	r.notify(RuntimeEvent{Kind: RuntimeEventClose, ParticipantID: participantID, DisplayName: name, Message: reason})
+	r.peerCloseOnce.Do(func() { close(r.peerClosed) })
+}
+
+func (r *HostRuntime) noteGuestStreamClosed(reason string) {
+	r.mu.Lock()
+	guestID := r.guestID
+	r.mu.Unlock()
+	if guestID == "" {
+		return
+	}
+	r.setPeerCloseReason(guestID, reason)
 }
 
 func (r *HostRuntime) notify(event RuntimeEvent) {

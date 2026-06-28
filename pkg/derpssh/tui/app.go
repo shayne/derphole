@@ -17,10 +17,11 @@ import (
 )
 
 type Options struct {
-	Side          string
-	DisplayName   string
-	InviteCommand string
-	Terminal      TerminalPane
+	Side              string
+	DisplayName       string
+	InviteCommand     string
+	InitialInviteOpen bool
+	Terminal          TerminalPane
 }
 
 type approvalChoice int
@@ -70,6 +71,27 @@ type topBarHit struct {
 	action topBarAction
 }
 
+type menuAction int
+
+const (
+	menuActionNone menuAction = iota
+	menuActionChat
+	menuActionFocusChat
+	menuActionFocusTerminal
+	menuActionInvite
+	menuActionCopyMode
+	menuActionQuit
+	menuActionRead
+	menuActionWrite
+	menuActionKick
+)
+
+type menuEntry struct {
+	label    string
+	shortcut string
+	action   menuAction
+}
+
 type App struct {
 	side          string
 	displayName   string
@@ -98,6 +120,8 @@ type App struct {
 	inviteOpen      bool
 	quitOpen        bool
 	quitChoice      quitChoice
+	noticeTitle     string
+	noticeBody      string
 	topBarHits      []topBarHit
 
 	localRole    Role
@@ -138,6 +162,7 @@ func NewApp(opts Options) *App {
 		height:        24,
 		sidebarOpen:   false,
 		focus:         FocusTerminal,
+		inviteOpen:    opts.InitialInviteOpen,
 		localRole:     RolePending,
 		transport:     "starting",
 		composer:      composer,
@@ -151,34 +176,64 @@ func (a *App) Init() tea.Cmd {
 }
 
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if cmd, handled := a.handleInteractiveMessage(msg); handled {
+		return a, cmd
+	}
+	a.applyMessage(msg)
+	return a, nil
+}
+
+func (a *App) handleInteractiveMessage(msg tea.Msg) (tea.Cmd, bool) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		return a.handleKey(msg), true
+	case tea.MouseMsg:
+		return HandleMouse(a, msg), true
+	default:
+		return nil, false
+	}
+}
+
+func (a *App) applyMessage(msg tea.Msg) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		a.resize(msg.Width, msg.Height, true)
 	case TerminalDataMsg:
 		_, _ = a.terminal.Write([]byte(msg))
 	case RuntimeStateMsg:
-		a.transport = valueOr(msg.Transport, a.transport)
-		a.hostCols = msg.HostCols
-		a.hostRows = msg.HostRows
-		if msg.LocalRole != "" {
-			a.localRole = msg.LocalRole
-		}
-		a.peers = append([]Peer(nil), msg.Peers...)
+		a.applyRuntimeState(msg)
 	case ChatMsg:
 		a.appendChatMessage(ChatMessage(msg))
 	case ApprovalRequestMsg:
-		a.approvalPeerID = strings.TrimSpace(msg.PeerID)
-		a.approvalPeer = strings.TrimSpace(valueOr(msg.Peer, msg.PeerID))
-		if a.approvalActive() {
-			a.focus = FocusApproval
-			a.approvalChoice = approvalChoiceWrite
-		}
-	case tea.KeyMsg:
-		return a, a.handleKey(msg)
-	case tea.MouseMsg:
-		return a, HandleMouse(a, msg)
+		a.applyApprovalRequest(msg)
+	case NoticeMsg:
+		a.applyNotice(msg)
 	}
-	return a, nil
+}
+
+func (a *App) applyRuntimeState(msg RuntimeStateMsg) {
+	a.transport = valueOr(msg.Transport, a.transport)
+	a.hostCols = msg.HostCols
+	a.hostRows = msg.HostRows
+	if msg.LocalRole != "" {
+		a.localRole = msg.LocalRole
+	}
+	a.peers = append([]Peer(nil), msg.Peers...)
+}
+
+func (a *App) applyApprovalRequest(msg ApprovalRequestMsg) {
+	a.inviteOpen = false
+	a.approvalPeerID = strings.TrimSpace(msg.PeerID)
+	a.approvalPeer = strings.TrimSpace(valueOr(msg.Peer, msg.PeerID))
+	if a.approvalActive() {
+		a.focus = FocusApproval
+		a.approvalChoice = approvalChoiceWrite
+	}
+}
+
+func (a *App) applyNotice(msg NoticeMsg) {
+	a.noticeTitle = strings.TrimSpace(msg.Title)
+	a.noticeBody = strings.TrimSpace(msg.Body)
 }
 
 func (a *App) View() string {
@@ -210,6 +265,9 @@ func (a *App) baseViewLines() []string {
 }
 
 func (a *App) applyOverlays(lines []string) {
+	if a.resizeWarningOpen() {
+		a.overlay(lines, a.resizeWarningLines())
+	}
 	if a.helpOpen {
 		a.overlay(lines, a.helpLines())
 	}
@@ -224,6 +282,9 @@ func (a *App) applyOverlays(lines []string) {
 	}
 	if a.quitOpen {
 		a.overlay(lines, a.quitLines())
+	}
+	if a.noticeOpen() {
+		a.overlay(lines, a.noticeLines())
 	}
 }
 
@@ -267,12 +328,20 @@ func (a *App) applyLayout() {
 		a.sidebarWidth = a.layout.Sidebar.W
 	}
 	if !a.layout.Terminal.empty() {
-		a.terminal.Resize(a.layout.Terminal.W, a.layout.Terminal.H)
+		cols, rows := a.terminalBufferSize()
+		a.terminal.Resize(cols, rows)
 	}
 	if !a.layout.Composer.empty() {
 		a.composer.SetWidth(a.layout.Composer.W)
 		a.composer.SetHeight(a.layout.Composer.H)
 	}
+}
+
+func (a *App) terminalBufferSize() (int, int) {
+	if strings.EqualFold(strings.TrimSpace(a.side), string(ModeGuest)) && a.hostCols > 0 && a.hostRows > 0 {
+		return a.hostCols, a.hostRows
+	}
+	return a.layout.Terminal.W, a.layout.Terminal.H
 }
 
 func (a *App) setSidebarOpen(open bool) {
@@ -306,23 +375,8 @@ func (a *App) emitTerminalResizeIfChanged(oldTerminal Rect) {
 }
 
 func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
-	if a.inviteOpen {
-		return a.handleInviteKey(msg)
-	}
-	if cmd, handled := a.handleQuitKey(msg); handled {
+	if cmd, handled := a.handleScreenKey(msg); handled {
 		return cmd
-	}
-	if a.handleEscapeKey(msg) {
-		return nil
-	}
-	if cmd, handled := a.handleHelpKey(msg); handled {
-		return cmd
-	}
-	if cmd, handled := a.handleApprovalKey(msg); handled {
-		return cmd
-	}
-	if a.kickPeer != "" {
-		return a.handleKickOverlayKey(msg)
 	}
 	if a.prefix {
 		return HandlePrefixKey(a, msg)
@@ -337,6 +391,44 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 	}
 
 	return a.handleTerminalKey(msg)
+}
+
+func (a *App) handleScreenKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	if a.inviteOpen {
+		return a.handleInviteKey(msg), true
+	}
+	if a.noticeOpen() {
+		return a.handleNoticeKey(msg), true
+	}
+	if cmd, handled := a.handleQuitKey(msg); handled {
+		return cmd, true
+	}
+	if a.handleEscapeKey(msg) {
+		return nil, true
+	}
+	if cmd, handled := a.handleHelpKey(msg); handled {
+		return cmd, true
+	}
+	if cmd, handled := a.handleApprovalKey(msg); handled {
+		return cmd, true
+	}
+	if a.kickPeer != "" {
+		return a.handleKickOverlayKey(msg), true
+	}
+	return nil, false
+}
+
+func (a *App) handleNoticeKey(msg tea.KeyMsg) tea.Cmd {
+	switch msg.Type {
+	case tea.KeyEnter, tea.KeyEsc, tea.KeySpace:
+		a.closeNotice()
+	case tea.KeyRunes:
+		switch strings.ToLower(string(msg.Runes)) {
+		case "q", "x":
+			a.closeNotice()
+		}
+	}
+	return nil
 }
 
 func (a *App) handleHelpKey(msg tea.KeyMsg) (tea.Cmd, bool) {
@@ -386,6 +478,8 @@ func (a *App) handleInviteKey(msg tea.KeyMsg) tea.Cmd {
 		if !a.copyMode {
 			return tea.EnableMouseCellMotion
 		}
+	case msg.Type == tea.KeyRunes && strings.EqualFold(string(msg.Runes), "c"):
+		a.emit(CopyInviteCommand{Command: strings.TrimSpace(a.inviteCommand)})
 	default:
 		return nil
 	}
@@ -643,19 +737,25 @@ func (a *App) chatTopBarSegments() []topBarSegment {
 
 func (a *App) actionTopBarSegments() []topBarSegment {
 	segments := []topBarSegment{}
-	if strings.TrimSpace(a.inviteCommand) != "" {
-		segments = append(segments, topBarSegment{text: "Invite", style: topBarMutedStyle, action: topBarActionInvite})
-	}
-	segments = append(segments, topBarSegment{text: "?", style: topBarMutedStyle, action: topBarActionHelp})
+	segments = append(segments, topBarSegment{text: "☰", style: topBarMutedStyle, action: topBarActionHelp})
 	if a.copyMode {
 		segments = append([]topBarSegment{{text: "select", style: topBarWarnStyle}}, segments...)
 		return segments
 	}
 	if a.prefix {
-		segments = append([]topBarSegment{{text: "S Chat · I Invite · Y Select · Q Quit", style: topBarWarnStyle}}, segments...)
+		segments = append([]topBarSegment{{text: a.prefixHintText(), style: topBarWarnStyle}}, segments...)
 		return segments
 	}
 	return segments
+}
+
+func (a *App) prefixHintText() string {
+	parts := []string{"S Chat"}
+	if a.canShowInvite() {
+		parts = append(parts, "I Invite")
+	}
+	parts = append(parts, "Y Select", "Q Quit")
+	return strings.Join(parts, " · ")
 }
 
 func (a *App) localDisplayName() string {
@@ -717,10 +817,11 @@ func (a *App) writeSidebarHeader(content []string, width int) {
 
 func (a *App) writeSidebarMessages(content []string, width int, height int, row int) {
 	messageRows := a.chatRenderLines(width)
-	available := maxInt(0, height-a.layout.Composer.H-row)
+	reserved := a.sidebarComposerRows(height)
+	available := maxInt(0, height-reserved-row)
 	start := chatWindowStart(len(messageRows), available, a.chatScroll)
 	for _, line := range messageRows[start:minInt(start+available, len(messageRows))] {
-		if row >= height-a.layout.Composer.H {
+		if row >= height-reserved {
 			return
 		}
 		content[row] = fitLine(line, width)
@@ -821,12 +922,22 @@ func (a *App) writeSidebarComposer(content []string, width int, height int) {
 	if height < 2 {
 		return
 	}
+	if height >= 3 {
+		content[height-2] = fitLine(composerBorderStyle.Width(width).Render(strings.Repeat(" ", width)), width)
+	}
 	composerLines := splitAndFit(a.composer.View(), width, 1)
 	for i := 0; i < 1 && height-1+i < height; i++ {
 		if i < len(composerLines) {
-			content[height-1+i] = fitLine(composerLines[i], width)
+			content[height-1+i] = fitLine(composerStyle.Width(width).Render(fitLine(composerLines[i], width)), width)
 		}
 	}
+}
+
+func (a *App) sidebarComposerRows(height int) int {
+	if height >= 3 {
+		return a.layout.Composer.H + 1
+	}
+	return a.layout.Composer.H
 }
 
 func (a *App) approvalLines() []string {
@@ -849,21 +960,36 @@ func (a *App) quitLines() []string {
 	}
 }
 
-func (a *App) helpLines() []string {
-	return []string{
-		"derpssh help",
-		"Ctrl-X S toggles Chat",
-		"Ctrl-X C focuses Chat",
-		"Ctrl-X T focuses Terminal",
-		"Ctrl-X I shows Invite",
-		"Ctrl-X Y toggles native selection",
-		"Ctrl-X Left/Right resizes Chat",
-		"Ctrl-X Q quits",
-		"Ctrl-X R grants Read",
-		"Ctrl-X W grants Write",
-		"Ctrl-X K kicks peer",
-		"Ctrl-X ? closes with Esc",
+func (a *App) noticeLines() []string {
+	width := a.noticeContentWidth()
+	body := strings.TrimSpace(a.noticeBody)
+	if body == "" {
+		body = "Session closed."
 	}
+	lines := []string{fitLine(labelStyle.Render(valueOr(a.noticeTitle, "Notice")), width)}
+	lines = append(lines, wrapPlainLines(body, width)...)
+	lines = append(lines, "", fitLine(dimStyle.Render("Enter or Esc closes this."), width))
+	return lines
+}
+
+func (a *App) resizeWarningLines() []string {
+	width := a.resizeWarningContentWidth()
+	current := fmt.Sprintf("%dx%d", a.layout.Terminal.W, a.layout.Terminal.H)
+	required := fmt.Sprintf("%dx%d", a.hostCols, a.hostRows)
+	lines := []string{fitLine(labelStyle.Render("Resize terminal"), width)}
+	lines = append(lines, wrapPlainLines("The host terminal is "+required+". Your current view is "+current+".", width)...)
+	lines = append(lines, wrapPlainLines("Resize this window until the shared terminal fits.", width)...)
+	return lines
+}
+
+func (a *App) helpLines() []string {
+	width := a.helpContentWidth()
+	lines := []string{fitLine(labelStyle.Render("derpssh menu"), width), ""}
+	for _, entry := range a.menuEntries() {
+		lines = append(lines, a.menuEntryLine(entry, width))
+	}
+	lines = append(lines, "", fitLine(dimStyle.Render("Esc closes"), width))
+	return lines
 }
 
 func (a *App) overlay(lines []string, body []string) {
@@ -1007,6 +1133,63 @@ func (a *App) quitContentWidth() int {
 	return maxInt(width, 1)
 }
 
+func (a *App) helpContentOrigin() (int, int) {
+	box := strings.Split(modalStyle.Render(strings.Join(a.helpLines(), "\n")), "\n")
+	boxW := a.overlayWidth(box)
+	boxX := (a.width - boxW) / 2
+	boxY := a.overlayY(len(box))
+	return boxX + modalStyle.GetBorderLeftSize() + modalStyle.GetPaddingLeft(),
+		boxY + modalStyle.GetBorderTopSize() + modalStyle.GetPaddingTop()
+}
+
+func (a *App) helpContentWidth() int {
+	width := displayWidth("derpssh menu")
+	for _, entry := range a.menuEntries() {
+		width = maxInt(width, displayWidth(entry.label)+displayWidth(entry.shortcut)+4)
+	}
+	width = maxInt(width, displayWidth("Esc closes"))
+	if a.width > 0 {
+		maxWidth := a.width - modalStyle.GetHorizontalBorderSize() - modalStyle.GetHorizontalPadding() - 2
+		width = minInt(width, maxInt(maxWidth, 1))
+	}
+	return maxInt(width, 1)
+}
+
+func (a *App) menuEntryLine(entry menuEntry, width int) string {
+	label := entry.label
+	shortcutW := displayWidth(entry.shortcut)
+	labelW := displayWidth(label)
+	if shortcutW > 0 && labelW+shortcutW+2 <= width {
+		label = fitLine(label, width-shortcutW-2)
+		gap := strings.Repeat(" ", maxInt(width-displayWidth(label)-shortcutW, 1))
+		return fitLine(label+dimStyle.Render(gap+entry.shortcut), width)
+	}
+	return fitLine(label, width)
+}
+
+func (a *App) menuEntries() []menuEntry {
+	entries := []menuEntry{
+		{label: "Toggle Chat", shortcut: "Ctrl-X S", action: menuActionChat},
+		{label: "Focus Chat", shortcut: "Ctrl-X C", action: menuActionFocusChat},
+		{label: "Focus Terminal", shortcut: "Ctrl-X T", action: menuActionFocusTerminal},
+	}
+	if a.canShowInvite() {
+		entries = append(entries, menuEntry{label: "Show Invite", shortcut: "Ctrl-X I", action: menuActionInvite})
+	}
+	entries = append(entries,
+		menuEntry{label: "Native Selection", shortcut: "Ctrl-X Y", action: menuActionCopyMode},
+		menuEntry{label: "Quit", shortcut: "Ctrl-X Q", action: menuActionQuit},
+	)
+	if len(a.peers) > 0 {
+		entries = append(entries,
+			menuEntry{label: "Grant Read", shortcut: "Ctrl-X R", action: menuActionRead},
+			menuEntry{label: "Grant Write", shortcut: "Ctrl-X W", action: menuActionWrite},
+			menuEntry{label: "Kick Peer", shortcut: "Ctrl-X K", action: menuActionKick},
+		)
+	}
+	return entries
+}
+
 func (a *App) quitButtonLine(width int) string {
 	lineW := quitButtonsWidth()
 	pad := strings.Repeat(" ", maxInt((width-lineW)/2, 0))
@@ -1015,6 +1198,30 @@ func (a *App) quitButtonLine(width int) string {
 		a.renderQuitButton(quitChoiceCancel),
 	}
 	return fitLine(pad+strings.Join(parts, strings.Repeat(" ", quitButtonGap)), width)
+}
+
+func (a *App) noticeContentWidth() int {
+	width := maxInt(34, displayWidth(valueOr(a.noticeTitle, "Notice")))
+	for _, line := range wrapPlainLines(strings.TrimSpace(a.noticeBody), 54) {
+		width = maxInt(width, displayWidth(line))
+	}
+	width = maxInt(width, displayWidth("Enter or Esc closes this."))
+	if a.width > 0 {
+		maxWidth := a.width - modalStyle.GetHorizontalBorderSize() - modalStyle.GetHorizontalPadding() - 2
+		width = minInt(width, maxInt(maxWidth, 1))
+	}
+	return maxInt(width, 1)
+}
+
+func (a *App) resizeWarningContentWidth() int {
+	width := maxInt(44, displayWidth("Resize terminal"))
+	width = maxInt(width, displayWidth(fmt.Sprintf("The host terminal is %dx%d. Your current view is %dx%d.", a.hostCols, a.hostRows, a.layout.Terminal.W, a.layout.Terminal.H)))
+	width = maxInt(width, displayWidth("Resize this window until the shared terminal fits."))
+	if a.width > 0 {
+		maxWidth := a.width - modalStyle.GetHorizontalBorderSize() - modalStyle.GetHorizontalPadding() - 2
+		width = minInt(width, maxInt(maxWidth, 1))
+	}
+	return maxInt(width, 1)
 }
 
 func (a *App) renderQuitButton(choice quitChoice) string {
@@ -1130,12 +1337,25 @@ func (a *App) moveQuitChoice(delta int) {
 	a.quitChoice = quitChoiceOrder[next]
 }
 
+func (a *App) noticeOpen() bool {
+	return strings.TrimSpace(a.noticeTitle) != "" || strings.TrimSpace(a.noticeBody) != ""
+}
+
+func (a *App) closeNotice() {
+	a.noticeTitle = ""
+	a.noticeBody = ""
+}
+
 func (a *App) openInvite() tea.Cmd {
-	if strings.TrimSpace(a.inviteCommand) == "" {
+	if !a.canShowInvite() {
 		return nil
 	}
 	a.inviteOpen = true
 	return tea.DisableMouse
+}
+
+func (a *App) canShowInvite() bool {
+	return strings.TrimSpace(a.inviteCommand) != "" && strings.EqualFold(strings.TrimSpace(a.side), string(ModeHost))
 }
 
 type terminalCursorController interface {
@@ -1149,7 +1369,18 @@ func (a *App) setTerminalCursorActive(active bool) {
 }
 
 func (a *App) modalActive() bool {
-	return a.helpOpen || a.approvalActive() || a.kickPeer != "" || a.quitOpen
+	return a.helpOpen || a.resizeWarningOpen() || a.approvalActive() || a.kickPeer != "" || a.quitOpen || a.noticeOpen()
+}
+
+func (a *App) resizeWarningOpen() bool {
+	if !strings.EqualFold(strings.TrimSpace(a.side), string(ModeGuest)) {
+		return false
+	}
+	if a.hostCols <= 0 || a.hostRows <= 0 {
+		return false
+	}
+	a.applyLayout()
+	return a.layout.Terminal.W < a.hostCols || a.layout.Terminal.H < a.hostRows
 }
 
 func (a *App) inviteView() string {
@@ -1161,9 +1392,9 @@ func (a *App) inviteView() string {
 	}
 	lines = append(lines, wrapPlainLines("Copy this command and send it to the other person:", width)...)
 	lines = append(lines, "")
-	lines = append(lines, wrapPlainLines(command, width)...)
+	lines = append(lines, command)
 	lines = append(lines, "")
-	lines = append(lines, wrapPlainLines("Press Enter, Esc, or q to return.", width)...)
+	lines = append(lines, wrapPlainLines("Press c to copy. Press Enter, Esc, or q to return.", width)...)
 	if a.height <= 0 {
 		return strings.Join(lines, "\n")
 	}

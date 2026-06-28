@@ -62,16 +62,18 @@ func TestMouseClickQuitConfirmationButtons(t *testing.T) {
 	}
 }
 
-func TestMouseClickTopBarInviteOpensInvite(t *testing.T) {
-	app := NewApp(Options{InviteCommand: "npx -y derpssh@latest connect DSH1copyme", Terminal: &fakePane{view: "ok"}})
+func TestMouseClickMenuInviteOpensInvite(t *testing.T) {
+	app := NewApp(Options{Side: "host", InviteCommand: "npx -y derpssh@latest connect DSH1copyme", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	drainCommands(app)
-	invite := topBarActionRect(t, app, topBarActionInvite)
+	menu := topBarActionRect(t, app, topBarActionHelp)
 
-	app.Update(leftClick(invite.X+invite.W/2, invite.Y))
+	app.Update(leftClick(menu.X+menu.W/2, menu.Y))
+	x, y := menuEntryPoint(t, app, menuActionInvite)
+	app.Update(leftClick(x, y))
 
 	if !app.inviteOpen {
-		t.Fatalf("inviteOpen = false, want true after top-bar invite click")
+		t.Fatalf("inviteOpen = false, want true after menu invite click")
 	}
 }
 
@@ -252,6 +254,20 @@ func topBarActionRect(t *testing.T, app *App, action topBarAction) Rect {
 	}
 	t.Fatalf("missing top-bar action %v in hits %+v", action, app.topBarHits)
 	return Rect{}
+}
+
+func menuEntryPoint(t *testing.T, app *App, action menuAction) (int, int) {
+	t.Helper()
+	contentX, contentY := app.helpContentOrigin()
+	row := contentY + 2
+	for _, entry := range app.menuEntries() {
+		if entry.action == action {
+			return contentX + 1, row
+		}
+		row++
+	}
+	t.Fatalf("missing menu action %v", action)
+	return 0, 0
 }
 
 func drainCommands(app *App) {

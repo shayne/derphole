@@ -101,6 +101,26 @@ func TestApprovalRequestRendersModal(t *testing.T) {
 	}
 }
 
+func TestNoticeMsgRendersDismissibleModal(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "shell$"}})
+	app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	app.Update(NoticeMsg{Title: "Guest left", Body: "guest quit"})
+
+	view := app.View()
+	if !strings.Contains(view, "Guest left") || !strings.Contains(view, "guest quit") {
+		t.Fatalf("notice missing from view:\n%s", view)
+	}
+	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	view = app.View()
+	if strings.Contains(view, "Guest left") || strings.Contains(view, "guest quit") {
+		t.Fatalf("notice still visible after Enter:\n%s", view)
+	}
+	if !strings.Contains(view, "shell$") {
+		t.Fatalf("terminal not restored after notice dismissed:\n%s", view)
+	}
+}
+
 func TestApprovalModalCapturesPrintableKeys(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
@@ -262,7 +282,7 @@ func TestViewRendersSingleQuietTopBar(t *testing.T) {
 
 	view := app.View()
 	firstLine := strings.Split(view, "\n")[0]
-	for _, want := range []string{"derpssh", "host", "Chat", "?"} {
+	for _, want := range []string{"derpssh", "host", "Chat", "☰"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("View() missing top-bar item %q:\n%s", want, view)
 		}
@@ -274,6 +294,91 @@ func TestViewRendersSingleQuietTopBar(t *testing.T) {
 		if strings.Contains(view, noisy) {
 			t.Fatalf("View() renders noisy shortcut %q:\n%s", noisy, view)
 		}
+	}
+}
+
+func TestTopBarHidesInviteBehindMenu(t *testing.T) {
+	invite := "npx -y derpssh@latest connect DSH1verysecretinvitetoken1234567890"
+	app := NewApp(Options{Side: "host", InviteCommand: invite, Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+
+	firstLine := strings.Split(app.View(), "\n")[0]
+	if strings.Contains(firstLine, "Invite") {
+		t.Fatalf("top bar exposes invite chip:\n%s", firstLine)
+	}
+	if strings.Contains(firstLine, "?") {
+		t.Fatalf("top bar should use the menu glyph, not a question mark:\n%s", firstLine)
+	}
+	if !strings.Contains(firstLine, "☰") {
+		t.Fatalf("top bar missing menu glyph:\n%s", firstLine)
+	}
+}
+
+func TestGuestPrefixHintsDoNotShowInvite(t *testing.T) {
+	app := NewApp(Options{Side: "guest", InviteCommand: "npx -y derpssh@latest connect DSH1copyme", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+
+	firstLine := strings.Split(app.View(), "\n")[0]
+	if strings.Contains(firstLine, "Invite") || strings.Contains(firstLine, "Ctrl-X I") {
+		t.Fatalf("guest prefix hints expose invite:\n%s", firstLine)
+	}
+}
+
+func TestMenuShowsInviteForHostOnly(t *testing.T) {
+	host := NewApp(Options{Side: "host", InviteCommand: "npx -y derpssh@latest connect DSH1copyme", Terminal: &fakePane{view: "ok"}})
+	host.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+	host.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	host.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+	if !strings.Contains(host.View(), "Show Invite") || !strings.Contains(host.View(), "Ctrl-X I") {
+		t.Fatalf("host menu missing invite action:\n%s", host.View())
+	}
+
+	guest := NewApp(Options{Side: "guest", InviteCommand: "npx -y derpssh@latest connect DSH1copyme", Terminal: &fakePane{view: "ok"}})
+	guest.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+	guest.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	guest.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+	if strings.Contains(guest.View(), "Show Invite") || strings.Contains(guest.View(), "Ctrl-X I") {
+		t.Fatalf("guest menu exposes invite action:\n%s", guest.View())
+	}
+}
+
+func TestGuestTooSmallShowsHostSizeWarning(t *testing.T) {
+	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "shell$"}})
+	app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	app.Update(RuntimeStateMsg{Transport: "connected-direct", HostCols: 101, HostRows: 30, LocalRole: RoleWrite})
+
+	view := app.View()
+	for _, want := range []string{"101x30", "Resize terminal", "80x23"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("resize warning missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestGuestSidebarDoesNotResizeHostTerminalBuffer(t *testing.T) {
+	pane := &fakePane{view: "shell$"}
+	app := NewApp(Options{Side: "guest", Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	drainCommands(app)
+	app.Update(RuntimeStateMsg{Transport: "connected-direct", HostCols: 101, HostRows: 30, LocalRole: RoleWrite})
+
+	_ = app.View()
+	if pane.cols != 101 || pane.rows != 30 {
+		t.Fatalf("guest terminal buffer = %dx%d, want host 101x30", pane.cols, pane.rows)
+	}
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	_ = app.View()
+	if pane.cols != 101 || pane.rows != 30 {
+		t.Fatalf("guest terminal buffer changed after chat opened = %dx%d, want host 101x30", pane.cols, pane.rows)
+	}
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	_ = app.View()
+	if pane.cols != 101 || pane.rows != 30 {
+		t.Fatalf("guest terminal buffer changed after chat closed = %dx%d, want host 101x30", pane.cols, pane.rows)
 	}
 }
 
@@ -335,16 +440,33 @@ func TestInviteShortcutShowsFullScreenPlainInvite(t *testing.T) {
 			t.Fatalf("invite view missing command fragment %q:\n%s", want, view)
 		}
 	}
-	for _, line := range strings.Split(view, "\n") {
-		if visibleWidth(line) > 40 {
-			t.Fatalf("invite line width = %d, want <= 40: %q", visibleWidth(line), line)
-		}
+	if got := strings.Count(view, invite); got != 1 {
+		t.Fatalf("invite command should be one physical line, count=%d:\n%s", got, view)
 	}
 	if strings.Contains(view, "\x1b[") {
 		t.Fatalf("invite view contains ANSI styling:\n%q", view)
 	}
 	if strings.Contains(view, "shell$") || strings.Contains(view, "Sidechat") {
 		t.Fatalf("invite view did not replace main TUI:\n%s", view)
+	}
+}
+
+func TestInviteScreenCopyEmitsCopyCommand(t *testing.T) {
+	invite := "npx -y derpssh@latest connect DSH1copyme"
+	app := NewApp(Options{Side: "host", InviteCommand: invite, Terminal: &fakePane{view: "shell$"}})
+	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
+	drainCommands(app)
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+
+	got, ok := readCommand(app).(CopyInviteCommand)
+	if !ok {
+		t.Fatalf("copy key command = %T, want CopyInviteCommand", got)
+	}
+	if got.Command != invite {
+		t.Fatalf("copy command = %q, want %q", got.Command, invite)
 	}
 }
 
@@ -478,6 +600,26 @@ func TestInviteScreenEscapeReturnsToTerminal(t *testing.T) {
 	}
 	if strings.Contains(view, "npx -y derpssh@latest connect") {
 		t.Fatalf("invite command still visible after Esc:\n%s", view)
+	}
+}
+
+func TestApprovalRequestDismissesInitialInviteScreen(t *testing.T) {
+	app := NewApp(Options{
+		Side:              "host",
+		InviteCommand:     "npx -y derpssh@latest connect DSH1test",
+		InitialInviteOpen: true,
+		Terminal:          &fakePane{view: "shell$"},
+	})
+	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
+
+	app.Update(ApprovalRequestMsg{PeerID: "guest-1", Peer: "shayne"})
+
+	view := app.View()
+	if strings.Contains(view, "npx -y derpssh@latest connect") {
+		t.Fatalf("approval did not dismiss invite screen:\n%s", view)
+	}
+	if !strings.Contains(view, "shayne wants to join") {
+		t.Fatalf("approval modal missing after invite dismissal:\n%s", view)
 	}
 }
 

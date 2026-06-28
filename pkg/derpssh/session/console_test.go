@@ -85,6 +85,31 @@ func TestTUIConsoleGuestPendingStatusClearsWhenPeerApproved(t *testing.T) {
 	}
 }
 
+func TestTUIConsoleHostCloseEventClearsPeerAndShowsNotice(t *testing.T) {
+	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, &recordingTerminalPane{view: "shell$"})
+	console.OnRuntimeEvent(RuntimeEvent{
+		Kind:          RuntimeEventPeer,
+		ParticipantID: "guest-1",
+		DisplayName:   "shayne",
+		Role:          protocol.RoleWrite,
+	})
+
+	console.OnRuntimeEvent(RuntimeEvent{
+		Kind:          RuntimeEventClose,
+		ParticipantID: "guest-1",
+		DisplayName:   "shayne",
+		Message:       "guest quit",
+	})
+
+	view := console.View()
+	if !strings.Contains(view, "Guest left") || !strings.Contains(view, "guest quit") {
+		t.Fatalf("view missing guest-left notice:\n%s", view)
+	}
+	if strings.Contains(strings.Split(view, "\n")[0], "shayne/write") {
+		t.Fatalf("top bar still shows departed peer:\n%s", view)
+	}
+}
+
 func TestTUIConsoleProgramRequiresInputAndOutputTTY(t *testing.T) {
 	stdin, stdout := openPipeFiles(t)
 	oldIsTerminalFD := isTerminalFD
@@ -222,6 +247,27 @@ func TestTUIConsoleNonTTYTranscriptWritesSnapshots(t *testing.T) {
 	}
 }
 
+func TestTUIConsoleCopyInviteWritesOSC52(t *testing.T) {
+	var out strings.Builder
+	console := newTerminalConsoleWithOptions(tuiConsoleOptions{
+		Mode:     tui.ModeHost,
+		Cols:     100,
+		Rows:     30,
+		Stdout:   &out,
+		Terminal: &recordingTerminalPane{view: "shell$"},
+	})
+
+	console.handleCommand(context.Background(), tui.CopyInviteCommand{Command: "npx -y derpssh@latest connect DSH1copyme"})
+
+	got := out.String()
+	if !strings.HasPrefix(got, "\x1b]52;c;") || !strings.HasSuffix(got, "\x07") {
+		t.Fatalf("OSC52 output malformed: %q", got)
+	}
+	if strings.Contains(got, "\n") {
+		t.Fatalf("OSC52 output contains newline: %q", got)
+	}
+}
+
 func TestTUIConsoleNonTTYApprovalDeniesWithoutEnv(t *testing.T) {
 	var out strings.Builder
 	console := newTerminalConsoleWithOptions(tuiConsoleOptions{
@@ -286,6 +332,35 @@ func TestTUIConsoleNonTTYHarnessActionsCallCallbacks(t *testing.T) {
 		kickReason:    "kicked",
 	}
 	waitForConsoleCalls(t, &calls, want)
+}
+
+func TestTUIConsoleHarnessQuitActionCallsCallback(t *testing.T) {
+	t.Setenv("DERPSSH_TEST_HARNESS", "1")
+	t.Setenv("DERPSSH_TEST_HOST_ACTIONS", strings.Join([]string{
+		"sleep 1ms",
+		"quit",
+	}, "\n"))
+	console := newTerminalConsoleWithOptions(tuiConsoleOptions{
+		Mode:     tui.ModeHost,
+		Cols:     100,
+		Rows:     30,
+		Stdout:   &strings.Builder{},
+		Terminal: &recordingTerminalPane{},
+	})
+	called := make(chan struct{}, 1)
+	console.SetCommandCallbacks(tuiConsoleCallbacks{
+		Quit: func(context.Context) error {
+			called <- struct{}{}
+			return nil
+		},
+	})
+	console.Start(context.Background())
+
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("harness quit action did not call Quit callback")
+	}
 }
 
 func TestTUIConsoleHarnessActionsWaitForCallbacksAfterStart(t *testing.T) {
@@ -468,6 +543,21 @@ func TestTUIConsoleRuntimeEventsUpdateApp(t *testing.T) {
 		if !strings.Contains(view, want) {
 			t.Fatalf("console view missing %q:\n%s", want, view)
 		}
+	}
+}
+
+func TestTUIConsoleIgnoresParticipantResizeForHostSize(t *testing.T) {
+	console := newHeadlessTUIConsole(tui.ModeGuest, 140, 30, &recordingTerminalPane{view: "shell$"})
+
+	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventResize, Cols: 101, Rows: 30})
+	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventResize, ParticipantID: "guest-1", Cols: 68, Rows: 29})
+
+	firstLine := strings.Split(console.View(), "\n")[0]
+	if !strings.Contains(firstLine, "101x30") {
+		t.Fatalf("header missing host size after participant resize:\n%s", firstLine)
+	}
+	if strings.Contains(firstLine, "68x29") {
+		t.Fatalf("header used guest-local size instead of host size:\n%s", firstLine)
 	}
 }
 

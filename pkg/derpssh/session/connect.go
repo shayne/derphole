@@ -99,7 +99,11 @@ func Connect(ctx context.Context, cfg ConnectConfig) error {
 	}
 	guest := NewGuestRuntime(guestCfg)
 	callbacks := guestConsoleCallbacks(guest)
-	callbacks.Quit = cancel
+	callbacks.Quit = func(ctx context.Context) error {
+		err := guest.Close(ctx, guestQuitReason)
+		cancel()
+		return err
+	}
 	console.SetCommandCallbacks(callbacks)
 	console.Start(runCtx)
 	statusMu.Lock()
