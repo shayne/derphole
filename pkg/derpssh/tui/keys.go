@@ -28,7 +28,18 @@ var encodedTerminalKeys = map[tea.KeyType][]byte{
 	tea.KeyPgDown:    []byte("\x1b[6~"),
 }
 
+var applicationCursorKeys = map[tea.KeyType][]byte{
+	tea.KeyUp:    []byte("\x1bOA"),
+	tea.KeyDown:  []byte("\x1bOB"),
+	tea.KeyRight: []byte("\x1bOC"),
+	tea.KeyLeft:  []byte("\x1bOD"),
+}
+
 func EncodeTerminalKey(msg tea.KeyMsg) ([]byte, bool) {
+	return EncodeTerminalKeyWithMode(msg, TerminalInputMode{})
+}
+
+func EncodeTerminalKeyWithMode(msg tea.KeyMsg, mode TerminalInputMode) ([]byte, bool) {
 	if msg.Type == tea.KeyRunes {
 		if len(msg.Runes) == 0 {
 			return nil, false
@@ -38,6 +49,11 @@ func EncodeTerminalKey(msg tea.KeyMsg) ([]byte, bool) {
 			data = append([]byte{0x1b}, data...)
 		}
 		return data, true
+	}
+	if mode.ApplicationCursor {
+		if data, ok := applicationCursorKeys[msg.Type]; ok {
+			return append([]byte(nil), data...), true
+		}
 	}
 	if data, ok := encodedTerminalKeys[msg.Type]; ok {
 		return append([]byte(nil), data...), true

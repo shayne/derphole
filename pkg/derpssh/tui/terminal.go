@@ -19,6 +19,7 @@ type TerminalPane interface {
 	Resize(cols int, rows int)
 	View(width int, height int) string
 	MouseMode() MouseMode
+	InputMode() TerminalInputMode
 }
 
 type MouseMode struct {
@@ -26,11 +27,16 @@ type MouseMode struct {
 	SGR     bool
 }
 
+type TerminalInputMode struct {
+	ApplicationCursor bool
+}
+
 type vtTerminalPane struct {
 	mu        sync.Mutex
 	term      vt10x.Terminal
 	mouse     MouseMode
-	mouseTail string
+	inputMode TerminalInputMode
+	modeTail  string
 }
 
 func NewVTTerminalPane(cols int, rows int) TerminalPane {
@@ -46,9 +52,10 @@ func NewVTTerminalPane(cols int, rows int) TerminalPane {
 func (p *vtTerminalPane) Write(b []byte) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	mouseInput := p.mouseTail + string(b)
-	p.mouse = TrackMouseMode(p.mouse, []byte(mouseInput))
-	p.mouseTail = incompleteMouseModeTail(mouseInput)
+	modeInput := p.modeTail + string(b)
+	p.mouse = TrackMouseMode(p.mouse, []byte(modeInput))
+	p.inputMode = TrackInputMode(p.inputMode, []byte(modeInput))
+	p.modeTail = incompletePrivateModeTail(modeInput)
 	return p.term.Write(b)
 }
 
@@ -71,35 +78,9 @@ func (p *vtTerminalPane) View(width int, height int) string {
 	defer p.term.Unlock()
 
 	lines := make([]string, 0, height)
+	cursor := terminalCursorView{cursor: p.term.Cursor(), visible: p.term.CursorVisible()}
 	for y := 0; y < height; y++ {
-		var b strings.Builder
-		activeStyle := defaultTerminalCellStyle()
-		styleActive := false
-		last := terminalLastRenderableColumn(p.term, width, y)
-		for x := 0; x <= last; x++ {
-			glyph := p.term.Cell(x, y)
-			style := terminalStyleFromGlyph(glyph)
-			if !style.equal(activeStyle) {
-				if styleActive {
-					b.WriteString("\x1b[0m")
-					styleActive = false
-				}
-				if style.active() {
-					b.WriteString(style.sgr())
-					styleActive = true
-				}
-				activeStyle = style
-			}
-			if glyph.Char == 0 {
-				b.WriteByte(' ')
-			} else {
-				b.WriteRune(glyph.Char)
-			}
-		}
-		if styleActive {
-			b.WriteString("\x1b[0m")
-		}
-		lines = append(lines, b.String())
+		lines = append(lines, renderTerminalRow(p.term, width, y, cursor))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -108,6 +89,12 @@ func (p *vtTerminalPane) MouseMode() MouseMode {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.mouse
+}
+
+func (p *vtTerminalPane) InputMode() TerminalInputMode {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.inputMode
 }
 
 const (
@@ -122,9 +109,74 @@ const (
 const vtRenderedAttrMask = vtAttrUnderline | vtAttrBold | vtAttrItalic | vtAttrBlink
 
 type terminalCellStyle struct {
-	mode int16
-	fg   vt10x.Color
-	bg   vt10x.Color
+	mode    int16
+	fg      vt10x.Color
+	bg      vt10x.Color
+	reverse bool
+}
+
+type terminalCursorView struct {
+	cursor  vt10x.Cursor
+	visible bool
+}
+
+func renderTerminalRow(term vt10x.Terminal, width int, y int, cursor terminalCursorView) string {
+	var b strings.Builder
+	activeStyle := defaultTerminalCellStyle()
+	styleActive := false
+	last := cursor.lastColumn(term, width, y)
+	for x := 0; x <= last; x++ {
+		glyph := term.Cell(x, y)
+		style := cursor.style(glyph, x, y)
+		writeTerminalCell(&b, glyph, style, &activeStyle, &styleActive)
+	}
+	if styleActive {
+		b.WriteString("\x1b[0m")
+	}
+	return b.String()
+}
+
+func writeTerminalCell(b *strings.Builder, glyph vt10x.Glyph, style terminalCellStyle, activeStyle *terminalCellStyle, styleActive *bool) {
+	if !style.equal(*activeStyle) {
+		resetTerminalStyle(b, styleActive)
+		if style.active() {
+			b.WriteString(style.sgr())
+			*styleActive = true
+		}
+		*activeStyle = style
+	}
+	if glyph.Char == 0 {
+		b.WriteByte(' ')
+		return
+	}
+	b.WriteRune(glyph.Char)
+}
+
+func resetTerminalStyle(b *strings.Builder, styleActive *bool) {
+	if !*styleActive {
+		return
+	}
+	b.WriteString("\x1b[0m")
+	*styleActive = false
+}
+
+func (c terminalCursorView) lastColumn(term vt10x.Terminal, width int, y int) int {
+	last := terminalLastRenderableColumn(term, width, y)
+	if c.visibleAt(y, width) && c.cursor.X > last {
+		return c.cursor.X
+	}
+	return last
+}
+
+func (c terminalCursorView) style(glyph vt10x.Glyph, x int, y int) terminalCellStyle {
+	if c.visible && c.cursor.Y == y && c.cursor.X == x {
+		return terminalCursorStyle(glyph, c.cursor)
+	}
+	return terminalStyleFromGlyph(glyph)
+}
+
+func (c terminalCursorView) visibleAt(y int, width int) bool {
+	return c.visible && c.cursor.Y == y && c.cursor.X >= 0 && c.cursor.X < width
 }
 
 func terminalLastRenderableColumn(term vt10x.Terminal, width int, y int) int {
@@ -144,6 +196,10 @@ func terminalStyleFromGlyph(glyph vt10x.Glyph) terminalCellStyle {
 	if glyph.Char == 0 {
 		return defaultTerminalCellStyle()
 	}
+	return terminalStyleFromAttr(glyph)
+}
+
+func terminalStyleFromAttr(glyph vt10x.Glyph) terminalCellStyle {
 	return terminalCellStyle{
 		mode: glyph.Mode & vtRenderedAttrMask,
 		fg:   glyph.FG,
@@ -151,22 +207,34 @@ func terminalStyleFromGlyph(glyph vt10x.Glyph) terminalCellStyle {
 	}
 }
 
+func terminalCursorStyle(glyph vt10x.Glyph, cursor vt10x.Cursor) terminalCellStyle {
+	style := terminalStyleFromGlyph(glyph)
+	if glyph.Char == 0 {
+		style = terminalStyleFromAttr(cursor.Attr)
+	}
+	style.reverse = true
+	return style
+}
+
 func defaultTerminalCellStyle() terminalCellStyle {
 	return terminalCellStyle{fg: vt10x.DefaultFG, bg: vt10x.DefaultBG}
 }
 
 func (s terminalCellStyle) equal(other terminalCellStyle) bool {
-	return s.mode == other.mode && s.fg == other.fg && s.bg == other.bg
+	return s.mode == other.mode && s.fg == other.fg && s.bg == other.bg && s.reverse == other.reverse
 }
 
 func (s terminalCellStyle) active() bool {
-	return s.mode != 0 || s.fg != vt10x.DefaultFG || s.bg != vt10x.DefaultBG
+	return s.mode != 0 || s.fg != vt10x.DefaultFG || s.bg != vt10x.DefaultBG || s.reverse
 }
 
 func (s terminalCellStyle) sgr() string {
-	codes := make([]string, 0, 6)
+	codes := make([]string, 0, 7)
 	if s.mode&vtAttrBold != 0 {
 		codes = append(codes, "1")
+	}
+	if s.reverse {
+		codes = append(codes, "7")
 	}
 	if s.mode&vtAttrItalic != 0 {
 		codes = append(codes, "3")
@@ -242,11 +310,15 @@ func (p *staticTerminalPane) MouseMode() MouseMode {
 	return MouseMode{}
 }
 
-var mouseModePattern = regexp.MustCompile(`\x1b\[\?([0-9;]+)([hl])`)
+func (p *staticTerminalPane) InputMode() TerminalInputMode {
+	return TerminalInputMode{}
+}
+
+var privateModePattern = regexp.MustCompile(`\x1b\[\?([0-9;]+)([hl])`)
 
 func TrackMouseMode(current MouseMode, output []byte) MouseMode {
 	next := current
-	for _, match := range mouseModePattern.FindAllSubmatch(output, -1) {
+	for _, match := range privateModePattern.FindAllSubmatch(output, -1) {
 		enable := len(match[2]) == 1 && match[2][0] == 'h'
 		for _, raw := range strings.Split(string(match[1]), ";") {
 			param, err := strconv.Atoi(raw)
@@ -273,13 +345,30 @@ func TrackMouseMode(current MouseMode, output []byte) MouseMode {
 	return next
 }
 
-func incompleteMouseModeTail(s string) string {
+func TrackInputMode(current TerminalInputMode, output []byte) TerminalInputMode {
+	next := current
+	for _, match := range privateModePattern.FindAllSubmatch(output, -1) {
+		enable := len(match[2]) == 1 && match[2][0] == 'h'
+		for _, raw := range strings.Split(string(match[1]), ";") {
+			param, err := strconv.Atoi(raw)
+			if err != nil {
+				continue
+			}
+			if param == 1 {
+				next.ApplicationCursor = enable
+			}
+		}
+	}
+	return next
+}
+
+func incompletePrivateModeTail(s string) string {
 	idx := strings.LastIndex(s, "\x1b[?")
 	if idx == -1 {
 		return ""
 	}
 	tail := s[idx:]
-	if mouseModePattern.MatchString(tail) {
+	if privateModePattern.MatchString(tail) {
 		return ""
 	}
 	if len(tail) > 32 {

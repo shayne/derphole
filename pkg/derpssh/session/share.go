@@ -91,12 +91,14 @@ func presentShareInvite(cfg ShareConfig, connectCommand string) error {
 
 func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand string) error {
 	size := terminalSize(cfg.Stdout)
+	displayName := shareDisplayName()
 	console := newTerminalConsoleWithOptions(tuiConsoleOptions{
 		Mode:          tui.ModeHost,
 		Cols:          size.Cols,
 		Rows:          size.Rows,
 		Stdin:         cfg.Stdin,
 		Stdout:        cfg.Stdout,
+		DisplayName:   displayName,
 		InviteCommand: connectCommand,
 	})
 	terminalSize := console.TerminalSize()
@@ -134,10 +136,6 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 		ForceRelay:  cfg.ForceRelay,
 		OnMux: func(ctx context.Context, mux *derptun.Mux) error {
 			hostStarted.Store(true)
-			hostName, _ := os.Hostname()
-			if hostName == "" {
-				hostName = "host"
-			}
 			approval := newShareApproval(cfg)
 			if _, ok := approval.(terminalShareApproval); ok {
 				approval = console
@@ -145,7 +143,7 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 			hostCfg := HostConfig{
 				Mux:         mux,
 				HostID:      randomID("host"),
-				HostName:    hostName,
+				HostName:    displayName,
 				InitialCols: terminalSize.Cols,
 				InitialRows: terminalSize.Rows,
 				PTYInput:    terminal.Input,
@@ -166,6 +164,26 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 			})
 		},
 	})
+}
+
+func shareDisplayName() string {
+	host, _ := os.Hostname()
+	return joinUserHost(os.Getenv("USER"), host)
+}
+
+func joinUserHost(user, host string) string {
+	user = strings.TrimSpace(user)
+	host = strings.TrimSpace(host)
+	switch {
+	case user != "" && host != "":
+		return user + "@" + host
+	case user != "":
+		return user
+	case host != "":
+		return host
+	default:
+		return "host"
+	}
 }
 
 func waitingShareConsoleCallbacks(terminal *shareTerminal, cancel context.CancelFunc, pendingChats *pendingShareChats) tuiConsoleCallbacks {

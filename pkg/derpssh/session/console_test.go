@@ -50,6 +50,41 @@ func TestTUIConsoleSendBeforeStartDoesNotCallProgramSend(t *testing.T) {
 	}
 }
 
+func TestTUIConsoleApprovalStatusClearsWhenRoleGranted(t *testing.T) {
+	console := newHeadlessTUIConsole(tui.ModeGuest, 100, 30, &recordingTerminalPane{view: "shell$"})
+
+	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventStatus, Message: "waiting for host approval"})
+	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventRole, Role: protocol.RoleWrite})
+
+	view := console.View()
+	if strings.Contains(view, "waiting for host approval") {
+		t.Fatalf("view still shows stale approval status after role grant:\n%s", view)
+	}
+	if !strings.Contains(view, "role write") || !strings.Contains(view, "approved") {
+		t.Fatalf("view missing granted role/approval state:\n%s", view)
+	}
+}
+
+func TestTUIConsoleGuestPendingStatusClearsWhenPeerApproved(t *testing.T) {
+	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, &recordingTerminalPane{view: "shell$"})
+
+	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventStatus, Message: "guest pending"})
+	console.OnRuntimeEvent(RuntimeEvent{
+		Kind:          RuntimeEventPeer,
+		ParticipantID: "guest-1",
+		DisplayName:   "shayne",
+		Role:          protocol.RoleWrite,
+	})
+
+	view := console.View()
+	if strings.Contains(view, "guest pending") {
+		t.Fatalf("view still shows stale pending status after peer approval:\n%s", view)
+	}
+	if !strings.Contains(view, "guest connected") || !strings.Contains(view, "shayne/write") {
+		t.Fatalf("view missing connected peer state:\n%s", view)
+	}
+}
+
 func TestTUIConsoleProgramRequiresInputAndOutputTTY(t *testing.T) {
 	stdin, stdout := openPipeFiles(t)
 	oldIsTerminalFD := isTerminalFD
@@ -660,12 +695,19 @@ func (p *recordingTerminalPane) MouseMode() tui.MouseMode {
 	return tui.MouseMode{}
 }
 
+func (p *recordingTerminalPane) InputMode() tui.TerminalInputMode {
+	return tui.TerminalInputMode{}
+}
+
 type blockingTerminalPane struct{}
 
 func (p *blockingTerminalPane) Write([]byte) (int, error) { panic("unexpected terminal write") }
 func (p *blockingTerminalPane) Resize(int, int)           {}
 func (p *blockingTerminalPane) View(int, int) string      { return "" }
 func (p *blockingTerminalPane) MouseMode() tui.MouseMode  { return tui.MouseMode{} }
+func (p *blockingTerminalPane) InputMode() tui.TerminalInputMode {
+	return tui.TerminalInputMode{}
+}
 
 type recordedConsoleCalls struct {
 	mu            sync.Mutex

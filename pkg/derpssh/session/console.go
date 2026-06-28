@@ -305,49 +305,79 @@ func (c *tuiConsole) resolvePendingApprovals(role protocol.Role) {
 func (c *tuiConsole) OnRuntimeEvent(event RuntimeEvent) {
 	switch event.Kind {
 	case RuntimeEventStatus:
-		c.stateMu.Lock()
-		c.transport = event.Message
-		msg := c.runtimeStateLocked()
-		c.stateMu.Unlock()
-		c.send(msg)
+		c.updateRuntimeState(func() { c.transport = event.Message })
 	case RuntimeEventPeer:
-		c.stateMu.Lock()
-		c.setPeerLocked(event.ParticipantID, event.DisplayName, event.Role)
-		msg := c.runtimeStateLocked()
-		c.stateMu.Unlock()
-		c.send(msg)
+		c.applyPeerRuntimeEvent(event)
 	case RuntimeEventRole:
-		c.stateMu.Lock()
-		c.localRole = tuiRoleFromProtocol(event.Role)
-		msg := c.runtimeStateLocked()
-		c.stateMu.Unlock()
-		c.send(msg)
+		c.applyRoleRuntimeEvent(event)
 	case RuntimeEventResize:
-		if strings.TrimSpace(event.ParticipantID) != "" {
-			return
-		}
-		c.stateMu.Lock()
+		c.applyResizeRuntimeEvent(event)
+	case RuntimeEventChat:
+		c.sendChatRuntimeEvent(event)
+	case RuntimeEventClose:
+		c.updateRuntimeState(func() { c.transport = closedTransportStatus(event.Message) })
+	}
+}
+
+func (c *tuiConsole) updateRuntimeState(update func()) {
+	c.stateMu.Lock()
+	update()
+	msg := c.runtimeStateLocked()
+	c.stateMu.Unlock()
+	c.send(msg)
+}
+
+func (c *tuiConsole) applyPeerRuntimeEvent(event RuntimeEvent) {
+	c.updateRuntimeState(func() {
+		c.setPeerLocked(event.ParticipantID, event.DisplayName, event.Role)
+		c.transport = transportAfterPeerRole(c.transport, event.Role)
+	})
+}
+
+func transportAfterPeerRole(current string, role protocol.Role) string {
+	if roleGranted(role) && current == "guest pending" {
+		return "guest connected"
+	}
+	return current
+}
+
+func (c *tuiConsole) applyRoleRuntimeEvent(event RuntimeEvent) {
+	c.updateRuntimeState(func() {
+		c.localRole = tuiRoleFromProtocol(event.Role)
+		c.transport = transportAfterLocalRole(c.transport, event.Role)
+	})
+}
+
+func transportAfterLocalRole(current string, role protocol.Role) string {
+	if roleGranted(role) && current == "waiting for host approval" {
+		return "approved"
+	}
+	return current
+}
+
+func (c *tuiConsole) applyResizeRuntimeEvent(event RuntimeEvent) {
+	if strings.TrimSpace(event.ParticipantID) != "" {
+		return
+	}
+	c.updateRuntimeState(func() {
 		c.hostCols = event.Cols
 		c.hostRows = event.Rows
-		msg := c.runtimeStateLocked()
-		c.stateMu.Unlock()
-		c.send(msg)
-	case RuntimeEventChat:
-		c.send(tui.ChatMsg{
-			Author: displayNameOrID(event.Chat.DisplayName, event.Chat.ParticipantID),
-			Body:   event.Chat.Text,
-		})
-	case RuntimeEventClose:
-		status := "closed"
-		if strings.TrimSpace(event.Message) != "" {
-			status += ": " + strings.TrimSpace(event.Message)
-		}
-		c.stateMu.Lock()
-		c.transport = status
-		msg := c.runtimeStateLocked()
-		c.stateMu.Unlock()
-		c.send(msg)
+	})
+}
+
+func (c *tuiConsole) sendChatRuntimeEvent(event RuntimeEvent) {
+	c.send(tui.ChatMsg{
+		Author: displayNameOrID(event.Chat.DisplayName, event.Chat.ParticipantID),
+		Body:   event.Chat.Text,
+	})
+}
+
+func closedTransportStatus(message string) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return "closed"
 	}
+	return "closed: " + message
 }
 
 func (c *tuiConsole) View() string {

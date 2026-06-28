@@ -73,6 +73,27 @@ func TestEncodeTerminalKeyNavigation(t *testing.T) {
 	}
 }
 
+func TestEncodeTerminalKeyApplicationCursorMode(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  tea.KeyMsg
+		want string
+	}{
+		{name: "up", msg: tea.KeyMsg{Type: tea.KeyUp}, want: "\x1bOA"},
+		{name: "down", msg: tea.KeyMsg{Type: tea.KeyDown}, want: "\x1bOB"},
+		{name: "right", msg: tea.KeyMsg{Type: tea.KeyRight}, want: "\x1bOC"},
+		{name: "left", msg: tea.KeyMsg{Type: tea.KeyLeft}, want: "\x1bOD"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := EncodeTerminalKeyWithMode(tt.msg, TerminalInputMode{ApplicationCursor: true})
+			if !ok || string(got) != tt.want {
+				t.Fatalf("EncodeTerminalKeyWithMode() = %q, %v; want %q, true", got, ok, tt.want)
+			}
+		})
+	}
+}
+
 func TestPrefixDoesNotReachPTY(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
@@ -152,6 +173,21 @@ func TestTerminalFocusEscapeReachesPTY(t *testing.T) {
 	}
 	if !bytes.Equal(got.Data, []byte{0x1b}) {
 		t.Fatalf("TerminalInputCommand.Data = %v, want escape byte", got.Data)
+	}
+}
+
+func TestTerminalFocusUsesApplicationCursorMode(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok", input: TerminalInputMode{ApplicationCursor: true}}})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyUp})
+
+	cmd := readCommand(app)
+	got, ok := cmd.(TerminalInputCommand)
+	if !ok {
+		t.Fatalf("command = %T, want TerminalInputCommand", cmd)
+	}
+	if !bytes.Equal(got.Data, []byte("\x1bOA")) {
+		t.Fatalf("TerminalInputCommand.Data = %q, want application cursor up", got.Data)
 	}
 }
 

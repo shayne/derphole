@@ -295,6 +295,27 @@ func TestLocalChatAuthorDefaultsToUser(t *testing.T) {
 	}
 }
 
+func TestLocalChatEchoIsDeduplicated(t *testing.T) {
+	app := NewApp(Options{Side: "host", DisplayName: "root@hetz", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	for _, r := range "hello" {
+		app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	app.Update(ChatMsg{Author: "root@hetz", Body: "hello"})
+
+	view := app.View()
+	if got := strings.Count(view, "root@hetz: hello"); got != 1 {
+		t.Fatalf("chat message rendered %d times, want once:\n%s", got, view)
+	}
+	if got := strings.Count(view, "Message"); got > 1 {
+		t.Fatalf("composer label rendered %d Message copies, want at most one:\n%s", got, view)
+	}
+}
+
 func TestInviteShortcutShowsFullScreenPlainInvite(t *testing.T) {
 	invite := "npx -y derpssh@latest connect DSH1verysecretinvitetoken1234567890"
 	app := NewApp(Options{Side: "host", InviteCommand: invite, Terminal: &fakePane{view: "ok"}})
@@ -390,6 +411,7 @@ type fakePane struct {
 	rows   int
 	view   string
 	mouse  MouseMode
+	input  TerminalInputMode
 }
 
 func (p *fakePane) Write(b []byte) (int, error) {
@@ -411,4 +433,8 @@ func (p *fakePane) View(width int, height int) string {
 
 func (p *fakePane) MouseMode() MouseMode {
 	return p.mouse
+}
+
+func (p *fakePane) InputMode() TerminalInputMode {
+	return p.input
 }

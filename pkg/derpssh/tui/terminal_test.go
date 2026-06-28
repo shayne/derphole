@@ -12,7 +12,7 @@ import (
 func TestVTTerminalPanePreservesANSIStyleOutput(t *testing.T) {
 	pane := NewVTTerminalPane(20, 4)
 
-	if _, err := pane.Write([]byte("plain \x1b[31mred\x1b[0m")); err != nil {
+	if _, err := pane.Write([]byte("plain \x1b[31mred\x1b[0m\x1b[?25l")); err != nil {
 		t.Fatalf("Write() error = %v", err)
 	}
 
@@ -53,7 +53,8 @@ func TestVTTerminalPaneHandlesCursorMovement(t *testing.T) {
 	}
 
 	view := pane.View(10, 3)
-	if !strings.Contains(view, "aZc") {
+	stripped := ansiPattern.ReplaceAllString(view, "")
+	if !strings.Contains(stripped, "aZc") {
 		t.Fatalf("View() = %q, want cursor movement to overwrite middle cell", view)
 	}
 }
@@ -91,5 +92,52 @@ func TestVTTerminalPaneTracksSplitSGRMouseMode(t *testing.T) {
 
 	if mode := pane.MouseMode(); !mode.Enabled || !mode.SGR {
 		t.Fatalf("MouseMode after split SGR enable = %+v, want enabled SGR", mode)
+	}
+}
+
+func TestVTTerminalPaneTracksApplicationCursorMode(t *testing.T) {
+	pane := NewVTTerminalPane(20, 4)
+
+	if _, err := pane.Write([]byte("\x1b[?1h")); err != nil {
+		t.Fatalf("enable Write() error = %v", err)
+	}
+	if mode := pane.InputMode(); !mode.ApplicationCursor {
+		t.Fatalf("InputMode after application cursor enable = %+v, want enabled", mode)
+	}
+
+	if _, err := pane.Write([]byte("\x1b[?1l")); err != nil {
+		t.Fatalf("disable Write() error = %v", err)
+	}
+	if mode := pane.InputMode(); mode.ApplicationCursor {
+		t.Fatalf("InputMode after application cursor disable = %+v, want disabled", mode)
+	}
+}
+
+func TestVTTerminalPaneRendersVisibleCursorOnBlankCell(t *testing.T) {
+	pane := NewVTTerminalPane(10, 3)
+
+	if _, err := pane.Write([]byte("$ ")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	view := pane.View(10, 3)
+	if !strings.Contains(view, "\x1b[7m \x1b[0m") {
+		t.Fatalf("View() = %q, want visible reverse-video cursor cell", view)
+	}
+	if width := visibleWidth(strings.Split(view, "\n")[0]); width != len("$  ") {
+		t.Fatalf("first line visible width = %d, want cursor cell included: %q", width, view)
+	}
+}
+
+func TestVTTerminalPaneHidesCursorWhenDECTCEMDisabled(t *testing.T) {
+	pane := NewVTTerminalPane(10, 3)
+
+	if _, err := pane.Write([]byte("$ \x1b[?25l")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	view := pane.View(10, 3)
+	if strings.Contains(view, "\x1b[7m") {
+		t.Fatalf("View() = %q, want hidden cursor to omit reverse-video overlay", view)
 	}
 }

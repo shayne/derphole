@@ -123,7 +123,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		a.peers = append([]Peer(nil), msg.Peers...)
 	case ChatMsg:
-		a.chatMessages = append(a.chatMessages, ChatMessage(msg))
+		a.appendChatMessage(ChatMessage(msg))
 	case ApprovalRequestMsg:
 		a.approvalPeerID = strings.TrimSpace(msg.PeerID)
 		a.approvalPeer = strings.TrimSpace(valueOr(msg.Peer, msg.PeerID))
@@ -362,7 +362,7 @@ func (a *App) handleChatKey(msg tea.KeyMsg) tea.Cmd {
 		body := strings.TrimSpace(a.composer.Value())
 		if body != "" {
 			a.emit(ChatSendCommand{Body: body})
-			a.chatMessages = append(a.chatMessages, ChatMessage{Author: a.localDisplayName(), Body: body, Local: true})
+			a.appendChatMessage(ChatMessage{Author: a.localDisplayName(), Body: body, Local: true})
 			a.composer.Reset()
 		}
 		return nil
@@ -372,8 +372,37 @@ func (a *App) handleChatKey(msg tea.KeyMsg) tea.Cmd {
 	return cmd
 }
 
+func (a *App) appendChatMessage(msg ChatMessage) {
+	if a.isLocalEcho(msg) {
+		return
+	}
+	a.chatMessages = append(a.chatMessages, msg)
+}
+
+func (a *App) isLocalEcho(msg ChatMessage) bool {
+	if msg.Local {
+		return false
+	}
+	author := strings.TrimSpace(msg.Author)
+	body := strings.TrimSpace(msg.Body)
+	if author == "" || body == "" {
+		return false
+	}
+	for i := len(a.chatMessages) - 1; i >= 0; i-- {
+		existing := a.chatMessages[i]
+		if !existing.Local {
+			continue
+		}
+		if strings.TrimSpace(existing.Author) == author && strings.TrimSpace(existing.Body) == body {
+			a.chatMessages[i].Local = false
+			return true
+		}
+	}
+	return false
+}
+
 func (a *App) handleTerminalKey(msg tea.KeyMsg) tea.Cmd {
-	if data, ok := EncodeTerminalKey(msg); ok {
+	if data, ok := EncodeTerminalKeyWithMode(msg, a.terminal.InputMode()); ok {
 		a.emit(TerminalInputCommand{Data: data})
 	}
 	return nil
@@ -502,7 +531,6 @@ func (a *App) writeSidebarComposer(content []string, width int, height int) {
 	if height < 4 {
 		return
 	}
-	content[height-3] = fitLine(labelStyle.Render("Message"), width)
 	composerLines := splitAndFit(a.composer.View(), width, 2)
 	for i := 0; i < 2 && height-2+i < height; i++ {
 		if i < len(composerLines) {

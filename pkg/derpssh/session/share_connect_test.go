@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -502,6 +503,52 @@ func TestShareStartsPTYAtTerminalPaneSize(t *testing.T) {
 	}
 
 	err := Share(context.Background(), ShareConfig{Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: io.Discard})
+	if err == nil || err.Error() != "stop" {
+		t.Fatalf("Share() error = %v, want stop", err)
+	}
+}
+
+func TestShareUsesUserAtHostDisplayName(t *testing.T) {
+	t.Setenv("USER", "root")
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
+		t.Skipf("hostname unavailable: %v", err)
+	}
+
+	oldGenerateServerToken := generateServerToken
+	oldGenerateClientToken := generateClientToken
+	oldServe := serveAppMux
+	oldStartPTY := startPTY
+	oldNewApproval := newShareApproval
+	oldRunHost := runHostSession
+	defer func() {
+		generateServerToken = oldGenerateServerToken
+		generateClientToken = oldGenerateClientToken
+		serveAppMux = oldServe
+		startPTY = oldStartPTY
+		newShareApproval = oldNewApproval
+		runHostSession = oldRunHost
+	}()
+	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	startPTY = func(pty.StartConfig) (*pty.Session, error) { return &pty.Session{}, nil }
+	newShareApproval = func(ShareConfig) Approval {
+		return StaticApproval{Role: protocol.RoleRead}
+	}
+	serveAppMux = func(ctx context.Context, cfg appsession.DerptunAppServeConfig) error {
+		return cfg.OnMux(ctx, nil)
+	}
+	runHostSession = func(ctx context.Context, cfg HostConfig, bindConsole func(*HostRuntime)) error {
+		_ = bindConsole
+		_ = ctx
+		want := "root@" + host
+		if cfg.HostName != want {
+			t.Fatalf("HostConfig.HostName = %q, want %q", cfg.HostName, want)
+		}
+		return errors.New("stop")
+	}
+
+	err = Share(context.Background(), ShareConfig{Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: io.Discard})
 	if err == nil || err.Error() != "stop" {
 		t.Fatalf("Share() error = %v, want stop", err)
 	}
