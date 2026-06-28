@@ -1355,7 +1355,9 @@ func (a *App) openInvite() tea.Cmd {
 }
 
 func (a *App) canShowInvite() bool {
-	return strings.TrimSpace(a.inviteCommand) != "" && strings.EqualFold(strings.TrimSpace(a.side), string(ModeHost))
+	// The invite command must stay on the normal terminal screen so users can
+	// manually select one soft-wrapped shell line, including over SSH.
+	return false
 }
 
 type terminalCursorController interface {

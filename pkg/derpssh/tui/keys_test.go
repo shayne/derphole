@@ -289,7 +289,7 @@ func TestPrefixRoleCommandsUseSelectedPeerID(t *testing.T) {
 	}
 }
 
-func TestPrefixInviteOpensInviteScreen(t *testing.T) {
+func TestPrefixInviteIgnoredInActiveSession(t *testing.T) {
 	invite := "npx -y derpssh@latest connect DSH1copyme"
 	app := NewApp(Options{Side: "host", InviteCommand: invite, Terminal: &fakePane{view: "ok"}})
 
@@ -297,10 +297,10 @@ func TestPrefixInviteOpensInviteScreen(t *testing.T) {
 	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
 
 	if cmd := readCommand(app); cmd != nil {
-		t.Fatalf("Ctrl-X I emitted command %+v, want only local invite screen", cmd)
+		t.Fatalf("Ctrl-X I emitted command %+v, want none", cmd)
 	}
-	if !app.inviteOpen {
-		t.Fatalf("inviteOpen = false, want true")
+	if app.inviteOpen {
+		t.Fatalf("inviteOpen = true, want false")
 	}
 }
 

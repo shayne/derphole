@@ -222,30 +222,34 @@ func TestStartShareTerminalPreservesCapableParentTerm(t *testing.T) {
 	}
 }
 
-func TestShareRunsInvitePreflightBeforeTerminal(t *testing.T) {
+func TestShareReturnsPlainInviteStartErrorBeforeServing(t *testing.T) {
+	t.Setenv("DERPSSH_TEST_COMMAND", "cat")
 	oldGenerateServerToken := generateServerToken
 	oldGenerateClientToken := generateClientToken
-	oldShowPreflight := showShareInvitePreflight
-	oldStartPTY := startPTY
+	oldCanUsePreflight := canUseShareInvitePreflight
+	oldStartPreflight := startShareInvitePreflight
+	oldServe := serveAppMux
 	defer func() {
 		generateServerToken = oldGenerateServerToken
 		generateClientToken = oldGenerateClientToken
-		showShareInvitePreflight = oldShowPreflight
-		startPTY = oldStartPTY
+		canUseShareInvitePreflight = oldCanUsePreflight
+		startShareInvitePreflight = oldStartPreflight
+		serveAppMux = oldServe
 	}()
 
 	sentinel := errors.New("preflight sentinel")
 	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
 	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
-	showShareInvitePreflight = func(stdin io.Reader, stdout io.Writer, command string) (bool, error) {
+	canUseShareInvitePreflight = func(ShareConfig) bool { return true }
+	startShareInvitePreflight = func(_ context.Context, _ ShareConfig, command string) (shareInvitePreflight, error) {
 		if !strings.Contains(command, "npx -y derpssh@latest connect DSH1") {
 			t.Fatalf("preflight command = %q, want derpssh connect invite", command)
 		}
-		return true, sentinel
+		return nil, sentinel
 	}
-	startPTY = func(pty.StartConfig) (*pty.Session, error) {
-		t.Fatal("startPTY called before preflight completed")
-		return nil, nil
+	serveAppMux = func(context.Context, appsession.DerptunAppServeConfig) error {
+		t.Fatal("serveAppMux called after plain invite failed to start")
+		return nil
 	}
 
 	err := Share(context.Background(), ShareConfig{Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: io.Discard})
@@ -259,6 +263,9 @@ func TestInvitePreflightScreenContainsPlainFullCommand(t *testing.T) {
 	screen := invitePreflightScreen(command)
 	if !strings.Contains(screen, command) {
 		t.Fatalf("preflight screen missing full command:\n%s", screen)
+	}
+	if got := strings.Count(screen, "\n"+command+"\n"); got != 1 {
+		t.Fatalf("preflight screen should render command as one physical line, count=%d:\n%s", got, screen)
 	}
 	if strings.Contains(screen, "\x1b[") {
 		t.Fatalf("preflight screen contains ANSI styling:\n%q", screen)
@@ -335,6 +342,66 @@ func TestReadInvitePreflightInputQuitsOnCtrlC(t *testing.T) {
 	}
 	if !shown {
 		t.Fatal("readInvitePreflightInput() shown = false, want true")
+	}
+}
+
+func TestReadInvitePreflightInputInterruptibleContinuesOnEnter(t *testing.T) {
+	inR, inW := testPipe(t)
+	wakeR, wakeW := testPipe(t)
+	defer closeFiles(inR, inW, wakeR, wakeW)
+
+	if _, err := inW.Write([]byte("\n")); err != nil {
+		t.Fatalf("write input pipe: %v", err)
+	}
+
+	result := readInvitePreflightInputInterruptible(inR, wakeR)
+	if result.Err != nil || result.Action != invitePreflightContinue {
+		t.Fatalf("interruptible input result = %+v, want continue", result)
+	}
+}
+
+func TestReadInvitePreflightInputInterruptibleQuitsOnQ(t *testing.T) {
+	inR, inW := testPipe(t)
+	wakeR, wakeW := testPipe(t)
+	defer closeFiles(inR, inW, wakeR, wakeW)
+
+	if _, err := inW.Write([]byte("q")); err != nil {
+		t.Fatalf("write input pipe: %v", err)
+	}
+
+	result := readInvitePreflightInputInterruptible(inR, wakeR)
+	if result.Err != nil || result.Action != invitePreflightQuit {
+		t.Fatalf("interruptible input result = %+v, want quit", result)
+	}
+}
+
+func TestReadInvitePreflightInputInterruptibleWakesOnInterrupt(t *testing.T) {
+	inR, inW := testPipe(t)
+	wakeR, wakeW := testPipe(t)
+	defer closeFiles(inR, inW, wakeR, wakeW)
+
+	if _, err := wakeW.Write([]byte{1}); err != nil {
+		t.Fatalf("write wake pipe: %v", err)
+	}
+
+	result := readInvitePreflightInputInterruptible(inR, wakeR)
+	if result.Err != nil || result.Action != invitePreflightInterrupted {
+		t.Fatalf("interruptible input result = %+v, want interrupted", result)
+	}
+}
+
+func TestReadInvitePreflightInputInterruptibleIgnoresUnknownKeys(t *testing.T) {
+	inR, inW := testPipe(t)
+	wakeR, wakeW := testPipe(t)
+	defer closeFiles(inR, inW, wakeR, wakeW)
+
+	if _, err := inW.Write([]byte("x\n")); err != nil {
+		t.Fatalf("write input pipe: %v", err)
+	}
+
+	result := readInvitePreflightInputInterruptible(inR, wakeR)
+	if result.Err != nil || result.Action != invitePreflightContinue {
+		t.Fatalf("interruptible input result = %+v, want continue after ignored key", result)
 	}
 }
 
@@ -631,6 +698,110 @@ func TestSharePrintsConnectCommandBeforeServing(t *testing.T) {
 	}
 }
 
+func TestShareStartsServingWhilePlainInviteWaits(t *testing.T) {
+	t.Setenv("DERPSSH_TEST_COMMAND", "cat")
+	oldGenerateServerToken := generateServerToken
+	oldGenerateClientToken := generateClientToken
+	oldServe := serveAppMux
+	oldCanUsePreflight := canUseShareInvitePreflight
+	oldStartPreflight := startShareInvitePreflight
+	defer func() {
+		generateServerToken = oldGenerateServerToken
+		generateClientToken = oldGenerateClientToken
+		serveAppMux = oldServe
+		canUseShareInvitePreflight = oldCanUsePreflight
+		startShareInvitePreflight = oldStartPreflight
+	}()
+	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	canUseShareInvitePreflight = func(ShareConfig) bool { return true }
+	preflight := newFakeShareInvitePreflight()
+	preflightStarted := make(chan struct{})
+	var gotCommand string
+	startShareInvitePreflight = func(_ context.Context, _ ShareConfig, command string) (shareInvitePreflight, error) {
+		gotCommand = command
+		close(preflightStarted)
+		return preflight, nil
+	}
+	served := make(chan struct{})
+	serveAppMux = func(ctx context.Context, cfg appsession.DerptunAppServeConfig) error {
+		_, _ = cfg, ctx
+		close(served)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Share(context.Background(), ShareConfig{Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: io.Discard})
+	}()
+
+	select {
+	case <-preflightStarted:
+	case <-time.After(time.Second):
+		t.Fatal("plain invite preflight did not start")
+	}
+	select {
+	case <-served:
+	case <-time.After(time.Second):
+		t.Fatal("share server did not start while invite preflight was waiting")
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("Share() returned before invite action: %v", err)
+	default:
+	}
+	if !strings.Contains(gotCommand, "npx -y derpssh@latest connect DSH1") {
+		t.Fatalf("preflight command = %q, want derpssh connect invite", gotCommand)
+	}
+	preflight.finish(shareInvitePreflightResult{Action: invitePreflightQuit})
+	if err := <-errCh; err != nil {
+		t.Fatalf("Share() after invite quit = %v, want nil", err)
+	}
+}
+
+func TestShareGuestApprovalInterruptsPlainInvite(t *testing.T) {
+	t.Setenv("DERPSSH_TEST_COMMAND", "cat")
+	oldGenerateServerToken := generateServerToken
+	oldGenerateClientToken := generateClientToken
+	oldServe := serveAppMux
+	oldCanUsePreflight := canUseShareInvitePreflight
+	oldStartPreflight := startShareInvitePreflight
+	oldRunHost := runHostSession
+	defer func() {
+		generateServerToken = oldGenerateServerToken
+		generateClientToken = oldGenerateClientToken
+		serveAppMux = oldServe
+		canUseShareInvitePreflight = oldCanUsePreflight
+		startShareInvitePreflight = oldStartPreflight
+		runHostSession = oldRunHost
+	}()
+	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	canUseShareInvitePreflight = func(ShareConfig) bool { return true }
+	preflight := newFakeShareInvitePreflight()
+	startShareInvitePreflight = func(context.Context, ShareConfig, string) (shareInvitePreflight, error) {
+		return preflight, nil
+	}
+	serveAppMux = func(ctx context.Context, cfg appsession.DerptunAppServeConfig) error {
+		return cfg.OnMux(ctx, nil)
+	}
+	runHostSession = func(ctx context.Context, cfg HostConfig, bindConsole func(*HostRuntime)) error {
+		_ = ctx
+		_ = bindConsole
+		_ = cfg.Approval.Approve(JoinRequest{ParticipantID: "guest-1", DisplayName: "shayne"})
+		if !preflight.interrupted.Load() {
+			t.Fatal("approval did not interrupt plain invite preflight before starting the console")
+		}
+		return errors.New("stop")
+	}
+
+	err := Share(context.Background(), ShareConfig{Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: io.Discard})
+	if err == nil || err.Error() != "stop" {
+		t.Fatalf("Share() error = %v, want stop", err)
+	}
+}
+
 func TestConnectDecodesInviteAndDials(t *testing.T) {
 	oldDial := dialAppMux
 	defer func() { dialAppMux = oldDial }()
@@ -820,6 +991,58 @@ type closeAwareReader struct {
 	closed atomic.Bool
 	done   chan struct{}
 	once   sync.Once
+}
+
+func testPipe(t *testing.T) (*os.File, *os.File) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
+	return r, w
+}
+
+func closeFiles(files ...*os.File) {
+	for _, file := range files {
+		if file != nil {
+			_ = file.Close()
+		}
+	}
+}
+
+type fakeShareInvitePreflight struct {
+	interrupted atomic.Bool
+	done        chan shareInvitePreflightResult
+	once        sync.Once
+	waitOnce    sync.Once
+	result      shareInvitePreflightResult
+}
+
+func newFakeShareInvitePreflight() *fakeShareInvitePreflight {
+	return &fakeShareInvitePreflight{done: make(chan shareInvitePreflightResult, 1)}
+}
+
+func (p *fakeShareInvitePreflight) Interrupt() {
+	p.interrupted.Store(true)
+	p.finish(shareInvitePreflightResult{Action: invitePreflightInterrupted})
+}
+
+func (p *fakeShareInvitePreflight) finish(result shareInvitePreflightResult) {
+	p.once.Do(func() {
+		p.done <- result
+		close(p.done)
+	})
+}
+
+func (p *fakeShareInvitePreflight) Wait() shareInvitePreflightResult {
+	p.waitOnce.Do(func() {
+		result, ok := <-p.done
+		if !ok {
+			result = shareInvitePreflightResult{Action: invitePreflightInterrupted}
+		}
+		p.result = result
+	})
+	return p.result
 }
 
 type readTrackingReader struct {

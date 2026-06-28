@@ -23,6 +23,7 @@ import (
 	"github.com/shayne/derphole/pkg/derptun"
 	appsession "github.com/shayne/derphole/pkg/session"
 	"github.com/shayne/derphole/pkg/telemetry"
+	"golang.org/x/sys/unix"
 )
 
 type ShareConfig struct {
@@ -39,6 +40,11 @@ var serveAppMux = appsession.DerptunAppServe
 var startPTY = pty.Start
 var newShareApproval = newTerminalShareApproval
 var showShareInvitePreflight = showInvitePreflight
+var canUseShareInvitePreflight = func(cfg ShareConfig) bool {
+	_, ok := invitePreflightFiles(cfg.Stdin, cfg.Stdout)
+	return ok
+}
+var startShareInvitePreflight = startRawShareInvitePreflight
 var clearInvitePreflightScreen = "\x1b[H\x1b[2J\x1b[3J"
 var runHostSession = func(ctx context.Context, cfg HostConfig, bindConsole func(*HostRuntime)) error {
 	host := NewHostRuntime(cfg)
@@ -54,8 +60,8 @@ func Share(ctx context.Context, cfg ShareConfig) error {
 	if err != nil {
 		return err
 	}
-	initialInviteOpen := canUseTUIInvite(cfg)
-	if !initialInviteOpen {
+	plainInvite := canUseShareInvitePreflight(cfg)
+	if !plainInvite {
 		if err := presentShareInvite(cfg, connectCommand); err != nil {
 			if errors.Is(err, errInvitePreflightQuit) {
 				return nil
@@ -63,7 +69,7 @@ func Share(ctx context.Context, cfg ShareConfig) error {
 			return err
 		}
 	}
-	return runShare(ctx, cfg, serverToken, connectCommand, initialInviteOpen)
+	return runShare(ctx, cfg, serverToken, connectCommand, plainInvite)
 }
 
 func newShareInviteCommand() (string, string, error) {
@@ -97,12 +103,7 @@ func presentShareInvite(cfg ShareConfig, connectCommand string) error {
 	return nil
 }
 
-func canUseTUIInvite(cfg ShareConfig) bool {
-	_, ok := invitePreflightFiles(cfg.Stdin, cfg.Stdout)
-	return ok
-}
-
-func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand string, initialInviteOpen bool) error {
+func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand string, plainInvite bool) error {
 	size := terminalSize(cfg.Stdout)
 	displayName := shareDisplayName()
 	console := newTerminalConsoleWithOptions(tuiConsoleOptions{
@@ -113,7 +114,7 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 		Stdout:            cfg.Stdout,
 		DisplayName:       displayName,
 		InviteCommand:     connectCommand,
-		InitialInviteOpen: initialInviteOpen,
+		InitialInviteOpen: false,
 	})
 	terminalSize := console.TerminalSize()
 	terminal, err := startShareTerminal(terminalSize)
@@ -127,6 +128,7 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 
 	shareCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	quitBeforeGuest := atomic.Bool{}
 
 	var hostStarted atomic.Bool
 	fanout := newTerminalFanout(terminal.Output, console)
@@ -138,8 +140,25 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 	}()
 
 	pendingChats := newPendingShareChats()
+	preflight, plainInvite, err := prepareShareInvitePreflight(shareCtx, cfg, connectCommand, plainInvite)
+	if err != nil {
+		return err
+	}
+	if preflight != nil {
+		defer func() {
+			preflight.Interrupt()
+			_ = preflight.Wait()
+		}()
+	}
+	starter := newShareConsoleStarter(console, shareCtx, preflight)
 	console.SetCommandCallbacks(waitingShareConsoleCallbacks(terminal, cancel, pendingChats))
-	console.Start(shareCtx)
+	var preflightErr atomic.Value
+	var preflightExit <-chan struct{}
+	if plainInvite {
+		preflightExit = watchShareInvitePreflight(preflight, starter, terminal, cancel, &quitBeforeGuest, &preflightErr)
+	} else {
+		starter.Start()
+	}
 	defer console.Stop()
 	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventStatus, Message: "waiting for guest"})
 	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventResize, Cols: terminalSize.Cols, Rows: terminalSize.Rows})
@@ -150,46 +169,108 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 		}
 	})
 
-	return serveAppMux(shareCtx, appsession.DerptunAppServeConfig{
-		ServerToken: serverToken,
-		Emitter:     sessionEmitter,
-		ForceRelay:  cfg.ForceRelay,
-		OnMux: func(ctx context.Context, mux *derptun.Mux) error {
-			hostStarted.Store(true)
-			approval := newShareApproval(cfg)
-			if _, ok := approval.(terminalShareApproval); ok {
-				approval = console
-			}
-			hostCfg := HostConfig{
-				Mux:           mux,
-				HostID:        randomID("host"),
-				HostName:      displayName,
-				InitialCols:   terminalSize.Cols,
-				InitialRows:   terminalSize.Rows,
-				PTYInput:      terminal.Input,
-				PTYOutput:     fanout.LazyReader(),
-				CloseOnPTYEOF: true,
-				PTYResize: func(cols int, rows int) error {
-					return terminal.Resize(pty.Size{Cols: cols, Rows: rows})
-				},
-				LocalInput:  emptyReader{},
-				LocalOutput: io.Discard,
-				Approval:    approval,
-				Observer:    console,
-			}
-			return runHostSession(ctx, hostCfg, func(host *HostRuntime) {
-				callbacks := hostConsoleCallbacks(host)
-				callbacks.Quit = func(ctx context.Context) error {
-					err := host.Close(ctx, hostQuitReason)
-					_ = terminal.Close()
-					cancel()
-					return err
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- serveAppMux(shareCtx, appsession.DerptunAppServeConfig{
+			ServerToken: serverToken,
+			Emitter:     sessionEmitter,
+			ForceRelay:  cfg.ForceRelay,
+			OnMux: func(ctx context.Context, mux *derptun.Mux) error {
+				hostStarted.Store(true)
+				approval := newShareApproval(cfg)
+				if _, ok := approval.(terminalShareApproval); ok {
+					approval = startingShareApproval{Approval: console, Start: starter.Start}
 				}
-				console.SetCommandCallbacks(callbacks)
-				go pendingChats.flush(ctx, callbacks.Chat)
-			})
-		},
-	})
+				hostCfg := HostConfig{
+					Mux:           mux,
+					HostID:        randomID("host"),
+					HostName:      displayName,
+					InitialCols:   terminalSize.Cols,
+					InitialRows:   terminalSize.Rows,
+					PTYInput:      terminal.Input,
+					PTYOutput:     fanout.LazyReader(),
+					CloseOnPTYEOF: true,
+					PTYResize: func(cols int, rows int) error {
+						return terminal.Resize(pty.Size{Cols: cols, Rows: rows})
+					},
+					LocalInput:  emptyReader{},
+					LocalOutput: io.Discard,
+					Approval:    approval,
+					Observer:    console,
+				}
+				return runHostSession(ctx, hostCfg, func(host *HostRuntime) {
+					callbacks := hostConsoleCallbacks(host)
+					callbacks.Quit = func(ctx context.Context) error {
+						err := host.Close(ctx, hostQuitReason)
+						_ = terminal.Close()
+						cancel()
+						return err
+					}
+					console.SetCommandCallbacks(callbacks)
+					go pendingChats.flush(ctx, callbacks.Chat)
+				})
+			},
+		})
+	}()
+	select {
+	case err = <-serveErr:
+	case <-preflightExit:
+		err = context.Canceled
+	}
+	return finishShareError(err, shareCtx, &quitBeforeGuest, &preflightErr)
+}
+
+func prepareShareInvitePreflight(ctx context.Context, cfg ShareConfig, command string, enabled bool) (shareInvitePreflight, bool, error) {
+	if !enabled {
+		return nil, false, nil
+	}
+	preflight, err := startShareInvitePreflight(ctx, cfg, command)
+	if err != nil {
+		return nil, false, err
+	}
+	return preflight, preflight != nil, nil
+}
+
+func watchShareInvitePreflight(
+	preflight shareInvitePreflight,
+	starter *shareConsoleStarter,
+	terminal *shareTerminal,
+	cancel context.CancelFunc,
+	quitBeforeGuest *atomic.Bool,
+	preflightErr *atomic.Value,
+) <-chan struct{} {
+	exited := make(chan struct{})
+	go func() {
+		result := preflight.Wait()
+		if result.Err != nil {
+			preflightErr.Store(result.Err)
+			quitBeforeGuest.Store(true)
+			_ = terminal.Close()
+			cancel()
+			close(exited)
+			return
+		}
+		switch result.Action {
+		case invitePreflightContinue:
+			starter.Start()
+		case invitePreflightQuit:
+			quitBeforeGuest.Store(true)
+			_ = terminal.Close()
+			cancel()
+			close(exited)
+		}
+	}()
+	return exited
+}
+
+func finishShareError(err error, ctx context.Context, quitBeforeGuest *atomic.Bool, preflightErr *atomic.Value) error {
+	if errValue := preflightErr.Load(); errValue != nil {
+		return errValue.(error)
+	}
+	if quitBeforeGuest.Load() || isShareQuitError(err, ctx) {
+		return nil
+	}
+	return err
 }
 
 func shareDisplayName() string {
@@ -281,6 +362,139 @@ func (p *pendingShareChats) flush(ctx context.Context, send func(context.Context
 	}
 }
 
+type shareInvitePreflight interface {
+	Interrupt()
+	Wait() shareInvitePreflightResult
+}
+
+type shareInvitePreflightResult struct {
+	Action invitePreflightAction
+	Err    error
+}
+
+type rawShareInvitePreflight struct {
+	done      chan shareInvitePreflightResult
+	inFile    *os.File
+	rawState  *pty.RawState
+	wakeRead  *os.File
+	wakeWrite *os.File
+	wakeOnce  sync.Once
+	waitOnce  sync.Once
+	result    shareInvitePreflightResult
+}
+
+func startRawShareInvitePreflight(_ context.Context, cfg ShareConfig, command string) (shareInvitePreflight, error) {
+	inFile, ok := invitePreflightFiles(cfg.Stdin, cfg.Stdout)
+	if !ok {
+		return nil, nil
+	}
+	state, err := pty.MakeRaw(inFile.Fd())
+	if err != nil {
+		return nil, err
+	}
+	if err := renderRawInvitePreflight(cfg.Stdout, command); err != nil {
+		_ = pty.Restore(inFile.Fd(), state)
+		return nil, err
+	}
+	wakeRead, wakeWrite, err := os.Pipe()
+	if err != nil {
+		_ = pty.Restore(inFile.Fd(), state)
+		return nil, err
+	}
+	preflight := &rawShareInvitePreflight{
+		done:      make(chan shareInvitePreflightResult, 1),
+		inFile:    inFile,
+		rawState:  state,
+		wakeRead:  wakeRead,
+		wakeWrite: wakeWrite,
+	}
+	go preflight.read()
+	return preflight, nil
+}
+
+func (p *rawShareInvitePreflight) read() {
+	defer close(p.done)
+	defer func() { _ = pty.Restore(p.inFile.Fd(), p.rawState) }()
+	defer func() { _ = p.wakeRead.Close() }()
+	defer p.closeWakeWriter()
+	p.done <- readInvitePreflightInputInterruptible(p.inFile, p.wakeRead)
+}
+
+func (p *rawShareInvitePreflight) Interrupt() {
+	p.wakeOnce.Do(func() {
+		_, _ = p.wakeWrite.Write([]byte{1})
+		_ = p.wakeWrite.Close()
+	})
+}
+
+func (p *rawShareInvitePreflight) closeWakeWriter() {
+	p.wakeOnce.Do(func() {
+		_ = p.wakeWrite.Close()
+	})
+}
+
+func (p *rawShareInvitePreflight) Wait() shareInvitePreflightResult {
+	p.waitOnce.Do(func() {
+		result, ok := <-p.done
+		if !ok {
+			result = shareInvitePreflightResult{Action: invitePreflightInterrupted}
+		}
+		p.result = result
+	})
+	return p.result
+}
+
+type shareConsoleStarter struct {
+	console   *tuiConsole
+	ctx       context.Context
+	preflight shareInvitePreflight
+	once      sync.Once
+}
+
+func newShareConsoleStarter(console *tuiConsole, ctx context.Context, preflight shareInvitePreflight) *shareConsoleStarter {
+	return &shareConsoleStarter{console: console, ctx: ctx, preflight: preflight}
+}
+
+func (s *shareConsoleStarter) Start() {
+	if s == nil || s.console == nil {
+		return
+	}
+	s.once.Do(func() {
+		if s.preflight != nil {
+			s.preflight.Interrupt()
+			if s.preflight.Wait().Action == invitePreflightQuit {
+				return
+			}
+		}
+		s.console.Start(s.ctx)
+	})
+}
+
+type startingShareApproval struct {
+	Approval Approval
+	Start    func()
+}
+
+func (a startingShareApproval) Approve(req JoinRequest) protocol.Role {
+	if a.Start != nil {
+		a.Start()
+	}
+	if a.Approval == nil {
+		return protocol.RoleDenied
+	}
+	return a.Approval.Approve(req)
+}
+
+func isShareQuitError(err error, ctx context.Context) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	return ctx.Err() != nil && strings.Contains(err.Error(), context.Canceled.Error())
+}
+
 var errInvitePreflightQuit = errors.New("invite preflight quit")
 
 func showInvitePreflight(stdin io.Reader, stdout io.Writer, command string) (bool, error) {
@@ -305,6 +519,12 @@ func invitePreflightFiles(stdin io.Reader, stdout io.Writer) (*os.File, bool) {
 
 func renderInvitePreflight(stdout io.Writer, command string) error {
 	_, err := io.WriteString(stdout, clearInvitePreflightScreen+invitePreflightScreen(command))
+	return err
+}
+
+func renderRawInvitePreflight(stdout io.Writer, command string) error {
+	text := strings.ReplaceAll(clearInvitePreflightScreen+invitePreflightScreen(command), "\n", "\r\n")
+	_, err := io.WriteString(stdout, text)
 	return err
 }
 
@@ -335,12 +555,60 @@ func readInvitePreflightInput(r io.Reader) (bool, error) {
 	}
 }
 
+func readInvitePreflightInputInterruptible(inFile, wakeRead *os.File) shareInvitePreflightResult {
+	var b [1]byte
+	for {
+		action, err := pollInvitePreflightInput(inFile, wakeRead, b[:])
+		if err != nil {
+			return shareInvitePreflightResult{Action: invitePreflightQuit, Err: err}
+		}
+		if action == invitePreflightInterrupted {
+			return shareInvitePreflightResult{Action: action}
+		}
+		switch invitePreflightKeyAction(b[0]) {
+		case invitePreflightContinue:
+			return shareInvitePreflightResult{Action: invitePreflightContinue}
+		case invitePreflightQuit:
+			return shareInvitePreflightResult{Action: invitePreflightQuit}
+		}
+	}
+}
+
+func pollInvitePreflightInput(inFile, wakeRead *os.File, buf []byte) (invitePreflightAction, error) {
+	for {
+		fds := []unix.PollFd{
+			{Fd: int32(inFile.Fd()), Events: unix.POLLIN},
+			{Fd: int32(wakeRead.Fd()), Events: unix.POLLIN | unix.POLLHUP},
+		}
+		if _, err := unix.Poll(fds, -1); err != nil {
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			return invitePreflightQuit, err
+		}
+		if fds[1].Revents != 0 {
+			return invitePreflightInterrupted, nil
+		}
+		if fds[0].Revents&unix.POLLIN == 0 {
+			continue
+		}
+		n, err := inFile.Read(buf)
+		if n > 0 {
+			return invitePreflightContinue, nil
+		}
+		if err != nil {
+			return invitePreflightQuit, err
+		}
+	}
+}
+
 type invitePreflightAction int
 
 const (
 	invitePreflightIgnore invitePreflightAction = iota
 	invitePreflightContinue
 	invitePreflightQuit
+	invitePreflightInterrupted
 )
 
 func invitePreflightKeyAction(b byte) invitePreflightAction {

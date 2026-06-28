@@ -326,13 +326,13 @@ func TestGuestPrefixHintsDoNotShowInvite(t *testing.T) {
 	}
 }
 
-func TestMenuShowsInviteForHostOnly(t *testing.T) {
+func TestMenuDoesNotShowInviteInActiveSession(t *testing.T) {
 	host := NewApp(Options{Side: "host", InviteCommand: "npx -y derpssh@latest connect DSH1copyme", Terminal: &fakePane{view: "ok"}})
 	host.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
 	host.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
 	host.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
-	if !strings.Contains(host.View(), "Show Invite") || !strings.Contains(host.View(), "Ctrl-X I") {
-		t.Fatalf("host menu missing invite action:\n%s", host.View())
+	if strings.Contains(host.View(), "Show Invite") || strings.Contains(host.View(), "Ctrl-X I") {
+		t.Fatalf("host menu exposes invite action inside active TUI:\n%s", host.View())
 	}
 
 	guest := NewApp(Options{Side: "guest", InviteCommand: "npx -y derpssh@latest connect DSH1copyme", Terminal: &fakePane{view: "ok"}})
@@ -426,7 +426,7 @@ func TestLocalChatEchoIsDeduplicated(t *testing.T) {
 	}
 }
 
-func TestInviteShortcutShowsFullScreenPlainInvite(t *testing.T) {
+func TestInviteShortcutDoesNotOpenInviteInActiveSession(t *testing.T) {
 	invite := "npx -y derpssh@latest connect DSH1verysecretinvitetoken1234567890"
 	app := NewApp(Options{Side: "host", InviteCommand: invite, Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 40, Height: 12})
@@ -435,38 +435,11 @@ func TestInviteShortcutShowsFullScreenPlainInvite(t *testing.T) {
 	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
 
 	view := app.View()
-	for _, want := range []string{"npx -y derpssh@latest connect", "DSH1verysecretinvitetoken1234567890"} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("invite view missing command fragment %q:\n%s", want, view)
-		}
+	if app.inviteOpen {
+		t.Fatalf("inviteOpen = true, want false")
 	}
-	if got := strings.Count(view, invite); got != 1 {
-		t.Fatalf("invite command should be one physical line, count=%d:\n%s", got, view)
-	}
-	if strings.Contains(view, "\x1b[") {
-		t.Fatalf("invite view contains ANSI styling:\n%q", view)
-	}
-	if strings.Contains(view, "shell$") || strings.Contains(view, "Sidechat") {
-		t.Fatalf("invite view did not replace main TUI:\n%s", view)
-	}
-}
-
-func TestInviteScreenCopyEmitsCopyCommand(t *testing.T) {
-	invite := "npx -y derpssh@latest connect DSH1copyme"
-	app := NewApp(Options{Side: "host", InviteCommand: invite, Terminal: &fakePane{view: "shell$"}})
-	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
-	drainCommands(app)
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
-
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
-
-	got, ok := readCommand(app).(CopyInviteCommand)
-	if !ok {
-		t.Fatalf("copy key command = %T, want CopyInviteCommand", got)
-	}
-	if got.Command != invite {
-		t.Fatalf("copy command = %q, want %q", got.Command, invite)
+	if strings.Contains(view, invite) || strings.Contains(view, "DSH1verysecretinvitetoken1234567890") {
+		t.Fatalf("active TUI exposes invite command:\n%s", view)
 	}
 }
 
@@ -587,10 +560,13 @@ func TestTerminalCursorSuppressedWhenChatFocused(t *testing.T) {
 }
 
 func TestInviteScreenEscapeReturnsToTerminal(t *testing.T) {
-	app := NewApp(Options{Side: "host", InviteCommand: "npx -y derpssh@latest connect DSH1test", Terminal: &fakePane{view: "shell$"}})
+	app := NewApp(Options{
+		Side:              "host",
+		InviteCommand:     "npx -y derpssh@latest connect DSH1test",
+		InitialInviteOpen: true,
+		Terminal:          &fakePane{view: "shell$"},
+	})
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
 
 	app.Update(tea.KeyMsg{Type: tea.KeyEsc})
 
@@ -624,11 +600,14 @@ func TestApprovalRequestDismissesInitialInviteScreen(t *testing.T) {
 }
 
 func TestInviteScreenQReturnsToTerminal(t *testing.T) {
-	app := NewApp(Options{Side: "host", InviteCommand: "npx -y derpssh@latest connect DSH1test", Terminal: &fakePane{view: "shell$"}})
+	app := NewApp(Options{
+		Side:              "host",
+		InviteCommand:     "npx -y derpssh@latest connect DSH1test",
+		InitialInviteOpen: true,
+		Terminal:          &fakePane{view: "shell$"},
+	})
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
 	drainCommands(app)
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
 
 	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 

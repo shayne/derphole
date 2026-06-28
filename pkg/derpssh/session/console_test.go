@@ -50,6 +50,28 @@ func TestTUIConsoleSendBeforeStartDoesNotCallProgramSend(t *testing.T) {
 	}
 }
 
+func TestTUIConsoleStopBeforeStartDoesNotQuitProgram(t *testing.T) {
+	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, &recordingTerminalPane{view: "shell$"})
+	program := newBlockingQuitProgram()
+	console.program = program
+
+	done := make(chan struct{})
+	go func() {
+		console.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-program.quitEntered:
+		program.releaseQuit()
+		t.Fatal("Stop called Program.Quit before Start")
+	case <-time.After(time.Second):
+		program.releaseQuit()
+		t.Fatal("Stop blocked before Start")
+	}
+}
+
 func TestTUIConsoleApprovalStatusClearsWhenRoleGranted(t *testing.T) {
 	console := newHeadlessTUIConsole(tui.ModeGuest, 100, 30, &recordingTerminalPane{view: "shell$"})
 
@@ -858,6 +880,40 @@ func (p *runGatedProgram) Quit() {
 	case <-p.quit:
 	default:
 		close(p.quit)
+	}
+}
+
+type blockingQuitProgram struct {
+	quitEntered chan struct{}
+	release     chan struct{}
+	once        sync.Once
+}
+
+func newBlockingQuitProgram() *blockingQuitProgram {
+	return &blockingQuitProgram{
+		quitEntered: make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+}
+
+func (p *blockingQuitProgram) Send(tea.Msg) {}
+
+func (p *blockingQuitProgram) Run() (tea.Model, error) {
+	return nil, nil
+}
+
+func (p *blockingQuitProgram) Quit() {
+	p.once.Do(func() {
+		close(p.quitEntered)
+	})
+	<-p.release
+}
+
+func (p *blockingQuitProgram) releaseQuit() {
+	select {
+	case <-p.release:
+	default:
+		close(p.release)
 	}
 }
 

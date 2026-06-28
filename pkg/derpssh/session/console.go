@@ -213,7 +213,7 @@ func (c *tuiConsole) Start(ctx context.Context) {
 		go func() {
 			<-runCtx.Done()
 			c.resolvePendingApprovals(protocol.RoleDenied)
-			if c.program != nil {
+			if c.shouldQuitProgram() {
 				c.program.Quit()
 			}
 		}()
@@ -236,7 +236,7 @@ func (c *tuiConsole) Stop() {
 		c.cancel()
 	}
 	c.resolvePendingApprovals(protocol.RoleDenied)
-	if c.program != nil {
+	if c.shouldQuitProgram() {
 		c.program.Quit()
 	}
 }
@@ -913,6 +913,12 @@ func (c *tuiConsole) isProgramStartRequested() bool {
 	c.programMu.Lock()
 	defer c.programMu.Unlock()
 	return c.programStartRequested
+}
+
+func (c *tuiConsole) shouldQuitProgram() bool {
+	c.programMu.Lock()
+	defer c.programMu.Unlock()
+	return c.program != nil && c.programStartRequested
 }
 
 func (c *tuiConsole) runTeaCommand(cmd tea.Cmd) {

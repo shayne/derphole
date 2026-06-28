@@ -57,7 +57,11 @@ func (s *Session) Close() error {
 	if s == nil || s.File == nil {
 		return nil
 	}
-	return s.File.Close()
+	err := s.File.Close()
+	if s.Cmd != nil && s.Cmd.Process != nil {
+		_ = s.Cmd.Process.Kill()
+	}
+	return err
 }
 
 func (s *Session) Wait() error {
