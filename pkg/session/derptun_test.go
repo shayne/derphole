@@ -808,6 +808,42 @@ func TestBridgeDerptunStdioClosesInputWhenRemoteEnds(t *testing.T) {
 	}
 }
 
+func TestBridgeDerptunStdioReadsMuxReplyBeforeRemoteClose(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	backend := startLineEchoServer(t)
+	clientCarrier, serverCarrier := net.Pipe()
+	clientMux := derptun.NewMux(derptun.MuxConfig{Role: derptun.MuxRoleClient, ReconnectTimeout: time.Second})
+	serverMux := derptun.NewMux(derptun.MuxConfig{Role: derptun.MuxRoleServer, ReconnectTimeout: time.Second})
+	defer clientMux.Close()
+	defer serverMux.Close()
+	clientMux.ReplaceCarrier(clientCarrier)
+	serverMux.ReplaceCarrier(serverCarrier)
+
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- serveDerptunMuxTarget(ctx, serverMux, backend, nil)
+	}()
+
+	conn, err := clientMux.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream() error = %v", err)
+	}
+	var out bytes.Buffer
+	if err := bridgeDerptunStdio(ctx, conn, strings.NewReader("hello\n"), &out); err != nil {
+		t.Fatalf("bridgeDerptunStdio() error = %v", err)
+	}
+	if got, want := out.String(), "echo: hello\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+
+	cancel()
+	if err := <-serveErr; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("serveDerptunMuxTarget() error = %v", err)
+	}
+}
+
 func startLineEchoServer(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

@@ -74,18 +74,27 @@ type muxStream struct {
 	stateMu sync.Mutex
 	sendSeq uint64
 	recvSeq uint64
-	pending *pendingWrite
+	pending []*pendingWrite
+	inbound chan inboundFrame
 
-	openAck     chan struct{}
-	openAckOnce sync.Once
-	closeOnce   sync.Once
-	deliverMu   sync.Mutex
+	openAck       chan struct{}
+	openAckOnce   sync.Once
+	closeOnce     sync.Once
+	inboundClosed chan struct{}
+	inboundOnce   sync.Once
+	deliverMu     sync.Mutex
 }
 
 type pendingWrite struct {
-	endSeq uint64
-	acked  chan struct{}
-	once   sync.Once
+	startSeq    uint64
+	endSeq      uint64
+	lastSentGen uint64
+	payload     []byte
+}
+
+type inboundFrame struct {
+	header  frameHeader
+	payload []byte
 }
 
 type frameHeader struct {
@@ -138,6 +147,7 @@ func (m *Mux) ReplaceCarrier(carrier io.ReadWriteCloser) {
 
 	if carrier != nil {
 		go m.readLoop(generation, carrier)
+		m.replayPendingStreams()
 	}
 }
 
@@ -216,6 +226,7 @@ func (m *Mux) Close() error {
 		_ = carrier.Close()
 	}
 	for _, stream := range streams {
+		stream.closeInbound()
 		_ = stream.conn.Close()
 	}
 	return nil
@@ -283,11 +294,15 @@ func (m *Mux) waitPong(ctx context.Context, pong <-chan struct{}, deadline time.
 
 func (m *Mux) newStream() (*muxStream, net.Conn) {
 	appConn, muxConn := net.Pipe()
-	return &muxStream{
-		mux:     m,
-		conn:    muxConn,
-		openAck: make(chan struct{}),
-	}, appConn
+	stream := &muxStream{
+		mux:           m,
+		conn:          muxConn,
+		inbound:       make(chan inboundFrame, 128),
+		openAck:       make(chan struct{}),
+		inboundClosed: make(chan struct{}),
+	}
+	go stream.inboundPump()
+	return stream, appConn
 }
 
 func (m *Mux) nextPing() uint64 {
@@ -366,29 +381,39 @@ func (m *Mux) deadline() time.Time {
 }
 
 func (m *Mux) writeFrameUntil(header frameHeader, payload []byte, deadline time.Time) error {
-	return m.writeFrameUntilContext(context.Background(), header, payload, deadline)
+	_, err := m.writeFrameUntilContextGeneration(context.Background(), header, payload, deadline)
+	return err
 }
 
 func (m *Mux) writeFrameUntilContext(ctx context.Context, header frameHeader, payload []byte, deadline time.Time) error {
+	_, err := m.writeFrameUntilContextGeneration(ctx, header, payload, deadline)
+	return err
+}
+
+func (m *Mux) writeFrameUntilGeneration(header frameHeader, payload []byte, deadline time.Time) (uint64, error) {
+	return m.writeFrameUntilContextGeneration(context.Background(), header, payload, deadline)
+}
+
+func (m *Mux) writeFrameUntilContextGeneration(ctx context.Context, header frameHeader, payload []byte, deadline time.Time) (uint64, error) {
 	for {
 		carrier, generation, changed, closed := m.carrierSnapshot()
 		if closed {
-			return net.ErrClosed
+			return 0, net.ErrClosed
 		}
 		if carrier == nil {
 			if err := m.waitForCarrier(ctx, changed, deadline); err != nil {
-				return err
+				return 0, err
 			}
 			continue
 		}
 
 		err := m.writeOnCarrier(carrier, generation, header, payload, deadline)
 		if err == nil {
-			return nil
+			return generation, nil
 		}
 		if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 			if time.Now().After(deadline) {
-				return err
+				return 0, err
 			}
 		}
 	}
@@ -537,15 +562,24 @@ func (m *Mux) handleDataFrame(header frameHeader, payload []byte) error {
 	if stream == nil {
 		return nil
 	}
-	go m.deliverDataFrame(stream, header, payload)
-	return nil
+	frame := inboundFrame{
+		header:  header,
+		payload: append([]byte(nil), payload...),
+	}
+	select {
+	case stream.inbound <- frame:
+		return nil
+	case <-stream.inboundClosed:
+		return net.ErrClosed
+	case <-m.closeCh:
+		return net.ErrClosed
+	}
 }
 
 func (m *Mux) deliverDataFrame(stream *muxStream, header frameHeader, payload []byte) {
 	ackSeq, err := stream.deliver(header.Seq, payload)
 	if err != nil {
-		m.removeStream(header.StreamID, stream)
-		_ = stream.conn.Close()
+		stream.close()
 		return
 	}
 	_ = m.writeFrameUntil(frameHeader{
@@ -571,8 +605,32 @@ func (m *Mux) handleCloseFrame(header frameHeader) {
 	if stream == nil {
 		return
 	}
-	m.removeStream(header.StreamID, stream)
-	_ = stream.conn.Close()
+	frame := inboundFrame{header: header}
+	select {
+	case stream.inbound <- frame:
+	case <-stream.inboundClosed:
+		stream.close()
+	case <-m.closeCh:
+		stream.close()
+	}
+}
+
+func (m *Mux) replayPendingStreams() {
+	streams := m.streamSnapshot()
+	for _, stream := range streams {
+		go stream.replayPending()
+	}
+}
+
+func (m *Mux) streamSnapshot() []*muxStream {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	streams := make([]*muxStream, 0, len(m.streams))
+	for _, stream := range m.streams {
+		streams = append(streams, stream)
+	}
+	return streams
 }
 
 func readFrame(r io.Reader) (frameHeader, []byte, error) {
@@ -609,6 +667,7 @@ func (s *muxStream) outboundPump() {
 	defer func() {
 		s.sendClose()
 		s.mux.removeStream(s.id, s)
+		s.closeInbound()
 	}()
 	buf := make([]byte, 32*1024)
 	for {
@@ -620,6 +679,21 @@ func (s *muxStream) outboundPump() {
 			}
 		}
 		if err != nil {
+			return
+		}
+	}
+}
+
+func (s *muxStream) inboundPump() {
+	for {
+		select {
+		case frame := <-s.inbound:
+			if frame.header.Type == frameTypeClose {
+				s.close()
+				return
+			}
+			s.mux.deliverDataFrame(s, frame.header, frame.payload)
+		case <-s.inboundClosed:
 			return
 		}
 	}
@@ -661,23 +735,21 @@ func (s *muxStream) sendChunk(payload []byte) error {
 	s.sendLock.Lock()
 	defer s.sendLock.Unlock()
 
+	if err := s.replayStalePendingLocked(); err != nil {
+		return err
+	}
+
+	payload = append([]byte(nil), payload...)
+
 	s.stateMu.Lock()
 	startSeq := s.sendSeq
 	s.sendSeq += uint64(len(payload))
-	pending := &pendingWrite{
-		endSeq: startSeq + uint64(len(payload)),
-		acked:  make(chan struct{}),
-	}
-	s.pending = pending
+	s.pending = append(s.pending, &pendingWrite{
+		startSeq: startSeq,
+		endSeq:   startSeq + uint64(len(payload)),
+		payload:  payload,
+	})
 	s.stateMu.Unlock()
-
-	defer func() {
-		s.stateMu.Lock()
-		if s.pending == pending {
-			s.pending = nil
-		}
-		s.stateMu.Unlock()
-	}()
 
 	header := frameHeader{
 		Type:     frameTypeData,
@@ -685,31 +757,65 @@ func (s *muxStream) sendChunk(payload []byte) error {
 		Seq:      startSeq,
 		Length:   len(payload),
 	}
-	deadline := s.mux.deadline()
+	generation, err := s.mux.writeFrameUntilGeneration(header, payload, s.mux.deadline())
+	if err != nil {
+		return err
+	}
+	s.markPendingSentGeneration(startSeq, startSeq+uint64(len(payload)), generation)
+	return nil
+}
 
-	for {
-		carrierChanged := s.mux.currentCarrierChange()
-		if err := s.mux.writeFrameUntil(header, payload, deadline); err != nil {
+func (s *muxStream) replayPending() {
+	s.sendLock.Lock()
+	defer s.sendLock.Unlock()
+
+	_ = s.replayStalePendingLocked()
+}
+
+func (s *muxStream) replayStalePendingLocked() error {
+	for _, pending := range s.pendingSnapshotForGeneration(s.mux.currentCarrierGeneration()) {
+		header := frameHeader{
+			Type:     frameTypeData,
+			StreamID: s.id,
+			Seq:      pending.startSeq,
+			Length:   len(pending.payload),
+		}
+		generation, err := s.mux.writeFrameUntilGeneration(header, pending.payload, s.mux.deadline())
+		if err != nil {
 			return err
 		}
+		s.markPendingSentGeneration(pending.startSeq, pending.endSeq, generation)
+	}
+	return nil
+}
 
-		wait := time.Until(deadline)
-		if wait <= 0 {
-			return context.DeadlineExceeded
+func (s *muxStream) pendingSnapshotForGeneration(generation uint64) []*pendingWrite {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+
+	pending := make([]*pendingWrite, 0, len(s.pending))
+	for _, write := range s.pending {
+		if write.lastSentGen == generation {
+			continue
 		}
+		pending = append(pending, &pendingWrite{
+			startSeq:    write.startSeq,
+			endSeq:      write.endSeq,
+			lastSentGen: write.lastSentGen,
+			payload:     write.payload,
+		})
+	}
+	return pending
+}
 
-		timer := time.NewTimer(wait)
-		select {
-		case <-pending.acked:
-			timer.Stop()
-			return nil
-		case <-carrierChanged:
-			timer.Stop()
-		case <-s.mux.closeCh:
-			timer.Stop()
-			return net.ErrClosed
-		case <-timer.C:
-			return context.DeadlineExceeded
+func (s *muxStream) markPendingSentGeneration(startSeq, endSeq, generation uint64) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+
+	for _, write := range s.pending {
+		if write.startSeq == startSeq && write.endSeq == endSeq {
+			write.lastSentGen = generation
+			return
 		}
 	}
 }
@@ -718,6 +824,18 @@ func (s *muxStream) sendClose() {
 	s.closeOnce.Do(func() {
 		_ = s.mux.writeFrameUntil(frameHeader{Type: frameTypeClose, StreamID: s.id}, nil, s.mux.deadline())
 	})
+}
+
+func (s *muxStream) closeInbound() {
+	s.inboundOnce.Do(func() {
+		close(s.inboundClosed)
+	})
+}
+
+func (s *muxStream) close() {
+	s.mux.removeStream(s.id, s)
+	s.closeInbound()
+	_ = s.conn.Close()
 }
 
 func (s *muxStream) deliver(seq uint64, payload []byte) (uint64, error) {
@@ -759,16 +877,28 @@ func (s *muxStream) handleAck(ack uint64) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 
-	if s.pending == nil || ack < s.pending.endSeq {
+	cut := 0
+	for cut < len(s.pending) && ack >= s.pending[cut].endSeq {
+		cut++
+	}
+	if cut == 0 {
 		return
 	}
-	s.pending.once.Do(func() {
-		close(s.pending.acked)
-	})
+	copy(s.pending, s.pending[cut:])
+	for i := len(s.pending) - cut; i < len(s.pending); i++ {
+		s.pending[i] = nil
+	}
+	s.pending = s.pending[:len(s.pending)-cut]
 }
 
 func (m *Mux) currentCarrierChange() <-chan struct{} {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.carrierChange
+}
+
+func (m *Mux) currentCarrierGeneration() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.carrierGen
 }

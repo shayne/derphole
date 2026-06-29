@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -161,6 +162,217 @@ func TestMuxResendsUnackedDataAfterCarrierReplacement(t *testing.T) {
 	}
 }
 
+func TestMuxPipelinesSmallWritesWithoutWaitingForAck(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	clientMux := NewMux(MuxConfig{Role: MuxRoleClient, ReconnectTimeout: time.Second})
+	defer clientMux.Close()
+
+	clientCarrier, serverCarrier := net.Pipe()
+	defer serverCarrier.Close()
+	clientMux.ReplaceCarrier(clientCarrier)
+
+	type openResult struct {
+		conn net.Conn
+		err  error
+	}
+	openCh := make(chan openResult, 1)
+	go func() {
+		conn, err := clientMux.OpenStream(ctx)
+		openCh <- openResult{conn: conn, err: err}
+	}()
+
+	openHeader, _, err := readFrame(serverCarrier)
+	if err != nil {
+		t.Fatalf("read open frame error = %v", err)
+	}
+	if openHeader.Type != frameTypeOpen {
+		t.Fatalf("open frame type = %q, want %q", openHeader.Type, frameTypeOpen)
+	}
+	writeTestFrame(t, serverCarrier, frameHeader{
+		Type:     frameTypeAck,
+		StreamID: openHeader.StreamID,
+		Seq:      0,
+	}, nil)
+
+	var clientConn net.Conn
+	select {
+	case result := <-openCh:
+		if result.err != nil {
+			t.Fatalf("OpenStream() error = %v", result.err)
+		}
+		clientConn = result.conn
+	case <-ctx.Done():
+		t.Fatal("OpenStream() did not return after open ACK")
+	}
+	defer clientConn.Close()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := clientConn.Write([]byte("a"))
+		firstDone <- err
+	}()
+
+	firstHeader, firstPayload, err := readFrame(serverCarrier)
+	if err != nil {
+		t.Fatalf("read first data frame error = %v", err)
+	}
+	if firstHeader.Type != frameTypeData || string(firstPayload) != "a" {
+		t.Fatalf("first frame = (%#v, %q), want data a", firstHeader, firstPayload)
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := clientConn.Write([]byte("b"))
+		secondDone <- err
+	}()
+
+	type frameResult struct {
+		header  frameHeader
+		payload []byte
+		err     error
+	}
+	secondFrame := make(chan frameResult, 1)
+	go func() {
+		header, payload, err := readFrame(serverCarrier)
+		secondFrame <- frameResult{header: header, payload: payload, err: err}
+	}()
+
+	select {
+	case result := <-secondFrame:
+		if result.err != nil {
+			t.Fatalf("read second data frame error = %v", result.err)
+		}
+		if result.header.Type != frameTypeData || string(result.payload) != "b" {
+			t.Fatalf("second frame = (%#v, %q), want data b", result.header, result.payload)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("second small write did not send before first ACK")
+	}
+
+	writeTestFrame(t, serverCarrier, frameHeader{
+		Type:     frameTypeAck,
+		StreamID: openHeader.StreamID,
+		Seq:      2,
+	}, nil)
+
+	for name, ch := range map[string]<-chan error{
+		"first write":  firstDone,
+		"second write": secondDone,
+	} {
+		select {
+		case err := <-ch:
+			if err != nil {
+				t.Fatalf("%s error = %v", name, err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("%s did not return", name)
+		}
+	}
+}
+
+func TestMuxReplaysUnackedDataBeforeNewWritesAfterCarrierReplacement(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	clientMux := NewMux(MuxConfig{Role: MuxRoleClient, ReconnectTimeout: time.Second})
+	defer clientMux.Close()
+
+	clientA, serverA := net.Pipe()
+	defer serverA.Close()
+	clientMux.ReplaceCarrier(clientA)
+
+	type openResult struct {
+		conn net.Conn
+		err  error
+	}
+	openCh := make(chan openResult, 1)
+	go func() {
+		conn, err := clientMux.OpenStream(ctx)
+		openCh <- openResult{conn: conn, err: err}
+	}()
+
+	openHeader, _, err := readFrame(serverA)
+	if err != nil {
+		t.Fatalf("read open frame error = %v", err)
+	}
+	writeTestFrame(t, serverA, frameHeader{
+		Type:     frameTypeAck,
+		StreamID: openHeader.StreamID,
+		Seq:      0,
+	}, nil)
+
+	var clientConn net.Conn
+	select {
+	case result := <-openCh:
+		if result.err != nil {
+			t.Fatalf("OpenStream() error = %v", result.err)
+		}
+		clientConn = result.conn
+	case <-ctx.Done():
+		t.Fatal("OpenStream() did not return")
+	}
+	defer clientConn.Close()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := clientConn.Write([]byte("a"))
+		firstDone <- err
+	}()
+
+	firstHeader, firstPayload, err := readFrame(serverA)
+	if err != nil {
+		t.Fatalf("read first data frame error = %v", err)
+	}
+	if firstHeader.Type != frameTypeData || string(firstPayload) != "a" {
+		t.Fatalf("first frame = (%#v, %q), want data a", firstHeader, firstPayload)
+	}
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first Write() error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("first Write() did not return")
+	}
+
+	clientB, serverB := net.Pipe()
+	defer serverB.Close()
+	clientMux.ReplaceCarrier(clientB)
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := clientConn.Write([]byte("b"))
+		secondDone <- err
+	}()
+
+	replayHeader, replayPayload, err := readFrame(serverB)
+	if err != nil {
+		t.Fatalf("read replay frame error = %v", err)
+	}
+	if replayHeader.Type != frameTypeData || string(replayPayload) != "a" {
+		t.Fatalf("replay frame = (%#v, %q), want data a", replayHeader, replayPayload)
+	}
+
+	secondHeader, secondPayload, err := readFrame(serverB)
+	if err != nil {
+		t.Fatalf("read second data frame error = %v", err)
+	}
+	if secondHeader.Type != frameTypeData || string(secondPayload) != "b" {
+		t.Fatalf("second frame = (%#v, %q), want data b", secondHeader, secondPayload)
+	}
+
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second Write() error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("second Write() did not return")
+	}
+}
+
 func TestMuxCloseFramePropagatesEOF(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -197,6 +409,88 @@ func TestMuxCloseFramePropagatesEOF(t *testing.T) {
 	}
 	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 		t.Fatal("server Read() timed out waiting for close frame")
+	}
+}
+
+func TestMuxDeliversPendingDataBeforeCloseFrame(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	clientMux, serverMux := newMuxPair(t, time.Second)
+	defer clientMux.Close()
+	defer serverMux.Close()
+
+	serverConnCh := make(chan net.Conn, 1)
+	go func() {
+		conn, _ := serverMux.Accept(ctx)
+		serverConnCh <- conn
+	}()
+
+	clientConn, err := clientMux.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream() error = %v", err)
+	}
+	defer clientConn.Close()
+	serverConn := <-serverConnCh
+
+	if _, err := clientConn.Write([]byte("hello\n")); err != nil {
+		t.Fatalf("client Write() error = %v", err)
+	}
+	got := make([]byte, len("hello\n"))
+	if _, err := io.ReadFull(serverConn, got); err != nil {
+		t.Fatalf("server ReadFull() error = %v", err)
+	}
+	if _, err := serverConn.Write([]byte("echo: hello\n")); err != nil {
+		t.Fatalf("server Write() error = %v", err)
+	}
+	if err := serverConn.Close(); err != nil {
+		t.Fatalf("server Close() error = %v", err)
+	}
+
+	reply := make([]byte, len("echo: hello\n"))
+	if _, err := io.ReadFull(clientConn, reply); err != nil {
+		t.Fatalf("client ReadFull() error = %v", err)
+	}
+	if string(reply) != "echo: hello\n" {
+		t.Fatalf("client reply = %q, want echo: hello", reply)
+	}
+}
+
+func TestMuxCloseFrameWaitsForQueuedInboundData(t *testing.T) {
+	serverMux := NewMux(MuxConfig{Role: MuxRoleServer, ReconnectTimeout: 10 * time.Millisecond})
+	defer serverMux.Close()
+
+	_, appConn := serverMux.getOrCreateRemoteStream(2)
+	defer appConn.Close()
+
+	payload := []byte("reply before close")
+	if err := serverMux.handleFrame(frameHeader{Type: frameTypeData, StreamID: 2, Seq: 0}, payload); err != nil {
+		t.Fatalf("handleFrame(data) error = %v", err)
+	}
+	if err := serverMux.handleFrame(frameHeader{Type: frameTypeClose, StreamID: 2}, nil); err != nil {
+		t.Fatalf("handleFrame(close) error = %v", err)
+	}
+
+	if err := appConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(appConn, got); err != nil {
+		t.Fatalf("ReadFull() error = %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("payload = %q, want %q", got, payload)
+	}
+
+	if err := appConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+	n, err := appConn.Read(make([]byte, 1))
+	if err == nil || n != 0 {
+		t.Fatalf("Read() after close = (%d, %v), want EOF/closed error", n, err)
+	}
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		t.Fatal("Read() timed out waiting for close frame")
 	}
 }
 
@@ -519,8 +813,15 @@ func TestMuxRemovesStreamOnCloseFrame(t *testing.T) {
 	if err := serverMux.handleFrame(frameHeader{Type: frameTypeClose, StreamID: 2}, nil); err != nil {
 		t.Fatalf("handleFrame(close) error = %v", err)
 	}
-	if stream := serverMux.getStream(2); stream != nil {
-		t.Fatal("stream still present after close frame")
+	deadline := time.Now().Add(time.Second)
+	for {
+		if stream := serverMux.getStream(2); stream == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stream still present after close frame")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -624,6 +925,30 @@ func closeBoth(t *testing.T, replaceClient func(io.ReadWriteCloser), replaceServ
 		replaceServer(nextServer)
 	}()
 	wg.Wait()
+}
+
+func writeTestFrame(t *testing.T, w io.Writer, header frameHeader, payload []byte) {
+	t.Helper()
+
+	header.Length = len(payload)
+	headerBytes, err := json.Marshal(header)
+	if err != nil {
+		t.Fatalf("marshal test frame header: %v", err)
+	}
+
+	var prefix [4]byte
+	binary.BigEndian.PutUint32(prefix[:], uint32(len(headerBytes)))
+	if _, err := w.Write(prefix[:]); err != nil {
+		t.Fatalf("write test frame prefix: %v", err)
+	}
+	if _, err := w.Write(headerBytes); err != nil {
+		t.Fatalf("write test frame header: %v", err)
+	}
+	if len(payload) > 0 {
+		if _, err := w.Write(payload); err != nil {
+			t.Fatalf("write test frame payload: %v", err)
+		}
+	}
 }
 
 type noReplyCarrier struct {

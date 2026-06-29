@@ -27,6 +27,33 @@ Measure raw network capacity separately before blaming tunnel overhead.
 
 Keep source payload size, host pair, and direction fixed when comparing variants. Record duration, throughput, final path state, and whether the session upgraded from `connected-relay` to `connected-direct`.
 
+## Interactive Latency Harness
+
+Use `cmd/derpssh-latency` when tuning interactive terminal latency. It compares a standard SSH line-echo baseline against derptun mux echo over the same SSH carrier, then writes machine-readable artifacts for agent feedback loops.
+
+```bash
+mise exec -- go run ./cmd/derpssh-latency run \
+  --remote ubuntu@derphole-testing \
+  --samples 200 \
+  --warmup 20 \
+  --out .tmp/latency/latest
+```
+
+Artifacts:
+
+- `summary.json` has per-scenario p50/p90/p95/p99/max latency and derptun-vs-SSH ratios
+- `samples.jsonl` has each measured and warmup sample
+- `events.jsonl` records setup and scenario boundaries
+- `logs/*.stderr.log` keeps helper stderr from each scenario
+
+Use `compare` to check a change against a previous run:
+
+```bash
+mise exec -- go run ./cmd/derpssh-latency compare .tmp/latency/before .tmp/latency/after
+```
+
+The baseline scenario is `ssh-stdio`. The first derptun diagnostic scenario is `derptun-mux-over-ssh`, which isolates mux framing and stream scheduling without changing the underlying network route. If `derptun-mux-over-ssh` is much slower than `ssh-stdio`, inspect mux ACK/write scheduling before tuning higher-level `derpssh` UI code.
+
 ## V2 Transport Diagnostic Comparison
 
 Use `scripts/transfer-stall-harness.sh` when a transfer completes below expected line rate or stalls. Pair it with `iperf3` between the same endpoints when you need a raw network baseline.
