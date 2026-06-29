@@ -683,7 +683,7 @@ func TestChatComposerPlaceholderUsesInputBackground(t *testing.T) {
 	if len(lines) != 1 {
 		t.Fatalf("composerVisibleLines() returned %d lines, want 1", len(lines))
 	}
-	if !strings.Contains(lines[0], composerStyle.Foreground(catSubtext).Render("Message")) {
+	if !strings.Contains(lines[0], composerPlaceholderStyle.Render("Message")) {
 		t.Fatalf("placeholder does not use composer input background:\n%q", lines[0])
 	}
 	if strings.Contains(lines[0], dimStyle.Render("Message")) {

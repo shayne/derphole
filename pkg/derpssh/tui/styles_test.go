@@ -39,3 +39,81 @@ func TestSeparatorStyleUsesAdaptiveForegroundOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestLightThemeChromeUsesRestrainedCatppuccinSurfaces(t *testing.T) {
+	tests := []struct {
+		name       string
+		style      lipgloss.Style
+		foreground string
+		background string
+	}{
+		{
+			name:       "muted top bar text",
+			style:      topBarMutedStyle,
+			foreground: "#5C5F77",
+			background: "#DCE0E8",
+		},
+		{
+			name:       "warning top bar chip",
+			style:      topBarWarnStyle,
+			foreground: "#D20F39",
+			background: "#E6E9EF",
+		},
+		{
+			name:       "modal interior",
+			style:      modalInteriorStyle,
+			foreground: "#4C4F69",
+			background: "#E6E9EF",
+		},
+		{
+			name:       "modal label",
+			style:      labelStyle,
+			foreground: "#209FB5",
+			background: "#E6E9EF",
+		},
+		{
+			name:       "default modal button",
+			style:      approvalButtonStyle,
+			foreground: "#4C4F69",
+			background: "#DCE0E8",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := lightColor(t, tt.style.GetForeground()); got != tt.foreground {
+				t.Fatalf("foreground = %q, want %q", got, tt.foreground)
+			}
+			if got := lightColor(t, tt.style.GetBackground()); got != tt.background {
+				t.Fatalf("background = %q, want %q", got, tt.background)
+			}
+		})
+	}
+}
+
+func TestModalBorderMatchesNeutralPanel(t *testing.T) {
+	if got := lightColor(t, modalBorderStyle.GetBackground()); got != lightColor(t, modalInteriorStyle.GetBackground()) {
+		t.Fatalf("modal border background = %q, want modal interior background", got)
+	}
+	if got := darkColor(t, modalBorderStyle.GetBackground()); got != darkColor(t, modalInteriorStyle.GetBackground()) {
+		t.Fatalf("modal border dark background = %q, want modal interior background", got)
+	}
+}
+
+func lightColor(t *testing.T, color any) string {
+	t.Helper()
+	adaptiveColor, ok := color.(lipgloss.AdaptiveColor)
+	if !ok {
+		t.Fatalf("color = %T, want lipgloss.AdaptiveColor", color)
+	}
+	return adaptiveColor.Light
+}
+
+func darkColor(t *testing.T, color any) string {
+	t.Helper()
+	adaptiveColor, ok := color.(lipgloss.AdaptiveColor)
+	if !ok {
+		t.Fatalf("color = %T, want lipgloss.AdaptiveColor", color)
+	}
+	return adaptiveColor.Dark
+}

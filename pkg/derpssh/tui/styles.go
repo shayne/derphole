@@ -8,103 +8,114 @@ import "github.com/charmbracelet/lipgloss"
 
 var (
 	catText     = adaptive("#4C4F69", "#CDD6F4")
-	catSubtext  = adaptive("#6C6F85", "#A6ADC8")
+	catSubtext1 = adaptive("#5C5F77", "#BAC2DE")
 	catOverlay  = adaptive("#9CA0B0", "#6C7086")
 	catSurface0 = adaptive("#CCD0DA", "#313244")
-	catSurface1 = adaptive("#BCC0CC", "#45475A")
 	catSurface2 = adaptive("#ACB0BE", "#585B70")
 	catMantle   = adaptive("#E6E9EF", "#181825")
 	catSapphire = adaptive("#209FB5", "#74C7EC")
 	catGreen    = adaptive("#40A02B", "#A6E3A1")
-	catYellow   = adaptive("#DF8E1D", "#F9E2AF")
 	catRed      = adaptive("#D20F39", "#F38BA8")
 )
 
 var (
+	chromeText      = catText
+	chromeMuted     = catSubtext1
+	chromeBar       = adaptive("#DCE0E8", "#313244")
+	chromeChip      = catSurface0
+	chromePanel     = adaptive("#E6E9EF", "#1E1E2E")
+	chromePanelAlt  = adaptive("#DCE0E8", "#313244")
+	chromeBorder    = adaptive("#7C7F93", "#74C7EC")
+	chromeWarningBg = adaptive("#E6E9EF", "#45475A")
+	chromeWarningFg = adaptive("#D20F39", "#F9E2AF")
+	chromeOnAccent  = adaptive("#EFF1F5", "#11111B")
+)
+
+var (
 	topBarStyle = lipgloss.NewStyle().
-			Foreground(catText).
-			Background(catSurface0)
+			Foreground(chromeText).
+			Background(chromeBar)
 	topBarBrandStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(adaptive("#EFF1F5", "#11111B")).
+				Foreground(chromeOnAccent).
 				Background(catSapphire)
 	topBarQuitStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(adaptive("#EFF1F5", "#11111B")).
+			Foreground(chromeOnAccent).
 			Background(catRed)
 	topBarChipStyle = lipgloss.NewStyle().
-			Foreground(catText).
-			Background(catSurface1)
+			Foreground(chromeText).
+			Background(chromeChip)
 	topBarMutedStyle = lipgloss.NewStyle().
-				Foreground(catSubtext).
-				Background(catSurface0)
+				Foreground(chromeMuted).
+				Background(chromeBar)
 	topBarWarnStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(adaptive("#4C4F69", "#11111B")).
-			Background(catYellow)
+			Foreground(chromeWarningFg).
+			Background(chromeWarningBg)
 	topBarActionStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(adaptive("#EFF1F5", "#11111B")).
+				Foreground(chromeOnAccent).
 				Background(catGreen)
 	topBarSeparatorStyle = lipgloss.NewStyle().
 				Foreground(catOverlay).
-				Background(catSurface0)
+				Background(chromeBar)
 	statusBarStyle = lipgloss.NewStyle().
-			Foreground(catText).
-			Background(catSurface0)
+			Foreground(chromeText).
+			Background(chromeBar)
 	labelStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(catSapphire).
-			Background(catMantle)
+			Background(chromePanel)
 	dimStyle = lipgloss.NewStyle().
-			Foreground(catSubtext).
-			Background(catMantle)
+			Foreground(chromeMuted).
+			Background(chromePanel)
 	separatorStyle = lipgloss.NewStyle().
 			Foreground(catSurface2)
 	sidebarStyle = lipgloss.NewStyle().
-			Foreground(catText).
+			Foreground(chromeText).
 			Background(catMantle)
 	sidebarHeaderStyle = lipgloss.NewStyle().
 				Bold(true).
 				Foreground(catSapphire).
-				Background(catSurface0)
+				Background(chromeBar)
 	composerBorderStyle = lipgloss.NewStyle().
 				Foreground(catSurface2).
 				Background(catMantle)
 	composerStyle = lipgloss.NewStyle().
-			Foreground(catText).
-			Background(catSurface0)
+			Foreground(chromeText).
+			Background(chromeChip)
 	composerPlaceholderStyle = lipgloss.NewStyle().
-					Foreground(catSubtext).
-					Background(catSurface0)
+					Foreground(chromeMuted).
+					Background(chromeChip)
 	composerCursorStyle = composerStyle.Reverse(true)
 	localChatStyle      = lipgloss.NewStyle().
 				Foreground(catGreen)
 	approvalButtonStyle = lipgloss.NewStyle().
-				Foreground(catText).
-				Background(catSurface0)
+				Foreground(chromeText).
+				Background(chromePanelAlt)
 	approvalButtonSelectedStyle = lipgloss.NewStyle().
 					Bold(true).
-					Foreground(adaptive("#EFF1F5", "#11111B")).
+					Foreground(chromeOnAccent).
 					Background(catSapphire)
 	modalStyle = lipgloss.NewStyle().
-			Foreground(catText).
-			Background(catMantle).
+			Foreground(chromeText).
+			Background(chromePanel).
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(catSapphire).
+			BorderForeground(chromeBorder).
 			Padding(0, 1)
 	modalBorderStyle = lipgloss.NewStyle().
-				Foreground(catSapphire).
-				Background(catMantle)
+				Foreground(chromeBorder).
+				Background(chromePanel)
 	modalInteriorStyle = lipgloss.NewStyle().
-				Foreground(catText).
-				Background(catMantle)
+				Foreground(chromeText).
+				Background(chromePanel)
 	menuLabelStyle = lipgloss.NewStyle().
-			Foreground(catText).
-			Background(catMantle)
+			Foreground(chromeText).
+			Background(chromePanel)
 	menuShortcutStyle = lipgloss.NewStyle().
-				Foreground(catSubtext).
-				Background(catMantle)
+				Foreground(chromeMuted).
+				Background(chromePanel)
 )
 
 func adaptive(light string, dark string) lipgloss.AdaptiveColor {
