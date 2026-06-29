@@ -22,6 +22,12 @@ func TestMouseClickTopBarChatToggle(t *testing.T) {
 	if !app.sidebarOpen {
 		t.Fatalf("sidebarOpen = false, want true after top-bar chat click")
 	}
+	if app.focus != FocusChat {
+		t.Fatalf("focus = %v, want chat after top-bar chat click", app.focus)
+	}
+	if !app.composer.Focused() {
+		t.Fatalf("composer focus = false, want true after top-bar chat click")
+	}
 	got, ok := readCommand(app).(TerminalResizeCommand)
 	if !ok {
 		t.Fatalf("command = %T, want TerminalResizeCommand", got)
@@ -29,6 +35,15 @@ func TestMouseClickTopBarChatToggle(t *testing.T) {
 	want := TerminalResizeCommand{Cols: 66, Rows: 29}
 	if got != want {
 		t.Fatalf("resize command = %+v, want %+v", got, want)
+	}
+
+	app.Update(leftClick(chat.X+chat.W/2, chat.Y))
+
+	if app.sidebarOpen {
+		t.Fatalf("sidebarOpen = true, want false after second top-bar chat click")
+	}
+	if app.focus != FocusTerminal {
+		t.Fatalf("focus = %v, want terminal after top-bar chat close", app.focus)
 	}
 }
 

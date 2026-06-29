@@ -128,6 +128,22 @@ func TestPrefixSidebarToggleEmitsTerminalResize(t *testing.T) {
 	if got != want {
 		t.Fatalf("resize command = %+v, want %+v", got, want)
 	}
+	if app.focus != FocusChat {
+		t.Fatalf("focus = %v, want chat after Ctrl-X S opens chat", app.focus)
+	}
+	if !app.composer.Focused() {
+		t.Fatalf("composer focus = false, want true after Ctrl-X S opens chat")
+	}
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+
+	if app.sidebarOpen {
+		t.Fatalf("sidebarOpen = true, want false after Ctrl-X S closes chat")
+	}
+	if app.focus != FocusTerminal {
+		t.Fatalf("focus = %v, want terminal after Ctrl-X S closes chat", app.focus)
+	}
 }
 
 func TestPrefixChatOpenEmitsTerminalResize(t *testing.T) {

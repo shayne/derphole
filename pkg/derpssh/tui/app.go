@@ -445,7 +445,9 @@ func (a *App) setSidebarOpen(open bool) {
 	oldTerminal := a.currentTerminalRect()
 	a.sidebarOpen = open
 	if open {
-		a.unreadChat = 0
+		a.focusChat()
+	} else if a.focus == FocusChat {
+		a.focusTerminal()
 	}
 	a.applyLayout()
 	a.emitTerminalResizeIfChanged(oldTerminal)
