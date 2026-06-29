@@ -1,10 +1,50 @@
 # Repository Guidelines
 
+If `AGENTS.local.md` exists, read it and merge its instructions with this file.
+
 ## Project Structure & Module Organization
 
 `cmd/derphole/` contains the CLI entrypoint and subcommand wiring. Core transport and session logic lives under `pkg/` (`pkg/session`, `pkg/wg`, `pkg/traversal`, `pkg/derpbind`, `pkg/derphole`, etc.). Packaging assets live in `packaging/npm/` and `tools/packaging/`. Verification scripts are in `scripts/`. Public documentation lives in `docs/derp/` and `docs/releases/`.
 
 `dist/` is generated output for local builds, release packaging, and npm assembly. Treat it as ephemeral.
+
+## Version Control
+
+Use GitButler (`but`) for normal agent version-control write operations, including branching, committing, branch pushes, and history edits.
+
+Assume multiple agents may be working in this repository. Do not move, amend, squash, discard, commit, push, or otherwise modify another agent's work unless the user asks.
+
+Use a dedicated GitButler branch for each agent session unless the user asks for a different branch structure. Commit only changes that belong to that session.
+
+Agents may create local checkpoint commits after a coherent unit of work is complete. Avoid micro-commits; prefer commits that match the current objective and would make sense when read later.
+
+Pre-commit hooks are intentionally expensive and should run normally. Report any pre-commit failure with the fix or remaining blocker.
+
+Treat checkpoint commits as local savepoints, not final history. Before finishing to `main`, use GitButler to tidy, squash, reword, or amend unpublished session commits into a clean final shape.
+
+At safe boundaries, such as before starting substantial work, before a checkpoint commit, or before finishing to `main`, run `but pull --check`. If it is clean and affects only this session's branch, `but pull` is allowed. If it conflicts or touches another active branch, stop and ask.
+
+If follow-up fixes clearly belong to an unpublished local commit, amend or absorb them into that commit instead of creating tiny fixup commits.
+
+Before large history edits or branch restructuring, create a GitButler recovery point with `but oplog snapshot -m "before history cleanup"`.
+
+If another active branch or session touches the same files, generated output, or runtime state, call out the overlap before committing or finishing.
+
+Do not push or open pull requests unless the user asks. Pull requests are not the default workflow.
+
+When the user asks to finish or integrate a session, the default outcome is that the session's work lands on both local `main` and `origin/main` without a pull request, unless the user asks for a different integration path.
+
+This repo normally targets `origin/main` in GitButler. Do not use `but merge` as the default finish command here: it is for `gb-local` targets and creates a merge commit, which is not the desired no-PR squash-to-main workflow.
+
+For a finish-to-main request, first use `but` to make the session branch a single commit when needed, then verify the commit is based on current `origin/main` and contains only this session's work. The final direct update of local `main` and `origin/main` is the only allowed raw `git` write exception for branch/commit publication, and it still requires explicit user authorization.
+
+After a session lands on `main`, run `but pull` so GitButler can mark the branch integrated, then preview cleanup with `but clean --dry-run` before running `but clean`. Delete non-empty branches or raw local `codex/*` refs only when they belong to this session and are confirmed merged; never clean up another agent's branch unless the user asks.
+
+If a direct squash-to-main publication is used while the GitButler session branch is still applied, `but pull` may try to rebase duplicate checkpoint commits onto the squash commit and report conflicts even though raw `git status` is clean. In that case, verify `main` and `origin/main` contain the squash commit, then delete only this session's GitButler branch instead of resolving duplicate conflicts. If the current `but` build prompts to delete "unpushed" duplicate commits and does not accept `--force`, pipe a single `y` into `but branch delete <branch>`.
+
+Final status must distinguish local checkpoint commits from branch pushes and from work that has landed on `origin/main`. If the user asked to push everything, finish only after verifying `origin/main` contains the session commit.
+
+Keep commit messages and any explicitly requested pull request descriptions succinct: explain what changed, why it changed, and any important decision.
 
 ## Build, Test, and Development Commands
 
