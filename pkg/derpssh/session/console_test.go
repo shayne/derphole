@@ -356,12 +356,62 @@ func TestTerminalRestoreSequenceDisablesInteractiveModes(t *testing.T) {
 		"\x1b[?1015l", // urxvt mouse tracking
 		"\x1b[?1004l", // focus reporting
 		"\x1b[?2004l", // bracketed paste
-		"\x1b[0m",     // text attributes
+		"\x1b[?1049l", // alternate screen
 		"\x1b[?25h",   // cursor visibility
+		"\x1b[?7h",    // line wrapping
+		"\x1b[?1l",    // application cursor keys
+		"\x1b>",       // application keypad
+		"\x1b[0m",     // text attributes
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("restore sequence missing %q in %q", want, got)
 		}
+	}
+}
+
+func TestTUIConsoleStopWaitsForProgramRunCleanup(t *testing.T) {
+	var out strings.Builder
+	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, &recordingTerminalPane{view: "shell$"})
+	program := newDelayedExitProgram()
+	console.program = program
+	console.programNotify = make(chan struct{}, 1)
+	console.tty = true
+	console.output = &out
+
+	console.Start(context.Background())
+
+	select {
+	case <-program.runEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Program.Run did not start")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		console.Stop()
+		close(stopped)
+	}()
+
+	select {
+	case <-program.quitCalled:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not call Program.Quit")
+	}
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned before Program.Run completed")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	program.release()
+
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not return after Program.Run completed")
+	}
+	if got := out.String(); !strings.Contains(got, "\x1b[?1049l") {
+		t.Fatalf("terminal restore sequence missing alt-screen reset in %q", got)
 	}
 }
 
@@ -922,12 +972,14 @@ func (p *sendBeforeRunProgram) Run() (tea.Model, error) {
 }
 
 func (p *sendBeforeRunProgram) Quit() {}
+func (p *sendBeforeRunProgram) Wait() {}
 
 type runGatedProgram struct {
 	allowRun   chan struct{}
 	runEntered chan struct{}
 	sends      chan tea.Msg
 	quit       chan struct{}
+	done       chan struct{}
 }
 
 func newRunGatedProgram() *runGatedProgram {
@@ -936,6 +988,7 @@ func newRunGatedProgram() *runGatedProgram {
 		runEntered: make(chan struct{}),
 		sends:      make(chan tea.Msg, 4),
 		quit:       make(chan struct{}),
+		done:       make(chan struct{}),
 	}
 }
 
@@ -945,6 +998,7 @@ func (p *runGatedProgram) Send(msg tea.Msg) {
 }
 
 func (p *runGatedProgram) Run() (tea.Model, error) {
+	defer close(p.done)
 	<-p.allowRun
 	close(p.runEntered)
 	<-p.quit
@@ -959,9 +1013,14 @@ func (p *runGatedProgram) Quit() {
 	}
 }
 
+func (p *runGatedProgram) Wait() {
+	<-p.done
+}
+
 type blockingQuitProgram struct {
 	quitEntered chan struct{}
 	release     chan struct{}
+	done        chan struct{}
 	once        sync.Once
 }
 
@@ -969,12 +1028,14 @@ func newBlockingQuitProgram() *blockingQuitProgram {
 	return &blockingQuitProgram{
 		quitEntered: make(chan struct{}),
 		release:     make(chan struct{}),
+		done:        make(chan struct{}),
 	}
 }
 
 func (p *blockingQuitProgram) Send(tea.Msg) {}
 
 func (p *blockingQuitProgram) Run() (tea.Model, error) {
+	close(p.done)
 	return nil, nil
 }
 
@@ -991,6 +1052,54 @@ func (p *blockingQuitProgram) releaseQuit() {
 	default:
 		close(p.release)
 	}
+}
+
+func (p *blockingQuitProgram) Wait() {
+	<-p.done
+}
+
+type delayedExitProgram struct {
+	runEntered  chan struct{}
+	quitCalled  chan struct{}
+	releaseRun  chan struct{}
+	done        chan struct{}
+	quitOnce    sync.Once
+	releaseOnce sync.Once
+}
+
+func newDelayedExitProgram() *delayedExitProgram {
+	return &delayedExitProgram{
+		runEntered: make(chan struct{}),
+		quitCalled: make(chan struct{}),
+		releaseRun: make(chan struct{}),
+		done:       make(chan struct{}),
+	}
+}
+
+func (p *delayedExitProgram) Send(tea.Msg) {}
+
+func (p *delayedExitProgram) Run() (tea.Model, error) {
+	close(p.runEntered)
+	<-p.quitCalled
+	<-p.releaseRun
+	close(p.done)
+	return nil, nil
+}
+
+func (p *delayedExitProgram) Quit() {
+	p.quitOnce.Do(func() {
+		close(p.quitCalled)
+	})
+}
+
+func (p *delayedExitProgram) Wait() {
+	<-p.done
+}
+
+func (p *delayedExitProgram) release() {
+	p.releaseOnce.Do(func() {
+		close(p.releaseRun)
+	})
 }
 
 func openPipeFiles(t *testing.T) (*os.File, *os.File) {

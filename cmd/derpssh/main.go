@@ -10,7 +10,9 @@ import (
 )
 
 func main() {
-	os.Exit(runMain(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	if code := runMain(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); code != 0 {
+		os.Exit(code)
+	}
 }
 
 func runMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {

@@ -1536,25 +1536,21 @@ func (a *App) peerActionContentWidth() int {
 }
 
 func (a *App) approvalButtonLine(width int) string {
-	lineW := approvalButtonsWidth()
-	pad := strings.Repeat(" ", maxInt((width-lineW)/2, 0))
 	parts := []string{
 		a.renderApprovalButton(approvalChoiceRead),
 		a.renderApprovalButton(approvalChoiceWrite),
 		a.renderApprovalButton(approvalChoiceDeny),
 	}
-	return fitLine(pad+strings.Join(parts, strings.Repeat(" ", approvalButtonGap)), width)
+	return modalActionLine(parts, width, approvalButtonsWidth(), approvalButtonGap)
 }
 
 func (a *App) peerActionButtonLine(width int) string {
-	lineW := peerActionButtonsWidth()
-	pad := strings.Repeat(" ", maxInt((width-lineW)/2, 0))
 	parts := []string{
 		a.renderPeerActionButton(peerActionRead),
 		a.renderPeerActionButton(peerActionWrite),
 		a.renderPeerActionButton(peerActionKick),
 	}
-	return fitLine(pad+strings.Join(parts, strings.Repeat(" ", peerActionButtonGap)), width)
+	return modalActionLine(parts, width, peerActionButtonsWidth(), peerActionButtonGap)
 }
 
 func (a *App) quitHit(x int, y int) quitChoice {
@@ -1706,23 +1702,49 @@ func (a *App) menuEntries() []menuEntry {
 }
 
 func (a *App) quitButtonLine(width int) string {
-	lineW := quitButtonsWidth()
-	pad := strings.Repeat(" ", maxInt((width-lineW)/2, 0))
 	parts := []string{
 		a.renderQuitButton(quitChoiceQuit),
 		a.renderQuitButton(quitChoiceCancel),
 	}
-	return fitLine(pad+strings.Join(parts, strings.Repeat(" ", quitButtonGap)), width)
+	return modalActionLine(parts, width, quitButtonsWidth(), quitButtonGap)
 }
 
 func (a *App) shellExitButtonLine(width int) string {
-	lineW := shellExitButtonsWidth()
-	pad := strings.Repeat(" ", maxInt((width-lineW)/2, 0))
 	parts := []string{
 		a.renderShellExitButton(shellExitChoiceRestart),
 		a.renderShellExitButton(shellExitChoiceQuit),
 	}
-	return fitLine(pad+strings.Join(parts, strings.Repeat(" ", shellExitButtonGap)), width)
+	return modalActionLine(parts, width, shellExitButtonsWidth(), shellExitButtonGap)
+}
+
+func modalActionLine(parts []string, width int, contentWidth int, gap int) string {
+	if width <= 0 {
+		return ""
+	}
+	leftPad := maxInt((width-contentWidth)/2, 0)
+	var b strings.Builder
+	used := 0
+	b.WriteString(modalSpacer(leftPad))
+	used += leftPad
+	for i, part := range parts {
+		if i > 0 {
+			b.WriteString(modalSpacer(gap))
+			used += gap
+		}
+		b.WriteString(part)
+		used += displayWidth(part)
+	}
+	if used < width {
+		b.WriteString(modalSpacer(width - used))
+	}
+	return fitLine(b.String(), width)
+}
+
+func modalSpacer(width int) string {
+	if width <= 0 {
+		return ""
+	}
+	return modalInteriorStyle.Render(strings.Repeat(" ", width))
 }
 
 func (a *App) noticeContentWidth() int {

@@ -24,6 +24,7 @@ type teaProgram interface {
 	Send(tea.Msg)
 	Run() (tea.Model, error)
 	Quit()
+	Wait()
 }
 
 var isTerminalFD = pty.IsTerminal
@@ -31,7 +32,10 @@ var newTeaProgram = func(model tea.Model, opts ...tea.ProgramOption) teaProgram 
 	return tea.NewProgram(model, opts...)
 }
 
-const terminalRestoreSequence = "\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[0m\x1b[?25h"
+const (
+	terminalRestoreWait     = 750 * time.Millisecond
+	terminalRestoreSequence = "\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[?1049l\x1b[?25h\x1b[?7h\x1b[?1l\x1b>\x1b[0m"
+)
 
 func writeTerminalRestore(w io.Writer) {
 	if w == nil {
@@ -102,6 +106,7 @@ type tuiConsole struct {
 	programStartRequested bool
 	programQueue          []tea.Msg
 	programNotify         chan struct{}
+	programQuitOnce       sync.Once
 	startOnce             sync.Once
 	cancel                context.CancelFunc
 
@@ -223,9 +228,7 @@ func (c *tuiConsole) Start(ctx context.Context) {
 		go func() {
 			<-runCtx.Done()
 			c.resolvePendingApprovals(protocol.RoleDenied)
-			if c.shouldQuitProgram() {
-				c.program.Quit()
-			}
+			c.quitProgramIfStarted()
 		}()
 		if c.program == nil {
 			c.markHarnessStarted(runCtx)
@@ -247,10 +250,11 @@ func (c *tuiConsole) Stop() {
 		c.cancel()
 	}
 	c.resolvePendingApprovals(protocol.RoleDenied)
-	if c.shouldQuitProgram() {
-		c.program.Quit()
-	}
+	quitStarted := c.quitProgramIfStarted()
 	if c.tty {
+		if quitStarted {
+			c.waitForProgramExit(terminalRestoreWait)
+		}
 		writeTerminalRestore(c.output)
 	}
 }
@@ -951,6 +955,31 @@ func (c *tuiConsole) shouldQuitProgram() bool {
 	c.programMu.Lock()
 	defer c.programMu.Unlock()
 	return c.program != nil && c.programStartRequested
+}
+
+func (c *tuiConsole) quitProgramIfStarted() bool {
+	if !c.shouldQuitProgram() {
+		return false
+	}
+	c.programQuitOnce.Do(func() {
+		c.program.Quit()
+	})
+	return true
+}
+
+func (c *tuiConsole) waitForProgramExit(timeout time.Duration) {
+	if c.program == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		c.program.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+	}
 }
 
 func (c *tuiConsole) runTeaCommand(cmd tea.Cmd) {
