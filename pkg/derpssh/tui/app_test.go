@@ -706,6 +706,24 @@ func TestFocusedEmptyChatComposerShowsBlockCursor(t *testing.T) {
 	}
 }
 
+func TestFocusedEmptyChatComposerShowsCursorBeforePlaceholder(t *testing.T) {
+	forceStyledTestOutput(t)
+	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	app.View()
+
+	lines := app.composerVisibleLines(24, 1)
+	if len(lines) != 1 {
+		t.Fatalf("composerVisibleLines() returned %d lines, want 1", len(lines))
+	}
+	got := ansiPattern.ReplaceAllString(lines[0], "")
+	if !strings.HasPrefix(got, " Message") {
+		t.Fatalf("empty focused composer cursor should occupy first cell and keep placeholder visible, got %q", got)
+	}
+}
+
 func TestClosedChatShowsUnreadNotification(t *testing.T) {
 	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 20})

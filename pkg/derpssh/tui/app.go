@@ -1214,7 +1214,7 @@ func (a *App) composerVisibleLines(width int, rows int) []string {
 	value := a.composer.Value()
 	focused := a.composerInputFocused()
 	if value == "" {
-		return []string{renderComposerLine(a.composer.Placeholder, composerPlaceholderStyle, width, focused)}
+		return []string{renderComposerPlaceholderLine(a.composer.Placeholder, width, focused)}
 	}
 	lines := wrapPlainLines(value, width)
 	if len(lines) > rows {
@@ -1247,6 +1247,25 @@ func renderComposerLine(text string, style lipgloss.Style, width int, cursor boo
 	if cursor {
 		line += composerCursorStyle.Render(" ")
 	}
+	used := ansi.StringWidth(line)
+	if used < width {
+		line += composerStyle.Render(strings.Repeat(" ", width-used))
+	}
+	return fitLine(line, width)
+}
+
+func renderComposerPlaceholderLine(text string, width int, focused bool) string {
+	if width <= 0 {
+		return ""
+	}
+	if !focused {
+		return renderComposerLine(text, composerPlaceholderStyle, width, false)
+	}
+	if width == 1 {
+		return fitLine(composerCursorStyle.Render(" "), width)
+	}
+	text = ansi.Truncate(text, width-1, "")
+	line := composerCursorStyle.Render(" ") + composerPlaceholderStyle.Render(text)
 	used := ansi.StringWidth(line)
 	if used < width {
 		line += composerStyle.Render(strings.Repeat(" ", width-used))
