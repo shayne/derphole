@@ -38,7 +38,11 @@ This repo normally targets `origin/main` in GitButler. Do not use `but merge` as
 
 For a finish-to-main request, first use `but` to make the session branch a single commit when needed, then verify the commit is based on current `origin/main` and contains only this session's work. The final direct update of local `main` and `origin/main` is the only allowed raw `git` write exception for branch/commit publication, and it still requires explicit user authorization.
 
+Fast path for direct finish-to-main: if the session branch is already a single commit based on current `origin/main`, do not create a detached worktree or cherry-pick. After tests and `but pull --check`, publish with `git push origin <session-commit>:main`. Treat a non-fast-forward rejection as the race check; run `but pull`, retest if the base changed, and retry only when clean. `but push <branch>` only publishes the GitButler branch; it does not land work on `main`.
+
 After a session lands on `main`, run `but pull` so GitButler can mark the branch integrated, then preview cleanup with `but clean --dry-run` before running `but clean`. Delete non-empty branches or raw local `codex/*` refs only when they belong to this session and are confirmed merged; never clean up another agent's branch unless the user asks.
+
+After the direct push, verify `main`, `origin/main`, and `git ls-remote origin refs/heads/main` all point at the landed commit. If local `main` is stale after `but pull`, update only local `main` to `origin/main` as part of the same explicit finish-to-main publication exception.
 
 If a direct squash-to-main publication is used while the GitButler session branch is still applied, `but pull` may try to rebase duplicate checkpoint commits onto the squash commit and report conflicts even though raw `git status` is clean. In that case, verify `main` and `origin/main` contain the squash commit, then delete only this session's GitButler branch instead of resolving duplicate conflicts. If the current `but` build prompts to delete "unpushed" duplicate commits and does not accept `--force`, pipe a single `y` into `but branch delete <branch>`.
 
