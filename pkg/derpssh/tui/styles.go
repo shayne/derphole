@@ -74,8 +74,12 @@ var (
 	composerStyle = lipgloss.NewStyle().
 			Foreground(catText).
 			Background(catSurface0)
-	localChatStyle = lipgloss.NewStyle().
-			Foreground(catGreen)
+	composerPlaceholderStyle = lipgloss.NewStyle().
+					Foreground(catSubtext).
+					Background(catSurface0)
+	composerCursorStyle = composerStyle.Reverse(true)
+	localChatStyle      = lipgloss.NewStyle().
+				Foreground(catGreen)
 	approvalButtonStyle = lipgloss.NewStyle().
 				Foreground(catText).
 				Background(catSurface0)

@@ -10,7 +10,9 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
+	"github.com/muesli/termenv"
 )
 
 func TestAppUsesAltScreenCompatibleView(t *testing.T) {
@@ -669,6 +671,41 @@ func TestChatComposerShowsAllRowsWhileGrowingToThree(t *testing.T) {
 	}
 }
 
+func TestChatComposerPlaceholderUsesInputBackground(t *testing.T) {
+	forceStyledTestOutput(t)
+	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	app.View()
+
+	lines := app.composerVisibleLines(24, 1)
+	if len(lines) != 1 {
+		t.Fatalf("composerVisibleLines() returned %d lines, want 1", len(lines))
+	}
+	if !strings.Contains(lines[0], composerStyle.Foreground(catSubtext).Render("Message")) {
+		t.Fatalf("placeholder does not use composer input background:\n%q", lines[0])
+	}
+	if strings.Contains(lines[0], dimStyle.Render("Message")) {
+		t.Fatalf("placeholder uses generic dim style instead of composer input style:\n%q", lines[0])
+	}
+}
+
+func TestFocusedEmptyChatComposerShowsBlockCursor(t *testing.T) {
+	forceStyledTestOutput(t)
+	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	app.View()
+
+	lines := app.composerVisibleLines(24, 1)
+	cursor := composerStyle.Reverse(true).Render(" ")
+	if !strings.Contains(lines[0], cursor) {
+		t.Fatalf("focused empty composer missing visible block cursor %q:\n%q", cursor, lines[0])
+	}
+}
+
 func TestClosedChatShowsUnreadNotification(t *testing.T) {
 	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
@@ -822,6 +859,12 @@ func TestViewFitsWideGlyphNarrowWindow(t *testing.T) {
 }
 
 var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+
+func forceStyledTestOutput(t *testing.T) {
+	t.Helper()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	lipgloss.SetHasDarkBackground(true)
+}
 
 func visibleWidth(line string) int {
 	return runewidth.StringWidth(ansiPattern.ReplaceAllString(line, ""))

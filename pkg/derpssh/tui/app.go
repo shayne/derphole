@@ -1201,7 +1201,7 @@ func (a *App) writeSidebarComposer(content []string, width int, height int) {
 	composerLines := a.composerVisibleLines(width, rows)
 	for i := 0; i < rows && start+i < height; i++ {
 		if i < len(composerLines) {
-			content[start+i] = fitLine(composerStyle.Width(width).Render(fitLine(composerLines[i], width)), width)
+			content[start+i] = fitLine(composerLines[i], width)
 		} else {
 			content[start+i] = fitLine(composerStyle.Width(width).Render(strings.Repeat(" ", width)), width)
 		}
@@ -1212,14 +1212,46 @@ func (a *App) composerVisibleLines(width int, rows int) []string {
 	width = maxInt(width, 1)
 	rows = clampInt(rows, 1, 3)
 	value := a.composer.Value()
+	focused := a.composerInputFocused()
 	if value == "" {
-		return []string{dimStyle.Render(a.composer.Placeholder)}
+		return []string{renderComposerLine(a.composer.Placeholder, composerPlaceholderStyle, width, focused)}
 	}
 	lines := wrapPlainLines(value, width)
 	if len(lines) > rows {
 		lines = lines[len(lines)-rows:]
 	}
+	for i := range lines {
+		lines[i] = renderComposerLine(lines[i], composerStyle, width, focused && i == len(lines)-1)
+	}
 	return lines
+}
+
+func (a *App) composerInputFocused() bool {
+	return a.focus == FocusChat && a.composer.Focused()
+}
+
+func renderComposerLine(text string, style lipgloss.Style, width int, cursor bool) string {
+	if width <= 0 {
+		return ""
+	}
+	cursor = cursor && ansi.StringWidth(text) < width
+	textWidth := width
+	if cursor {
+		textWidth--
+	}
+	if textWidth < 0 {
+		textWidth = 0
+	}
+	text = ansi.Truncate(text, textWidth, "")
+	line := style.Render(text)
+	if cursor {
+		line += composerCursorStyle.Render(" ")
+	}
+	used := ansi.StringWidth(line)
+	if used < width {
+		line += composerStyle.Render(strings.Repeat(" ", width-used))
+	}
+	return fitLine(line, width)
 }
 
 func (a *App) sidebarComposerRows(height int) int {
