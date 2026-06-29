@@ -71,7 +71,10 @@ func HandleMouse(app *App, msg tea.MouseMsg) tea.Cmd {
 }
 
 func ignoreMouse(app *App, msg tea.MouseMsg) bool {
-	return app == nil || app.copyMode || !supportedMouseAction(msg.Action)
+	if app == nil || !supportedMouseAction(msg.Action) {
+		return true
+	}
+	return app.copyMode && !app.layout.TopBar.contains(msg.X, msg.Y)
 }
 
 func supportedMouseAction(action tea.MouseAction) bool {
@@ -83,6 +86,9 @@ func (a *App) handleModalMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
 		return cmd, true
 	}
 	if cmd, handled := a.handleQuitMouse(msg); handled {
+		return cmd, true
+	}
+	if cmd, handled := a.handlePeerDialogMouse(msg); handled {
 		return cmd, true
 	}
 	if cmd, handled := a.handleHelpMouse(msg); handled {
@@ -121,6 +127,19 @@ func (a *App) handleQuitMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
 		if choice := a.quitHit(msg.X, msg.Y); choice >= 0 {
 			a.quitChoice = choice
 			a.confirmQuitChoice()
+		}
+	}
+	return nil, true
+}
+
+func (a *App) handlePeerDialogMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
+	if !a.peerDialogOpen {
+		return nil, false
+	}
+	if msg.Action == tea.MouseActionPress {
+		if choice := a.peerActionHit(msg.X, msg.Y); choice >= 0 {
+			a.peerDialogChoice = choice
+			a.confirmPeerActionChoice()
 		}
 	}
 	return nil, true
@@ -209,7 +228,11 @@ func (a *App) handleTopBarMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
 		return nil, false
 	}
 	_ = a.renderTopBar()
-	switch a.topBarActionAt(msg.X, msg.Y) {
+	hit, ok := a.topBarHitAt(msg.X, msg.Y)
+	if !ok {
+		return nil, true
+	}
+	switch hit.action {
 	case topBarActionQuit:
 		a.openQuitConfirm()
 	case topBarActionChat:
@@ -218,17 +241,21 @@ func (a *App) handleTopBarMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
 		return a.openInvite(), true
 	case topBarActionHelp:
 		a.helpOpen = true
+	case topBarActionPeer:
+		a.openPeerDialog(hit.peer)
+	case topBarActionSelect:
+		return a.setCopyMode(false), true
 	}
 	return nil, true
 }
 
-func (a *App) topBarActionAt(x int, y int) topBarAction {
+func (a *App) topBarHitAt(x int, y int) (topBarHit, bool) {
 	for _, hit := range a.topBarHits {
 		if hit.rect.contains(x, y) {
-			return hit.action
+			return hit, true
 		}
 	}
-	return topBarActionNone
+	return topBarHit{}, false
 }
 
 func (a *App) handleDividerMouse(msg tea.MouseMsg) bool {
@@ -298,7 +325,7 @@ func (a *App) handleTerminalMouse(msg tea.MouseMsg) {
 	if !mode.Enabled || !mode.SGR {
 		return
 	}
-	if data, ok := EncodeSGRMouse(msg, a.layout.Terminal); ok {
+	if data, ok := EncodeSGRMouse(msg, a.currentTerminalRect()); ok {
 		a.emit(TerminalInputCommand{Data: data})
 	}
 }

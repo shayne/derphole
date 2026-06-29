@@ -31,6 +31,15 @@ var newTeaProgram = func(model tea.Model, opts ...tea.ProgramOption) teaProgram 
 	return tea.NewProgram(model, opts...)
 }
 
+const terminalRestoreSequence = "\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[0m\x1b[?25h"
+
+func writeTerminalRestore(w io.Writer) {
+	if w == nil {
+		return
+	}
+	_, _ = io.WriteString(w, terminalRestoreSequence)
+}
+
 type tuiConsoleCallbacks struct {
 	TerminalInput func(context.Context, []byte) error
 	Chat          func(context.Context, string) error
@@ -227,6 +236,7 @@ func (c *tuiConsole) Start(ctx context.Context) {
 		go func() {
 			close(runStarted)
 			_, _ = c.program.Run()
+			writeTerminalRestore(c.output)
 			cancel()
 		}()
 	})
@@ -239,6 +249,9 @@ func (c *tuiConsole) Stop() {
 	c.resolvePendingApprovals(protocol.RoleDenied)
 	if c.shouldQuitProgram() {
 		c.program.Quit()
+	}
+	if c.tty {
+		writeTerminalRestore(c.output)
 	}
 }
 

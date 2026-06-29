@@ -340,6 +340,31 @@ func TestTUIConsoleCopyInviteWritesOSC52(t *testing.T) {
 	}
 }
 
+func TestTerminalRestoreSequenceDisablesInteractiveModes(t *testing.T) {
+	var out strings.Builder
+
+	writeTerminalRestore(&out)
+
+	got := out.String()
+	for _, want := range []string{
+		"\x1b[?9l",    // X10 mouse tracking
+		"\x1b[?1000l", // normal mouse tracking
+		"\x1b[?1002l", // cell-motion mouse tracking
+		"\x1b[?1003l", // all-motion mouse tracking
+		"\x1b[?1005l", // UTF-8 extended mouse tracking
+		"\x1b[?1006l", // SGR mouse tracking
+		"\x1b[?1015l", // urxvt mouse tracking
+		"\x1b[?1004l", // focus reporting
+		"\x1b[?2004l", // bracketed paste
+		"\x1b[0m",     // text attributes
+		"\x1b[?25h",   // cursor visibility
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("restore sequence missing %q in %q", want, got)
+		}
+	}
+}
+
 func TestTUIConsoleNonTTYApprovalDeniesWithoutEnv(t *testing.T) {
 	var out strings.Builder
 	console := newTerminalConsoleWithOptions(tuiConsoleOptions{

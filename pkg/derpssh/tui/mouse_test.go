@@ -48,6 +48,53 @@ func TestMouseClickTopBarQuitOpensConfirmation(t *testing.T) {
 	}
 }
 
+func TestMouseClickPeerTopBarOpensPeerDialog(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	app.Update(RuntimeStateMsg{Peers: []Peer{
+		{ID: "guest-1", Name: "Alex", Role: RoleRead},
+		{ID: "guest-2", Name: "Blair", Role: RoleWrite},
+	}})
+	drainCommands(app)
+	peer := topBarPeerRect(t, app, "guest-2")
+
+	app.Update(leftClick(peer.X+peer.W/2, peer.Y))
+
+	if !app.peerDialogOpen {
+		t.Fatal("peer dialog did not open after clicking peer chip")
+	}
+	if app.peerDialogPeer.ID != "guest-2" {
+		t.Fatalf("peer dialog peer ID = %q, want guest-2", app.peerDialogPeer.ID)
+	}
+	if app.peerDialogChoice != peerActionWrite {
+		t.Fatalf("peer dialog choice = %v, want peerActionWrite", app.peerDialogChoice)
+	}
+}
+
+func TestMouseClickPeerDialogReadChangesClickedPeer(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	app.Update(RuntimeStateMsg{Peers: []Peer{
+		{ID: "guest-1", Name: "Alex", Role: RoleWrite},
+		{ID: "guest-2", Name: "Blair", Role: RoleWrite},
+	}})
+	drainCommands(app)
+	peer := topBarPeerRect(t, app, "guest-2")
+	app.Update(leftClick(peer.X+peer.W/2, peer.Y))
+	read, _, _ := app.peerActionButtonRects()
+
+	app.Update(leftClick(read.X+read.W/2, read.Y))
+
+	got, ok := readCommand(app).(RoleChangeCommand)
+	if !ok {
+		t.Fatalf("command = %T, want RoleChangeCommand", got)
+	}
+	want := RoleChangeCommand{PeerID: "guest-2", Peer: "Blair", Role: RoleRead}
+	if got != want {
+		t.Fatalf("role command = %+v, want %+v", got, want)
+	}
+}
+
 func TestMouseClickQuitConfirmationButtons(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
@@ -251,6 +298,18 @@ func topBarActionRect(t *testing.T, app *App, action topBarAction) Rect {
 		}
 	}
 	t.Fatalf("missing top-bar action %v in hits %+v", action, app.topBarHits)
+	return Rect{}
+}
+
+func topBarPeerRect(t *testing.T, app *App, peerID string) Rect {
+	t.Helper()
+	app.renderTopBar()
+	for _, hit := range app.topBarHits {
+		if hit.action == topBarActionPeer && hit.peer.ID == peerID {
+			return hit.rect
+		}
+	}
+	t.Fatalf("missing top-bar peer %q in hits %+v", peerID, app.topBarHits)
 	return Rect{}
 }
 

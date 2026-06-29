@@ -13,7 +13,6 @@ var (
 	catSurface0 = adaptive("#CCD0DA", "#313244")
 	catSurface1 = adaptive("#BCC0CC", "#45475A")
 	catSurface2 = adaptive("#ACB0BE", "#585B70")
-	catBase     = adaptive("#EFF1F5", "#1E1E2E")
 	catMantle   = adaptive("#E6E9EF", "#181825")
 	catSapphire = adaptive("#209FB5", "#74C7EC")
 	catGreen    = adaptive("#40A02B", "#A6E3A1")
@@ -56,10 +55,10 @@ var (
 	labelStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(catSapphire).
-			Background(catBase)
+			Background(catMantle)
 	dimStyle = lipgloss.NewStyle().
 			Foreground(catSubtext).
-			Background(catBase)
+			Background(catMantle)
 	separatorStyle = lipgloss.NewStyle().
 			Foreground(catSurface2)
 	sidebarStyle = lipgloss.NewStyle().
@@ -86,10 +85,22 @@ var (
 					Background(catSapphire)
 	modalStyle = lipgloss.NewStyle().
 			Foreground(catText).
-			Background(catBase).
+			Background(catMantle).
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(catSapphire).
 			Padding(0, 1)
+	modalBorderStyle = lipgloss.NewStyle().
+				Foreground(catSapphire).
+				Background(catMantle)
+	modalInteriorStyle = lipgloss.NewStyle().
+				Foreground(catText).
+				Background(catMantle)
+	menuLabelStyle = lipgloss.NewStyle().
+			Foreground(catText).
+			Background(catMantle)
+	menuShortcutStyle = lipgloss.NewStyle().
+				Foreground(catSubtext).
+				Background(catMantle)
 )
 
 func adaptive(light string, dark string) lipgloss.AdaptiveColor {

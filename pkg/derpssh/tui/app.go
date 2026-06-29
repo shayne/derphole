@@ -62,6 +62,20 @@ var shellExitChoiceOrder = []shellExitChoice{
 	shellExitChoiceQuit,
 }
 
+type peerActionChoice int
+
+const (
+	peerActionRead peerActionChoice = iota
+	peerActionWrite
+	peerActionKick
+)
+
+var peerActionChoiceOrder = []peerActionChoice{
+	peerActionRead,
+	peerActionWrite,
+	peerActionKick,
+}
+
 type topBarAction int
 
 const (
@@ -70,17 +84,21 @@ const (
 	topBarActionChat
 	topBarActionInvite
 	topBarActionHelp
+	topBarActionPeer
+	topBarActionSelect
 )
 
 type topBarSegment struct {
 	text   string
 	style  lipgloss.Style
 	action topBarAction
+	peer   Peer
 }
 
 type topBarHit struct {
 	rect   Rect
 	action topBarAction
+	peer   Peer
 }
 
 type menuAction int
@@ -114,31 +132,34 @@ type App struct {
 	commandQueue  []Command
 	commandPump   bool
 
-	width           int
-	height          int
-	layout          Layout
-	sidebarOpen     bool
-	sidebarWidth    int
-	draggingDivider bool
-	focus           Focus
-	prefix          bool
-	copyMode        bool
-	helpOpen        bool
-	approvalPeerID  string
-	approvalPeer    string
-	approvalChoice  approvalChoice
-	kickPeerID      string
-	kickPeer        string
-	inviteOpen      bool
-	quitOpen        bool
-	quitChoice      quitChoice
-	quitTitle       string
-	quitBody        string
-	shellExitOpen   bool
-	shellExitChoice shellExitChoice
-	noticeTitle     string
-	noticeBody      string
-	topBarHits      []topBarHit
+	width            int
+	height           int
+	layout           Layout
+	sidebarOpen      bool
+	sidebarWidth     int
+	draggingDivider  bool
+	focus            Focus
+	prefix           bool
+	copyMode         bool
+	helpOpen         bool
+	approvalPeerID   string
+	approvalPeer     string
+	approvalChoice   approvalChoice
+	kickPeerID       string
+	kickPeer         string
+	inviteOpen       bool
+	quitOpen         bool
+	quitChoice       quitChoice
+	quitTitle        string
+	quitBody         string
+	shellExitOpen    bool
+	shellExitChoice  shellExitChoice
+	peerDialogOpen   bool
+	peerDialogPeer   Peer
+	peerDialogChoice peerActionChoice
+	noticeTitle      string
+	noticeBody       string
+	topBarHits       []topBarHit
 
 	localRole    Role
 	transport    string
@@ -235,6 +256,7 @@ func (a *App) applyRuntimeState(msg RuntimeStateMsg) {
 		a.localRole = msg.LocalRole
 	}
 	a.peers = append([]Peer(nil), msg.Peers...)
+	a.refreshPeerDialog()
 }
 
 func (a *App) applyApprovalRequest(msg ApprovalRequestMsg) {
@@ -305,6 +327,9 @@ func (a *App) applyOverlays(lines []string) {
 			"Kick " + a.kickPeer + "?",
 			"Enter confirms. Esc cancels.",
 		})
+	}
+	if a.peerDialogOpen {
+		a.overlay(lines, a.peerActionLines())
 	}
 	if a.approvalActive() {
 		a.overlay(lines, a.approvalLines())
@@ -412,6 +437,10 @@ func (a *App) isGuest() bool {
 	return strings.EqualFold(strings.TrimSpace(a.side), string(ModeGuest))
 }
 
+func (a *App) isHost() bool {
+	return strings.EqualFold(strings.TrimSpace(a.side), string(ModeHost))
+}
+
 func (a *App) setSidebarOpen(open bool) {
 	oldTerminal := a.currentTerminalRect()
 	a.sidebarOpen = open
@@ -453,6 +482,9 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		a.prefix = true
 		return nil
 	}
+	if a.copyMode && msg.Type == tea.KeyEsc {
+		return a.setCopyMode(false)
+	}
 
 	if a.focus == FocusChat {
 		return a.handleChatKey(msg)
@@ -462,6 +494,16 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 }
 
 func (a *App) handleScreenKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	if cmd, handled := a.handleImmediateScreenKey(msg); handled {
+		return cmd, true
+	}
+	if cmd, handled := a.handleDialogScreenKey(msg); handled {
+		return cmd, true
+	}
+	return nil, false
+}
+
+func (a *App) handleImmediateScreenKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	if a.inviteOpen {
 		return a.handleInviteKey(msg), true
 	}
@@ -474,6 +516,13 @@ func (a *App) handleScreenKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	if cmd, handled := a.handleQuitKey(msg); handled {
 		return cmd, true
 	}
+	if cmd, handled := a.handlePeerDialogKey(msg); handled {
+		return cmd, true
+	}
+	return nil, false
+}
+
+func (a *App) handleDialogScreenKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	if a.handleEscapeKey(msg) {
 		return nil, true
 	}
@@ -560,6 +609,32 @@ func (a *App) handleApprovalKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		a.moveApprovalChoice(1)
 	case tea.KeyShiftTab, tea.KeyLeft, tea.KeyUp:
 		a.moveApprovalChoice(-1)
+	}
+	return nil, true
+}
+
+func (a *App) handlePeerDialogKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	if !a.peerDialogOpen {
+		return nil, false
+	}
+	if a.prefix {
+		return HandlePrefixKey(a, msg), true
+	}
+	if msg.Type == tea.KeyCtrlX {
+		a.prefix = true
+		return nil, true
+	}
+	switch msg.Type {
+	case tea.KeyEnter, tea.KeySpace:
+		a.confirmPeerActionChoice()
+	case tea.KeyEsc:
+		a.closePeerDialog()
+	case tea.KeyTab, tea.KeyRight, tea.KeyDown:
+		a.movePeerActionChoice(1)
+	case tea.KeyShiftTab, tea.KeyLeft, tea.KeyUp:
+		a.movePeerActionChoice(-1)
+	case tea.KeyRunes:
+		a.handlePeerActionRune(string(msg.Runes))
 	}
 	return nil, true
 }
@@ -818,6 +893,7 @@ func (a *App) renderTopBarSegments(segments []topBarSegment, maxWidth int) (stri
 			hits = append(hits, topBarHit{
 				rect:   Rect{X: start, Y: 0, W: partW, H: 1},
 				action: segment.action,
+				peer:   segment.peer,
 			})
 		}
 	}
@@ -863,13 +939,31 @@ func (a *App) stateTopBarSegments() []topBarSegment {
 	if a.localRole != "" && a.localRole != RolePending {
 		parts = append(parts, topBarSegment{text: string(a.localRole), style: topBarChipStyle})
 	}
-	if len(a.peers) > 0 {
-		parts = append(parts, topBarSegment{text: peerSummary(a.peers, a.identityCounts()), style: topBarChipStyle})
-	}
+	parts = append(parts, a.peerTopBarSegments()...)
 	if a.approvalActive() {
 		parts = append(parts, topBarSegment{text: "approve " + a.displayHandle(a.approvalPeer, 18), style: topBarWarnStyle})
 	}
 	return parts
+}
+
+func (a *App) peerTopBarSegments() []topBarSegment {
+	if len(a.peers) == 0 {
+		return nil
+	}
+	counts := a.identityCounts()
+	segments := make([]topBarSegment, 0, len(a.peers))
+	for _, peer := range a.peers {
+		label := peerDisplayLabel(peer, counts)
+		if label == "" {
+			continue
+		}
+		action := topBarActionNone
+		if a.isHost() {
+			action = topBarActionPeer
+		}
+		segments = append(segments, topBarSegment{text: label, style: topBarChipStyle, action: action, peer: peer})
+	}
+	return segments
 }
 
 func (a *App) chatTopBarSegments() []topBarSegment {
@@ -885,12 +979,12 @@ func (a *App) chatTopBarSegments() []topBarSegment {
 func (a *App) actionTopBarSegments() []topBarSegment {
 	segments := []topBarSegment{}
 	segments = append(segments, topBarSegment{text: "☰", style: topBarMutedStyle, action: topBarActionHelp})
-	if a.copyMode {
-		segments = append([]topBarSegment{{text: "select", style: topBarWarnStyle}}, segments...)
-		return segments
-	}
 	if a.prefix {
 		segments = append([]topBarSegment{{text: a.prefixHintText(), style: topBarWarnStyle}}, segments...)
+		return segments
+	}
+	if a.copyMode {
+		segments = append([]topBarSegment{{text: "select on · Esc/Y off", style: topBarWarnStyle, action: topBarActionSelect}}, segments...)
 		return segments
 	}
 	return segments
@@ -901,7 +995,12 @@ func (a *App) prefixHintText() string {
 	if a.canShowInvite() {
 		parts = append(parts, "I Invite")
 	}
-	parts = append(parts, "Y Select", "Q Quit")
+	if a.copyMode {
+		parts = append(parts, "Y Select off")
+	} else {
+		parts = append(parts, "Y Select")
+	}
+	parts = append(parts, "Q Quit")
 	return strings.Join(parts, " · ")
 }
 
@@ -1197,6 +1296,17 @@ func (a *App) waitingApprovalLines() []string {
 	}
 }
 
+func (a *App) peerActionLines() []string {
+	width := a.peerActionContentWidth()
+	name := valueOr(a.peerDialogPeer.Name, a.peerDialogPeer.ID)
+	return []string{
+		fitLine(labelStyle.Render("Manage "+a.displayHandle(name, 24)), width),
+		fitLine(dimStyle.Render("Change access or remove this guest."), width),
+		fitLine("", width),
+		a.peerActionButtonLine(width),
+	}
+}
+
 func (a *App) helpLines() []string {
 	width := a.helpContentWidth()
 	lines := []string{fitLine(labelStyle.Render("derpssh menu"), width), fitLine("", width)}
@@ -1224,28 +1334,25 @@ func (a *App) overlay(lines []string, body []string) {
 func renderModalBox(body []string) []string {
 	width := modalBodyWidth(body)
 	border := lipgloss.RoundedBorder()
-	borderStyle := lipgloss.NewStyle().Foreground(catSapphire)
-	interiorStyle := lipgloss.NewStyle().
-		Foreground(catText).
-		Background(catBase)
 
 	innerWidth := width + 2
 	box := make([]string, 0, len(body)+2)
-	box = append(box, borderStyle.Render(border.TopLeft+strings.Repeat(border.Top, innerWidth)+border.TopRight))
+	box = append(box, modalBorderStyle.Render(border.TopLeft+strings.Repeat(border.Top, innerWidth)+border.TopRight))
 	for _, line := range body {
-		line = strings.TrimRight(line, " ")
-		line = ansi.Truncate(line, width, "")
-		pad := strings.Repeat(" ", maxInt(width-displayWidth(line), 0))
-		box = append(box,
-			borderStyle.Render(border.Left)+
-				interiorStyle.Render(" ")+
-				line+
-				interiorStyle.Render(pad+" ")+
-				borderStyle.Render(border.Right),
-		)
+		box = append(box, modalBorderStyle.Render(border.Left)+renderModalContentLine(line, width)+modalBorderStyle.Render(border.Right))
 	}
-	box = append(box, borderStyle.Render(border.BottomLeft+strings.Repeat(border.Bottom, innerWidth)+border.BottomRight))
+	box = append(box, modalBorderStyle.Render(border.BottomLeft+strings.Repeat(border.Bottom, innerWidth)+border.BottomRight))
 	return box
+}
+
+func renderModalContentLine(line string, width int) string {
+	line = strings.TrimRight(line, " ")
+	line = ansi.Truncate(line, width, "")
+	pad := strings.Repeat(" ", maxInt(width-displayWidth(line), 0))
+	if strings.Contains(line, "\x1b[") {
+		return modalInteriorStyle.Render(" ") + line + modalInteriorStyle.Render(pad+" ")
+	}
+	return modalInteriorStyle.Render(" " + line + pad + " ")
 }
 
 func modalBodyWidth(body []string) int {
@@ -1307,8 +1414,44 @@ func (a *App) approvalButtonRects() (Rect, Rect, Rect) {
 	return read, write, deny
 }
 
+func (a *App) peerActionHit(x int, y int) peerActionChoice {
+	read, write, kick := a.peerActionButtonRects()
+	switch {
+	case read.contains(x, y):
+		return peerActionRead
+	case write.contains(x, y):
+		return peerActionWrite
+	case kick.contains(x, y):
+		return peerActionKick
+	default:
+		return -1
+	}
+}
+
+func (a *App) peerActionButtonRects() (Rect, Rect, Rect) {
+	contentW := a.peerActionContentWidth()
+	contentX, contentY := a.peerActionContentOrigin()
+	buttonLineW := peerActionButtonsWidth()
+	startX := contentX + maxInt((contentW-buttonLineW)/2, 0)
+	y := contentY + peerActionButtonLineIndex
+
+	read := Rect{X: startX, Y: y, W: peerActionButtonWidth(peerActionRead), H: 1}
+	write := Rect{X: read.X + read.W + peerActionButtonGap, Y: y, W: peerActionButtonWidth(peerActionWrite), H: 1}
+	kick := Rect{X: write.X + write.W + peerActionButtonGap, Y: y, W: peerActionButtonWidth(peerActionKick), H: 1}
+	return read, write, kick
+}
+
 func (a *App) approvalContentOrigin() (int, int) {
 	box := renderModalBox(a.approvalLines())
+	boxW := a.overlayWidth(box)
+	boxX := (a.width - boxW) / 2
+	boxY := a.overlayY(len(box))
+	return boxX + modalStyle.GetBorderLeftSize() + modalStyle.GetPaddingLeft(),
+		boxY + modalStyle.GetBorderTopSize() + modalStyle.GetPaddingTop()
+}
+
+func (a *App) peerActionContentOrigin() (int, int) {
+	box := renderModalBox(a.peerActionLines())
 	boxW := a.overlayWidth(box)
 	boxX := (a.width - boxW) / 2
 	boxY := a.overlayY(len(box))
@@ -1327,6 +1470,18 @@ func (a *App) approvalContentWidth() int {
 	return maxInt(width, 1)
 }
 
+func (a *App) peerActionContentWidth() int {
+	name := valueOr(a.peerDialogPeer.Name, a.peerDialogPeer.ID)
+	width := maxInt(42, displayWidth("Manage "+a.displayHandle(name, 24)))
+	width = maxInt(width, displayWidth("Change access or remove this guest."))
+	width = maxInt(width, peerActionButtonsWidth())
+	if a.width > 0 {
+		maxWidth := a.width - modalStyle.GetHorizontalBorderSize() - modalStyle.GetHorizontalPadding() - 2
+		width = minInt(width, maxInt(maxWidth, 1))
+	}
+	return maxInt(width, 1)
+}
+
 func (a *App) approvalButtonLine(width int) string {
 	lineW := approvalButtonsWidth()
 	pad := strings.Repeat(" ", maxInt((width-lineW)/2, 0))
@@ -1336,6 +1491,17 @@ func (a *App) approvalButtonLine(width int) string {
 		a.renderApprovalButton(approvalChoiceDeny),
 	}
 	return fitLine(pad+strings.Join(parts, strings.Repeat(" ", approvalButtonGap)), width)
+}
+
+func (a *App) peerActionButtonLine(width int) string {
+	lineW := peerActionButtonsWidth()
+	pad := strings.Repeat(" ", maxInt((width-lineW)/2, 0))
+	parts := []string{
+		a.renderPeerActionButton(peerActionRead),
+		a.renderPeerActionButton(peerActionWrite),
+		a.renderPeerActionButton(peerActionKick),
+	}
+	return fitLine(pad+strings.Join(parts, strings.Repeat(" ", peerActionButtonGap)), width)
 }
 
 func (a *App) quitHit(x int, y int) quitChoice {
@@ -1458,9 +1624,9 @@ func (a *App) menuEntryLine(entry menuEntry, width int) string {
 	if shortcutW > 0 && labelW+shortcutW+2 <= width {
 		label = fitLine(label, width-shortcutW-2)
 		gap := strings.Repeat(" ", maxInt(width-displayWidth(label)-shortcutW, 1))
-		return fitLine(label+dimStyle.Render(gap+entry.shortcut), width)
+		return fitLine(menuLabelStyle.Render(label)+menuShortcutStyle.Render(gap+entry.shortcut), width)
 	}
-	return fitLine(label, width)
+	return fitLine(menuLabelStyle.Width(width).Render(fitLine(label, width)), width)
 }
 
 func (a *App) menuEntries() []menuEntry {
@@ -1566,6 +1732,14 @@ func (a *App) renderApprovalButton(choice approvalChoice) string {
 	return approvalButtonStyle.Render(text)
 }
 
+func (a *App) renderPeerActionButton(choice peerActionChoice) string {
+	text := peerActionButtonText(choice)
+	if a.peerDialogChoice == choice {
+		return approvalButtonSelectedStyle.Render(text)
+	}
+	return approvalButtonStyle.Render(text)
+}
+
 func (a *App) approvalActive() bool {
 	return a.approvalPeer != "" || a.approvalPeerID != ""
 }
@@ -1605,6 +1779,101 @@ func (a *App) moveApprovalChoice(delta int) {
 		next += len(approvalChoiceOrder)
 	}
 	a.approvalChoice = approvalChoiceOrder[next]
+}
+
+func (a *App) openPeerDialog(peer Peer) {
+	if !a.isHost() {
+		return
+	}
+	if strings.TrimSpace(peer.ID) == "" && strings.TrimSpace(peer.Name) == "" {
+		return
+	}
+	a.peerDialogPeer = peer
+	a.peerDialogChoice = peerActionRead
+	if peer.Role == RoleWrite {
+		a.peerDialogChoice = peerActionWrite
+	}
+	a.peerDialogOpen = true
+	a.focus = FocusApproval
+}
+
+func (a *App) closePeerDialog() {
+	a.peerDialogOpen = false
+	a.peerDialogPeer = Peer{}
+	a.peerDialogChoice = peerActionRead
+	a.focusTerminal()
+}
+
+func (a *App) refreshPeerDialog() {
+	if !a.peerDialogOpen {
+		return
+	}
+	for _, peer := range a.peers {
+		if samePeer(peer, a.peerDialogPeer) {
+			a.peerDialogPeer = peer
+			return
+		}
+	}
+	a.closePeerDialog()
+}
+
+func samePeer(left Peer, right Peer) bool {
+	leftID := strings.TrimSpace(left.ID)
+	rightID := strings.TrimSpace(right.ID)
+	if leftID != "" && rightID != "" {
+		return leftID == rightID
+	}
+	leftName := strings.TrimSpace(left.Name)
+	rightName := strings.TrimSpace(right.Name)
+	return leftName != "" && leftName == rightName
+}
+
+func (a *App) confirmPeerActionChoice() {
+	if !a.peerDialogOpen {
+		return
+	}
+	peer := a.peerDialogPeer
+	peerName := valueOr(peer.Name, peer.ID)
+	switch a.peerDialogChoice {
+	case peerActionRead:
+		a.emit(RoleChangeCommand{PeerID: peer.ID, Peer: peerName, Role: RoleRead})
+	case peerActionWrite:
+		a.emit(RoleChangeCommand{PeerID: peer.ID, Peer: peerName, Role: RoleWrite})
+	case peerActionKick:
+		a.emit(KickCommand{PeerID: peer.ID, Peer: peerName})
+	}
+	a.closePeerDialog()
+}
+
+func (a *App) movePeerActionChoice(delta int) {
+	idx := 0
+	for i, choice := range peerActionChoiceOrder {
+		if choice == a.peerDialogChoice {
+			idx = i
+			break
+		}
+	}
+	next := (idx + delta) % len(peerActionChoiceOrder)
+	if next < 0 {
+		next += len(peerActionChoiceOrder)
+	}
+	a.peerDialogChoice = peerActionChoiceOrder[next]
+}
+
+func (a *App) handlePeerActionRune(key string) {
+	switch strings.ToLower(key) {
+	case "r":
+		a.peerDialogChoice = peerActionRead
+		a.confirmPeerActionChoice()
+	case "w":
+		a.peerDialogChoice = peerActionWrite
+		a.confirmPeerActionChoice()
+	case "k", "d":
+		a.peerDialogChoice = peerActionKick
+		a.confirmPeerActionChoice()
+	case "q":
+		a.closePeerDialog()
+	}
 }
 
 func (a *App) focusTerminal() {
@@ -1710,6 +1979,17 @@ func (a *App) openInvite() tea.Cmd {
 	return tea.DisableMouse
 }
 
+func (a *App) setCopyMode(enabled bool) tea.Cmd {
+	if a.copyMode == enabled {
+		return nil
+	}
+	a.copyMode = enabled
+	if enabled {
+		return tea.DisableMouse
+	}
+	return tea.EnableMouseCellMotion
+}
+
 func (a *App) canShowInvite() bool {
 	// The invite command must stay on the normal terminal screen so users can
 	// manually select one soft-wrapped shell line, including over SSH.
@@ -1727,7 +2007,7 @@ func (a *App) setTerminalCursorActive(active bool) {
 }
 
 func (a *App) modalActive() bool {
-	return a.helpOpen || a.resizeWarningOpen() || a.waitingApprovalOpen() || a.approvalActive() || a.kickPeer != "" || a.quitOpen || a.shellExitOpen || a.noticeOpen()
+	return a.helpOpen || a.resizeWarningOpen() || a.waitingApprovalOpen() || a.approvalActive() || a.kickPeer != "" || a.quitOpen || a.shellExitOpen || a.peerDialogOpen || a.noticeOpen()
 }
 
 func (a *App) resizeWarningOpen() bool {
@@ -1821,12 +2101,14 @@ func (a *App) pumpCommands() {
 }
 
 const (
-	approvalButtonGap        = 3
-	approvalButtonLineIndex  = 3
-	quitButtonGap            = 3
-	quitButtonLineIndex      = 3
-	shellExitButtonGap       = 3
-	shellExitButtonLineIndex = 4
+	approvalButtonGap         = 3
+	approvalButtonLineIndex   = 3
+	peerActionButtonGap       = 3
+	peerActionButtonLineIndex = 3
+	quitButtonGap             = 3
+	quitButtonLineIndex       = 3
+	shellExitButtonGap        = 3
+	shellExitButtonLineIndex  = 4
 )
 
 func approvalButtonsWidth() int {
@@ -1848,6 +2130,30 @@ func approvalButtonText(choice approvalChoice) string {
 		return " Write "
 	case approvalChoiceDeny:
 		return " Deny "
+	default:
+		return "      "
+	}
+}
+
+func peerActionButtonsWidth() int {
+	return peerActionButtonWidth(peerActionRead) +
+		peerActionButtonWidth(peerActionWrite) +
+		peerActionButtonWidth(peerActionKick) +
+		peerActionButtonGap*2
+}
+
+func peerActionButtonWidth(choice peerActionChoice) int {
+	return displayWidth(peerActionButtonText(choice))
+}
+
+func peerActionButtonText(choice peerActionChoice) string {
+	switch choice {
+	case peerActionRead:
+		return " Read "
+	case peerActionWrite:
+		return " Write "
+	case peerActionKick:
+		return " Kick "
 	default:
 		return "      "
 	}
@@ -1997,15 +2303,12 @@ var compactTransportStatuses = map[string]string{
 	"stream-complete":           "complete",
 }
 
-func peerSummary(peers []Peer, counts map[string]int) string {
-	parts := make([]string, 0, len(peers))
-	for _, peer := range peers {
-		if strings.TrimSpace(peer.Name) == "" {
-			continue
-		}
-		parts = append(parts, fmt.Sprintf("%s/%s", displayHandleWithCounts(peer.Name, 18, counts), peer.Role))
+func peerDisplayLabel(peer Peer, counts map[string]int) string {
+	name := valueOr(peer.Name, peer.ID)
+	if strings.TrimSpace(name) == "" {
+		return ""
 	}
-	return strings.Join(parts, ", ")
+	return fmt.Sprintf("%s/%s", displayHandleWithCounts(name, 18, counts), peer.Role)
 }
 
 func splitAndFit(s string, width int, height int) []string {

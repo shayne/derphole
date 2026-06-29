@@ -6,6 +6,7 @@ package tui
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 	"time"
 
@@ -304,6 +305,194 @@ func TestPrefixRoleCommandsUseSelectedPeerID(t *testing.T) {
 	}
 }
 
+func TestPeerDialogKeyboardNavigationAndConfirm(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+	app.openPeerDialog(Peer{ID: "guest-2", Name: "Blair", Role: RoleWrite})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyRight})
+	if app.peerDialogChoice != peerActionKick {
+		t.Fatalf("right key choice = %v, want kick", app.peerDialogChoice)
+	}
+	app.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	if app.peerDialogChoice != peerActionWrite {
+		t.Fatalf("left key choice = %v, want write", app.peerDialogChoice)
+	}
+	app.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if app.peerDialogChoice != peerActionKick {
+		t.Fatalf("tab key choice = %v, want kick", app.peerDialogChoice)
+	}
+	app.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	if app.peerDialogChoice != peerActionWrite {
+		t.Fatalf("shift-tab key choice = %v, want write", app.peerDialogChoice)
+	}
+	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	got, ok := readCommand(app).(RoleChangeCommand)
+	if !ok {
+		t.Fatalf("command = %T, want RoleChangeCommand", got)
+	}
+	want := RoleChangeCommand{PeerID: "guest-2", Peer: "Blair", Role: RoleWrite}
+	if got != want {
+		t.Fatalf("role command = %+v, want %+v", got, want)
+	}
+	if app.peerDialogOpen {
+		t.Fatalf("peer dialog still open after confirm")
+	}
+}
+
+func TestPeerDialogRuneShortcuts(t *testing.T) {
+	tests := []struct {
+		name string
+		key  rune
+		want Command
+	}{
+		{name: "read", key: 'r', want: RoleChangeCommand{PeerID: "guest-2", Peer: "Blair", Role: RoleRead}},
+		{name: "write", key: 'w', want: RoleChangeCommand{PeerID: "guest-2", Peer: "Blair", Role: RoleWrite}},
+		{name: "kick", key: 'k', want: KickCommand{PeerID: "guest-2", Peer: "Blair"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+			app.openPeerDialog(Peer{ID: "guest-2", Name: "Blair", Role: RoleWrite})
+
+			app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{tt.key}})
+
+			if got := readCommand(app); got != tt.want {
+				t.Fatalf("command = %+v, want %+v", got, tt.want)
+			}
+			if app.peerDialogOpen {
+				t.Fatalf("peer dialog still open after %q shortcut", tt.key)
+			}
+		})
+	}
+}
+
+func TestPeerDialogShortcutAndCancelKeys(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+	app.openPeerDialog(Peer{ID: "guest-2", Name: "Blair", Role: RoleWrite})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	if !app.prefix {
+		t.Fatalf("Ctrl-X did not enable prefix while peer dialog was open")
+	}
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	if !app.quitOpen {
+		t.Fatalf("Ctrl-X Q did not open quit confirmation while peer dialog was open")
+	}
+
+	app.closeQuitConfirm()
+	app.openPeerDialog(Peer{ID: "guest-2", Name: "Blair", Role: RoleWrite})
+	app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if app.peerDialogOpen {
+		t.Fatalf("Esc did not close peer dialog")
+	}
+
+	app.openPeerDialog(Peer{ID: "guest-2", Name: "Blair", Role: RoleWrite})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	if app.peerDialogOpen {
+		t.Fatalf("q did not close peer dialog")
+	}
+}
+
+func TestEscapeClosesActiveOverlays(t *testing.T) {
+	t.Run("approval denies", func(t *testing.T) {
+		app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+		app.Update(ApprovalRequestMsg{PeerID: "guest-1", Peer: "Alex"})
+
+		app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+		got, ok := readCommand(app).(ApprovalDecisionCommand)
+		if !ok {
+			t.Fatalf("command = %T, want ApprovalDecisionCommand", got)
+		}
+		if !got.Deny || got.PeerID != "guest-1" || got.Peer != "Alex" {
+			t.Fatalf("decision = %+v, want deny for guest-1/Alex", got)
+		}
+		if app.approvalActive() {
+			t.Fatalf("approval still active after Esc")
+		}
+	})
+
+	t.Run("quit confirm", func(t *testing.T) {
+		app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+		app.openQuitConfirm()
+
+		app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+		if app.quitOpen {
+			t.Fatalf("quit confirmation still open after Esc")
+		}
+	})
+
+	t.Run("prefix", func(t *testing.T) {
+		app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+		app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+
+		app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+		if app.prefix {
+			t.Fatalf("prefix still active after Esc")
+		}
+	})
+
+	t.Run("help", func(t *testing.T) {
+		app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+		app.helpOpen = true
+
+		app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+		if app.helpOpen {
+			t.Fatalf("help still open after Esc")
+		}
+	})
+
+	t.Run("invite", func(t *testing.T) {
+		app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+		app.inviteOpen = true
+
+		app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+		if app.inviteOpen {
+			t.Fatalf("invite still open after Esc")
+		}
+	})
+
+	t.Run("kick", func(t *testing.T) {
+		app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+		app.kickPeerID = "guest-1"
+		app.kickPeer = "Alex"
+
+		app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+		if app.kickPeerID != "" || app.kickPeer != "" {
+			t.Fatalf("kick confirmation still open after Esc")
+		}
+	})
+
+	t.Run("notice", func(t *testing.T) {
+		app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+		app.noticeTitle = "Disconnected"
+		app.noticeBody = "Guest quit"
+
+		app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+		if app.noticeOpen() {
+			t.Fatalf("notice still open after Esc")
+		}
+	})
+
+	t.Run("shell exit", func(t *testing.T) {
+		app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+		app.shellExitOpen = true
+
+		app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+		if !app.shellExitOpen {
+			t.Fatalf("shell-exit dialog closed on Esc, want it to stay open")
+		}
+	})
+}
+
 func TestPrefixInviteIgnoredInActiveSession(t *testing.T) {
 	invite := "npx -y derpssh@latest connect DSH1copyme"
 	app := NewApp(Options{Side: "host", InviteCommand: invite, Terminal: &fakePane{view: "ok"}})
@@ -348,6 +537,47 @@ func TestPrefixCopyModeTogglesSelectionMode(t *testing.T) {
 	}
 	if cmd == nil {
 		t.Fatalf("copy mode toggle returned nil command, want mouse disable command")
+	}
+}
+
+func TestCopyModeEscapeLeavesSelectionMode(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	if !app.copyMode {
+		t.Fatalf("copyMode = false, want true before escape")
+	}
+
+	_, cmd := app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	if app.copyMode {
+		t.Fatalf("copyMode = true, want false after escape")
+	}
+	if cmd == nil {
+		t.Fatalf("escape in copy mode returned nil command, want mouse re-enable command")
+	}
+	if got := readCommand(app); got != nil {
+		t.Fatalf("escape in copy mode emitted terminal command %+v, want none", got)
+	}
+}
+
+func TestCopyModeCtrlXShowsExitHint(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+
+	firstLine := strings.Split(app.View(), "\n")[0]
+	for _, want := range []string{"Y Select off", "Q Quit"} {
+		if !strings.Contains(firstLine, want) {
+			t.Fatalf("copy-mode prefix bar missing %q:\n%s", want, firstLine)
+		}
+	}
+	if strings.Contains(firstLine, "I Invite") {
+		t.Fatalf("copy-mode prefix bar exposes invite action:\n%s", firstLine)
 	}
 }
 

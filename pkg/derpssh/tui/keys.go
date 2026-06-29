@@ -144,11 +144,7 @@ func inviteAction(a *App) tea.Cmd {
 }
 
 func copyModeAction(a *App) tea.Cmd {
-	a.copyMode = !a.copyMode
-	if a.copyMode {
-		return tea.DisableMouse
-	}
-	return tea.EnableMouseCellMotion
+	return a.setCopyMode(!a.copyMode)
 }
 
 func widenChatAction(a *App) tea.Cmd {
