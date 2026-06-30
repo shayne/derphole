@@ -191,7 +191,9 @@ set -euo pipefail
 tools_mod="$PWD/dist/tools/gomobile.mod"
 tools_gopath="$PWD/dist/tools/.gopath"
 mkdir -p dist/apple
-PATH="$PWD/dist/tools/bin:$PATH" GOPATH="$tools_gopath" GOFLAGS="-modfile=$tools_mod -mod=mod" gomobile bind \
+PATH="$PWD/dist/tools/bin:$PATH" GOPATH="$tools_gopath" GOFLAGS="-modfile=$tools_mod -mod=mod" ZERO_AR_DATE=1 gomobile bind \
+  -trimpath \
+  -ldflags=-buildid= \
   -target=ios,iossimulator \
   -iosversion "${APPLE_IOS_VERSION:-17.0}" \
   -o dist/apple/DerpholeMobile.xcframework \

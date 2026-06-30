@@ -107,6 +107,46 @@ func TestReleaseWorkflowVerifiesSwiftPMPackageTarget(t *testing.T) {
 	}
 }
 
+func TestSwiftPMFrameworkBuildIsNormalizedForReleaseChecksum(t *testing.T) {
+	t.Parallel()
+
+	misePath := filepath.Join("..", ".mise.toml")
+	miseData, err := os.ReadFile(misePath)
+	if err != nil {
+		t.Fatalf("read mise config: %v", err)
+	}
+
+	miseBody := string(miseData)
+	for _, required := range []string{
+		"ZERO_AR_DATE=1 gomobile bind",
+		"-trimpath",
+		"-ldflags=-buildid=",
+	} {
+		if !strings.Contains(miseBody, required) {
+			t.Fatalf("SwiftPM framework build is not deterministic; missing %q", required)
+		}
+	}
+
+	scriptPath := filepath.Join("..", "tools", "packaging", "build-swiftpm-framework.sh")
+	scriptData, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("read SwiftPM framework build script: %v", err)
+	}
+
+	scriptBody := string(scriptData)
+	for _, required := range []string{
+		"plistlib.dump(info, handle, sort_keys=True)",
+		"CFBundleShortVersionString",
+		"CFBundleVersion",
+		"find DerpholeMobile.xcframework -exec touch -h -t 202001010000 {} +",
+		"find DerpholeMobile.xcframework -print | LC_ALL=C sort | zip -q -X -@ DerpholeMobile.xcframework.zip",
+	} {
+		if !strings.Contains(scriptBody, required) {
+			t.Fatalf("SwiftPM framework archive is not normalized; missing %q", required)
+		}
+	}
+}
+
 func TestReleaseWorkflowDoesNotInterpolateVersionInShell(t *testing.T) {
 	t.Parallel()
 
