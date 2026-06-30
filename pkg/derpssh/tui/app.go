@@ -1839,6 +1839,7 @@ func (a *App) approve(role Role, deny bool) {
 	if !a.approvalActive() {
 		return
 	}
+	a.clearMousePress()
 	a.emit(ApprovalDecisionCommand{PeerID: a.approvalPeerID, Peer: a.approvalPeer, Role: role, Deny: deny})
 	a.approvalPeerID = ""
 	a.approvalPeer = ""
@@ -1879,6 +1880,7 @@ func (a *App) openPeerDialog(peer Peer) {
 	if strings.TrimSpace(peer.ID) == "" && strings.TrimSpace(peer.Name) == "" {
 		return
 	}
+	a.clearMousePress()
 	a.peerDialogPeer = peer
 	a.peerDialogChoice = peerActionRead
 	if peer.Role == RoleWrite {
@@ -1889,6 +1891,7 @@ func (a *App) openPeerDialog(peer Peer) {
 }
 
 func (a *App) closePeerDialog() {
+	a.clearMousePress()
 	a.peerDialogOpen = false
 	a.peerDialogPeer = Peer{}
 	a.peerDialogChoice = peerActionRead
@@ -1991,6 +1994,7 @@ func (a *App) changeFirstPeerRole(role Role) {
 
 func (a *App) openQuitConfirm() {
 	a.prefix = false
+	a.clearMousePress()
 	a.quitOpen = true
 	a.quitChoice = quitChoiceQuit
 	a.quitTitle = ""
@@ -1998,6 +2002,7 @@ func (a *App) openQuitConfirm() {
 }
 
 func (a *App) closeQuitConfirm() {
+	a.clearMousePress()
 	a.quitOpen = false
 	a.quitChoice = quitChoiceQuit
 	a.quitTitle = ""
@@ -2005,6 +2010,7 @@ func (a *App) closeQuitConfirm() {
 }
 
 func (a *App) confirmQuitChoice() {
+	a.clearMousePress()
 	if a.quitChoice == quitChoiceQuit {
 		a.emit(QuitCommand{})
 		return
@@ -2013,6 +2019,7 @@ func (a *App) confirmQuitChoice() {
 }
 
 func (a *App) confirmShellExitChoice() {
+	a.clearMousePress()
 	switch a.shellExitChoice {
 	case shellExitChoiceRestart:
 		a.shellExitOpen = false

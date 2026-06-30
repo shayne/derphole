@@ -450,6 +450,30 @@ func TestGuestChatOverlayDoesNotShrinkEffectiveTerminalViewport(t *testing.T) {
 	}
 }
 
+func TestClosingChatRestoresTerminalContent(t *testing.T) {
+	pane := &fakePane{view: "terminal-left " + strings.Repeat(".", 48) + " terminal-right"}
+	app := NewApp(Options{Side: "host", Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 80, Height: 10})
+	closedLine := ansiPattern.ReplaceAllString(strings.Split(app.View(), "\n")[1], "")
+	if !strings.Contains(closedLine, "terminal-right") {
+		t.Fatalf("closed chat baseline missing right edge terminal content: %q", closedLine)
+	}
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	openLine := ansiPattern.ReplaceAllString(strings.Split(app.View(), "\n")[1], "")
+	if strings.Contains(openLine, "terminal-right") {
+		t.Fatalf("open chat did not cover right edge terminal content: %q", openLine)
+	}
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	restoredLine := ansiPattern.ReplaceAllString(strings.Split(app.View(), "\n")[1], "")
+	if restoredLine != closedLine {
+		t.Fatalf("closed chat did not repaint terminal line\n got: %q\nwant: %q", restoredLine, closedLine)
+	}
+}
+
 func TestOverlayLinePreservesContentAfterModal(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 40, Height: 5})

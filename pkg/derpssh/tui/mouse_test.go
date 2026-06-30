@@ -134,6 +134,32 @@ func TestMouseClickQuitConfirmationButtons(t *testing.T) {
 	}
 }
 
+func TestMouseQuitPressDoesNotSurviveKeyboardClose(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	app.openQuitConfirm()
+	quit, _ := app.quitButtonRects()
+
+	app.Update(leftClick(quit.X+quit.W/2, quit.Y))
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("quit confirmation press emitted command %+v, want none until release", cmd)
+	}
+
+	app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if app.quitOpen {
+		t.Fatal("quit confirmation still open after Esc")
+	}
+
+	app.openQuitConfirm()
+	quit, _ = app.quitButtonRects()
+	app.Update(leftRelease(quit.X+quit.W/2, quit.Y))
+
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("stale mouse release emitted command %+v, want none without fresh press", cmd)
+	}
+}
+
 func TestMouseClickQuitConfirmationWorksInCopyMode(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
@@ -222,6 +248,29 @@ func TestMouseDragDividerResizesChat(t *testing.T) {
 	}
 	if !app.sidebarOpen {
 		t.Fatalf("sidebarOpen = false after divider drag")
+	}
+}
+
+func TestMouseDragDividerRepaintsTerminalDuringMotion(t *testing.T) {
+	pane := &recordingViewPane{fakePane: fakePane{view: "ok"}}
+	app := NewApp(Options{Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	drainCommands(app)
+	start := app.layout.Divider.X
+
+	_ = app.View()
+	initialWidth := pane.lastViewWidth()
+	app.Update(leftClick(start, app.layout.Divider.Y+2))
+	app.Update(tea.MouseMsg{X: 70, Y: app.layout.Divider.Y + 2, Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft})
+	_ = app.View()
+
+	if got := pane.lastViewWidth(); got == initialWidth {
+		t.Fatalf("terminal view width did not change during divider drag: got %d", got)
+	}
+	if got := pane.lastViewWidth(); got != app.layout.Terminal.W {
+		t.Fatalf("terminal view width = %d, want current layout width %d", got, app.layout.Terminal.W)
 	}
 }
 
@@ -371,6 +420,23 @@ func leftRelease(x int, y int) tea.MouseMsg {
 		Action: tea.MouseActionRelease,
 		Button: tea.MouseButtonLeft,
 	}
+}
+
+type recordingViewPane struct {
+	fakePane
+	viewWidths []int
+}
+
+func (p *recordingViewPane) View(width int, height int) string {
+	p.viewWidths = append(p.viewWidths, width)
+	return p.fakePane.View(width, height)
+}
+
+func (p *recordingViewPane) lastViewWidth() int {
+	if len(p.viewWidths) == 0 {
+		return 0
+	}
+	return p.viewWidths[len(p.viewWidths)-1]
 }
 
 func topBarActionRect(t *testing.T, app *App, action topBarAction) Rect {
