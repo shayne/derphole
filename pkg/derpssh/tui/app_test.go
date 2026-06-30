@@ -792,6 +792,91 @@ func TestClosedChatShowsUnreadNotification(t *testing.T) {
 	}
 }
 
+func TestClosedChatUnreadPulsesTopBar(t *testing.T) {
+	forceStyledTestOutput(t)
+	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+
+	_, cmd := app.Update(ChatMsg{Author: "alex", Body: "ping"})
+	if cmd == nil {
+		t.Fatal("remote unread chat did not start a pulse tick")
+	}
+	firstLine := strings.Split(app.View(), "\n")[0]
+	firstPlain := ansiPattern.ReplaceAllString(firstLine, "")
+	if !strings.Contains(firstPlain, "Chat 1") {
+		t.Fatalf("closed chat missing unread top-bar notification:\n%s", app.View())
+	}
+
+	app.Update(unreadChatPulseMsg{seq: app.unreadPulseSeq})
+	secondLine := strings.Split(app.View(), "\n")[0]
+	if secondLine == firstLine {
+		t.Fatalf("unread top-bar style did not pulse:\nfirst:  %q\nsecond: %q", firstLine, secondLine)
+	}
+	if secondPlain := ansiPattern.ReplaceAllString(secondLine, ""); secondPlain != firstPlain {
+		t.Fatalf("unread pulse changed visible label:\nfirst:  %q\nsecond: %q", firstPlain, secondPlain)
+	}
+
+	app.Update(unreadChatPulseMsg{seq: app.unreadPulseSeq})
+	thirdLine := strings.Split(app.View(), "\n")[0]
+	if thirdLine != firstLine {
+		t.Fatalf("unread top-bar pulse did not return to original style:\nfirst: %q\nthird: %q", firstLine, thirdLine)
+	}
+}
+
+func TestClosedChatUnreadIgnoresStalePulseTick(t *testing.T) {
+	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
+	app.Update(ChatMsg{Author: "alex", Body: "ping"})
+	staleSeq := app.unreadPulseSeq
+
+	app.setSidebarOpen(true)
+	app.setSidebarOpen(false)
+	app.Update(ChatMsg{Author: "alex", Body: "again"})
+	currentSeq := app.unreadPulseSeq
+	if currentSeq == staleSeq {
+		t.Fatalf("new unread pulse reused stale sequence %d", currentSeq)
+	}
+
+	app.Update(unreadChatPulseMsg{seq: staleSeq})
+	if app.unreadPulse {
+		t.Fatal("stale unread pulse tick changed pulse state")
+	}
+
+	app.Update(unreadChatPulseMsg{seq: currentSeq})
+	if !app.unreadPulse {
+		t.Fatal("current unread pulse tick did not change pulse state")
+	}
+}
+
+func TestClosedChatUnreadEmitsBellCommand(t *testing.T) {
+	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
+
+	app.Update(ChatMsg{Author: "alex", Body: "ping"})
+	if _, ok := readCommand(app).(TerminalBellCommand); !ok {
+		t.Fatal("remote unread chat did not emit TerminalBellCommand")
+	}
+
+	app.Update(ChatMsg{Author: "alex", Body: "again"})
+	if _, ok := readCommand(app).(TerminalBellCommand); !ok {
+		t.Fatal("next remote unread chat did not emit another TerminalBellCommand")
+	}
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	app.Update(ChatMsg{Author: "alex", Body: "open chat"})
+	for cmd := readCommand(app); cmd != nil; cmd = readCommand(app) {
+		if _, ok := cmd.(TerminalBellCommand); ok {
+			t.Fatal("open chat emitted TerminalBellCommand")
+		}
+	}
+
+	app.Update(ChatMsg{Author: "me", Body: "local", Local: true})
+	for cmd := readCommand(app); cmd != nil; cmd = readCommand(app) {
+		if _, ok := cmd.(TerminalBellCommand); ok {
+			t.Fatal("local chat emitted TerminalBellCommand")
+		}
+	}
+}
+
 func TestTransportStatusIsReducedToPath(t *testing.T) {
 	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 20})

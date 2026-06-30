@@ -26,6 +26,11 @@ type Options struct {
 }
 
 const approvalInputGrace = 200 * time.Millisecond
+const unreadChatPulseInterval = 500 * time.Millisecond
+
+type unreadChatPulseMsg struct {
+	seq uint64
+}
 
 type approvalChoice int
 
@@ -154,16 +159,19 @@ type App struct {
 	noticeBody       string
 	topBarHits       []topBarHit
 
-	localRole    Role
-	transport    string
-	hostCols     int
-	hostRows     int
-	peers        []Peer
-	chatMessages []ChatMessage
-	chatScroll   int
-	unreadChat   int
-	composer     textarea.Model
-	now          func() time.Time
+	localRole      Role
+	transport      string
+	hostCols       int
+	hostRows       int
+	peers          []Peer
+	chatMessages   []ChatMessage
+	chatScroll     int
+	unreadChat     int
+	unreadPulse    bool
+	unreadTicking  bool
+	unreadPulseSeq uint64
+	composer       textarea.Model
+	now            func() time.Time
 }
 
 func NewApp(opts Options) *App {
@@ -211,8 +219,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if cmd, handled := a.handleInteractiveMessage(msg); handled {
 		return a, cmd
 	}
-	a.applyMessage(msg)
-	return a, nil
+	return a, a.applyMessage(msg)
 }
 
 func (a *App) handleInteractiveMessage(msg tea.Msg) (tea.Cmd, bool) {
@@ -226,7 +233,7 @@ func (a *App) handleInteractiveMessage(msg tea.Msg) (tea.Cmd, bool) {
 	}
 }
 
-func (a *App) applyMessage(msg tea.Msg) {
+func (a *App) applyMessage(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		a.resize(msg.Width, msg.Height, true)
@@ -235,12 +242,15 @@ func (a *App) applyMessage(msg tea.Msg) {
 	case RuntimeStateMsg:
 		a.applyRuntimeState(msg)
 	case ChatMsg:
-		a.appendChatMessage(ChatMessage(msg))
+		return a.appendChatMessage(ChatMessage(msg))
 	case ApprovalRequestMsg:
 		a.applyApprovalRequest(msg)
 	case NoticeMsg:
 		a.applyNotice(msg)
+	case unreadChatPulseMsg:
+		return a.handleUnreadChatPulse(msg)
 	}
+	return nil
 }
 
 func (a *App) applyRuntimeState(msg RuntimeStateMsg) {
@@ -456,7 +466,7 @@ func (a *App) setSidebarWidth(width int) {
 	oldTerminal := a.currentTerminalRect()
 	a.sidebarWidth = clampSidebarWidth(a.width, width)
 	a.sidebarOpen = true
-	a.unreadChat = 0
+	a.clearUnreadChat()
 	a.applyLayout()
 	a.emitTerminalResizeIfChanged(oldTerminal)
 }
@@ -829,7 +839,7 @@ func (a *App) handleChatKey(msg tea.KeyMsg) tea.Cmd {
 		body := strings.TrimSpace(a.composer.Value())
 		if body != "" {
 			a.emit(ChatSendCommand{Body: body})
-			a.appendChatMessage(ChatMessage{Author: a.localDisplayName(), Body: body, Local: true})
+			_ = a.appendChatMessage(ChatMessage{Author: a.localDisplayName(), Body: body, Local: true})
 			a.composer.Reset()
 		}
 		return nil
@@ -839,9 +849,9 @@ func (a *App) handleChatKey(msg tea.KeyMsg) tea.Cmd {
 	return cmd
 }
 
-func (a *App) appendChatMessage(msg ChatMessage) {
+func (a *App) appendChatMessage(msg ChatMessage) tea.Cmd {
 	if a.isLocalEcho(msg) {
-		return
+		return nil
 	}
 	a.chatMessages = append(a.chatMessages, msg)
 	if msg.Local {
@@ -849,7 +859,51 @@ func (a *App) appendChatMessage(msg ChatMessage) {
 	}
 	if !a.sidebarOpen && !msg.Local {
 		a.unreadChat++
+		return a.startUnreadChatAttention()
 	}
+	return nil
+}
+
+func (a *App) startUnreadChatAttention() tea.Cmd {
+	a.emit(TerminalBellCommand{})
+	if a.unreadTicking {
+		return nil
+	}
+	a.unreadPulseSeq++
+	a.unreadTicking = true
+	a.unreadPulse = false
+	return unreadChatPulseTick(a.unreadPulseSeq)
+}
+
+func (a *App) handleUnreadChatPulse(msg unreadChatPulseMsg) tea.Cmd {
+	if msg.seq != a.unreadPulseSeq {
+		return nil
+	}
+	if a.unreadChat == 0 || a.sidebarOpen {
+		a.stopUnreadChatAttention()
+		return nil
+	}
+	a.unreadPulse = !a.unreadPulse
+	return unreadChatPulseTick(a.unreadPulseSeq)
+}
+
+func (a *App) clearUnreadChat() {
+	a.unreadChat = 0
+	a.stopUnreadChatAttention()
+}
+
+func (a *App) stopUnreadChatAttention() {
+	a.unreadPulse = false
+	if a.unreadTicking {
+		a.unreadPulseSeq++
+	}
+	a.unreadTicking = false
+}
+
+func unreadChatPulseTick(seq uint64) tea.Cmd {
+	return tea.Tick(unreadChatPulseInterval, func(time.Time) tea.Msg {
+		return unreadChatPulseMsg{seq: seq}
+	})
 }
 
 func (a *App) isLocalEcho(msg ChatMessage) bool {
@@ -996,7 +1050,11 @@ func (a *App) chatTopBarSegments() []topBarSegment {
 		return []topBarSegment{{text: "Chat", style: topBarActionStyle, action: ActionToggleChat}}
 	}
 	if a.unreadChat > 0 {
-		return []topBarSegment{{text: fmt.Sprintf("Chat %d", a.unreadChat), style: topBarWarnStyle, action: ActionToggleChat}}
+		style := topBarWarnStyle
+		if a.unreadPulse {
+			style = topBarActionStyle
+		}
+		return []topBarSegment{{text: fmt.Sprintf("Chat %d", a.unreadChat), style: style, action: ActionToggleChat}}
 	}
 	return []topBarSegment{{text: "Chat", style: topBarMutedStyle, action: ActionToggleChat}}
 }
@@ -1967,7 +2025,7 @@ func (a *App) focusTerminal() {
 func (a *App) focusChat() {
 	a.focus = FocusChat
 	_ = a.composer.Focus()
-	a.unreadChat = 0
+	a.clearUnreadChat()
 }
 
 func (a *App) changeFirstPeerRole(role Role) {

@@ -27,6 +27,10 @@ type ChatSendCommand struct {
 
 func (ChatSendCommand) command() {}
 
+type TerminalBellCommand struct{}
+
+func (TerminalBellCommand) command() {}
+
 type QuitCommand struct{}
 
 func (QuitCommand) command() {}

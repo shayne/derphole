@@ -182,6 +182,18 @@ func TestTUIConsoleRestartShellCommandCallsCallback(t *testing.T) {
 	}
 }
 
+func TestTUIConsoleTerminalBellCommandWritesBell(t *testing.T) {
+	var out strings.Builder
+	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, &recordingTerminalPane{view: "shell$"})
+	console.output = &out
+
+	console.handleCommand(context.Background(), tui.TerminalBellCommand{})
+
+	if got := out.String(); got != "\a" {
+		t.Fatalf("terminal bell output = %q, want BEL", got)
+	}
+}
+
 func TestTUIConsoleProgramRequiresInputAndOutputTTY(t *testing.T) {
 	stdin, stdout := openPipeFiles(t)
 	oldIsTerminalFD := isTerminalFD

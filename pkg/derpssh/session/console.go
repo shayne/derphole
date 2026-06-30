@@ -506,11 +506,12 @@ func (c *tuiConsole) consumeCommands(ctx context.Context) {
 }
 
 func (c *tuiConsole) handleCommand(ctx context.Context, cmd tui.Command) {
+	if c.handleTerminalCommand(ctx, cmd) {
+		return
+	}
 	switch cmd := cmd.(type) {
 	case tui.ApprovalDecisionCommand:
 		c.handleApprovalDecision(cmd)
-	case tui.TerminalInputCommand:
-		c.handleTerminalInputCommand(ctx, cmd)
 	case tui.ChatSendCommand:
 		c.handleChatCommand(ctx, cmd)
 	case tui.QuitCommand:
@@ -526,6 +527,18 @@ func (c *tuiConsole) handleCommand(ctx context.Context, cmd tui.Command) {
 	case tui.RestartShellCommand:
 		c.handleRestartShellCommand(ctx)
 	}
+}
+
+func (c *tuiConsole) handleTerminalCommand(ctx context.Context, cmd tui.Command) bool {
+	switch cmd := cmd.(type) {
+	case tui.TerminalInputCommand:
+		c.handleTerminalInputCommand(ctx, cmd)
+	case tui.TerminalBellCommand:
+		c.handleTerminalBellCommand()
+	default:
+		return false
+	}
+	return true
 }
 
 func (c *tuiConsole) handleQuitCommand(ctx context.Context) {
@@ -566,6 +579,13 @@ func (c *tuiConsole) handleChatCommand(ctx context.Context, cmd tui.ChatSendComm
 	if callbacks.Chat != nil {
 		_ = callbacks.Chat(ctx, cmd.Body)
 	}
+}
+
+func (c *tuiConsole) handleTerminalBellCommand() {
+	if c.output == nil {
+		return
+	}
+	_, _ = io.WriteString(c.output, "\a")
 }
 
 func (c *tuiConsole) handleRoleChangeCommand(ctx context.Context, cmd tui.RoleChangeCommand) {
