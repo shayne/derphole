@@ -17,12 +17,14 @@ type CloseReason struct {
 
 type terminalLifecycleOptions struct {
 	Output  io.Writer
+	Program teaProgram
 	Restore []byte
 	IsTTY   bool
 }
 
 type TerminalLifecycle struct {
 	output  io.Writer
+	program teaProgram
 	restore []byte
 	isTTY   bool
 
@@ -35,6 +37,7 @@ type TerminalLifecycle struct {
 func newTerminalLifecycle(opts terminalLifecycleOptions) *TerminalLifecycle {
 	return &TerminalLifecycle{
 		output:  opts.Output,
+		program: opts.Program,
 		restore: append([]byte(nil), opts.Restore...),
 		isTTY:   opts.IsTTY,
 	}
@@ -54,6 +57,9 @@ func (l *TerminalLifecycle) End(reason CloseReason) {
 	l.restoreOnce.Do(func() {
 		if l.output != nil && len(l.restore) > 0 {
 			_, _ = l.output.Write(l.restore)
+		}
+		if l.program != nil {
+			l.program.Quit()
 		}
 	})
 }

@@ -122,6 +122,18 @@ type menuEntry struct {
 	action   menuAction
 }
 
+var actionMenuActions = map[ActionID]menuAction{
+	ActionToggleChat:    menuActionChat,
+	ActionFocusChat:     menuActionFocusChat,
+	ActionFocusTerminal: menuActionFocusTerminal,
+	ActionShowInvite:    menuActionInvite,
+	ActionToggleSelect:  menuActionCopyMode,
+	ActionQuit:          menuActionQuit,
+	ActionGrantRead:     menuActionRead,
+	ActionGrantWrite:    menuActionWrite,
+	ActionKickPeer:      menuActionKick,
+}
+
 type mousePressKind int
 
 const (
@@ -310,8 +322,12 @@ func (a *App) View() string {
 	a.applyLayout()
 
 	lines := a.baseViewLines()
-	a.applyOverlays(lines)
-	return a.joinFittedLines(lines)
+	canvas := NewFrameCanvas(a.width, a.height, lipgloss.NewStyle())
+	for y, line := range lines {
+		canvas.DrawANSIText(0, y, fitLine(line, a.width), lipgloss.NewStyle())
+	}
+	a.applyOverlays(canvas)
+	return canvas.Render()
 }
 
 func (a *App) baseViewLines() []string {
@@ -328,44 +344,37 @@ func (a *App) baseViewLines() []string {
 	return lines
 }
 
-func (a *App) applyOverlays(lines []string) {
+func (a *App) applyOverlays(canvas *FrameCanvas) {
 	if a.resizeWarningOpen() {
-		a.overlay(lines, a.resizeWarningLines())
+		a.overlay(canvas, a.resizeWarningLines())
 	}
 	if a.waitingApprovalOpen() {
-		a.overlay(lines, a.waitingApprovalLines())
+		a.overlay(canvas, a.waitingApprovalLines())
 	}
 	if a.helpOpen {
-		a.overlay(lines, a.helpLines())
+		a.overlay(canvas, a.helpLines())
 	}
 	if a.kickPeer != "" {
-		a.overlay(lines, []string{
+		a.overlay(canvas, []string{
 			"Kick " + a.kickPeer + "?",
 			"Enter confirms. Esc cancels.",
 		})
 	}
 	if a.peerDialogOpen {
-		a.overlay(lines, a.peerActionLines())
+		a.overlay(canvas, a.peerActionLines())
 	}
 	if a.approvalActive() {
-		a.overlay(lines, a.approvalLines())
+		a.overlay(canvas, a.approvalLines())
 	}
 	if a.quitOpen {
-		a.overlay(lines, a.quitLines())
+		a.overlay(canvas, a.quitLines())
 	}
 	if a.shellExitOpen {
-		a.overlay(lines, a.shellExitLines())
+		a.overlay(canvas, a.shellExitLines())
 	}
 	if a.noticeOpen() {
-		a.overlay(lines, a.noticeLines())
+		a.overlay(canvas, a.noticeLines())
 	}
-}
-
-func (a *App) joinFittedLines(lines []string) string {
-	for i := range lines {
-		lines[i] = fitLine(lines[i], a.width)
-	}
-	return strings.Join(lines, "\n")
 }
 
 func (a *App) Commands() <-chan Command {
@@ -490,25 +499,7 @@ func (a *App) emitTerminalResizeIfChanged(oldTerminal Rect) {
 }
 
 func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
-	if cmd, handled := a.handleScreenKey(msg); handled {
-		return cmd
-	}
-	if a.prefix {
-		return HandlePrefixKey(a, msg)
-	}
-	if msg.Type == tea.KeyCtrlX {
-		a.prefix = true
-		return nil
-	}
-	if a.copyMode && msg.Type == tea.KeyEsc {
-		return a.setCopyMode(false)
-	}
-
-	if a.focus == FocusChat {
-		return a.handleChatKey(msg)
-	}
-
-	return a.handleTerminalKey(msg)
+	return a.routeInput(msg)
 }
 
 func (a *App) handleScreenKey(msg tea.KeyMsg) (tea.Cmd, bool) {
@@ -857,25 +848,7 @@ func (a *App) handleTerminalKey(msg tea.KeyMsg) tea.Cmd {
 }
 
 func (a *App) renderTopBar() string {
-	width := maxInt(a.width, 1)
-	left := a.leftTopBarSegments()
-	right := a.rightTopBarSegments()
-	rightLine, rightHits := a.renderTopBarSegments(right, width)
-	rightW := displayWidth(rightLine)
-	leftMax := maxInt(width-rightW-1, 0)
-	leftLine, leftHits := a.renderTopBarSegments(left, leftMax)
-	leftW := displayWidth(leftLine)
-	gapW := maxInt(width-leftW-rightW, 0)
-	gap := topBarStyle.Render(strings.Repeat(" ", gapW))
-
-	a.topBarHits = append(leftHits[:0:0], leftHits...)
-	rightX := leftW + gapW
-	for _, hit := range rightHits {
-		hit.rect.X += rightX
-		a.topBarHits = append(a.topBarHits, hit)
-	}
-
-	return fitLine(leftLine+gap+rightLine, width)
+	return Header{app: a}.View()
 }
 
 func (a *App) renderTopBarSegments(segments []topBarSegment, maxWidth int) (string, []topBarHit) {
@@ -1386,18 +1359,19 @@ func (a *App) helpLines() []string {
 	return lines
 }
 
-func (a *App) overlay(lines []string, body []string) {
-	if !a.canOverlay(lines) {
+func (a *App) overlay(canvas *FrameCanvas, body []string) {
+	if !a.canOverlay(canvas) {
 		return
 	}
 	box := renderModalBox(body)
 	boxW := a.overlayWidth(box)
 	x := (a.width - boxW) / 2
 	y := a.overlayY(len(box))
+	overlay := NewFrameCanvas(boxW, len(box), lipgloss.NewStyle())
 	for i, line := range box {
-		row := y + i
-		a.overlayLine(lines, row, x, line, boxW)
+		overlay.DrawANSIText(0, i, fitLine(line, boxW), lipgloss.NewStyle())
 	}
+	canvas.Overlay(overlay, Point{X: x, Y: y})
 }
 
 func renderModalBox(body []string) []string {
@@ -1432,8 +1406,8 @@ func modalBodyWidth(body []string) int {
 	return width
 }
 
-func (a *App) canOverlay(lines []string) bool {
-	return len(lines) > 0 && a.width > 0 && a.height > 0
+func (a *App) canOverlay(canvas *FrameCanvas) bool {
+	return canvas != nil && canvas.width > 0 && canvas.height > 0 && a.width > 0 && a.height > 0
 }
 
 func (a *App) overlayWidth(box []string) int {
@@ -1695,26 +1669,22 @@ func (a *App) menuEntryLine(entry menuEntry, width int) string {
 }
 
 func (a *App) menuEntries() []menuEntry {
-	entries := []menuEntry{
-		{label: "Toggle Chat", shortcut: "Ctrl-X S", action: menuActionChat},
-		{label: "Focus Chat", shortcut: "Ctrl-X C", action: menuActionFocusChat},
-		{label: "Focus Terminal", shortcut: "Ctrl-X T", action: menuActionFocusTerminal},
-	}
-	if a.canShowInvite() {
-		entries = append(entries, menuEntry{label: "Show Invite", shortcut: "Ctrl-X I", action: menuActionInvite})
-	}
-	entries = append(entries,
-		menuEntry{label: "Native Selection", shortcut: "Ctrl-X Y", action: menuActionCopyMode},
-		menuEntry{label: "Quit", shortcut: "Ctrl-X Q", action: menuActionQuit},
-	)
-	if len(a.peers) > 0 {
-		entries = append(entries,
-			menuEntry{label: "Grant Read", shortcut: "Ctrl-X R", action: menuActionRead},
-			menuEntry{label: "Grant Write", shortcut: "Ctrl-X W", action: menuActionWrite},
-			menuEntry{label: "Kick Peer", shortcut: "Ctrl-X K", action: menuActionKick},
-		)
+	actions := NewActionRegistry().Visible(a.actionContext())
+	entries := make([]menuEntry, 0, len(actions))
+	for _, action := range actions {
+		if entry, ok := menuEntryForAction(action); ok {
+			entries = append(entries, entry)
+		}
 	}
 	return entries
+}
+
+func menuEntryForAction(action Action) (menuEntry, bool) {
+	menuAction, ok := actionMenuActions[action.ID]
+	if !ok {
+		return menuEntry{}, false
+	}
+	return menuEntry{label: action.Label, shortcut: string(action.Shortcut), action: menuAction}, true
 }
 
 func (a *App) quitButtonLine(width int) string {
@@ -2089,9 +2059,7 @@ func (a *App) setCopyMode(enabled bool) tea.Cmd {
 }
 
 func (a *App) canShowInvite() bool {
-	// The invite command must stay on the normal terminal screen so users can
-	// manually select one soft-wrapped shell line, including over SSH.
-	return false
+	return a.isHost() && strings.TrimSpace(a.inviteCommand) != ""
 }
 
 type terminalCursorController interface {

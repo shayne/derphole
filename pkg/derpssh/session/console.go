@@ -86,14 +86,9 @@ type tuiConsole struct {
 	mode    tui.Mode
 	output  io.Writer
 
-	appMu     sync.Mutex
-	stateMu   sync.Mutex
-	transport string
-	hostCols  int
-	hostRows  int
-	localRole tui.Role
-	peers     map[string]tui.Peer
-	peerOrder []string
+	appMu   sync.Mutex
+	stateMu sync.Mutex
+	runtime *RuntimeStateAdapter
 
 	callbackMu sync.Mutex
 	callbacks  tuiConsoleCallbacks
@@ -159,12 +154,28 @@ func newTUIConsole(opts tuiConsoleOptions) *tuiConsole {
 		app:                       app,
 		mode:                      opts.Mode,
 		output:                    opts.Stdout,
-		peers:                     make(map[string]tui.Peer),
+		runtime:                   newConsoleRuntimeState(opts),
 		approvals:                 make(map[string]chan protocol.Role),
 		allowHeadlessApprovalWait: opts.AllowHeadlessApprovalWait,
 	}
 	c.configureProgram(opts)
 	return c
+}
+
+func newConsoleRuntimeState(opts tuiConsoleOptions) *RuntimeStateAdapter {
+	return NewRuntimeStateAdapter(RuntimeStateOptions{
+		Mode:          runtimeModeFromTUI(opts.Mode),
+		LocalName:     DisplayName(opts.DisplayName),
+		CanonicalCols: opts.Cols,
+		CanonicalRows: opts.Rows,
+	})
+}
+
+func runtimeModeFromTUI(mode tui.Mode) RuntimeMode {
+	if mode == tui.ModeHost {
+		return ModeHost
+	}
+	return ModeGuest
 }
 
 func normalizeTUIConsoleOptions(opts tuiConsoleOptions) tuiConsoleOptions {
@@ -342,7 +353,7 @@ func (c *tuiConsole) resolvePendingApprovals(role protocol.Role) {
 func (c *tuiConsole) OnRuntimeEvent(event RuntimeEvent) {
 	switch event.Kind {
 	case RuntimeEventStatus:
-		c.updateRuntimeState(func() { c.transport = event.Message })
+		c.updateRuntimeState(func(state *RuntimeStateAdapter) { state.SetTransport(event.Message) })
 	case RuntimeEventPeer:
 		c.applyPeerRuntimeEvent(event)
 	case RuntimeEventRole:
@@ -356,28 +367,41 @@ func (c *tuiConsole) OnRuntimeEvent(event RuntimeEvent) {
 	}
 }
 
-func (c *tuiConsole) updateRuntimeState(update func()) {
+func (c *tuiConsole) updateRuntimeState(update func(*RuntimeStateAdapter)) {
 	c.stateMu.Lock()
-	update()
+	if c.runtime == nil {
+		c.runtime = NewRuntimeStateAdapter(RuntimeStateOptions{Mode: runtimeModeFromTUI(c.mode)})
+	}
+	update(c.runtime)
 	msg := c.runtimeStateLocked()
 	c.stateMu.Unlock()
 	c.send(msg)
 }
 
 func (c *tuiConsole) applyPeerRuntimeEvent(event RuntimeEvent) {
-	c.updateRuntimeState(func() {
-		c.setPeerLocked(event.ParticipantID, event.DisplayName, event.Role)
-		c.transport = transportAfterPeerRole(c.transport, event.Role)
+	c.updateRuntimeState(func(state *RuntimeStateAdapter) {
+		state.UpsertPeer(PeerState{
+			ID:      event.ParticipantID,
+			Display: DisplayName(event.DisplayName),
+			Role:    event.Role,
+			Active:  true,
+		})
+		snapshot := state.Snapshot()
+		state.SetTransport(transportAfterPeerRole(snapshot.Transport, event.Role))
 	})
 }
 
 func (c *tuiConsole) applyCloseRuntimeEvent(event RuntimeEvent) {
 	message := strings.TrimSpace(event.Message)
 	participantID := strings.TrimSpace(event.ParticipantID)
-	c.updateRuntimeState(func() {
-		c.transport = closedTransportStatus(message)
+	c.updateRuntimeState(func(state *RuntimeStateAdapter) {
+		state.SetCloseReason(CloseReason{Code: closeReasonCode(message), Message: message})
+		state.SetTransport(closedTransportStatus(message))
+		if message == hostShellExitedReason {
+			state.SetShell(ShellExited)
+		}
 		if c.mode == tui.ModeHost && participantID != "" {
-			c.clearPeersLocked()
+			state.ClearPeers()
 		}
 	})
 	if c.mode == tui.ModeHost && participantID != "" {
@@ -406,9 +430,10 @@ func transportAfterPeerRole(current string, role protocol.Role) string {
 }
 
 func (c *tuiConsole) applyRoleRuntimeEvent(event RuntimeEvent) {
-	c.updateRuntimeState(func() {
-		c.localRole = tuiRoleFromProtocol(event.Role)
-		c.transport = transportAfterLocalRole(c.transport, event.Role)
+	c.updateRuntimeState(func(state *RuntimeStateAdapter) {
+		state.SetLocalRole(event.Role)
+		snapshot := state.Snapshot()
+		state.SetTransport(transportAfterLocalRole(snapshot.Transport, event.Role))
 	})
 }
 
@@ -423,9 +448,8 @@ func (c *tuiConsole) applyResizeRuntimeEvent(event RuntimeEvent) {
 	if strings.TrimSpace(event.ParticipantID) != "" {
 		return
 	}
-	c.updateRuntimeState(func() {
-		c.hostCols = event.Cols
-		c.hostRows = event.Rows
+	c.updateRuntimeState(func(state *RuntimeStateAdapter) {
+		state.SetCanonicalSize(event.Cols, event.Rows)
 	})
 }
 
@@ -442,6 +466,25 @@ func closedTransportStatus(message string) string {
 		return "closed"
 	}
 	return "closed: " + message
+}
+
+func closeReasonCode(message string) string {
+	code := strings.ToLower(strings.TrimSpace(message))
+	code = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		default:
+			return '_'
+		}
+	}, code)
+	code = strings.Trim(code, "_")
+	for strings.Contains(code, "__") {
+		code = strings.ReplaceAll(code, "__", "_")
+	}
+	return code
 }
 
 func (c *tuiConsole) View() string {
@@ -964,7 +1007,7 @@ func (c *tuiConsole) quitProgramIfStarted() bool {
 		return false
 	}
 	c.programQuitOnce.Do(func() {
-		c.program.Quit()
+		c.terminalLifecycle().End(CloseReason{Code: "program_quit"})
 	})
 	return true
 }
@@ -994,6 +1037,7 @@ func (c *tuiConsole) terminalLifecycle() *TerminalLifecycle {
 	if c.lifecycle == nil {
 		c.lifecycle = newTerminalLifecycle(terminalLifecycleOptions{
 			Output:  c.output,
+			Program: c.program,
 			Restore: []byte(terminalRestoreSequence),
 			IsTTY:   c.tty,
 		})
@@ -1012,83 +1056,24 @@ func (c *tuiConsole) runTeaCommand(cmd tea.Cmd) {
 	}()
 }
 
-func (c *tuiConsole) setPeerLocked(id, name string, role protocol.Role) {
-	id = strings.TrimSpace(id)
-	name = strings.TrimSpace(name)
-	if id == "" {
-		id = name
-	}
-	if id == "" {
-		return
-	}
-	if c.mode == tui.ModeHost {
-		c.removeStaleHostPeersLocked(id, name, role)
-	}
-	if existing, ok := c.peers[id]; ok {
-		if name == "" {
-			name = existing.Name
-		}
-	} else {
-		c.peerOrder = append(c.peerOrder, id)
-	}
-	name = displayNameOrID(name, id)
-	c.peers[id] = tui.Peer{ID: id, Name: name, Role: tuiRoleFromProtocol(role)}
-}
-
-func (c *tuiConsole) removeStaleHostPeersLocked(id, name string, role protocol.Role) {
-	if !roleGranted(role) && role != protocol.RolePending {
-		return
-	}
-	for _, existingID := range c.peerOrder {
-		if existingID == id {
-			continue
-		}
-		existing := c.peers[existingID]
-		if roleGranted(role) || samePeerDisplayName(existing.Name, name) {
-			delete(c.peers, existingID)
-		}
-	}
-	c.compactPeerOrderLocked()
-}
-
-func samePeerDisplayName(left, right string) bool {
-	left = strings.TrimSpace(left)
-	right = strings.TrimSpace(right)
-	return left != "" && right != "" && left == right
-}
-
-func (c *tuiConsole) compactPeerOrderLocked() {
-	if len(c.peerOrder) == 0 {
-		return
-	}
-	compact := c.peerOrder[:0]
-	for _, id := range c.peerOrder {
-		if _, ok := c.peers[id]; ok {
-			compact = append(compact, id)
-		}
-	}
-	c.peerOrder = compact
-}
-
-func (c *tuiConsole) clearPeersLocked() {
-	clear(c.peers)
-	c.peerOrder = nil
-}
-
 func (c *tuiConsole) runtimeStateLocked() tui.RuntimeStateMsg {
-	peers := make([]tui.Peer, 0, len(c.peerOrder))
-	for _, id := range c.peerOrder {
-		peer, ok := c.peers[id]
-		if ok {
-			peers = append(peers, peer)
-		}
+	snapshot := c.runtime.Snapshot()
+	peers := make([]tui.Peer, 0, len(snapshot.ActivePeers))
+	for _, peer := range snapshot.ActivePeers {
+		peers = append(peers, tui.Peer{
+			ID:   peer.ID,
+			Name: displayNameOrID(string(peer.Display), peer.ID),
+			Role: tuiRoleFromProtocol(peer.Role),
+		})
 	}
 	return tui.RuntimeStateMsg{
-		Transport: c.transport,
-		HostCols:  c.hostCols,
-		HostRows:  c.hostRows,
-		LocalRole: c.localRole,
-		Peers:     peers,
+		Transport:   snapshot.Transport,
+		HostCols:    snapshot.CanonicalCols,
+		HostRows:    snapshot.CanonicalRows,
+		LocalRole:   tuiRoleFromProtocol(snapshot.LocalRole),
+		Peers:       peers,
+		ShellState:  string(snapshot.Shell),
+		CloseReason: snapshot.CloseReason.Message,
 	}
 }
 

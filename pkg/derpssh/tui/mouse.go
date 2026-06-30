@@ -59,11 +59,14 @@ func HandleMouse(app *App, msg tea.MouseMsg) tea.Cmd {
 	if cmd, handled := app.handleModalMouse(msg); handled {
 		return cmd
 	}
+	if app.copyMode {
+		if msg.Action == tea.MouseActionPress && !app.currentTerminalRect().contains(msg.X, msg.Y) {
+			return app.setCopyMode(false)
+		}
+		return nil
+	}
 	if cmd, handled := app.handleTopBarMouse(msg); handled {
 		return cmd
-	}
-	if app.copyMode {
-		return nil
 	}
 	if app.handleDividerMouse(msg) {
 		return nil

@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/hinshun/vt10x"
 )
@@ -32,76 +31,36 @@ type TerminalInputMode struct {
 }
 
 type vtTerminalPane struct {
-	mu           sync.Mutex
-	term         vt10x.Terminal
-	mouse        MouseMode
-	inputMode    TerminalInputMode
-	modeTail     string
-	cursorActive bool
+	surface *vtTerminalSurface
 }
 
 func NewVTTerminalPane(cols int, rows int) TerminalPane {
-	return newVTTerminalSurface(terminalSize{Cols: cols, Rows: rows})
+	return &vtTerminalPane{surface: newVTTerminalSurface(terminalSize{Cols: cols, Rows: rows})}
 }
 
 func (p *vtTerminalPane) Write(b []byte) (int, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	modeInput := p.modeTail + string(b)
-	p.mouse = TrackMouseMode(p.mouse, []byte(modeInput))
-	p.inputMode = TrackInputMode(p.inputMode, []byte(modeInput))
-	p.modeTail = incompletePrivateModeTail(modeInput)
-	return p.term.Write(b)
+	p.surface.Write(b)
+	return len(b), nil
 }
 
 func (p *vtTerminalPane) Resize(cols int, rows int) {
-	if cols <= 0 || rows <= 0 {
-		return
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.term.Resize(cols, rows)
+	p.surface.Resize(terminalSize{Cols: cols, Rows: rows})
 }
 
 func (p *vtTerminalPane) View(width int, height int) string {
-	if width <= 0 || height <= 0 {
-		return ""
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.term.Lock()
-	defer p.term.Unlock()
-
-	lines := make([]string, 0, height)
-	cursor := terminalCursorView{cursor: p.term.Cursor(), visible: p.term.CursorVisible() && p.cursorActive}
-	cols, rows := p.term.Size()
-	renderWidth := minInt(width, cols)
-	for y := 0; y < height; y++ {
-		if y >= rows || renderWidth <= 0 {
-			lines = append(lines, "")
-			continue
-		}
-		lines = append(lines, renderTerminalRow(p.term, renderWidth, y, cursor))
-	}
-	return strings.Join(lines, "\n")
+	return renderTerminalSurfaceRows(p.surface, terminalRenderOptions{Width: width, Height: height, Focused: true})
 }
 
 func (p *vtTerminalPane) MouseMode() MouseMode {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.mouse
+	return p.surface.MouseMode()
 }
 
 func (p *vtTerminalPane) InputMode() TerminalInputMode {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.inputMode
+	return p.surface.InputMode()
 }
 
 func (p *vtTerminalPane) SetCursorActive(active bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.cursorActive = active
+	p.surface.SetCursorActive(active)
 }
 
 const (
@@ -127,24 +86,8 @@ type terminalCursorView struct {
 	visible bool
 }
 
-func renderTerminalRow(term vt10x.Terminal, width int, y int, cursor terminalCursorView) string {
-	var b strings.Builder
-	activeStyle := defaultTerminalCellStyle()
-	styleActive := false
-	last := cursor.lastColumn(term, width, y)
-	for x := 0; x <= last; x++ {
-		glyph := term.Cell(x, y)
-		style := cursor.style(glyph, x, y)
-		writeTerminalCell(&b, glyph, style, &activeStyle, &styleActive)
-	}
-	if styleActive {
-		b.WriteString("\x1b[0m")
-	}
-	return b.String()
-}
-
-func writeTerminalCell(b *strings.Builder, glyph vt10x.Glyph, style terminalCellStyle, activeStyle *terminalCellStyle, styleActive *bool) {
-	if terminalBlankCellShouldUseDefaultStyle(glyph, style) {
+func writeTerminalCell(b *strings.Builder, r rune, style terminalCellStyle, activeStyle *terminalCellStyle, styleActive *bool) {
+	if terminalBlankCellShouldUseDefaultStyle(r, style) {
 		style = defaultTerminalCellStyle()
 	}
 	if !style.equal(*activeStyle) {
@@ -155,11 +98,7 @@ func writeTerminalCell(b *strings.Builder, glyph vt10x.Glyph, style terminalCell
 		}
 		*activeStyle = style
 	}
-	if glyph.Char == 0 {
-		b.WriteByte(' ')
-		return
-	}
-	b.WriteRune(glyph.Char)
+	b.WriteRune(r)
 }
 
 func resetTerminalStyle(b *strings.Builder, styleActive *bool) {
@@ -170,44 +109,46 @@ func resetTerminalStyle(b *strings.Builder, styleActive *bool) {
 	*styleActive = false
 }
 
-func (c terminalCursorView) lastColumn(term vt10x.Terminal, width int, y int) int {
-	last := terminalLastRenderableColumn(term, width, y)
+func (c terminalCursorView) lastColumn(surface TerminalSurface, width int, y int) int {
+	last := terminalLastRenderableColumn(surface, width, y)
 	if c.visibleAt(y, width) && c.cursor.X > last {
 		return c.cursor.X
 	}
 	return last
 }
 
-func (c terminalCursorView) style(glyph vt10x.Glyph, x int, y int) terminalCellStyle {
+func (c terminalCursorView) styleCell(cell terminalCell, x int, y int) terminalCellStyle {
 	if c.visible && c.cursor.Y == y && c.cursor.X == x {
-		return terminalCursorStyle(glyph, c.cursor)
+		style := cell.Style
+		style.reverse = true
+		return style
 	}
-	return terminalStyleFromGlyph(glyph)
+	return cell.Style
 }
 
 func (c terminalCursorView) visibleAt(y int, width int) bool {
 	return c.visible && c.cursor.Y == y && c.cursor.X >= 0 && c.cursor.X < width
 }
 
-func terminalLastRenderableColumn(term vt10x.Terminal, width int, y int) int {
+func terminalLastRenderableColumn(surface TerminalSurface, width int, y int) int {
 	for x := width - 1; x >= 0; x-- {
-		glyph := term.Cell(x, y)
-		if glyph.Char != 0 && glyph.Char != ' ' {
+		cell := surface.Cell(x, y)
+		if cell.Rune != ' ' {
 			return x
 		}
-		if terminalBlankCellHasVisibleStyle(glyph) {
+		if terminalBlankCellHasVisibleStyle(cell) {
 			return x
 		}
 	}
 	return -1
 }
 
-func terminalBlankCellShouldUseDefaultStyle(glyph vt10x.Glyph, style terminalCellStyle) bool {
-	return glyph.Char == ' ' && !terminalCellVisibleOnBlank(style)
+func terminalBlankCellShouldUseDefaultStyle(r rune, style terminalCellStyle) bool {
+	return r == ' ' && !terminalCellVisibleOnBlank(style)
 }
 
-func terminalBlankCellHasVisibleStyle(glyph vt10x.Glyph) bool {
-	return glyph.Char == ' ' && terminalCellVisibleOnBlank(terminalStyleFromAttr(glyph))
+func terminalBlankCellHasVisibleStyle(cell terminalCell) bool {
+	return cell.Rune == ' ' && terminalCellVisibleOnBlank(cell.Style)
 }
 
 func terminalStyleFromGlyph(glyph vt10x.Glyph) terminalCellStyle {
@@ -223,15 +164,6 @@ func terminalStyleFromAttr(glyph vt10x.Glyph) terminalCellStyle {
 		fg:   glyph.FG,
 		bg:   glyph.BG,
 	}
-}
-
-func terminalCursorStyle(glyph vt10x.Glyph, cursor vt10x.Cursor) terminalCellStyle {
-	style := terminalStyleFromGlyph(glyph)
-	if glyph.Char == 0 {
-		style = terminalStyleFromAttr(cursor.Attr)
-	}
-	style.reverse = true
-	return style
 }
 
 func defaultTerminalCellStyle() terminalCellStyle {

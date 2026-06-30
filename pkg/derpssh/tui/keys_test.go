@@ -74,6 +74,27 @@ func TestEncodeTerminalKeyNavigation(t *testing.T) {
 	}
 }
 
+func TestEncodeTerminalKeyHtopFunctionKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  tea.KeyMsg
+		want string
+	}{
+		{name: "f1", msg: tea.KeyMsg{Type: tea.KeyF1}, want: "\x1bOP"},
+		{name: "f5", msg: tea.KeyMsg{Type: tea.KeyF5}, want: "\x1b[15~"},
+		{name: "f10", msg: tea.KeyMsg{Type: tea.KeyF10}, want: "\x1b[21~"},
+		{name: "f12", msg: tea.KeyMsg{Type: tea.KeyF12}, want: "\x1b[24~"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := EncodeTerminalKey(tt.msg)
+			if !ok || string(got) != tt.want {
+				t.Fatalf("EncodeTerminalKey() = %q, %v; want %q, true", got, ok, tt.want)
+			}
+		})
+	}
+}
+
 func TestEncodeTerminalKeyApplicationCursorMode(t *testing.T) {
 	tests := []struct {
 		name string
@@ -92,6 +113,21 @@ func TestEncodeTerminalKeyApplicationCursorMode(t *testing.T) {
 				t.Fatalf("EncodeTerminalKeyWithMode() = %q, %v; want %q, true", got, ok, tt.want)
 			}
 		})
+	}
+}
+
+func TestTerminalFocusHtopFunctionKeyReachesPTY(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyF10})
+
+	cmd := readCommand(app)
+	got, ok := cmd.(TerminalInputCommand)
+	if !ok {
+		t.Fatalf("command = %T, want TerminalInputCommand", cmd)
+	}
+	if string(got.Data) != "\x1b[21~" {
+		t.Fatalf("TerminalInputCommand.Data = %q, want F10 sequence", got.Data)
 	}
 }
 
@@ -509,7 +545,7 @@ func TestEscapeClosesActiveOverlays(t *testing.T) {
 	})
 }
 
-func TestPrefixInviteIgnoredInActiveSession(t *testing.T) {
+func TestPrefixInviteOpensHostInvite(t *testing.T) {
 	invite := "npx -y derpssh@latest connect DSH1copyme"
 	app := NewApp(Options{Side: "host", InviteCommand: invite, Terminal: &fakePane{view: "ok"}})
 
@@ -519,8 +555,8 @@ func TestPrefixInviteIgnoredInActiveSession(t *testing.T) {
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("Ctrl-X I emitted command %+v, want none", cmd)
 	}
-	if app.inviteOpen {
-		t.Fatalf("inviteOpen = true, want false")
+	if !app.inviteOpen {
+		t.Fatalf("inviteOpen = false, want true")
 	}
 }
 

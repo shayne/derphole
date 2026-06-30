@@ -8,12 +8,16 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestTerminalLifecycleRestoresExactlyOnce(t *testing.T) {
 	var out bytes.Buffer
+	program := &recordingTeaProgram{}
 	lifecycle := newTerminalLifecycle(terminalLifecycleOptions{
 		Output:  &out,
+		Program: program,
 		Restore: []byte("RESTORE"),
 	})
 
@@ -23,6 +27,9 @@ func TestTerminalLifecycleRestoresExactlyOnce(t *testing.T) {
 
 	if got := strings.Count(out.String(), "RESTORE"); got != 1 {
 		t.Fatalf("restore writes = %d, want 1; output %q", got, out.String())
+	}
+	if got := program.quitCalls; got != 1 {
+		t.Fatalf("program Quit calls = %d, want 1", got)
 	}
 }
 
@@ -43,3 +50,19 @@ func TestTerminalLifecycleWritesRestoreBeforeFinalReason(t *testing.T) {
 		t.Fatalf("restore must precede final reason, output %q", got)
 	}
 }
+
+type recordingTeaProgram struct {
+	quitCalls int
+}
+
+func (p *recordingTeaProgram) Send(tea.Msg) {}
+
+func (p *recordingTeaProgram) Run() (tea.Model, error) {
+	return nil, nil
+}
+
+func (p *recordingTeaProgram) Quit() {
+	p.quitCalls++
+}
+
+func (p *recordingTeaProgram) Wait() {}

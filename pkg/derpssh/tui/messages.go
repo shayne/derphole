@@ -68,11 +68,13 @@ func (ApprovalDecisionCommand) command() {}
 type TerminalDataMsg []byte
 
 type RuntimeStateMsg struct {
-	Transport string
-	HostCols  int
-	HostRows  int
-	LocalRole Role
-	Peers     []Peer
+	Transport   string
+	HostCols    int
+	HostRows    int
+	LocalRole   Role
+	Peers       []Peer
+	ShellState  string
+	CloseReason string
 }
 
 type ChatMsg ChatMessage

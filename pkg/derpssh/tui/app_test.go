@@ -370,13 +370,13 @@ func TestGuestPrefixHintsDoNotShowInvite(t *testing.T) {
 	}
 }
 
-func TestMenuDoesNotShowInviteInActiveSession(t *testing.T) {
+func TestMenuShowsInviteForHostOnly(t *testing.T) {
 	host := NewApp(Options{Side: "host", InviteCommand: "npx -y derpssh@latest connect DSH1copyme", Terminal: &fakePane{view: "ok"}})
 	host.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
 	host.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
 	host.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
-	if strings.Contains(host.View(), "Show Invite") || strings.Contains(host.View(), "Ctrl-X I") {
-		t.Fatalf("host menu exposes invite action inside active TUI:\n%s", host.View())
+	if !strings.Contains(host.View(), "Show Invite") || !strings.Contains(host.View(), "Ctrl-X I") {
+		t.Fatalf("host menu missing invite action:\n%s", host.View())
 	}
 
 	guest := NewApp(Options{Side: "guest", InviteCommand: "npx -y derpssh@latest connect DSH1copyme", Terminal: &fakePane{view: "ok"}})
@@ -548,7 +548,7 @@ func TestLocalChatEchoIsDeduplicated(t *testing.T) {
 	}
 }
 
-func TestInviteShortcutDoesNotOpenInviteInActiveSession(t *testing.T) {
+func TestInviteShortcutOpensHostInvite(t *testing.T) {
 	invite := "npx -y derpssh@latest connect DSH1verysecretinvitetoken1234567890"
 	app := NewApp(Options{Side: "host", InviteCommand: invite, Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 40, Height: 12})
@@ -557,11 +557,11 @@ func TestInviteShortcutDoesNotOpenInviteInActiveSession(t *testing.T) {
 	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
 
 	view := app.View()
-	if app.inviteOpen {
-		t.Fatalf("inviteOpen = true, want false")
+	if !app.inviteOpen {
+		t.Fatalf("inviteOpen = false, want true")
 	}
-	if strings.Contains(view, invite) || strings.Contains(view, "DSH1verysecretinvitetoken1234567890") {
-		t.Fatalf("active TUI exposes invite command:\n%s", view)
+	if !strings.Contains(view, invite) {
+		t.Fatalf("invite screen missing invite command:\n%s", view)
 	}
 }
 

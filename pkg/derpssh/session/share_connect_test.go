@@ -959,8 +959,8 @@ func TestConnectReportsGuestCloseReason(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Connect() error = %v, want nil", err)
 	}
-	if got := stderr.String(); !strings.Contains(got, "host quit") {
-		t.Fatalf("stderr = %q, want host quit reason", got)
+	if got, want := stderr.String(), "derpssh: session ended: host quit\n"; got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
 	}
 }
 

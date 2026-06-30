@@ -636,12 +636,15 @@ func invitePreflightFiles(stdin io.Reader, stdout io.Writer) (*os.File, bool) {
 }
 
 func renderInvitePreflight(stdout io.Writer, command string) error {
-	_, err := io.WriteString(stdout, clearInvitePreflightScreen+invitePreflightScreen(command))
-	return err
+	if _, err := io.WriteString(stdout, clearInvitePreflightScreen); err != nil {
+		return err
+	}
+	return NewInviteInterstitial(InviteOptions{Output: stdout, Command: command}).Print()
 }
 
 func renderRawInvitePreflight(stdout io.Writer, command string) error {
-	text := strings.ReplaceAll(clearInvitePreflightScreen+invitePreflightScreen(command), "\n", "\r\n")
+	interstitial := NewInviteInterstitial(InviteOptions{Command: command})
+	text := clearInvitePreflightScreen + interstitial.TextWithLineEnding("\r\n")
 	_, err := io.WriteString(stdout, text)
 	return err
 }
@@ -738,19 +741,6 @@ func invitePreflightKeyAction(b byte) invitePreflightAction {
 	default:
 		return invitePreflightIgnore
 	}
-}
-
-func invitePreflightScreen(command string) string {
-	return strings.Join([]string{
-		"derpssh invite",
-		"",
-		"Copy this command and send it to the other person:",
-		"",
-		strings.TrimSpace(command),
-		"",
-		"Press Enter to start sharing. Press q to quit.",
-		"",
-	}, "\n")
 }
 
 func normalizeShareConfig(cfg ShareConfig) ShareConfig {

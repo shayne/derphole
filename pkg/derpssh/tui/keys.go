@@ -26,6 +26,18 @@ var encodedTerminalKeys = map[tea.KeyType][]byte{
 	tea.KeyInsert:    []byte("\x1b[2~"),
 	tea.KeyPgUp:      []byte("\x1b[5~"),
 	tea.KeyPgDown:    []byte("\x1b[6~"),
+	tea.KeyF1:        []byte("\x1bOP"),
+	tea.KeyF2:        []byte("\x1bOQ"),
+	tea.KeyF3:        []byte("\x1bOR"),
+	tea.KeyF4:        []byte("\x1bOS"),
+	tea.KeyF5:        []byte("\x1b[15~"),
+	tea.KeyF6:        []byte("\x1b[17~"),
+	tea.KeyF7:        []byte("\x1b[18~"),
+	tea.KeyF8:        []byte("\x1b[19~"),
+	tea.KeyF9:        []byte("\x1b[20~"),
+	tea.KeyF10:       []byte("\x1b[21~"),
+	tea.KeyF11:       []byte("\x1b[23~"),
+	tea.KeyF12:       []byte("\x1b[24~"),
 }
 
 var applicationCursorKeys = map[tea.KeyType][]byte{

@@ -180,6 +180,38 @@ func TestMouseClickQuitConfirmationWorksInCopyMode(t *testing.T) {
 	}
 }
 
+func TestSelectionModeClickOutsideTerminalRestoresMouse(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok", mouse: MouseMode{Enabled: true, SGR: true}}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	app.copyMode = true
+
+	_, cmd := app.Update(leftClick(0, 0))
+
+	if app.copyMode {
+		t.Fatalf("copyMode = true, want false after click outside terminal")
+	}
+	if cmd == nil {
+		t.Fatalf("click outside selection mode returned nil command, want mouse restore command")
+	}
+}
+
+func TestSelectionModeTerminalClickDoesNotForwardMouse(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok", mouse: MouseMode{Enabled: true, SGR: true}}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	app.copyMode = true
+
+	app.Update(leftClick(app.layout.Terminal.X+1, app.layout.Terminal.Y+1))
+
+	if !app.copyMode {
+		t.Fatalf("copyMode = false, want true after terminal-area selection click")
+	}
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("selection-mode terminal click emitted command %+v, want none", cmd)
+	}
+}
+
 func TestMouseClickShellExitQuitCommitsOnRelease(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
@@ -200,7 +232,7 @@ func TestMouseClickShellExitQuitCommitsOnRelease(t *testing.T) {
 	}
 }
 
-func TestMouseMenuDoesNotExposeInvite(t *testing.T) {
+func TestMouseMenuShowsHostInvite(t *testing.T) {
 	app := NewApp(Options{Side: "host", InviteCommand: "npx -y derpssh@latest connect DSH1copyme", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	drainCommands(app)
@@ -208,8 +240,8 @@ func TestMouseMenuDoesNotExposeInvite(t *testing.T) {
 
 	app.Update(leftClick(menu.X+menu.W/2, menu.Y))
 
-	if strings.Contains(app.View(), "Show Invite") || strings.Contains(app.View(), "Ctrl-X I") {
-		t.Fatalf("menu exposes invite action:\n%s", app.View())
+	if !strings.Contains(app.View(), "Show Invite") || !strings.Contains(app.View(), "Ctrl-X I") {
+		t.Fatalf("menu missing invite action:\n%s", app.View())
 	}
 }
 

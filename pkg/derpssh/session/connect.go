@@ -146,7 +146,7 @@ func reportGuestCloseReason(w io.Writer, reason string) {
 	if w == nil || reason == "" {
 		return
 	}
-	_, _ = fmt.Fprintf(w, "derpssh: session closed: %s\n", reason)
+	_, _ = fmt.Fprintf(w, "derpssh: session ended: %s\n", reason)
 }
 
 type guestInputSender interface {
