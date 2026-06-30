@@ -545,10 +545,38 @@ func TestEscapeClosesActiveOverlays(t *testing.T) {
 	})
 }
 
+func TestApprovalIgnoresSelectionKeysDuringInputGrace(t *testing.T) {
+	now := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+	app.now = func() time.Time { return now }
+	app.Update(ApprovalRequestMsg{PeerID: "guest-1", Peer: "Alex"})
+
+	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("immediate Enter emitted command %+v, want none during grace", cmd)
+	}
+	if !app.approvalActive() {
+		t.Fatalf("approval was cleared during input grace")
+	}
+
+	now = now.Add(approvalInputGrace + time.Millisecond)
+	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	got, ok := readCommand(app).(ApprovalDecisionCommand)
+	if !ok {
+		t.Fatalf("command = %T, want ApprovalDecisionCommand after grace", got)
+	}
+	if got.Role != RoleWrite || got.Deny {
+		t.Fatalf("decision = %+v, want write approval", got)
+	}
+}
+
 func TestFrontModalReceivesKeysWhenHelpIsBehind(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 	app.helpOpen = true
 	app.Update(ApprovalRequestMsg{PeerID: "guest-1", Peer: "Alex"})
+	expireApprovalGrace(app)
 
 	if got := app.modalStack().Front().ID(); got != ModalApproval {
 		t.Fatalf("front modal = %q, want approval", got)

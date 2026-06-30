@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
@@ -23,6 +24,8 @@ type Options struct {
 	InitialInviteOpen bool
 	Terminal          TerminalPane
 }
+
+const approvalInputGrace = 200 * time.Millisecond
 
 type approvalChoice int
 
@@ -133,6 +136,7 @@ type App struct {
 	approvalPeerID   string
 	approvalPeer     string
 	approvalChoice   approvalChoice
+	approvalGraceEnd time.Time
 	kickPeerID       string
 	kickPeer         string
 	inviteOpen       bool
@@ -159,6 +163,7 @@ type App struct {
 	chatScroll   int
 	unreadChat   int
 	composer     textarea.Model
+	now          func() time.Time
 }
 
 func NewApp(opts Options) *App {
@@ -192,6 +197,7 @@ func NewApp(opts Options) *App {
 		localRole:     RolePending,
 		transport:     "starting",
 		composer:      composer,
+		now:           time.Now,
 	}
 	app.applyLayout()
 	return app
@@ -255,6 +261,7 @@ func (a *App) applyApprovalRequest(msg ApprovalRequestMsg) {
 	if a.approvalActive() {
 		a.focus = FocusApproval
 		a.approvalChoice = approvalChoiceWrite
+		a.approvalGraceEnd = a.currentTime().Add(approvalInputGrace)
 	}
 }
 
@@ -604,6 +611,9 @@ func (a *App) handleApprovalKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		a.prefix = true
 		return nil, true
 	}
+	if a.approvalGraceActive() && isApprovalSelectionKey(msg) {
+		return nil, true
+	}
 	switch msg.Type {
 	case tea.KeyEsc:
 		a.approve("", true)
@@ -615,6 +625,19 @@ func (a *App) handleApprovalKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		a.moveApprovalChoice(-1)
 	}
 	return nil, true
+}
+
+func (a *App) approvalGraceActive() bool {
+	return !a.approvalGraceEnd.IsZero() && a.currentTime().Before(a.approvalGraceEnd)
+}
+
+func isApprovalSelectionKey(msg tea.KeyMsg) bool {
+	switch msg.Type {
+	case tea.KeyEnter, tea.KeySpace, tea.KeyTab, tea.KeyShiftTab, tea.KeyRight, tea.KeyDown, tea.KeyLeft, tea.KeyUp:
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *App) handlePeerDialogKey(msg tea.KeyMsg) (tea.Cmd, bool) {
@@ -1006,6 +1029,13 @@ func (a *App) localDisplayName() string {
 		return side
 	}
 	return "local"
+}
+
+func (a *App) currentTime() time.Time {
+	if a != nil && a.now != nil {
+		return a.now()
+	}
+	return time.Now()
 }
 
 func (a *App) contentLines() []string {
@@ -1789,6 +1819,7 @@ func (a *App) approve(role Role, deny bool) {
 	a.approvalPeerID = ""
 	a.approvalPeer = ""
 	a.approvalChoice = approvalChoiceWrite
+	a.approvalGraceEnd = time.Time{}
 	a.focusTerminal()
 }
 

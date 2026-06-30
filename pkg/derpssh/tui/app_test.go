@@ -230,6 +230,7 @@ func TestApprovalEnterConfirmsSelectedAccessNotHiddenKick(t *testing.T) {
 	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
 	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
 	app.Update(ApprovalRequestMsg{PeerID: "guest-2", Peer: "Blair"})
+	expireApprovalGrace(app)
 
 	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
 
@@ -286,6 +287,7 @@ func TestApprovalKeyboardSelection(t *testing.T) {
 			app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 			app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 			app.Update(ApprovalRequestMsg{PeerID: "guest-2", Peer: "Alex"})
+			expireApprovalGrace(app)
 
 			for _, key := range tt.keys {
 				app.Update(key)
@@ -300,6 +302,10 @@ func TestApprovalKeyboardSelection(t *testing.T) {
 			}
 		})
 	}
+}
+
+func expireApprovalGrace(app *App) {
+	app.approvalGraceEnd = app.currentTime()
 }
 
 func TestApprovalEscapeWinsOverHiddenKick(t *testing.T) {
