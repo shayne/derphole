@@ -345,36 +345,42 @@ func (a *App) baseViewLines() []string {
 }
 
 func (a *App) applyOverlays(canvas *FrameCanvas) {
+	a.modalStack().Draw(canvas, ModalFrame{Width: a.width, Height: a.height})
+}
+
+func (a *App) modalStack() *ModalStack {
+	stack := NewModalStack()
 	if a.resizeWarningOpen() {
-		a.overlay(canvas, a.resizeWarningLines())
+		stack.Push(NewLineDialog(ModalResizeWarning, a.resizeWarningLines()))
 	}
 	if a.waitingApprovalOpen() {
-		a.overlay(canvas, a.waitingApprovalLines())
+		stack.Push(NewLineDialog(ModalWaitingApproval, a.waitingApprovalLines()))
 	}
 	if a.helpOpen {
-		a.overlay(canvas, a.helpLines())
+		stack.Push(NewLineDialog(ModalHelp, a.helpLines()))
 	}
 	if a.kickPeer != "" {
-		a.overlay(canvas, []string{
+		stack.Push(NewLineDialog(ModalKick, []string{
 			"Kick " + a.kickPeer + "?",
 			"Enter confirms. Esc cancels.",
-		})
+		}))
 	}
 	if a.peerDialogOpen {
-		a.overlay(canvas, a.peerActionLines())
+		stack.Push(NewLineDialog(ModalPeerAction, a.peerActionLines()))
 	}
 	if a.approvalActive() {
-		a.overlay(canvas, a.approvalLines())
+		stack.Push(NewLineDialog(ModalApproval, a.approvalLines()))
 	}
 	if a.quitOpen {
-		a.overlay(canvas, a.quitLines())
+		stack.Push(NewLineDialog(ModalQuit, a.quitLines()))
 	}
 	if a.shellExitOpen {
-		a.overlay(canvas, a.shellExitLines())
+		stack.Push(NewLineDialog(ModalShellExit, a.shellExitLines()))
 	}
 	if a.noticeOpen() {
-		a.overlay(canvas, a.noticeLines())
+		stack.Push(NewLineDialog(ModalNotice, a.noticeLines()))
 	}
+	return stack
 }
 
 func (a *App) Commands() <-chan Command {
@@ -1359,21 +1365,6 @@ func (a *App) helpLines() []string {
 	return lines
 }
 
-func (a *App) overlay(canvas *FrameCanvas, body []string) {
-	if !a.canOverlay(canvas) {
-		return
-	}
-	box := renderModalBox(body)
-	boxW := a.overlayWidth(box)
-	x := (a.width - boxW) / 2
-	y := a.overlayY(len(box))
-	overlay := NewFrameCanvas(boxW, len(box), lipgloss.NewStyle())
-	for i, line := range box {
-		overlay.DrawANSIText(0, i, fitLine(line, boxW), lipgloss.NewStyle())
-	}
-	canvas.Overlay(overlay, Point{X: x, Y: y})
-}
-
 func renderModalBox(body []string) []string {
 	width := modalBodyWidth(body)
 	border := lipgloss.RoundedBorder()
@@ -1406,17 +1397,8 @@ func modalBodyWidth(body []string) int {
 	return width
 }
 
-func (a *App) canOverlay(canvas *FrameCanvas) bool {
-	return canvas != nil && canvas.width > 0 && canvas.height > 0 && a.width > 0 && a.height > 0
-}
-
 func (a *App) overlayWidth(box []string) int {
-	boxW := 0
-	for _, line := range box {
-		boxW = maxInt(boxW, displayWidth(line))
-	}
-	boxW = minInt(boxW, a.width-2)
-	return maxInt(boxW, 1)
+	return modalOverlayWidth(a.width, box)
 }
 
 func (a *App) overlayY(boxH int) int {
@@ -2073,7 +2055,7 @@ func (a *App) setTerminalCursorActive(active bool) {
 }
 
 func (a *App) modalActive() bool {
-	return a.helpOpen || a.resizeWarningOpen() || a.waitingApprovalOpen() || a.approvalActive() || a.kickPeer != "" || a.quitOpen || a.shellExitOpen || a.peerDialogOpen || a.noticeOpen()
+	return a.modalStack().HasDialogs()
 }
 
 func (a *App) resizeWarningOpen() bool {
