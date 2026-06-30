@@ -70,7 +70,7 @@ func TestReleaseWorkflowPublishesSwiftPMFramework(t *testing.T) {
 	body := string(data)
 	for _, required := range []string{
 		"build-swiftpm-framework:",
-		"runs-on: macos-latest",
+		"runs-on: macos-15",
 		"mise run swiftpm:framework",
 		"name: derphole-mobile-swiftpm",
 		"path: dist/swiftpm/DerpholeMobile.xcframework.zip",

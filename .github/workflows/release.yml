@@ -185,7 +185,7 @@ jobs:
 
   build-swiftpm-framework:
     name: Build SwiftPM mobile framework
-    runs-on: macos-latest
+    runs-on: macos-15
     needs: [meta]
     if: needs.meta.outputs.is_tag == 'true'
     steps:
