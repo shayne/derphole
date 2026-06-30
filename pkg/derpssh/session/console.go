@@ -1048,12 +1048,21 @@ func (c *tuiConsole) terminalLifecycle() *TerminalLifecycle {
 	if c.lifecycle == nil {
 		c.lifecycle = newTerminalLifecycle(terminalLifecycleOptions{
 			Output:  c.output,
-			Program: c.program,
+			Program: c.startedProgram(),
 			Restore: []byte(terminalRestoreSequence),
 			IsTTY:   c.tty,
 		})
 	}
 	return c.lifecycle
+}
+
+func (c *tuiConsole) startedProgram() teaProgram {
+	c.programMu.Lock()
+	defer c.programMu.Unlock()
+	if c.programStartRequested {
+		return c.program
+	}
+	return nil
 }
 
 func (c *tuiConsole) runTeaCommand(cmd tea.Cmd) {

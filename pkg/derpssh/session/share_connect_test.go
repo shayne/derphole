@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	creackpty "github.com/creack/pty"
 	"github.com/shayne/derphole/pkg/derpssh/protocol"
 	"github.com/shayne/derphole/pkg/derpssh/pty"
 	"github.com/shayne/derphole/pkg/derptun"
@@ -404,6 +405,113 @@ func TestReadInvitePreflightInputInterruptibleIgnoresUnknownKeys(t *testing.T) {
 	if result.Err != nil || result.Action != invitePreflightContinue {
 		t.Fatalf("interruptible input result = %+v, want continue after ignored key", result)
 	}
+}
+
+func TestRawShareInvitePreflightTerminalQuitsOnQ(t *testing.T) {
+	master, slave, err := creackpty.Open()
+	if err != nil {
+		t.Fatalf("pty open: %v", err)
+	}
+	defer closeFiles(master, slave)
+	output := newStringCapture()
+	copyDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(output, master)
+		close(copyDone)
+	}()
+
+	preflight, err := startRawShareInvitePreflight(context.Background(), ShareConfig{
+		Stdin:  slave,
+		Stdout: slave,
+	}, "npx -y derpssh@latest connect DSH1test")
+	if err != nil {
+		t.Fatalf("startRawShareInvitePreflight() error = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	waitForString(t, ctx, output.String, "Press Enter to start sharing. Press q to quit.")
+	if _, err := master.Write([]byte("q")); err != nil {
+		t.Fatalf("write q: %v", err)
+	}
+
+	resultCh := make(chan shareInvitePreflightResult, 1)
+	go func() { resultCh <- preflight.Wait() }()
+	select {
+	case result := <-resultCh:
+		if result.Err != nil || result.Action != invitePreflightQuit {
+			t.Fatalf("preflight result = %+v, want quit", result)
+		}
+	case <-ctx.Done():
+		t.Fatalf("preflight did not quit after q; output:\n%s", output.String())
+	}
+	closeFiles(slave, master)
+	<-copyDone
+}
+
+func TestSharePlainInviteTerminalQuitsOnQ(t *testing.T) {
+	t.Setenv("DERPSSH_TEST_HARNESS", "1")
+	t.Setenv("DERPSSH_TEST_COMMAND", "cat")
+
+	oldGenerateServerToken := generateServerToken
+	oldGenerateClientToken := generateClientToken
+	oldServe := serveAppMux
+	defer func() {
+		generateServerToken = oldGenerateServerToken
+		generateClientToken = oldGenerateClientToken
+		serveAppMux = oldServe
+	}()
+	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	serveStarted := make(chan struct{})
+	serveAppMux = func(ctx context.Context, cfg appsession.DerptunAppServeConfig) error {
+		_ = cfg
+		close(serveStarted)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	master, slave, err := creackpty.Open()
+	if err != nil {
+		t.Fatalf("pty open: %v", err)
+	}
+	defer closeFiles(master, slave)
+	output := newStringCapture()
+	copyDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(output, master)
+		close(copyDone)
+	}()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Share(context.Background(), ShareConfig{Stdin: slave, Stdout: slave, Stderr: io.Discard})
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	waitForString(t, ctx, output.String, "Press Enter to start sharing. Press q to quit.")
+	select {
+	case <-serveStarted:
+	case <-ctx.Done():
+		t.Fatal("share server did not start while plain invite waited")
+	}
+
+	if _, err := master.Write([]byte("q")); err != nil {
+		t.Fatalf("write q: %v", err)
+	}
+	quitCtx, quitCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer quitCancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Share() after q = %v, want nil", err)
+		}
+	case <-quitCtx.Done():
+		t.Fatalf("Share() did not quit after q; output:\n%s", output.String())
+	}
+	closeFiles(slave, master)
+	<-copyDone
 }
 
 func TestWaitingShareConsoleBuffersChatUntilHostCallbacks(t *testing.T) {
