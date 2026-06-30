@@ -545,6 +545,49 @@ func TestEscapeClosesActiveOverlays(t *testing.T) {
 	})
 }
 
+func TestFrontModalReceivesKeysWhenHelpIsBehind(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+	app.helpOpen = true
+	app.Update(ApprovalRequestMsg{PeerID: "guest-1", Peer: "Alex"})
+
+	if got := app.modalStack().Front().ID(); got != ModalApproval {
+		t.Fatalf("front modal = %q, want approval", got)
+	}
+
+	app.Update(tea.KeyMsg{Type: tea.KeyRight})
+
+	if app.approvalChoice != approvalChoiceDeny {
+		t.Fatalf("approval choice = %v, want deny after right key", app.approvalChoice)
+	}
+	if !app.helpOpen {
+		t.Fatalf("help overlay behind approval should remain open")
+	}
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("right key emitted command %+v, want none", cmd)
+	}
+}
+
+func TestResizeWarningAllowsPrefixQuit(t *testing.T) {
+	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 40, Height: 12})
+	app.Update(RuntimeStateMsg{HostCols: 100, HostRows: 30, LocalRole: RoleWrite})
+	drainCommands(app)
+
+	if got := app.modalStack().Front().ID(); got != ModalResizeWarning {
+		t.Fatalf("front modal = %q, want resize warning", got)
+	}
+
+	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("Ctrl-X Q emitted command %+v before confirmation", cmd)
+	}
+	if !app.quitOpen {
+		t.Fatalf("Ctrl-X Q did not open quit confirmation over resize warning")
+	}
+}
+
 func TestPrefixInviteOpensHostInvite(t *testing.T) {
 	invite := "npx -y derpssh@latest connect DSH1copyme"
 	app := NewApp(Options{Side: "host", InviteCommand: invite, Terminal: &fakePane{view: "ok"}})

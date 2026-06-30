@@ -482,51 +482,73 @@ func (a *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 }
 
 func (a *App) handleScreenKey(msg tea.KeyMsg) (tea.Cmd, bool) {
-	if cmd, handled := a.handleImmediateScreenKey(msg); handled {
-		return cmd, true
-	}
-	if cmd, handled := a.handleDialogScreenKey(msg); handled {
-		return cmd, true
-	}
-	return nil, false
-}
-
-func (a *App) handleImmediateScreenKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	if a.inviteOpen {
 		return a.handleInviteKey(msg), true
 	}
-	if a.noticeOpen() {
-		return a.handleNoticeKey(msg), true
-	}
-	if cmd, handled := a.handleShellExitKey(msg); handled {
+	if cmd, handled := a.handleFrontModalKey(msg); handled {
 		return cmd, true
 	}
-	if cmd, handled := a.handleQuitKey(msg); handled {
-		return cmd, true
-	}
-	if cmd, handled := a.handlePeerDialogKey(msg); handled {
-		return cmd, true
+	if a.handleEscapeKey(msg) {
+		return nil, true
 	}
 	return nil, false
 }
 
-func (a *App) handleDialogScreenKey(msg tea.KeyMsg) (tea.Cmd, bool) {
-	if a.handleEscapeKey(msg) {
-		return nil, true
+func (a *App) handleFrontModalKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	id, ok := a.frontModalID()
+	if !ok {
+		return nil, false
 	}
-	if cmd, handled := a.handleHelpKey(msg); handled {
-		return cmd, true
+	handler := modalKeyHandlers[id]
+	if handler == nil {
+		return nil, false
 	}
-	if cmd, handled := a.handleWaitingApprovalKey(msg); handled {
-		return cmd, true
+	return handler(a, msg)
+}
+
+type modalKeyHandler func(*App, tea.KeyMsg) (tea.Cmd, bool)
+
+var modalKeyHandlers = map[ModalID]modalKeyHandler{
+	ModalResizeWarning:   handleResizeWarningModalKey,
+	ModalWaitingApproval: (*App).handleWaitingApprovalKey,
+	ModalHelp:            (*App).handleHelpKey,
+	ModalKick:            handleKickModalKey,
+	ModalPeerAction:      (*App).handlePeerDialogKey,
+	ModalApproval:        (*App).handleApprovalKey,
+	ModalQuit:            (*App).handleQuitKey,
+	ModalShellExit:       (*App).handleShellExitKey,
+	ModalNotice:          handleNoticeModalKey,
+}
+
+func handleResizeWarningModalKey(app *App, msg tea.KeyMsg) (tea.Cmd, bool) {
+	return app.handlePassiveModalKey(msg), true
+}
+
+func handleKickModalKey(app *App, msg tea.KeyMsg) (tea.Cmd, bool) {
+	return app.handleKickOverlayKey(msg), true
+}
+
+func handleNoticeModalKey(app *App, msg tea.KeyMsg) (tea.Cmd, bool) {
+	return app.handleNoticeKey(msg), true
+}
+
+func (a *App) handlePassiveModalKey(msg tea.KeyMsg) tea.Cmd {
+	if a.prefix {
+		return HandlePrefixKey(a, msg)
 	}
-	if cmd, handled := a.handleApprovalKey(msg); handled {
-		return cmd, true
+	if msg.Type == tea.KeyCtrlX {
+		a.prefix = true
 	}
-	if a.kickPeer != "" {
-		return a.handleKickOverlayKey(msg), true
+	return nil
+}
+
+func (a *App) frontModalID() (ModalID, bool) {
+	stack := a.modalStack()
+	front := stack.Front()
+	if front == nil {
+		return "", false
 	}
-	return nil, false
+	return front.ID(), true
 }
 
 func (a *App) handleNoticeKey(msg tea.KeyMsg) tea.Cmd {
@@ -561,6 +583,10 @@ func (a *App) handleHelpKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	}
 	if msg.Type == tea.KeyCtrlX {
 		a.prefix = true
+		return nil, true
+	}
+	if msg.Type == tea.KeyEsc {
+		a.helpOpen = false
 	}
 	return nil, true
 }
@@ -591,6 +617,8 @@ func (a *App) handleApprovalKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		return nil, true
 	}
 	switch msg.Type {
+	case tea.KeyEsc:
+		a.approve("", true)
 	case tea.KeyEnter, tea.KeySpace:
 		a.approveSelected()
 	case tea.KeyTab, tea.KeyRight, tea.KeyDown:
@@ -760,8 +788,13 @@ func (a *App) handleEscapeKey(msg tea.KeyMsg) bool {
 }
 
 func (a *App) handleKickOverlayKey(msg tea.KeyMsg) tea.Cmd {
-	if msg.Type == tea.KeyEnter {
+	switch msg.Type {
+	case tea.KeyEnter:
 		a.emit(KickCommand{PeerID: a.kickPeerID, Peer: a.kickPeer})
+		a.kickPeerID = ""
+		a.kickPeer = ""
+		a.focusTerminal()
+	case tea.KeyEsc:
 		a.kickPeerID = ""
 		a.kickPeer = ""
 		a.focusTerminal()
