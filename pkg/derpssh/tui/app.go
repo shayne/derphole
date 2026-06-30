@@ -2080,6 +2080,9 @@ func (a *App) resizeWarningOpen() bool {
 	if !a.isGuest() {
 		return false
 	}
+	if a.localRole == RolePending {
+		return false
+	}
 	if a.hostCols <= 0 || a.hostRows <= 0 {
 		return false
 	}

@@ -369,6 +369,24 @@ func TestTerminalRestoreSequenceDisablesInteractiveModes(t *testing.T) {
 	}
 }
 
+func TestTerminalRestoreSequenceClearsNormalScreenAfterAltScreen(t *testing.T) {
+	var out strings.Builder
+
+	writeTerminalRestore(&out)
+
+	got := out.String()
+	altScreenExit := strings.Index(got, "\x1b[?1049l")
+	clearScreen := strings.LastIndex(got, "\x1b[2J")
+	clearScrollback := strings.LastIndex(got, "\x1b[3J")
+	cursorHome := strings.LastIndex(got, "\x1b[H")
+	if altScreenExit < 0 {
+		t.Fatalf("restore sequence missing alt-screen exit: %q", got)
+	}
+	if cursorHome < altScreenExit || clearScreen < altScreenExit || clearScrollback < altScreenExit {
+		t.Fatalf("restore must clear normal screen after alt-screen exit; output %q", got)
+	}
+}
+
 func TestTUIConsoleStopWaitsForProgramRunCleanup(t *testing.T) {
 	var out strings.Builder
 	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, &recordingTerminalPane{view: "shell$"})

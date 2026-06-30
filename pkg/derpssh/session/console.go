@@ -34,7 +34,7 @@ var newTeaProgram = func(model tea.Model, opts ...tea.ProgramOption) teaProgram 
 
 const (
 	terminalRestoreWait     = 750 * time.Millisecond
-	terminalRestoreSequence = "\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[?1049l\x1b[?25h\x1b[?7h\x1b[?1l\x1b>\x1b[0m"
+	terminalRestoreSequence = "\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[?1049l\x1b[H\x1b[2J\x1b[3J\x1b[?25h\x1b[?7h\x1b[?1l\x1b>\x1b[0m"
 )
 
 func writeTerminalRestore(w io.Writer) {

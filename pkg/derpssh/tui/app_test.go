@@ -145,6 +145,27 @@ func TestGuestPendingRoleRendersWaitingApprovalModal(t *testing.T) {
 	}
 }
 
+func TestGuestWaitingApprovalSuppressesResizeWarning(t *testing.T) {
+	app := NewApp(Options{Side: "guest", DisplayName: "shayne", Terminal: &fakePane{view: ""}})
+	app.Update(tea.WindowSizeMsg{Width: 101, Height: 30})
+	app.Update(RuntimeStateMsg{Transport: "direct", HostCols: 101, HostRows: 30, LocalRole: RolePending})
+
+	if !app.waitingApprovalOpen() {
+		t.Fatal("pending guest did not open waiting approval modal")
+	}
+	if app.resizeWarningOpen() {
+		t.Fatal("pending guest opened resize warning while waiting for approval")
+	}
+
+	view := app.View()
+	if !strings.Contains(view, "Waiting for host approval") {
+		t.Fatalf("View() missing waiting approval modal:\n%s", view)
+	}
+	if strings.Contains(view, "Resize terminal") {
+		t.Fatalf("pending guest showed resize warning behind approval modal:\n%s", view)
+	}
+}
+
 func TestNoticeMsgRendersDismissibleModal(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "shell$"}})
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
