@@ -12,8 +12,8 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "DerpholeMobile",
-            url: "https://github.com/shayne/derphole/releases/download/v0.15.1/DerpholeMobile.xcframework.zip",
-            checksum: "9a05591d75c5fd27fb12b0767d35dddb03fb5dae844dd727f65c1c50321e5f7c"
+            url: "https://github.com/shayne/derphole/releases/download/v0.15.5/DerpholeMobile.xcframework.zip",
+            checksum: "b26ee33c720fe116da2444148f917434b1d735e6a3178f768fe2e58fe2458506"
         ),
         .target(
             name: "DerpholeTunnel",
