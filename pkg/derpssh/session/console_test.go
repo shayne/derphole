@@ -415,6 +415,32 @@ func TestTUIConsoleStopWaitsForProgramRunCleanup(t *testing.T) {
 	}
 }
 
+func TestTUIConsoleStopRestoresTerminalExactlyOnce(t *testing.T) {
+	var out strings.Builder
+	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, &recordingTerminalPane{view: "shell$"})
+	program := &sendBeforeRunProgram{}
+	console.program = program
+	console.programNotify = make(chan struct{}, 1)
+	console.tty = true
+	console.output = &out
+
+	console.Start(context.Background())
+
+	deadline := time.After(time.Second)
+	for strings.Count(out.String(), "\x1b[?1049l") == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("Program.Run did not write terminal restore")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	console.Stop()
+	if got := strings.Count(out.String(), "\x1b[?1049l"); got != 1 {
+		t.Fatalf("terminal restore writes = %d, want 1; output %q", got, out.String())
+	}
+}
+
 func TestTUIConsoleNonTTYApprovalDeniesWithoutEnv(t *testing.T) {
 	var out strings.Builder
 	console := newTerminalConsoleWithOptions(tuiConsoleOptions{

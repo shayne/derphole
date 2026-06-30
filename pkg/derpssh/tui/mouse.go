@@ -53,7 +53,7 @@ func EncodeSGRMouse(msg tea.MouseMsg, terminal Rect) ([]byte, bool) {
 }
 
 func HandleMouse(app *App, msg tea.MouseMsg) tea.Cmd {
-	if ignoreMouse(app, msg) {
+	if app == nil || !supportedMouseAction(msg.Action) {
 		return nil
 	}
 	if cmd, handled := app.handleModalMouse(msg); handled {
@@ -62,19 +62,15 @@ func HandleMouse(app *App, msg tea.MouseMsg) tea.Cmd {
 	if cmd, handled := app.handleTopBarMouse(msg); handled {
 		return cmd
 	}
+	if app.copyMode {
+		return nil
+	}
 	if app.handleDividerMouse(msg) {
 		return nil
 	}
 
 	app.handleContentMouse(msg)
 	return nil
-}
-
-func ignoreMouse(app *App, msg tea.MouseMsg) bool {
-	if app == nil || !supportedMouseAction(msg.Action) {
-		return true
-	}
-	return app.copyMode && !app.layout.TopBar.contains(msg.X, msg.Y)
 }
 
 func supportedMouseAction(action tea.MouseAction) bool {
@@ -110,10 +106,21 @@ func (a *App) handleShellExitMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
 	if !a.shellExitOpen {
 		return nil, false
 	}
-	if msg.Action == tea.MouseActionPress {
+	switch msg.Action {
+	case tea.MouseActionPress:
 		if choice := a.shellExitHit(msg.X, msg.Y); choice >= 0 {
 			a.shellExitChoice = choice
+			a.armMousePress(mousePressShellExit, int(choice))
+		} else {
+			a.clearMousePress()
+		}
+	case tea.MouseActionRelease:
+		choice := a.shellExitHit(msg.X, msg.Y)
+		if choice >= 0 && a.releaseMousePress(mousePressShellExit, int(choice)) {
+			a.shellExitChoice = choice
 			a.confirmShellExitChoice()
+		} else {
+			a.clearMousePress()
 		}
 	}
 	return nil, true
@@ -123,10 +130,21 @@ func (a *App) handleQuitMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
 	if !a.quitOpen {
 		return nil, false
 	}
-	if msg.Action == tea.MouseActionPress {
+	switch msg.Action {
+	case tea.MouseActionPress:
 		if choice := a.quitHit(msg.X, msg.Y); choice >= 0 {
 			a.quitChoice = choice
+			a.armMousePress(mousePressQuit, int(choice))
+		} else {
+			a.clearMousePress()
+		}
+	case tea.MouseActionRelease:
+		choice := a.quitHit(msg.X, msg.Y)
+		if choice >= 0 && a.releaseMousePress(mousePressQuit, int(choice)) {
+			a.quitChoice = choice
 			a.confirmQuitChoice()
+		} else {
+			a.clearMousePress()
 		}
 	}
 	return nil, true
@@ -136,10 +154,21 @@ func (a *App) handlePeerDialogMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
 	if !a.peerDialogOpen {
 		return nil, false
 	}
-	if msg.Action == tea.MouseActionPress {
+	switch msg.Action {
+	case tea.MouseActionPress:
 		if choice := a.peerActionHit(msg.X, msg.Y); choice >= 0 {
 			a.peerDialogChoice = choice
+			a.armMousePress(mousePressPeerAction, int(choice))
+		} else {
+			a.clearMousePress()
+		}
+	case tea.MouseActionRelease:
+		choice := a.peerActionHit(msg.X, msg.Y)
+		if choice >= 0 && a.releaseMousePress(mousePressPeerAction, int(choice)) {
+			a.peerDialogChoice = choice
 			a.confirmPeerActionChoice()
+		} else {
+			a.clearMousePress()
 		}
 	}
 	return nil, true
@@ -196,10 +225,35 @@ func (a *App) handleApprovalMouse(msg tea.MouseMsg) bool {
 	if !a.approvalActive() {
 		return false
 	}
-	if msg.Action == tea.MouseActionPress {
-		a.handleApprovalClick(msg.X, msg.Y)
+	switch msg.Action {
+	case tea.MouseActionPress:
+		hit := a.approvalHit(msg.X, msg.Y)
+		if hit != HitNone {
+			a.selectApprovalHit(hit)
+			a.armMousePress(mousePressApproval, int(hit))
+		} else {
+			a.clearMousePress()
+		}
+	case tea.MouseActionRelease:
+		hit := a.approvalHit(msg.X, msg.Y)
+		if hit != HitNone && a.releaseMousePress(mousePressApproval, int(hit)) {
+			a.handleApprovalClick(msg.X, msg.Y)
+		} else {
+			a.clearMousePress()
+		}
 	}
 	return true
+}
+
+func (a *App) selectApprovalHit(hit HitTarget) {
+	switch hit {
+	case HitApprovalRead:
+		a.approvalChoice = approvalChoiceRead
+	case HitApprovalWrite:
+		a.approvalChoice = approvalChoiceWrite
+	case HitApprovalDeny:
+		a.approvalChoice = approvalChoiceDeny
+	}
 }
 
 func (a *App) handleApprovalClick(x int, y int) {
@@ -221,6 +275,20 @@ func (a *App) handleKickMouse(msg tea.MouseMsg) bool {
 	a.kickPeer = ""
 	a.focusTerminal()
 	return true
+}
+
+func (a *App) armMousePress(kind mousePressKind, choice int) {
+	a.mousePress = mousePressTarget{kind: kind, choice: choice}
+}
+
+func (a *App) releaseMousePress(kind mousePressKind, choice int) bool {
+	pressed := a.mousePress
+	a.clearMousePress()
+	return pressed.kind == kind && pressed.choice == choice
+}
+
+func (a *App) clearMousePress() {
+	a.mousePress = mousePressTarget{}
 }
 
 func (a *App) handleTopBarMouse(msg tea.MouseMsg) (tea.Cmd, bool) {

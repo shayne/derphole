@@ -41,13 +41,7 @@ type vtTerminalPane struct {
 }
 
 func NewVTTerminalPane(cols int, rows int) TerminalPane {
-	if cols <= 0 {
-		cols = 80
-	}
-	if rows <= 0 {
-		rows = 24
-	}
-	return &vtTerminalPane{term: vt10x.New(vt10x.WithSize(cols, rows)), cursorActive: true}
+	return newVTTerminalSurface(terminalSize{Cols: cols, Rows: rows})
 }
 
 func (p *vtTerminalPane) Write(b []byte) (int, error) {
@@ -209,11 +203,11 @@ func terminalLastRenderableColumn(term vt10x.Terminal, width int, y int) int {
 }
 
 func terminalBlankCellShouldUseDefaultStyle(glyph vt10x.Glyph, style terminalCellStyle) bool {
-	return glyph.Char == ' ' && !style.visibleOnBlankCell()
+	return glyph.Char == ' ' && !terminalCellVisibleOnBlank(style)
 }
 
 func terminalBlankCellHasVisibleStyle(glyph vt10x.Glyph) bool {
-	return glyph.Char == ' ' && terminalStyleFromAttr(glyph).visibleOnBlankCell()
+	return glyph.Char == ' ' && terminalCellVisibleOnBlank(terminalStyleFromAttr(glyph))
 }
 
 func terminalStyleFromGlyph(glyph vt10x.Glyph) terminalCellStyle {
@@ -252,8 +246,8 @@ func (s terminalCellStyle) active() bool {
 	return s.mode != 0 || s.fg != vt10x.DefaultFG || s.bg != vt10x.DefaultBG || s.reverse
 }
 
-func (s terminalCellStyle) visibleOnBlankCell() bool {
-	return s.reverse || s.bg != vt10x.DefaultBG
+func terminalCellVisibleOnBlank(style terminalCellStyle) bool {
+	return style.reverse || style.bg != vt10x.DefaultBG
 }
 
 func (s terminalCellStyle) sgr() string {

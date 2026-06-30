@@ -99,6 +99,11 @@ func TestMouseClickPeerDialogReadChangesClickedPeer(t *testing.T) {
 	read, _, _ := app.peerActionButtonRects()
 
 	app.Update(leftClick(read.X+read.W/2, read.Y))
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("peer dialog press emitted command %+v, want none until release", cmd)
+	}
+
+	app.Update(leftRelease(read.X+read.W/2, read.Y))
 
 	got, ok := readCommand(app).(RoleChangeCommand)
 	if !ok {
@@ -118,9 +123,54 @@ func TestMouseClickQuitConfirmationButtons(t *testing.T) {
 	quit, _ := app.quitButtonRects()
 
 	app.Update(leftClick(quit.X+quit.W/2, quit.Y))
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("quit confirmation press emitted command %+v, want none until release", cmd)
+	}
+
+	app.Update(leftRelease(quit.X+quit.W/2, quit.Y))
 
 	if _, ok := readCommand(app).(QuitCommand); !ok {
 		t.Fatalf("quit confirmation click did not emit QuitCommand")
+	}
+}
+
+func TestMouseClickQuitConfirmationWorksInCopyMode(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	app.copyMode = true
+	app.openQuitConfirm()
+	quit, _ := app.quitButtonRects()
+
+	app.Update(leftClick(quit.X+quit.W/2, quit.Y))
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("quit confirmation press in copy mode emitted command %+v, want none until release", cmd)
+	}
+
+	app.Update(leftRelease(quit.X+quit.W/2, quit.Y))
+
+	if _, ok := readCommand(app).(QuitCommand); !ok {
+		t.Fatalf("quit confirmation click in copy mode did not emit QuitCommand")
+	}
+}
+
+func TestMouseClickShellExitQuitCommitsOnRelease(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	app.shellExitOpen = true
+	app.shellExitChoice = shellExitChoiceQuit
+	_, quit := app.shellExitButtonRects()
+
+	app.Update(leftClick(quit.X+quit.W/2, quit.Y))
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("shell-exit quit press emitted command %+v, want none until release", cmd)
+	}
+
+	app.Update(leftRelease(quit.X+quit.W/2, quit.Y))
+
+	if _, ok := readCommand(app).(QuitCommand); !ok {
+		t.Fatalf("shell-exit quit release did not emit QuitCommand")
 	}
 }
 
@@ -194,6 +244,11 @@ func TestMouseClickApprovalButtons(t *testing.T) {
 			button := tt.pick(read, write, deny)
 
 			app.Update(leftClick(button.X+button.W/2, button.Y))
+			if cmd := readCommand(app); cmd != nil {
+				t.Fatalf("approval press emitted command %+v, want none until release", cmd)
+			}
+
+			app.Update(leftRelease(button.X+button.W/2, button.Y))
 
 			got, ok := readCommand(app).(ApprovalDecisionCommand)
 			if !ok {
@@ -230,6 +285,11 @@ func TestApprovalDecisionIncludesPeerIDForDuplicateNames(t *testing.T) {
 	read, _, _ := app.approvalButtonRects()
 
 	app.Update(leftClick(read.X+read.W/2, read.Y))
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("approval press emitted command %+v, want none until release", cmd)
+	}
+
+	app.Update(leftRelease(read.X+read.W/2, read.Y))
 
 	got, ok := readCommand(app).(ApprovalDecisionCommand)
 	if !ok {
@@ -300,6 +360,15 @@ func leftClick(x int, y int) tea.MouseMsg {
 		X:      x,
 		Y:      y,
 		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	}
+}
+
+func leftRelease(x int, y int) tea.MouseMsg {
+	return tea.MouseMsg{
+		X:      x,
+		Y:      y,
+		Action: tea.MouseActionRelease,
 		Button: tea.MouseButtonLeft,
 	}
 }

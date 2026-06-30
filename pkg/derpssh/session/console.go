@@ -109,6 +109,8 @@ type tuiConsole struct {
 	programQuitOnce       sync.Once
 	startOnce             sync.Once
 	cancel                context.CancelFunc
+	lifecycleMu           sync.Mutex
+	lifecycle             *TerminalLifecycle
 
 	harnessMu           sync.Mutex
 	harnessCtx          context.Context
@@ -239,7 +241,7 @@ func (c *tuiConsole) Start(ctx context.Context) {
 		go func() {
 			close(runStarted)
 			_, _ = c.program.Run()
-			writeTerminalRestore(c.output)
+			c.restoreTerminal()
 			cancel()
 		}()
 	})
@@ -255,7 +257,7 @@ func (c *tuiConsole) Stop() {
 		if quitStarted {
 			c.waitForProgramExit(terminalRestoreWait)
 		}
-		writeTerminalRestore(c.output)
+		c.restoreTerminal()
 	}
 }
 
@@ -980,6 +982,23 @@ func (c *tuiConsole) waitForProgramExit(timeout time.Duration) {
 	case <-done:
 	case <-time.After(timeout):
 	}
+}
+
+func (c *tuiConsole) restoreTerminal() {
+	c.terminalLifecycle().End(CloseReason{Code: "restore"})
+}
+
+func (c *tuiConsole) terminalLifecycle() *TerminalLifecycle {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	if c.lifecycle == nil {
+		c.lifecycle = newTerminalLifecycle(terminalLifecycleOptions{
+			Output:  c.output,
+			Restore: []byte(terminalRestoreSequence),
+			IsTTY:   c.tty,
+		})
+	}
+	return c.lifecycle
 }
 
 func (c *tuiConsole) runTeaCommand(cmd tea.Cmd) {

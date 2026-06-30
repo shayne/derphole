@@ -615,6 +615,18 @@ func TestPrefixQuitOpensConfirmation(t *testing.T) {
 	}
 }
 
+func TestQuitConfirmationEnterWorksInCopyMode(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+	app.copyMode = true
+	app.openQuitConfirm()
+
+	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if _, ok := readCommand(app).(QuitCommand); !ok {
+		t.Fatalf("enter on quit confirmation in copy mode did not emit QuitCommand")
+	}
+}
+
 func TestPrefixQuitWorksDuringApproval(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 	app.Update(ApprovalRequestMsg{PeerID: "guest-1", Peer: "Alex"})

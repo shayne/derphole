@@ -130,6 +130,49 @@ func TestVTTerminalPaneTracksApplicationCursorMode(t *testing.T) {
 	}
 }
 
+func TestTrackInputModeApplicationCursorEnableDisable(t *testing.T) {
+	mode := TrackInputMode(TerminalInputMode{}, []byte("\x1b[?1h"))
+	if !mode.ApplicationCursor {
+		t.Fatalf("TrackInputMode enable = %+v, want application cursor enabled", mode)
+	}
+
+	mode = TrackInputMode(mode, []byte("\x1b[?25l\x1b[?1l"))
+	if mode.ApplicationCursor {
+		t.Fatalf("TrackInputMode disable = %+v, want application cursor disabled", mode)
+	}
+}
+
+func TestTrackInputModePreservesStateForUnrelatedPrivateModes(t *testing.T) {
+	mode := TrackInputMode(TerminalInputMode{ApplicationCursor: true}, []byte("\x1b[?25l\x1b[?1006h\x1b[?bad?h"))
+	if !mode.ApplicationCursor {
+		t.Fatalf("TrackInputMode unrelated modes = %+v, want application cursor unchanged", mode)
+	}
+}
+
+func TestIncompletePrivateModeTail(t *testing.T) {
+	longTail := "\x1b[?" + strings.Repeat("1", 33)
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "none", in: "plain output", want: ""},
+		{name: "partial tail", in: "prefix \x1b[?100", want: "\x1b[?100"},
+		{name: "complete sequence", in: "\x1b[?1006h", want: ""},
+		{name: "invalid tail", in: "\x1b[?100x", want: ""},
+		{name: "too long", in: longTail, want: ""},
+		{name: "last partial wins", in: "first \x1b[?1006h second \x1b[?1", want: "\x1b[?1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := incompletePrivateModeTail(tt.in); got != tt.want {
+				t.Fatalf("incompletePrivateModeTail(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestVTTerminalPaneRendersVisibleCursorOnBlankCell(t *testing.T) {
 	pane := NewVTTerminalPane(10, 3)
 

@@ -122,6 +122,21 @@ type menuEntry struct {
 	action   menuAction
 }
 
+type mousePressKind int
+
+const (
+	mousePressNone mousePressKind = iota
+	mousePressQuit
+	mousePressShellExit
+	mousePressPeerAction
+	mousePressApproval
+)
+
+type mousePressTarget struct {
+	kind   mousePressKind
+	choice int
+}
+
 type App struct {
 	side          string
 	displayName   string
@@ -157,6 +172,7 @@ type App struct {
 	peerDialogOpen   bool
 	peerDialogPeer   Peer
 	peerDialogChoice peerActionChoice
+	mousePress       mousePressTarget
 	noticeTitle      string
 	noticeBody       string
 	topBarHits       []topBarHit
