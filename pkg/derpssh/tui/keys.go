@@ -85,11 +85,9 @@ func HandlePrefixKey(app *App, msg tea.KeyMsg) tea.Cmd {
 
 	switch key {
 	case "q":
-		app.openQuitConfirm()
-		return nil
+		return app.runAction(ActionQuit)
 	case "?":
-		app.helpOpen = true
-		return nil
+		return app.runAction(ActionShowMenu)
 	}
 
 	if app.approvalActive() {
@@ -112,27 +110,27 @@ func (a *App) handleApprovalPrefix(key string) {
 }
 
 func (a *App) handleGlobalPrefix(key string) tea.Cmd {
-	if action, ok := globalPrefixActions[key]; ok {
-		return action(a)
+	if id, ok := globalPrefixActions[key]; ok {
+		return a.runAction(id)
 	}
 	return nil
 }
 
-var globalPrefixActions = map[string]func(*App) tea.Cmd{
-	"s":     toggleSidebarAction,
-	"c":     focusChatAction,
-	"t":     focusTerminalAction,
-	"i":     inviteAction,
-	"y":     copyModeAction,
-	"left":  widenChatAction,
-	"[":     widenChatAction,
-	"right": narrowChatAction,
-	"]":     narrowChatAction,
-	"q":     quitAction,
-	"r":     readRoleAction,
-	"w":     writeRoleAction,
-	"k":     kickPeerAction,
-	"?":     helpAction,
+var globalPrefixActions = map[string]ActionID{
+	"s":     ActionToggleChat,
+	"c":     ActionFocusChat,
+	"t":     ActionFocusTerminal,
+	"i":     ActionShowInvite,
+	"y":     ActionToggleSelect,
+	"left":  ActionWidenChat,
+	"[":     ActionWidenChat,
+	"right": ActionNarrowChat,
+	"]":     ActionNarrowChat,
+	"q":     ActionQuit,
+	"r":     ActionGrantRead,
+	"w":     ActionGrantWrite,
+	"k":     ActionKickPeer,
+	"?":     ActionShowMenu,
 }
 
 func toggleSidebarAction(a *App) tea.Cmd {
@@ -195,6 +193,17 @@ func kickPeerAction(a *App) tea.Cmd {
 
 func helpAction(a *App) tea.Cmd {
 	a.helpOpen = true
+	return nil
+}
+
+func denyGuestAction(a *App) tea.Cmd {
+	a.approve("", true)
+	return nil
+}
+
+func restartShellAction(a *App) tea.Cmd {
+	a.shellExitChoice = shellExitChoiceRestart
+	a.confirmShellExitChoice()
 	return nil
 }
 

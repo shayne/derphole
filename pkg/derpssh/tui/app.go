@@ -101,37 +101,10 @@ type topBarHit struct {
 	peer   Peer
 }
 
-type menuAction int
-
-const (
-	menuActionNone menuAction = iota
-	menuActionChat
-	menuActionFocusChat
-	menuActionFocusTerminal
-	menuActionInvite
-	menuActionCopyMode
-	menuActionQuit
-	menuActionRead
-	menuActionWrite
-	menuActionKick
-)
-
 type menuEntry struct {
 	label    string
 	shortcut string
-	action   menuAction
-}
-
-var actionMenuActions = map[ActionID]menuAction{
-	ActionToggleChat:    menuActionChat,
-	ActionFocusChat:     menuActionFocusChat,
-	ActionFocusTerminal: menuActionFocusTerminal,
-	ActionShowInvite:    menuActionInvite,
-	ActionToggleSelect:  menuActionCopyMode,
-	ActionQuit:          menuActionQuit,
-	ActionGrantRead:     menuActionRead,
-	ActionGrantWrite:    menuActionWrite,
-	ActionKickPeer:      menuActionKick,
+	action   ActionID
 }
 
 type mousePressKind int
@@ -1662,11 +1635,10 @@ func (a *App) menuEntries() []menuEntry {
 }
 
 func menuEntryForAction(action Action) (menuEntry, bool) {
-	menuAction, ok := actionMenuActions[action.ID]
-	if !ok {
+	if !action.Menu {
 		return menuEntry{}, false
 	}
-	return menuEntry{label: action.Label, shortcut: string(action.Shortcut), action: menuAction}, true
+	return menuEntry{label: action.Label, shortcut: string(action.Shortcut), action: action.ID}, true
 }
 
 func (a *App) quitButtonLine(width int) string {

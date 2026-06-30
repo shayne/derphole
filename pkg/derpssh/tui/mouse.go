@@ -18,18 +18,6 @@ var mouseButtonCodes = map[tea.MouseButton]int{
 	tea.MouseButtonWheelDown: 65,
 }
 
-var menuActionHandlers = map[menuAction]func(*App) tea.Cmd{
-	menuActionChat:          toggleSidebarAction,
-	menuActionFocusChat:     focusChatAction,
-	menuActionFocusTerminal: focusTerminalAction,
-	menuActionInvite:        inviteAction,
-	menuActionCopyMode:      copyModeAction,
-	menuActionQuit:          quitAction,
-	menuActionRead:          readRoleAction,
-	menuActionWrite:         writeRoleAction,
-	menuActionKick:          kickPeerAction,
-}
-
 func EncodeSGRMouse(msg tea.MouseMsg, terminal Rect) ([]byte, bool) {
 	if !terminal.contains(msg.X, msg.Y) {
 		return nil, false
@@ -182,8 +170,8 @@ func (a *App) handleHelpMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
 		return nil, false
 	}
 	if msg.Action == tea.MouseActionPress {
-		action := a.helpActionAt(msg.X, msg.Y)
-		if action == menuActionNone {
+		action, ok := a.helpActionAt(msg.X, msg.Y)
+		if !ok {
 			a.helpOpen = false
 			return nil, true
 		}
@@ -192,26 +180,22 @@ func (a *App) handleHelpMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
 	return nil, true
 }
 
-func (a *App) helpActionAt(x int, y int) menuAction {
+func (a *App) helpActionAt(x int, y int) (ActionID, bool) {
 	contentX, contentY := a.helpContentOrigin()
 	width := a.helpContentWidth()
 	row := contentY + 2
 	for _, entry := range a.menuEntries() {
 		if y == row && x >= contentX && x < contentX+width {
-			return entry.action
+			return entry.action, true
 		}
 		row++
 	}
-	return menuActionNone
+	return "", false
 }
 
-func (a *App) runMenuAction(action menuAction) tea.Cmd {
+func (a *App) runMenuAction(action ActionID) tea.Cmd {
 	a.helpOpen = false
-	handler := menuActionHandlers[action]
-	if handler == nil {
-		return nil
-	}
-	return handler(a)
+	return a.runAction(action)
 }
 
 func (a *App) handleNoticeMouse(msg tea.MouseMsg) bool {

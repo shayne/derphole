@@ -16,6 +16,8 @@ const (
 	ActionToggleSelect  ActionID = "toggle_select"
 	ActionShowMenu      ActionID = "show_menu"
 	ActionShowInvite    ActionID = "show_invite"
+	ActionWidenChat     ActionID = "widen_chat"
+	ActionNarrowChat    ActionID = "narrow_chat"
 	ActionGrantRead     ActionID = "grant_read"
 	ActionGrantWrite    ActionID = "grant_write"
 	ActionDenyGuest     ActionID = "deny_guest"
@@ -35,6 +37,7 @@ type Action struct {
 	ID       ActionID
 	Label    string
 	Shortcut KeyChord
+	Menu     bool
 	Visible  func(ActionContext) bool
 	Enabled  func(ActionContext) bool
 	Run      func(*App, ActionContext) tea.Cmd
@@ -46,18 +49,20 @@ type ActionRegistry struct {
 
 func NewActionRegistry() ActionRegistry {
 	return ActionRegistry{actions: []Action{
-		{ID: ActionToggleChat, Label: "Toggle Chat", Shortcut: "Ctrl-X S", Visible: alwaysVisible, Enabled: alwaysEnabled},
-		{ID: ActionFocusChat, Label: "Focus Chat", Shortcut: "Ctrl-X C", Visible: alwaysVisible, Enabled: alwaysEnabled},
-		{ID: ActionFocusTerminal, Label: "Focus Terminal", Shortcut: "Ctrl-X T", Visible: alwaysVisible, Enabled: alwaysEnabled},
-		{ID: ActionShowInvite, Label: "Show Invite", Shortcut: "Ctrl-X I", Visible: hostInviteVisible, Enabled: alwaysEnabled},
-		{ID: ActionToggleSelect, Label: "Native Selection", Shortcut: "Ctrl-X Y", Visible: alwaysVisible, Enabled: alwaysEnabled},
-		{ID: ActionQuit, Label: "Quit", Shortcut: "Ctrl-X Q", Visible: alwaysVisible, Enabled: alwaysEnabled},
-		{ID: ActionGrantRead, Label: "Grant Read", Shortcut: "Ctrl-X R", Visible: hostPeerVisible, Enabled: alwaysEnabled},
-		{ID: ActionGrantWrite, Label: "Grant Write", Shortcut: "Ctrl-X W", Visible: hostPeerVisible, Enabled: alwaysEnabled},
-		{ID: ActionKickPeer, Label: "Kick Peer", Shortcut: "Ctrl-X K", Visible: hostPeerVisible, Enabled: alwaysEnabled},
-		{ID: ActionDenyGuest, Label: "Deny Guest", Shortcut: "Esc", Visible: hostInviteVisible, Enabled: alwaysEnabled},
-		{ID: ActionRestartShell, Label: "Restart Shell", Shortcut: "R", Visible: hostVisible, Enabled: alwaysEnabled},
-		{ID: ActionShowMenu, Label: "Menu", Shortcut: "Ctrl-X ?", Visible: alwaysVisible, Enabled: alwaysEnabled},
+		{ID: ActionToggleChat, Label: "Toggle Chat", Shortcut: "Ctrl-X S", Menu: true, Visible: alwaysVisible, Enabled: alwaysEnabled, Run: appAction(toggleSidebarAction)},
+		{ID: ActionFocusChat, Label: "Focus Chat", Shortcut: "Ctrl-X C", Menu: true, Visible: alwaysVisible, Enabled: alwaysEnabled, Run: appAction(focusChatAction)},
+		{ID: ActionFocusTerminal, Label: "Focus Terminal", Shortcut: "Ctrl-X T", Menu: true, Visible: alwaysVisible, Enabled: alwaysEnabled, Run: appAction(focusTerminalAction)},
+		{ID: ActionShowInvite, Label: "Show Invite", Shortcut: "Ctrl-X I", Menu: true, Visible: hostInviteVisible, Enabled: alwaysEnabled, Run: appAction(inviteAction)},
+		{ID: ActionToggleSelect, Label: "Native Selection", Shortcut: "Ctrl-X Y", Menu: true, Visible: alwaysVisible, Enabled: alwaysEnabled, Run: appAction(copyModeAction)},
+		{ID: ActionQuit, Label: "Quit", Shortcut: "Ctrl-X Q", Menu: true, Visible: alwaysVisible, Enabled: alwaysEnabled, Run: appAction(quitAction)},
+		{ID: ActionWidenChat, Label: "Widen Chat", Shortcut: "Ctrl-X [", Visible: alwaysVisible, Enabled: alwaysEnabled, Run: appAction(widenChatAction)},
+		{ID: ActionNarrowChat, Label: "Narrow Chat", Shortcut: "Ctrl-X ]", Visible: alwaysVisible, Enabled: alwaysEnabled, Run: appAction(narrowChatAction)},
+		{ID: ActionGrantRead, Label: "Grant Read", Shortcut: "Ctrl-X R", Menu: true, Visible: hostPeerVisible, Enabled: alwaysEnabled, Run: appAction(readRoleAction)},
+		{ID: ActionGrantWrite, Label: "Grant Write", Shortcut: "Ctrl-X W", Menu: true, Visible: hostPeerVisible, Enabled: alwaysEnabled, Run: appAction(writeRoleAction)},
+		{ID: ActionKickPeer, Label: "Kick Peer", Shortcut: "Ctrl-X K", Menu: true, Visible: hostPeerVisible, Enabled: alwaysEnabled, Run: appAction(kickPeerAction)},
+		{ID: ActionDenyGuest, Label: "Deny Guest", Shortcut: "Esc", Visible: hostInviteVisible, Enabled: alwaysEnabled, Run: appAction(denyGuestAction)},
+		{ID: ActionRestartShell, Label: "Restart Shell", Shortcut: "R", Visible: hostVisible, Enabled: alwaysEnabled, Run: appAction(restartShellAction)},
+		{ID: ActionShowMenu, Label: "Menu", Shortcut: "Ctrl-X ?", Visible: alwaysVisible, Enabled: alwaysEnabled, Run: appAction(helpAction)},
 	}}
 }
 
@@ -69,6 +74,45 @@ func (r ActionRegistry) Visible(ctx ActionContext) []Action {
 		}
 	}
 	return visible
+}
+
+func (r ActionRegistry) Action(ctx ActionContext, id ActionID) (Action, bool) {
+	for _, action := range r.actions {
+		if action.ID != id {
+			continue
+		}
+		if action.Visible != nil && !action.Visible(ctx) {
+			return Action{}, false
+		}
+		if action.Enabled != nil && !action.Enabled(ctx) {
+			return Action{}, false
+		}
+		return action, true
+	}
+	return Action{}, false
+}
+
+func (r ActionRegistry) Run(app *App, id ActionID) (tea.Cmd, bool) {
+	if app == nil {
+		return nil, false
+	}
+	ctx := app.actionContext()
+	action, ok := r.Action(ctx, id)
+	if !ok || action.Run == nil {
+		return nil, false
+	}
+	return action.Run(app, ctx), true
+}
+
+func (a *App) runAction(id ActionID) tea.Cmd {
+	cmd, _ := NewActionRegistry().Run(a, id)
+	return cmd
+}
+
+func appAction(fn func(*App) tea.Cmd) func(*App, ActionContext) tea.Cmd {
+	return func(app *App, _ ActionContext) tea.Cmd {
+		return fn(app)
+	}
 }
 
 func alwaysVisible(ActionContext) bool { return true }

@@ -33,6 +33,64 @@ func TestActionRegistryShowsPeerActionsOnlyForHostWithPeers(t *testing.T) {
 	}
 }
 
+func TestActionRegistryRunsVisibleAction(t *testing.T) {
+	reg := NewActionRegistry()
+	app := NewApp(Options{
+		Side:     "host",
+		Terminal: &fakePane{view: "ok"},
+	})
+
+	cmd, ok := reg.Run(app, ActionToggleChat)
+
+	if !ok {
+		t.Fatalf("Run(ActionToggleChat) ok = false, want true")
+	}
+	if cmd != nil {
+		t.Fatalf("Run(ActionToggleChat) cmd = %+v, want nil", cmd)
+	}
+	if !app.sidebarOpen {
+		t.Fatalf("Run(ActionToggleChat) did not open sidebar")
+	}
+}
+
+func TestActionRegistryDoesNotRunHiddenAction(t *testing.T) {
+	reg := NewActionRegistry()
+	app := NewApp(Options{
+		Side:          "guest",
+		InviteCommand: "npx -y derpssh@latest connect DSH1copyme",
+		Terminal:      &fakePane{view: "ok"},
+	})
+
+	cmd, ok := reg.Run(app, ActionShowInvite)
+
+	if ok {
+		t.Fatalf("Run(ActionShowInvite) ok = true for guest, want false")
+	}
+	if cmd != nil {
+		t.Fatalf("Run(ActionShowInvite) cmd = %+v, want nil", cmd)
+	}
+	if app.inviteOpen {
+		t.Fatalf("Run(ActionShowInvite) opened hidden guest invite")
+	}
+}
+
+func TestMenuEntriesCarryActionIDs(t *testing.T) {
+	app := NewApp(Options{
+		Side:          "host",
+		InviteCommand: "npx -y derpssh@latest connect DSH1copyme",
+		Terminal:      &fakePane{view: "ok"},
+	})
+
+	entries := app.menuEntries()
+	entry, ok := findMenuEntry(entries, "Show Invite")
+	if !ok {
+		t.Fatalf("menu entries missing Show Invite action: %+v", entries)
+	}
+	if entry.action != ActionShowInvite {
+		t.Fatalf("Show Invite action = %q, want %q", entry.action, ActionShowInvite)
+	}
+}
+
 func hasAction(actions []Action, id ActionID) bool {
 	for _, action := range actions {
 		if action.ID == id {
@@ -40,4 +98,13 @@ func hasAction(actions []Action, id ActionID) bool {
 		}
 	}
 	return false
+}
+
+func findMenuEntry(entries []menuEntry, label string) (menuEntry, bool) {
+	for _, entry := range entries {
+		if entry.label == label {
+			return entry, true
+		}
+	}
+	return menuEntry{}, false
 }
