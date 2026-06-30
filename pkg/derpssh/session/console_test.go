@@ -433,6 +433,36 @@ func TestTUIConsoleStopWaitsForProgramRunCleanup(t *testing.T) {
 	}
 }
 
+func TestTUIConsoleProgramExitRunsQuitCallback(t *testing.T) {
+	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, &recordingTerminalPane{view: "shell$"})
+	program := newExternallyClosedProgram()
+	console.program = program
+	console.programNotify = make(chan struct{}, 1)
+
+	quitCalled := make(chan struct{})
+	console.SetCommandCallbacks(tuiConsoleCallbacks{
+		Quit: func(context.Context) error {
+			close(quitCalled)
+			return nil
+		},
+	})
+
+	console.Start(context.Background())
+	select {
+	case <-program.runEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Program.Run did not start")
+	}
+
+	program.close()
+
+	select {
+	case <-quitCalled:
+	case <-time.After(time.Second):
+		t.Fatal("Program.Run exit did not call Quit callback")
+	}
+}
+
 func TestTUIConsoleStopRestoresTerminalExactlyOnce(t *testing.T) {
 	var out strings.Builder
 	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, &recordingTerminalPane{view: "shell$"})
@@ -1143,6 +1173,44 @@ func (p *delayedExitProgram) Wait() {
 func (p *delayedExitProgram) release() {
 	p.releaseOnce.Do(func() {
 		close(p.releaseRun)
+	})
+}
+
+type externallyClosedProgram struct {
+	runEntered chan struct{}
+	exit       chan struct{}
+	done       chan struct{}
+	exitOnce   sync.Once
+}
+
+func newExternallyClosedProgram() *externallyClosedProgram {
+	return &externallyClosedProgram{
+		runEntered: make(chan struct{}),
+		exit:       make(chan struct{}),
+		done:       make(chan struct{}),
+	}
+}
+
+func (p *externallyClosedProgram) Send(tea.Msg) {}
+
+func (p *externallyClosedProgram) Run() (tea.Model, error) {
+	close(p.runEntered)
+	<-p.exit
+	close(p.done)
+	return nil, nil
+}
+
+func (p *externallyClosedProgram) Quit() {
+	p.close()
+}
+
+func (p *externallyClosedProgram) Wait() {
+	<-p.done
+}
+
+func (p *externallyClosedProgram) close() {
+	p.exitOnce.Do(func() {
+		close(p.exit)
 	})
 }
 

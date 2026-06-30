@@ -132,6 +132,7 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 
 	var hostStarted atomic.Bool
 	fanout := newTerminalFanout(terminal.Output, console)
+	fanout.setTerminalResponseWriter(terminal.Input)
 	go func() {
 		_ = fanout.Run(shareCtx)
 		if !hostStarted.Load() {

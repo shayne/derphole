@@ -81,6 +81,41 @@ func TestTerminalFanoutDeliversFinalDataBeforeEOF(t *testing.T) {
 	}
 }
 
+func TestTerminalFanoutRespondsToPrimaryDeviceAttributeQuery(t *testing.T) {
+	pr, pw := io.Pipe()
+	input := newCaptureWriter()
+	fanout := newTerminalFanout(pr, io.Discard)
+	fanout.setTerminalResponseWriter(input)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go func() { _ = fanout.Run(ctx) }()
+
+	if _, err := pw.Write([]byte("\x1b[c")); err != nil {
+		t.Fatalf("write query: %v", err)
+	}
+
+	waitForCapturedWrite(t, ctx, input, "\x1b[?1;2c")
+}
+
+func TestTerminalFanoutRespondsToSplitPrimaryDeviceAttributeQuery(t *testing.T) {
+	pr, pw := io.Pipe()
+	input := newCaptureWriter()
+	fanout := newTerminalFanout(pr, io.Discard)
+	fanout.setTerminalResponseWriter(input)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go func() { _ = fanout.Run(ctx) }()
+
+	if _, err := pw.Write([]byte("\x1b")); err != nil {
+		t.Fatalf("write query prefix: %v", err)
+	}
+	if _, err := pw.Write([]byte("[0c")); err != nil {
+		t.Fatalf("write query suffix: %v", err)
+	}
+
+	waitForCapturedWrite(t, ctx, input, "\x1b[?1;2c")
+}
+
 func readN(t *testing.T, r io.Reader, n int) string {
 	t.Helper()
 	done := make(chan string, 1)

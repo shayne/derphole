@@ -252,6 +252,7 @@ func (c *tuiConsole) Start(ctx context.Context) {
 		go func() {
 			close(runStarted)
 			_, _ = c.program.Run()
+			c.handleProgramExit(runCtx)
 			c.restoreTerminal()
 			cancel()
 		}()
@@ -533,6 +534,16 @@ func (c *tuiConsole) handleQuitCommand(ctx context.Context) {
 		_ = callbacks.Quit(ctx)
 	}
 	c.Stop()
+}
+
+func (c *tuiConsole) handleProgramExit(ctx context.Context) {
+	if ctx == nil || ctx.Err() != nil {
+		return
+	}
+	callbacks := c.currentCallbacks()
+	if callbacks.Quit != nil {
+		_ = callbacks.Quit(ctx)
+	}
 }
 
 func (c *tuiConsole) handleCopyInviteCommand(cmd tui.CopyInviteCommand) {

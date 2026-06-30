@@ -8,15 +8,23 @@ import (
 	"context"
 	"errors"
 	"io"
+	"regexp"
+	"strings"
 	"sync"
 )
 
 const terminalReplayLimit = 128 * 1024
+const terminalPrimaryDeviceAttributesResponse = "\x1b[?1;2c"
+const terminalSecondaryDeviceAttributesResponse = "\x1b[>0;0;0c"
+
+var terminalQueryPattern = regexp.MustCompile("\x1b\\[(>?)(0?)c")
 
 type terminalFanout struct {
-	src   io.Reader
-	local io.Writer
-	limit int
+	src            io.Reader
+	local          io.Writer
+	responseWriter io.Writer
+	responseTail   string
+	limit          int
 
 	mu     sync.Mutex
 	replay []byte
@@ -37,12 +45,22 @@ func newTerminalFanout(src io.Reader, local io.Writer) *terminalFanout {
 	}
 }
 
+func (f *terminalFanout) setTerminalResponseWriter(w io.Writer) {
+	f.mu.Lock()
+	f.responseWriter = w
+	f.responseTail = ""
+	f.mu.Unlock()
+}
+
 func (f *terminalFanout) Run(ctx context.Context) error {
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := f.src.Read(buf)
 		if n > 0 {
 			data := append([]byte(nil), buf[:n]...)
+			// The host shell talks to derpssh's internal terminal surface, so
+			// answer terminal identity queries before rendering or broadcasting.
+			f.respondToTerminalQueries(data)
 			if f.local != nil {
 				if _, writeErr := f.local.Write(data); writeErr != nil {
 					f.closeSubscribers()
@@ -58,6 +76,52 @@ func (f *terminalFanout) Run(ctx context.Context) error {
 			}
 			return err
 		}
+	}
+}
+
+func (f *terminalFanout) respondToTerminalQueries(data []byte) {
+	f.mu.Lock()
+	writer := f.responseWriter
+	input := f.responseTail + string(data)
+	responses := terminalQueryResponses(input)
+	f.responseTail = incompleteTerminalQueryTail(input)
+	f.mu.Unlock()
+
+	if writer == nil {
+		return
+	}
+	for _, response := range responses {
+		_, _ = io.WriteString(writer, response)
+	}
+}
+
+func terminalQueryResponses(output string) []string {
+	matches := terminalQueryPattern.FindAllStringSubmatch(output, -1)
+	var responses []string
+	for _, match := range matches {
+		if len(match) > 1 && match[1] == ">" {
+			responses = append(responses, terminalSecondaryDeviceAttributesResponse)
+		} else {
+			responses = append(responses, terminalPrimaryDeviceAttributesResponse)
+		}
+	}
+	return responses
+}
+
+func incompleteTerminalQueryTail(output string) string {
+	if strings.HasSuffix(output, "\x1b") {
+		return "\x1b"
+	}
+	idx := strings.LastIndex(output, "\x1b[")
+	if idx == -1 {
+		return ""
+	}
+	tail := output[idx:]
+	switch tail {
+	case "\x1b[", "\x1b[0", "\x1b[>", "\x1b[>0":
+		return tail
+	default:
+		return ""
 	}
 }
 
