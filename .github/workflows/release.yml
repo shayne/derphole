@@ -1,6 +1,12 @@
 name: Release
 
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Prepared release tag to publish, for example v0.15.6"
+        required: true
+        type: string
   push:
     branches:
       - "main"
@@ -31,14 +37,31 @@ jobs:
     steps:
       - name: Build version strings
         id: meta
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           is_tag=false
           is_main=false
+          input_version="${INPUT_VERSION:-}"
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then is_tag=true; fi
           if [ "${GITHUB_REF_NAME:-}" = "main" ]; then is_main=true; fi
+          if [ -n "$input_version" ]; then
+            if [[ ! "$input_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "workflow_dispatch version must look like vX.Y.Z: $input_version" >&2
+              exit 1
+            fi
+            if [ "$GITHUB_REF_NAME" != "$input_version" ]; then
+              echo "workflow_dispatch ref must be the prepared tag $input_version; got $GITHUB_REF_NAME" >&2
+              exit 1
+            fi
+            is_tag=true
+            is_main=false
+          fi
           ts=$(date -u +%Y%m%d%H%M%S)
           short_sha="${GITHUB_SHA::7}"
-          if [ "$is_tag" = true ]; then
+          if [ -n "$input_version" ]; then
+            version="$input_version"
+          elif [ "$is_tag" = true ]; then
             version="${GITHUB_REF_NAME}"
           else
             version="0.0.0-dev.${ts}.${short_sha}"
@@ -197,6 +220,8 @@ jobs:
           install: true
           cache: true
       - name: Build SwiftPM framework artifact
+        env:
+          DERPHOLE_MOBILE_FRAMEWORK_VERSION: ${{ needs.meta.outputs.version }}
         run: mise run swiftpm:framework
       - name: Verify Package.swift binary target
         env:

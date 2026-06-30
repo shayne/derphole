@@ -71,6 +71,7 @@ func TestReleaseWorkflowPublishesSwiftPMFramework(t *testing.T) {
 	for _, required := range []string{
 		"build-swiftpm-framework:",
 		"runs-on: macos-15",
+		"DERPHOLE_MOBILE_FRAMEWORK_VERSION: ${{ needs.meta.outputs.version }}",
 		"mise run swiftpm:framework",
 		"name: derphole-mobile-swiftpm",
 		"path: dist/swiftpm/DerpholeMobile.xcframework.zip",
@@ -81,6 +82,62 @@ func TestReleaseWorkflowPublishesSwiftPMFramework(t *testing.T) {
 	} {
 		if !strings.Contains(body, required) {
 			t.Fatalf("release workflow does not publish SwiftPM framework; missing %q", required)
+		}
+	}
+}
+
+func TestPrepareReleaseWorkflowCreatesSwiftPMTagFromCIArtifact(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join("..", ".github", "workflows", "prepare-release.yml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read prepare release workflow: %v", err)
+	}
+
+	body := string(data)
+	for _, required := range []string{
+		"name: Prepare Release",
+		"workflow_dispatch:",
+		"version:",
+		"contents: write",
+		"actions: write",
+		"runs-on: macos-15",
+		"DERPHOLE_MOBILE_FRAMEWORK_VERSION: ${{ inputs.version }}",
+		"bash ./tools/packaging/update-swiftpm-binary-target.sh \"$VERSION\"",
+		"git commit -m \"build: prepare ${VERSION} SwiftPM target\"",
+		"git tag -a \"$VERSION\" -m \"$VERSION\"",
+		"git push origin HEAD:main",
+		"git push origin \"refs/tags/${VERSION}\"",
+		"gh workflow run release.yml -R \"$GITHUB_REPOSITORY\" --ref \"$VERSION\" -f version=\"$VERSION\"",
+	} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("prepare release workflow does not create SwiftPM release tag from CI artifact; missing %q", required)
+		}
+	}
+}
+
+func TestReleaseWorkflowSupportsPreparedReleaseDispatch(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join("..", ".github", "workflows", "release.yml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read release workflow: %v", err)
+	}
+
+	body := string(data)
+	for _, required := range []string{
+		"workflow_dispatch:",
+		"INPUT_VERSION: ${{ inputs.version }}",
+		"input_version=\"${INPUT_VERSION:-}\"",
+		"if [ -n \"$input_version\" ]; then",
+		"if [ \"$GITHUB_REF_NAME\" != \"$input_version\" ]; then",
+		"version=\"$input_version\"",
+		"is_tag=true",
+	} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("release workflow does not support prepared release dispatch; missing %q", required)
 		}
 	}
 }
@@ -150,22 +207,34 @@ func TestSwiftPMFrameworkBuildIsNormalizedForReleaseChecksum(t *testing.T) {
 func TestReleaseWorkflowDoesNotInterpolateVersionInShell(t *testing.T) {
 	t.Parallel()
 
-	path := filepath.Join("..", ".github", "workflows", "release.yml")
-	data, err := os.ReadFile(path)
+	workflowPaths := []string{
+		filepath.Join("..", ".github", "workflows", "release.yml"),
+		filepath.Join("..", ".github", "workflows", "prepare-release.yml"),
+	}
+	for _, path := range workflowPaths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read workflow %s: %v", path, err)
+		}
+		body := string(data)
+		for _, unsafe := range []string{
+			"VERSION=${{ needs.meta.outputs.version }}",
+			"\"${{ needs.meta.outputs.version }}\"",
+			"VERSION=${{ inputs.version }}",
+			"\"${{ inputs.version }}\"",
+			"--ref ${{ inputs.version }}",
+			"-f version=${{ inputs.version }}",
+		} {
+			if strings.Contains(body, unsafe) {
+				t.Fatalf("workflow %s interpolates version into shell with %q", path, unsafe)
+			}
+		}
+	}
+	releaseData, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "release.yml"))
 	if err != nil {
 		t.Fatalf("read release workflow: %v", err)
 	}
-
-	body := string(data)
-	for _, unsafe := range []string{
-		"VERSION=${{ needs.meta.outputs.version }}",
-		"\"${{ needs.meta.outputs.version }}\"",
-	} {
-		if strings.Contains(body, unsafe) {
-			t.Fatalf("release workflow interpolates version into shell with %q", unsafe)
-		}
-	}
-	if !strings.Contains(body, "VERSION: ${{ needs.meta.outputs.version }}") {
+	if !strings.Contains(string(releaseData), "VERSION: ${{ needs.meta.outputs.version }}") {
 		t.Fatal("release workflow does not pass version through step environment")
 	}
 }

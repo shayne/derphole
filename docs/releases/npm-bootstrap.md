@@ -48,8 +48,7 @@ Once npm trusted publishing is configured for `shayne/derphole`:
 
 ```bash
 git push origin main
-git tag v0.1.0
-git push origin v0.1.0
+gh workflow run prepare-release.yml --ref main -f version=v0.1.0
 ```
 
-Before the package is bootstrapped and publishable by this workflow, pushes to `main` and pushes of `v*` tags still build and dry-run the npm artifact, but npm publish jobs skip registry ownership or permission failures instead of failing CI. After bootstrap and trusted publisher setup, pushes to `main` update the npm `dev` dist-tag, and pushes of `v*` tags publish production releases through GitHub Actions. The manual `0.0.1` bootstrap path is no longer needed once trusted publishing is configured.
+Before the package is bootstrapped and publishable by this workflow, pushes to `main` and pushes of `v*` tags still build and dry-run the npm artifact, but npm publish jobs skip registry ownership or permission failures instead of failing CI. After bootstrap and trusted publisher setup, pushes to `main` update the npm `dev` dist-tag, and prepared `v*` tags publish production releases through GitHub Actions. The normal release path is the Prepare Release workflow, which creates the tag after updating `Package.swift`. The manual `0.0.1` bootstrap path is no longer needed once trusted publishing is configured.
