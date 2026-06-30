@@ -183,10 +183,57 @@ jobs:
             dist/release/derphole-web.zip.sha256
           if-no-files-found: error
 
+  build-swiftpm-framework:
+    name: Build SwiftPM mobile framework
+    runs-on: macos-latest
+    needs: [meta]
+    if: needs.meta.outputs.is_tag == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+        with:
+          install: true
+          cache: true
+      - name: Build SwiftPM framework artifact
+        run: mise run swiftpm:framework
+      - name: Verify Package.swift binary target
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          checksum="$(swift package compute-checksum dist/swiftpm/DerpholeMobile.xcframework.zip)"
+          expected_url="https://github.com/shayne/derphole/releases/download/${VERSION}/DerpholeMobile.xcframework.zip"
+          python3 - "$expected_url" "$checksum" <<'PY'
+          from pathlib import Path
+          import sys
+
+          expected_url, expected_checksum = sys.argv[1:]
+          text = Path("Package.swift").read_text()
+          start = text.find('        .binaryTarget(\n            name: "DerpholeMobile",')
+          if start < 0:
+              sys.exit("Package.swift missing DerpholeMobile binary target")
+          end = text.find("\n        ),", start)
+          if end < 0:
+              sys.exit("Package.swift has malformed DerpholeMobile binary target")
+          target = text[start:end]
+          if expected_url not in target or expected_checksum not in target:
+              print("DerpholeMobile SwiftPM binary target does not match this release artifact", file=sys.stderr)
+              print(f"expected url: {expected_url}", file=sys.stderr)
+              print(f"expected checksum: {expected_checksum}", file=sys.stderr)
+              sys.exit(1)
+          PY
+      - name: Upload SwiftPM framework artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: derphole-mobile-swiftpm
+          path: dist/swiftpm/DerpholeMobile.xcframework.zip
+          if-no-files-found: error
+
   release-prod:
     name: Publish release
     runs-on: ubuntu-latest
-    needs: [meta, check, build-binaries, build-web, publish-npm-prod]
+    needs: [meta, check, build-binaries, build-web, build-swiftpm-framework, publish-npm-prod]
     if: needs.meta.outputs.is_tag == 'true'
     permissions:
       actions: read
@@ -215,7 +262,8 @@ jobs:
             -n derpssh-linux-arm64 \
             -n derpssh-darwin-amd64 \
             -n derpssh-darwin-arm64 \
-            -n derphole-web-release
+            -n derphole-web-release \
+            -n derphole-mobile-swiftpm
           for asset in derphole-linux-amd64 derphole-linux-arm64 derphole-darwin-amd64 derphole-darwin-arm64 derptun-linux-amd64 derptun-linux-arm64 derptun-darwin-amd64 derptun-darwin-arm64 derpssh-linux-amd64 derpssh-linux-arm64 derpssh-darwin-amd64 derpssh-darwin-arm64; do
             cp "dist/downloads/$asset/$asset" "dist/raw/$asset"
           done
@@ -232,6 +280,7 @@ jobs:
           bash ./tools/packaging/build-release-assets.sh
           cp dist/downloads/derphole-web-release/derphole-web.zip dist/release/
           cp dist/downloads/derphole-web-release/derphole-web.zip.sha256 dist/release/
+          cp dist/downloads/derphole-mobile-swiftpm/DerpholeMobile.xcframework.zip dist/release/
       - name: Publish release
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -264,6 +313,7 @@ jobs:
             dist/release/derpssh-darwin-arm64.tar.gz.sha256
             dist/release/derphole-web.zip
             dist/release/derphole-web.zip.sha256
+            dist/release/DerpholeMobile.xcframework.zip
           )
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" -R "$GITHUB_REPOSITORY" "${files[@]}" --clobber
@@ -534,7 +584,7 @@ jobs:
   publish-npm-prod:
     name: Publish npm package
     runs-on: ubuntu-latest
-    needs: [check, publish-packages-prod]
+    needs: [check, publish-packages-prod, build-swiftpm-framework]
     if: needs.publish-packages-prod.result == 'success'
     permissions:
       actions: read

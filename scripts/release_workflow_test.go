@@ -58,6 +58,55 @@ func TestReleaseWorkflowIncludesDerpsshArtifacts(t *testing.T) {
 	}
 }
 
+func TestReleaseWorkflowPublishesSwiftPMFramework(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join("..", ".github", "workflows", "release.yml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read release workflow: %v", err)
+	}
+
+	body := string(data)
+	for _, required := range []string{
+		"build-swiftpm-framework:",
+		"runs-on: macos-latest",
+		"mise run swiftpm:framework",
+		"name: derphole-mobile-swiftpm",
+		"path: dist/swiftpm/DerpholeMobile.xcframework.zip",
+		"needs: [meta, check, build-binaries, build-web, build-swiftpm-framework, publish-npm-prod]",
+		"needs: [check, publish-packages-prod, build-swiftpm-framework]",
+		"-n derphole-mobile-swiftpm",
+		"dist/release/DerpholeMobile.xcframework.zip",
+	} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("release workflow does not publish SwiftPM framework; missing %q", required)
+		}
+	}
+}
+
+func TestReleaseWorkflowVerifiesSwiftPMPackageTarget(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join("..", ".github", "workflows", "release.yml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read release workflow: %v", err)
+	}
+
+	body := string(data)
+	for _, required := range []string{
+		"Verify Package.swift binary target",
+		"swift package compute-checksum dist/swiftpm/DerpholeMobile.xcframework.zip",
+		"https://github.com/shayne/derphole/releases/download/${VERSION}/DerpholeMobile.xcframework.zip",
+		"DerpholeMobile SwiftPM binary target does not match this release artifact",
+	} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("release workflow does not verify SwiftPM Package.swift target; missing %q", required)
+		}
+	}
+}
+
 func TestReleaseWorkflowDoesNotInterpolateVersionInShell(t *testing.T) {
 	t.Parallel()
 
