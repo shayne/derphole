@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
 	"github.com/muesli/termenv"
+	"github.com/shayne/derphole/pkg/derpssh/brand"
 )
 
 func TestAppUsesAltScreenCompatibleView(t *testing.T) {
@@ -589,6 +590,9 @@ func TestInviteShortcutOpensHostInvite(t *testing.T) {
 	}
 	if !strings.Contains(view, invite) {
 		t.Fatalf("invite screen missing invite command:\n%s", view)
+	}
+	if !strings.Contains(view, brand.Wordmark()) {
+		t.Fatalf("invite screen missing derpssh wordmark:\n%s", view)
 	}
 }
 

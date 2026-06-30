@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/shayne/derphole/pkg/derpssh/brand"
 	"github.com/shayne/derphole/pkg/derpssh/protocol"
 )
 
@@ -24,6 +25,9 @@ func TestInviteInterstitialPrintsCommandAsOneLogicalLine(t *testing.T) {
 	got := out.String()
 	if !strings.HasSuffix(got, "\n") {
 		t.Fatalf("invite output should end with newline: %q", got)
+	}
+	if !strings.Contains(got, brand.Wordmark()) {
+		t.Fatalf("invite output missing derpssh wordmark:\n%s", got)
 	}
 	if strings.Count(got, cmd) != 1 {
 		t.Fatalf("invite command not printed exactly once: %q", got)

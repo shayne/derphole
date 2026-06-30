@@ -64,6 +64,7 @@ func Share(ctx context.Context, cfg ShareConfig) error {
 	if !plainInvite {
 		if err := presentShareInvite(cfg, connectCommand); err != nil {
 			if errors.Is(err, errInvitePreflightQuit) {
+				reportSessionCloseReason(cfg.Stderr, hostQuitReason)
 				return nil
 			}
 			return err
@@ -131,6 +132,7 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 	quitBeforeGuest := atomic.Bool{}
 
 	var hostStarted atomic.Bool
+	exitReporter := newShareExitReporter(cfg.Stderr)
 	fanout := newTerminalFanout(terminal.Output, console)
 	fanout.setTerminalResponseWriter(terminal.Input)
 	go func() {
@@ -154,17 +156,20 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 	}
 	starter := newShareConsoleStarter(console, shareCtx, preflight)
 	restartShell := newShareRestartShellCallback(console, terminal, fanout)
-	waitingCallbacks := waitingShareConsoleCallbacks(terminal, cancel, pendingChats)
+	waitingCallbacks := waitingShareConsoleCallbacks(terminal, cancel, pendingChats, exitReporter.Set)
 	waitingCallbacks.RestartShell = restartShell
 	console.SetCommandCallbacks(waitingCallbacks)
 	var preflightErr atomic.Value
 	var preflightExit <-chan struct{}
 	if plainInvite {
-		preflightExit = watchShareInvitePreflight(preflight, starter, terminal, cancel, &quitBeforeGuest, &preflightErr)
+		preflightExit = watchShareInvitePreflight(preflight, starter, terminal, cancel, &quitBeforeGuest, &preflightErr, exitReporter.Set)
 	} else {
 		starter.Start()
 	}
-	defer console.Stop()
+	defer func() {
+		console.Stop()
+		exitReporter.Report()
+	}()
 	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventStatus, Message: "waiting for guest"})
 	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventResize, Cols: terminalSize.Cols, Rows: terminalSize.Rows})
 	sessionEmitter := telemetry.WithStatusHook(cfg.Emitter, func(msg string) {
@@ -188,6 +193,7 @@ func runShare(ctx context.Context, cfg ShareConfig, serverToken, connectCommand 
 			Cancel:       cancel,
 			HostStarted:  &hostStarted,
 			RestartShell: restartShell,
+			CloseReason:  exitReporter.Set,
 		}
 		serveErr <- serveAppMux(shareCtx, appsession.DerptunAppServeConfig{
 			ServerToken: serverToken,
@@ -218,6 +224,7 @@ type shareHostMuxOptions struct {
 	Cancel       context.CancelFunc
 	HostStarted  *atomic.Bool
 	RestartShell func(context.Context) error
+	CloseReason  func(string)
 }
 
 func runShareHostMux(ctx context.Context, mux *derptun.Mux, opts shareHostMuxOptions) error {
@@ -231,6 +238,9 @@ func runShareHostMux(ctx context.Context, mux *derptun.Mux, opts shareHostMuxOpt
 		callbacks := hostConsoleCallbacks(host)
 		callbacks.RestartShell = opts.RestartShell
 		callbacks.Quit = func(ctx context.Context) error {
+			if opts.CloseReason != nil {
+				opts.CloseReason(hostQuitReason)
+			}
 			err := host.Close(ctx, hostQuitReason)
 			_ = opts.Terminal.Close()
 			opts.Cancel()
@@ -240,6 +250,9 @@ func runShareHostMux(ctx context.Context, mux *derptun.Mux, opts shareHostMuxOpt
 		go opts.PendingChats.flush(ctx, callbacks.Chat)
 	})
 	if shouldEndShareAfterHostSession(hostRuntime, err) {
+		if opts.CloseReason != nil {
+			opts.CloseReason(hostQuitReason)
+		}
 		opts.Cancel()
 	}
 	return err
@@ -299,6 +312,7 @@ func watchShareInvitePreflight(
 	cancel context.CancelFunc,
 	quitBeforeGuest *atomic.Bool,
 	preflightErr *atomic.Value,
+	setCloseReason func(string),
 ) <-chan struct{} {
 	exited := make(chan struct{})
 	go func() {
@@ -315,6 +329,9 @@ func watchShareInvitePreflight(
 		case invitePreflightContinue:
 			starter.Start()
 		case invitePreflightQuit:
+			if setCloseReason != nil {
+				setCloseReason(hostQuitReason)
+			}
 			quitBeforeGuest.Store(true)
 			_ = terminal.Close()
 			cancel()
@@ -392,6 +409,33 @@ func finishShareError(err error, ctx context.Context, quitBeforeGuest *atomic.Bo
 	return err
 }
 
+type shareExitReporter struct {
+	output io.Writer
+	reason atomic.Value
+}
+
+func newShareExitReporter(output io.Writer) *shareExitReporter {
+	return &shareExitReporter{output: output}
+}
+
+func (r *shareExitReporter) Set(reason string) {
+	if r == nil {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason != "" {
+		r.reason.Store(reason)
+	}
+}
+
+func (r *shareExitReporter) Report() {
+	if r == nil {
+		return
+	}
+	reason, _ := r.reason.Load().(string)
+	reportSessionCloseReason(r.output, reason)
+}
+
 func shareDisplayName() string {
 	host, _ := os.Hostname()
 	return joinUserHost(os.Getenv("USER"), host)
@@ -412,7 +456,7 @@ func joinUserHost(user, host string) string {
 	}
 }
 
-func waitingShareConsoleCallbacks(terminal *restartableShareTerminal, cancel context.CancelFunc, pendingChats *pendingShareChats) tuiConsoleCallbacks {
+func waitingShareConsoleCallbacks(terminal *restartableShareTerminal, cancel context.CancelFunc, pendingChats *pendingShareChats, setCloseReason func(string)) tuiConsoleCallbacks {
 	return tuiConsoleCallbacks{
 		TerminalInput: func(ctx context.Context, data []byte) error {
 			_ = ctx
@@ -437,6 +481,9 @@ func waitingShareConsoleCallbacks(terminal *restartableShareTerminal, cancel con
 			return nil
 		},
 		Quit: func(context.Context) error {
+			if setCloseReason != nil {
+				setCloseReason(hostQuitReason)
+			}
 			if terminal != nil {
 				_ = terminal.Close()
 			}

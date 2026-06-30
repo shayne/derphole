@@ -6,7 +6,6 @@ package session
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -146,7 +145,7 @@ func reportGuestCloseReason(w io.Writer, reason string) {
 	if w == nil || reason == "" {
 		return
 	}
-	_, _ = fmt.Fprintf(w, "derpssh: session ended: %s\n", reason)
+	reportSessionCloseReason(w, reason)
 }
 
 type guestInputSender interface {

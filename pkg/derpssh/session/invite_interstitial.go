@@ -7,6 +7,8 @@ package session
 import (
 	"io"
 	"strings"
+
+	"github.com/shayne/derphole/pkg/derpssh/brand"
 )
 
 const hostQuitBeforeApprovalReason = "host_quit_before_approval"
@@ -62,8 +64,7 @@ func inviteInterstitialQuitReason(guestPending bool) CloseReason {
 }
 
 func invitePreflightScreen(command string) string {
-	return strings.Join([]string{
-		"derpssh invite",
+	lines := append(brand.WordmarkLines(),
 		"",
 		"Copy this command and send it to the other person:",
 		"",
@@ -71,5 +72,6 @@ func invitePreflightScreen(command string) string {
 		"",
 		"Press Enter to start sharing. Press q to quit.",
 		"",
-	}, "\n")
+	)
+	return strings.Join(lines, "\n")
 }

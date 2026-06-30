@@ -516,7 +516,7 @@ func TestSharePlainInviteTerminalQuitsOnQ(t *testing.T) {
 
 func TestWaitingShareConsoleBuffersChatUntilHostCallbacks(t *testing.T) {
 	pending := newPendingShareChats()
-	callbacks := waitingShareConsoleCallbacks(nil, func() {}, pending)
+	callbacks := waitingShareConsoleCallbacks(nil, func() {}, pending, nil)
 
 	if err := callbacks.Chat(context.Background(), "host-side"); err != nil {
 		t.Fatalf("waiting Chat() error = %v", err)
@@ -530,6 +530,24 @@ func TestWaitingShareConsoleBuffersChatUntilHostCallbacks(t *testing.T) {
 	})
 	if len(got) != 1 || got[0] != "host-side" {
 		t.Fatalf("flushed chats = %#v, want host-side", got)
+	}
+}
+
+func TestWaitingShareConsoleQuitReportsHostReason(t *testing.T) {
+	var gotReason string
+	cancelled := false
+	callbacks := waitingShareConsoleCallbacks(nil, func() { cancelled = true }, nil, func(reason string) {
+		gotReason = reason
+	})
+
+	if err := callbacks.Quit(context.Background()); err != nil {
+		t.Fatalf("Quit() error = %v", err)
+	}
+	if gotReason != hostQuitReason {
+		t.Fatalf("close reason = %q, want %q", gotReason, hostQuitReason)
+	}
+	if !cancelled {
+		t.Fatal("Quit() did not cancel share")
 	}
 }
 

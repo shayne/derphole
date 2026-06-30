@@ -15,6 +15,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/shayne/derphole/pkg/derpssh/brand"
 )
 
 type Options struct {
@@ -2179,10 +2180,7 @@ func (a *App) waitingApprovalOpen() bool {
 func (a *App) inviteView() string {
 	width := maxInt(a.width, 1)
 	command := strings.TrimSpace(a.inviteCommand)
-	lines := []string{
-		"derpssh invite",
-		"",
-	}
+	lines := append(brand.WordmarkLines(), "")
 	lines = append(lines, wrapPlainLines("Copy this command and send it to the other person:", width)...)
 	lines = append(lines, "")
 	lines = append(lines, command)
