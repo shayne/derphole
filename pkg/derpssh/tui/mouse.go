@@ -68,29 +68,44 @@ func supportedMouseAction(action tea.MouseAction) bool {
 	return action == tea.MouseActionPress || action == tea.MouseActionRelease || action == tea.MouseActionMotion
 }
 
+type modalMouseHandler func(*App, tea.MouseMsg) (tea.Cmd, bool)
+
+var modalMouseHandlers = map[ModalID]modalMouseHandler{
+	ModalResizeWarning:   handlePassiveModalMouse,
+	ModalWaitingApproval: handlePassiveModalMouse,
+	ModalHelp:            (*App).handleHelpMouse,
+	ModalKick:            handleKickModalMouse,
+	ModalPeerAction:      (*App).handlePeerDialogMouse,
+	ModalApproval:        (*App).handleApprovalMouse,
+	ModalQuit:            (*App).handleQuitMouse,
+	ModalShellExit:       (*App).handleShellExitMouse,
+	ModalNotice:          handleNoticeModalMouse,
+}
+
 func (a *App) handleModalMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
-	if cmd, handled := a.handleShellExitMouse(msg); handled {
-		return cmd, true
+	id, ok := a.frontModalID()
+	if !ok {
+		return nil, false
 	}
-	if cmd, handled := a.handleQuitMouse(msg); handled {
-		return cmd, true
-	}
-	if cmd, handled := a.handlePeerDialogMouse(msg); handled {
-		return cmd, true
-	}
-	if cmd, handled := a.handleHelpMouse(msg); handled {
-		return cmd, true
-	}
-	if a.handleNoticeMouse(msg) {
+	handler := modalMouseHandlers[id]
+	if handler == nil {
+		a.clearMousePress()
 		return nil, true
 	}
-	if a.handleApprovalMouse(msg) {
-		return nil, true
+	if cmd, handled := handler(a, msg); handled {
+		return cmd, true
 	}
-	if a.handleKickMouse(msg) {
-		return nil, true
-	}
-	return nil, false
+	a.clearMousePress()
+	return nil, true
+}
+
+func handlePassiveModalMouse(app *App, msg tea.MouseMsg) (tea.Cmd, bool) {
+	app.clearMousePress()
+	return nil, true
+}
+
+func handleNoticeModalMouse(app *App, msg tea.MouseMsg) (tea.Cmd, bool) {
+	return nil, app.handleNoticeMouse(msg)
 }
 
 func (a *App) handleShellExitMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
@@ -208,9 +223,9 @@ func (a *App) handleNoticeMouse(msg tea.MouseMsg) bool {
 	return true
 }
 
-func (a *App) handleApprovalMouse(msg tea.MouseMsg) bool {
+func (a *App) handleApprovalMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
 	if !a.approvalActive() {
-		return false
+		return nil, false
 	}
 	switch msg.Action {
 	case tea.MouseActionPress:
@@ -224,12 +239,14 @@ func (a *App) handleApprovalMouse(msg tea.MouseMsg) bool {
 	case tea.MouseActionRelease:
 		hit := a.approvalHit(msg.X, msg.Y)
 		if hit != HitNone && a.releaseMousePress(mousePressApproval, int(hit)) {
-			a.handleApprovalClick(msg.X, msg.Y)
+			if a.handleApprovalClick(msg.X, msg.Y) {
+				return tea.ClearScreen, true
+			}
 		} else {
 			a.clearMousePress()
 		}
 	}
-	return true
+	return nil, true
 }
 
 func (a *App) selectApprovalHit(hit HitTarget) {
@@ -243,24 +260,31 @@ func (a *App) selectApprovalHit(hit HitTarget) {
 	}
 }
 
-func (a *App) handleApprovalClick(x int, y int) {
+func (a *App) handleApprovalClick(x int, y int) bool {
 	switch a.approvalHit(x, y) {
 	case HitApprovalRead:
-		a.approve(RoleRead, false)
+		return a.approve(RoleRead, false)
 	case HitApprovalWrite:
-		a.approve(RoleWrite, false)
+		return a.approve(RoleWrite, false)
 	case HitApprovalDeny:
-		a.approve("", true)
+		return a.approve("", true)
 	}
+	return false
+}
+
+func handleKickModalMouse(app *App, msg tea.MouseMsg) (tea.Cmd, bool) {
+	return nil, app.handleKickMouse(msg)
 }
 
 func (a *App) handleKickMouse(msg tea.MouseMsg) bool {
-	if a.kickPeer == "" || msg.Action != tea.MouseActionPress {
+	if a.kickPeer == "" {
 		return false
 	}
-	a.kickPeerID = ""
-	a.kickPeer = ""
-	a.focusTerminal()
+	if msg.Action == tea.MouseActionPress {
+		a.kickPeerID = ""
+		a.kickPeer = ""
+		a.focusTerminal()
+	}
 	return true
 }
 

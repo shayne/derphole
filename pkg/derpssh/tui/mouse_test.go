@@ -359,6 +359,65 @@ func TestMouseDuringApprovalDoesNotReachTerminalOrChangeFocus(t *testing.T) {
 	}
 }
 
+func TestHostApprovalClickAtDisplayedWriteButtonConsumesMouseAndRepaints(t *testing.T) {
+	pane := &fakePane{view: "ubuntu@host:~$ ", mouse: MouseMode{Enabled: true, SGR: true}}
+	app := NewApp(Options{Side: "host", Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 101, Height: 30})
+	drainCommands(app)
+	app.Update(ApprovalRequestMsg{PeerID: "guest-1", Peer: "shayne@m5mbp"})
+
+	_, write, _ := app.approvalButtonRects()
+	x := write.X + write.W/2
+	y := write.Y
+
+	app.Update(leftClick(x, y))
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("approval press emitted command %+v, want none until release", cmd)
+	}
+
+	_, repaint := app.Update(leftRelease(x, y))
+	if repaint == nil {
+		t.Fatal("approval release returned nil command, want repaint command")
+	}
+	got, ok := readCommand(app).(ApprovalDecisionCommand)
+	if !ok {
+		t.Fatalf("command = %T, want ApprovalDecisionCommand", got)
+	}
+	want := ApprovalDecisionCommand{PeerID: "guest-1", Peer: "shayne@m5mbp", Role: RoleWrite}
+	if got != want {
+		t.Fatalf("approval command = %+v, want %+v", got, want)
+	}
+	view := app.View()
+	for _, stale := range []string{"wants to join", "Select access"} {
+		if strings.Contains(view, stale) {
+			t.Fatalf("view contains stale approval text %q after approval:\n%s", stale, view)
+		}
+	}
+
+	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	keyCmd, ok := readCommand(app).(TerminalInputCommand)
+	if !ok {
+		t.Fatalf("post-approval key command = %T, want TerminalInputCommand", keyCmd)
+	}
+	if string(keyCmd.Data) != "l" {
+		t.Fatalf("post-approval key data = %q, want l", keyCmd.Data)
+	}
+}
+
+func TestPassiveModalMouseDoesNotReachTerminal(t *testing.T) {
+	pane := &fakePane{view: "ok", mouse: MouseMode{Enabled: true, SGR: true}}
+	app := NewApp(Options{Side: "guest", Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 101, Height: 30})
+	drainCommands(app)
+	app.Update(RuntimeStateMsg{Transport: "direct", HostCols: 101, HostRows: 29, LocalRole: RolePending})
+
+	app.Update(leftClick(app.layout.Terminal.X+50, app.layout.Terminal.Y+16))
+
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("passive modal mouse emitted command %+v, want none", cmd)
+	}
+}
+
 func TestApprovalDecisionIncludesPeerIDForDuplicateNames(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})

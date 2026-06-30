@@ -614,17 +614,28 @@ func (a *App) handleApprovalKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	if a.approvalGraceActive() && isApprovalSelectionKey(msg) {
 		return nil, true
 	}
+	return a.dispatchApprovalKey(msg), true
+}
+
+func (a *App) dispatchApprovalKey(msg tea.KeyMsg) tea.Cmd {
 	switch msg.Type {
 	case tea.KeyEsc:
-		a.approve("", true)
+		return repaintIfApproved(a.approve("", true))
 	case tea.KeyEnter, tea.KeySpace:
-		a.approveSelected()
+		return repaintIfApproved(a.approveSelected())
 	case tea.KeyTab, tea.KeyRight, tea.KeyDown:
 		a.moveApprovalChoice(1)
 	case tea.KeyShiftTab, tea.KeyLeft, tea.KeyUp:
 		a.moveApprovalChoice(-1)
 	}
-	return nil, true
+	return nil
+}
+
+func repaintIfApproved(approved bool) tea.Cmd {
+	if approved {
+		return tea.ClearScreen
+	}
+	return nil
 }
 
 func (a *App) approvalGraceActive() bool {
@@ -1810,9 +1821,9 @@ func (a *App) approvalActive() bool {
 	return a.approvalPeer != "" || a.approvalPeerID != ""
 }
 
-func (a *App) approve(role Role, deny bool) {
+func (a *App) approve(role Role, deny bool) bool {
 	if !a.approvalActive() {
-		return
+		return false
 	}
 	a.clearMousePress()
 	a.emit(ApprovalDecisionCommand{PeerID: a.approvalPeerID, Peer: a.approvalPeer, Role: role, Deny: deny})
@@ -1821,17 +1832,19 @@ func (a *App) approve(role Role, deny bool) {
 	a.approvalChoice = approvalChoiceWrite
 	a.approvalGraceEnd = time.Time{}
 	a.focusTerminal()
+	return true
 }
 
-func (a *App) approveSelected() {
+func (a *App) approveSelected() bool {
 	switch a.approvalChoice {
 	case approvalChoiceRead:
-		a.approve(RoleRead, false)
+		return a.approve(RoleRead, false)
 	case approvalChoiceWrite:
-		a.approve(RoleWrite, false)
+		return a.approve(RoleWrite, false)
 	case approvalChoiceDeny:
-		a.approve("", true)
+		return a.approve("", true)
 	}
+	return false
 }
 
 func (a *App) moveApprovalChoice(delta int) {
