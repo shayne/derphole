@@ -76,28 +76,16 @@ var peerActionChoiceOrder = []peerActionChoice{
 	peerActionKick,
 }
 
-type topBarAction int
-
-const (
-	topBarActionNone topBarAction = iota
-	topBarActionQuit
-	topBarActionChat
-	topBarActionInvite
-	topBarActionHelp
-	topBarActionPeer
-	topBarActionSelect
-)
-
 type topBarSegment struct {
 	text   string
 	style  lipgloss.Style
-	action topBarAction
+	action ActionID
 	peer   Peer
 }
 
 type topBarHit struct {
 	rect   Rect
-	action topBarAction
+	action ActionID
 	peer   Peer
 }
 
@@ -892,7 +880,7 @@ func (a *App) renderTopBarSegments(segments []topBarSegment, maxWidth int) (stri
 		start := x
 		b.WriteString(part)
 		x += partW
-		if segment.action != topBarActionNone {
+		if segment.action != "" {
 			hits = append(hits, topBarHit{
 				rect:   Rect{X: start, Y: 0, W: partW, H: 1},
 				action: segment.action,
@@ -905,7 +893,7 @@ func (a *App) renderTopBarSegments(segments []topBarSegment, maxWidth int) (stri
 
 func (a *App) leftTopBarSegments() []topBarSegment {
 	segments := []topBarSegment{
-		{text: "×", style: topBarQuitStyle, action: topBarActionQuit},
+		{text: "×", style: topBarQuitStyle, action: ActionQuit},
 		{text: "derpssh", style: topBarBrandStyle},
 	}
 	segments = append(segments, a.identityTopBarSegments()...)
@@ -960,9 +948,9 @@ func (a *App) peerTopBarSegments() []topBarSegment {
 		if label == "" {
 			continue
 		}
-		action := topBarActionNone
+		action := ActionID("")
 		if a.isHost() {
-			action = topBarActionPeer
+			action = ActionManagePeer
 		}
 		segments = append(segments, topBarSegment{text: label, style: topBarChipStyle, action: action, peer: peer})
 	}
@@ -971,23 +959,23 @@ func (a *App) peerTopBarSegments() []topBarSegment {
 
 func (a *App) chatTopBarSegments() []topBarSegment {
 	if a.sidebarOpen {
-		return []topBarSegment{{text: "Chat", style: topBarActionStyle, action: topBarActionChat}}
+		return []topBarSegment{{text: "Chat", style: topBarActionStyle, action: ActionToggleChat}}
 	}
 	if a.unreadChat > 0 {
-		return []topBarSegment{{text: fmt.Sprintf("Chat %d", a.unreadChat), style: topBarWarnStyle, action: topBarActionChat}}
+		return []topBarSegment{{text: fmt.Sprintf("Chat %d", a.unreadChat), style: topBarWarnStyle, action: ActionToggleChat}}
 	}
-	return []topBarSegment{{text: "Chat", style: topBarMutedStyle, action: topBarActionChat}}
+	return []topBarSegment{{text: "Chat", style: topBarMutedStyle, action: ActionToggleChat}}
 }
 
 func (a *App) actionTopBarSegments() []topBarSegment {
 	segments := []topBarSegment{}
-	segments = append(segments, topBarSegment{text: "☰", style: topBarMutedStyle, action: topBarActionHelp})
+	segments = append(segments, topBarSegment{text: "☰", style: topBarMutedStyle, action: ActionShowMenu})
 	if a.prefix {
 		segments = append([]topBarSegment{{text: a.prefixHintText(), style: topBarWarnStyle}}, segments...)
 		return segments
 	}
 	if a.copyMode {
-		segments = append([]topBarSegment{{text: "select on · Esc/Y off", style: topBarWarnStyle, action: topBarActionSelect}}, segments...)
+		segments = append([]topBarSegment{{text: "select on · Esc/Y off", style: topBarWarnStyle, action: ActionToggleSelect}}, segments...)
 		return segments
 	}
 	return segments

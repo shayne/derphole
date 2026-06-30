@@ -15,7 +15,7 @@ func TestMouseClickTopBarChatToggle(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	drainCommands(app)
-	chat := topBarActionRect(t, app, topBarActionChat)
+	chat := topBarActionRect(t, app, ActionToggleChat)
 
 	app.Update(leftClick(chat.X+chat.W/2, chat.Y))
 
@@ -51,7 +51,7 @@ func TestMouseClickTopBarQuitOpensConfirmation(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	drainCommands(app)
-	quit := topBarActionRect(t, app, topBarActionQuit)
+	quit := topBarActionRect(t, app, ActionQuit)
 
 	app.Update(leftClick(quit.X+quit.W/2, quit.Y))
 
@@ -236,7 +236,7 @@ func TestMouseMenuShowsHostInvite(t *testing.T) {
 	app := NewApp(Options{Side: "host", InviteCommand: "npx -y derpssh@latest connect DSH1copyme", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	drainCommands(app)
-	menu := topBarActionRect(t, app, topBarActionHelp)
+	menu := topBarActionRect(t, app, ActionShowMenu)
 
 	app.Update(leftClick(menu.X+menu.W/2, menu.Y))
 
@@ -471,7 +471,7 @@ func (p *recordingViewPane) lastViewWidth() int {
 	return p.viewWidths[len(p.viewWidths)-1]
 }
 
-func topBarActionRect(t *testing.T, app *App, action topBarAction) Rect {
+func topBarActionRect(t *testing.T, app *App, action ActionID) Rect {
 	t.Helper()
 	app.renderTopBar()
 	for _, hit := range app.topBarHits {
@@ -487,7 +487,7 @@ func topBarPeerRect(t *testing.T, app *App, peerID string) Rect {
 	t.Helper()
 	app.renderTopBar()
 	for _, hit := range app.topBarHits {
-		if hit.action == topBarActionPeer && hit.peer.ID == peerID {
+		if hit.action == ActionManagePeer && hit.peer.ID == peerID {
 			return hit.rect
 		}
 	}

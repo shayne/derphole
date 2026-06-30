@@ -20,6 +20,7 @@ const (
 	ActionNarrowChat    ActionID = "narrow_chat"
 	ActionGrantRead     ActionID = "grant_read"
 	ActionGrantWrite    ActionID = "grant_write"
+	ActionManagePeer    ActionID = "manage_peer"
 	ActionDenyGuest     ActionID = "deny_guest"
 	ActionKickPeer      ActionID = "kick_peer"
 	ActionRestartShell  ActionID = "restart_shell"
@@ -59,6 +60,7 @@ func NewActionRegistry() ActionRegistry {
 		{ID: ActionNarrowChat, Label: "Narrow Chat", Shortcut: "Ctrl-X ]", Visible: alwaysVisible, Enabled: alwaysEnabled, Run: appAction(narrowChatAction)},
 		{ID: ActionGrantRead, Label: "Grant Read", Shortcut: "Ctrl-X R", Menu: true, Visible: hostPeerVisible, Enabled: alwaysEnabled, Run: appAction(readRoleAction)},
 		{ID: ActionGrantWrite, Label: "Grant Write", Shortcut: "Ctrl-X W", Menu: true, Visible: hostPeerVisible, Enabled: alwaysEnabled, Run: appAction(writeRoleAction)},
+		{ID: ActionManagePeer, Label: "Manage Peer", Visible: hostPeerVisible, Enabled: alwaysEnabled},
 		{ID: ActionKickPeer, Label: "Kick Peer", Shortcut: "Ctrl-X K", Menu: true, Visible: hostPeerVisible, Enabled: alwaysEnabled, Run: appAction(kickPeerAction)},
 		{ID: ActionDenyGuest, Label: "Deny Guest", Shortcut: "Esc", Visible: hostInviteVisible, Enabled: alwaysEnabled, Run: appAction(denyGuestAction)},
 		{ID: ActionRestartShell, Label: "Restart Shell", Shortcut: "R", Visible: hostVisible, Enabled: alwaysEnabled, Run: appAction(restartShellAction)},

@@ -287,21 +287,11 @@ func (a *App) handleTopBarMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
 	if !ok {
 		return nil, true
 	}
-	switch hit.action {
-	case topBarActionQuit:
-		a.openQuitConfirm()
-	case topBarActionChat:
-		a.setSidebarOpen(!a.sidebarOpen)
-	case topBarActionInvite:
-		return a.openInvite(), true
-	case topBarActionHelp:
-		a.helpOpen = true
-	case topBarActionPeer:
+	if hit.action == ActionManagePeer {
 		a.openPeerDialog(hit.peer)
-	case topBarActionSelect:
-		return a.setCopyMode(false), true
+		return nil, true
 	}
-	return nil, true
+	return a.runAction(hit.action), true
 }
 
 func (a *App) topBarHitAt(x int, y int) (topBarHit, bool) {
