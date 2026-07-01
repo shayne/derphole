@@ -9,7 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/signal"
+	"sync"
+	"sync/atomic"
 	"syscall"
 
 	derpsshsession "github.com/shayne/derphole/pkg/derpssh/session"
@@ -20,8 +23,44 @@ type shareSessionConfig = derpsshsession.ShareConfig
 
 var runShareSession = derpsshsession.Share
 
+var commandSignalReset = signal.Reset
+var commandSignalSelf = func(sig os.Signal) error {
+	proc, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		return err
+	}
+	return proc.Signal(sig)
+}
+
 var commandContext = func() (context.Context, context.CancelFunc) {
-	return signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	baseCtx, baseStop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(baseCtx)
+	sigquitCh := make(chan os.Signal, 1)
+	signal.Notify(sigquitCh, syscall.SIGQUIT)
+
+	var sigquit atomic.Bool
+	go func() {
+		select {
+		case <-sigquitCh:
+			sigquit.Store(true)
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			cancel()
+			baseStop()
+			signal.Stop(sigquitCh)
+			if sigquit.Load() {
+				commandSignalReset(syscall.SIGQUIT)
+				_ = commandSignalSelf(syscall.SIGQUIT)
+			}
+		})
+	}
+	return ctx, stop
 }
 
 func runShare(args []string, level telemetry.Level, stdin io.Reader, stdout, stderr io.Writer) int {

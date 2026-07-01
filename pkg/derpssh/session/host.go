@@ -40,6 +40,9 @@ type HostRuntime struct {
 	chatReady        chan net.Conn
 	peerClosed       chan struct{}
 	peerCloseOnce    sync.Once
+
+	contextCancelCloseOnce sync.Once
+	ptyOutputCloseOnce     sync.Once
 }
 
 const (
@@ -83,6 +86,7 @@ func NewHostRuntime(cfg HostConfig) *HostRuntime {
 }
 
 func (r *HostRuntime) Run(ctx context.Context) error {
+	parentCtx := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	defer func() {
@@ -93,7 +97,8 @@ func (r *HostRuntime) Run(ctx context.Context) error {
 	defer r.closePTYOutput()
 
 	go func() {
-		<-ctx.Done()
+		<-parentCtx.Done()
+		r.closeForContextCancel()
 		if r.cfg.Mux != nil {
 			_ = r.cfg.Mux.Close()
 		}
@@ -547,13 +552,26 @@ func (r *HostRuntime) runUntilControlOrPTYExit(ctx context.Context, cancel conte
 		}
 		return nil
 	case <-ctx.Done():
-		r.closeSessionConns()
+		r.closeForContextCancel()
 		if r.cfg.Mux != nil {
 			_ = r.cfg.Mux.Close()
 		}
-		r.closePTYOutput()
 		return nil
 	}
+}
+
+func (r *HostRuntime) closeForContextCancel() {
+	r.contextCancelCloseOnce.Do(func() {
+		r.mu.Lock()
+		reason := strings.TrimSpace(r.closeReason)
+		r.mu.Unlock()
+		if reason != "" && reason != hostQuitReason {
+			r.closeSessionConns()
+			r.closePTYOutput()
+			return
+		}
+		_ = r.Close(context.Background(), hostQuitReason)
+	})
 }
 
 func (r *HostRuntime) closeAfterPTYOutputExit(ctx context.Context, cancel context.CancelFunc, err error, controlErrCh <-chan error) error {
@@ -687,11 +705,13 @@ func (r *HostRuntime) notify(event RuntimeEvent) {
 }
 
 func (r *HostRuntime) closePTYOutput() {
-	closer, ok := r.cfg.PTYOutput.(io.Closer)
-	if !ok {
-		return
-	}
-	_ = closer.Close()
+	r.ptyOutputCloseOnce.Do(func() {
+		closer, ok := r.cfg.PTYOutput.(io.Closer)
+		if !ok {
+			return
+		}
+		_ = closer.Close()
+	})
 }
 
 func (r *HostRuntime) closeSessionConns() {

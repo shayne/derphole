@@ -230,10 +230,7 @@ func (r *GuestRuntime) Close(ctx context.Context, reason string) error {
 		reason = guestQuitReason
 	}
 	r.setCloseReason(reason)
-	err := r.writeControlCtx(ctx, protocol.Message{
-		Type:  protocol.MessageClose,
-		Close: &protocol.Close{Reason: reason},
-	})
+	err := r.writeControlClose(reason)
 	_ = r.writeTerminalInClose(reason)
 	_ = r.writeChatClose(reason)
 	gracefullyDrainCloseNotice()
@@ -426,6 +423,19 @@ func (r *GuestRuntime) writeControlCtx(ctx context.Context, msg protocol.Message
 		}
 	}
 	return lockedWriter{conn: conn, mu: &r.controlMu}.write(msg)
+}
+
+func (r *GuestRuntime) writeControlClose(reason string) error {
+	r.mu.Lock()
+	conn := r.control
+	r.mu.Unlock()
+	if conn == nil {
+		return net.ErrClosed
+	}
+	return lockedWriter{conn: conn, mu: &r.controlMu}.writeWithDeadline(protocol.Message{
+		Type:  protocol.MessageClose,
+		Close: &protocol.Close{Reason: reason},
+	}, hostCloseNotifyTimeout)
 }
 
 func (r *GuestRuntime) writeTerminalInClose(reason string) error {

@@ -475,6 +475,48 @@ func TestTUIConsoleProgramExitRunsQuitCallback(t *testing.T) {
 	}
 }
 
+func TestTUIConsoleQuitCommandStopsWhenCallbackBlocks(t *testing.T) {
+	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, &recordingTerminalPane{view: "shell$"})
+	callbackEntered := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseCallback) })
+	})
+	console.SetCommandCallbacks(tuiConsoleCallbacks{
+		Quit: func(context.Context) error {
+			close(callbackEntered)
+			<-releaseCallback
+			return nil
+		},
+	})
+
+	done := make(chan struct{})
+	go func() {
+		console.handleQuitCommand(context.Background())
+		close(done)
+	}()
+
+	select {
+	case <-callbackEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Quit callback was not called")
+	}
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		releaseOnce.Do(func() { close(releaseCallback) })
+		t.Fatal("Quit command waited for blocked callback")
+	}
+
+	console.approvalMu.Lock()
+	stopped := console.stopped
+	console.approvalMu.Unlock()
+	if !stopped {
+		t.Fatal("console was not stopped after Quit command")
+	}
+}
+
 func TestTUIConsoleStopRestoresTerminalExactlyOnce(t *testing.T) {
 	var out strings.Builder
 	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, &recordingTerminalPane{view: "shell$"})

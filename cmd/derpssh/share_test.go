@@ -9,8 +9,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/shayne/derphole/pkg/telemetry"
 )
@@ -44,5 +48,100 @@ func TestRunSharePrintsConnectCommand(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "npx -y derpssh@latest connect DSH1test") {
 		t.Fatalf("stderr missing connect command:\n%s", stderr.String())
+	}
+}
+
+func TestCommandContextCancelsOnSIGQUIT(t *testing.T) {
+	oldReset := commandSignalReset
+	oldSelf := commandSignalSelf
+	defer func() {
+		commandSignalReset = oldReset
+		commandSignalSelf = oldSelf
+	}()
+
+	resetCh := make(chan os.Signal, 1)
+	reraiseCh := make(chan os.Signal, 1)
+	commandSignalReset = func(sig ...os.Signal) {
+		for _, s := range sig {
+			resetCh <- s
+		}
+	}
+	commandSignalSelf = func(sig os.Signal) error {
+		reraiseCh <- sig
+		return nil
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGQUIT)
+	defer signal.Stop(sigCh)
+
+	ctx, stop := commandContext()
+
+	proc, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("FindProcess() error = %v", err)
+	}
+	if err := proc.Signal(syscall.SIGQUIT); err != nil {
+		t.Fatalf("signal SIGQUIT: %v", err)
+	}
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("commandContext did not cancel on SIGQUIT")
+	}
+
+	stop()
+
+	select {
+	case got := <-resetCh:
+		if got != syscall.SIGQUIT {
+			t.Fatalf("reset signal = %v, want SIGQUIT", got)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("commandContext stop did not reset SIGQUIT")
+	}
+	select {
+	case got := <-reraiseCh:
+		if got != syscall.SIGQUIT {
+			t.Fatalf("reraised signal = %v, want SIGQUIT", got)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("commandContext stop did not reraise SIGQUIT")
+	}
+}
+
+func TestCommandContextStopDoesNotReraiseWithoutSIGQUIT(t *testing.T) {
+	oldReset := commandSignalReset
+	oldSelf := commandSignalSelf
+	defer func() {
+		commandSignalReset = oldReset
+		commandSignalSelf = oldSelf
+	}()
+
+	resetCh := make(chan os.Signal, 1)
+	reraiseCh := make(chan os.Signal, 1)
+	commandSignalReset = func(sig ...os.Signal) {
+		for _, s := range sig {
+			resetCh <- s
+		}
+	}
+	commandSignalSelf = func(sig os.Signal) error {
+		reraiseCh <- sig
+		return nil
+	}
+
+	_, stop := commandContext()
+	stop()
+
+	select {
+	case sig := <-resetCh:
+		t.Fatalf("unexpected reset for signal %v", sig)
+	default:
+	}
+	select {
+	case sig := <-reraiseCh:
+		t.Fatalf("unexpected reraise for signal %v", sig)
+	default:
 	}
 }
