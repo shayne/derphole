@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta
       name="description"
-      content="Private access without a VPN: file transfer, TCP tunnels, and terminal sharing over DERP connectivity. No open inbound port, tailnet, or daemon required."
+      content="Move files, open TCP tunnels, and share a terminal without opening ports or running a VPN. Built on DERP with direct paths when available and end-to-end encrypted payloads."
     />
     <title>derphole</title>
     <link
@@ -34,8 +34,8 @@
           <p class="kicker">open source access tools built on derp</p>
           <h1 id="intro-title">private access without a vpn</h1>
           <p class="intro-lede">
-            Run small utilities for file transfer, TCP tunnels, and terminal
-            sharing across networks that do not accept inbound connections.
+            Move files, open TCP tunnels, and share a terminal without opening
+            ports or running a VPN.
           </p>
         </div>
 
@@ -56,7 +56,10 @@
         <article class="tool-entry">
           <p class="tool-name">derptun</p>
           <h2>open a tcp tunnel</h2>
-          <p>derptun gives a private service a reconnectable path and scoped tokens.</p>
+          <p>
+            Put any TCP service behind a durable tunnel, then share access with
+            client tokens or embed it in an app.
+          </p>
           <pre><code>npx -y derptun@latest token server &gt; server.dts
 npx -y derptun@latest serve --token-file server.dts --tcp 127.0.0.1:22</code></pre>
         </article>
@@ -80,12 +83,15 @@ npx -y derptun@latest serve --token-file server.dts --tcp 127.0.0.1:22</code></p
           </p>
         </article>
         <article>
-          <p class="label">derp first</p>
-          <h2>relay start, direct when possible</h2>
+          <p class="label">derp explained</p>
+          <h2>direct paths when possible</h2>
           <p>
-            DERP gets peers connected first. Encrypted relay fallback keeps
-            sessions working when direct paths are blocked, and direct transport
-            takes over when the network allows it.
+            DERP is Tailscale's Designated Encrypted Relay for Packets.
+            Tailscale operates a public DERP network for rendezvous and
+            fallback; derphole uses it so peers can find each other when both
+            sides can only dial out. Sessions prefer direct paths when
+            available. Payloads stay end-to-end encrypted, and this project is
+            not affiliated with Tailscale.
           </p>
         </article>
       </section>
@@ -104,7 +110,7 @@ npx -y derpssh@latest share</code></pre>
           <h2>small tools, shared path</h2>
           <p>
             derphole handles one-shot transfers and temporary service shares.
-            derptun keeps private TCP services reachable with durable tokens.
+            derptun keeps TCP services reachable with persistent tunnels.
             derpssh shares a shell over the same no-open-port transport.
           </p>
         </article>
