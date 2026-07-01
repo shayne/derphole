@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta
       name="description"
-      content="Session-scoped file transfer and localhost sharing for machines behind NAT. No open inbound port, VPN, or public listener required."
+      content="Private access without a VPN: file transfer, TCP tunnels, and terminal sharing over DERP connectivity. No open inbound port, tailnet, or daemon required."
     />
     <title>derphole</title>
     <link
@@ -21,9 +21,9 @@
         <span>derphole</span>
       </a>
       <nav aria-label="Primary">
+        <a href="#tools">tools</a>
+        <a href="#model">not a vpn</a>
         <a href="#demo">demo</a>
-        <a href="#model">model</a>
-        <a href="#install">install</a>
         <a href="https://github.com/shayne/derphole">github</a>
       </nav>
     </header>
@@ -31,76 +31,92 @@
     <main class="site-shell">
       <section id="top" class="intro" aria-labelledby="intro-title">
         <div class="intro-copy">
-          <p class="kicker">one session / one token / no inbound port</p>
-          <h1 id="intro-title">move a file without opening a port</h1>
+          <p class="kicker">open source access tools built on derp</p>
+          <h1 id="intro-title">private access without a vpn</h1>
           <p class="intro-lede">
-            derphole is a small CLI for sending files, piping bytes, and
-            sharing localhost services between machines that may both be behind NAT.
-            It uses a one-session token and a relay rendezvous path, then
-            moves to direct transport when the network allows.
+            Run small utilities for file transfer, TCP tunnels, and terminal
+            sharing across networks that do not accept inbound connections.
           </p>
         </div>
 
         <div class="repo-actions" aria-label="Project links">
           <a class="link-button primary" href="https://github.com/shayne/derphole">github repo</a>
-          <a class="link-button" href="#demo">try browser demo</a>
+          <a class="link-button" href="#run">run with npx</a>
         </div>
+      </section>
 
-        <section id="install" class="install-block" aria-labelledby="install-title">
-          <div>
-            <p class="label">cli first</p>
-            <h2 id="install-title">native path, fastest path</h2>
-          </div>
+      <section id="tools" class="tools-grid" aria-label="derphole tools">
+        <article class="tool-entry">
+          <p class="tool-name">derphole</p>
+          <h2>move a file</h2>
+          <p>derphole is the one-session path for files, streams, and localhost shares.</p>
+          <pre><code>npx -y derphole@latest receive &lt;code&gt;</code></pre>
+        </article>
+
+        <article class="tool-entry">
+          <p class="tool-name">derptun</p>
+          <h2>open a tcp tunnel</h2>
+          <p>derptun gives a private service a reconnectable path and scoped tokens.</p>
+          <pre><code>npx -y derptun@latest token server &gt; server.dts
+npx -y derptun@latest serve --token-file server.dts --tcp 127.0.0.1:22</code></pre>
+        </article>
+
+        <article class="tool-entry">
+          <p class="tool-name">derpssh</p>
+          <h2>share your terminal</h2>
+          <p>derpssh is terminal sharing over the same no-open-port transport.</p>
+          <pre><code>npx -y derpssh@latest connect &lt;invite&gt;</code></pre>
+        </article>
+      </section>
+
+      <section id="model" class="model-strip" aria-label="Transport model">
+        <article>
+          <p class="label">not a vpn</p>
+          <h2>scoped access, not a network</h2>
+          <p>
+            Scoped tokens authorize one transfer, one tunnel, or one terminal
+            session. No daemon, overlay interface, tailnet, subnet route, or
+            account-backed control plane.
+          </p>
+        </article>
+        <article>
+          <p class="label">derp first</p>
+          <h2>relay start, direct when possible</h2>
+          <p>
+            DERP gets peers connected first. Encrypted relay fallback keeps
+            sessions working when direct paths are blocked, and direct transport
+            takes over when the network allows it.
+          </p>
+        </article>
+      </section>
+
+      <section id="run" class="command-strip" aria-label="CLI examples">
+        <article>
+          <p class="label">run with npx</p>
+          <h2>use the native tools first</h2>
           <pre><code>npx -y derphole@latest send ./file
-npx -y derphole@latest receive &lt;code&gt;</code></pre>
-        </section>
-      </section>
-
-      <section class="capabilities" aria-label="What derphole does">
-        <article>
-          <span>01</span>
-          <p>send text, files, directories, raw streams, and SSH invites</p>
+npx -y derptun@latest token server &gt; server.dts
+npx -y derptun@latest serve --token-file server.dts --tcp 127.0.0.1:22
+npx -y derpssh@latest share</code></pre>
         </article>
         <article>
-          <span>02</span>
-          <p>share a localhost service without exposing it to the Internet</p>
-        </article>
-        <article>
-          <span>03</span>
-          <p>rendezvous through a relay, then switch the live session to direct</p>
-        </article>
-      </section>
-
-      <section id="model" class="briefing" aria-label="How derphole works">
-        <article>
-          <h2>DERP, in plain terms</h2>
+          <p class="label">one transport family</p>
+          <h2>small tools, shared path</h2>
           <p>
-            DERP stands for Designated Encrypted Relay for Packets. It gives
-            both peers a reachable meeting point when they cannot reach each
-            other directly yet. derphole uses Tailscale's open-source DERP
-            implementation plus the public DERP map and relays for rendezvous
-            and encrypted fallback. derphole is not affiliated with Tailscale,
-            does not use tailscaled, and does not require a Tailscale account
-            or tailnet.
-          </p>
-        </article>
-        <article>
-          <h2>not a VPN</h2>
-          <p>
-            There is no long-lived mesh, subnet route, ACL system, or network
-            interface. A token authorizes one transfer or one shared service.
-            Copy the token to the other side over a channel you trust.
+            derphole handles one-shot transfers and temporary service shares.
+            derptun keeps private TCP services reachable with durable tokens.
+            derpssh shares a shell over the same no-open-port transport.
           </p>
         </article>
       </section>
 
-      <section class="section-note" aria-labelledby="demo-title">
-        <p class="label">browser proof</p>
-        <h2 id="demo-title">same session shape, browser limits</h2>
+      <section class="section-note demo-note" aria-labelledby="demo-title">
+        <p class="label">browser demo</p>
+        <h2 id="demo-title">try a small derphole transfer</h2>
         <p>
-          The browser demo is a proof, not the fast path. It starts over DERP
-          relay, tries WebRTC direct, and keeps the sender/receiver flow visible
-          without installing the CLI.
+          This page includes a browser derphole demo for small files. It is
+          useful for seeing the flow without installing anything. Use the CLI
+          for real transfers and throughput work.
         </p>
       </section>
 
@@ -138,29 +154,10 @@ npx -y derphole@latest receive &lt;code&gt;</code></pre>
           <p id="receive-status" class="status">idle</p>
         </article>
       </section>
-
-      <section class="command-strip" aria-label="CLI examples">
-        <article>
-          <h2>use the CLI for real transfers</h2>
-          <pre><code>npx -y derphole@latest listen &gt; disk.img
-cat ./disk.img | npx -y derphole@latest pipe &lt;token&gt;
-npx -y derphole@latest share 127.0.0.1:3000
-npx -y derphole@latest open &lt;token&gt;</code></pre>
-        </article>
-        <article>
-          <h2>fine print on the web demo</h2>
-          <p>
-            Browser JavaScript cannot open raw UDP sockets, so this page uses
-            DERP-over-WebSocket and WebRTC DataChannel. Relay frames are capped at 16 KiB
-            and ACKed to protect browser memory and public DERP queues. Use the
-            native CLI for large files and throughput work.
-          </p>
-        </article>
-      </section>
     </main>
 
     <footer class="footer">
-      <span>session-scoped transport, no public listener required</span>
+      <span>private access tools built on derp connectivity</span>
       <a href="https://github.com/shayne/derphole">github.com/shayne/derphole</a>
     </footer>
 

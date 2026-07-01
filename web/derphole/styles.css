@@ -286,9 +286,9 @@ h3 {
 .intro-lede,
 .section-note p,
 .command-strip p,
-.briefing p,
+.model-strip p,
 .panel-heading p,
-.capabilities p {
+.tool-entry p {
   color: var(--ink-muted);
 }
 
@@ -314,17 +314,7 @@ h3 {
   background: var(--ink);
 }
 
-.install-block {
-  display: grid;
-  gap: var(--space-md);
-  max-width: 46rem;
-  padding: var(--space-md);
-  border: 1px solid var(--line);
-  border-radius: 0.5rem;
-  background: color-mix(in oklch, var(--surface) 82%, transparent);
-}
-
-.install-block pre,
+.tool-entry pre,
 .command-strip pre,
 .progress {
   overflow-x: auto;
@@ -335,37 +325,44 @@ h3 {
   line-height: 1.6;
 }
 
-.install-block pre,
+.tool-entry pre,
 .command-strip pre {
   padding: var(--space-md);
 }
 
-.install-block pre code,
+.tool-entry pre code,
 .command-strip pre code {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
-.capabilities {
+.tools-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr));
   gap: var(--space-md);
 }
 
-.capabilities article {
+.tool-entry {
   display: grid;
   gap: var(--space-xs);
+  align-content: start;
   padding-top: var(--space-md);
   border-top: 1px solid var(--line-strong);
 }
 
-.capabilities span {
+.tool-entry .tool-name {
+  margin: 0;
   color: var(--ink-faint);
   font-family: var(--font-code);
   font-size: 0.78rem;
+  font-weight: 720;
 }
 
-.briefing {
+.tool-entry pre {
+  margin-top: var(--space-xs);
+}
+
+.model-strip {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 24rem), 1fr));
   gap: var(--space-lg);
@@ -373,7 +370,7 @@ h3 {
   border-block: 1px solid var(--line);
 }
 
-.briefing article {
+.model-strip article {
   display: grid;
   gap: var(--space-sm);
   align-content: start;
@@ -384,6 +381,11 @@ h3 {
   display: grid;
   gap: var(--space-xs);
   max-width: 50rem;
+}
+
+.demo-note {
+  padding-top: var(--space-md);
+  border-top: 1px solid var(--line);
 }
 
 .demo-grid {
@@ -476,12 +478,6 @@ h3 {
     grid-template-columns: minmax(0, 1fr) auto;
     align-items: start;
   }
-
-  .install-block {
-    grid-column: 1 / -1;
-    grid-template-columns: minmax(12rem, 0.45fr) minmax(0, 1fr);
-    align-items: start;
-  }
 }
 
 @media (min-width: 64rem) {
@@ -515,7 +511,8 @@ h3 {
   }
 
   .panel-heading,
-  .command-strip {
+  .command-strip,
+  .model-strip {
     grid-template-columns: 1fr;
   }
 }
