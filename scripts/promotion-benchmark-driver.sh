@@ -45,6 +45,15 @@ parallel_args_remote=""
 if [[ "${DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES:-}" == "1" ]]; then
   remote_env+=(DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1)
 fi
+if [[ -n "${DERPHOLE_V2_RAW_DIRECT:-}" ]]; then
+  remote_env+=(DERPHOLE_V2_RAW_DIRECT="${DERPHOLE_V2_RAW_DIRECT}")
+fi
+if [[ -n "${DERPHOLE_V2_RAW_DIRECT_BUDGET_MS:-}" ]]; then
+  remote_env+=(DERPHOLE_V2_RAW_DIRECT_BUDGET_MS="${DERPHOLE_V2_RAW_DIRECT_BUDGET_MS}")
+fi
+if [[ -n "${DERPHOLE_V2_MANAGER_QUIC_FANOUT:-}" ]]; then
+  remote_env+=(DERPHOLE_V2_MANAGER_QUIC_FANOUT="${DERPHOLE_V2_MANAGER_QUIC_FANOUT}")
+fi
 if [[ "${tool}" == "derphole" && -n "${DERPHOLE_PARALLEL_ARGS:-}" ]]; then
   read -r -a parallel_args <<<"${DERPHOLE_PARALLEL_ARGS}"
   parallel_args_remote="${parallel_args[*]-}"

@@ -16,34 +16,37 @@ import (
 )
 
 type QUICClient struct {
-	manager   *transport.Manager
-	identity  quicpath.SessionIdentity
-	peer      [32]byte
-	endpoint  *directquic.Endpoint
-	endpoints []*directquic.Endpoint
-	adapter   *quicpath.Adapter
-	conn      net.PacketConn
-	remote    net.Addr
-	conns     []net.PacketConn
-	remotes   []net.Addr
+	manager            *transport.Manager
+	identity           quicpath.SessionIdentity
+	peer               [32]byte
+	endpoint           *directquic.Endpoint
+	endpoints          []*directquic.Endpoint
+	adapter            *quicpath.Adapter
+	conn               net.PacketConn
+	remote             net.Addr
+	conns              []net.PacketConn
+	remotes            []net.Addr
+	managerConnections int
 }
 
 type QUICServer struct {
-	manager   *transport.Manager
-	identity  quicpath.SessionIdentity
-	peer      [32]byte
-	endpoint  *directquic.Endpoint
-	endpoints []*directquic.Endpoint
-	adapter   *quicpath.Adapter
-	conn      net.PacketConn
-	remote    net.Addr
-	conns     []net.PacketConn
+	manager            *transport.Manager
+	identity           quicpath.SessionIdentity
+	peer               [32]byte
+	endpoint           *directquic.Endpoint
+	endpoints          []*directquic.Endpoint
+	adapter            *quicpath.Adapter
+	conn               net.PacketConn
+	remote             net.Addr
+	conns              []net.PacketConn
+	managerConnections int
 }
 
 type packetPath struct {
-	conn    net.PacketConn
-	remote  net.Addr
-	adapter *quicpath.Adapter
+	conn               net.PacketConn
+	remote             net.Addr
+	adapter            *quicpath.Adapter
+	managerConnections int
 }
 
 func NewQUICClient(manager *transport.Manager, identity quicpath.SessionIdentity, peer [32]byte) *QUICClient {
@@ -77,6 +80,14 @@ func NewQUICServerOnPacketConns(conns []net.PacketConn, identity quicpath.Sessio
 		identity: identity,
 		peer:     peer,
 	}
+}
+
+func (q *QUICClient) SetManagerConnectionCount(count int) {
+	q.managerConnections = count
+}
+
+func (q *QUICServer) SetManagerConnectionCount(count int) {
+	q.managerConnections = count
 }
 
 func (q *QUICClient) Open(ctx context.Context) (Stream, error) {
@@ -270,7 +281,7 @@ func (q *QUICClient) packetPaths(ctx context.Context) []packetPath {
 	}
 	peerConn := q.manager.PeerDatagramConn(ctx)
 	adapter := quicpath.NewAdapter(peerConn)
-	return []packetPath{{conn: adapter, remote: peerConn.RemoteAddr(), adapter: adapter}}
+	return []packetPath{{conn: adapter, remote: peerConn.RemoteAddr(), adapter: adapter, managerConnections: q.managerConnections}}
 }
 
 func (q *QUICServer) packetPaths(ctx context.Context) []packetPath {
@@ -286,7 +297,7 @@ func (q *QUICServer) packetPaths(ctx context.Context) []packetPath {
 	}
 	peerConn := q.manager.PeerDatagramConn(ctx)
 	adapter := quicpath.NewAdapter(peerConn)
-	return []packetPath{{conn: adapter, remote: peerConn.RemoteAddr(), adapter: adapter}}
+	return []packetPath{{conn: adapter, remote: peerConn.RemoteAddr(), adapter: adapter, managerConnections: q.managerConnections}}
 }
 
 func closePacketPath(path packetPath) {
@@ -302,6 +313,12 @@ func closePacketPaths(paths []packetPath) {
 }
 
 func endpointConnectionCount(path packetPath, streams int) int {
+	if streams < 1 {
+		return 1
+	}
+	if path.adapter != nil && path.managerConnections > 1 {
+		return min(path.managerConnections, streams)
+	}
 	return 1
 }
 

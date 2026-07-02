@@ -102,7 +102,7 @@ func acceptExternalShareClaim(ctx context.Context, cfg ShareConfig, session *rel
 	if err := sendAuthenticatedEnvelope(ctx, session.derp, peerDERP, envelope{Type: envelopeDecision, Decision: &decision}, auth); err != nil {
 		return tok, err
 	}
-	rawPath, err := negotiateExternalV2DirectPacketPath(transportCtx, session.derp, peerDERP, transportManager, session.derpMap, auth, cfg.Emitter, 1, 0, cfg.ForceRelay)
+	rawPath, err := negotiateExternalV2DirectPacketPath(transportCtx, session.derp, peerDERP, transportManager, session.derpMap, auth, cfg.Emitter, 1, 0, 0, cfg.ForceRelay)
 	if err != nil {
 		return tok, err
 	}
@@ -300,7 +300,7 @@ func (r *openExternalRuntime) open(ctx context.Context, cfg OpenConfig, decision
 }
 
 func (r *openExternalRuntime) openQUIC(ctx context.Context, cfg OpenConfig, transportCtx context.Context, transportManager *transport.Manager) (*quic.Conn, func(), bool, error) {
-	rawPath, err := negotiateExternalV2DirectPacketPath(transportCtx, r.derpClient, r.listenerDERP, transportManager, r.dm, externalPeerControlAuthForToken(r.tok), cfg.Emitter, 1, externalV2DataPlaneSenderPunchDelay, cfg.ForceRelay)
+	rawPath, err := negotiateExternalV2DirectPacketPath(transportCtx, r.derpClient, r.listenerDERP, transportManager, r.dm, externalPeerControlAuthForToken(r.tok), cfg.Emitter, 1, externalV2DataPlaneSenderPunchDelay, 0, cfg.ForceRelay)
 	if err != nil {
 		return nil, nil, false, err
 	}

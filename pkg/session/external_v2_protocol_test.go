@@ -59,6 +59,38 @@ func TestExternalV2ParallelPolicyDefaultsAndRoundTrips(t *testing.T) {
 	}
 }
 
+func TestExternalV2ManagerConnectionCountDefaultsToOne(t *testing.T) {
+	t.Setenv("DERPHOLE_V2_MANAGER_QUIC_FANOUT", "")
+
+	if got := externalV2SetManagerConnectionCount(FixedParallelPolicy(4)); got != 1 {
+		t.Fatalf("externalV2SetManagerConnectionCount() = %d, want 1", got)
+	}
+	if got := externalV2ManagerConnectionCount(externalV2Accept{}, FixedParallelPolicy(4)); got != 1 {
+		t.Fatalf("externalV2ManagerConnectionCount(empty accept) = %d, want 1", got)
+	}
+}
+
+func TestExternalV2ManagerConnectionCountNegotiatesOptInFanout(t *testing.T) {
+	t.Setenv("DERPHOLE_V2_MANAGER_QUIC_FANOUT", "1")
+
+	if got := externalV2SetManagerConnectionCount(FixedParallelPolicy(4)); got != 4 {
+		t.Fatalf("externalV2SetManagerConnectionCount() = %d, want 4", got)
+	}
+	accept := externalV2Accept{ManagerConnections: 4}
+	if got := externalV2ManagerConnectionCount(accept, FixedParallelPolicy(4)); got != 4 {
+		t.Fatalf("externalV2ManagerConnectionCount() = %d, want 4", got)
+	}
+}
+
+func TestExternalV2ManagerConnectionCountClampsAcceptedValue(t *testing.T) {
+	if got := externalV2ManagerConnectionCount(externalV2Accept{ManagerConnections: 8}, FixedParallelPolicy(4)); got != 4 {
+		t.Fatalf("externalV2ManagerConnectionCount(8 connections, 4 streams) = %d, want 4", got)
+	}
+	if got := externalV2ManagerConnectionCount(externalV2Accept{ManagerConnections: -1}, FixedParallelPolicy(4)); got != 1 {
+		t.Fatalf("externalV2ManagerConnectionCount(-1 connections) = %d, want 1", got)
+	}
+}
+
 func TestSendExternalUsesV2(t *testing.T) {
 	sentinel := errors.New("v2 send")
 	prev := sendExternalViaV2Fn

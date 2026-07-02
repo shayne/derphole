@@ -6,6 +6,7 @@ package session
 
 import (
 	"errors"
+	"os"
 
 	"github.com/shayne/derphole/pkg/token"
 )
@@ -29,14 +30,16 @@ type externalV2Claim struct {
 }
 
 type externalV2Accept struct {
-	Protocol        string   `json:"protocol"`
-	Accepted        bool     `json:"accepted"`
-	Candidates      []string `json:"candidates,omitempty"`
-	RelayCapable    bool     `json:"relay_capable"`
-	Reason          string   `json:"reason,omitempty"`
-	ParallelMode    string   `json:"parallel_mode,omitempty"`
-	ParallelInitial int      `json:"parallel_initial,omitempty"`
-	ParallelCap     int      `json:"parallel_cap,omitempty"`
+	Protocol           string   `json:"protocol"`
+	Accepted           bool     `json:"accepted"`
+	Candidates         []string `json:"candidates,omitempty"`
+	RelayCapable       bool     `json:"relay_capable"`
+	Reason             string   `json:"reason,omitempty"`
+	ParallelMode       string   `json:"parallel_mode,omitempty"`
+	ParallelInitial    int      `json:"parallel_initial,omitempty"`
+	ParallelCap        int      `json:"parallel_cap,omitempty"`
+	ManagerConnections int      `json:"manager_connections,omitempty"`
+	RawDirectBudgetMS  int      `json:"raw_direct_budget_ms,omitempty"`
 }
 
 type externalV2Complete struct {
@@ -103,6 +106,24 @@ func externalV2SetParallelPolicy(policy ParallelPolicy) (mode string, initial in
 
 func externalV2StreamCount(policy ParallelPolicy) int {
 	return externalParallelQUICConnCount(policy)
+}
+
+func externalV2SetManagerConnectionCount(policy ParallelPolicy) int {
+	if os.Getenv("DERPHOLE_V2_MANAGER_QUIC_FANOUT") != "1" {
+		return 1
+	}
+	return externalV2StreamCount(policy)
+}
+
+func externalV2ManagerConnectionCount(accept externalV2Accept, policy ParallelPolicy) int {
+	count := accept.ManagerConnections
+	if count < 1 {
+		return 1
+	}
+	if max := externalV2StreamCount(policy); count > max {
+		return max
+	}
+	return count
 }
 
 func isV2ClaimPayload(payload []byte) bool {

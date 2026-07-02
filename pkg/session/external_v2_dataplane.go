@@ -6,6 +6,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"os"
@@ -50,11 +51,30 @@ func (p externalV2DirectPacketPath) Close() {
 	}
 }
 
-func negotiateExternalV2DirectPacketPath(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, manager *transport.Manager, dm *tailcfg.DERPMap, auth externalPeerControlAuth, emitter *telemetry.Emitter, streamCount int, punchDelay time.Duration, relayOnly bool) (externalV2DirectPacketPath, error) {
+func negotiateExternalV2DirectPacketPath(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, manager *transport.Manager, dm *tailcfg.DERPMap, auth externalPeerControlAuth, emitter *telemetry.Emitter, streamCount int, punchDelay time.Duration, rawDirectBudget time.Duration, relayOnly bool) (externalV2DirectPacketPath, error) {
 	if relayOnly || !externalV2CanUseRawDirect(manager) {
 		emitExternalV2Debug(emitter, "v2-data-plane=manager")
 		return externalV2DirectPacketPath{}, nil
 	}
+	if rawDirectBudget <= 0 {
+		return negotiateExternalV2DirectPacketPathUnbounded(ctx, client, peerDERP, manager, dm, auth, emitter, streamCount, punchDelay)
+	}
+
+	budgetCtx, cancel := context.WithTimeout(ctx, rawDirectBudget)
+	defer cancel()
+	path, err := negotiateExternalV2DirectPacketPathUnbounded(budgetCtx, client, peerDERP, manager, dm, auth, emitter, streamCount, punchDelay)
+	if err == nil {
+		return path, nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		emitExternalV2Debug(emitter, "v2-raw-direct-budget-expired-ms="+strconv.Itoa(int(rawDirectBudget/time.Millisecond)))
+		emitExternalV2Debug(emitter, "v2-data-plane=manager")
+		return externalV2DirectPacketPath{}, nil
+	}
+	return externalV2DirectPacketPath{}, err
+}
+
+func negotiateExternalV2DirectPacketPathUnbounded(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, manager *transport.Manager, dm *tailcfg.DERPMap, auth externalPeerControlAuth, emitter *telemetry.Emitter, streamCount int, punchDelay time.Duration) (externalV2DirectPacketPath, error) {
 	var local externalV2DataPacketPath
 	localRawDirect := false
 	if externalV2RawDirectEnabled() {
@@ -175,6 +195,29 @@ func externalV2RawDirectEnabled() bool {
 	default:
 		return true
 	}
+}
+
+func externalV2RawDirectStartupBudget() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("DERPHOLE_V2_RAW_DIRECT_BUDGET_MS"))
+	if raw == "" {
+		return 0
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms <= 0 {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func externalV2SetRawDirectStartupBudgetMS() int {
+	return int(externalV2RawDirectStartupBudget() / time.Millisecond)
+}
+
+func externalV2AcceptedRawDirectStartupBudget(accept externalV2Accept) time.Duration {
+	if accept.RawDirectBudgetMS <= 0 {
+		return 0
+	}
+	return time.Duration(accept.RawDirectBudgetMS) * time.Millisecond
 }
 
 type externalV2DataPacketPath struct {

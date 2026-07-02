@@ -124,3 +124,46 @@ func TestPromotionDriverReportsAverageTraceGoodput(t *testing.T) {
 		t.Fatal("promotion driver checks final instantaneous send_goodput_mbps before average trace goodput")
 	}
 }
+
+func TestPromotionBenchmarkDriverPropagatesTransportExperimentEnv(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(filepath.Join(".", "promotion-benchmark-driver.sh"))
+	if err != nil {
+		t.Fatalf("read promotion-benchmark-driver.sh: %v", err)
+	}
+	body := string(data)
+
+	for _, want := range []string{
+		"DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES",
+		"DERPHOLE_V2_RAW_DIRECT",
+		"DERPHOLE_V2_RAW_DIRECT_BUDGET_MS",
+		"DERPHOLE_V2_MANAGER_QUIC_FANOUT",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("promotion-benchmark-driver.sh missing remote env propagation for %s", want)
+		}
+	}
+}
+
+func TestPublicPathPerformanceHarnessDocumentsBaselineMatrix(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(filepath.Join(".", "public-path-performance-harness.sh"))
+	if err != nil {
+		t.Fatalf("read public-path-performance-harness.sh: %v", err)
+	}
+	body := string(data)
+
+	for _, want := range []string{
+		"DERPHOLE_PUBLIC_IPERF_PORT:-8321",
+		"DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1",
+		"DERPHOLE_V2_RAW_DIRECT_BUDGET_MS",
+		"DERPHOLE_V2_MANAGER_QUIC_FANOUT",
+		"iperf_reverse_received_mbps",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("public-path-performance-harness.sh missing %q", want)
+		}
+	}
+}

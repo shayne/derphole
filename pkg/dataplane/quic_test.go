@@ -227,3 +227,25 @@ func TestEndpointConnectionCountUsesOneConnectionPerPacketPath(t *testing.T) {
 		t.Fatalf("endpointConnectionCount(raw packet path) = %d, want 1", got)
 	}
 }
+
+func TestEndpointConnectionCountUsesStreamCountForManagerAdapter(t *testing.T) {
+	path := packetPath{adapter: &quicpath.Adapter{}, managerConnections: 4}
+
+	if got := endpointConnectionCount(path, 4); got != 4 {
+		t.Fatalf("endpointConnectionCount(manager adapter, 4) = %d, want 4", got)
+	}
+	if got := endpointConnectionCount(path, 0); got != 1 {
+		t.Fatalf("endpointConnectionCount(manager adapter, 0) = %d, want 1", got)
+	}
+	if got := endpointConnectionCount(packetPath{adapter: &quicpath.Adapter{}, managerConnections: 8}, 4); got != 4 {
+		t.Fatalf("endpointConnectionCount(manager adapter, 8 connections, 4 streams) = %d, want 4", got)
+	}
+}
+
+func TestEndpointConnectionCountKeepsSingleConnectionForDefaultManagerAdapter(t *testing.T) {
+	path := packetPath{adapter: &quicpath.Adapter{}}
+
+	if got := endpointConnectionCount(path, 4); got != 1 {
+		t.Fatalf("endpointConnectionCount(default manager adapter, 4) = %d, want 1", got)
+	}
+}

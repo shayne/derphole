@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/shayne/derphole/pkg/derpbind"
@@ -23,6 +24,37 @@ const (
 	peerProgressWatcherStopWait   = time.Second
 	externalTestRelayPlaintextEnv = "DERPHOLE_TEST_RELAY_PLAINTEXT_MARKER"
 )
+
+type externalV2PeerProgressState struct {
+	bytesReceived     atomic.Int64
+	transferElapsedMS atomic.Int64
+}
+
+func (s *externalV2PeerProgressState) Record(bytesReceived int64, transferElapsedMS int64) {
+	if s == nil {
+		return
+	}
+	s.bytesReceived.Store(bytesReceived)
+	s.transferElapsedMS.Store(transferElapsedMS)
+}
+
+func (s *externalV2PeerProgressState) BytesReceived() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.bytesReceived.Load()
+}
+
+func recordExternalV2PeerProgress(state *externalV2PeerProgressState, next func(int64, int64)) func(int64, int64) {
+	return func(bytesReceived int64, transferElapsedMS int64) {
+		if state != nil {
+			state.Record(bytesReceived, transferElapsedMS)
+		}
+		if next != nil {
+			next(bytesReceived, transferElapsedMS)
+		}
+	}
+}
 
 func externalPeerProgressConsumer(metrics *externalTransferMetrics, callback func(int64, int64)) func(peerProgress, time.Time) {
 	return func(progress peerProgress, at time.Time) {

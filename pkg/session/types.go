@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 
 	"github.com/shayne/derphole/pkg/telemetry"
@@ -315,10 +316,30 @@ func (e *transportPathEmitter) emitTransportManagerSummaryLocked(manager *transp
 	emitPositiveUintDebug(e.emitter, "transport-dropped-datagrams", manager.DroppedPeerDatagrams())
 	emitPositiveUintDebug(e.emitter, "transport-rejected-direct-datagrams", manager.RejectedDirectDatagrams())
 	emitPositiveIntDebug(e.emitter, "transport-max-peer-recv-queue-depth", manager.MaxPeerRecvQueueDepth())
+	if endpoint, active := manager.DirectPath(); active {
+		e.emitter.Debug("transport-direct-path=" + endpoint)
+		e.emitter.Debug("transport-direct-path-class=" + externalDirectEndpointClass(endpoint))
+	}
 	if path := manager.PathState(); path == transport.PathDirect && e.last != transport.PathDirect && !e.suppressWatcherDirect {
 		e.last = transport.PathDirect
 		e.lastState = StateDirect
 		e.emitter.Status(string(StateDirect))
+	}
+}
+
+func externalDirectEndpointClass(endpoint string) string {
+	addrPort, err := netip.ParseAddrPort(endpoint)
+	if err != nil {
+		return "unknown"
+	}
+	addr := addrPort.Addr()
+	switch {
+	case publicProbeTailscaleCGNATPrefix.Contains(addr) || publicProbeTailscaleULAPrefix.Contains(addr):
+		return "tailscale"
+	case addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLoopback():
+		return "private"
+	default:
+		return "public"
 	}
 }
 

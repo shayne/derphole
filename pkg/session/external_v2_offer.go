@@ -249,16 +249,19 @@ func (rt *externalV2OfferRuntime) send(ctx context.Context, accepted externalV2A
 	defer progressStop()
 
 	policy := rt.cfg.ParallelPolicy.normalized()
-	if err := rt.sendAccept(transferCtx, accepted.peerDERP, tr.localCandidates, policy); err != nil {
+	accept, err := rt.sendAccept(transferCtx, accepted.peerDERP, tr.localCandidates, policy)
+	if err != nil {
 		return externalV2PreferPeerAbort(ctx, abortErrCh, err)
 	}
 
-	return rt.sendQUIC(ctx, transferCtx, accepted, tr, policy, countedSrc, metrics, pathEmitter, abortErrCh, setEndpoint)
+	managerConnections := externalV2ManagerConnectionCount(accept, policy)
+	rawDirectBudget := externalV2AcceptedRawDirectStartupBudget(accept)
+	return rt.sendQUIC(ctx, transferCtx, accepted, tr, policy, managerConnections, rawDirectBudget, countedSrc, metrics, pathEmitter, abortErrCh, setEndpoint)
 }
 
-func (rt *externalV2OfferRuntime) sendQUIC(preferenceCtx context.Context, ctx context.Context, accepted externalV2AcceptedClaim, tr externalV2ListenTransport, policy ParallelPolicy, countedSrc *byteCountingReadCloser, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter, abortErrCh <-chan error, setEndpoint func(externalV2QUICEndpoint)) error {
+func (rt *externalV2OfferRuntime) sendQUIC(preferenceCtx context.Context, ctx context.Context, accepted externalV2AcceptedClaim, tr externalV2ListenTransport, policy ParallelPolicy, managerConnections int, rawDirectBudget time.Duration, countedSrc *byteCountingReadCloser, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter, abortErrCh <-chan error, setEndpoint func(externalV2QUICEndpoint)) error {
 	streamCount := externalV2StreamCount(policy)
-	rawPath, err := negotiateExternalV2DirectPacketPath(ctx, rt.session.derp, accepted.peerDERP, tr.manager, rt.session.derpMap, rt.auth, rt.cfg.Emitter, streamCount, externalV2DataPlaneSenderPunchDelay, tr.relayOnly)
+	rawPath, err := negotiateExternalV2DirectPacketPath(ctx, rt.session.derp, accepted.peerDERP, tr.manager, rt.session.derpMap, rt.auth, rt.cfg.Emitter, streamCount, externalV2DataPlaneSenderPunchDelay, rawDirectBudget, tr.relayOnly)
 	if err != nil {
 		return externalV2PreferPeerAbort(preferenceCtx, abortErrCh, err)
 	}
@@ -278,6 +281,7 @@ func (rt *externalV2OfferRuntime) sendQUIC(preferenceCtx context.Context, ctx co
 		return rt.sendQUICStreams(ctx, accepted, countedSrc, streams, endpoint, abortErrCh, metrics, pathEmitter, tr.manager)
 	}
 	server := dataplane.NewQUICServer(tr.manager, rt.session.quicIdentity, accepted.claim.QUICPublic)
+	server.SetManagerConnectionCount(managerConnections)
 	endpoint = server
 	setEndpoint(endpoint)
 	streams, err = server.OpenStreamsWithReady(ctx, streamCount, nil)
@@ -373,7 +377,7 @@ func (rt *externalV2OfferRuntime) startSendTransport(ctx context.Context, accept
 	}, nil
 }
 
-func (rt *externalV2OfferRuntime) sendAccept(ctx context.Context, peerDERP key.NodePublic, candidates []string, policy ParallelPolicy) error {
+func (rt *externalV2OfferRuntime) sendAccept(ctx context.Context, peerDERP key.NodePublic, candidates []string, policy ParallelPolicy) (externalV2Accept, error) {
 	accept := externalV2Accept{
 		Protocol:     externalV2Protocol,
 		Accepted:     true,
@@ -381,10 +385,13 @@ func (rt *externalV2OfferRuntime) sendAccept(ctx context.Context, peerDERP key.N
 		RelayCapable: !rt.cfg.ForceRelay,
 	}
 	accept.ParallelMode, accept.ParallelInitial, accept.ParallelCap = externalV2SetParallelPolicy(policy)
-	return sendAuthenticatedEnvelope(ctx, rt.session.derp, peerDERP, envelope{
+	accept.ManagerConnections = externalV2SetManagerConnectionCount(policy)
+	accept.RawDirectBudgetMS = externalV2SetRawDirectStartupBudgetMS()
+	err := sendAuthenticatedEnvelope(ctx, rt.session.derp, peerDERP, envelope{
 		Type:     envelopeV2Accept,
 		V2Accept: &accept,
 	}, rt.auth)
+	return accept, err
 }
 
 func (rt *externalV2OfferRuntime) receiveComplete(ctx context.Context, peerDERP key.NodePublic, abortErrCh <-chan error) (externalV2Complete, error) {
@@ -638,12 +645,14 @@ func (rt *externalV2OfferReceiveRuntime) run(ctx context.Context) (retErr error)
 	go sendPeerProgressLoop(progressCtx, rt.derp, rt.listenerDERP, rt.countedDst.Count, rt.countedDst.FirstByteAt, rt.auth)
 
 	policy := externalV2ParallelPolicy(accept)
+	managerConnections := externalV2ManagerConnectionCount(accept, policy)
+	rawDirectBudget := externalV2AcceptedRawDirectStartupBudget(accept)
 
-	return rt.receiveQUIC(ctx, tr, policy, metrics, pathEmitter)
+	return rt.receiveQUIC(ctx, tr, policy, managerConnections, rawDirectBudget, metrics, pathEmitter)
 }
 
-func (rt *externalV2OfferReceiveRuntime) receiveQUIC(ctx context.Context, tr externalV2ListenTransport, policy ParallelPolicy, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter) error {
-	endpoint, streams, rawPath, err := rt.acceptReceiveStreams(tr, externalV2StreamCount(policy))
+func (rt *externalV2OfferReceiveRuntime) receiveQUIC(ctx context.Context, tr externalV2ListenTransport, policy ParallelPolicy, managerConnections int, rawDirectBudget time.Duration, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter) error {
+	endpoint, streams, rawPath, err := rt.acceptReceiveStreams(tr, externalV2StreamCount(policy), managerConnections, rawDirectBudget)
 	if err != nil {
 		return err
 	}
@@ -660,9 +669,10 @@ func (rt *externalV2OfferReceiveRuntime) receiveQUIC(ctx context.Context, tr ext
 	return nil
 }
 
-func (rt *externalV2OfferReceiveRuntime) acceptReceiveStreams(tr externalV2ListenTransport, streamCount int) (externalV2QUICEndpoint, []io.ReadCloser, externalV2DirectPacketPath, error) {
+func (rt *externalV2OfferReceiveRuntime) acceptReceiveStreams(tr externalV2ListenTransport, streamCount int, managerConnections int, rawDirectBudget time.Duration) (externalV2QUICEndpoint, []io.ReadCloser, externalV2DirectPacketPath, error) {
 	client := dataplane.NewQUICClient(tr.manager, rt.identity, rt.tok.QUICPublic)
-	rawPath, err := negotiateExternalV2DirectPacketPath(tr.ctx, rt.derp, rt.listenerDERP, tr.manager, rt.dm, rt.auth, rt.cfg.Emitter, streamCount, 0, tr.relayOnly)
+	client.SetManagerConnectionCount(managerConnections)
+	rawPath, err := negotiateExternalV2DirectPacketPath(tr.ctx, rt.derp, rt.listenerDERP, tr.manager, rt.dm, rt.auth, rt.cfg.Emitter, streamCount, 0, rawDirectBudget, tr.relayOnly)
 	if err != nil {
 		return nil, nil, externalV2DirectPacketPath{}, err
 	}

@@ -27,6 +27,18 @@ Measure raw network capacity separately before blaming tunnel overhead.
 
 Keep source payload size, host pair, and direction fixed when comparing variants. Record duration, throughput, final path state, and whether the session upgraded from `connected-relay` to `connected-direct`.
 
+## Public Path Performance Harness
+
+Use this harness when comparing high-RTT derphole transfer performance against the UK test VM and a public Internet `iperf3` baseline:
+
+```bash
+DERPHOLE_REMOTE_USER=ubuntu ./scripts/public-path-performance-harness.sh derphole-testing
+```
+
+The harness forces public Internet candidates with `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1`, runs an `iperf3` reverse baseline against local WAN port `8321`, then runs derphole raw-direct reverse, raw-direct forward, forced-manager reverse, manager-fanout reverse, and startup-budget reverse cases. Use `DERPHOLE_PUBLIC_IPERF_PORT` if the local WAN forward uses a different port.
+
+Treat raw-direct reverse goodput within roughly 20 percent of the same-run `iperf3` reverse result as healthy for the public path. Treat manager-path no-progress gaps above 5 seconds or manager goodput below half of raw-direct reverse as a regression candidate unless the `iperf3` run shows the path was also degraded. `DERPHOLE_V2_MANAGER_QUIC_FANOUT=1` and `DERPHOLE_V2_RAW_DIRECT_BUDGET_MS=850` are experiment knobs for this harness; default production behavior remains Tailscale-capable and uses no startup budget unless configured.
+
 ## Interactive Latency Harness
 
 Use `cmd/derpssh-latency` when tuning interactive terminal latency. It compares a standard SSH line-echo baseline against derptun mux echo over the same SSH carrier, then writes machine-readable artifacts for agent feedback loops.
