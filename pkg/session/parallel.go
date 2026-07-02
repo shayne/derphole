@@ -12,11 +12,12 @@ import (
 )
 
 const (
-	DefaultParallelInitial     = 4
+	DefaultParallelStripes     = 8
+	DefaultParallelInitial     = DefaultParallelStripes
 	MaxParallelStripes         = 16
 	AutoParallelSamplePeriod   = 500 * time.Millisecond
 	AutoParallelGrowthStep     = 2
-	AutoParallelTargetFloor    = 8
+	AutoParallelTargetFloor    = DefaultParallelStripes
 	AutoParallelHoldSamples    = 4
 	AutoParallelMinGainMbps    = 50
 	AutoParallelMinGainPercent = 10
@@ -36,7 +37,7 @@ type ParallelPolicy struct {
 }
 
 func DefaultParallelPolicy() ParallelPolicy {
-	return FixedParallelPolicy(DefaultParallelInitial)
+	return FixedParallelPolicy(DefaultParallelStripes)
 }
 
 func FixedParallelPolicy(n int) ParallelPolicy {

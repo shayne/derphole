@@ -82,6 +82,11 @@ var header = [...]string{
 	"repair_bytes",
 	"peer_recv_queue_depth",
 	"peer_recv_queue_depth_max",
+	"striped_send_blocked_ms",
+	"striped_receive_pending_chunks",
+	"striped_receive_pending_chunks_max",
+	"striped_receive_pending_bytes",
+	"striped_receive_pending_bytes_max",
 	"direct_packet_bytes",
 	"direct_committed_bytes",
 	"direct_transport",
@@ -133,19 +138,26 @@ type Snapshot struct {
 	OutOfOrderBytes            uint64
 	PeerRecvQueueDepth         int
 	PeerRecvQueueDepthMax      int
-	DirectPacketBytes          int64
-	DirectCommittedBytes       int64
-	DirectTransport            string
-	QUICHandshakeMS            int64
-	QUICFirstByteMS            int64
-	QUICStreamBytesSent        int64
-	QUICStreamBytesReceived    int64
-	QUICStreamGoodputMbps      string
-	QUICSmoothedRTTMS          string
-	QUICLossEvents             int64
-	QUICCloseReason            string
-	LastState                  string
-	LastError                  string
+
+	StripedSendBlockedMS           int64
+	StripedReceivePendingChunks    int
+	StripedReceivePendingChunksMax int
+	StripedReceivePendingBytes     int64
+	StripedReceivePendingBytesMax  int64
+
+	DirectPacketBytes       int64
+	DirectCommittedBytes    int64
+	DirectTransport         string
+	QUICHandshakeMS         int64
+	QUICFirstByteMS         int64
+	QUICStreamBytesSent     int64
+	QUICStreamBytesReceived int64
+	QUICStreamGoodputMbps   string
+	QUICSmoothedRTTMS       string
+	QUICLossEvents          int64
+	QUICCloseReason         string
+	LastState               string
+	LastError               string
 }
 
 type Recorder struct {
@@ -400,6 +412,11 @@ func (r *Recorder) row(snap Snapshot, deltaBytes int64, deltaMS int64, localSent
 		formatOptionalInt64(snap.RepairBytes),
 		formatOptionalInt(snap.PeerRecvQueueDepth),
 		formatOptionalInt(snap.PeerRecvQueueDepthMax),
+		strconv.FormatInt(snap.StripedSendBlockedMS, 10),
+		strconv.Itoa(snap.StripedReceivePendingChunks),
+		strconv.Itoa(snap.StripedReceivePendingChunksMax),
+		strconv.FormatInt(snap.StripedReceivePendingBytes, 10),
+		strconv.FormatInt(snap.StripedReceivePendingBytesMax, 10),
 		formatOptionalInt64(snap.DirectPacketBytes),
 		formatOptionalInt64(snap.DirectCommittedBytes),
 		snap.DirectTransport,

@@ -35,9 +35,17 @@ func TestParseParallelPolicyRejectsInvalidValues(t *testing.T) {
 	}
 }
 
-func TestDefaultParallelPolicyUsesInitialStripeCount(t *testing.T) {
-	if got, want := DefaultParallelPolicy(), FixedParallelPolicy(4); got != want {
+func TestDefaultParallelPolicyUsesEmpiricalBulkDefault(t *testing.T) {
+	want := FixedParallelPolicy(DefaultParallelStripes)
+	if got := DefaultParallelPolicy(); got != want {
 		t.Fatalf("DefaultParallelPolicy() = %#v, want %#v", got, want)
+	}
+}
+
+func TestAutoParallelPolicyStartsAtEmpiricalBulkDefault(t *testing.T) {
+	got := AutoParallelPolicy()
+	if got.Mode != ParallelModeAuto || got.Initial != DefaultParallelStripes || got.Cap != MaxParallelStripes {
+		t.Fatalf("AutoParallelPolicy() = %#v, want auto initial=%d cap=%d", got, DefaultParallelStripes, MaxParallelStripes)
 	}
 }
 
@@ -45,17 +53,17 @@ func TestParallelAutoControllerRequestsGrowthWhenThroughputImproves(t *testing.T
 	c := newParallelAutoController(AutoParallelPolicy())
 
 	first := c.Observe(parallelWindow{
-		Target:         4,
+		Target:         1,
 		BacklogLimited: true,
 		ThroughputMbps: 300,
 	})
-	if first.NextTarget != 8 {
-		t.Fatalf("first Observe() next target = %d, want 8", first.NextTarget)
+	if first.NextTarget != DefaultParallelStripes {
+		t.Fatalf("first Observe() next target = %d, want %d", first.NextTarget, DefaultParallelStripes)
 	}
 
 	for i := 0; i < AutoParallelHoldSamples; i++ {
 		hold := c.Observe(parallelWindow{
-			Target:             8,
+			Target:             DefaultParallelStripes,
 			BacklogLimited:     true,
 			ThroughputMbps:     410,
 			PreviousThroughput: 300,
@@ -66,13 +74,13 @@ func TestParallelAutoControllerRequestsGrowthWhenThroughputImproves(t *testing.T
 	}
 
 	second := c.Observe(parallelWindow{
-		Target:             8,
+		Target:             DefaultParallelStripes,
 		BacklogLimited:     true,
 		ThroughputMbps:     470,
 		PreviousThroughput: 410,
 	})
-	if second.NextTarget != 10 {
-		t.Fatalf("second Observe() next target = %d, want 10", second.NextTarget)
+	if second.NextTarget != DefaultParallelStripes+AutoParallelGrowthStep {
+		t.Fatalf("second Observe() next target = %d, want %d", second.NextTarget, DefaultParallelStripes+AutoParallelGrowthStep)
 	}
 	if second.StopReason != "" {
 		t.Fatalf("second Observe() stop reason = %q, want empty", second.StopReason)
@@ -83,17 +91,17 @@ func TestParallelAutoControllerStopsOnDiminishingReturn(t *testing.T) {
 	c := newParallelAutoController(AutoParallelPolicy())
 
 	first := c.Observe(parallelWindow{
-		Target:         4,
+		Target:         1,
 		BacklogLimited: true,
 		ThroughputMbps: 300,
 	})
-	if first.NextTarget != 8 {
-		t.Fatalf("first Observe() next target = %d, want 8", first.NextTarget)
+	if first.NextTarget != DefaultParallelStripes {
+		t.Fatalf("first Observe() next target = %d, want %d", first.NextTarget, DefaultParallelStripes)
 	}
 
 	for i := 0; i < AutoParallelHoldSamples; i++ {
 		hold := c.Observe(parallelWindow{
-			Target:             8,
+			Target:             DefaultParallelStripes,
 			BacklogLimited:     true,
 			ThroughputMbps:     320,
 			PreviousThroughput: 300,
@@ -104,7 +112,7 @@ func TestParallelAutoControllerStopsOnDiminishingReturn(t *testing.T) {
 	}
 
 	second := c.Observe(parallelWindow{
-		Target:             8,
+		Target:             DefaultParallelStripes,
 		BacklogLimited:     true,
 		ThroughputMbps:     320,
 		PreviousThroughput: 300,
@@ -117,7 +125,7 @@ func TestParallelAutoControllerStopsOnDiminishingReturn(t *testing.T) {
 	}
 }
 
-func TestParallelAutoControllerRespectsCapBelowFloor(t *testing.T) {
+func TestParallelAutoControllerRespectsCurrentTargetAtCap(t *testing.T) {
 	c := newParallelAutoController(ParallelPolicy{
 		Mode:    ParallelModeAuto,
 		Initial: 4,

@@ -59,6 +59,19 @@ func TestExternalV2ParallelPolicyDefaultsAndRoundTrips(t *testing.T) {
 	}
 }
 
+func TestExternalV2DefaultPolicyStartsAtEmpiricalBulkDefault(t *testing.T) {
+	policy := externalV2ParallelPolicy(externalV2Claim{})
+	if got := externalV2StreamCount(policy); got != DefaultParallelStripes {
+		t.Fatalf("externalV2StreamCount(default) = %d, want %d", got, DefaultParallelStripes)
+	}
+}
+
+func TestExternalV2CopyBufferSizeMatchesLatencyFriendlyStripedChunk(t *testing.T) {
+	if externalV2CopyBufferSize != externalCopyBufferSize {
+		t.Fatalf("externalV2CopyBufferSize = %d, want %d", externalV2CopyBufferSize, externalCopyBufferSize)
+	}
+}
+
 func TestExternalV2ManagerConnectionCountDefaultsToOne(t *testing.T) {
 	t.Setenv("DERPHOLE_V2_MANAGER_QUIC_FANOUT", "")
 

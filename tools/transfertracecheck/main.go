@@ -77,6 +77,15 @@ func formatDiagnosticsSummary(diagnostics transfertrace.DiagnosticsSummary) stri
 	if diagnostics.MaxPeerRecvQueueDepth > 0 {
 		summary += fmt.Sprintf(" max_peer_recv_queue_depth=%d", diagnostics.MaxPeerRecvQueueDepth)
 	}
+	if diagnostics.MaxStripedSendBlockedMS > 0 {
+		summary += fmt.Sprintf(" max_striped_send_blocked_ms=%d", diagnostics.MaxStripedSendBlockedMS)
+	}
+	if diagnostics.MaxStripedReceivePendingChunks > 0 {
+		summary += fmt.Sprintf(" max_striped_receive_pending_chunks=%d", diagnostics.MaxStripedReceivePendingChunks)
+	}
+	if diagnostics.MaxStripedReceivePendingBytes > 0 {
+		summary += fmt.Sprintf(" max_striped_receive_pending_bytes=%d", diagnostics.MaxStripedReceivePendingBytes)
+	}
 	if diagnostics.DirectTransport != "" {
 		summary += fmt.Sprintf(" direct_transport=%s", diagnostics.DirectTransport)
 	}

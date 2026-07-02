@@ -15,7 +15,7 @@ Use the checked-in harnesses first:
 
 `promotion-test.sh` is the main throughput benchmark for one-shot `listen/pipe`. It verifies byte count, SHA-256, path transition logs, and now fails if any `derphole` process or UDP socket survives after cleanup.
 
-When comparing direct-path striping, forward the same CLI flag family used by `pipe` and `open` through the harness with `DERPHOLE_PARALLEL_ARGS`. The harness passes those args to the active side only: local `pipe/open` in forward runs and remote `pipe/open` in reverse runs. The passive side follows the active side's negotiated request.
+When comparing direct-path striping diagnostics, set `DERPHOLE_BENCH_PARALLEL` to the value that would be passed to `--parallel`. The harness passes that diagnostic override to the active side only: local `pipe/open` in forward runs and remote `pipe/open` in reverse runs. Leave `DERPHOLE_BENCH_PARALLEL` unset for product-default runs.
 
 ## Baseline Comparisons
 
@@ -29,15 +29,21 @@ Keep source payload size, host pair, and direction fixed when comparing variants
 
 ## Public Path Performance Harness
 
-Use this harness when comparing high-RTT derphole transfer performance against the UK test VM and a public Internet `iperf3` baseline:
+The public-path throughput gate is Mac -> remote by default:
 
 ```bash
-DERPHOLE_REMOTE_USER=ubuntu ./scripts/public-path-performance-harness.sh derphole-testing
+DERPHOLE_PUBLIC_PATH_HOSTS='ubuntu@derphole-testing ubuntu@eric-nuc root@hetz root@canlxc' \
+DERPHOLE_PUBLIC_PATH_SIZE_MIB=1024 \
+DERPHOLE_PUBLIC_PATH_RUNS=3 \
+DERPHOLE_PUBLIC_IPERF_PORT=8123 \
+./scripts/public-path-performance-harness.sh
 ```
 
-The harness forces public Internet candidates with `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1`, runs an `iperf3` reverse baseline against local WAN port `8321`, then runs derphole raw-direct reverse, raw-direct forward, forced-manager reverse, manager-fanout reverse, and startup-budget reverse cases. Use `DERPHOLE_PUBLIC_IPERF_PORT` if the local WAN forward uses a different port.
+The harness sets `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1` for derphole runs so the measurement stays on the public Internet path. This is a test-only guard; production defaults still allow Tailscale candidates.
 
-Treat raw-direct reverse goodput within roughly 20 percent of the same-run `iperf3` reverse result as healthy for the public path. Treat manager-path no-progress gaps above 5 seconds or manager goodput below half of raw-direct reverse as a regression candidate unless the `iperf3` run shows the path was also degraded. `DERPHOLE_V2_MANAGER_QUIC_FANOUT=1` and `DERPHOLE_V2_RAW_DIRECT_BUDGET_MS=850` are experiment knobs for this harness; default production behavior remains Tailscale-capable and uses no startup budget unless configured.
+Normal public-path runs leave `DERPHOLE_BENCH_PARALLEL` unset. Set it only for a diagnostic policy comparison, for example `DERPHOLE_BENCH_PARALLEL=auto ./scripts/public-path-performance-harness.sh`.
+
+The primary pass condition is eric-nuc Mac -> remote derphole average within 10-15 percent of same-run `iperf3`, with zero steady direct-phase `transfertracecheck` stalls over 1s. The other hosts must not regress against the July 2 baseline matrix.
 
 ## Interactive Latency Harness
 
@@ -155,9 +161,9 @@ Default production runs allow Tailscale CGNAT/ULA candidates, because those rout
 
 Examples:
 
-- `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_PARALLEL_ARGS='--parallel=8' ./scripts/promotion-test.sh ktzlxc 1024`
-- `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_PARALLEL_ARGS='--parallel=auto' ./scripts/promotion-test.sh canlxc 1024`
-- `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_PARALLEL_ARGS='--parallel=8' ./scripts/promotion-test-reverse.sh ktzlxc 1024`
+- `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_BENCH_PARALLEL=8 ./scripts/promotion-test.sh ktzlxc 1024`
+- `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_BENCH_PARALLEL=auto ./scripts/promotion-test.sh canlxc 1024`
+- `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_BENCH_PARALLEL=8 ./scripts/promotion-test-reverse.sh ktzlxc 1024`
 
 ## Production Matrix Runner
 
@@ -169,10 +175,10 @@ Use these harnesses for proof runs:
 - `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-test-reverse.sh ktzlxc 1024`
 - `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 ./scripts/promotion-matrix-no-tailscale.sh 1024`
 
-Useful production tuning knobs:
+Useful diagnostic override knobs:
 
-- `DERPHOLE_PARALLEL_ARGS='--parallel=auto'` lets the active side choose direct-path striping.
-- `DERPHOLE_PARALLEL_ARGS='--parallel=<n>'` forces a specific striping request for controlled comparisons.
+- `DERPHOLE_BENCH_PARALLEL=auto` lets the active side choose direct-path striping.
+- `DERPHOLE_BENCH_PARALLEL=<n>` forces a specific striping request for controlled comparisons.
 - `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1` removes Tailscale CGNAT/ULA candidates from test runs only.
 
 The matrix runner covers:

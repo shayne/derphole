@@ -227,9 +227,16 @@ func TestRecorderWritesDirectPathDiagnosticFields(t *testing.T) {
 		RepairBytes:                98_304,
 		PeerRecvQueueDepth:         512,
 		PeerRecvQueueDepthMax:      1_069,
-		DirectPacketBytes:          2_000_000,
-		DirectCommittedBytes:       1_250_000,
-		LastState:                  "connected-direct",
+
+		StripedSendBlockedMS:           250,
+		StripedReceivePendingChunks:    7,
+		StripedReceivePendingChunksMax: 9,
+		StripedReceivePendingBytes:     7_340_032,
+		StripedReceivePendingBytesMax:  9_437_184,
+
+		DirectPacketBytes:    2_000_000,
+		DirectCommittedBytes: 1_250_000,
+		LastState:            "connected-direct",
 	})
 	if err := sendRec.Close(); err != nil {
 		t.Fatalf("Close(send) error = %v", err)
@@ -257,6 +264,11 @@ func TestRecorderWritesDirectPathDiagnosticFields(t *testing.T) {
 	assertColumn(t, sendRow, sendIndexes, "repair_bytes", "98304")
 	assertColumn(t, sendRow, sendIndexes, "peer_recv_queue_depth", "512")
 	assertColumn(t, sendRow, sendIndexes, "peer_recv_queue_depth_max", "1069")
+	assertColumn(t, sendRow, sendIndexes, "striped_send_blocked_ms", "250")
+	assertColumn(t, sendRow, sendIndexes, "striped_receive_pending_chunks", "7")
+	assertColumn(t, sendRow, sendIndexes, "striped_receive_pending_chunks_max", "9")
+	assertColumn(t, sendRow, sendIndexes, "striped_receive_pending_bytes", "7340032")
+	assertColumn(t, sendRow, sendIndexes, "striped_receive_pending_bytes_max", "9437184")
 	assertColumn(t, sendRow, sendIndexes, "direct_packet_bytes", "2000000")
 	assertColumn(t, sendRow, sendIndexes, "direct_committed_bytes", "1250000")
 
@@ -392,6 +404,11 @@ func TestRecorderLeavesRoleSpecificDiagnosticFieldsEmpty(t *testing.T) {
 	assertColumn(t, receiveRow, receiveIndexes, "repair_bytes", "")
 	assertColumn(t, receiveRow, receiveIndexes, "peer_recv_queue_depth", "")
 	assertColumn(t, receiveRow, receiveIndexes, "peer_recv_queue_depth_max", "")
+	assertColumn(t, receiveRow, receiveIndexes, "striped_send_blocked_ms", "0")
+	assertColumn(t, receiveRow, receiveIndexes, "striped_receive_pending_chunks", "0")
+	assertColumn(t, receiveRow, receiveIndexes, "striped_receive_pending_chunks_max", "0")
+	assertColumn(t, receiveRow, receiveIndexes, "striped_receive_pending_bytes", "0")
+	assertColumn(t, receiveRow, receiveIndexes, "striped_receive_pending_bytes_max", "0")
 }
 
 func TestRecorderRowsParseByHeaderAndBlankZeroOptionalFields(t *testing.T) {
@@ -558,6 +575,11 @@ func directPathDiagnosticHeader() []string {
 		"repair_bytes",
 		"peer_recv_queue_depth",
 		"peer_recv_queue_depth_max",
+		"striped_send_blocked_ms",
+		"striped_receive_pending_chunks",
+		"striped_receive_pending_chunks_max",
+		"striped_receive_pending_bytes",
+		"striped_receive_pending_bytes_max",
 		"direct_packet_bytes",
 		"direct_committed_bytes",
 		"direct_transport",

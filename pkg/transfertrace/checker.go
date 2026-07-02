@@ -30,14 +30,17 @@ type Result struct {
 }
 
 type DiagnosticsSummary struct {
-	MaxRateTargetMbps             int
-	MaxReplayBytes                uint64
-	MaxRetransmits                int64
-	MaxPeerRecvQueueDepth         int
-	DirectTransport               string
-	ReceiverCommittedMbpsMin      float64
-	ReceiverCommittedMbpsMax      float64
-	ReceiverCommittedMbpsObserved bool
+	MaxRateTargetMbps              int
+	MaxReplayBytes                 uint64
+	MaxRetransmits                 int64
+	MaxPeerRecvQueueDepth          int
+	MaxStripedSendBlockedMS        int64
+	MaxStripedReceivePendingChunks int
+	MaxStripedReceivePendingBytes  int64
+	DirectTransport                string
+	ReceiverCommittedMbpsMin       float64
+	ReceiverCommittedMbpsMax       float64
+	ReceiverCommittedMbpsObserved  bool
 }
 
 type PairOptions struct {
@@ -91,14 +94,56 @@ type checkerRow struct {
 }
 
 type checkerRowDiagnostics struct {
-	rateTargetMbps                int
-	receiverCommittedMbps         float64
-	receiverCommittedMbpsObserved bool
-	replayBytes                   uint64
-	retransmits                   int64
-	peerRecvQueueDepth            int
-	peerRecvQueueDepthMax         int
-	directTransport               string
+	rateTargetMbps                 int
+	receiverCommittedMbps          float64
+	receiverCommittedMbpsObserved  bool
+	replayBytes                    uint64
+	retransmits                    int64
+	peerRecvQueueDepth             int
+	peerRecvQueueDepthMax          int
+	stripedSendBlockedMS           int64
+	stripedReceivePendingChunks    int
+	stripedReceivePendingChunksMax int
+	stripedReceivePendingBytes     int64
+	stripedReceivePendingBytesMax  int64
+	directTransport                string
+}
+
+var checkerRowDiagnosticRecorders = map[string]func(*checkerRowDiagnostics, checkerNumericDiagnosticValue){
+	"rate_target_mbps": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.rateTargetMbps = value.intValue
+	},
+	"receiver_committed_mbps": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.receiverCommittedMbps = value.floatValue
+		d.receiverCommittedMbpsObserved = true
+	},
+	"replay_bytes": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.replayBytes = value.uint64Value
+	},
+	"retransmits": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.retransmits = value.int64Value
+	},
+	"peer_recv_queue_depth": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.peerRecvQueueDepth = value.intValue
+	},
+	"peer_recv_queue_depth_max": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.peerRecvQueueDepthMax = value.intValue
+	},
+	"striped_send_blocked_ms": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.stripedSendBlockedMS = value.int64Value
+	},
+	"striped_receive_pending_chunks": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.stripedReceivePendingChunks = value.intValue
+	},
+	"striped_receive_pending_chunks_max": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.stripedReceivePendingChunksMax = value.intValue
+	},
+	"striped_receive_pending_bytes": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.stripedReceivePendingBytes = value.int64Value
+	},
+	"striped_receive_pending_bytes_max": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.stripedReceivePendingBytesMax = value.int64Value
+	},
 }
 
 type checkerNumericDiagnosticKind int
@@ -146,6 +191,11 @@ var checkerNumericDiagnosticColumns = []checkerNumericDiagnosticColumn{
 	{name: "repair_bytes", kind: checkerNumericDiagnosticInt64},
 	{name: "peer_recv_queue_depth", kind: checkerNumericDiagnosticInt},
 	{name: "peer_recv_queue_depth_max", kind: checkerNumericDiagnosticInt},
+	{name: "striped_send_blocked_ms", kind: checkerNumericDiagnosticInt64},
+	{name: "striped_receive_pending_chunks", kind: checkerNumericDiagnosticInt},
+	{name: "striped_receive_pending_chunks_max", kind: checkerNumericDiagnosticInt},
+	{name: "striped_receive_pending_bytes", kind: checkerNumericDiagnosticInt64},
+	{name: "striped_receive_pending_bytes_max", kind: checkerNumericDiagnosticInt64},
 	{name: "direct_packet_bytes", kind: checkerNumericDiagnosticInt64},
 	{name: "direct_committed_bytes", kind: checkerNumericDiagnosticInt64},
 	{name: "quic_handshake_ms", kind: checkerNumericDiagnosticInt64},
@@ -275,6 +325,9 @@ func (c *checker) recordDiagnostics(row checkerRow) {
 	diagnostics.MaxReplayBytes = maxUint64(diagnostics.MaxReplayBytes, rowDiagnostics.replayBytes)
 	diagnostics.MaxRetransmits = maxInt64(diagnostics.MaxRetransmits, rowDiagnostics.retransmits)
 	diagnostics.MaxPeerRecvQueueDepth = maxInt(diagnostics.MaxPeerRecvQueueDepth, maxInt(rowDiagnostics.peerRecvQueueDepth, rowDiagnostics.peerRecvQueueDepthMax))
+	diagnostics.MaxStripedSendBlockedMS = maxInt64(diagnostics.MaxStripedSendBlockedMS, rowDiagnostics.stripedSendBlockedMS)
+	diagnostics.MaxStripedReceivePendingChunks = maxInt(diagnostics.MaxStripedReceivePendingChunks, maxInt(rowDiagnostics.stripedReceivePendingChunks, rowDiagnostics.stripedReceivePendingChunksMax))
+	diagnostics.MaxStripedReceivePendingBytes = maxInt64(diagnostics.MaxStripedReceivePendingBytes, maxInt64(rowDiagnostics.stripedReceivePendingBytes, rowDiagnostics.stripedReceivePendingBytesMax))
 	if rowDiagnostics.directTransport != "" {
 		diagnostics.DirectTransport = rowDiagnostics.directTransport
 	}
@@ -738,20 +791,8 @@ func parseCheckerRowDiagnostics(record []string, indexes checkerIndexes, rowNo i
 }
 
 func (d *checkerRowDiagnostics) record(name string, value checkerNumericDiagnosticValue) {
-	switch name {
-	case "rate_target_mbps":
-		d.rateTargetMbps = value.intValue
-	case "receiver_committed_mbps":
-		d.receiverCommittedMbps = value.floatValue
-		d.receiverCommittedMbpsObserved = true
-	case "replay_bytes":
-		d.replayBytes = value.uint64Value
-	case "retransmits":
-		d.retransmits = value.int64Value
-	case "peer_recv_queue_depth":
-		d.peerRecvQueueDepth = value.intValue
-	case "peer_recv_queue_depth_max":
-		d.peerRecvQueueDepthMax = value.intValue
+	if record, ok := checkerRowDiagnosticRecorders[name]; ok {
+		record(d, value)
 	}
 }
 
@@ -800,6 +841,11 @@ func isOptionalTrailingDiagnosticColumn(name string) bool {
 		"repair_bytes",
 		"peer_recv_queue_depth",
 		"peer_recv_queue_depth_max",
+		"striped_send_blocked_ms",
+		"striped_receive_pending_chunks",
+		"striped_receive_pending_chunks_max",
+		"striped_receive_pending_bytes",
+		"striped_receive_pending_bytes_max",
 		"direct_packet_bytes",
 		"direct_committed_bytes",
 		"direct_transport",

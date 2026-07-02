@@ -220,41 +220,49 @@ func TestCheckAllowsDirectFallbackRelayReason(t *testing.T) {
 func TestCheckReportsDiagnosticsSummaryFromDirectPathFields(t *testing.T) {
 	csvText := HeaderLine + "\n" +
 		testTraceRow(testTraceRowConfig{
-			timestampMS:           1000,
-			role:                  RoleSend,
-			phase:                 PhaseDirectExecute,
-			appBytes:              1024,
-			deltaAppBytes:         1024,
-			localSentBytes:        1024,
-			peerReceivedBytes:     1024,
-			transferElapsedMS:     500,
-			directValidated:       true,
-			lastState:             "connected-direct",
-			rateTargetMbps:        263,
-			receiverCommittedMbps: "1.00",
-			replayBytes:           1048576,
-			retransmits:           7,
-			peerRecvQueueDepth:    512,
-			peerRecvQueueDepthMax: 700,
+			timestampMS:                    1000,
+			role:                           RoleSend,
+			phase:                          PhaseDirectExecute,
+			appBytes:                       1024,
+			deltaAppBytes:                  1024,
+			localSentBytes:                 1024,
+			peerReceivedBytes:              1024,
+			transferElapsedMS:              500,
+			directValidated:                true,
+			lastState:                      "connected-direct",
+			rateTargetMbps:                 263,
+			receiverCommittedMbps:          "1.00",
+			replayBytes:                    1048576,
+			retransmits:                    7,
+			peerRecvQueueDepth:             512,
+			peerRecvQueueDepthMax:          700,
+			stripedSendBlockedMS:           150,
+			stripedReceivePendingChunks:    10,
+			stripedReceivePendingChunksMax: 7,
+			stripedReceivePendingBytes:     10485760,
+			stripedReceivePendingBytesMax:  7340032,
 		}) +
 		testTraceRow(testTraceRowConfig{
-			timestampMS:           1500,
-			elapsedMS:             500,
-			role:                  RoleSend,
-			phase:                 PhaseComplete,
-			appBytes:              2048,
-			deltaAppBytes:         1024,
-			localSentBytes:        2048,
-			peerReceivedBytes:     2048,
-			transferElapsedMS:     1000,
-			directValidated:       true,
-			lastState:             "stream-complete",
-			rateTargetMbps:        300,
-			receiverCommittedMbps: "16.38",
-			replayBytes:           2097152,
-			retransmits:           9,
-			peerRecvQueueDepth:    900,
-			peerRecvQueueDepthMax: 1069,
+			timestampMS:                    1500,
+			elapsedMS:                      500,
+			role:                           RoleSend,
+			phase:                          PhaseComplete,
+			appBytes:                       2048,
+			deltaAppBytes:                  1024,
+			localSentBytes:                 2048,
+			peerReceivedBytes:              2048,
+			transferElapsedMS:              1000,
+			directValidated:                true,
+			lastState:                      "stream-complete",
+			rateTargetMbps:                 300,
+			receiverCommittedMbps:          "16.38",
+			replayBytes:                    2097152,
+			retransmits:                    9,
+			peerRecvQueueDepth:             900,
+			peerRecvQueueDepthMax:          1069,
+			stripedSendBlockedMS:           250,
+			stripedReceivePendingChunksMax: 9,
+			stripedReceivePendingBytesMax:  9437184,
 		})
 	result, err := Check(strings.NewReader(csvText), Options{Role: RoleSend, StallWindow: time.Second, ExpectedBytes: 2048, ExpectedBytesSet: true})
 	if err != nil {
@@ -271,6 +279,15 @@ func TestCheckReportsDiagnosticsSummaryFromDirectPathFields(t *testing.T) {
 	}
 	if result.Diagnostics.MaxPeerRecvQueueDepth != 1069 {
 		t.Fatalf("MaxPeerRecvQueueDepth = %d, want 1069", result.Diagnostics.MaxPeerRecvQueueDepth)
+	}
+	if result.Diagnostics.MaxStripedSendBlockedMS != 250 {
+		t.Fatalf("MaxStripedSendBlockedMS = %d, want 250", result.Diagnostics.MaxStripedSendBlockedMS)
+	}
+	if result.Diagnostics.MaxStripedReceivePendingChunks != 10 {
+		t.Fatalf("MaxStripedReceivePendingChunks = %d, want 10", result.Diagnostics.MaxStripedReceivePendingChunks)
+	}
+	if result.Diagnostics.MaxStripedReceivePendingBytes != 10485760 {
+		t.Fatalf("MaxStripedReceivePendingBytes = %d, want 10485760", result.Diagnostics.MaxStripedReceivePendingBytes)
 	}
 	if !result.Diagnostics.ReceiverCommittedMbpsObserved {
 		t.Fatal("ReceiverCommittedMbpsObserved = false, want true")
@@ -690,65 +707,82 @@ func TestCheckAllowsOmittedExpectedZeroBytes(t *testing.T) {
 }
 
 type testTraceRowConfig struct {
-	timestampMS           int64
-	elapsedMS             int64
-	role                  Role
-	phase                 Phase
-	relayBytes            int64
-	directBytes           int64
-	appBytes              int64
-	deltaAppBytes         int64
-	localSentBytes        int64
-	peerReceivedBytes     int64
-	transferElapsedMS     int64
-	directValidated       bool
-	fallbackReason        string
-	lastState             string
-	lastError             string
-	rateTargetMbps        int
-	receiverCommittedMbps string
-	replayBytes           uint64
-	retransmits           int64
-	peerRecvQueueDepth    int
-	peerRecvQueueDepthMax int
-	directTransport       string
-	quicHandshakeMS       int64
-	quicFirstByteMS       int64
-	quicBytesSent         int64
-	quicGoodputMbps       string
-	quicCloseReason       string
+	timestampMS                    int64
+	elapsedMS                      int64
+	role                           Role
+	phase                          Phase
+	relayBytes                     int64
+	directBytes                    int64
+	appBytes                       int64
+	deltaAppBytes                  int64
+	localSentBytes                 int64
+	peerReceivedBytes              int64
+	transferElapsedMS              int64
+	directValidated                bool
+	fallbackReason                 string
+	lastState                      string
+	lastError                      string
+	rateTargetMbps                 int
+	receiverCommittedMbps          string
+	replayBytes                    uint64
+	retransmits                    int64
+	peerRecvQueueDepth             int
+	peerRecvQueueDepthMax          int
+	stripedSendBlockedMS           int64
+	stripedReceivePendingChunks    int
+	stripedReceivePendingChunksMax int
+	stripedReceivePendingBytes     int64
+	stripedReceivePendingBytesMax  int64
+	directTransport                string
+	quicHandshakeMS                int64
+	quicFirstByteMS                int64
+	quicBytesSent                  int64
+	quicGoodputMbps                string
+	quicCloseReason                string
 }
 
 func testTraceRow(cfg testTraceRowConfig) string {
 	fields := make([]string, len(Header))
-	fields[0] = strconv.FormatInt(cfg.timestampMS, 10)
-	fields[1] = strconv.FormatInt(cfg.elapsedMS, 10)
-	fields[2] = string(cfg.role)
-	fields[3] = string(cfg.phase)
-	fields[4] = strconv.FormatInt(cfg.relayBytes, 10)
-	fields[5] = strconv.FormatInt(cfg.directBytes, 10)
-	fields[6] = strconv.FormatInt(cfg.appBytes, 10)
-	fields[7] = strconv.FormatInt(cfg.deltaAppBytes, 10)
-	fields[8] = "0.00"
-	fields[9] = strconv.FormatInt(cfg.localSentBytes, 10)
-	fields[10] = strconv.FormatInt(cfg.peerReceivedBytes, 10)
-	fields[12] = formatTestOptionalInt64(cfg.transferElapsedMS)
-	fields[13] = strconv.FormatBool(cfg.directValidated)
-	fields[14] = cfg.fallbackReason
-	fields[25] = cfg.lastState
-	fields[26] = cfg.lastError
-	fields[27] = formatTestOptionalInt(cfg.rateTargetMbps)
-	fields[39] = cfg.receiverCommittedMbps
-	fields[40] = formatTestOptionalUint64(cfg.replayBytes)
-	fields[41] = formatTestOptionalInt64(cfg.retransmits)
-	fields[44] = formatTestOptionalInt(cfg.peerRecvQueueDepth)
-	fields[45] = formatTestOptionalInt(cfg.peerRecvQueueDepthMax)
-	fields[48] = cfg.directTransport
-	fields[49] = formatTestOptionalInt64(cfg.quicHandshakeMS)
-	fields[50] = formatTestOptionalInt64(cfg.quicFirstByteMS)
-	fields[51] = formatTestOptionalInt64(cfg.quicBytesSent)
-	fields[53] = cfg.quicGoodputMbps
-	fields[56] = cfg.quicCloseReason
+	positions := make(map[string]int, len(Header))
+	for i, name := range Header {
+		positions[name] = i
+	}
+	set := func(name string, value string) {
+		fields[positions[name]] = value
+	}
+	set("timestamp_unix_ms", strconv.FormatInt(cfg.timestampMS, 10))
+	set("elapsed_ms", strconv.FormatInt(cfg.elapsedMS, 10))
+	set("role", string(cfg.role))
+	set("phase", string(cfg.phase))
+	set("relay_bytes", strconv.FormatInt(cfg.relayBytes, 10))
+	set("direct_bytes", strconv.FormatInt(cfg.directBytes, 10))
+	set("app_bytes", strconv.FormatInt(cfg.appBytes, 10))
+	set("delta_app_bytes", strconv.FormatInt(cfg.deltaAppBytes, 10))
+	set("app_mbps", "0.00")
+	set("local_sent_bytes", strconv.FormatInt(cfg.localSentBytes, 10))
+	set("peer_received_bytes", strconv.FormatInt(cfg.peerReceivedBytes, 10))
+	set("transfer_elapsed_ms", formatTestOptionalInt64(cfg.transferElapsedMS))
+	set("direct_validated", strconv.FormatBool(cfg.directValidated))
+	set("fallback_reason", cfg.fallbackReason)
+	set("last_state", cfg.lastState)
+	set("last_error", cfg.lastError)
+	set("rate_target_mbps", formatTestOptionalInt(cfg.rateTargetMbps))
+	set("receiver_committed_mbps", cfg.receiverCommittedMbps)
+	set("replay_bytes", formatTestOptionalUint64(cfg.replayBytes))
+	set("retransmits", formatTestOptionalInt64(cfg.retransmits))
+	set("peer_recv_queue_depth", formatTestOptionalInt(cfg.peerRecvQueueDepth))
+	set("peer_recv_queue_depth_max", formatTestOptionalInt(cfg.peerRecvQueueDepthMax))
+	set("striped_send_blocked_ms", formatTestOptionalInt64(cfg.stripedSendBlockedMS))
+	set("striped_receive_pending_chunks", formatTestOptionalInt(cfg.stripedReceivePendingChunks))
+	set("striped_receive_pending_chunks_max", formatTestOptionalInt(cfg.stripedReceivePendingChunksMax))
+	set("striped_receive_pending_bytes", formatTestOptionalInt64(cfg.stripedReceivePendingBytes))
+	set("striped_receive_pending_bytes_max", formatTestOptionalInt64(cfg.stripedReceivePendingBytesMax))
+	set("direct_transport", cfg.directTransport)
+	set("quic_handshake_ms", formatTestOptionalInt64(cfg.quicHandshakeMS))
+	set("quic_first_byte_ms", formatTestOptionalInt64(cfg.quicFirstByteMS))
+	set("quic_stream_bytes_sent", formatTestOptionalInt64(cfg.quicBytesSent))
+	set("quic_stream_goodput_mbps", cfg.quicGoodputMbps)
+	set("quic_close_reason", cfg.quicCloseReason)
 	return strings.Join(fields, ",") + "\n"
 }
 

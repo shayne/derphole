@@ -370,6 +370,115 @@ func TestExternalStripedCopyKeepsFastStripeBusyWhenOneWriterBlocks(t *testing.T)
 	}
 }
 
+func TestExternalStripedCopyObserverRecordsSenderBlockedDuration(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	release := make(chan struct{})
+	writers := []io.WriteCloser{
+		newNotifyingBlockingWriteCloser(release),
+		newNotifyingBlockingWriteCloser(release),
+	}
+	reader := newNotifyingChunkReader(bytes.Repeat([]byte("x"), 6), 5)
+	blockedCh := make(chan time.Duration, 1)
+	done := make(chan error, 1)
+	observer := externalStripedCopyObserver{
+		SendBlocked: func(d time.Duration) {
+			select {
+			case blockedCh <- d:
+			default:
+			}
+		},
+	}
+
+	go func() {
+		done <- sendExternalStripedCopyWithObserver(ctx, reader, writers, 1, observer)
+	}()
+
+	for _, writer := range writers {
+		blockingWriter := writer.(*notifyingBlockingWriteCloser)
+		select {
+		case <-blockingWriter.entered:
+		case <-time.After(time.Second):
+			close(release)
+			t.Fatal("writer did not block before sender saturation")
+		}
+	}
+	select {
+	case <-reader.reached:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("sender did not fill the jobs channel")
+	}
+	time.Sleep(25 * time.Millisecond)
+	close(release)
+
+	select {
+	case d := <-blockedCh:
+		if d <= 0 {
+			t.Fatalf("blocked duration = %s, want positive", d)
+		}
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("sendExternalStripedCopyWithObserver() error = %v", err)
+		}
+		t.Fatal("sendExternalStripedCopyWithObserver() completed without recording blocked duration")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for blocked duration")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("sendExternalStripedCopyWithObserver() error = %v", err)
+	}
+}
+
+func TestExternalStripedCopyObserverReportsReceiveBacklog(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	first := []byte("first")
+	second := []byte("second")
+	releaseFirst := make(chan struct{})
+	var releaseFirstOnce sync.Once
+	closeReleaseFirst := func() { releaseFirstOnce.Do(func() { close(releaseFirst) }) }
+	readers := []io.ReadCloser{
+		&gatedReadCloser{reader: bytes.NewReader(externalStripedTestFrame(t, 0, first)), release: releaseFirst, closeRelease: closeReleaseFirst},
+		io.NopCloser(bytes.NewReader(externalStripedTestFrame(t, 1, second))),
+	}
+	var got bytes.Buffer
+	var events []externalStripedBacklogEvent
+	observer := externalStripedCopyObserver{
+		ReceiveBacklog: func(chunks int, bytes int64) {
+			events = append(events, externalStripedBacklogEvent{chunks: chunks, bytes: bytes})
+			if chunks == 1 && bytes == int64(len(second)) {
+				closeReleaseFirst()
+			}
+		},
+	}
+
+	if err := receiveExternalStripedCopyWithObserver(ctx, &got, readers, 8, observer); err != nil {
+		closeReleaseFirst()
+		t.Fatalf("receiveExternalStripedCopyWithObserver() error = %v", err)
+	}
+	if !bytes.Equal(got.Bytes(), append(first, second...)) {
+		t.Fatalf("reassembled payload = %q, want %q", got.String(), string(append(first, second...)))
+	}
+	sawPending := false
+	sawZeroAfterPending := false
+	for _, event := range events {
+		if !sawPending && event.chunks == 1 && event.bytes == int64(len(second)) {
+			sawPending = true
+			continue
+		}
+		if sawPending && event.chunks == 0 && event.bytes == 0 {
+			sawZeroAfterPending = true
+			break
+		}
+	}
+	if !sawPending || !sawZeroAfterPending {
+		t.Fatalf("receive backlog events = %#v, want pending second chunk then zero after flush", events)
+	}
+}
+
 func BenchmarkExternalStripedCopy256MiB4Stripes(b *testing.B) {
 	payload := bytes.Repeat([]byte{1, 2, 3, 4, 5, 6, 7, 8}, 32<<20)
 	b.SetBytes(int64(len(payload)))
@@ -439,4 +548,85 @@ func (w *countingWriteCloser) Write(p []byte) (int, error) {
 
 func (*countingWriteCloser) Close() error {
 	return nil
+}
+
+type notifyingBlockingWriteCloser struct {
+	release <-chan struct{}
+	entered chan struct{}
+	once    sync.Once
+}
+
+func newNotifyingBlockingWriteCloser(release <-chan struct{}) *notifyingBlockingWriteCloser {
+	return &notifyingBlockingWriteCloser{
+		release: release,
+		entered: make(chan struct{}),
+	}
+}
+
+func (w *notifyingBlockingWriteCloser) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.entered) })
+	<-w.release
+	return len(p), nil
+}
+
+func (*notifyingBlockingWriteCloser) Close() error {
+	return nil
+}
+
+type notifyingChunkReader struct {
+	reader  *bytes.Reader
+	target  int64
+	reads   int64
+	reached chan struct{}
+	once    sync.Once
+}
+
+func newNotifyingChunkReader(payload []byte, target int64) *notifyingChunkReader {
+	return &notifyingChunkReader{
+		reader:  bytes.NewReader(payload),
+		target:  target,
+		reached: make(chan struct{}),
+	}
+}
+
+func (r *notifyingChunkReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 && atomic.AddInt64(&r.reads, 1) == r.target {
+		r.once.Do(func() { close(r.reached) })
+	}
+	return n, err
+}
+
+type gatedReadCloser struct {
+	reader       *bytes.Reader
+	release      <-chan struct{}
+	closeRelease func()
+	once         sync.Once
+}
+
+func (r *gatedReadCloser) Read(p []byte) (int, error) {
+	r.once.Do(func() { <-r.release })
+	return r.reader.Read(p)
+}
+
+func (r *gatedReadCloser) Close() error {
+	if r.closeRelease != nil {
+		r.closeRelease()
+	}
+	return nil
+}
+
+type externalStripedBacklogEvent struct {
+	chunks int
+	bytes  int64
+}
+
+func externalStripedTestFrame(t *testing.T, seq uint64, payload []byte) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+	if err := writeExternalStripedChunk(&buf, externalStripedChunk{seq: seq, data: payload}); err != nil {
+		t.Fatalf("writeExternalStripedChunk() error = %v", err)
+	}
+	return buf.Bytes()
 }

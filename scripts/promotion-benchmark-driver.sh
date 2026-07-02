@@ -11,15 +11,19 @@ direction="${DERPHOLE_BENCH_DIRECTION:?DERPHOLE_BENCH_DIRECTION is required}"
 target="${1:?usage: $0 <target> [size-mib]}"
 size_mib="${2:-1024}"
 expected_size="$((size_mib * 1048576))"
-tmp="$(mktemp -d)"
+local_tmp_root="${DERPHOLE_BENCH_LOCAL_TMP_ROOT:-.tmp/promotion-benchmark}"
+mkdir -p "${local_tmp_root}"
+tmp="$(mktemp -d "${local_tmp_root%/}/${tool}-${direction}.XXXXXX")"
 start_ms=0
 duration_ms=0
 remote_suffix=""
 if [[ "${direction}" == "reverse" ]]; then
   remote_suffix="-reverse"
 fi
-remote_base="/tmp/${tool}-promotion${remote_suffix}-$$"
-remote_upload="/tmp/${tool}-promotion${remote_suffix}-bin-$$"
+remote_output_root="${DERPHOLE_BENCH_REMOTE_OUTPUT_ROOT:-derphole-bench/promotion}"
+remote_run_dir="${remote_output_root%/}/${tool}-promotion${remote_suffix}-$$"
+remote_base="${remote_run_dir}/run"
+remote_upload="${remote_run_dir}/${tool}-linux-amd64"
 remote_target="${target}"
 if [[ "${target}" != *"@"* ]]; then
   remote_user="${DERPHOLE_REMOTE_USER:-root}"
@@ -42,6 +46,10 @@ remote_env=()
 parallel_args=()
 parallel_args_remote=""
 
+if [[ "${DERPHOLE_BENCH_PARALLEL:-}" != "" ]]; then
+  parallel_args=(--parallel "${DERPHOLE_BENCH_PARALLEL}")
+  parallel_args_remote="${parallel_args[*]-}"
+fi
 if [[ "${DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES:-}" == "1" ]]; then
   remote_env+=(DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1)
 fi
@@ -54,11 +62,6 @@ fi
 if [[ -n "${DERPHOLE_V2_MANAGER_QUIC_FANOUT:-}" ]]; then
   remote_env+=(DERPHOLE_V2_MANAGER_QUIC_FANOUT="${DERPHOLE_V2_MANAGER_QUIC_FANOUT}")
 fi
-if [[ "${tool}" == "derphole" && -n "${DERPHOLE_PARALLEL_ARGS:-}" ]]; then
-  read -r -a parallel_args <<<"${DERPHOLE_PARALLEL_ARGS}"
-  parallel_args_remote="${parallel_args[*]-}"
-fi
-
 remote() {
   ssh "${remote_target}" "${remote_env[@]}" 'bash -se' <<<"$1"
 }
@@ -365,7 +368,7 @@ cleanup() {
   if [[ -n "${listener_pid}" ]]; then
     kill "${listener_pid}" 2>/dev/null || true
   fi
-  remote "if [[ -f '${remote_base}.pid' ]]; then kill \$(cat '${remote_base}.pid') 2>/dev/null || true; fi; rm -f '${remote_base}.pid' '${remote_base}.payload' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_upload}'; if [[ '${remote_bin_dir}' != '${requested_remote_bin_dir}' ]]; then rm -f '${remote_bin}'; fi" >/dev/null 2>&1 || true
+  remote "if [[ -f '${remote_base}.pid' ]]; then kill \$(cat '${remote_base}.pid') 2>/dev/null || true; fi; rm -f '${remote_base}.pid' '${remote_base}.payload' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_upload}'; if [[ '${remote_bin_dir}' != '${requested_remote_bin_dir}' ]]; then rm -f '${remote_bin}'; fi; rmdir '${remote_run_dir}' 2>/dev/null || true" >/dev/null 2>&1 || true
   rm -rf "${tmp}"
 }
 
@@ -374,6 +377,7 @@ trap 'status=$?; if [[ ${status} -ne 0 ]]; then if [[ ${start_ms} -gt 0 && ${dur
 build_and_install_remote_binary() {
   mise run build
   mise run build-linux-amd64
+  remote "mkdir -p '${remote_run_dir}'"
   scp "${linux_bin}" "${remote_target}:${remote_upload}" >/dev/null
   if install_remote_bin "${remote_bin_dir}"; then
     return 0

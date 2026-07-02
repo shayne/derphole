@@ -70,6 +70,12 @@ type externalTransferMetrics struct {
 	quicLossEvents         int64
 	quicCloseReason        string
 	transportManager       *transport.Manager
+
+	stripedSendBlocked             time.Duration
+	stripedReceivePendingChunks    int
+	stripedReceivePendingChunksMax int
+	stripedReceivePendingBytes     int64
+	stripedReceivePendingBytesMax  int64
 }
 
 type externalDirectTransferStats struct {
@@ -205,6 +211,41 @@ func (m *externalTransferMetrics) RecordDirectPathSend(n int64, at time.Time) {
 
 func (m *externalTransferMetrics) RecordDirectPathReceive(n int64, at time.Time) {
 	m.recordDirectPathBytes(n, at, false)
+}
+
+func (m *externalTransferMetrics) RecordStripedSendBlocked(d time.Duration, at time.Time) {
+	if m == nil || d <= 0 {
+		return
+	}
+	m.mu.Lock()
+	m.stripedSendBlocked += d
+	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
+	m.mu.Unlock()
+	sampleExternalTransferTrace(trace, snap, ok)
+}
+
+func (m *externalTransferMetrics) RecordStripedReceiveBacklog(chunks int, bytes int64, at time.Time) {
+	if m == nil {
+		return
+	}
+	if chunks < 0 {
+		chunks = 0
+	}
+	if bytes < 0 {
+		bytes = 0
+	}
+	m.mu.Lock()
+	m.stripedReceivePendingChunks = chunks
+	m.stripedReceivePendingBytes = bytes
+	if chunks > m.stripedReceivePendingChunksMax {
+		m.stripedReceivePendingChunksMax = chunks
+	}
+	if bytes > m.stripedReceivePendingBytesMax {
+		m.stripedReceivePendingBytesMax = bytes
+	}
+	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
+	m.mu.Unlock()
+	sampleExternalTransferTrace(trace, snap, ok)
 }
 
 func (m *externalTransferMetrics) RecordPeerProgressFromFirstByte(bytesReceived int64, at time.Time) {
@@ -511,21 +552,28 @@ func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrac
 		RepairRequests:             m.repairRequests,
 		RepairBytes:                m.repairBytes,
 		OutOfOrderBytes:            m.outOfOrderBytes,
-		DirectPacketBytes:          m.directPacketBytes,
-		DirectCommittedBytes:       m.directCommittedBytes,
-		DirectTransport:            m.directTransport,
-		QUICHandshakeMS:            m.quicHandshakeMS,
-		QUICFirstByteMS:            m.quicFirstByteMS,
-		QUICStreamBytesSent:        m.quicStreamBytesSent,
-		QUICStreamBytesReceived:    m.quicStreamBytesRecv,
-		QUICStreamGoodputMbps:      m.quicStreamGoodputMbps,
-		QUICSmoothedRTTMS:          m.quicSmoothedRTTMS,
-		QUICLossEvents:             m.quicLossEvents,
-		QUICCloseReason:            m.quicCloseReason,
-		PeerRecvQueueDepth:         peerRecvQueueDepth,
-		PeerRecvQueueDepthMax:      peerRecvQueueDepthMax,
-		LastState:                  m.lastState,
-		LastError:                  m.lastError,
+
+		StripedSendBlockedMS:           roundedUpMilliseconds(m.stripedSendBlocked),
+		StripedReceivePendingChunks:    m.stripedReceivePendingChunks,
+		StripedReceivePendingChunksMax: m.stripedReceivePendingChunksMax,
+		StripedReceivePendingBytes:     m.stripedReceivePendingBytes,
+		StripedReceivePendingBytesMax:  m.stripedReceivePendingBytesMax,
+
+		DirectPacketBytes:       m.directPacketBytes,
+		DirectCommittedBytes:    m.directCommittedBytes,
+		DirectTransport:         m.directTransport,
+		QUICHandshakeMS:         m.quicHandshakeMS,
+		QUICFirstByteMS:         m.quicFirstByteMS,
+		QUICStreamBytesSent:     m.quicStreamBytesSent,
+		QUICStreamBytesReceived: m.quicStreamBytesRecv,
+		QUICStreamGoodputMbps:   m.quicStreamGoodputMbps,
+		QUICSmoothedRTTMS:       m.quicSmoothedRTTMS,
+		QUICLossEvents:          m.quicLossEvents,
+		QUICCloseReason:         m.quicCloseReason,
+		PeerRecvQueueDepth:      peerRecvQueueDepth,
+		PeerRecvQueueDepthMax:   peerRecvQueueDepthMax,
+		LastState:               m.lastState,
+		LastError:               m.lastError,
 	}, true
 }
 
@@ -678,6 +726,17 @@ func nonZeroTime(at time.Time) time.Time {
 		return time.Now()
 	}
 	return at
+}
+
+func roundedUpMilliseconds(d time.Duration) int64 {
+	if d <= 0 {
+		return 0
+	}
+	ms := d / time.Millisecond
+	if d%time.Millisecond != 0 {
+		ms++
+	}
+	return int64(ms)
 }
 
 func sampleExternalTransferTrace(trace *transfertrace.Recorder, snap transfertrace.Snapshot, ok bool) {

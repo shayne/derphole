@@ -184,6 +184,50 @@ func TestExternalTransferMetricsSamplesPeerRecvQueueDepthFromTransportManager(t 
 	}
 }
 
+func TestTransferTraceIncludesStripedCopyDiagnostics(t *testing.T) {
+	var out bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleReceive, time.Unix(80, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(80, 0), rec, transfertrace.RoleReceive)
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct")
+	metrics.RecordStripedReceiveBacklog(7, 7340032, time.Unix(80, 1))
+	metrics.RecordStripedSendBlocked(250*time.Millisecond, time.Unix(80, 2))
+	metrics.RecordStripedReceiveBacklog(0, 0, time.Unix(80, 2).Add(500*time.Millisecond))
+	metrics.Tick(time.Unix(80, 3))
+
+	rows := readTransferTraceRows(t, out.String())
+	row := rows[len(rows)-1]
+	if row["striped_send_blocked_ms"] != "250" ||
+		row["striped_receive_pending_chunks"] != "0" ||
+		row["striped_receive_pending_bytes"] != "0" ||
+		row["striped_receive_pending_chunks_max"] != "7" ||
+		row["striped_receive_pending_bytes_max"] != "7340032" {
+		t.Fatalf("trace row missing striped diagnostics: %#v", row)
+	}
+}
+
+func TestTransferTraceRoundsAccumulatedSubMillisecondStripedSendBlocked(t *testing.T) {
+	var out bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleReceive, time.Unix(80, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(80, 0), rec, transfertrace.RoleReceive)
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct")
+	metrics.RecordStripedSendBlocked(400*time.Microsecond, time.Unix(80, 1))
+	metrics.RecordStripedSendBlocked(400*time.Microsecond, time.Unix(80, 2))
+	metrics.RecordStripedSendBlocked(400*time.Microsecond, time.Unix(80, 3))
+	metrics.Tick(time.Unix(80, 4))
+
+	rows := readTransferTraceRows(t, out.String())
+	row := rows[len(rows)-1]
+	if row["striped_send_blocked_ms"] != "2" {
+		t.Fatalf("striped_send_blocked_ms = %q, want rounded-up accumulated duration of 2ms; row = %#v", row["striped_send_blocked_ms"], row)
+	}
+}
+
 func TestExternalTransferMetricsSetDirectStatsUpdatesTrace(t *testing.T) {
 	var out bytes.Buffer
 	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(30, 0))

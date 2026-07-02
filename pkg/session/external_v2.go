@@ -26,7 +26,7 @@ import (
 	"tailscale.com/types/key"
 )
 
-const externalV2CopyBufferSize = 1 << 20
+const externalV2CopyBufferSize = externalCopyBufferSize
 const externalV2AbortNotifyWait = 2 * time.Second
 const externalV2AbortDrainWait = time.Second
 const externalV2AbortSignalDrainWait = 150 * time.Millisecond
@@ -898,7 +898,7 @@ func copyExternalV2SendStreams(ctx context.Context, src io.Reader, streams []io.
 		}
 		writers = append(writers, writer)
 	}
-	return sendExternalStripedCopy(ctx, src, writers, externalV2CopyBufferSize)
+	return sendExternalStripedCopyWithObserver(ctx, src, writers, externalV2CopyBufferSize, externalV2StripedObserver(metrics))
 }
 
 func copyExternalV2ReceiveStreams(ctx context.Context, dst io.Writer, streams []io.ReadCloser, metrics *externalTransferMetrics) (int64, error) {
@@ -913,8 +913,22 @@ func copyExternalV2ReceiveStreams(ctx context.Context, dst io.Writer, streams []
 		_ = streams[0].Close()
 		return countingDst.n, err
 	}
-	err := receiveExternalStripedCopy(ctx, recordDst, streams, externalV2CopyBufferSize)
+	err := receiveExternalStripedCopyWithObserver(ctx, recordDst, streams, externalV2CopyBufferSize, externalV2StripedObserver(metrics))
 	return countingDst.n, err
+}
+
+func externalV2StripedObserver(metrics *externalTransferMetrics) externalStripedCopyObserver {
+	if metrics == nil || metrics.trace == nil {
+		return externalStripedCopyObserver{}
+	}
+	return externalStripedCopyObserver{
+		SendBlocked: func(d time.Duration) {
+			metrics.RecordStripedSendBlocked(d, time.Now())
+		},
+		ReceiveBacklog: func(chunks int, bytes int64) {
+			metrics.RecordStripedReceiveBacklog(chunks, bytes, time.Now())
+		},
+	}
 }
 
 type externalTransferMetricsWriteCloser struct {

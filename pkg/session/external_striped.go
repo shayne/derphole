@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 )
 
 var errExternalStripedDuplicateChunk = errors.New("duplicate striped chunk sequence")
@@ -29,7 +30,30 @@ type externalStripedReadResult struct {
 	err   error
 }
 
+type externalStripedCopyObserver struct {
+	SendBlocked    func(time.Duration)
+	ReceiveBacklog func(chunks int, bytes int64)
+}
+
+func (o externalStripedCopyObserver) recordSendBlocked(d time.Duration) {
+	if d <= 0 || o.SendBlocked == nil {
+		return
+	}
+	o.SendBlocked(d)
+}
+
+func (o externalStripedCopyObserver) recordReceiveBacklog(chunks int, bytes int64) {
+	if o.ReceiveBacklog == nil {
+		return
+	}
+	o.ReceiveBacklog(chunks, bytes)
+}
+
 func sendExternalStripedCopy(ctx context.Context, src io.Reader, writers []io.WriteCloser, chunkSize int) error {
+	return sendExternalStripedCopyWithObserver(ctx, src, writers, chunkSize, externalStripedCopyObserver{})
+}
+
+func sendExternalStripedCopyWithObserver(ctx context.Context, src io.Reader, writers []io.WriteCloser, chunkSize int, observer externalStripedCopyObserver) error {
 	if err := validateExternalStripedArgs(len(writers), chunkSize, "writers"); err != nil {
 		return err
 	}
@@ -37,7 +61,7 @@ func sendExternalStripedCopy(ctx context.Context, src io.Reader, writers []io.Wr
 
 	chunkPool := newExternalStripedChunkPool(chunkSize)
 	jobs, errCh, wait := startExternalStripedWriters(writers, chunkPool)
-	readErr := sendExternalStripedChunks(ctx, src, jobs, errCh, wait, chunkPool)
+	readErr := sendExternalStripedChunks(ctx, src, jobs, errCh, wait, chunkPool, observer)
 	if readErr != nil {
 		return readErr
 	}
@@ -96,7 +120,7 @@ func startExternalStripedWriters(writers []io.WriteCloser, chunkPool *sync.Pool)
 	return jobs, errCh, wg.Wait
 }
 
-func sendExternalStripedChunks(ctx context.Context, src io.Reader, jobs chan externalStripedChunk, errCh <-chan error, wait func(), chunkPool *sync.Pool) error {
+func sendExternalStripedChunks(ctx context.Context, src io.Reader, jobs chan externalStripedChunk, errCh <-chan error, wait func(), chunkPool *sync.Pool, observer externalStripedCopyObserver) error {
 	var seq uint64
 	var readErr error
 	for {
@@ -107,7 +131,7 @@ func sendExternalStripedChunks(ctx context.Context, src io.Reader, jobs chan ext
 		buf := getExternalStripedBuffer(chunkPool)
 		n, err := src.Read(buf)
 		if n > 0 {
-			nextSeq, err := sendExternalStripedChunkJob(ctx, jobs, errCh, chunkPool, seq, buf[:n], buf)
+			nextSeq, err := sendExternalStripedChunkJob(ctx, jobs, errCh, chunkPool, seq, buf[:n], buf, observer)
 			if err != nil {
 				close(jobs)
 				wait()
@@ -132,9 +156,23 @@ func sendExternalStripedChunks(ctx context.Context, src io.Reader, jobs chan ext
 	return readErr
 }
 
-func sendExternalStripedChunkJob(ctx context.Context, jobs chan<- externalStripedChunk, errCh <-chan error, chunkPool *sync.Pool, seq uint64, data []byte, buf []byte) (uint64, error) {
+func sendExternalStripedChunkJob(ctx context.Context, jobs chan<- externalStripedChunk, errCh <-chan error, chunkPool *sync.Pool, seq uint64, data []byte, buf []byte, observer externalStripedCopyObserver) (uint64, error) {
+	chunk := externalStripedChunk{seq: seq, data: data}
 	select {
-	case jobs <- externalStripedChunk{seq: seq, data: data}:
+	case jobs <- chunk:
+		return seq + 1, nil
+	case writeErr := <-errCh:
+		putExternalStripedBuffer(chunkPool, buf)
+		return seq, writeErr
+	case <-ctx.Done():
+		putExternalStripedBuffer(chunkPool, buf)
+		return seq, ctx.Err()
+	default:
+	}
+	blockedAt := time.Now()
+	select {
+	case jobs <- chunk:
+		observer.recordSendBlocked(time.Since(blockedAt))
 		return seq + 1, nil
 	case writeErr := <-errCh:
 		putExternalStripedBuffer(chunkPool, buf)
@@ -146,6 +184,10 @@ func sendExternalStripedChunkJob(ctx context.Context, jobs chan<- externalStripe
 }
 
 func receiveExternalStripedCopy(ctx context.Context, dst io.Writer, readers []io.ReadCloser, chunkSize int) error {
+	return receiveExternalStripedCopyWithObserver(ctx, dst, readers, chunkSize, externalStripedCopyObserver{})
+}
+
+func receiveExternalStripedCopyWithObserver(ctx context.Context, dst io.Writer, readers []io.ReadCloser, chunkSize int, observer externalStripedCopyObserver) error {
 	if err := validateExternalStripedArgs(len(readers), chunkSize, "readers"); err != nil {
 		return err
 	}
@@ -153,7 +195,7 @@ func receiveExternalStripedCopy(ctx context.Context, dst io.Writer, readers []io
 
 	chunkPool := newExternalStripedChunkPool(chunkSize)
 	results := startExternalStripedReaders(ctx, readers, chunkSize, chunkPool)
-	return receiveExternalStripedResults(ctx, dst, len(readers), results, chunkPool)
+	return receiveExternalStripedResults(ctx, dst, len(readers), results, chunkPool, observer)
 }
 
 func startExternalStripedReaders(ctx context.Context, readers []io.ReadCloser, chunkSize int, chunkPool *sync.Pool) <-chan externalStripedReadResult {
@@ -190,11 +232,12 @@ func startExternalStripedReaders(ctx context.Context, readers []io.ReadCloser, c
 	return results
 }
 
-func receiveExternalStripedResults(ctx context.Context, dst io.Writer, liveReaders int, results <-chan externalStripedReadResult, chunkPool *sync.Pool) error {
+func receiveExternalStripedResults(ctx context.Context, dst io.Writer, liveReaders int, results <-chan externalStripedReadResult, chunkPool *sync.Pool, observer externalStripedCopyObserver) error {
 	nextSeq := uint64(0)
 	pending := make(map[uint64][]byte)
+	var pendingBytes int64
 	for liveReaders > 0 || len(pending) > 0 {
-		next, flushed, err := flushExternalStripedPending(dst, pending, nextSeq, chunkPool)
+		next, flushed, err := flushExternalStripedPending(dst, pending, &pendingBytes, nextSeq, chunkPool, observer)
 		if err != nil {
 			return err
 		}
@@ -204,7 +247,7 @@ func receiveExternalStripedResults(ctx context.Context, dst io.Writer, liveReade
 		}
 		select {
 		case result, ok := <-results:
-			state, err := handleExternalStripedReadResult(dst, pending, result, ok, nextSeq, liveReaders, chunkPool)
+			state, err := handleExternalStripedReadResult(dst, pending, &pendingBytes, result, ok, nextSeq, liveReaders, chunkPool, observer)
 			if err != nil {
 				return err
 			}
@@ -222,7 +265,7 @@ type externalStripedReceiveState struct {
 	nextSeq     uint64
 }
 
-func flushExternalStripedPending(dst io.Writer, pending map[uint64][]byte, nextSeq uint64, chunkPool *sync.Pool) (uint64, bool, error) {
+func flushExternalStripedPending(dst io.Writer, pending map[uint64][]byte, pendingBytes *int64, nextSeq uint64, chunkPool *sync.Pool, observer externalStripedCopyObserver) (uint64, bool, error) {
 	chunk, ok := pending[nextSeq]
 	if !ok {
 		return nextSeq, false, nil
@@ -233,10 +276,12 @@ func flushExternalStripedPending(dst io.Writer, pending map[uint64][]byte, nextS
 	}
 	putExternalStripedBuffer(chunkPool, chunk)
 	delete(pending, nextSeq)
+	*pendingBytes -= int64(len(chunk))
+	observer.recordReceiveBacklog(len(pending), *pendingBytes)
 	return nextSeq + 1, true, nil
 }
 
-func handleExternalStripedReadResult(dst io.Writer, pending map[uint64][]byte, result externalStripedReadResult, ok bool, nextSeq uint64, liveReaders int, chunkPool *sync.Pool) (externalStripedReceiveState, error) {
+func handleExternalStripedReadResult(dst io.Writer, pending map[uint64][]byte, pendingBytes *int64, result externalStripedReadResult, ok bool, nextSeq uint64, liveReaders int, chunkPool *sync.Pool, observer externalStripedCopyObserver) (externalStripedReceiveState, error) {
 	state := externalStripedReceiveState{liveReaders: liveReaders, nextSeq: nextSeq}
 	if !ok {
 		return state, externalStripedResultsClosedErr(liveReaders)
@@ -258,7 +303,11 @@ func handleExternalStripedReadResult(dst io.Writer, pending map[uint64][]byte, r
 		state.nextSeq = next
 		return state, err
 	}
-	return state, bufferExternalStripedOutOfOrderChunk(pending, result.chunk, chunkPool)
+	if err := bufferExternalStripedOutOfOrderChunk(pending, pendingBytes, result.chunk, chunkPool); err != nil {
+		return state, err
+	}
+	observer.recordReceiveBacklog(len(pending), *pendingBytes)
+	return state, nil
 }
 
 func externalStripedResultsClosedErr(liveReaders int) error {
@@ -277,12 +326,13 @@ func writeExternalStripedImmediateChunk(dst io.Writer, chunk externalStripedChun
 	return nextSeq + 1, nil
 }
 
-func bufferExternalStripedOutOfOrderChunk(pending map[uint64][]byte, chunk externalStripedChunk, chunkPool *sync.Pool) error {
+func bufferExternalStripedOutOfOrderChunk(pending map[uint64][]byte, pendingBytes *int64, chunk externalStripedChunk, chunkPool *sync.Pool) error {
 	if _, ok := pending[chunk.seq]; ok {
 		putExternalStripedBuffer(chunkPool, chunk.data)
 		return errExternalStripedDuplicateChunk
 	}
 	pending[chunk.seq] = chunk.data
+	*pendingBytes += int64(len(chunk.data))
 	return nil
 }
 
