@@ -92,6 +92,7 @@ func executePipeSession(ctx context.Context, parsed *yargs.TypedParseResult[stru
 		Token:          parsed.Args.Token,
 		Emitter:        telemetry.New(stderr, commandSessionTelemetryLevel(level)),
 		StdioIn:        stdin,
+		BlockSource:    pipeBlockSource(stdin),
 		ForceRelay:     parsed.SubCommandFlags.ForceRelay,
 		UsePublicDERP:  usePublicDERPTransport(),
 		ParallelPolicy: policy,

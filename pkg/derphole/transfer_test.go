@@ -869,7 +869,7 @@ func TestSendSessionProgressFollowsPeerReceivedPayloadBytes(t *testing.T) {
 			t.Error("session SendConfig.Progress = nil, want peer progress callback")
 		}
 		var wire bytes.Buffer
-		if _, err := io.Copy(&wire, cfg.StdioIn); err != nil {
+		if err := copySessionSendInput(&wire, cfg); err != nil {
 			return err
 		}
 		header, err := protocol.ReadHeader(bufio.NewReader(bytes.NewReader(wire.Bytes())))
@@ -1020,6 +1020,312 @@ func TestSendPassesKnownFileWireSizeToSession(t *testing.T) {
 	}
 }
 
+func TestSendPublicFileConfiguresBlockSource(t *testing.T) {
+	prev := derpholeSessionSend
+	t.Cleanup(func() {
+		derpholeSessionSend = prev
+	})
+
+	sentinel := errors.New("session stopped")
+	var got session.SendConfig
+	var gotPayload []byte
+	var gotPayloadErr error
+	derpholeSessionSend = func(_ context.Context, cfg session.SendConfig) error {
+		got = cfg
+		if cfg.BlockSource != nil {
+			gotPayload = make([]byte, cfg.BlockSource.PayloadSize)
+			_, gotPayloadErr = cfg.BlockSource.Payload.ReadAt(gotPayload, 0)
+		}
+		if rc, ok := cfg.StdioIn.(io.ReadCloser); ok {
+			_ = rc.Close()
+		}
+		return sentinel
+	}
+
+	payload := bytes.Repeat([]byte("b"), 8192)
+	srcDir := t.TempDir()
+	srcPath := filepath.Join(srcDir, "payload.bin")
+	if err := os.WriteFile(srcPath, payload, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	tok, err := token.Encode(token.Token{
+		Version:      token.SupportedVersion,
+		ExpiresUnix:  time.Now().Add(time.Hour).Unix(),
+		Capabilities: token.CapabilityStdio,
+	})
+	if err != nil {
+		t.Fatalf("token.Encode() error = %v", err)
+	}
+
+	err = Send(context.Background(), SendConfig{
+		Token:         tok,
+		What:          srcPath,
+		UsePublicDERP: true,
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Send() error = %v, want %v", err, sentinel)
+	}
+	if got.BlockSource == nil {
+		t.Fatal("session SendConfig.BlockSource = nil, want public file block source")
+	}
+	if got.BlockSource.PayloadSize != int64(len(payload)) {
+		t.Fatalf("BlockSource.PayloadSize = %d, want %d", got.BlockSource.PayloadSize, len(payload))
+	}
+	blockHeader := got.BlockSource.Header
+	if len(blockHeader) == 0 && got.BlockSource.HeaderFunc != nil {
+		blockHeader = got.BlockSource.HeaderFunc()
+	}
+	header, err := protocol.ReadHeader(bufio.NewReader(bytes.NewReader(blockHeader)))
+	if err != nil {
+		t.Fatalf("block source header is not a derphole header: %v", err)
+	}
+	if header.Kind != protocol.KindFile || header.Name != "payload.bin" || header.Size != int64(len(payload)) || header.Verify != VerificationString(tok) {
+		t.Fatalf("block source header = %#v, want verified file header", header)
+	}
+	if gotPayloadErr != nil {
+		t.Fatalf("BlockSource.Payload.ReadAt() error = %v", gotPayloadErr)
+	}
+	if !bytes.Equal(gotPayload, payload) {
+		t.Fatal("block source payload bytes did not match input file")
+	}
+}
+
+func TestReceiveAllocatedPublicSessionConfiguresBlockReceiver(t *testing.T) {
+	prev := derpholeSessionListen
+	t.Cleanup(func() {
+		derpholeSessionListen = prev
+	})
+
+	sentinel := errors.New("session stopped")
+	var got session.ListenConfig
+	derpholeSessionListen = func(_ context.Context, cfg session.ListenConfig) (string, error) {
+		got = cfg
+		if cfg.TokenSink != nil {
+			cfg.TokenSink <- "fake-token"
+		}
+		return "fake-token", sentinel
+	}
+
+	err := Receive(context.Background(), ReceiveConfig{
+		Allocate:      true,
+		UsePublicDERP: true,
+		OutputPath:    t.TempDir(),
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Receive() error = %v, want %v", err, sentinel)
+	}
+	if got.BlockReceiver == nil {
+		t.Fatal("session ListenConfig.BlockReceiver = nil, want public file block receiver")
+	}
+}
+
+func TestOfferPublicFileConfiguresBlockSource(t *testing.T) {
+	prev := derpholeSessionOffer
+	t.Cleanup(func() {
+		derpholeSessionOffer = prev
+	})
+
+	sentinel := errors.New("session stopped")
+	var got session.OfferConfig
+	var gotPayload []byte
+	var gotPayloadErr error
+	derpholeSessionOffer = func(_ context.Context, cfg session.OfferConfig) (string, error) {
+		got = cfg
+		if cfg.BlockSource != nil {
+			gotPayload = make([]byte, cfg.BlockSource.PayloadSize)
+			_, gotPayloadErr = cfg.BlockSource.Payload.ReadAt(gotPayload, 0)
+		}
+		if cfg.TokenSink != nil {
+			cfg.TokenSink <- "fake-token"
+		}
+		if rc, ok := cfg.StdioIn.(io.ReadCloser); ok {
+			_ = rc.Close()
+		}
+		return "fake-token", sentinel
+	}
+
+	payload := bytes.Repeat([]byte("c"), 8192)
+	srcDir := t.TempDir()
+	srcPath := filepath.Join(srcDir, "payload.bin")
+	if err := os.WriteFile(srcPath, payload, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	err := Send(context.Background(), SendConfig{
+		What:          srcPath,
+		UsePublicDERP: true,
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Send() error = %v, want %v", err, sentinel)
+	}
+	if got.BlockSource == nil {
+		t.Fatal("session OfferConfig.BlockSource = nil, want public file block source")
+	}
+	blockHeader := got.BlockSource.Header
+	if len(blockHeader) == 0 && got.BlockSource.HeaderFunc != nil {
+		blockHeader = got.BlockSource.HeaderFunc()
+	}
+	header, err := protocol.ReadHeader(bufio.NewReader(bytes.NewReader(blockHeader)))
+	if err != nil {
+		t.Fatalf("block source header is not a derphole header: %v", err)
+	}
+	if header.Kind != protocol.KindFile || header.Name != "payload.bin" || header.Size != int64(len(payload)) || header.Verify != VerificationString("fake-token") {
+		t.Fatalf("block source header = %#v, want verified file header", header)
+	}
+	if gotPayloadErr != nil {
+		t.Fatalf("BlockSource.Payload.ReadAt() error = %v", gotPayloadErr)
+	}
+	if !bytes.Equal(gotPayload, payload) {
+		t.Fatal("block source payload bytes did not match input file")
+	}
+}
+
+func TestReceiveOfferPublicSessionConfiguresBlockReceiver(t *testing.T) {
+	prev := derpholeSessionReceive
+	t.Cleanup(func() {
+		derpholeSessionReceive = prev
+	})
+
+	sentinel := errors.New("session stopped")
+	var got session.ReceiveConfig
+	derpholeSessionReceive = func(_ context.Context, cfg session.ReceiveConfig) error {
+		got = cfg
+		if closer, ok := cfg.StdioOut.(interface{ CloseWithError(error) error }); ok {
+			_ = closer.CloseWithError(sentinel)
+		}
+		return sentinel
+	}
+
+	tok, err := token.Encode(token.Token{
+		Version:      token.SupportedVersion,
+		ExpiresUnix:  time.Now().Add(time.Hour).Unix(),
+		Capabilities: token.CapabilityStdioOffer | token.CapabilityTransferV2,
+	})
+	if err != nil {
+		t.Fatalf("token.Encode() error = %v", err)
+	}
+	err = Receive(context.Background(), ReceiveConfig{
+		Token:         tok,
+		UsePublicDERP: true,
+		OutputPath:    t.TempDir(),
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Receive() error = %v, want %v", err, sentinel)
+	}
+	if got.BlockReceiver == nil {
+		t.Fatal("session ReceiveConfig.BlockReceiver = nil, want public file block receiver")
+	}
+}
+
+func TestSessionBlockReceiverWritesVerifiedFile(t *testing.T) {
+	dir := t.TempDir()
+	tokenValue := "block-token"
+	receiver := newSessionBlockReceiver(ReceiveConfig{OutputPath: dir}, func() string {
+		return tokenValue
+	}, nil)
+
+	header := transferTestHeaderBytes(t, protocol.Header{
+		Version: 1,
+		Kind:    protocol.KindFile,
+		Name:    "payload.bin",
+		Size:    5,
+		Verify:  VerificationString(tokenValue),
+	})
+	sink, err := receiver(context.Background(), session.BlockReceiveRequest{
+		Header:      header,
+		PayloadSize: 5,
+	})
+	if err != nil {
+		t.Fatalf("BlockReceiver() error = %v", err)
+	}
+	if _, err := sink.WriteAt([]byte("lo"), 3); err != nil {
+		t.Fatalf("WriteAt(lo) error = %v", err)
+	}
+	if _, err := sink.WriteAt([]byte("hel"), 0); err != nil {
+		t.Fatalf("WriteAt(hel) error = %v", err)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatalf("sink.Close() error = %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "payload.bin"))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("received file = %q, want hello", string(got))
+	}
+}
+
+func TestSessionBlockReceiverRejectsInvalidRequests(t *testing.T) {
+	dir := t.TempDir()
+	receiver := newSessionBlockReceiver(ReceiveConfig{OutputPath: dir}, func() string {
+		return "block-token"
+	}, nil)
+
+	cases := []struct {
+		name        string
+		header      []byte
+		payloadSize int64
+	}{
+		{
+			name:        "bad header",
+			header:      []byte("bad"),
+			payloadSize: 1,
+		},
+		{
+			name: "verification mismatch",
+			header: transferTestHeaderBytes(t, protocol.Header{
+				Version: 1,
+				Kind:    protocol.KindFile,
+				Name:    "payload.bin",
+				Size:    1,
+				Verify:  VerificationString("other-token"),
+			}),
+			payloadSize: 1,
+		},
+		{
+			name: "unsupported kind",
+			header: transferTestHeaderBytes(t, protocol.Header{
+				Version: 1,
+				Kind:    protocol.KindText,
+				Size:    1,
+				Verify:  VerificationString("block-token"),
+			}),
+			payloadSize: 1,
+		},
+		{
+			name: "size mismatch",
+			header: transferTestHeaderBytes(t, protocol.Header{
+				Version: 1,
+				Kind:    protocol.KindFile,
+				Name:    "payload.bin",
+				Size:    2,
+				Verify:  VerificationString("block-token"),
+			}),
+			payloadSize: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := receiver(context.Background(), session.BlockReceiveRequest{Header: tc.header, PayloadSize: tc.payloadSize}); err == nil {
+				t.Fatal("BlockReceiver() error = nil, want failure")
+			}
+		})
+	}
+}
+
+func TestReceiveBlockFileSinkWriteErrorsWhenClosed(t *testing.T) {
+	sink := &receiveBlockFileSink{
+		progress: NewProgressReporter(io.Discard, 4),
+		size:     4,
+	}
+	if _, err := sink.WriteAt([]byte("data"), 0); err == nil {
+		t.Fatal("WriteAt() error = nil, want closed sink failure")
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+}
+
 type synchronizedBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -1058,4 +1364,30 @@ func waitForTokenLine(t *testing.T, stderr interface{ String() string }) string 
 
 	t.Fatalf("token line not found in stderr %q", stderr.String())
 	return ""
+}
+
+func copySessionSendInput(dst io.Writer, cfg session.SendConfig) error {
+	if cfg.StdioIn != nil {
+		_, err := io.Copy(dst, cfg.StdioIn)
+		return err
+	}
+	if cfg.BlockSource != nil && cfg.BlockSource.OpenStream != nil {
+		src, err := cfg.BlockSource.OpenStream()
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+		_, err = io.Copy(dst, src)
+		return err
+	}
+	return nil
+}
+
+func transferTestHeaderBytes(t *testing.T, h protocol.Header) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := protocol.WriteHeader(&buf, h); err != nil {
+		t.Fatalf("WriteHeader() error = %v", err)
+	}
+	return buf.Bytes()
 }

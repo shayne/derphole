@@ -86,6 +86,7 @@ func startListenSession(ctx context.Context, parsed *yargs.TypedParseResult[stru
 			Emitter:       emitter,
 			TokenSink:     tokenSink,
 			StdioOut:      stdout,
+			BlockReceiver: pipeBlockReceiver(stdout),
 			ForceRelay:    parsed.SubCommandFlags.ForceRelay,
 			UsePublicDERP: usePublicDERPTransport(),
 			Trace:         trace,

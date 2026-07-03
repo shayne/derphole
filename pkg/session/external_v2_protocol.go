@@ -27,6 +27,11 @@ type externalV2Claim struct {
 	ParallelMode    string   `json:"parallel_mode,omitempty"`
 	ParallelInitial int      `json:"parallel_initial,omitempty"`
 	ParallelCap     int      `json:"parallel_cap,omitempty"`
+	TransferMode    string   `json:"transfer_mode,omitempty"`
+	BlockHeader     []byte   `json:"block_header,omitempty"`
+	BlockSize       int64    `json:"block_size,omitempty"`
+	BlockChunkSize  int      `json:"block_chunk_size,omitempty"`
+	BlockCapable    bool     `json:"block_capable,omitempty"`
 }
 
 type externalV2Accept struct {
@@ -40,6 +45,10 @@ type externalV2Accept struct {
 	ParallelCap        int      `json:"parallel_cap,omitempty"`
 	ManagerConnections int      `json:"manager_connections,omitempty"`
 	RawDirectBudgetMS  int      `json:"raw_direct_budget_ms,omitempty"`
+	TransferMode       string   `json:"transfer_mode,omitempty"`
+	BlockHeader        []byte   `json:"block_header,omitempty"`
+	BlockSize          int64    `json:"block_size,omitempty"`
+	BlockChunkSize     int      `json:"block_chunk_size,omitempty"`
 }
 
 type externalV2Complete struct {

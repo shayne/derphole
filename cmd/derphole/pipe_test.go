@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -71,5 +72,48 @@ func TestRunPipePassesTransferTraceFromEnvironment(t *testing.T) {
 	}
 	if got == nil {
 		t.Fatal("Trace was nil")
+	}
+}
+
+func TestRunPipeConfiguresBlockSourceForRegularFile(t *testing.T) {
+	prev := sendSession
+	t.Cleanup(func() {
+		sendSession = prev
+	})
+
+	file, err := os.CreateTemp(t.TempDir(), "pipe-input")
+	if err != nil {
+		t.Fatalf("CreateTemp() error = %v", err)
+	}
+	defer file.Close()
+	if _, err := file.WriteString("012345"); err != nil {
+		t.Fatalf("WriteString() error = %v", err)
+	}
+	if _, err := file.Seek(2, io.SeekStart); err != nil {
+		t.Fatalf("Seek() error = %v", err)
+	}
+
+	var got *session.BlockSource
+	sendSession = func(_ context.Context, cfg session.SendConfig) error {
+		got = cfg.BlockSource
+		return nil
+	}
+
+	code := runPipe([]string{"token"}, telemetry.LevelQuiet, file, io.Discard, io.Discard)
+	if code != 0 {
+		t.Fatalf("runPipe() code = %d, want 0", code)
+	}
+	if got == nil {
+		t.Fatal("BlockSource was nil")
+	}
+	if got.PayloadSize != 4 {
+		t.Fatalf("PayloadSize = %d, want 4", got.PayloadSize)
+	}
+	buf := make([]byte, got.PayloadSize)
+	if _, err := got.Payload.ReadAt(buf, 0); err != nil {
+		t.Fatalf("Payload.ReadAt() error = %v", err)
+	}
+	if string(buf) != "2345" {
+		t.Fatalf("block payload = %q, want 2345", string(buf))
 	}
 }

@@ -29,11 +29,18 @@ func openSendSource(ctx context.Context, cfg SendConfig) (io.ReadCloser, error) 
 		}
 		return nopReadCloser{Reader: cfg.StdioIn}, nil
 	}
+	if cfg.BlockSource != nil && cfg.BlockSource.OpenStream != nil {
+		return cfg.BlockSource.OpenStream()
+	}
 	return nopReadCloser{Reader: io.LimitReader(nilReader{}, 0)}, nil
 }
 
 func sendConfigWithInferredExpectedBytes(cfg SendConfig) SendConfig {
 	if cfg.StdioExpectedBytes > 0 {
+		return cfg
+	}
+	if cfg.BlockSource != nil && cfg.BlockSource.PayloadSize >= 0 {
+		cfg.StdioExpectedBytes = int64(len(cfg.BlockSource.Header)) + cfg.BlockSource.PayloadSize
 		return cfg
 	}
 	expectedBytes, ok := regularFileRemainingBytes(cfg.StdioIn)

@@ -20,8 +20,10 @@ const externalStripedFrameHeaderSize = 12
 const externalStripedWarmupSeq = ^uint64(0)
 
 type externalStripedChunk struct {
-	seq  uint64
-	data []byte
+	seq    uint64
+	data   []byte
+	frame  []byte
+	pooled []byte
 }
 
 type externalStripedReadResult struct {
@@ -59,9 +61,9 @@ func sendExternalStripedCopyWithObserver(ctx context.Context, src io.Reader, wri
 	}
 	defer closeExternalStripedWriters(writers)
 
-	chunkPool := newExternalStripedChunkPool(chunkSize)
+	chunkPool := newExternalStripedFramePool(chunkSize)
 	jobs, errCh, wait := startExternalStripedWriters(writers, chunkPool)
-	readErr := sendExternalStripedChunks(ctx, src, jobs, errCh, wait, chunkPool, observer)
+	readErr := sendExternalStripedChunks(ctx, src, chunkSize, jobs, errCh, wait, chunkPool, observer)
 	if readErr != nil {
 		return readErr
 	}
@@ -92,6 +94,15 @@ func newExternalStripedChunkPool(chunkSize int) *sync.Pool {
 	}
 }
 
+func newExternalStripedFramePool(chunkSize int) *sync.Pool {
+	return &sync.Pool{
+		New: func() any {
+			buf := make([]byte, externalStripedFrameHeaderSize+chunkSize)
+			return &buf
+		},
+	}
+}
+
 func startExternalStripedWriters(writers []io.WriteCloser, chunkPool *sync.Pool) (chan externalStripedChunk, chan error, func()) {
 	jobs := make(chan externalStripedChunk, len(writers)*2)
 	errCh := make(chan error, len(writers))
@@ -109,18 +120,18 @@ func startExternalStripedWriters(writers []io.WriteCloser, chunkPool *sync.Pool)
 			}
 			for chunk := range jobs {
 				if err := writeExternalStripedChunk(dst, chunk); err != nil {
-					putExternalStripedBuffer(chunkPool, chunk.data)
+					putExternalStripedChunkBuffer(chunkPool, chunk)
 					errCh <- err
 					return
 				}
-				putExternalStripedBuffer(chunkPool, chunk.data)
+				putExternalStripedChunkBuffer(chunkPool, chunk)
 			}
 		}(writer)
 	}
 	return jobs, errCh, wg.Wait
 }
 
-func sendExternalStripedChunks(ctx context.Context, src io.Reader, jobs chan externalStripedChunk, errCh <-chan error, wait func(), chunkPool *sync.Pool, observer externalStripedCopyObserver) error {
+func sendExternalStripedChunks(ctx context.Context, src io.Reader, chunkSize int, jobs chan externalStripedChunk, errCh <-chan error, wait func(), chunkPool *sync.Pool, observer externalStripedCopyObserver) error {
 	var seq uint64
 	var readErr error
 	for {
@@ -128,10 +139,19 @@ func sendExternalStripedChunks(ctx context.Context, src io.Reader, jobs chan ext
 			readErr = err
 			break
 		}
-		buf := getExternalStripedBuffer(chunkPool)
-		n, err := src.Read(buf)
+		frame := getExternalStripedBuffer(chunkPool)
+		dataBuf := frame[externalStripedFrameHeaderSize : externalStripedFrameHeaderSize+chunkSize]
+		n, err := src.Read(dataBuf)
 		if n > 0 {
-			nextSeq, err := sendExternalStripedChunkJob(ctx, jobs, errCh, chunkPool, seq, buf[:n], buf, observer)
+			binary.BigEndian.PutUint64(frame[:8], seq)
+			binary.BigEndian.PutUint32(frame[8:externalStripedFrameHeaderSize], uint32(n))
+			chunk := externalStripedChunk{
+				seq:    seq,
+				data:   frame[externalStripedFrameHeaderSize : externalStripedFrameHeaderSize+n],
+				frame:  frame[:externalStripedFrameHeaderSize+n],
+				pooled: frame,
+			}
+			nextSeq, err := sendExternalStripedChunkJob(ctx, jobs, errCh, chunkPool, chunk, observer)
 			if err != nil {
 				close(jobs)
 				wait()
@@ -139,7 +159,7 @@ func sendExternalStripedChunks(ctx context.Context, src io.Reader, jobs chan ext
 			}
 			seq = nextSeq
 		} else {
-			putExternalStripedBuffer(chunkPool, buf)
+			putExternalStripedBuffer(chunkPool, frame)
 		}
 		if err == nil {
 			continue
@@ -156,30 +176,29 @@ func sendExternalStripedChunks(ctx context.Context, src io.Reader, jobs chan ext
 	return readErr
 }
 
-func sendExternalStripedChunkJob(ctx context.Context, jobs chan<- externalStripedChunk, errCh <-chan error, chunkPool *sync.Pool, seq uint64, data []byte, buf []byte, observer externalStripedCopyObserver) (uint64, error) {
-	chunk := externalStripedChunk{seq: seq, data: data}
+func sendExternalStripedChunkJob(ctx context.Context, jobs chan<- externalStripedChunk, errCh <-chan error, chunkPool *sync.Pool, chunk externalStripedChunk, observer externalStripedCopyObserver) (uint64, error) {
 	select {
 	case jobs <- chunk:
-		return seq + 1, nil
+		return chunk.seq + 1, nil
 	case writeErr := <-errCh:
-		putExternalStripedBuffer(chunkPool, buf)
-		return seq, writeErr
+		putExternalStripedChunkBuffer(chunkPool, chunk)
+		return chunk.seq, writeErr
 	case <-ctx.Done():
-		putExternalStripedBuffer(chunkPool, buf)
-		return seq, ctx.Err()
+		putExternalStripedChunkBuffer(chunkPool, chunk)
+		return chunk.seq, ctx.Err()
 	default:
 	}
 	blockedAt := time.Now()
 	select {
 	case jobs <- chunk:
 		observer.recordSendBlocked(time.Since(blockedAt))
-		return seq + 1, nil
+		return chunk.seq + 1, nil
 	case writeErr := <-errCh:
-		putExternalStripedBuffer(chunkPool, buf)
-		return seq, writeErr
+		putExternalStripedChunkBuffer(chunkPool, chunk)
+		return chunk.seq, writeErr
 	case <-ctx.Done():
-		putExternalStripedBuffer(chunkPool, buf)
-		return seq, ctx.Err()
+		putExternalStripedChunkBuffer(chunkPool, chunk)
+		return chunk.seq, ctx.Err()
 	}
 }
 
@@ -337,12 +356,19 @@ func bufferExternalStripedOutOfOrderChunk(pending map[uint64][]byte, pendingByte
 }
 
 func putExternalStripedChunkBuffer(chunkPool *sync.Pool, chunk externalStripedChunk) {
+	if chunk.pooled != nil {
+		putExternalStripedBuffer(chunkPool, chunk.pooled)
+		return
+	}
 	if chunk.data != nil {
 		putExternalStripedBuffer(chunkPool, chunk.data)
 	}
 }
 
 func writeExternalStripedChunk(dst io.Writer, chunk externalStripedChunk) error {
+	if len(chunk.frame) > 0 {
+		return writeExternalStripedFrameBytes(dst, chunk.frame)
+	}
 	var header [externalStripedFrameHeaderSize]byte
 	binary.BigEndian.PutUint64(header[:8], chunk.seq)
 	binary.BigEndian.PutUint32(header[8:], uint32(len(chunk.data)))
@@ -351,6 +377,22 @@ func writeExternalStripedChunk(dst io.Writer, chunk externalStripedChunk) error 
 	}
 	_, err := dst.Write(chunk.data)
 	return err
+}
+
+func writeExternalStripedFrameBytes(dst io.Writer, frame []byte) error {
+	for len(frame) > 0 {
+		n, err := dst.Write(frame)
+		if n > 0 {
+			frame = frame[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
 
 func readExternalStripedChunk(src io.Reader, chunkSize int, chunkPool *sync.Pool) (externalStripedChunk, error) {

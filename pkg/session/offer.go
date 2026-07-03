@@ -94,7 +94,7 @@ func Receive(ctx context.Context, cfg ReceiveConfig) error {
 }
 
 func openOfferSource(ctx context.Context, cfg OfferConfig) (io.ReadCloser, error) {
-	return openSendSource(ctx, SendConfig{StdioIn: cfg.StdioIn})
+	return openSendSource(ctx, SendConfig{StdioIn: cfg.StdioIn, BlockSource: cfg.BlockSource})
 }
 
 func openReceiveSink(ctx context.Context, cfg ReceiveConfig) (io.WriteCloser, error) {

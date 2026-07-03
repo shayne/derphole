@@ -178,6 +178,30 @@ func TestExternalStripedCopyPreservesOrderAcrossInterleavedStripes(t *testing.T)
 	}
 }
 
+func TestSendExternalStripedChunksBuildsFrameWithoutPayloadCopy(t *testing.T) {
+	jobs := make(chan externalStripedChunk, 1)
+	errCh := make(chan error, 1)
+	pool := newExternalStripedFramePool(4)
+
+	err := sendExternalStripedChunks(context.Background(), bytes.NewReader([]byte("z")), 4, jobs, errCh, func() {}, pool, externalStripedCopyObserver{})
+	if err != nil {
+		t.Fatalf("sendExternalStripedChunks() error = %v", err)
+	}
+
+	chunk, ok := <-jobs
+	if !ok {
+		t.Fatal("jobs channel closed without chunk")
+	}
+	if len(chunk.frame) != externalStripedFrameHeaderSize+len(chunk.data) {
+		t.Fatalf("frame length = %d, want header plus data %d", len(chunk.frame), len(chunk.data))
+	}
+	chunk.frame[externalStripedFrameHeaderSize] = 'y'
+	if got := chunk.data[0]; got != 'y' {
+		t.Fatalf("chunk data did not share frame storage, got %q", got)
+	}
+	putExternalStripedChunkBuffer(pool, chunk)
+}
+
 func TestExternalStripedCopyHandlesShortFinalChunk(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

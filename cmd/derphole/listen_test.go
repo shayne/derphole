@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -70,5 +71,54 @@ func TestRunListenPassesTransferTraceFromEnvironment(t *testing.T) {
 	}
 	if got == nil {
 		t.Fatal("Trace was nil")
+	}
+}
+
+func TestRunListenConfiguresBlockReceiverForRegularFile(t *testing.T) {
+	prev := listenSession
+	t.Cleanup(func() {
+		listenSession = prev
+	})
+
+	file, err := os.CreateTemp(t.TempDir(), "listen-output")
+	if err != nil {
+		t.Fatalf("CreateTemp() error = %v", err)
+	}
+	defer file.Close()
+
+	listenSession = func(ctx context.Context, cfg session.ListenConfig) (string, error) {
+		if cfg.BlockReceiver == nil {
+			t.Fatal("BlockReceiver was nil")
+		}
+		sink, err := cfg.BlockReceiver(ctx, session.BlockReceiveRequest{PayloadSize: 5})
+		if err != nil {
+			t.Fatalf("BlockReceiver() error = %v", err)
+		}
+		if _, err := sink.WriteAt([]byte("lo"), 3); err != nil {
+			t.Fatalf("WriteAt(lo) error = %v", err)
+		}
+		if _, err := sink.WriteAt([]byte("hel"), 0); err != nil {
+			t.Fatalf("WriteAt(hel) error = %v", err)
+		}
+		if err := sink.Close(); err != nil {
+			t.Fatalf("sink.Close() error = %v", err)
+		}
+		cfg.TokenSink <- "raw-stream-token"
+		return "raw-stream-token", nil
+	}
+
+	code := runListen(nil, telemetry.LevelQuiet, file, io.Discard)
+	if code != 0 {
+		t.Fatalf("runListen() code = %d, want 0", code)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		t.Fatalf("Seek() error = %v", err)
+	}
+	got, err := io.ReadAll(file)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("output file = %q, want hello", string(got))
 	}
 }

@@ -21,6 +21,7 @@ type ListenConfig struct {
 	Emitter       *telemetry.Emitter
 	TokenSink     chan<- string
 	StdioOut      io.Writer
+	BlockReceiver BlockReceiver
 	ForceRelay    bool
 	UsePublicDERP bool
 	Trace         *transfertrace.Recorder
@@ -37,6 +38,7 @@ type SendConfig struct {
 	Emitter            *telemetry.Emitter
 	StdioIn            io.Reader
 	StdioExpectedBytes int64
+	BlockSource        *BlockSource
 	ForceRelay         bool
 	UsePublicDERP      bool
 	ParallelPolicy     ParallelPolicy
@@ -49,6 +51,7 @@ type OfferConfig struct {
 	TokenSink          chan<- string
 	StdioIn            io.Reader
 	StdioExpectedBytes int64
+	BlockSource        *BlockSource
 	ForceRelay         bool
 	UsePublicDERP      bool
 	ParallelPolicy     ParallelPolicy
@@ -60,10 +63,33 @@ type ReceiveConfig struct {
 	Token         string
 	Emitter       *telemetry.Emitter
 	StdioOut      io.Writer
+	BlockReceiver BlockReceiver
 	ForceRelay    bool
 	UsePublicDERP bool
 	Trace         *transfertrace.Recorder
 }
+
+type BlockSource struct {
+	Header      []byte
+	HeaderFunc  func() []byte
+	Payload     io.ReaderAt
+	PayloadSize int64
+	ChunkSize   int
+	OpenStream  func() (io.ReadCloser, error)
+}
+
+type BlockReceiveRequest struct {
+	Header      []byte
+	PayloadSize int64
+	ChunkSize   int
+}
+
+type BlockReceiveSink interface {
+	io.WriterAt
+	Close() error
+}
+
+type BlockReceiver func(context.Context, BlockReceiveRequest) (BlockReceiveSink, error)
 
 type AttachDialConfig struct {
 	Token          string

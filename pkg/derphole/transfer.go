@@ -6,6 +6,7 @@ package derphole
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -72,6 +73,8 @@ type sendTransfer struct {
 	cleanup       func() error
 	summary       string
 	progressTotal int64
+	blockPayload  io.ReaderAt
+	blockSize     int64
 }
 
 const verificationPlaceholder = "0000-0000-0000"
@@ -86,6 +89,8 @@ var (
 	derpholeWebRelayReceiveWithOptions = webrelay.ReceiveWithOptions
 	derpholeNewWebDirect               = func() webrelay.DirectTransport { return webrtcdirect.New() }
 )
+
+var errBlockTransferHandled = errors.New("block transfer handled")
 
 func normalizeParallelPolicy(policy session.ParallelPolicy) session.ParallelPolicy {
 	if policy == (session.ParallelPolicy{}) {
@@ -189,12 +194,23 @@ func receivePromptInput(r io.Reader) io.Reader {
 func receiveAllocated(ctx context.Context, cfg ReceiveConfig) error {
 	tokenSink := make(chan string, 1)
 	pipeReader, pipeWriter := io.Pipe()
+	var receiveToken atomic.Value
+	blockReceiver := session.BlockReceiver(nil)
+	if cfg.UsePublicDERP {
+		blockReceiver = newSessionBlockReceiver(cfg, func() string {
+			token, _ := receiveToken.Load().(string)
+			return token
+		}, func() {
+			_ = pipeWriter.CloseWithError(errBlockTransferHandled)
+		})
+	}
 	listenErrCh := make(chan error, 1)
 	go func() {
 		_, err := derpholeSessionListen(ctx, session.ListenConfig{
 			Emitter:       cfg.Emitter,
 			TokenSink:     tokenSink,
 			StdioOut:      pipeWriter,
+			BlockReceiver: blockReceiver,
 			UsePublicDERP: cfg.UsePublicDERP,
 			ForceRelay:    cfg.ForceRelay,
 			Trace:         cfg.Trace,
@@ -209,6 +225,7 @@ func receiveAllocated(ctx context.Context, cfg ReceiveConfig) error {
 	if err != nil {
 		return err
 	}
+	receiveToken.Store(token)
 	WriteReceiveToken(cfg.Stderr, token)
 	readErr := readTransfer(pipeReader, token, cfg.Stdout, cfg.OutputPath, cfg.Stderr, cfg.ProgressOutput, cfg.Progress)
 	listenErr := <-listenErrCh
@@ -262,12 +279,21 @@ func receiveWithToken(ctx context.Context, cfg ReceiveConfig, receiveToken strin
 
 func receiveViaStdioOffer(ctx context.Context, cfg ReceiveConfig, receiveToken string) error {
 	pipeReader, pipeWriter := io.Pipe()
+	blockReceiver := session.BlockReceiver(nil)
+	if cfg.UsePublicDERP {
+		blockReceiver = newSessionBlockReceiver(cfg, func() string {
+			return receiveToken
+		}, func() {
+			_ = pipeWriter.CloseWithError(errBlockTransferHandled)
+		})
+	}
 	receiveErrCh := make(chan error, 1)
 	go func() {
 		err := derpholeSessionReceive(ctx, session.ReceiveConfig{
 			Token:         receiveToken,
 			Emitter:       cfg.Emitter,
 			StdioOut:      pipeWriter,
+			BlockReceiver: blockReceiver,
 			UsePublicDERP: cfg.UsePublicDERP,
 			ForceRelay:    cfg.ForceRelay,
 			Trace:         cfg.Trace,
@@ -317,6 +343,44 @@ func receiveViaWebRelay(ctx context.Context, cfg ReceiveConfig, receiveToken str
 		opts.Direct = derpholeNewWebDirect()
 	}
 	return derpholeWebRelayReceiveWithOptions(ctx, receiveToken, sink, cb, opts)
+}
+
+func newSessionBlockReceiver(cfg ReceiveConfig, token func() string, handled func()) session.BlockReceiver {
+	return func(ctx context.Context, req session.BlockReceiveRequest) (session.BlockReceiveSink, error) {
+		header, err := protocol.ReadHeader(bufio.NewReader(bytes.NewReader(req.Header)))
+		if err != nil {
+			return nil, err
+		}
+		if want := VerificationString(token()); header.Verify != "" && header.Verify != want {
+			return nil, fmt.Errorf("verification mismatch: got %q, want %q", header.Verify, want)
+		}
+		if header.Kind != protocol.KindFile {
+			return nil, fmt.Errorf("unsupported block transfer kind %q", header.Kind)
+		}
+		if header.Size != req.PayloadSize {
+			return nil, fmt.Errorf("block payload size mismatch: got %d, want header size %d", req.PayloadSize, header.Size)
+		}
+		target, err := prepareReceiveFileTarget(cfg.OutputPath, header, cfg.Stderr)
+		if err != nil {
+			return nil, err
+		}
+		f, err := os.Create(target)
+		if err != nil {
+			return nil, err
+		}
+		progress := NewProgressReporterWithCallback(cfg.ProgressOutput, header.Size, cfg.Progress)
+		if header.Size == 0 {
+			progress.Finish()
+		}
+		if handled != nil {
+			handled()
+		}
+		return &receiveBlockFileSink{
+			file:     f,
+			progress: progress,
+			size:     header.Size,
+		}, nil
+	}
 }
 
 func prepareSendTransfer(cfg SendConfig) (sendTransfer, error) {
@@ -375,6 +439,8 @@ func prepareSendTransfer(cfg SendConfig) (sendTransfer, error) {
 				cleanup:       file.Close,
 				summary:       fmt.Sprintf("Sending %s file named %q", formatProgressBytes(info.Size()), filepath.Base(cfg.What)),
 				progressTotal: info.Size(),
+				blockPayload:  file,
+				blockSize:     info.Size(),
 			}, nil
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return sendTransfer{}, err
@@ -414,6 +480,49 @@ func transferSessionExpectedBytes(tx sendTransfer) int64 {
 		return -1
 	}
 	return headerBytes + tx.progressTotal
+}
+
+func sessionBlockSourceForTransfer(tx sendTransfer) (*session.BlockSource, int64, error) {
+	if tx.header.Kind != protocol.KindFile || tx.blockPayload == nil || tx.blockSize < 0 {
+		return nil, 0, nil
+	}
+	blockSource := &session.BlockSource{
+		Payload:     tx.blockPayload,
+		PayloadSize: tx.blockSize,
+	}
+	headerBytes, err := configureSessionBlockSource(blockSource, tx)
+	return blockSource, headerBytes, err
+}
+
+func transferHeaderBytes(tx sendTransfer) ([]byte, error) {
+	var header bytes.Buffer
+	if err := protocol.WriteHeader(&header, tx.header); err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), header.Bytes()...), nil
+}
+
+func configureSessionBlockSource(blockSource *session.BlockSource, tx sendTransfer) (int64, error) {
+	if blockSource == nil {
+		return 0, errors.New("nil block source")
+	}
+	headerBytes, err := transferHeaderBytes(tx)
+	if err != nil {
+		return 0, err
+	}
+	blockSource.Header = headerBytes
+	blockSource.OpenStream = func() (io.ReadCloser, error) {
+		return nopReadCloser{Reader: io.MultiReader(bytes.NewReader(headerBytes), io.NewSectionReader(tx.blockPayload, 0, tx.blockSize))}, nil
+	}
+	return int64(len(headerBytes)), nil
+}
+
+type nopReadCloser struct {
+	io.Reader
+}
+
+func (nopReadCloser) Close() error {
+	return nil
 }
 
 func writeTransferWithProgress(w io.Writer, tx sendTransfer, progressOut, stderr io.Writer) (*ProgressReporter, error) {
@@ -498,6 +607,20 @@ func setSenderPeerPayloadProgress(progress *ProgressReporter, headerBytes, total
 }
 
 func offerTransfer(ctx context.Context, cfg SendConfig, tx sendTransfer) error {
+	if handled, err := offerTransferBlockIfSupported(ctx, cfg, tx); handled {
+		return err
+	}
+	return offerTransferStream(ctx, cfg, tx)
+}
+
+func offerTransferBlockIfSupported(ctx context.Context, cfg SendConfig, tx sendTransfer) (bool, error) {
+	if !cfg.UsePublicDERP {
+		return false, nil
+	}
+	return offerTransferBlock(ctx, cfg, tx)
+}
+
+func offerTransferStream(ctx context.Context, cfg SendConfig, tx sendTransfer) error {
 	pipeReader, pipeWriter := io.Pipe()
 	stopPipeCancel := closePipeReaderOnContext(ctx, pipeReader)
 	defer stopPipeCancel()
@@ -568,7 +691,119 @@ func offerTransfer(ctx context.Context, cfg SendConfig, tx sendTransfer) error {
 	return err
 }
 
+func offerTransferBlock(ctx context.Context, cfg SendConfig, tx sendTransfer) (bool, error) {
+	if !sendTransferSupportsBlock(tx) {
+		return false, nil
+	}
+	tokenSink := make(chan string, 1)
+	offerErrCh := make(chan error, 1)
+	progress := NewProgressReporter(cfg.ProgressOutput, tx.progressTotal)
+	var headerBytes atomic.Int64
+	headerBytes.Store(unknownSessionProgressHeaderBytes)
+	var blockHeader atomic.Value
+	blockSource := newOfferSessionBlockSource(tx, &blockHeader)
+	progressCallback := func(sessionBytes int64, transferElapsedMS int64) {
+		if progress == nil || tx.progressTotal < 0 {
+			return
+		}
+		setSenderPeerPayloadProgress(progress, headerBytes.Load(), tx.progressTotal, sessionBytes, transferElapsedMS)
+	}
+	go func() {
+		_, err := derpholeSessionOffer(ctx, session.OfferConfig{
+			Emitter:            cfg.Emitter,
+			TokenSink:          tokenSink,
+			BlockSource:        blockSource,
+			StdioExpectedBytes: transferSessionExpectedBytes(tx),
+			Progress:           progressCallback,
+			UsePublicDERP:      cfg.UsePublicDERP,
+			ForceRelay:         cfg.ForceRelay,
+			ParallelPolicy:     cfg.ParallelPolicy,
+			Trace:              cfg.Trace,
+		})
+		offerErrCh <- err
+	}()
+
+	token, err := waitForOfferBlockToken(ctx, tokenSink, offerErrCh)
+	if err != nil {
+		finishTransferProgress(progress, err)
+		return true, err
+	}
+	header, err := offerBlockHeaderForToken(tx, token)
+	if err != nil {
+		return finishOfferBlockSetupError(progress, offerErrCh, err)
+	}
+	blockHeader.Store(header)
+	headerBytes.Store(int64(len(header)))
+	writeSendOfferInstruction(cfg, tx.summary, token)
+
+	offerErr := <-offerErrCh
+	finishTransferProgress(progress, offerErr)
+	return true, offerErr
+}
+
+func sendTransferSupportsBlock(tx sendTransfer) bool {
+	return tx.header.Kind == protocol.KindFile && tx.blockPayload != nil && tx.blockSize >= 0
+}
+
+func newOfferSessionBlockSource(tx sendTransfer, headerValue *atomic.Value) *session.BlockSource {
+	return &session.BlockSource{
+		Payload:     tx.blockPayload,
+		PayloadSize: tx.blockSize,
+		HeaderFunc: func() []byte {
+			header, _ := headerValue.Load().([]byte)
+			return header
+		},
+		OpenStream: func() (io.ReadCloser, error) {
+			header, _ := headerValue.Load().([]byte)
+			if len(header) == 0 {
+				return nil, errors.New("block transfer header is not ready")
+			}
+			return nopReadCloser{Reader: io.MultiReader(bytes.NewReader(header), io.NewSectionReader(tx.blockPayload, 0, tx.blockSize))}, nil
+		},
+	}
+}
+
+func waitForOfferBlockToken(ctx context.Context, tokenSink <-chan string, offerErrCh <-chan error) (string, error) {
+	select {
+	case token := <-tokenSink:
+		return token, nil
+	case err := <-offerErrCh:
+		return "", err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func offerBlockHeaderForToken(tx sendTransfer, token string) ([]byte, error) {
+	tx.header.Verify = VerificationString(token)
+	return transferHeaderBytes(tx)
+}
+
+func finishOfferBlockSetupError(progress *ProgressReporter, offerErrCh <-chan error, err error) (bool, error) {
+	offerErr := <-offerErrCh
+	err = preferSessionPipeError(err, offerErr)
+	finishTransferProgress(progress, err)
+	return true, err
+}
+
+func writeSendOfferInstruction(cfg SendConfig, summary string, token string) {
+	if summary != "" && cfg.Stderr != nil {
+		_, _ = fmt.Fprintln(cfg.Stderr, summary)
+	}
+	if cfg.QR {
+		WriteSendQRInstruction(cfg.Stderr, token)
+		return
+	}
+	WriteSendInstruction(cfg.Stderr, token)
+}
+
 func sendViaSession(ctx context.Context, cfg SendConfig, tx sendTransfer) error {
+	if cfg.UsePublicDERP {
+		handled, err := sendViaSessionBlock(ctx, cfg, tx)
+		if handled {
+			return err
+		}
+	}
 	pipeReader, pipeWriter := io.Pipe()
 	stopPipeCancel := closePipeReaderOnContext(ctx, pipeReader)
 	defer stopPipeCancel()
@@ -608,6 +843,34 @@ func sendViaSession(ctx context.Context, cfg SendConfig, tx sendTransfer) error 
 	err = preferSessionPipeError(writeErr, sendErr)
 	finishTransferProgress(progress, err)
 	return err
+}
+
+func sendViaSessionBlock(ctx context.Context, cfg SendConfig, tx sendTransfer) (bool, error) {
+	tx.header.Verify = VerificationString(cfg.Token)
+	blockSource, headerBytes, err := sessionBlockSourceForTransfer(tx)
+	if err != nil {
+		return true, err
+	}
+	if blockSource == nil {
+		return false, nil
+	}
+	if tx.summary != "" && cfg.Stderr != nil {
+		_, _ = fmt.Fprintln(cfg.Stderr, tx.summary)
+	}
+	progress := NewProgressReporter(cfg.ProgressOutput, tx.progressTotal)
+	err = derpholeSessionSend(ctx, session.SendConfig{
+		Token:              cfg.Token,
+		Emitter:            cfg.Emitter,
+		BlockSource:        blockSource,
+		StdioExpectedBytes: headerBytes + tx.progressTotal,
+		Progress:           senderPeerPayloadProgress(progress, headerBytes, tx.progressTotal),
+		UsePublicDERP:      cfg.UsePublicDERP,
+		ForceRelay:         cfg.ForceRelay,
+		ParallelPolicy:     cfg.ParallelPolicy,
+		Trace:              cfg.Trace,
+	})
+	finishTransferProgress(progress, err)
+	return true, err
 }
 
 func readTransfer(r io.Reader, token string, stdout io.Writer, outputPath string, stderr, progressOut io.Writer, progress func(current, total int64)) error {
@@ -708,6 +971,45 @@ type nativeWebFileSink struct {
 	file        *os.File
 }
 
+type receiveBlockFileSink struct {
+	file     *os.File
+	progress *ProgressReporter
+	size     int64
+	current  atomic.Int64
+}
+
+func (s *receiveBlockFileSink) WriteAt(p []byte, off int64) (int, error) {
+	if s.file == nil {
+		return 0, errors.New("file sink is not open")
+	}
+	n, err := s.file.WriteAt(p, off)
+	if n > 0 {
+		s.progress.Add(n)
+		if s.current.Add(int64(n)) >= s.size {
+			s.progress.Finish()
+		}
+	}
+	if err != nil {
+		return n, err
+	}
+	if n != len(p) {
+		return n, io.ErrShortWrite
+	}
+	return n, nil
+}
+
+func (s *receiveBlockFileSink) Close() error {
+	if s.file == nil {
+		return nil
+	}
+	if s.current.Load() < s.size {
+		s.progress.Abort()
+	}
+	err := s.file.Close()
+	s.file = nil
+	return err
+}
+
 func newNativeWebFileSink(outputPath string, stderr, progressOut io.Writer, progress func(current, total int64)) *nativeWebFileSink {
 	return &nativeWebFileSink{
 		outputPath:  outputPath,
@@ -805,6 +1107,9 @@ func decodeDirectorySummary(raw []byte) (directorySummary, bool) {
 }
 
 func preferSessionPipeError(pipeErr, sessionErr error) error {
+	if errors.Is(pipeErr, errBlockTransferHandled) {
+		return sessionErr
+	}
 	if sessionErr == nil {
 		return pipeErr
 	}
