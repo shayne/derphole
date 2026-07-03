@@ -83,12 +83,57 @@ func TestExternalV2BlockTransferModePrefersBulkPacketsWhenBothPeersSupportIt(t *
 	if !claim.BlockPacketCapable {
 		t.Fatal("claim BlockPacketCapable = false, want true")
 	}
-	if got := externalV2AcceptedBlockTransferMode(claim, true); got != externalV2TransferModeBulkPackets {
+	if got := externalV2AcceptedBlockTransferMode(claim, true, nil); got != externalV2TransferModeBulkPackets {
 		t.Fatalf("accepted block mode = %q, want %q", got, externalV2TransferModeBulkPackets)
 	}
+	claim.Candidates = []string{
+		"203.0.113.20:20000",
+		"203.0.113.20:20001",
+		"203.0.113.20:20002",
+		"203.0.113.20:20003",
+		"203.0.113.20:20004",
+	}
+	compactAcceptCandidates := []string{
+		"203.0.113.10:10000",
+		"203.0.113.10:10001",
+		"203.0.113.10:10002",
+		"203.0.113.10:10003",
+	}
+	if got := externalV2AcceptedBlockTransferMode(claim, true, compactAcceptCandidates); got != externalV2TransferModeBulkPackets {
+		t.Fatalf("accepted block mode for compact accept candidate set = %q, want %q", got, externalV2TransferModeBulkPackets)
+	}
+	claim.Candidates = []string{
+		"203.0.113.10:10000",
+		"203.0.113.10:10001",
+		"203.0.113.10:10002",
+		"203.0.113.10:10003",
+	}
+	if got := externalV2AcceptedBlockTransferMode(claim, true, claim.Candidates); got != externalV2TransferModeBulkPackets {
+		t.Fatalf("accepted block mode for compact public candidate set = %q, want %q", got, externalV2TransferModeBulkPackets)
+	}
 	claim.BlockPacketCapable = false
-	if got := externalV2AcceptedBlockTransferMode(claim, true); got != externalV2TransferModeBlocks {
+	if got := externalV2AcceptedBlockTransferMode(claim, true, nil); got != externalV2TransferModeBlocks {
 		t.Fatalf("accepted block mode without packet support = %q, want %q", got, externalV2TransferModeBlocks)
+	}
+}
+
+func TestExternalV2BlockTransferModeKeepsQUICForPublicServerCandidateSet(t *testing.T) {
+	claim := externalV2Claim{
+		TransferMode:       externalV2TransferModeBlocks,
+		BlockSize:          1024,
+		BlockChunkSize:     externalV2DefaultBlockChunkSize,
+		BlockPacketCapable: true,
+		Candidates: []string{
+			"203.0.113.10:10000",
+			"203.0.113.10:10001",
+			"203.0.113.10:10002",
+			"203.0.113.10:10003",
+			"203.0.113.10:10004",
+		},
+	}
+
+	if got := externalV2AcceptedBlockTransferMode(claim, true, claim.Candidates); got != externalV2TransferModeBlocks {
+		t.Fatalf("accepted block mode for public server candidate set = %q, want %q", got, externalV2TransferModeBlocks)
 	}
 }
 

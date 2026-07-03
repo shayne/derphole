@@ -917,7 +917,7 @@ func (rt *externalV2ListenRuntime) sendAccept(ctx context.Context, peerDERP key.
 	accept.ManagerConnections = externalV2SetManagerConnectionCount(policy)
 	accept.RawDirectBudgetMS = externalV2SetRawDirectStartupBudgetMS()
 	if blockTransfer {
-		accept.TransferMode = externalV2AcceptedBlockTransferMode(claim, true)
+		accept.TransferMode = externalV2AcceptedBlockTransferMode(claim, true, candidates)
 	}
 	err := sendAuthenticatedEnvelope(ctx, rt.session.derp, peerDERP, envelope{
 		Type:     envelopeV2Accept,

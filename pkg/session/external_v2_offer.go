@@ -418,7 +418,7 @@ func (rt *externalV2OfferRuntime) sendAccept(ctx context.Context, peerDERP key.N
 	accept.RawDirectBudgetMS = externalV2SetRawDirectStartupBudgetMS()
 	if claim.BlockCapable {
 		externalV2BlockSourceAccept(rt.cfg.BlockSource, &accept)
-		accept.TransferMode = externalV2AcceptedBlockTransferMode(claim, validExternalV2BlockSource(rt.cfg.BlockSource))
+		accept.TransferMode = externalV2AcceptedBlockTransferMode(claim, validExternalV2BlockSource(rt.cfg.BlockSource), candidates)
 	}
 	err := sendAuthenticatedEnvelope(ctx, rt.session.derp, peerDERP, envelope{
 		Type:     envelopeV2Accept,

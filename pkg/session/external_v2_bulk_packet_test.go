@@ -326,6 +326,15 @@ func TestExternalV2BulkPacketReceiveCoalescesSinkWrites(t *testing.T) {
 	}
 }
 
+func TestExternalV2BulkPacketDataPacketUsesConservativeMTU(t *testing.T) {
+	if got, want := externalV2BulkPacketMaxSize, 1400; got != want {
+		t.Fatalf("max packet size = %d, want %d", got, want)
+	}
+	if got, want := externalV2BulkPacketPayloadSize, 1358; got != want {
+		t.Fatalf("payload size = %d, want %d", got, want)
+	}
+}
+
 func TestExternalV2BulkPacketMissingBatchesHonorsLimit(t *testing.T) {
 	seen := []bool{true, false, false, true, false}
 
@@ -343,6 +352,20 @@ func TestExternalV2BulkPacketMissingBatchesHonorsLimit(t *testing.T) {
 	}
 	if got, want := batches[0], []uint32{1, 2, 4}; !slices.Equal(got, want) {
 		t.Fatalf("clamped missing batch = %v, want %v", got, want)
+	}
+}
+
+func TestExternalV2BulkPacketActiveRepairWaitsForPublicPathReorderWindow(t *testing.T) {
+	receiver := &externalV2BulkPacketReceiver{
+		totalPackets:       8192,
+		seen:               make([]bool, 8192),
+		runID:              1,
+		highestSeenPlusOne: 4096,
+	}
+
+	receiver.sendActiveMissing(time.Now())
+	if receiver.repairRequests != 0 {
+		t.Fatalf("active repair requests = %d, want 0 while still inside reorder window", receiver.repairRequests)
 	}
 }
 
@@ -380,23 +403,47 @@ func TestExternalV2BulkPacketBackoffPaceUpdatesLimiter(t *testing.T) {
 	current.Store(externalV2BulkPacketPaceMbps)
 	pacer := rate.NewLimiter(externalV2BulkPacketRateLimit(externalV2BulkPacketPaceMbps), externalV2BulkPacketPaceBurst)
 
+	if got, want := externalV2BulkPacketPaceMbps, 1000; got != want {
+		t.Fatalf("initial pace = %d, want %d", got, want)
+	}
 	externalV2BulkPacketBackoffPace(pacer, &current, &lastBackoff)
-	if got, want := current.Load(), int64(680); got != want {
+	if got, want := current.Load(), int64(850); got != want {
 		t.Fatalf("current pace after first backoff = %d, want %d", got, want)
 	}
-	if got, want := pacer.Limit(), externalV2BulkPacketRateLimit(680); got != want {
+	if got, want := pacer.Limit(), externalV2BulkPacketRateLimit(850); got != want {
 		t.Fatalf("pacer limit after first backoff = %v, want %v", got, want)
 	}
 
 	externalV2BulkPacketBackoffPace(pacer, &current, &lastBackoff)
-	if got, want := current.Load(), int64(680); got != want {
+	if got, want := current.Load(), int64(850); got != want {
 		t.Fatalf("current pace after immediate backoff = %d, want %d", got, want)
 	}
 
 	lastBackoff.Store(time.Now().Add(-externalV2BulkPacketPaceBackoff - time.Millisecond).UnixNano())
 	externalV2BulkPacketBackoffPace(pacer, &current, &lastBackoff)
-	if got, want := current.Load(), int64(578); got != want {
+	if got, want := current.Load(), int64(722); got != want {
 		t.Fatalf("current pace after delayed backoff = %d, want %d", got, want)
+	}
+}
+
+func TestExternalV2BulkPacketRecoverPaceRaisesLimiterAfterQuietPeriod(t *testing.T) {
+	var current atomic.Int64
+	var lastPaceChange atomic.Int64
+	current.Store(680)
+	lastPaceChange.Store(time.Now().Add(-externalV2BulkPacketPaceRecovery - time.Millisecond).UnixNano())
+	pacer := rate.NewLimiter(externalV2BulkPacketRateLimit(680), externalV2BulkPacketPaceBurst)
+
+	externalV2BulkPacketRecoverPace(pacer, &current, &lastPaceChange)
+	if got, want := current.Load(), int64(808); got != want {
+		t.Fatalf("current pace after quiet recovery = %d, want %d", got, want)
+	}
+	if got, want := pacer.Limit(), externalV2BulkPacketRateLimit(808); got != want {
+		t.Fatalf("pacer limit after quiet recovery = %v, want %v", got, want)
+	}
+
+	externalV2BulkPacketRecoverPace(pacer, &current, &lastPaceChange)
+	if got, want := current.Load(), int64(808); got != want {
+		t.Fatalf("current pace after immediate recovery = %d, want %d", got, want)
 	}
 }
 

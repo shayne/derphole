@@ -26,13 +26,13 @@ import (
 )
 
 const (
-	externalV2BulkPacketPayloadSize       = 1180
-	externalV2BulkPacketMaxSize           = 1300
+	externalV2BulkPacketPayloadSize       = 1358
+	externalV2BulkPacketMaxSize           = 1400
 	externalV2BulkPacketHeaderSize        = 26
 	externalV2BulkPacketRepairWait        = 30 * time.Second
 	externalV2BulkPacketReadIdle          = 100 * time.Millisecond
 	externalV2BulkPacketActiveRepair      = 100 * time.Millisecond
-	externalV2BulkPacketActiveRepairTrail = 256
+	externalV2BulkPacketActiveRepairTrail = 8192
 	externalV2BulkPacketRepairSkip        = 250 * time.Millisecond
 	externalV2BulkPacketPaceBackoff       = 500 * time.Millisecond
 	externalV2BulkPacketBackoffMissing    = 256
@@ -42,8 +42,11 @@ const (
 	externalV2BulkPacketDataQueue         = 4096
 	externalV2BulkPacketRepairQueue       = 1024
 	externalV2BulkPacketReceiveGroupBytes = 64 << 10
-	externalV2BulkPacketPaceMbps          = 800
+	externalV2BulkPacketPaceMbps          = 1000
+	externalV2BulkPacketPaceCeilingMbps   = 2400
 	externalV2BulkPacketMinPaceMbps       = 128
+	externalV2BulkPacketPaceRecovery      = 500 * time.Millisecond
+	externalV2BulkPacketPaceRecoveryStep  = 128
 	externalV2BulkPacketPaceBurst         = 512 << 10
 )
 
@@ -167,6 +170,8 @@ type externalV2BulkPacketSender struct {
 	sentPackets     atomic.Uint64
 	sentPayload     atomic.Int64
 	currentPaceMbps atomic.Int64
+	lastBackoff     atomic.Int64
+	lastRecovery    atomic.Int64
 }
 
 func newExternalV2BulkPacketSender(ctx context.Context, src *BlockSource, path externalV2BulkPacketPath, auth externalV2BulkPacketAuth, metrics *externalTransferMetrics) *externalV2BulkPacketSender {
@@ -182,6 +187,7 @@ func newExternalV2BulkPacketSender(ctx context.Context, src *BlockSource, path e
 		pacer:        rate.NewLimiter(externalV2BulkPacketRateLimit(externalV2BulkPacketPaceMbps), externalV2BulkPacketPaceBurst),
 	}
 	sender.currentPaceMbps.Store(externalV2BulkPacketPaceMbps)
+	sender.lastRecovery.Store(time.Now().UnixNano())
 	return sender
 }
 
@@ -212,6 +218,7 @@ func (s *externalV2BulkPacketSender) sendPacket(index uint32, lane int) error {
 	if err != nil {
 		return err
 	}
+	s.recoverPaceAfterQuietPeriod()
 	if err := s.pacer.WaitN(s.ctx, len(data)); err != nil {
 		return err
 	}
@@ -227,14 +234,13 @@ func (s *externalV2BulkPacketSender) sendPacket(index uint32, lane int) error {
 }
 
 func (s *externalV2BulkPacketSender) startRepairWorker(ctx context.Context, missingCh <-chan []uint32, repairActivityCh chan<- struct{}, repairErrCh chan<- error) {
-	var lastBackoff atomic.Int64
 	go func() {
 		lastRepair := make(map[uint32]time.Time)
 		repairAttempt := make(map[uint32]uint64)
 		for {
 			select {
 			case missing := <-missingCh:
-				sentRepair, err := s.repairMissing(missing, lastRepair, repairAttempt, &lastBackoff)
+				sentRepair, err := s.repairMissing(missing, lastRepair, repairAttempt)
 				if err != nil {
 					offerExternalV2BulkPacketRepairError(repairErrCh, err)
 					return
@@ -249,7 +255,7 @@ func (s *externalV2BulkPacketSender) startRepairWorker(ctx context.Context, miss
 	}()
 }
 
-func (s *externalV2BulkPacketSender) repairMissing(missing []uint32, lastRepair map[uint32]time.Time, repairAttempt map[uint32]uint64, lastBackoff *atomic.Int64) (bool, error) {
+func (s *externalV2BulkPacketSender) repairMissing(missing []uint32, lastRepair map[uint32]time.Time, repairAttempt map[uint32]uint64) (bool, error) {
 	sentRepair := false
 	now := time.Now()
 	for _, index := range missing {
@@ -259,7 +265,7 @@ func (s *externalV2BulkPacketSender) repairMissing(missing []uint32, lastRepair 
 		attempt := repairAttempt[index]
 		repairAttempt[index] = attempt + 1
 		if externalV2BulkPacketShouldBackoffForMissing(len(missing)) {
-			externalV2BulkPacketBackoffPace(s.pacer, &s.currentPaceMbps, lastBackoff)
+			externalV2BulkPacketBackoffPace(s.pacer, &s.currentPaceMbps, &s.lastBackoff)
 		}
 		if err := s.sendPacket(index, externalV2BulkPacketRepairLane(index, s.laneCount, attempt)); err != nil {
 			return sentRepair, err
@@ -278,6 +284,14 @@ func (s *externalV2BulkPacketSender) shouldRepairMissing(index uint32, now time.
 	}
 	lastRepair[index] = now
 	return true
+}
+
+func (s *externalV2BulkPacketSender) recoverPaceAfterQuietPeriod() {
+	lastBackoff := time.Unix(0, s.lastBackoff.Load())
+	if !lastBackoff.IsZero() && time.Since(lastBackoff) < externalV2BulkPacketPaceRecovery {
+		return
+	}
+	externalV2BulkPacketRecoverPace(s.pacer, &s.currentPaceMbps, &s.lastRecovery)
 }
 
 func (s *externalV2BulkPacketSender) waitForCompletion(doneCh <-chan struct{}, repairActivityCh <-chan struct{}, repairErrCh <-chan error, repairRequests *atomic.Int64) (externalDirectTransferStats, error) {
@@ -1003,6 +1017,41 @@ func externalV2BulkPacketBackoffMbps(current int64) int64 {
 	return next
 }
 
+func externalV2BulkPacketRecoverPace(pacer *rate.Limiter, currentMbps *atomic.Int64, lastRecovery *atomic.Int64) {
+	now := time.Now()
+	for {
+		last := time.Unix(0, lastRecovery.Load())
+		if now.Sub(last) < externalV2BulkPacketPaceRecovery {
+			return
+		}
+		if lastRecovery.CompareAndSwap(last.UnixNano(), now.UnixNano()) {
+			break
+		}
+	}
+	for {
+		current := currentMbps.Load()
+		next := externalV2BulkPacketRecoverMbps(current)
+		if next <= current {
+			return
+		}
+		if currentMbps.CompareAndSwap(current, next) {
+			pacer.SetLimitAt(now, externalV2BulkPacketRateLimit(int(next)))
+			return
+		}
+	}
+}
+
+func externalV2BulkPacketRecoverMbps(current int64) int64 {
+	if current >= externalV2BulkPacketPaceCeilingMbps {
+		return externalV2BulkPacketPaceCeilingMbps
+	}
+	next := current + externalV2BulkPacketPaceRecoveryStep
+	if next > externalV2BulkPacketPaceCeilingMbps {
+		return externalV2BulkPacketPaceCeilingMbps
+	}
+	return next
+}
+
 func externalV2BulkPacketCount(sizeBytes int64) uint32 {
 	if sizeBytes <= 0 {
 		return 0
@@ -1039,7 +1088,7 @@ func externalV2BulkPacketSendStats(payloadSize int64, sentPackets uint64, totalP
 		Diagnostics: externalDirectTransferDiagnostics{
 			RateSelectedMbps:     paceMbps,
 			RateTargetMbps:       paceMbps,
-			RateCeilingMbps:      externalV2BulkPacketPaceMbps,
+			RateCeilingMbps:      externalV2BulkPacketPaceCeilingMbps,
 			ActiveLanes:          lanes,
 			AvailableLanes:       lanes,
 			ControllerDecision:   "bulk-packets",

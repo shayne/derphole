@@ -19,10 +19,11 @@ import (
 )
 
 const (
-	externalV2TransferModeBlocks      = "blocks-v1"
-	externalV2TransferModeBulkPackets = "bulk-packets-v1"
-	externalV2BlockFrameSize          = 12
-	externalV2DefaultBlockChunkSize   = 256 << 10
+	externalV2TransferModeBlocks       = "blocks-v1"
+	externalV2TransferModeBulkPackets  = "bulk-packets-v1"
+	externalV2BlockFrameSize           = 12
+	externalV2DefaultBlockChunkSize    = 256 << 10
+	externalV2BulkPacketCandidateLimit = 4
 )
 
 type externalV2BlockChunk struct {
@@ -91,14 +92,18 @@ func externalV2ClaimRequestsBlockTransfer(claim externalV2Claim) bool {
 	return claim.TransferMode == externalV2TransferModeBlocks && claim.BlockSize >= 0 && claim.BlockChunkSize > 0
 }
 
-func externalV2AcceptedBlockTransferMode(claim externalV2Claim, blockTransfer bool) string {
+func externalV2AcceptedBlockTransferMode(claim externalV2Claim, blockTransfer bool, acceptCandidates []string) string {
 	if !blockTransfer {
 		return ""
 	}
-	if claim.BlockPacketCapable {
+	if externalV2ClaimPrefersBulkPacketTransfer(claim, acceptCandidates) {
 		return externalV2TransferModeBulkPackets
 	}
 	return externalV2TransferModeBlocks
+}
+
+func externalV2ClaimPrefersBulkPacketTransfer(claim externalV2Claim, acceptCandidates []string) bool {
+	return claim.BlockPacketCapable && len(acceptCandidates) <= externalV2BulkPacketCandidateLimit
 }
 
 func externalV2UsesBulkPacketTransfer(mode string) bool {
