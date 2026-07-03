@@ -118,6 +118,21 @@ func TestCheckResetsFlatlineClockWhenActivePhaseChanges(t *testing.T) {
 	}
 }
 
+func TestCheckIgnoresInitialActiveSetupBeforeFirstAppByte(t *testing.T) {
+	csvText := "timestamp_unix_ms,role,phase,app_bytes,last_error\n" +
+		"1000,send,direct_execute,0,\n" +
+		"2501,send,direct_execute,0,\n" +
+		"3000,send,direct_execute,1024,\n" +
+		"3500,send,complete,1024,\n"
+	result, err := Check(strings.NewReader(csvText), Options{Role: RoleSend, StallWindow: time.Second, ExpectedBytes: 1024})
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if result.Rows != 4 || result.FinalAppBytes != 1024 || result.FinalPhase != PhaseComplete {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
 func TestCheckFailsApplicationFlatline(t *testing.T) {
 	csvText := HeaderLine + "\n" +
 		"1000,0,receive,relay,1024,0,1024,1024,0.00,0,0,,,false,,,,,,,,,,,,connected-relay,\n" +

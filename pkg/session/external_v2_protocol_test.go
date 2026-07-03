@@ -5,6 +5,7 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -69,6 +70,25 @@ func TestExternalV2DefaultPolicyStartsAtEmpiricalBulkDefault(t *testing.T) {
 func TestExternalV2CopyBufferSizeMatchesLatencyFriendlyStripedChunk(t *testing.T) {
 	if externalV2CopyBufferSize != externalCopyBufferSize {
 		t.Fatalf("externalV2CopyBufferSize = %d, want %d", externalV2CopyBufferSize, externalCopyBufferSize)
+	}
+}
+
+func TestExternalV2BlockTransferModePrefersBulkPacketsWhenBothPeersSupportIt(t *testing.T) {
+	payload := []byte("bulk packet capable")
+	var claim externalV2Claim
+	externalV2BlockSourceClaim(&BlockSource{
+		Payload:     bytes.NewReader(payload),
+		PayloadSize: int64(len(payload)),
+	}, &claim)
+	if !claim.BlockPacketCapable {
+		t.Fatal("claim BlockPacketCapable = false, want true")
+	}
+	if got := externalV2AcceptedBlockTransferMode(claim, true); got != externalV2TransferModeBulkPackets {
+		t.Fatalf("accepted block mode = %q, want %q", got, externalV2TransferModeBulkPackets)
+	}
+	claim.BlockPacketCapable = false
+	if got := externalV2AcceptedBlockTransferMode(claim, true); got != externalV2TransferModeBlocks {
+		t.Fatalf("accepted block mode without packet support = %q, want %q", got, externalV2TransferModeBlocks)
 	}
 }
 

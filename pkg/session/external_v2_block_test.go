@@ -8,9 +8,13 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/shayne/derphole/pkg/telemetry"
 )
 
 func TestExternalV2BlockChunkSizeDefaultsToLargeBlocks(t *testing.T) {
@@ -260,6 +264,93 @@ func TestExternalV2BlockTransferRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(sink.bytes(), payload) {
 		t.Fatalf("received payload = %q, want %q", string(sink.bytes()), string(payload))
+	}
+}
+
+func TestExternalV2BlockTransferUsesBulkPacketsOnRawDirect(t *testing.T) {
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+
+	prevInterfaceAddrs := publicInterfaceAddrs
+	publicInterfaceAddrs = func() ([]net.Addr, error) {
+		return []net.Addr{
+			&net.IPNet{
+				IP:   net.IPv4(127, 0, 0, 1),
+				Mask: net.CIDRMask(8, 32),
+			},
+		}, nil
+	}
+	t.Cleanup(func() { publicInterfaceAddrs = prevInterfaceAddrs })
+
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	header := []byte("bulk-header")
+	payload := bytes.Repeat([]byte("bulk-packets:"), 64<<10)
+	sink := newMemoryBlockSink(int64(len(payload)))
+	var listenerStatus syncBuffer
+	var senderStatus syncBuffer
+	tokenSink := make(chan string, 1)
+	listenErr := make(chan error, 1)
+	go func() {
+		_, err := listenExternal(ctx, ListenConfig{
+			TokenSink:     tokenSink,
+			Emitter:       telemetry.New(&listenerStatus, telemetry.LevelVerbose),
+			UsePublicDERP: true,
+			BlockReceiver: func(_ context.Context, req BlockReceiveRequest) (BlockReceiveSink, error) {
+				if !bytes.Equal(req.Header, header) {
+					t.Errorf("block header = %q, want %q", string(req.Header), string(header))
+				}
+				if req.PayloadSize != int64(len(payload)) {
+					t.Errorf("payload size = %d, want %d", req.PayloadSize, len(payload))
+				}
+				return sink, nil
+			},
+		})
+		listenErr <- err
+	}()
+
+	var raw string
+	select {
+	case raw = <-tokenSink:
+	case err := <-listenErr:
+		t.Fatalf("listenExternal() returned before token: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for token: %v", ctx.Err())
+	}
+
+	if err := sendExternal(ctx, SendConfig{
+		Token:         raw,
+		Emitter:       telemetry.New(&senderStatus, telemetry.LevelVerbose),
+		UsePublicDERP: true,
+		BlockSource: &BlockSource{
+			Header:      header,
+			Payload:     bytes.NewReader(payload),
+			PayloadSize: int64(len(payload)),
+		},
+	}); err != nil {
+		t.Fatalf("sendExternal() error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+	}
+	select {
+	case err := <-listenErr:
+		if err != nil {
+			t.Fatalf("listenExternal() error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for listener: %v", ctx.Err())
+	}
+	if !bytes.Equal(sink.bytes(), payload) {
+		t.Fatalf("received payload length = %d, want %d", len(sink.bytes()), len(payload))
+	}
+	if got := senderStatus.String(); !strings.Contains(got, "v2-block-transfer=bulk-packets") {
+		t.Fatalf("sender status = %q, want bulk packet transfer marker", got)
+	}
+	if got := listenerStatus.String(); !strings.Contains(got, "v2-block-transfer=bulk-packets") {
+		t.Fatalf("listener status = %q, want bulk packet transfer marker", got)
 	}
 }
 

@@ -206,11 +206,19 @@ func (m *externalTransferMetrics) SetDirectAppProgressBase(offset int64) {
 }
 
 func (m *externalTransferMetrics) RecordDirectPathSend(n int64, at time.Time) {
-	m.recordDirectPathBytes(n, at, true)
+	m.recordDirectPathBytes(n, at, true, "quic")
 }
 
 func (m *externalTransferMetrics) RecordDirectPathReceive(n int64, at time.Time) {
-	m.recordDirectPathBytes(n, at, false)
+	m.recordDirectPathBytes(n, at, false, "quic")
+}
+
+func (m *externalTransferMetrics) RecordDirectPacketSend(n int64, at time.Time) {
+	m.recordDirectPathBytes(n, at, true, "udp")
+}
+
+func (m *externalTransferMetrics) RecordDirectPacketReceive(n int64, at time.Time) {
+	m.recordDirectPathBytes(n, at, false, "udp")
 }
 
 func (m *externalTransferMetrics) RecordStripedSendBlocked(d time.Duration, at time.Time) {
@@ -477,13 +485,20 @@ func (m *externalTransferMetrics) recordWrite(totalBytes *int64, n int64, at tim
 	sampleExternalTransferTrace(trace, snap, ok)
 }
 
-func (m *externalTransferMetrics) recordDirectPathBytes(n int64, at time.Time, send bool) {
+func (m *externalTransferMetrics) recordDirectPathBytes(n int64, at time.Time, send bool, transport string) {
 	if m == nil || n <= 0 {
 		return
 	}
 	at = nonZeroTime(at)
 	m.mu.Lock()
-	m.directTransport = "quic"
+	m.directTransport = transport
+	if !m.directValidated {
+		m.directValidated = true
+		if m.phase != transfertrace.PhaseComplete && m.phase != transfertrace.PhaseError {
+			m.phase = transfertrace.PhaseDirectExecute
+			m.lastState = string(StateDirect)
+		}
+	}
 	m.directBytes += n
 	m.directPacketBytes += n
 	if send {

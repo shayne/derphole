@@ -75,6 +75,9 @@ func negotiateExternalV2DirectPacketPath(ctx context.Context, client *derpbind.C
 }
 
 func negotiateExternalV2DirectPacketPathUnbounded(ctx context.Context, client *derpbind.Client, peerDERP key.NodePublic, manager *transport.Manager, dm *tailcfg.DERPMap, auth externalPeerControlAuth, emitter *telemetry.Emitter, streamCount int, punchDelay time.Duration) (externalV2DirectPacketPath, error) {
+	if fakeTransportEnabled() {
+		ctx = withExternalV2RawDirectAllowUnverifiedFallback(ctx)
+	}
 	var local externalV2DataPacketPath
 	localRawDirect := false
 	if externalV2RawDirectEnabled() {
@@ -263,6 +266,9 @@ func openExternalV2DataPacketPath(ctx context.Context, dm *tailcfg.DERPMap, emit
 }
 
 func externalV2DataPacketListenAddr() string {
+	if fakeTransportEnabled() {
+		return "127.0.0.1:0"
+	}
 	ip := externalV2DefaultRouteIPv4()
 	if ip == nil || ip.IsUnspecified() || ip.IsLoopback() || ip.To4() == nil {
 		return ":0"

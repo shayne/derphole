@@ -285,17 +285,33 @@ func (rt *externalV2SendRuntime) acceptAndStartTransport(ctx context.Context, pa
 func (rt *externalV2SendRuntime) sendStream(ctx context.Context, accept externalV2Accept, manager *transport.Manager, relayOnly bool, metrics *externalTransferMetrics, streamCount int, managerConnections int, rawDirectBudget time.Duration, progress *externalV2PeerProgressState) error {
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	defer cancelStream()
-	client := dataplane.NewQUICClient(manager, rt.identity, rt.tok.QUICPublic)
-	client.SetManagerConnectionCount(managerConnections)
 	path, err := negotiateExternalV2DirectPacketPath(streamCtx, rt.derp, rt.listenerDERP, manager, rt.dm, rt.auth, rt.cfg.Emitter, streamCount, externalV2DataPlaneSenderPunchDelay, rawDirectBudget, relayOnly)
 	if err != nil {
 		return err
 	}
 	defer path.Close()
-	if path.raw {
-		client = dataplane.NewQUICClientOnPacketConns(path.conns, path.addrs, rt.identity, rt.tok.QUICPublic)
-		client.SetManagerConnectionCount(managerConnections)
+	if path.raw && externalV2UsesBulkPacketTransfer(accept.TransferMode) {
+		emitExternalV2Debug(rt.cfg.Emitter, "v2-block-transfer=bulk-packets")
+		abortErrCh, stopAbortWatch := rt.watchAbort(ctx, cancelStream)
+		defer stopAbortWatch()
+		return rt.sendBulkPacketBlock(streamCtx, ctx, path, metrics, abortErrCh, progress)
 	}
+	client := rt.newExternalV2SendClient(manager, path, managerConnections)
+	return rt.copySendStreamWithClient(streamCtx, ctx, accept, path.raw, streamCount, client, cancelStream, metrics, progress)
+}
+
+func (rt *externalV2SendRuntime) newExternalV2SendClient(manager *transport.Manager, path externalV2DirectPacketPath, managerConnections int) *dataplane.QUICClient {
+	if path.raw {
+		client := dataplane.NewQUICClientOnPacketConns(path.conns, path.addrs, rt.identity, rt.tok.QUICPublic)
+		client.SetManagerConnectionCount(managerConnections)
+		return client
+	}
+	client := dataplane.NewQUICClient(manager, rt.identity, rt.tok.QUICPublic)
+	client.SetManagerConnectionCount(managerConnections)
+	return client
+}
+
+func (rt *externalV2SendRuntime) copySendStreamWithClient(streamCtx context.Context, ctx context.Context, accept externalV2Accept, boundedOpen bool, streamCount int, client *dataplane.QUICClient, cancelStream context.CancelFunc, metrics *externalTransferMetrics, progress *externalV2PeerProgressState) error {
 	abortErrCh, stopAbortWatch := rt.watchAbort(ctx, func() {
 		cancelStream()
 		_ = client.CloseWithError(1, "peer aborted transfer")
@@ -303,8 +319,7 @@ func (rt *externalV2SendRuntime) sendStream(ctx context.Context, accept external
 	defer stopAbortWatch()
 	openCtx := streamCtx
 	cancelOpen := func() {}
-	boundedOpen := path.raw
-	if path.raw {
+	if boundedOpen {
 		openCtx, cancelOpen = context.WithTimeout(streamCtx, externalV2StreamOpenWait)
 	}
 	streams, err := client.OpenStreams(openCtx, streamCount)
@@ -328,6 +343,27 @@ func (rt *externalV2SendRuntime) sendStream(ctx context.Context, accept external
 	if err := client.CloseWithError(0, "complete"); err != nil {
 		return err
 	}
+	if complete.BytesReceived < 0 {
+		return fmt.Errorf("invalid v2 complete bytes %d", complete.BytesReceived)
+	}
+	return nil
+}
+
+func (rt *externalV2SendRuntime) sendBulkPacketBlock(streamCtx context.Context, completeCtx context.Context, path externalV2DirectPacketPath, metrics *externalTransferMetrics, abortErrCh <-chan error, progress *externalV2PeerProgressState) error {
+	auth, err := externalV2BulkPacketAuthForToken(rt.tok, rt.derp.PublicKey(), rt.listenerDERP)
+	if err != nil {
+		return err
+	}
+	stats, err := sendExternalV2BulkBlockPackets(streamCtx, rt.cfg.BlockSource, externalV2BulkPacketPathFromRaw(path), auth, metrics)
+	metrics.SetDirectStats(stats)
+	if err != nil {
+		return externalV2PreferPeerAbort(completeCtx, abortErrCh, err)
+	}
+	complete, err := rt.receiveComplete(completeCtx, abortErrCh, rt.cfg.StdioExpectedBytes, progress)
+	if err != nil {
+		return err
+	}
+	metrics.RecordPeerProgress(complete.BytesReceived, 0, time.Now())
 	if complete.BytesReceived < 0 {
 		return fmt.Errorf("invalid v2 complete bytes %d", complete.BytesReceived)
 	}
@@ -680,7 +716,7 @@ func (rt *externalV2ListenRuntime) receive(ctx context.Context, accepted externa
 	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
 
 	policy := externalV2ParallelPolicy(accepted.claim)
-	accept, err := rt.sendAccept(ctx, accepted.peerDERP, tr.localCandidates, policy, useBlock)
+	accept, err := rt.sendAccept(ctx, accepted.peerDERP, tr.localCandidates, policy, accepted.claim, useBlock)
 	if err != nil {
 		return err
 	}
@@ -691,7 +727,7 @@ func (rt *externalV2ListenRuntime) receive(ctx context.Context, accepted externa
 	defer stopPeerProgress()
 	if useBlock {
 		go sendPeerProgressLoop(progressCtx, rt.session.derp, accepted.peerDERP, blockSink.Count, blockSink.FirstByteAt, rt.auth)
-		return rt.receiveQUICBlock(ctx, accepted, tr, policy, managerConnections, rawDirectBudget, blockSink, blockCfg, metrics, pathEmitter)
+		return rt.receiveQUICBlock(ctx, accepted, accept.TransferMode, tr, policy, managerConnections, rawDirectBudget, blockSink, blockCfg, metrics, pathEmitter)
 	}
 	go sendPeerProgressLoop(progressCtx, rt.session.derp, accepted.peerDERP, countedDst.Count, countedDst.FirstByteAt, rt.auth)
 	return rt.receiveQUIC(ctx, accepted, tr, policy, managerConnections, rawDirectBudget, countedDst, metrics, pathEmitter)
@@ -870,7 +906,7 @@ func (rt *externalV2ListenRuntime) notifyAbort(peerDERP key.NodePublic, err erro
 	}, rt.auth)
 }
 
-func (rt *externalV2ListenRuntime) sendAccept(ctx context.Context, peerDERP key.NodePublic, candidates []string, policy ParallelPolicy, blockTransfer bool) (externalV2Accept, error) {
+func (rt *externalV2ListenRuntime) sendAccept(ctx context.Context, peerDERP key.NodePublic, candidates []string, policy ParallelPolicy, claim externalV2Claim, blockTransfer bool) (externalV2Accept, error) {
 	accept := externalV2Accept{
 		Protocol:     externalV2Protocol,
 		Accepted:     true,
@@ -881,7 +917,7 @@ func (rt *externalV2ListenRuntime) sendAccept(ctx context.Context, peerDERP key.
 	accept.ManagerConnections = externalV2SetManagerConnectionCount(policy)
 	accept.RawDirectBudgetMS = externalV2SetRawDirectStartupBudgetMS()
 	if blockTransfer {
-		accept.TransferMode = externalV2TransferModeBlocks
+		accept.TransferMode = externalV2AcceptedBlockTransferMode(claim, true)
 	}
 	err := sendAuthenticatedEnvelope(ctx, rt.session.derp, peerDERP, envelope{
 		Type:     envelopeV2Accept,

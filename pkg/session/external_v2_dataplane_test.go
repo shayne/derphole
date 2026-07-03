@@ -11,6 +11,13 @@ import (
 	"time"
 )
 
+func TestExternalV2DataPacketListenAddrUsesLoopbackForFakeTransport(t *testing.T) {
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	if got := externalV2DataPacketListenAddr(); got != "127.0.0.1:0" {
+		t.Fatalf("listen addr = %q, want loopback fake transport bind", got)
+	}
+}
+
 func TestExternalV2DataPacketCandidateKeepsSetMappedLanesIsolated(t *testing.T) {
 	prevRoute := externalV2RawDirectRouteCandidate
 	externalV2RawDirectRouteCandidate = func(_ net.PacketConn, _ string) bool {

@@ -307,6 +307,10 @@ func (c *checker) consume(row checkerRow) error {
 		c.recordInactive(row)
 		return nil
 	}
+	if c.lastAppBytes == 0 && row.appBytes == 0 {
+		c.recordPreProgressActive(row)
+		return nil
+	}
 	if !c.active || row.appBytes > c.lastAppBytes {
 		c.recordActiveProgress(row)
 		return nil
@@ -392,6 +396,11 @@ func (c *checker) recordInactive(row checkerRow) {
 	if row.appBytes > c.lastAppBytes {
 		c.lastAppBytes = row.appBytes
 	}
+	c.active = false
+	c.lastPhase = row.phase
+}
+
+func (c *checker) recordPreProgressActive(row checkerRow) {
 	c.active = false
 	c.lastPhase = row.phase
 }
