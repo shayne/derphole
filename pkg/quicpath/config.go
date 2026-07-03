@@ -48,6 +48,7 @@ func DefaultQUICConfig() *quic.Config {
 		MaxIdleTimeout:                 30 * time.Second,
 		HandshakeIdleTimeout:           10 * time.Second,
 		InitialPacketSize:              1200,
+		DisablePathMTUDiscovery:        false,
 		InitialStreamReceiveWindow:     initialStreamReceiveWindow,
 		MaxStreamReceiveWindow:         maxStreamReceiveWindow,
 		InitialConnectionReceiveWindow: initialConnectionReceiveWindow,

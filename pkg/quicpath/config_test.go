@@ -16,7 +16,7 @@ func TestDefaultQUICConfigUsesConservativeInitialPacketSize(t *testing.T) {
 	}
 }
 
-func TestDefaultQUICConfigKeepsPathMTUDiscoveryEnabled(t *testing.T) {
+func TestDefaultQUICConfigEnablesPathMTUDiscovery(t *testing.T) {
 	cfg := DefaultQUICConfig()
 	if cfg.DisablePathMTUDiscovery {
 		t.Fatal("DisablePathMTUDiscovery = true, want false")

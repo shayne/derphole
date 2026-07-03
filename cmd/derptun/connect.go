@@ -70,12 +70,11 @@ func runConnect(args []string, level telemetry.Level, stdin io.Reader, stdout, s
 	ctx, stop := commandContext()
 	defer stop()
 	if err := derptunConnect(ctx, session.DerptunConnectConfig{
-		ClientToken:   token,
-		StdioIn:       streamIn,
-		StdioOut:      stdout,
-		Emitter:       telemetry.New(stderr, commandSessionTelemetryLevel(level)),
-		ForceRelay:    parsed.SubCommandFlags.ForceRelay,
-		UsePublicDERP: usePublicDERPTransport(),
+		ClientToken: token,
+		StdioIn:     streamIn,
+		StdioOut:    stdout,
+		Emitter:     telemetry.New(stderr, commandSessionTelemetryLevel(level)),
+		ForceRelay:  parsed.SubCommandFlags.ForceRelay,
 	}); err != nil && !errors.Is(err, context.Canceled) {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1

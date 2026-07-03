@@ -77,12 +77,11 @@ func runOpenSession(ctx context.Context, token string, parsed *yargs.TypedParseR
 	done := make(chan error, 1)
 	go func() {
 		done <- derptunOpen(ctx, session.DerptunOpenConfig{
-			ClientToken:   token,
-			ListenAddr:    parsed.SubCommandFlags.Listen,
-			BindAddrSink:  bindSink,
-			Emitter:       telemetry.New(stderr, commandSessionTelemetryLevel(level)),
-			ForceRelay:    parsed.SubCommandFlags.ForceRelay,
-			UsePublicDERP: usePublicDERPTransport(),
+			ClientToken:  token,
+			ListenAddr:   parsed.SubCommandFlags.Listen,
+			BindAddrSink: bindSink,
+			Emitter:      telemetry.New(stderr, commandSessionTelemetryLevel(level)),
+			ForceRelay:   parsed.SubCommandFlags.ForceRelay,
 		})
 	}()
 

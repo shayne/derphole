@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	quic "github.com/quic-go/quic-go"
 	"github.com/shayne/derphole/pkg/derpbind"
 	"github.com/shayne/derphole/pkg/derptun"
 	"github.com/shayne/derphole/pkg/quicpath"
@@ -86,6 +87,166 @@ func TestDerptunOpenForwardsTCPToServedTarget(t *testing.T) {
 	<-openErr
 }
 
+func TestDerptunOpenForwardsConcurrentTCPConnections(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	backend, accepted := startHoldingTCPServer(t)
+	serverToken, clientToken := derptunServerAndClientTokens(t)
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- DerptunServe(ctx, DerptunServeConfig{ServerToken: serverToken, TargetAddr: backend, ForceRelay: true})
+	}()
+
+	bindCh := make(chan string, 1)
+	openErr := make(chan error, 1)
+	go func() {
+		openErr <- DerptunOpen(ctx, DerptunOpenConfig{ClientToken: clientToken, ListenAddr: "127.0.0.1:0", BindAddrSink: bindCh, ForceRelay: true})
+	}()
+	bindAddr := <-bindCh
+
+	firstConn, err := net.Dial("tcp", bindAddr)
+	if err != nil {
+		t.Fatalf("first Dial(open listener) error = %v", err)
+	}
+	defer firstConn.Close()
+	if _, err := firstConn.Write([]byte("x")); err != nil {
+		t.Fatalf("first Write() error = %v", err)
+	}
+	waitForBackendAccept(t, ctx, accepted, "first connection")
+
+	secondConn, err := net.Dial("tcp", bindAddr)
+	if err != nil {
+		t.Fatalf("second Dial(open listener) error = %v", err)
+	}
+	defer secondConn.Close()
+	if _, err := secondConn.Write([]byte("x")); err != nil {
+		t.Fatalf("second Write() error = %v", err)
+	}
+	waitForBackendAccept(t, ctx, accepted, "second connection")
+
+	cancel()
+	<-serveErr
+	<-openErr
+}
+
+func TestDerptunOpenStripesTCPConnectionsAcrossQUICConnections(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	backend, backendDone := startEchoServer(t, ctx)
+	defer backendDone()
+	serverToken, clientToken := derptunServerAndClientTokens(t)
+	var serveStatus syncBuffer
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- DerptunServe(ctx, DerptunServeConfig{
+			ServerToken: serverToken,
+			TargetAddr:  backend,
+			Emitter:     telemetry.New(&serveStatus, telemetry.LevelVerbose),
+			ForceRelay:  true,
+		})
+	}()
+
+	bindCh := make(chan string, 1)
+	openErr := make(chan error, 1)
+	go func() {
+		openErr <- DerptunOpen(ctx, DerptunOpenConfig{
+			ClientToken:  clientToken,
+			ListenAddr:   "127.0.0.1:0",
+			BindAddrSink: bindCh,
+			ForceRelay:   true,
+		})
+	}()
+	bindAddr := <-bindCh
+
+	for _, payload := range []string{"first", "second"} {
+		reply, err := roundTripTCP(ctx, bindAddr, payload)
+		if err != nil {
+			t.Fatalf("roundTripTCP(%q) error = %v; serve=%q", payload, err, serveStatus.String())
+		}
+		if reply != payload {
+			t.Fatalf("reply = %q, want %q", reply, payload)
+		}
+	}
+
+	waitCtx, waitCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer waitCancel()
+	if err := waitForSessionTestStatusOccurrences(waitCtx, &serveStatus, "derptun-quic-connection-accepted", 9); err != nil {
+		t.Fatalf("serve status = %q, want control plus striped per-flow QUIC connections: %v", serveStatus.String(), err)
+	}
+
+	cancel()
+	<-serveErr
+	<-openErr
+}
+
+func TestDerptunOpenUsesV2RawDirectDataPlane(t *testing.T) {
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	backend, backendDone := startEchoServer(t, ctx)
+	defer backendDone()
+	serverToken, clientToken := derptunServerAndClientTokens(t)
+	var serveStatus syncBuffer
+	var openStatus syncBuffer
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- DerptunServe(ctx, DerptunServeConfig{
+			ServerToken: serverToken,
+			TargetAddr:  backend,
+			Emitter:     telemetry.New(&serveStatus, telemetry.LevelVerbose),
+		})
+	}()
+
+	bindCh := make(chan string, 1)
+	openErr := make(chan error, 1)
+	go func() {
+		openErr <- DerptunOpen(ctx, DerptunOpenConfig{
+			ClientToken:  clientToken,
+			ListenAddr:   "127.0.0.1:0",
+			BindAddrSink: bindCh,
+			Emitter:      telemetry.New(&openStatus, telemetry.LevelVerbose),
+		})
+	}()
+	bindAddr := <-bindCh
+
+	reply, err := roundTripTCP(ctx, bindAddr, "raw-direct")
+	if err != nil {
+		t.Fatalf("roundTripTCP() error = %v; serve=%q open=%q", err, serveStatus.String(), openStatus.String())
+	}
+	if reply != "raw-direct" {
+		t.Fatalf("reply = %q, want raw-direct; serve=%q open=%q", reply, serveStatus.String(), openStatus.String())
+	}
+	waitCtx, waitCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer waitCancel()
+	if err := waitForSessionTestStatusContains(waitCtx, &serveStatus, "v2-data-plane=raw-direct"); err != nil {
+		t.Fatalf("serve status = %q, want raw-direct data plane: %v", serveStatus.String(), err)
+	}
+	if err := waitForSessionTestStatusContains(waitCtx, &openStatus, "v2-data-plane=raw-direct"); err != nil {
+		t.Fatalf("open status = %q, want raw-direct data plane: %v", openStatus.String(), err)
+	}
+
+	cancel()
+	<-serveErr
+	<-openErr
+}
+
 func TestDerptunConnectBridgesStdio(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
@@ -98,19 +259,24 @@ func TestDerptunConnectBridgesStdio(t *testing.T) {
 	serverToken, clientToken := derptunServerAndClientTokens(t)
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- DerptunServe(ctx, DerptunServeConfig{ServerToken: serverToken, TargetAddr: backend})
+		serveErr <- DerptunServe(ctx, DerptunServeConfig{ServerToken: serverToken, TargetAddr: backend, ForceRelay: true})
 	}()
 	var out strings.Builder
+	start := time.Now()
 	err := DerptunConnect(ctx, DerptunConnectConfig{
 		ClientToken: clientToken,
 		StdioIn:     strings.NewReader("hello\n"),
 		StdioOut:    &out,
+		ForceRelay:  true,
 	})
 	if err != nil {
 		t.Fatalf("DerptunConnect() error = %v", err)
 	}
 	if out.String() != "echo: hello\n" {
 		t.Fatalf("stdout = %q, want echo: hello", out.String())
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("DerptunConnect() elapsed = %v, want under 5s", elapsed)
 	}
 	cancel()
 	<-serveErr
@@ -178,6 +344,9 @@ func TestDerptunServeRejectsConcurrentConnector(t *testing.T) {
 			ForceRelay:  true,
 		})
 	}()
+	if _, err := firstInputWriter.Write([]byte("first\n")); err != nil {
+		t.Fatalf("first connector Write() error = %v", err)
+	}
 	select {
 	case <-accepted:
 	case <-ctx.Done():
@@ -403,7 +572,7 @@ func TestDerptunServerTokenForClaimRejectsClientExpiryPastServerExpiry(t *testin
 	}
 }
 
-func TestHandleDerptunServeClaimRejectsSourceMismatch(t *testing.T) {
+func TestHandleDerptunServeRuntimeClaimRejectsSourceMismatch(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	serverToken, err := derptun.GenerateServerToken(derptun.ServerTokenOptions{Now: now, Days: 30})
 	if err != nil {
@@ -430,22 +599,18 @@ func TestHandleDerptunServeClaimRejectsSourceMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Marshal() error = %v", err)
 	}
+	runtime := &derptunServeRuntime{server: serverCred}
 	gate := &derptunClientGate{}
-	active, err := handleDerptunServeClaim(
+	active, err := handleDerptunServeRuntimeClaim(
 		context.Background(),
-		DerptunServeConfig{ForceRelay: true},
-		serverCred,
-		quicpath.SessionIdentity{},
-		nil,
-		nil,
-		nil,
-		nil,
+		derptunServeSessionConfig{ForceRelay: true, TargetAddr: "127.0.0.1:1"},
+		runtime,
 		gate,
 		nil,
 		derpbind.Packet{From: key.NewNode().Public(), Payload: payload},
 	)
 	if err != nil {
-		t.Fatalf("handleDerptunServeClaim() error = %v, want nil for ignored source mismatch", err)
+		t.Fatalf("handleDerptunServeRuntimeClaim() error = %v, want nil for ignored source mismatch", err)
 	}
 	if active != nil {
 		t.Fatalf("active = %+v, want nil", active)
@@ -455,7 +620,7 @@ func TestHandleDerptunServeClaimRejectsSourceMismatch(t *testing.T) {
 	}
 }
 
-func TestHandleDerptunServeClaimRejectsUnsignedEnvelope(t *testing.T) {
+func TestHandleDerptunServeRuntimeClaimRejectsUnsignedEnvelope(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -513,15 +678,18 @@ func TestHandleDerptunServeClaimRejectsUnsignedEnvelope(t *testing.T) {
 	}
 
 	gate := &derptunClientGate{}
-	active, err := handleDerptunServeClaim(
+	runtime := &derptunServeRuntime{
+		server:     serverCred,
+		identity:   quicpath.SessionIdentity{},
+		dm:         srv.Map,
+		derpClient: derpClient,
+		probeConn:  probeConn,
+		pm:         newBoundPublicPortmap(probeConn, nil),
+	}
+	active, err := handleDerptunServeRuntimeClaim(
 		ctx,
-		DerptunServeConfig{ForceRelay: true},
-		serverCred,
-		quicpath.SessionIdentity{},
-		srv.Map,
-		derpClient,
-		probeConn,
-		newBoundPublicPortmap(probeConn, nil),
+		derptunServeSessionConfig{ForceRelay: true, TargetAddr: "127.0.0.1:1"},
+		runtime,
 		gate,
 		nil,
 		derpbind.Packet{From: peerDERP.PublicKey(), Payload: payload},
@@ -530,7 +698,7 @@ func TestHandleDerptunServeClaimRejectsUnsignedEnvelope(t *testing.T) {
 		defer func() { _ = active.stop(context.Background()) }()
 	}
 	if err != nil {
-		t.Fatalf("handleDerptunServeClaim() error = %v, want nil for ignored unsigned claim", err)
+		t.Fatalf("handleDerptunServeRuntimeClaim() error = %v, want nil for ignored unsigned claim", err)
 	}
 	if active != nil {
 		t.Fatalf("active = %+v, want nil", active)
@@ -666,106 +834,74 @@ func TestRecoverStaleDerptunActiveReleasesClosedTransport(t *testing.T) {
 	}
 }
 
-func TestServeDerptunMuxTargetAllowsOneActiveStream(t *testing.T) {
+func TestServeQUICListenerForwardsConcurrentStreams(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	backend, accepted := startHoldingTCPServer(t)
-	clientCarrier, serverCarrier := net.Pipe()
-	clientMux := derptun.NewMux(derptun.MuxConfig{Role: derptun.MuxRoleClient, ReconnectTimeout: time.Second})
-	serverMux := derptun.NewMux(derptun.MuxConfig{Role: derptun.MuxRoleServer, ReconnectTimeout: time.Second})
-	defer clientMux.Close()
-	defer serverMux.Close()
-	clientMux.ReplaceCarrier(clientCarrier)
-	serverMux.ReplaceCarrier(serverCarrier)
+	serverIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(server) error = %v", err)
+	}
+	clientIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(client) error = %v", err)
+	}
+	packetConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer packetConn.Close()
+	listener, err := quic.Listen(packetConn, quicpath.ServerTLSConfig(serverIdentity, clientIdentity.Public), derptunQUICConfig())
+	if err != nil {
+		t.Fatalf("quic.Listen() error = %v", err)
+	}
+	defer listener.Close()
+	clientPacketConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(client) error = %v", err)
+	}
+	defer clientPacketConn.Close()
 
-	var debug bytes.Buffer
-	errCh := make(chan error, 1)
+	serveErr := make(chan error, 1)
 	go func() {
-		errCh <- serveDerptunMuxTarget(ctx, serverMux, backend, telemetry.New(&debug, telemetry.LevelVerbose))
-	}()
-
-	firstConn, err := clientMux.OpenStream(ctx)
-	if err != nil {
-		t.Fatalf("first OpenStream() error = %v", err)
-	}
-	defer firstConn.Close()
-	select {
-	case <-accepted:
-	case <-ctx.Done():
-		t.Fatal("first stream did not reach backend")
-	}
-
-	secondConn, err := clientMux.OpenStream(ctx)
-	if err != nil {
-		t.Fatalf("second OpenStream() error = %v, want accepted then closed by server stream limit", err)
-	}
-	defer secondConn.Close()
-	waitForBufferContains(t, &debug, "derptun-stream-limit-reached")
-	select {
-	case <-accepted:
-		t.Fatal("second stream reached backend while first stream was still active")
-	default:
-	}
-
-	if err := firstConn.Close(); err != nil {
-		t.Fatalf("first Close() error = %v", err)
-	}
-	thirdConn := openStreamUntilBackendAccepted(t, ctx, clientMux, accepted)
-	defer thirdConn.Close()
-
-	cancel()
-	if err := <-errCh; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("serveDerptunMuxTarget() error = %v", err)
-	}
-}
-
-func TestServeDerptunMuxTargetRemovesStreamWhenBackendCloses(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	backend := startCountingEchoServer(t, 3)
-	clientCarrier, serverCarrier := net.Pipe()
-	clientMux := derptun.NewMux(derptun.MuxConfig{Role: derptun.MuxRoleClient, ReconnectTimeout: time.Second})
-	serverMux := derptun.NewMux(derptun.MuxConfig{Role: derptun.MuxRoleServer, ReconnectTimeout: time.Second})
-	defer clientMux.Close()
-	defer serverMux.Close()
-	clientMux.ReplaceCarrier(clientCarrier)
-	serverMux.ReplaceCarrier(serverCarrier)
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- serveDerptunMuxTarget(ctx, serverMux, backend, nil)
-	}()
-
-	conn, err := clientMux.OpenStream(ctx)
-	if err != nil {
-		t.Fatalf("OpenStream() error = %v", err)
-	}
-	reader := bufio.NewReader(conn)
-	for i := 0; i < 3; i++ {
-		if _, err := io.WriteString(conn, "ping\n"); err != nil {
-			t.Fatalf("WriteString(%d) error = %v", i, err)
-		}
-		line, err := reader.ReadString('\n')
+		quicConn, err := listener.Accept(ctx)
 		if err != nil {
-			t.Fatalf("ReadString(%d) error = %v", i, err)
+			serveErr <- err
+			return
 		}
-		if line != "pong\n" {
-			t.Fatalf("line(%d) = %q, want pong", i, line)
-		}
+		serveErr <- serveQUICListener(ctx, quicConn, backend, nil)
+	}()
+
+	clientConn, err := quic.Dial(ctx, clientPacketConn, packetConn.LocalAddr(), quicpath.ClientTLSConfig(clientIdentity, serverIdentity.Public), derptunQUICConfig())
+	if err != nil {
+		t.Fatalf("quic.Dial() error = %v", err)
 	}
-	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatalf("SetReadDeadline() error = %v", err)
+	defer func() { _ = clientConn.CloseWithError(0, "") }()
+
+	firstStream, err := clientConn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("first OpenStreamSync() error = %v", err)
 	}
-	if _, err := conn.Read(make([]byte, 1)); err == nil {
-		t.Fatal("Read() error = nil, want backend close")
+	defer firstStream.Close()
+	if _, err := firstStream.Write([]byte("x")); err != nil {
+		t.Fatalf("first stream Write() error = %v", err)
 	}
-	waitForMuxStreamCount(t, serverMux, 0)
+	waitForBackendAccept(t, ctx, accepted, "first native QUIC stream")
+
+	secondStream, err := clientConn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("second OpenStreamSync() error = %v", err)
+	}
+	defer secondStream.Close()
+	if _, err := secondStream.Write([]byte("x")); err != nil {
+		t.Fatalf("second stream Write() error = %v", err)
+	}
+	waitForBackendAccept(t, ctx, accepted, "second native QUIC stream")
 
 	cancel()
-	if err := <-errCh; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("serveDerptunMuxTarget() error = %v", err)
+	if err := <-serveErr; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("serveQUICListener() error = %v", err)
 	}
 }
 
@@ -776,6 +912,46 @@ func TestDerptunQUICConfigDetectsDeadPeersPromptly(t *testing.T) {
 	}
 	if cfg.MaxIdleTimeout > 10*time.Second {
 		t.Fatalf("MaxIdleTimeout = %v, want <= 10s", cfg.MaxIdleTimeout)
+	}
+}
+
+func TestDerptunNativeTCPUsesMeasuredStripeCount(t *testing.T) {
+	if derptunNativeTCPStripeCount != 12 {
+		t.Fatalf("derptunNativeTCPStripeCount = %d, want 12", derptunNativeTCPStripeCount)
+	}
+}
+
+func TestDerptunStripedStreamConnStaysOpenUntilClose(t *testing.T) {
+	localLane, remoteLane := net.Pipe()
+	defer remoteLane.Close()
+
+	conn := newDerptunStripedStreamConn([]derptunNativeDialedLane{{conn: localLane}})
+	defer conn.Close()
+
+	payload := []byte("payload")
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := conn.Write(payload)
+		writeDone <- err
+	}()
+
+	if err := remoteLane.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+	chunk, err := readExternalStripedChunk(remoteLane, externalCopyBufferSize, newExternalStripedChunkPool(externalCopyBufferSize))
+	if err != nil {
+		t.Fatalf("readExternalStripedChunk() error = %v", err)
+	}
+	if !bytes.Equal(chunk.data, payload) {
+		t.Fatalf("chunk.data = %q, want %q", chunk.data, payload)
+	}
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("Write() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Write() did not return")
 	}
 }
 
@@ -808,39 +984,26 @@ func TestBridgeDerptunStdioClosesInputWhenRemoteEnds(t *testing.T) {
 	}
 }
 
-func TestBridgeDerptunStdioReadsMuxReplyBeforeRemoteClose(t *testing.T) {
+func TestBridgeDerptunStdioReadsReplyBeforeRemoteClose(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	backend := startLineEchoServer(t)
-	clientCarrier, serverCarrier := net.Pipe()
-	clientMux := derptun.NewMux(derptun.MuxConfig{Role: derptun.MuxRoleClient, ReconnectTimeout: time.Second})
-	serverMux := derptun.NewMux(derptun.MuxConfig{Role: derptun.MuxRoleServer, ReconnectTimeout: time.Second})
-	defer clientMux.Close()
-	defer serverMux.Close()
-	clientMux.ReplaceCarrier(clientCarrier)
-	serverMux.ReplaceCarrier(serverCarrier)
-
-	serveErr := make(chan error, 1)
+	local, remote := net.Pipe()
+	defer local.Close()
 	go func() {
-		serveErr <- serveDerptunMuxTarget(ctx, serverMux, backend, nil)
+		defer remote.Close()
+		line, err := bufio.NewReader(remote).ReadString('\n')
+		if err == nil {
+			_, _ = io.WriteString(remote, "echo: "+line)
+		}
 	}()
 
-	conn, err := clientMux.OpenStream(ctx)
-	if err != nil {
-		t.Fatalf("OpenStream() error = %v", err)
-	}
 	var out bytes.Buffer
-	if err := bridgeDerptunStdio(ctx, conn, strings.NewReader("hello\n"), &out); err != nil {
+	if err := bridgeDerptunStdio(ctx, local, strings.NewReader("hello\n"), &out); err != nil {
 		t.Fatalf("bridgeDerptunStdio() error = %v", err)
 	}
 	if got, want := out.String(), "echo: hello\n"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
-	}
-
-	cancel()
-	if err := <-serveErr; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("serveDerptunMuxTarget() error = %v", err)
 	}
 }
 
@@ -897,77 +1060,28 @@ func startHoldingTCPServer(t *testing.T) (string, <-chan struct{}) {
 	return ln.Addr().String(), accepted
 }
 
-func startCountingEchoServer(t *testing.T, closeAfter int) string {
+func waitForBackendAccept(t *testing.T, ctx context.Context, accepted <-chan struct{}, label string) {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen() error = %v", err)
+	select {
+	case <-accepted:
+	case <-ctx.Done():
+		t.Fatalf("%s did not reach backend: %v", label, ctx.Err())
 	}
-	t.Cleanup(func() { _ = ln.Close() })
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func() {
-				defer conn.Close()
-				scanner := bufio.NewScanner(conn)
-				for count := 1; scanner.Scan(); count++ {
-					_, _ = io.WriteString(conn, "pong\n")
-					if count >= closeAfter {
-						return
-					}
-				}
-			}()
-		}
-	}()
-	return ln.Addr().String()
 }
 
-func waitForBufferContains(t *testing.T, buf *bytes.Buffer, want string) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if strings.Contains(buf.String(), want) {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("debug output = %q, want %q", buf.String(), want)
-}
-
-func waitForMuxStreamCount(t *testing.T, mux *derptun.Mux, want int) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if got := mux.ActiveStreamCount(); got == want {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("ActiveStreamCount() = %d, want %d", mux.ActiveStreamCount(), want)
-}
-
-func openStreamUntilBackendAccepted(t *testing.T, ctx context.Context, mux *derptun.Mux, accepted <-chan struct{}) net.Conn {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		conn, err := mux.OpenStream(ctx)
-		if err != nil {
-			t.Fatalf("OpenStream() error = %v", err)
+func waitForSessionTestStatusOccurrences(ctx context.Context, status *syncBuffer, needle string, want int) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if strings.Count(status.String(), needle) >= want {
+			return nil
 		}
 		select {
-		case <-accepted:
-			return conn
-		case <-time.After(25 * time.Millisecond):
-			_ = conn.Close()
 		case <-ctx.Done():
-			t.Fatal("stream did not reach backend before context expired")
+			return ctx.Err()
+		case <-ticker.C:
 		}
 	}
-	t.Fatal("stream did not reach backend after previous stream closed")
-	return nil
 }
 
 func derptunTestToken(expires time.Time) token.Token {

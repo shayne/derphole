@@ -251,12 +251,11 @@ func (c *TunnelClient) Open(token, listenAddr string, callbacks TunnelCallbacks)
 
 	go func() {
 		err := derptunOpen(ctx, session.DerptunOpenConfig{
-			ClientToken:   token,
-			ListenAddr:    listenAddr,
-			BindAddrSink:  bindSink,
-			Emitter:       telemetry.New(statusWriter, telemetry.LevelDefault),
-			ForceRelay:    false,
-			UsePublicDERP: true,
+			ClientToken:  token,
+			ListenAddr:   listenAddr,
+			BindAddrSink: bindSink,
+			Emitter:      telemetry.New(statusWriter, telemetry.LevelDefault),
+			ForceRelay:   false,
 		})
 		c.clearCancel(generation)
 		done <- err

@@ -27,9 +27,6 @@ func TestRunServePassesServerTokenAndTCP(t *testing.T) {
 		if cfg.TargetAddr != "127.0.0.1:22" {
 			t.Fatalf("TargetAddr = %q, want 127.0.0.1:22", cfg.TargetAddr)
 		}
-		if !cfg.UsePublicDERP {
-			t.Fatal("UsePublicDERP = false, want true")
-		}
 		return nil
 	}
 

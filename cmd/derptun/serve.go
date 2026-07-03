@@ -78,11 +78,10 @@ func runServe(args []string, level telemetry.Level, stdin io.Reader, stderr io.W
 	ctx, stop := commandContext()
 	defer stop()
 	if err := derptunServe(ctx, session.DerptunServeConfig{
-		ServerToken:   token,
-		TargetAddr:    parsed.SubCommandFlags.TCP,
-		Emitter:       telemetry.New(stderr, commandSessionTelemetryLevel(level)),
-		ForceRelay:    parsed.SubCommandFlags.ForceRelay,
-		UsePublicDERP: usePublicDERPTransport(),
+		ServerToken: token,
+		TargetAddr:  parsed.SubCommandFlags.TCP,
+		Emitter:     telemetry.New(stderr, commandSessionTelemetryLevel(level)),
+		ForceRelay:  parsed.SubCommandFlags.ForceRelay,
 	}); err != nil && !errors.Is(err, context.Canceled) {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1

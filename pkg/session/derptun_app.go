@@ -17,31 +17,25 @@ type DerptunAppServeConfig struct {
 	ServerToken string
 	Emitter     *telemetry.Emitter
 	ForceRelay  bool
-	// UsePublicDERP is reserved for parity with TCP derptun config; current
-	// app-mux setup preserves existing DERP selection and does not branch on it.
-	UsePublicDERP bool
-	OnMux         func(context.Context, *derptun.Mux) error
+	OnMux       func(context.Context, *derptun.Mux) error
 }
 
 type DerptunAppDialConfig struct {
 	ClientToken string
 	Emitter     *telemetry.Emitter
 	ForceRelay  bool
-	// UsePublicDERP is reserved for parity with TCP derptun config; current
-	// app-mux setup preserves existing DERP selection and does not branch on it.
-	UsePublicDERP bool
 }
 
 // DerptunAppServe serves one derptun app mux at a time and passes each claimed
 // mux to cfg.OnMux. The helper owns the mux and closes it when OnMux returns or
-// the session shuts down.
+// the session shuts down; cfg.OnMux should keep running until it is done serving
+// the peer.
 func DerptunAppServe(ctx context.Context, cfg DerptunAppServeConfig) error {
-	return serveDerptunApp(ctx, derptunServeMuxConfig{
-		ServerToken:   cfg.ServerToken,
-		Emitter:       cfg.Emitter,
-		ForceRelay:    cfg.ForceRelay,
-		UsePublicDERP: cfg.UsePublicDERP,
-		onMux:         cfg.OnMux,
+	return serveDerptunSession(ctx, derptunServeSessionConfig{
+		ServerToken: cfg.ServerToken,
+		Emitter:     cfg.Emitter,
+		ForceRelay:  cfg.ForceRelay,
+		onMux:       cfg.OnMux,
 	})
 }
 

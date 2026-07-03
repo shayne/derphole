@@ -6,10 +6,12 @@ package session
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
 	quic "github.com/quic-go/quic-go"
@@ -17,7 +19,6 @@ import (
 	"github.com/shayne/derphole/pkg/derptun"
 	"github.com/shayne/derphole/pkg/quicpath"
 	"github.com/shayne/derphole/pkg/rendezvous"
-	"github.com/shayne/derphole/pkg/stream"
 	"github.com/shayne/derphole/pkg/telemetry"
 	sessiontoken "github.com/shayne/derphole/pkg/token"
 	"github.com/shayne/derphole/pkg/transport"
@@ -27,37 +28,34 @@ import (
 )
 
 type DerptunServeConfig struct {
-	ServerToken   string
-	TargetAddr    string
-	Emitter       *telemetry.Emitter
-	ForceRelay    bool
-	UsePublicDERP bool
+	ServerToken string
+	TargetAddr  string
+	Emitter     *telemetry.Emitter
+	ForceRelay  bool
 }
 
 type DerptunOpenConfig struct {
-	ClientToken   string
-	ListenAddr    string
-	BindAddrSink  chan<- string
-	Emitter       *telemetry.Emitter
-	ForceRelay    bool
-	UsePublicDERP bool
+	ClientToken  string
+	ListenAddr   string
+	BindAddrSink chan<- string
+	Emitter      *telemetry.Emitter
+	ForceRelay   bool
 }
 
 type DerptunConnectConfig struct {
-	ClientToken   string
-	StdioIn       io.Reader
-	StdioOut      io.Writer
-	Emitter       *telemetry.Emitter
-	ForceRelay    bool
-	UsePublicDERP bool
+	ClientToken string
+	StdioIn     io.Reader
+	StdioOut    io.Writer
+	Emitter     *telemetry.Emitter
+	ForceRelay  bool
 }
 
-type derptunServeMuxConfig struct {
-	ServerToken   string
-	Emitter       *telemetry.Emitter
-	ForceRelay    bool
-	UsePublicDERP bool
-	onMux         func(context.Context, *derptun.Mux) error
+type derptunServeSessionConfig struct {
+	ServerToken string
+	TargetAddr  string
+	Emitter     *telemetry.Emitter
+	ForceRelay  bool
+	onMux       func(context.Context, *derptun.Mux) error
 }
 
 func decodeDerptunServer(raw string) (derptun.ServerCredential, error) {
@@ -75,26 +73,30 @@ func derptunQUICConfig() *quic.Config {
 	return cfg
 }
 
+const (
+	derptunNativeTCPStripeCount      = 12
+	derptunNativeStreamHeaderSize    = 24
+	derptunNativeStreamHeaderVersion = 1
+	derptunNativeStreamHeaderMagic   = "DPTS"
+)
+
 var (
 	derptunActiveProbeTimeout = 2 * time.Second
 	derptunActiveStopTimeout  = 500 * time.Millisecond
 )
 
 func DerptunServe(ctx context.Context, cfg DerptunServeConfig) error {
-	return DerptunAppServe(ctx, DerptunAppServeConfig{
-		ServerToken:   cfg.ServerToken,
-		Emitter:       cfg.Emitter,
-		ForceRelay:    cfg.ForceRelay,
-		UsePublicDERP: cfg.UsePublicDERP,
-		OnMux: func(ctx context.Context, mux *derptun.Mux) error {
-			return serveDerptunMuxTarget(ctx, mux, cfg.TargetAddr, cfg.Emitter)
-		},
+	return serveDerptunSession(ctx, derptunServeSessionConfig{
+		ServerToken: cfg.ServerToken,
+		TargetAddr:  cfg.TargetAddr,
+		Emitter:     cfg.Emitter,
+		ForceRelay:  cfg.ForceRelay,
 	})
 }
 
-func serveDerptunApp(ctx context.Context, cfg derptunServeMuxConfig) error {
-	if cfg.onMux == nil {
-		return errors.New("derptun app mux handler is required")
+func serveDerptunSession(ctx context.Context, cfg derptunServeSessionConfig) error {
+	if err := cfg.validate(); err != nil {
+		return err
 	}
 	runtime, err := newDerptunServeRuntime(ctx, cfg)
 	if err != nil {
@@ -113,6 +115,20 @@ func serveDerptunApp(ctx context.Context, cfg derptunServeMuxConfig) error {
 	return nil
 }
 
+func (cfg derptunServeSessionConfig) validate() error {
+	if cfg.onMux == nil && cfg.TargetAddr == "" {
+		return errors.New("derptun target or app mux handler is required")
+	}
+	if cfg.onMux != nil && cfg.TargetAddr != "" {
+		return errors.New("derptun target and app mux handler are mutually exclusive")
+	}
+	return nil
+}
+
+func (cfg derptunServeSessionConfig) nativeTCP() bool {
+	return cfg.onMux == nil
+}
+
 type derptunServeRuntime struct {
 	server     derptun.ServerCredential
 	identity   quicpath.SessionIdentity
@@ -122,7 +138,7 @@ type derptunServeRuntime struct {
 	pm         publicPortmap
 }
 
-func newDerptunServeRuntime(ctx context.Context, cfg derptunServeMuxConfig) (*derptunServeRuntime, error) {
+func newDerptunServeRuntime(ctx context.Context, cfg derptunServeSessionConfig) (*derptunServeRuntime, error) {
 	server, tok, identity, err := loadDerptunServeIdentity(cfg.ServerToken)
 	if err != nil {
 		return nil, err
@@ -211,12 +227,37 @@ func (r *derptunServeRuntime) close() {
 }
 
 type derptunServeActive struct {
+	mu       sync.Mutex
 	claim    rendezvous.Claim
 	decision rendezvous.Decision
 	mux      *derptun.Mux
+	quicConn *quic.Conn
+	native   bool
 	quicDone <-chan struct{}
 	cancel   context.CancelFunc
 	done     chan error
+}
+
+func (a *derptunServeActive) setQUICConn(conn *quic.Conn) bool {
+	if a == nil || conn == nil {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.quicConn != nil {
+		return false
+	}
+	a.quicConn = conn
+	return true
+}
+
+func (a *derptunServeActive) currentQUICConn() *quic.Conn {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.quicConn
 }
 
 func (a *derptunServeActive) sameClaim(claim rendezvous.Claim) bool {
@@ -240,10 +281,32 @@ func (a *derptunServeActive) stop(ctx context.Context) error {
 }
 
 func (a *derptunServeActive) probe(ctx context.Context, timeout time.Duration) error {
-	if a == nil || a.mux == nil {
+	if a == nil {
 		return net.ErrClosed
 	}
+	if a.mux == nil {
+		return a.probeNativeQUIC()
+	}
 	return a.mux.Ping(ctx, timeout)
+}
+
+func (a *derptunServeActive) probeNativeQUIC() error {
+	if !a.native {
+		return net.ErrClosed
+	}
+	quicConn := a.currentQUICConn()
+	if quicConn == nil {
+		if a.transportDone() {
+			return net.ErrClosed
+		}
+		return nil
+	}
+	select {
+	case <-quicConn.Context().Done():
+		return net.ErrClosed
+	default:
+		return nil
+	}
 }
 
 func (a *derptunServeActive) transportDone() bool {
@@ -288,7 +351,10 @@ func releaseDoneDerptunActive(emitter *telemetry.Emitter, gate *derptunClientGat
 }
 
 func emitDerptunActiveStats(emitter *telemetry.Emitter, active *derptunServeActive) {
-	if emitter == nil || active == nil || active.mux == nil {
+	if emitter == nil || active == nil {
+		return
+	}
+	if active.mux == nil {
 		return
 	}
 	lastPeerActivity := active.lastPeerActivity()
@@ -417,8 +483,8 @@ type derptunClientGate struct {
 }
 
 func (g *derptunClientGate) Accept(now time.Time, tok sessiontoken.Token, claim rendezvous.Claim) (rendezvous.Decision, error) {
-	// V1 intentionally allows one active client. Multi-client support should replace
-	// this single active claim with a map keyed by client ID and independent tunnel state.
+	// One active client is allowed per tunnel. Multi-client support should replace
+	// this claim with a map keyed by client ID and independent tunnel state.
 	if g.active != nil {
 		if sameDerptunConnector(*g.active, claim) {
 			return rendezvous.NewGate(tok).Accept(now, claim)
@@ -455,7 +521,7 @@ func derptunServeTunnelErr(err error) error {
 
 func serveDerptunClaims(
 	ctx context.Context,
-	cfg derptunServeMuxConfig,
+	cfg derptunServeSessionConfig,
 	runtime *derptunServeRuntime,
 	gate *derptunClientGate,
 ) error {
@@ -475,7 +541,7 @@ func serveDerptunClaims(
 }
 
 type derptunClaimServer struct {
-	cfg     derptunServeMuxConfig
+	cfg     derptunServeSessionConfig
 	runtime *derptunServeRuntime
 	gate    *derptunClientGate
 	active  *derptunServeActive
@@ -537,41 +603,9 @@ func (s *derptunClaimServer) closeActive(ctx context.Context) error {
 	return derptunServeTunnelErr(err)
 }
 
-func handleDerptunServeClaim(
-	ctx context.Context,
-	cfg DerptunServeConfig,
-	server derptun.ServerCredential,
-	identity quicpath.SessionIdentity,
-	dm *tailcfg.DERPMap,
-	derpClient *derpbind.Client,
-	probeConn net.PacketConn,
-	pm publicPortmap,
-	gate *derptunClientGate,
-	active *derptunServeActive,
-	pkt derpbind.Packet,
-) (*derptunServeActive, error) {
-	runtime := &derptunServeRuntime{
-		server:     server,
-		identity:   identity,
-		dm:         dm,
-		derpClient: derpClient,
-		probeConn:  probeConn,
-		pm:         pm,
-	}
-	return handleDerptunServeRuntimeClaim(ctx, derptunServeMuxConfig{
-		ServerToken:   cfg.ServerToken,
-		Emitter:       cfg.Emitter,
-		ForceRelay:    cfg.ForceRelay,
-		UsePublicDERP: cfg.UsePublicDERP,
-		onMux: func(ctx context.Context, mux *derptun.Mux) error {
-			return serveDerptunMuxTarget(ctx, mux, cfg.TargetAddr, cfg.Emitter)
-		},
-	}, runtime, gate, active, pkt)
-}
-
 func handleDerptunServeRuntimeClaim(
 	ctx context.Context,
-	cfg derptunServeMuxConfig,
+	cfg derptunServeSessionConfig,
 	runtime *derptunServeRuntime,
 	gate *derptunClientGate,
 	active *derptunServeActive,
@@ -611,7 +645,7 @@ type derptunServeClaimToken struct {
 	now   time.Time
 }
 
-func readDerptunServeClaim(cfg derptunServeMuxConfig, runtime *derptunServeRuntime, pkt derpbind.Packet) (derptunServeClaimRequest, bool) {
+func readDerptunServeClaim(cfg derptunServeSessionConfig, runtime *derptunServeRuntime, pkt derpbind.Packet) (derptunServeClaimRequest, bool) {
 	env, err := decodeEnvelope(pkt.Payload)
 	if err != nil || env.Type != envelopeClaim || env.Claim == nil {
 		return derptunServeClaimRequest{}, false
@@ -649,7 +683,7 @@ func issueDerptunServeClaimToken(ctx context.Context, runtime *derptunServeRunti
 
 func acceptDerptunServeClaim(
 	ctx context.Context,
-	cfg derptunServeMuxConfig,
+	cfg derptunServeSessionConfig,
 	gate *derptunClientGate,
 	active *derptunServeActive,
 	claim rendezvous.Claim,
@@ -692,7 +726,7 @@ func resendDerptunActiveDecision(ctx context.Context, runtime *derptunServeRunti
 	return true, sendDerptunServeDecisionWithAuth(ctx, runtime, request.peerDERP, auth, retryDecision)
 }
 
-func enrichDerptunServeDecision(ctx context.Context, cfg derptunServeMuxConfig, runtime *derptunServeRuntime, decision *rendezvous.Decision) {
+func enrichDerptunServeDecision(ctx context.Context, cfg derptunServeSessionConfig, runtime *derptunServeRuntime, decision *rendezvous.Decision) {
 	if decision.Accept == nil || cfg.ForceRelay {
 		return
 	}
@@ -701,7 +735,7 @@ func enrichDerptunServeDecision(ctx context.Context, cfg derptunServeMuxConfig, 
 
 func startDerptunServeClaimTunnel(
 	ctx context.Context,
-	cfg derptunServeMuxConfig,
+	cfg derptunServeSessionConfig,
 	runtime *derptunServeRuntime,
 	gate *derptunClientGate,
 	request derptunServeClaimRequest,
@@ -728,19 +762,43 @@ func startDerptunServeClaimTunnel(
 		gate.Release(claim.DERPPublic)
 		return nil, err
 	}
+	rawPath, err := negotiateExternalV2DirectPacketPath(transportCtx, runtime.derpClient, request.peerDERP, transportManager, runtime.dm, issued.auth, cfg.Emitter, 1, 0, 0, cfg.ForceRelay)
+	if err != nil {
+		cleanupDerptunServeListener(quicListener, adapter)
+		cleanupDerptunServeTransport(pathEmitter, transportManager, transportCleanup, transportCancel)
+		gate.Release(claim.DERPPublic)
+		return nil, err
+	}
+	rawDirect := rawPath.raw
+	if rawDirect {
+		rawListener, err := listenDerptunServeRawQUIC(rawPath, runtime, claim)
+		if err != nil {
+			rawPath.Close()
+			cleanupDerptunServeListener(quicListener, adapter)
+			cleanupDerptunServeTransport(pathEmitter, transportManager, transportCleanup, transportCancel)
+			gate.Release(claim.DERPPublic)
+			return nil, err
+		}
+		cleanupDerptunServeListener(quicListener, adapter)
+		quicListener = rawListener
+		adapter = nil
+	}
 
-	mux := derptun.NewMux(derptun.MuxConfig{Role: derptun.MuxRoleServer, ReconnectTimeout: 30 * time.Second})
+	var mux *derptun.Mux
+	if cfg.onMux != nil {
+		mux = derptun.NewMux(derptun.MuxConfig{Role: derptun.MuxRoleServer, ReconnectTimeout: 30 * time.Second})
+	}
 	tunnelCtx, tunnelCancel := context.WithCancel(ctx)
 	transportDone := make(chan struct{})
-	next := &derptunServeActive{claim: claim, decision: decision, mux: mux, quicDone: transportDone, cancel: tunnelCancel, done: make(chan error, 1)}
+	next := &derptunServeActive{claim: claim, decision: decision, mux: mux, native: cfg.nativeTCP(), quicDone: transportDone, cancel: tunnelCancel, done: make(chan error, 1)}
 	cancelDecisionResends := startDerptunDecisionResender(ctx, runtime.derpClient, request.peerDERP, decision, issued.auth, cfg.Emitter)
-	go runDerptunServeTunnel(cfg, next, tunnelCtx, tunnelCancel, cancelDecisionResends, quicListener, adapter, pathEmitter, transportManager, transportCleanup, transportCancel, transportDone)
+	go runDerptunServeTunnel(cfg, next, tunnelCtx, tunnelCancel, cancelDecisionResends, quicListener, adapter, rawPath, rawDirect, pathEmitter, transportManager, transportCleanup, transportCancel, transportDone)
 	return next, nil
 }
 
 func startDerptunServeTransport(
 	ctx context.Context,
-	cfg derptunServeMuxConfig,
+	cfg derptunServeSessionConfig,
 	runtime *derptunServeRuntime,
 	peerDERP key.NodePublic,
 	claimToken sessiontoken.Token,
@@ -781,6 +839,10 @@ func listenDerptunServeQUIC(transportCtx context.Context, runtime *derptunServeR
 	return adapter, quicListener, nil
 }
 
+func listenDerptunServeRawQUIC(rawPath externalV2DirectPacketPath, runtime *derptunServeRuntime, claim rendezvous.Claim) (*quic.Listener, error) {
+	return quic.Listen(rawPath.conn, quicpath.ServerTLSConfig(runtime.identity, claim.QUICPublic), derptunQUICConfig())
+}
+
 func cleanupDerptunServeListener(quicListener *quic.Listener, adapter *quicpath.Adapter) {
 	if quicListener != nil {
 		_ = quicListener.Close()
@@ -803,13 +865,15 @@ func cleanupDerptunServeTransport(pathEmitter *transportPathEmitter, transportMa
 }
 
 func runDerptunServeTunnel(
-	cfg derptunServeMuxConfig,
+	cfg derptunServeSessionConfig,
 	active *derptunServeActive,
 	tunnelCtx context.Context,
 	tunnelCancel context.CancelFunc,
 	cancelDecisionResends context.CancelFunc,
 	quicListener *quic.Listener,
 	adapter *quicpath.Adapter,
+	rawPath externalV2DirectPacketPath,
+	rawDirect bool,
 	pathEmitter *transportPathEmitter,
 	transportManager *transport.Manager,
 	transportCleanup func(),
@@ -821,23 +885,43 @@ func runDerptunServeTunnel(
 	defer func() {
 		cancelDecisionResends()
 		tunnelCancel()
-		_ = active.mux.Close()
+		if active.mux != nil {
+			_ = active.mux.Close()
+		}
 		if quicConn != nil {
 			_ = quicConn.CloseWithError(0, "")
 		}
 		cleanupDerptunServeListener(quicListener, adapter)
+		rawPath.Close()
 		cleanupDerptunServeTransport(pathEmitter, transportManager, transportCleanup, transportCancel)
 		close(transportDone)
 		active.done <- err
 	}()
 
+	if cfg.nativeTCP() {
+		if rawDirect {
+			pathEmitter.Emit(StateDirect)
+		}
+		err = serveDerptunQUICListener(tunnelCtx, quicListener, cfg.TargetAddr, cfg.Emitter, func(conn *quic.Conn) {
+			if active.setQUICConn(conn) {
+				watchDerptunServeQUICConn(tunnelCtx, tunnelCancel, conn)
+				cancelDecisionResends()
+			}
+		})
+		return
+	}
+
 	quicConn, err = quicListener.Accept(tunnelCtx)
 	if err != nil {
 		return
 	}
+	active.setQUICConn(quicConn)
 	watchDerptunServeQUICConn(tunnelCtx, tunnelCancel, quicConn)
-	carrier, acceptErr := quicConn.AcceptStream(tunnelCtx)
 	cancelDecisionResends()
+	if rawDirect {
+		pathEmitter.Emit(StateDirect)
+	}
+	carrier, acceptErr := quicConn.AcceptStream(tunnelCtx)
 	if acceptErr != nil {
 		err = acceptErr
 		_ = quicConn.CloseWithError(1, "accept derptun carrier failed")
@@ -857,46 +941,294 @@ func watchDerptunServeQUICConn(tunnelCtx context.Context, tunnelCancel context.C
 	}()
 }
 
-func serveDerptunMuxTarget(ctx context.Context, mux *derptun.Mux, targetAddr string, emitter *telemetry.Emitter) error {
-	slots := make(chan struct{}, 1)
+func serveDerptunQUICListener(ctx context.Context, listener *quic.Listener, targetAddr string, emitter *telemetry.Emitter, onAccept func(*quic.Conn)) error {
+	var wg sync.WaitGroup
+	assembler := newDerptunNativeStreamAssembler(targetAddr, emitter)
+	defer wg.Wait()
+
 	for {
-		overlayConn, err := mux.Accept(ctx)
+		conn, err := listener.Accept(ctx)
 		if err != nil {
+			if derptunQUICAcceptDone(ctx, err) {
+				return nil
+			}
 			return err
 		}
-		select {
-		case slots <- struct{}{}:
-		default:
-			if emitter != nil {
-				emitter.Debug("derptun-stream-limit-reached")
-			}
-			_ = overlayConn.Close()
-			continue
+		if emitter != nil {
+			emitter.Debug("derptun-quic-connection-accepted")
 		}
-		backendConn, err := (&net.Dialer{}).DialContext(ctx, "tcp", targetAddr)
+		if onAccept != nil {
+			onAccept(conn)
+		}
+		wg.Add(1)
+		go serveDerptunQUICConnection(ctx, &wg, conn, assembler, emitter)
+	}
+}
+
+func derptunQUICAcceptDone(ctx context.Context, err error) bool {
+	return ctx.Err() != nil ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, quic.ErrServerClosed)
+}
+
+func serveDerptunQUICConnection(ctx context.Context, wg *sync.WaitGroup, conn *quic.Conn, assembler *derptunNativeStreamAssembler, emitter *telemetry.Emitter) {
+	defer wg.Done()
+	defer func() { _ = conn.CloseWithError(0, "") }()
+	for {
+		streamConn, err := conn.AcceptStream(ctx)
 		if err != nil {
-			if emitter != nil {
-				emitter.Debug("derptun-backend-dial-failed")
+			if derptunServeTunnelErr(err) != nil && emitter != nil {
+				emitter.Debug("derptun-quic-connection-error")
 			}
-			<-slots
-			_ = overlayConn.Close()
-			continue
+			return
 		}
-		go func() {
-			defer func() { <-slots }()
-			defer func() { _ = overlayConn.Close() }()
-			defer func() { _ = backendConn.Close() }()
-			_ = stream.Bridge(ctx, overlayConn, backendConn)
-		}()
+		lane := derptunNativeAcceptedLane{
+			conn:     quicpath.WrapStream(conn, streamConn),
+			quicConn: conn,
+		}
+		if err := assembler.addLane(ctx, lane); err != nil {
+			_ = lane.conn.Close()
+			if emitter != nil {
+				emitter.Debug("derptun-native-lane-rejected")
+			}
+		}
+	}
+}
+
+type derptunNativeAcceptedLane struct {
+	conn     net.Conn
+	quicConn *quic.Conn
+}
+
+type derptunNativeStreamAssembler struct {
+	targetAddr string
+	emitter    *telemetry.Emitter
+
+	mu     sync.Mutex
+	groups map[derptunNativeStreamID]*derptunNativeStreamGroup
+}
+
+type derptunNativeStreamGroup struct {
+	laneCount int
+	lanes     []derptunNativeAcceptedLane
+	seen      []bool
+}
+
+func newDerptunNativeStreamAssembler(targetAddr string, emitter *telemetry.Emitter) *derptunNativeStreamAssembler {
+	return &derptunNativeStreamAssembler{
+		targetAddr: targetAddr,
+		emitter:    emitter,
+		groups:     make(map[derptunNativeStreamID]*derptunNativeStreamGroup),
+	}
+}
+
+func (a *derptunNativeStreamAssembler) addLane(ctx context.Context, lane derptunNativeAcceptedLane) error {
+	header, err := readDerptunNativeStreamHeader(lane.conn)
+	if err != nil {
+		return err
+	}
+	lanes, complete, err := a.storeLane(header, lane)
+	if err != nil {
+		return err
+	}
+	if complete {
+		go a.serveGroup(ctx, lanes)
+	}
+	return nil
+}
+
+func (a *derptunNativeStreamAssembler) storeLane(header derptunNativeStreamHeader, lane derptunNativeAcceptedLane) ([]derptunNativeAcceptedLane, bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	group := a.groups[header.id]
+	if group == nil {
+		group = &derptunNativeStreamGroup{
+			laneCount: int(header.laneCount),
+			lanes:     make([]derptunNativeAcceptedLane, int(header.laneCount)),
+			seen:      make([]bool, int(header.laneCount)),
+		}
+		a.groups[header.id] = group
+	}
+	if group.laneCount != int(header.laneCount) {
+		return nil, false, errors.New("derptun native stream lane count mismatch")
+	}
+	index := int(header.laneIndex)
+	if group.seen[index] {
+		return nil, false, errors.New("derptun native stream duplicate lane")
+	}
+	group.seen[index] = true
+	group.lanes[index] = lane
+	if !group.complete() {
+		return nil, false, nil
+	}
+	delete(a.groups, header.id)
+	return append([]derptunNativeAcceptedLane(nil), group.lanes...), true, nil
+}
+
+func (g *derptunNativeStreamGroup) complete() bool {
+	for _, seen := range g.seen {
+		if !seen {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *derptunNativeStreamAssembler) serveGroup(ctx context.Context, lanes []derptunNativeAcceptedLane) {
+	backendConn, err := (&net.Dialer{}).DialContext(ctx, "tcp", a.targetAddr)
+	if err != nil {
+		closeDerptunNativeAcceptedLanes(lanes)
+		if a.emitter != nil {
+			a.emitter.Debug("backend-dial-failed")
+		}
+		return
+	}
+	defer func() { _ = backendConn.Close() }()
+	defer closeDerptunNativeAcceptedLaneStreams(lanes)
+	if err := bridgeDerptunNativeStriped(ctx, lanes, backendConn); derptunServeTunnelErr(err) != nil && a.emitter != nil {
+		a.emitter.Debug("derptun-native-bridge-error")
+	}
+}
+
+func bridgeDerptunNativeStriped(ctx context.Context, lanes []derptunNativeAcceptedLane, backendConn net.Conn) error {
+	errCh := make(chan derptunNativeBridgeResult, 2)
+	closeFullOnce := sync.Once{}
+	closeFull := func() {
+		closeFullOnce.Do(func() {
+			_ = backendConn.Close()
+			closeDerptunNativeAcceptedLanes(lanes)
+		})
+	}
+	closeGracefulOnce := sync.Once{}
+	closeGraceful := func() {
+		closeGracefulOnce.Do(func() {
+			_ = backendConn.Close()
+			closeDerptunNativeAcceptedLaneStreams(lanes)
+		})
+	}
+	go func() {
+		err := receiveExternalStripedCopy(ctx, backendConn, derptunNativeAcceptedLaneReaders(lanes), externalCopyBufferSize)
+		if err == nil {
+			_ = closeDerptunWrite(backendConn)
+		}
+		errCh <- derptunNativeBridgeResult{direction: derptunNativeBridgeReceive, err: err}
+	}()
+	go func() {
+		err := sendExternalStripedCopy(ctx, backendConn, derptunNativeAcceptedLaneWriters(lanes), externalCopyBufferSize)
+		errCh <- derptunNativeBridgeResult{direction: derptunNativeBridgeSend, err: err}
+	}()
+
+	if err := waitDerptunNativeBridge(ctx, errCh, closeFull, closeGraceful); err != nil {
+		return err
+	}
+	closeGraceful()
+	return nil
+}
+
+type derptunNativeBridgeDirection int
+
+const (
+	derptunNativeBridgeReceive derptunNativeBridgeDirection = iota
+	derptunNativeBridgeSend
+)
+
+type derptunNativeBridgeResult struct {
+	direction derptunNativeBridgeDirection
+	err       error
+}
+
+func waitDerptunNativeBridge(ctx context.Context, errCh <-chan derptunNativeBridgeResult, closeFull func(), closeGraceful func()) error {
+	var retErr error
+	for range 2 {
+		select {
+		case result := <-errCh:
+			if err := handleDerptunNativeBridgeResult(result, closeFull, closeGraceful); err != nil && retErr == nil {
+				retErr = err
+			}
+		case <-ctx.Done():
+			closeFull()
+			retErr = ctx.Err()
+		}
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if retErr != nil {
+		closeFull()
+		return retErr
+	}
+	return nil
+}
+
+func handleDerptunNativeBridgeResult(result derptunNativeBridgeResult, closeFull func(), closeGraceful func()) error {
+	if result.err != nil && !derptunNativeExpectedCloseError(result.err) {
+		closeFull()
+		return result.err
+	}
+	if result.direction == derptunNativeBridgeSend {
+		closeGraceful()
+	}
+	return nil
+}
+
+func derptunNativeExpectedCloseError(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed)
+}
+
+func closeDerptunWrite(conn net.Conn) error {
+	if closer, ok := conn.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
+	}
+	return nil
+}
+
+func derptunNativeAcceptedLaneReaders(lanes []derptunNativeAcceptedLane) []io.ReadCloser {
+	readers := make([]io.ReadCloser, 0, len(lanes))
+	for _, lane := range lanes {
+		if lane.conn != nil {
+			readers = append(readers, derptunNativeNoCloseReader{Reader: lane.conn})
+		}
+	}
+	return readers
+}
+
+func derptunNativeAcceptedLaneWriters(lanes []derptunNativeAcceptedLane) []io.WriteCloser {
+	writers := make([]io.WriteCloser, 0, len(lanes))
+	for _, lane := range lanes {
+		if lane.conn != nil {
+			writers = append(writers, lane.conn)
+		}
+	}
+	return writers
+}
+
+func closeDerptunNativeAcceptedLanes(lanes []derptunNativeAcceptedLane) {
+	for _, lane := range lanes {
+		if lane.conn != nil {
+			_ = lane.conn.Close()
+		}
+		if lane.quicConn != nil {
+			_ = lane.quicConn.CloseWithError(0, "")
+		}
+	}
+}
+
+func closeDerptunNativeAcceptedLaneStreams(lanes []derptunNativeAcceptedLane) {
+	for _, lane := range lanes {
+		if lane.conn != nil {
+			_ = lane.conn.Close()
+		}
 	}
 }
 
 func DerptunOpen(ctx context.Context, cfg DerptunOpenConfig) error {
-	mux, cleanup, err := DerptunAppDial(ctx, DerptunAppDialConfig{
-		ClientToken:   cfg.ClientToken,
-		Emitter:       cfg.Emitter,
-		ForceRelay:    cfg.ForceRelay,
-		UsePublicDERP: cfg.UsePublicDERP,
+	dialer, cleanup, err := dialDerptunQUICStreamDialer(ctx, derptunDialRuntimeConfig{
+		ClientToken: cfg.ClientToken,
+		Emitter:     cfg.Emitter,
+		ForceRelay:  cfg.ForceRelay,
+		KeepAlive:   true,
 	})
 	if err != nil {
 		return err
@@ -915,21 +1247,24 @@ func DerptunOpen(ctx context.Context, cfg DerptunOpenConfig) error {
 	notifyBindAddr(cfg.BindAddrSink, listener.Addr().String(), ctx)
 
 	return serveOpenListener(ctx, listener, func(ctx context.Context) (net.Conn, error) {
-		return mux.OpenStream(ctx)
+		return dialer.OpenStream(ctx)
 	}, cfg.Emitter)
 }
 
 func DerptunConnect(ctx context.Context, cfg DerptunConnectConfig) error {
-	conn, cleanup, err := DerptunAppDialStream(ctx, DerptunAppDialConfig{
-		ClientToken:   cfg.ClientToken,
-		Emitter:       cfg.Emitter,
-		ForceRelay:    cfg.ForceRelay,
-		UsePublicDERP: cfg.UsePublicDERP,
+	dialer, cleanup, err := dialDerptunQUICStreamDialer(ctx, derptunDialRuntimeConfig{
+		ClientToken: cfg.ClientToken,
+		Emitter:     cfg.Emitter,
+		ForceRelay:  cfg.ForceRelay,
 	})
 	if err != nil {
 		return err
 	}
 	defer cleanup()
+	conn, err := dialer.OpenStream(ctx)
+	if err != nil {
+		return err
+	}
 	defer func() { _ = conn.Close() }()
 	return bridgeDerptunStdio(ctx, conn, cfg.StdioIn, cfg.StdioOut)
 }
@@ -972,6 +1307,10 @@ func handleDerptunStdioInputDone(conn net.Conn, err error, inErr *chan error) er
 		_ = conn.Close()
 		return err
 	}
+	if err := closeDerptunWrite(conn); err != nil && !derptunNativeExpectedCloseError(err) {
+		_ = conn.Close()
+		return err
+	}
 	*inErr = nil
 	return nil
 }
@@ -1008,6 +1347,389 @@ type derptunDialRuntime struct {
 	pm              publicPortmap
 	clientIdentity  quicpath.SessionIdentity
 	localCandidates []string
+}
+
+type derptunDialRuntimeConfig struct {
+	ClientToken string
+	Emitter     *telemetry.Emitter
+	ForceRelay  bool
+	KeepAlive   bool
+}
+
+type derptunQUICStreamDialer struct {
+	transport       *quic.Transport
+	remoteAddr      net.Addr
+	identity        quicpath.SessionIdentity
+	peerPublic      [32]byte
+	closePacketPath func()
+	controlConn     *quic.Conn
+	closeOnce       sync.Once
+}
+
+func newDerptunQUICStreamDialer(packetConn net.PacketConn, remoteAddr net.Addr, identity quicpath.SessionIdentity, peerPublic [32]byte, closePacketPath func()) *derptunQUICStreamDialer {
+	return &derptunQUICStreamDialer{
+		transport:       &quic.Transport{Conn: packetConn},
+		remoteAddr:      remoteAddr,
+		identity:        identity,
+		peerPublic:      peerPublic,
+		closePacketPath: closePacketPath,
+	}
+}
+
+func (d *derptunQUICStreamDialer) OpenControl(ctx context.Context) error {
+	conn, err := d.dialConn(ctx)
+	if err != nil {
+		return err
+	}
+	d.controlConn = conn
+	return nil
+}
+
+func (d *derptunQUICStreamDialer) OpenStream(ctx context.Context) (net.Conn, error) {
+	return d.OpenStripedStream(ctx, derptunNativeTCPStripeCount)
+}
+
+func (d *derptunQUICStreamDialer) OpenStripedStream(ctx context.Context, laneCount int) (net.Conn, error) {
+	if laneCount < 1 {
+		return nil, errors.New("derptun stripe count must be positive")
+	}
+	if laneCount > 255 {
+		return nil, errors.New("derptun stripe count must fit in stream header")
+	}
+	id, err := newDerptunNativeStreamID()
+	if err != nil {
+		return nil, err
+	}
+	lanes, err := d.openStripedLanes(ctx, id, laneCount)
+	if err != nil {
+		return nil, err
+	}
+	return newDerptunStripedStreamConn(lanes), nil
+}
+
+func (d *derptunQUICStreamDialer) openStripedLanes(ctx context.Context, id derptunNativeStreamID, laneCount int) ([]derptunNativeDialedLane, error) {
+	type laneResult struct {
+		index int
+		lane  derptunNativeDialedLane
+		err   error
+	}
+	laneCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan laneResult, laneCount)
+	for i := range laneCount {
+		go func(index int) {
+			lane, err := d.openStripedLane(laneCtx, derptunNativeStreamHeader{
+				id:        id,
+				laneCount: uint8(laneCount),
+				laneIndex: uint8(index),
+			})
+			results <- laneResult{index: index, lane: lane, err: err}
+		}(i)
+	}
+
+	lanes := make([]derptunNativeDialedLane, laneCount)
+	var firstErr error
+	for range laneCount {
+		result := <-results
+		if result.err != nil {
+			if firstErr == nil {
+				firstErr = result.err
+				cancel()
+			}
+			continue
+		}
+		lanes[result.index] = result.lane
+	}
+	if firstErr != nil {
+		closeDerptunNativeDialedLanes(lanes)
+		return nil, firstErr
+	}
+	return lanes, nil
+}
+
+func (d *derptunQUICStreamDialer) openStripedLane(ctx context.Context, header derptunNativeStreamHeader) (derptunNativeDialedLane, error) {
+	conn, err := d.dialConn(ctx)
+	if err != nil {
+		return derptunNativeDialedLane{}, err
+	}
+	streamConn, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		_ = conn.CloseWithError(1, "open derptun stream failed")
+		return derptunNativeDialedLane{}, err
+	}
+	laneConn := quicpath.WrapStream(conn, streamConn)
+	if err := writeDerptunNativeStreamHeader(laneConn, header); err != nil {
+		_ = laneConn.Close()
+		_ = conn.CloseWithError(1, "write derptun stream header failed")
+		return derptunNativeDialedLane{}, err
+	}
+	return derptunNativeDialedLane{conn: laneConn, quicConn: conn}, nil
+}
+
+func (d *derptunQUICStreamDialer) dialConn(ctx context.Context) (*quic.Conn, error) {
+	return d.transport.Dial(ctx, d.remoteAddr, quicpath.ClientTLSConfig(d.identity, d.peerPublic), derptunQUICConfig())
+}
+
+func (d *derptunQUICStreamDialer) Close() error {
+	if d == nil {
+		return nil
+	}
+	var err error
+	d.closeOnce.Do(func() {
+		if d.controlConn != nil {
+			err = d.controlConn.CloseWithError(0, "")
+		}
+		if d.closePacketPath != nil {
+			d.closePacketPath()
+		}
+		if d.transport != nil {
+			if transportErr := d.transport.Close(); err == nil {
+				err = transportErr
+			}
+		}
+	})
+	return err
+}
+
+type derptunNativeStreamID [16]byte
+
+type derptunNativeStreamHeader struct {
+	id        derptunNativeStreamID
+	laneCount uint8
+	laneIndex uint8
+}
+
+type derptunNativeDialedLane struct {
+	conn     net.Conn
+	quicConn *quic.Conn
+}
+
+type derptunStripedStreamConn struct {
+	inboundReader  *io.PipeReader
+	inboundWriter  *io.PipeWriter
+	outboundReader *io.PipeReader
+	outboundWriter *io.PipeWriter
+	cancel         context.CancelFunc
+	lanes          []derptunNativeDialedLane
+	closeWriteOnce sync.Once
+	closeOnce      sync.Once
+}
+
+type derptunNativeNoCloseReader struct {
+	io.Reader
+}
+
+func (derptunNativeNoCloseReader) Close() error { return nil }
+
+type derptunNativeAddr string
+
+func (a derptunNativeAddr) Network() string { return "derptun" }
+func (a derptunNativeAddr) String() string  { return string(a) }
+
+func newDerptunNativeStreamID() (derptunNativeStreamID, error) {
+	var id derptunNativeStreamID
+	if _, err := rand.Read(id[:]); err != nil {
+		return derptunNativeStreamID{}, err
+	}
+	return id, nil
+}
+
+func writeDerptunNativeStreamHeader(w io.Writer, header derptunNativeStreamHeader) error {
+	var buf [derptunNativeStreamHeaderSize]byte
+	copy(buf[:4], derptunNativeStreamHeaderMagic)
+	buf[4] = derptunNativeStreamHeaderVersion
+	buf[5] = header.laneCount
+	buf[6] = header.laneIndex
+	copy(buf[8:], header.id[:])
+	return writeFull(w, buf[:])
+}
+
+func readDerptunNativeStreamHeader(r io.Reader) (derptunNativeStreamHeader, error) {
+	var buf [derptunNativeStreamHeaderSize]byte
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
+		return derptunNativeStreamHeader{}, err
+	}
+	if string(buf[:4]) != derptunNativeStreamHeaderMagic {
+		return derptunNativeStreamHeader{}, errors.New("invalid derptun stream header")
+	}
+	if buf[4] != derptunNativeStreamHeaderVersion {
+		return derptunNativeStreamHeader{}, errors.New("unsupported derptun stream header version")
+	}
+	header := derptunNativeStreamHeader{
+		laneCount: buf[5],
+		laneIndex: buf[6],
+	}
+	copy(header.id[:], buf[8:])
+	if err := header.validate(); err != nil {
+		return derptunNativeStreamHeader{}, err
+	}
+	return header, nil
+}
+
+func (h derptunNativeStreamHeader) validate() error {
+	if h.laneCount == 0 {
+		return errors.New("derptun stream lane count is zero")
+	}
+	if h.laneIndex >= h.laneCount {
+		return errors.New("derptun stream lane index out of range")
+	}
+	return nil
+}
+
+func writeFull(w io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		if n > 0 {
+			p = p[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}
+
+func newDerptunStripedStreamConn(lanes []derptunNativeDialedLane) net.Conn {
+	outboundReader, outboundWriter := io.Pipe()
+	inboundReader, inboundWriter := io.Pipe()
+	streamCtx, cancel := context.WithCancel(context.Background())
+	conn := &derptunStripedStreamConn{
+		inboundReader:  inboundReader,
+		inboundWriter:  inboundWriter,
+		outboundReader: outboundReader,
+		outboundWriter: outboundWriter,
+		cancel:         cancel,
+		lanes:          lanes,
+	}
+	go conn.bridge(streamCtx)
+	return conn
+}
+
+func (c *derptunStripedStreamConn) bridge(ctx context.Context) {
+	type bridgeResult struct {
+		direction string
+		err       error
+	}
+	errCh := make(chan bridgeResult, 2)
+	go func() {
+		err := sendExternalStripedCopy(ctx, c.outboundReader, derptunNativeLaneWriters(c.lanes), externalCopyBufferSize)
+		errCh <- bridgeResult{direction: "send", err: err}
+	}()
+	go func() {
+		err := receiveExternalStripedCopy(ctx, c.inboundWriter, derptunNativeLaneReaders(c.lanes), externalCopyBufferSize)
+		errCh <- bridgeResult{direction: "receive", err: err}
+	}()
+	for range 2 {
+		result := <-errCh
+		if result.direction == "send" && (result.err == nil || derptunNativeExpectedCloseError(result.err)) {
+			continue
+		}
+		if result.direction == "receive" {
+			if result.err != nil && !derptunNativeExpectedCloseError(result.err) {
+				_ = c.inboundWriter.CloseWithError(result.err)
+			} else {
+				_ = c.inboundWriter.Close()
+			}
+		}
+		_ = c.Close()
+		return
+	}
+	_ = c.Close()
+}
+
+func (c *derptunStripedStreamConn) Read(p []byte) (int, error) {
+	return c.inboundReader.Read(p)
+}
+
+func (c *derptunStripedStreamConn) Write(p []byte) (int, error) {
+	return c.outboundWriter.Write(p)
+}
+
+func (c *derptunStripedStreamConn) LocalAddr() net.Addr {
+	if len(c.lanes) > 0 && c.lanes[0].conn != nil {
+		return c.lanes[0].conn.LocalAddr()
+	}
+	return derptunNativeAddr("local")
+}
+
+func (c *derptunStripedStreamConn) RemoteAddr() net.Addr {
+	if len(c.lanes) > 0 && c.lanes[0].conn != nil {
+		return c.lanes[0].conn.RemoteAddr()
+	}
+	return derptunNativeAddr("remote")
+}
+
+func (c *derptunStripedStreamConn) SetDeadline(time.Time) error {
+	return nil
+}
+
+func (c *derptunStripedStreamConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (c *derptunStripedStreamConn) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+func (c *derptunStripedStreamConn) CloseWrite() error {
+	if c == nil {
+		return nil
+	}
+	var err error
+	c.closeWriteOnce.Do(func() {
+		err = c.outboundWriter.Close()
+	})
+	return err
+}
+
+func (c *derptunStripedStreamConn) Close() error {
+	if c == nil {
+		return nil
+	}
+	var err error
+	c.closeOnce.Do(func() {
+		c.cancel()
+		_ = c.outboundWriter.Close()
+		_ = c.outboundReader.Close()
+		_ = c.inboundWriter.Close()
+		err = c.inboundReader.Close()
+		closeDerptunNativeDialedLanes(c.lanes)
+	})
+	return err
+}
+
+func derptunNativeLaneReaders(lanes []derptunNativeDialedLane) []io.ReadCloser {
+	readers := make([]io.ReadCloser, 0, len(lanes))
+	for _, lane := range lanes {
+		if lane.conn != nil {
+			readers = append(readers, derptunNativeNoCloseReader{Reader: lane.conn})
+		}
+	}
+	return readers
+}
+
+func derptunNativeLaneWriters(lanes []derptunNativeDialedLane) []io.WriteCloser {
+	writers := make([]io.WriteCloser, 0, len(lanes))
+	for _, lane := range lanes {
+		if lane.conn != nil {
+			writers = append(writers, lane.conn)
+		}
+	}
+	return writers
+}
+
+func closeDerptunNativeDialedLanes(lanes []derptunNativeDialedLane) {
+	for _, lane := range lanes {
+		if lane.conn != nil {
+			_ = lane.conn.Close()
+		}
+		if lane.quicConn != nil {
+			_ = lane.quicConn.CloseWithError(0, "")
+		}
+	}
 }
 
 func newDerptunDialRuntime(ctx context.Context, clientToken string, emitter *telemetry.Emitter, forceRelay bool) (*derptunDialRuntime, error) {
@@ -1110,6 +1832,29 @@ func (r *derptunDialRuntime) claim() rendezvous.Claim {
 	return claim
 }
 
+func dialDerptunQUICStreamDialer(ctx context.Context, cfg derptunDialRuntimeConfig) (*derptunQUICStreamDialer, func(), error) {
+	runtime, err := newDerptunDialRuntime(ctx, cfg.ClientToken, cfg.Emitter, cfg.ForceRelay)
+	if err != nil {
+		return nil, nil, err
+	}
+	claim := runtime.claim()
+	decision, err := runtime.sendClaim(ctx, claim)
+	if err != nil {
+		runtime.closeBase()
+		return nil, nil, err
+	}
+	if err := derptunClaimDecisionErr(decision); err != nil {
+		runtime.closeBase()
+		return nil, nil, err
+	}
+	dialer, cleanup, err := runtime.dialQUICStreamDialer(ctx, cfg.Emitter, cfg.ForceRelay, cfg.KeepAlive, decision)
+	if err != nil {
+		runtime.closeBase()
+		return nil, nil, err
+	}
+	return dialer, cleanup, nil
+}
+
 func (r *derptunDialRuntime) sendClaim(ctx context.Context, claim rendezvous.Claim) (rendezvous.Decision, error) {
 	return sendClaimAndReceiveDecision(ctx, r.derpClient, r.listenerDERP, claim, externalPeerControlAuthForToken(r.tok))
 }
@@ -1124,7 +1869,15 @@ func derptunClaimDecisionErr(decision rendezvous.Decision) error {
 	return errors.New("claim rejected")
 }
 
-func (r *derptunDialRuntime) dialMux(ctx context.Context, emitter *telemetry.Emitter, forceRelay bool, decision rendezvous.Decision) (*derptun.Mux, func(), error) {
+type derptunDialTransport struct {
+	ctx         context.Context
+	cancel      context.CancelFunc
+	manager     *transport.Manager
+	cleanup     func()
+	pathEmitter *transportPathEmitter
+}
+
+func (r *derptunDialRuntime) startDialTransport(ctx context.Context, emitter *telemetry.Emitter, forceRelay bool, decision rendezvous.Decision) (*derptunDialTransport, error) {
 	pathEmitter := newTransportPathEmitter(emitter)
 	pathEmitter.Emit(StateProbing)
 	transportCtx, transportCancel := context.WithCancel(ctx)
@@ -1141,44 +1894,133 @@ func (r *derptunDialRuntime) dialMux(ctx context.Context, emitter *telemetry.Emi
 	)
 	if err != nil {
 		transportCancel()
-		return nil, nil, err
+		return nil, err
 	}
 	pathEmitter.Watch(transportCtx, transportManager)
 	pathEmitter.Flush(transportManager)
 	seedAcceptedDecisionCandidates(transportCtx, transportManager, decision)
+	return &derptunDialTransport{
+		ctx:         transportCtx,
+		cancel:      transportCancel,
+		manager:     transportManager,
+		cleanup:     transportCleanup,
+		pathEmitter: pathEmitter,
+	}, nil
+}
 
-	adapter, quicConn, carrier, err := r.openQUICCarrier(ctx, transportCtx, transportManager)
+func (t *derptunDialTransport) close() {
+	if t == nil {
+		return
+	}
+	if t.pathEmitter != nil && t.manager != nil {
+		t.pathEmitter.Complete(t.manager)
+	}
+	if t.cleanup != nil {
+		t.cleanup()
+	}
+	if t.cancel != nil {
+		t.cancel()
+	}
+}
+
+func (r *derptunDialRuntime) dialQUIC(ctx context.Context, emitter *telemetry.Emitter, forceRelay bool, decision rendezvous.Decision) (*quic.Conn, func(), error) {
+	dialTransport, err := r.startDialTransport(ctx, emitter, forceRelay, decision)
 	if err != nil {
-		transportCleanup()
-		transportCancel()
+		return nil, nil, err
+	}
+	quicConn, closePacketPath, rawDirect, err := r.openQUICConn(ctx, dialTransport.ctx, dialTransport.manager, emitter, forceRelay)
+	if err != nil {
+		dialTransport.close()
+		return nil, nil, err
+	}
+	if rawDirect {
+		dialTransport.pathEmitter.Emit(StateDirect)
+	}
+	cleanup := func() {
+		_ = quicConn.CloseWithError(0, "")
+		closePacketPath()
+		dialTransport.close()
+		r.closeBase()
+	}
+	return quicConn, cleanup, nil
+}
+
+func (r *derptunDialRuntime) dialQUICStreamDialer(ctx context.Context, emitter *telemetry.Emitter, forceRelay bool, keepAlive bool, decision rendezvous.Decision) (*derptunQUICStreamDialer, func(), error) {
+	dialTransport, err := r.startDialTransport(ctx, emitter, forceRelay, decision)
+	if err != nil {
+		return nil, nil, err
+	}
+	dialer, rawDirect, err := r.openQUICStreamDialer(dialTransport.ctx, dialTransport.manager, emitter, forceRelay)
+	if err != nil {
+		dialTransport.close()
+		return nil, nil, err
+	}
+	if rawDirect {
+		dialTransport.pathEmitter.Emit(StateDirect)
+	}
+	if keepAlive {
+		if err := dialer.OpenControl(ctx); err != nil {
+			_ = dialer.Close()
+			dialTransport.close()
+			return nil, nil, err
+		}
+	}
+	cleanup := func() {
+		_ = dialer.Close()
+		dialTransport.close()
+		r.closeBase()
+	}
+	return dialer, cleanup, nil
+}
+
+func (r *derptunDialRuntime) dialMux(ctx context.Context, emitter *telemetry.Emitter, forceRelay bool, decision rendezvous.Decision) (*derptun.Mux, func(), error) {
+	quicConn, cleanup, err := r.dialQUIC(ctx, emitter, forceRelay, decision)
+	if err != nil {
+		return nil, nil, err
+	}
+	carrier, err := quicConn.OpenStreamSync(ctx)
+	if err != nil {
+		cleanup()
 		return nil, nil, err
 	}
 	mux := derptun.NewMux(derptun.MuxConfig{Role: derptun.MuxRoleClient, ReconnectTimeout: 30 * time.Second})
 	mux.ReplaceCarrier(quicpath.WrapStream(quicConn, carrier))
-	cleanup := func() {
-		_ = quicConn.CloseWithError(0, "")
-		_ = adapter.Close()
-		pathEmitter.Complete(transportManager)
-		transportCleanup()
-		transportCancel()
-		r.closeBase()
-	}
 	return mux, cleanup, nil
 }
 
-func (r *derptunDialRuntime) openQUICCarrier(ctx context.Context, transportCtx context.Context, transportManager *transport.Manager) (*quicpath.Adapter, *quic.Conn, *quic.Stream, error) {
+func (r *derptunDialRuntime) openQUICConn(ctx context.Context, transportCtx context.Context, transportManager *transport.Manager, emitter *telemetry.Emitter, forceRelay bool) (*quic.Conn, func(), bool, error) {
+	packetConn, remoteAddr, closePacketPath, rawDirect, err := r.openQUICPacketPath(transportCtx, transportManager, emitter, forceRelay)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	quicConn, err := quic.Dial(ctx, packetConn, remoteAddr, quicpath.ClientTLSConfig(r.clientIdentity, r.tok.QUICPublic), derptunQUICConfig())
+	if err != nil {
+		closePacketPath()
+		return nil, nil, false, err
+	}
+	return quicConn, closePacketPath, rawDirect, nil
+}
+
+func (r *derptunDialRuntime) openQUICStreamDialer(transportCtx context.Context, transportManager *transport.Manager, emitter *telemetry.Emitter, forceRelay bool) (*derptunQUICStreamDialer, bool, error) {
+	packetConn, remoteAddr, closePacketPath, rawDirect, err := r.openQUICPacketPath(transportCtx, transportManager, emitter, forceRelay)
+	if err != nil {
+		return nil, false, err
+	}
+	dialer := newDerptunQUICStreamDialer(packetConn, remoteAddr, r.clientIdentity, r.tok.QUICPublic, closePacketPath)
+	return dialer, rawDirect, nil
+}
+
+func (r *derptunDialRuntime) openQUICPacketPath(transportCtx context.Context, transportManager *transport.Manager, emitter *telemetry.Emitter, forceRelay bool) (net.PacketConn, net.Addr, func(), bool, error) {
+	rawPath, err := negotiateExternalV2DirectPacketPath(transportCtx, r.derpClient, r.listenerDERP, transportManager, r.dm, externalPeerControlAuthForToken(r.tok), emitter, 1, externalV2DataPlaneSenderPunchDelay, 0, forceRelay)
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
+	if rawPath.raw {
+		return rawPath.conn, rawPath.addr, rawPath.Close, true, nil
+	}
+	rawPath.Close()
+
 	peerConn := transportManager.PeerDatagramConn(transportCtx)
 	adapter := quicpath.NewAdapter(peerConn)
-	quicConn, err := quic.Dial(ctx, adapter, peerConn.RemoteAddr(), quicpath.ClientTLSConfig(r.clientIdentity, r.tok.QUICPublic), derptunQUICConfig())
-	if err != nil {
-		_ = adapter.Close()
-		return nil, nil, nil, err
-	}
-	carrier, err := quicConn.OpenStreamSync(ctx)
-	if err != nil {
-		_ = quicConn.CloseWithError(1, "open derptun carrier failed")
-		_ = adapter.Close()
-		return nil, nil, nil, err
-	}
-	return adapter, quicConn, carrier, nil
+	return adapter, peerConn.RemoteAddr(), func() { _ = adapter.Close() }, false, nil
 }
