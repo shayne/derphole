@@ -22,7 +22,7 @@ import (
 
 const (
 	ServerTokenPrefix = "dts1_"
-	ClientTokenPrefix = "dtc1_"
+	ClientTokenPrefix = "DT1"
 	TokenVersion      = 1
 	DefaultServerDays = 180
 	DefaultClientDays = 90
@@ -141,11 +141,14 @@ func GenerateClientToken(opts ClientTokenOptions) (string, error) {
 	client.QUICPublic = serverTok.QUICPublic
 	client.BearerSecret = deriveClientBearerSecret(server.SigningSecret, client.ClientID)
 	client.ProofMAC = computeClientProofMAC(server.SigningSecret, client)
-	return encodeJSONToken(ClientTokenPrefix, client)
+	return EncodeClientCredential(client)
 }
 
 func EncodeClientCredential(cred ClientCredential) (string, error) {
-	return encodeJSONToken(ClientTokenPrefix, cred)
+	if !validClientCredential(cred) {
+		return "", ErrInvalidToken
+	}
+	return encodeCompactClientToken(cred)
 }
 
 func DecodeServerToken(encoded string, now time.Time) (ServerCredential, error) {
@@ -170,17 +173,7 @@ func DecodeServerToken(encoded string, now time.Time) (ServerCredential, error) 
 }
 
 func DecodeClientToken(encoded string, now time.Time) (ClientCredential, error) {
-	var cred ClientCredential
-	if err := decodeJSONToken(encoded, ClientTokenPrefix, &cred); err != nil {
-		return ClientCredential{}, err
-	}
-	if !validClientCredential(cred) {
-		return ClientCredential{}, ErrInvalidToken
-	}
-	if expired(now, cred.ExpiresUnix) {
-		return ClientCredential{}, ErrExpired
-	}
-	return cred, nil
+	return decodeCompactClientToken(encoded, now)
 }
 
 func validClientCredential(cred ClientCredential) bool {

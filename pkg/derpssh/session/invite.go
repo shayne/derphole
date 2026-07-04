@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/shayne/derphole/pkg/derptun"
 )
@@ -52,5 +53,9 @@ func DecodeInvite(raw string) (Invite, error) {
 
 func validInviteClientToken(token string) bool {
 	token = strings.TrimSpace(token)
-	return token != "" && strings.HasPrefix(token, derptun.ClientTokenPrefix)
+	if token == "" {
+		return false
+	}
+	_, err := derptun.DecodeClientToken(token, time.Now())
+	return err == nil
 }

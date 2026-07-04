@@ -44,11 +44,11 @@ wait_for_file_value() {
   return 1
 }
 
-wait_for_compact_invite() {
+wait_for_invite() {
   local log_path="$1"
   local invite=""
   for _ in $(seq 1 300); do
-    invite="$(sed -nE 's/^Invite: (DT1[^[:space:]]+).*/\1/p' "${log_path}" | tail -n 1 || true)"
+    invite="$(sed -nE 's/^Token: (DT1[^[:space:]]+).*/\1/p' "${log_path}" | tail -n 1 || true)"
     if [[ -n "${invite}" ]]; then
       printf '%s\n' "${invite}"
       return 0
@@ -169,8 +169,8 @@ serve_log="${tmp}/derptun-serve.log"
 dist/derptun serve --token "${server_token}" --tcp "${ssh_addr}" --qr >"${tmp}/derptun-serve.out" 2>"${serve_log}" &
 serve_pid=$!
 
-if ! invite="$(wait_for_compact_invite "${serve_log}")"; then
-  echo "failed to capture compact invite from derptun serve" >&2
+if ! invite="$(wait_for_invite "${serve_log}")"; then
+  echo "failed to capture invite from derptun serve" >&2
   cat "${serve_log}" >&2 || true
   exit 1
 fi

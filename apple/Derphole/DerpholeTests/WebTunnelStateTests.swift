@@ -11,12 +11,12 @@ final class WebTunnelStateTests: XCTestCase {
         let opener = RecordingWebTunnelOpener(boundAddr: "127.0.0.1:49281")
         let state = WebTunnelState(tokenStore: store, tunnelOpenerFactory: { opener })
 
-        state.acceptScannedPayload("derphole://web?path=%2Fadmin&scheme=http&token=dtc1_web_token&v=1")
+        state.acceptScannedPayload("derphole://web?path=%2Fadmin&scheme=http&token=web-token-for-test&v=1")
         await fulfillment(of: [opener.openedExpectation], timeout: 2)
         await Task.yield()
 
-        XCTAssertEqual(store.webToken, "dtc1_web_token")
-        XCTAssertEqual(opener.openedToken, "dtc1_web_token")
+        XCTAssertEqual(store.webToken, "web-token-for-test")
+        XCTAssertEqual(opener.openedToken, "web-token-for-test")
         XCTAssertEqual(opener.openedListenAddr, "127.0.0.1:0")
         XCTAssertEqual(state.boundAddr, "127.0.0.1:49281")
         XCTAssertEqual(state.browserURL?.absoluteString, "http://127.0.0.1:49281/admin")
@@ -33,12 +33,12 @@ final class WebTunnelStateTests: XCTestCase {
         let opener = RecordingWebTunnelOpener(boundAddr: "127.0.0.1:49280")
         let state = WebTunnelState(tokenStore: store, tunnelOpenerFactory: { opener })
 
-        state.acceptScannedPayload("derphole://tcp?token=dtc1_web_token&v=1")
+        state.acceptScannedPayload("derphole://tcp?token=web-token-for-test&v=1")
         await fulfillment(of: [opener.openedExpectation], timeout: 2)
         await Task.yield()
 
-        XCTAssertEqual(store.webToken, "dtc1_web_token")
-        XCTAssertEqual(opener.openedToken, "dtc1_web_token")
+        XCTAssertEqual(store.webToken, "web-token-for-test")
+        XCTAssertEqual(opener.openedToken, "web-token-for-test")
         XCTAssertEqual(state.browserURL?.absoluteString, "http://127.0.0.1:49280/")
         XCTAssertTrue(state.isConnected)
         XCTAssertFalse(state.isConnecting)
@@ -53,13 +53,13 @@ final class WebTunnelStateTests: XCTestCase {
         let opener = RecordingWebTunnelOpener(boundAddr: "127.0.0.1:49282")
         let state = WebTunnelState(tokenStore: store, tunnelOpenerFactory: { opener })
 
-        state.acceptScannedPayload("derphole://tcp?token=dtc1_web_token&v=1")
+        state.acceptScannedPayload("derphole://tcp?token=web-token-for-test&v=1")
         await fulfillment(of: [opener.openedExpectation], timeout: 2)
         await Task.yield()
 
         state.disconnect()
 
-        XCTAssertEqual(store.webToken, "dtc1_web_token")
+        XCTAssertEqual(store.webToken, "web-token-for-test")
         XCTAssertTrue(opener.cancelCalled)
         XCTAssertFalse(state.isConnected)
         XCTAssertFalse(state.isConnecting)
@@ -92,7 +92,7 @@ final class WebTunnelStateTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let store = TokenStore(defaults: defaults)
-        store.webToken = "dtc1_remembered"
+        store.webToken = "remembered-token-for-test"
         let opener = RecordingWebTunnelOpener(boundAddr: "127.0.0.1:49284")
         let state = WebTunnelState(tokenStore: store, tunnelOpenerFactory: { opener })
 
@@ -100,7 +100,7 @@ final class WebTunnelStateTests: XCTestCase {
         await fulfillment(of: [opener.openedExpectation], timeout: 2)
         await Task.yield()
 
-        XCTAssertEqual(opener.openedToken, "dtc1_remembered")
+        XCTAssertEqual(opener.openedToken, "remembered-token-for-test")
         XCTAssertEqual(state.browserURL?.absoluteString, "http://127.0.0.1:49284/")
         XCTAssertTrue(state.isConnected)
     }
@@ -114,7 +114,7 @@ final class WebTunnelStateTests: XCTestCase {
         let opener = RecordingWebTunnelOpener(boundAddr: "127.0.0.1:49285")
         let state = WebTunnelState(tokenStore: store, tunnelOpenerFactory: { opener })
 
-        state.acceptScannedPayload("derphole://tcp?token=dtc1_web_token&v=1")
+        state.acceptScannedPayload("derphole://tcp?token=web-token-for-test&v=1")
         state.disconnect()
 
         try await Task.sleep(nanoseconds: 100_000_000)
@@ -135,19 +135,19 @@ final class WebTunnelStateTests: XCTestCase {
         let state = WebTunnelState(tokenStore: store, tunnelOpenerFactory: { opener })
 
         state.openRuntimeInjectedPayloadIfConfigured(
-            environment: ["DERPHOLE_LIVE_WEB_PAYLOAD": " derphole://tcp?token=dtc1_runtime_web&v=1 "],
+            environment: ["DERPHOLE_LIVE_WEB_PAYLOAD": " derphole://tcp?token=runtime-web-token-for-test&v=1 "],
             arguments: []
         )
         await fulfillment(of: [opener.openedExpectation], timeout: 2)
         await Task.yield()
 
         state.openRuntimeInjectedPayloadIfConfigured(
-            environment: ["DERPHOLE_LIVE_WEB_PAYLOAD": " derphole://tcp?token=dtc1_second_web&v=1 "],
+            environment: ["DERPHOLE_LIVE_WEB_PAYLOAD": " derphole://tcp?token=second-web-token-for-test&v=1 "],
             arguments: []
         )
 
-        XCTAssertEqual(store.webToken, "dtc1_runtime_web")
-        XCTAssertEqual(opener.openedToken, "dtc1_runtime_web")
+        XCTAssertEqual(store.webToken, "runtime-web-token-for-test")
+        XCTAssertEqual(opener.openedToken, "runtime-web-token-for-test")
         XCTAssertEqual(opener.openCallCount, 1)
         XCTAssertEqual(state.browserURL?.absoluteString, "http://127.0.0.1:49286/")
     }
@@ -165,7 +165,7 @@ final class WebTunnelStateTests: XCTestCase {
             return opener
         })
 
-        let payload = "derphole://tcp?token=dtc1_web_token&v=1"
+        let payload = "derphole://tcp?token=web-token-for-test&v=1"
         state.acceptScannedPayload(payload)
         guard let firstOpener = createdOpeners.first else {
             XCTFail("expected first web tunnel opener")
@@ -190,10 +190,10 @@ final class WebTunnelStateTests: XCTestCase {
         let store = TokenStore(defaults: defaults)
         let state = WebTunnelState(tokenStore: store, tunnelOpenerFactory: { nil })
 
-        state.acceptPayloadForTesting(kind: "tcp", token: "dtc1_web_token")
+        state.acceptPayloadForTesting(kind: "tcp", token: "web-token-for-test")
         state.markBoundForTesting("127.0.0.1:49287")
 
-        XCTAssertEqual(store.webToken, "dtc1_web_token")
+        XCTAssertEqual(store.webToken, "web-token-for-test")
         XCTAssertEqual(state.browserURL?.absoluteString, "http://127.0.0.1:49287/")
         XCTAssertTrue(state.isConnected)
         XCTAssertFalse(state.isConnecting)

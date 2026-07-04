@@ -8,11 +8,11 @@ final class TokenStoreTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let store = TokenStore(defaults: defaults)
 
-        store.webToken = "dtc1_web_token"
-        store.tcpToken = "dtc1_tcp_token"
+        store.webToken = "web-token-for-test"
+        store.tcpToken = "tcp-token-for-test"
 
-        XCTAssertEqual(TokenStore(defaults: defaults).webToken, "dtc1_web_token")
-        XCTAssertEqual(TokenStore(defaults: defaults).tcpToken, "dtc1_tcp_token")
+        XCTAssertEqual(TokenStore(defaults: defaults).webToken, "web-token-for-test")
+        XCTAssertEqual(TokenStore(defaults: defaults).tcpToken, "tcp-token-for-test")
         XCTAssertNil(defaults.string(forKey: "sshUsername"))
         XCTAssertNil(defaults.string(forKey: "sshPassword"))
     }
@@ -23,8 +23,8 @@ final class TokenStoreTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let store = TokenStore(defaults: defaults)
 
-        store.webToken = "dtc1_web_token"
-        store.tcpToken = "dtc1_tcp_token"
+        store.webToken = "web-token-for-test"
+        store.tcpToken = "tcp-token-for-test"
         store.webToken = nil
         store.tcpToken = nil
 

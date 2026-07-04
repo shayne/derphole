@@ -30,21 +30,22 @@ type serveFlags struct {
 var serveHelpConfig = yargs.HelpConfig{
 	Command: yargs.CommandInfo{
 		Name:        "derptun",
-		Description: "Serve a local TCP service through a derptun server token.",
+		Description: "Serve a local TCP service and print the command for the connecting side.",
 		Examples: []string{
+			"derptun serve --tcp 127.0.0.1:8080",
 			"derptun token server --days 365 > server.dts",
-			"derptun serve --token-file server.dts --tcp 127.0.0.1:22",
+			"derptun serve --token-file server.dts --tcp 127.0.0.1:8080",
 		},
 	},
 	SubCommands: map[string]yargs.SubCommandInfo{
 		"serve": {
 			Name:        "serve",
 			Description: "Expose a local TCP target until Ctrl-C.",
-			Usage:       "(--token TOKEN|--token-file PATH|--token-stdin) --tcp HOST:PORT [--force-relay] [--qr]",
+			Usage:       "[--token TOKEN|--token-file PATH|--token-stdin] --tcp HOST:PORT [--force-relay] [--qr]",
 			Examples: []string{
-				"derptun serve --token-file server.dts --tcp 127.0.0.1:22",
-				"derptun serve --token-file server.dts --tcp 127.0.0.1:4222 --qr",
-				"printf '%s\\n' \"$DERPTUN_SERVER_TOKEN\" | derptun serve --token-stdin --tcp 127.0.0.1:22",
+				"derptun serve --tcp 127.0.0.1:8080",
+				"derptun token server --days 365 > server.dts",
+				"derptun serve --token-file server.dts --tcp 127.0.0.1:8080",
 			},
 		},
 	},
@@ -61,17 +62,11 @@ func runServe(args []string, level telemetry.Level, stdin io.Reader, stderr io.W
 		_, _ = fmt.Fprint(stderr, serveHelpText())
 		return 2
 	}
-	token, _, err := resolveTokenSource(stdin, tokenSource{
-		Token:      parsed.SubCommandFlags.Token,
-		TokenFile:  parsed.SubCommandFlags.TokenFile,
-		TokenStdin: parsed.SubCommandFlags.TokenStdin,
-	})
-	if err != nil {
-		_, _ = fmt.Fprintln(stderr, err)
-		_, _ = fmt.Fprint(stderr, serveHelpText())
-		return 2
+	token, code, failed := resolveServeServerToken(parsed.SubCommandFlags, stdin, stderr)
+	if failed {
+		return code
 	}
-	if code, failed := maybeWriteServeQR(parsed.SubCommandFlags.QR, token, stderr); failed {
+	if code, failed := writeServeClientAccess(parsed.SubCommandFlags.QR, token, stderr); failed {
 		return code
 	}
 
@@ -89,16 +84,39 @@ func runServe(args []string, level telemetry.Level, stdin io.Reader, stderr io.W
 	return 0
 }
 
-func maybeWriteServeQR(enabled bool, token string, stderr io.Writer) (int, bool) {
-	if !enabled {
-		return 0, false
+func resolveServeServerToken(flags serveFlags, stdin io.Reader, stderr io.Writer) (string, int, bool) {
+	token, _, hasToken, err := resolveOptionalTokenSource(stdin, tokenSource{
+		Token:      flags.Token,
+		TokenFile:  flags.TokenFile,
+		TokenStdin: flags.TokenStdin,
+	})
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprint(stderr, serveHelpText())
+		return "", 2, true
 	}
-	invite, err := serveQRInvite(token)
+	if hasToken {
+		return token, 0, false
+	}
+
+	token, err = derptunpkg.GenerateServerToken(derptunpkg.ServerTokenOptions{})
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return "", 1, true
+	}
+	return token, 0, false
+}
+
+func writeServeClientAccess(qr bool, token string, stderr io.Writer) (int, bool) {
+	clientToken, err := deriveServeClientToken(token, time.Now())
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1, true
 	}
-	writeServeQRInstruction(stderr, invite)
+	writeServeOpenCommand(stderr, clientToken)
+	if qr {
+		writeServeQRInstruction(stderr, clientToken)
+	}
 	return 0, false
 }
 
@@ -106,15 +124,7 @@ func serveHelpText() string {
 	return yargs.GenerateSubCommandHelp(serveHelpConfig, "serve", struct{}{}, serveFlags{}, struct{}{})
 }
 
-func serveQRInvite(serverToken string) (string, error) {
-	clientToken, err := deriveServeQRClientToken(serverToken, time.Now())
-	if err != nil {
-		return "", err
-	}
-	return derptunpkg.EncodeClientInvite(clientToken)
-}
-
-func deriveServeQRClientToken(serverToken string, now time.Time) (string, error) {
+func deriveServeClientToken(serverToken string, now time.Time) (string, error) {
 	server, err := derptunpkg.DecodeServerToken(serverToken, now)
 	if err != nil {
 		return "", err
@@ -131,11 +141,19 @@ func deriveServeQRClientToken(serverToken string, now time.Time) (string, error)
 	})
 }
 
-func writeServeQRInstruction(stderr io.Writer, invite string) {
+func writeServeOpenCommand(stderr io.Writer, clientToken string) {
+	if stderr == nil {
+		return
+	}
+	_, _ = fmt.Fprintln(stderr, "On the other machine, run:")
+	_, _ = fmt.Fprintf(stderr, "  npx -y derptun@latest open --token %s\n", clientToken)
+}
+
+func writeServeQRInstruction(stderr io.Writer, clientToken string) {
 	if stderr == nil {
 		return
 	}
 	_, _ = fmt.Fprintln(stderr, "Scan this QR code with a derptun-compatible mobile app to open this TCP tunnel:")
-	_, _ = fmt.Fprintf(stderr, "Invite: %s\n", invite)
-	qrterminal.GenerateHalfBlock(invite, qrterminal.M, stderr)
+	_, _ = fmt.Fprintf(stderr, "Token: %s\n", clientToken)
+	qrterminal.GenerateHalfBlock(clientToken, qrterminal.M, stderr)
 }

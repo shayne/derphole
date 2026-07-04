@@ -61,11 +61,11 @@ func TestParseFilePayload(t *testing.T) {
 }
 
 func TestEncodeAndParseWebPayload(t *testing.T) {
-	encoded, err := EncodeWebToken("dtc1_test", "http", "/admin")
+	encoded, err := EncodeWebToken("web-token", "http", "/admin")
 	if err != nil {
 		t.Fatalf("EncodeWebToken() error = %v", err)
 	}
-	const want = "derphole://web?path=%2Fadmin&scheme=http&token=dtc1_test&v=1"
+	const want = "derphole://web?path=%2Fadmin&scheme=http&token=web-token&v=1"
 	if encoded != want {
 		t.Fatalf("EncodeWebToken() = %q, want %q", encoded, want)
 	}
@@ -74,17 +74,17 @@ func TestEncodeAndParseWebPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse(web) error = %v", err)
 	}
-	if got.Kind != KindWeb || got.Token != "dtc1_test" || got.Scheme != "http" || got.Path != "/admin" {
+	if got.Kind != KindWeb || got.Token != "web-token" || got.Scheme != "http" || got.Path != "/admin" {
 		t.Fatalf("Parse(web) = %#v, want web payload", got)
 	}
 }
 
 func TestEncodeAndParseTCPPayload(t *testing.T) {
-	encoded, err := EncodeTCPToken("dtc1_test")
+	encoded, err := EncodeTCPToken("tcp-token")
 	if err != nil {
 		t.Fatalf("EncodeTCPToken() error = %v", err)
 	}
-	const want = "derphole://tcp?token=dtc1_test&v=1"
+	const want = "derphole://tcp?token=tcp-token&v=1"
 	if encoded != want {
 		t.Fatalf("EncodeTCPToken() = %q, want %q", encoded, want)
 	}
@@ -93,7 +93,7 @@ func TestEncodeAndParseTCPPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse(tcp) error = %v", err)
 	}
-	if got.Kind != KindTCP || got.Token != "dtc1_test" {
+	if got.Kind != KindTCP || got.Token != "tcp-token" {
 		t.Fatalf("Parse(tcp) = %#v, want tcp payload", got)
 	}
 }

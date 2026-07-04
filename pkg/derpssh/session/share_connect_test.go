@@ -24,7 +24,8 @@ import (
 )
 
 func TestInviteRoundTrip(t *testing.T) {
-	encoded, err := EncodeInvite(Invite{ClientToken: "dtc1_test"})
+	clientToken := newTestDerptunClientToken(t)
+	encoded, err := EncodeInvite(Invite{ClientToken: clientToken})
 	if err != nil {
 		t.Fatalf("EncodeInvite() error = %v", err)
 	}
@@ -35,9 +36,23 @@ func TestInviteRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeInvite() error = %v", err)
 	}
-	if decoded.ClientToken != "dtc1_test" {
-		t.Fatalf("ClientToken = %q, want dtc1_test", decoded.ClientToken)
+	if decoded.ClientToken != clientToken {
+		t.Fatalf("ClientToken = %q, want %q", decoded.ClientToken, clientToken)
 	}
+}
+
+func newTestDerptunClientToken(t *testing.T) string {
+	t.Helper()
+	now := time.Now()
+	server, err := derptun.GenerateServerToken(derptun.ServerTokenOptions{Now: now, Days: 7})
+	if err != nil {
+		t.Fatalf("GenerateServerToken() error = %v", err)
+	}
+	client, err := derptun.GenerateClientToken(derptun.ClientTokenOptions{Now: now, ServerToken: server, Days: 3})
+	if err != nil {
+		t.Fatalf("GenerateClientToken() error = %v", err)
+	}
+	return client
 }
 
 func TestDecodeInviteRejectsWrongPrefix(t *testing.T) {
@@ -57,6 +72,20 @@ func TestDecodeInviteRejectsNonClientTokenPrefix(t *testing.T) {
 	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"client_token":"not-a-client-token"}`))
 	if _, err := DecodeInvite(InvitePrefix + payload); err == nil {
 		t.Fatal("DecodeInvite(non-client token) error = nil, want error")
+	}
+}
+
+func TestDecodeInviteRejectsMalformedClientTokenWithCanonicalPrefix(t *testing.T) {
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"client_token":"DT1not-valid"}`))
+	if _, err := DecodeInvite(InvitePrefix + payload); err == nil {
+		t.Fatal("DecodeInvite(malformed client token) error = nil, want error")
+	}
+}
+
+func TestDecodeInviteRejectsRemovedClientTokenFormat(t *testing.T) {
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"client_token":"dtc1_legacy"}`))
+	if _, err := DecodeInvite(InvitePrefix + payload); err == nil {
+		t.Fatal("DecodeInvite(old client token) error = nil, want error")
 	}
 }
 
@@ -112,7 +141,8 @@ func TestShareTestCommandBacksHostTerminal(t *testing.T) {
 		runHostSession = oldRunHost
 	}()
 	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
-	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	clientToken := newTestDerptunClientToken(t)
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return clientToken, nil }
 	startPTY = func(pty.StartConfig) (*pty.Session, error) {
 		t.Fatal("startPTY called for DERPSSH_TEST_COMMAND")
 		return nil, nil
@@ -241,7 +271,8 @@ func TestShareReturnsPlainInviteStartErrorBeforeServing(t *testing.T) {
 
 	sentinel := errors.New("preflight sentinel")
 	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
-	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	clientToken := newTestDerptunClientToken(t)
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return clientToken, nil }
 	canUseShareInvitePreflight = func(ShareConfig) bool { return true }
 	startShareInvitePreflight = func(_ context.Context, _ ShareConfig, command string) (shareInvitePreflight, error) {
 		if !strings.Contains(command, "npx -y derpssh@latest connect DSH1") {
@@ -462,7 +493,8 @@ func TestSharePlainInviteTerminalQuitsOnQ(t *testing.T) {
 		serveAppMux = oldServe
 	}()
 	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
-	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	clientToken := newTestDerptunClientToken(t)
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return clientToken, nil }
 	serveStarted := make(chan struct{})
 	serveAppMux = func(ctx context.Context, cfg appsession.DerptunAppServeConfig) error {
 		_ = cfg
@@ -565,7 +597,8 @@ func TestShareStartsTerminalBeforeGuestMux(t *testing.T) {
 
 	sentinel := errors.New("pty start sentinel")
 	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
-	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	clientToken := newTestDerptunClientToken(t)
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return clientToken, nil }
 	startPTY = func(pty.StartConfig) (*pty.Session, error) {
 		return nil, sentinel
 	}
@@ -595,7 +628,8 @@ func TestShareRendersHostTerminalBeforeGuestMux(t *testing.T) {
 		serveAppMux = oldServe
 	}()
 	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
-	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	clientToken := newTestDerptunClientToken(t)
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return clientToken, nil }
 	serveAppMux = func(ctx context.Context, cfg appsession.DerptunAppServeConfig) error {
 		<-ctx.Done()
 		return ctx.Err()
@@ -630,7 +664,8 @@ func TestShareUsesApprovalSeam(t *testing.T) {
 		runHostSession = oldRunHost
 	}()
 	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
-	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	clientToken := newTestDerptunClientToken(t)
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return clientToken, nil }
 	startPTY = func(pty.StartConfig) (*pty.Session, error) { return &pty.Session{}, nil }
 	newShareApproval = func(ShareConfig) Approval {
 		return StaticApproval{Role: protocol.RoleRead}
@@ -670,7 +705,8 @@ func TestShareDoesNotPassStdinToHostLocalInputWhenUsingTUI(t *testing.T) {
 		runHostSession = oldRunHost
 	}()
 	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
-	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	clientToken := newTestDerptunClientToken(t)
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return clientToken, nil }
 	newShareApproval = func(ShareConfig) Approval {
 		return StaticApproval{Role: protocol.RoleRead}
 	}
@@ -712,7 +748,8 @@ func TestShareStartsPTYAtTerminalPaneSize(t *testing.T) {
 		runHostSession = oldRunHost
 	}()
 	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
-	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	clientToken := newTestDerptunClientToken(t)
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return clientToken, nil }
 	var startedSize pty.Size
 	startPTY = func(cfg pty.StartConfig) (*pty.Session, error) {
 		startedSize = cfg.Size
@@ -767,7 +804,8 @@ func TestShareUsesUserAtHostDisplayName(t *testing.T) {
 		runHostSession = oldRunHost
 	}()
 	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
-	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	clientToken := newTestDerptunClientToken(t)
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return clientToken, nil }
 	startPTY = func(pty.StartConfig) (*pty.Session, error) { return &pty.Session{}, nil }
 	newShareApproval = func(ShareConfig) Approval {
 		return StaticApproval{Role: protocol.RoleRead}
@@ -803,11 +841,12 @@ func TestSharePrintsConnectCommandBeforeServing(t *testing.T) {
 	generateServerToken = func(derptun.ServerTokenOptions) (string, error) {
 		return "server-token", nil
 	}
+	clientToken := newTestDerptunClientToken(t)
 	generateClientToken = func(opts derptun.ClientTokenOptions) (string, error) {
 		if opts.ServerToken != "server-token" {
 			t.Fatalf("ServerToken = %q, want server-token", opts.ServerToken)
 		}
-		return "dtc1_test", nil
+		return clientToken, nil
 	}
 	serveErr := errors.New("stop")
 	serveAppMux = func(ctx context.Context, cfg appsession.DerptunAppServeConfig) error {
@@ -840,7 +879,8 @@ func TestShareStartsServingWhilePlainInviteWaits(t *testing.T) {
 		startShareInvitePreflight = oldStartPreflight
 	}()
 	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
-	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	clientToken := newTestDerptunClientToken(t)
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return clientToken, nil }
 	canUseShareInvitePreflight = func(ShareConfig) bool { return true }
 	preflight := newFakeShareInvitePreflight()
 	preflightStarted := make(chan struct{})
@@ -904,7 +944,8 @@ func TestShareGuestApprovalInterruptsPlainInvite(t *testing.T) {
 		runHostSession = oldRunHost
 	}()
 	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
-	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	clientToken := newTestDerptunClientToken(t)
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return clientToken, nil }
 	canUseShareInvitePreflight = func(ShareConfig) bool { return true }
 	preflight := newFakeShareInvitePreflight()
 	startShareInvitePreflight = func(context.Context, ShareConfig, string) (shareInvitePreflight, error) {
@@ -942,7 +983,8 @@ func TestShareCancelsServerAfterHostQuit(t *testing.T) {
 		runHostSession = oldRunHost
 	}()
 	generateServerToken = func(derptun.ServerTokenOptions) (string, error) { return "server-token", nil }
-	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return "dtc1_test", nil }
+	clientToken := newTestDerptunClientToken(t)
+	generateClientToken = func(derptun.ClientTokenOptions) (string, error) { return clientToken, nil }
 	serveAppMux = func(ctx context.Context, cfg appsession.DerptunAppServeConfig) error {
 		if err := cfg.OnMux(ctx, nil); err != nil {
 			return err
@@ -997,14 +1039,15 @@ func TestConnectDecodesInviteAndDials(t *testing.T) {
 	oldDial := dialAppMux
 	defer func() { dialAppMux = oldDial }()
 
-	invite, err := EncodeInvite(Invite{ClientToken: "dtc1_test"})
+	clientToken := newTestDerptunClientToken(t)
+	invite, err := EncodeInvite(Invite{ClientToken: clientToken})
 	if err != nil {
 		t.Fatalf("EncodeInvite() error = %v", err)
 	}
 	dialAppMux = func(ctx context.Context, cfg appsession.DerptunAppDialConfig) (*derptun.Mux, func(), error) {
 		_, _ = ctx, cfg.Emitter
-		if cfg.ClientToken != "dtc1_test" {
-			t.Fatalf("ClientToken = %q, want dtc1_test", cfg.ClientToken)
+		if cfg.ClientToken != clientToken {
+			t.Fatalf("ClientToken = %q, want %q", cfg.ClientToken, clientToken)
 		}
 		return nil, func() {}, errors.New("stop")
 	}
@@ -1028,7 +1071,8 @@ func TestConnectClosesStdinWhenGuestRunExits(t *testing.T) {
 		dialAppMux = oldDial
 		runGuestSession = oldRunGuest
 	}()
-	invite, err := EncodeInvite(Invite{ClientToken: "dtc1_test"})
+	clientToken := newTestDerptunClientToken(t)
+	invite, err := EncodeInvite(Invite{ClientToken: clientToken})
 	if err != nil {
 		t.Fatalf("EncodeInvite() error = %v", err)
 	}
@@ -1062,7 +1106,8 @@ func TestConnectReportsGuestCloseReason(t *testing.T) {
 		dialAppMux = oldDial
 		runGuestSession = oldRunGuest
 	}()
-	invite, err := EncodeInvite(Invite{ClientToken: "dtc1_test"})
+	clientToken := newTestDerptunClientToken(t)
+	invite, err := EncodeInvite(Invite{ClientToken: clientToken})
 	if err != nil {
 		t.Fatalf("EncodeInvite() error = %v", err)
 	}
@@ -1099,7 +1144,8 @@ func TestConnectStartsConsoleBeforeInitialStatus(t *testing.T) {
 		runGuestSession = oldRunGuest
 		newConnectConsole = oldNewConsole
 	}()
-	invite, err := EncodeInvite(Invite{ClientToken: "dtc1_test"})
+	clientToken := newTestDerptunClientToken(t)
+	invite, err := EncodeInvite(Invite{ClientToken: clientToken})
 	if err != nil {
 		t.Fatalf("EncodeInvite() error = %v", err)
 	}
@@ -1146,7 +1192,8 @@ func TestConnectStartsGuestCommandPumpInsteadOfRawStdinPump(t *testing.T) {
 		dialAppMux = oldDial
 		runGuestSession = oldRunGuest
 	}()
-	invite, err := EncodeInvite(Invite{ClientToken: "dtc1_test"})
+	clientToken := newTestDerptunClientToken(t)
+	invite, err := EncodeInvite(Invite{ClientToken: clientToken})
 	if err != nil {
 		t.Fatalf("EncodeInvite() error = %v", err)
 	}

@@ -50,8 +50,8 @@ func TestParsePayloadClassifiesModes(t *testing.T) {
 		path   string
 	}{
 		{name: "file", raw: "derphole://file?v=1&token=file-token", kind: "file", token: "file-token"},
-		{name: "web", raw: "derphole://web?path=%2Fadmin&scheme=http&token=dtc1_test&v=1", kind: "web", token: "dtc1_test", scheme: "http", path: "/admin"},
-		{name: "tcp", raw: "derphole://tcp?v=1&token=dtc1_test", kind: "tcp", token: "dtc1_test"},
+		{name: "web", raw: "derphole://web?path=%2Fadmin&scheme=http&token=tcp-token&v=1", kind: "web", token: "tcp-token", scheme: "http", path: "/admin"},
+		{name: "tcp", raw: "derphole://tcp?v=1&token=tcp-token", kind: "tcp", token: "tcp-token"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			parsed, err := ParsePayload(tt.raw)
@@ -74,7 +74,7 @@ func TestParsePayloadClassifiesModes(t *testing.T) {
 	}
 }
 
-func TestParsePayloadClassifiesCompactInviteAsTCP(t *testing.T) {
+func TestParsePayloadClassifiesClientTokenAsTCP(t *testing.T) {
 	now := time.Now()
 	server, err := derptun.GenerateServerToken(derptun.ServerTokenOptions{Now: now, Days: 7})
 	if err != nil {
@@ -84,20 +84,16 @@ func TestParsePayloadClassifiesCompactInviteAsTCP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateClientToken() error = %v", err)
 	}
-	invite, err := derptun.EncodeClientInvite(client)
-	if err != nil {
-		t.Fatalf("EncodeClientInvite() error = %v", err)
-	}
 
-	parsed, err := ParsePayload(invite)
+	parsed, err := ParsePayload(client)
 	if err != nil {
 		t.Fatalf("ParsePayload() error = %v", err)
 	}
 	if parsed.Kind() != "tcp" {
 		t.Fatalf("Kind() = %q, want tcp", parsed.Kind())
 	}
-	if parsed.Token() == "" {
-		t.Fatal("Token() is empty")
+	if parsed.Token() != client {
+		t.Fatalf("Token() = %q, want original client token", parsed.Token())
 	}
 }
 
@@ -116,7 +112,7 @@ func TestParseFileTokenReturnsFileToken(t *testing.T) {
 }
 
 func TestParseFileTokenRejectsNonFilePayload(t *testing.T) {
-	payload, err := qrpayload.EncodeTCPToken("dtc1_test")
+	payload, err := qrpayload.EncodeTCPToken("tcp-token")
 	if err != nil {
 		t.Fatalf("EncodeTCPToken() error = %v", err)
 	}
@@ -134,8 +130,8 @@ func TestTunnelClientOpenUsesDerptunOpen(t *testing.T) {
 	called := false
 	derptunOpen = func(ctx context.Context, cfg session.DerptunOpenConfig) error {
 		called = true
-		if cfg.ClientToken != "dtc1_test" {
-			t.Fatalf("ClientToken = %q, want dtc1_test", cfg.ClientToken)
+		if cfg.ClientToken != "tcp-token" {
+			t.Fatalf("ClientToken = %q, want tcp-token", cfg.ClientToken)
 		}
 		if cfg.ListenAddr != "127.0.0.1:0" {
 			t.Fatalf("ListenAddr = %q, want 127.0.0.1:0", cfg.ListenAddr)
@@ -152,7 +148,7 @@ func TestTunnelClientOpenUsesDerptunOpen(t *testing.T) {
 
 	client := NewTunnelClient()
 	callbacks := &recordingTunnelCallbacks{}
-	if err := client.Open("dtc1_test", "127.0.0.1:0", callbacks); err != nil {
+	if err := client.Open("tcp-token", "127.0.0.1:0", callbacks); err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
 	if !called {
@@ -182,14 +178,9 @@ func TestTunnelClientOpenInviteUsesDerptunOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateClientToken() error = %v", err)
 	}
-	invite, err := derptun.EncodeClientInvite(clientToken)
-	if err != nil {
-		t.Fatalf("EncodeClientInvite() error = %v", err)
-	}
-
 	derptunOpen = func(ctx context.Context, cfg session.DerptunOpenConfig) error {
-		if cfg.ClientToken == "" {
-			t.Fatal("ClientToken is empty")
+		if cfg.ClientToken != clientToken {
+			t.Fatalf("ClientToken = %q, want %q", cfg.ClientToken, clientToken)
 		}
 		if cfg.ListenAddr != "127.0.0.1:0" {
 			t.Fatalf("ListenAddr = %q, want 127.0.0.1:0", cfg.ListenAddr)
@@ -201,7 +192,7 @@ func TestTunnelClientOpenInviteUsesDerptunOpen(t *testing.T) {
 
 	callbacks := &recordingTunnelCallbacks{}
 	client := NewTunnelClient()
-	if err := client.OpenInvite(invite, "127.0.0.1:0", callbacks); err != nil {
+	if err := client.OpenInvite(clientToken, "127.0.0.1:0", callbacks); err != nil {
 		t.Fatalf("OpenInvite() error = %v", err)
 	}
 	if callbacks.boundAddr != "127.0.0.1:54322" {
@@ -219,7 +210,7 @@ func TestTunnelClientOpenReturnsFirstError(t *testing.T) {
 		return sentinel
 	}
 
-	err := NewTunnelClient().Open("dtc1_test", "127.0.0.1:0", &recordingTunnelCallbacks{})
+	err := NewTunnelClient().Open("tcp-token", "127.0.0.1:0", &recordingTunnelCallbacks{})
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("Open() error = %v, want %v", err, sentinel)
 	}

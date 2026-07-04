@@ -28,8 +28,8 @@ var openHelpConfig = yargs.HelpConfig{
 		Name:        "derptun",
 		Description: "Open a local TCP listener that forwards through a derptun client token.",
 		Examples: []string{
-			"derptun open --token-file client.dtc --listen 127.0.0.1:2222",
-			"ssh -p 2222 foo@127.0.0.1",
+			"derptun open --token DT1...",
+			"derptun open --token-file client.dt1 --listen 127.0.0.1:8081",
 		},
 	},
 	SubCommands: map[string]yargs.SubCommandInfo{
@@ -38,8 +38,8 @@ var openHelpConfig = yargs.HelpConfig{
 			Description: "Listen locally and forward each TCP connection through the tunnel.",
 			Usage:       "(--token TOKEN|--token-file PATH|--token-stdin) [--listen HOST:PORT] [--force-relay]",
 			Examples: []string{
-				"derptun open --token-file client.dtc",
-				"printf '%s\\n' \"$DERPTUN_CLIENT_TOKEN\" | derptun open --token-stdin --listen 127.0.0.1:2222",
+				"derptun open --token-file client.dt1",
+				"printf '%s\\n' \"$DERPTUN_CLIENT_TOKEN\" | derptun open --token-stdin --listen 127.0.0.1:8081",
 			},
 		},
 	},
@@ -62,6 +62,11 @@ func runOpen(args []string, level telemetry.Level, stdin io.Reader, stderr io.Wr
 		TokenStdin: parsed.SubCommandFlags.TokenStdin,
 	})
 	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprint(stderr, openHelpText())
+		return 2
+	}
+	if err := validateClientTokenForCLI(token); err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		_, _ = fmt.Fprint(stderr, openHelpText())
 		return 2

@@ -31,10 +31,10 @@ func TestAppleWebTunnelTaskUsesRuntimePayload(t *testing.T) {
 	for _, want := range []string{
 		"derptun serve",
 		"--qr",
-		"wait_for_compact_invite",
+		"wait_for_invite",
 		"DERPHOLE_LIVE_WEB_PAYLOAD",
 		"DERPHOLE_LIVE_WEB_MARKER",
-		"Invite: (DT1[^[:space:]]+)",
+		"Token: (DT1[^[:space:]]+)",
 		"testLiveWebTunnelPayloadLoadsFixtureMarker",
 		"-only-testing:DerpholeUITests/DerpholeUITests/testLiveWebTunnelPayloadLoadsFixtureMarker",
 	} {

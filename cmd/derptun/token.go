@@ -32,8 +32,8 @@ var tokenHelpConfig = yargs.HelpConfig{
 		Name:        "derptun",
 		Description: "Generate derptun server and client tokens.",
 		Examples: []string{
-			"derptun token server",
-			"derptun token client --token-file server.dts",
+			"derptun token server > server.dts",
+			"derptun token client --token-file server.dts > client.dt1",
 		},
 	},
 	SubCommands: map[string]yargs.SubCommandInfo{
@@ -42,8 +42,8 @@ var tokenHelpConfig = yargs.HelpConfig{
 			Description: "Generate a server credential or client access token.",
 			Usage:       "server [--days N|--expires DATE] | client (--token TOKEN|--token-file PATH|--token-stdin) [--days N|--expires DATE]",
 			Examples: []string{
-				"derptun token server",
-				"derptun token client --token-file server.dts",
+				"derptun token server > server.dts",
+				"derptun token client --token-file server.dts > client.dt1",
 				"printf '%s\\n' \"$DERPTUN_SERVER_TOKEN\" | derptun token client --token-stdin",
 			},
 		},

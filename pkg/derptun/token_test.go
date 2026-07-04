@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -68,8 +69,11 @@ func TestGenerateClientTokenFromServerToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateClientToken() error = %v", err)
 	}
-	if got := clientToken[:len(ClientTokenPrefix)]; got != ClientTokenPrefix {
-		t.Fatalf("prefix = %q, want %q", got, ClientTokenPrefix)
+	if !strings.HasPrefix(clientToken, ClientTokenPrefix) {
+		t.Fatalf("client token = %q, want %s prefix", clientToken, ClientTokenPrefix)
+	}
+	if strings.HasPrefix(clientToken, "dtc1_") {
+		t.Fatalf("client token = %q, want removed format to be unused", clientToken)
 	}
 	clientCred, err := DecodeClientToken(clientToken, now)
 	if err != nil {
@@ -78,37 +82,25 @@ func TestGenerateClientTokenFromServerToken(t *testing.T) {
 	if clientCred.ClientName == "" {
 		t.Fatalf("ClientName = empty, want generated name")
 	}
-	payload := decodeTokenPayload(t, ClientTokenPrefix, clientToken)
-	for _, field := range []string{"derp_private", "quic_private", "signing_secret"} {
-		if _, ok := payload[field]; ok {
-			t.Fatalf("client token exposed private field %q", field)
-		}
-	}
 	if got, want := time.Unix(clientCred.ExpiresUnix, 0).UTC(), now.Add(7*24*time.Hour); !got.Equal(want) {
 		t.Fatalf("client expiry = %s, want %s", got, want)
 	}
 }
 
-func TestDecodeClientTokenRejectsMalformedProofMAC(t *testing.T) {
+func TestDecodeClientTokenRejectsMalformedInput(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
-	serverToken, err := GenerateServerToken(ServerTokenOptions{Now: now, Days: 30})
-	if err != nil {
-		t.Fatalf("GenerateServerToken() error = %v", err)
-	}
-	clientToken, err := GenerateClientToken(ClientTokenOptions{
-		Now:         now,
-		ServerToken: serverToken,
-		Days:        7,
-	})
-	if err != nil {
-		t.Fatalf("GenerateClientToken() error = %v", err)
-	}
-	payload := decodeTokenPayload(t, ClientTokenPrefix, clientToken)
-	payload["proof_mac"] = "not-hex"
-	tampered := encodeTokenPayload(t, ClientTokenPrefix, payload)
-
-	if _, err := DecodeClientToken(tampered, now); !errors.Is(err, ErrInvalidToken) {
-		t.Fatalf("DecodeClientToken(tampered) error = %v, want ErrInvalidToken", err)
+	for _, raw := range []string{
+		"",
+		"dtc1_legacy",
+		"DT2ABC",
+		"DT1",
+		"DT1not valid",
+		ClientTokenPrefix + strings.Repeat("0", compactClientTokenPayloadLen-1),
+		ClientTokenPrefix + strings.Repeat("0", compactClientTokenPayloadLen+1),
+	} {
+		if _, err := DecodeClientToken(raw, now); !errors.Is(err, ErrInvalidToken) {
+			t.Fatalf("DecodeClientToken(%q) error = %v, want ErrInvalidToken", raw, err)
+		}
 	}
 }
 
@@ -247,6 +239,9 @@ func TestEncodeClientCredentialAndDecodeServerValidation(t *testing.T) {
 	encoded, err := EncodeClientCredential(clientCred)
 	if err != nil {
 		t.Fatalf("EncodeClientCredential() error = %v", err)
+	}
+	if !strings.HasPrefix(encoded, ClientTokenPrefix) {
+		t.Fatalf("EncodeClientCredential() = %q, want %s prefix", encoded, ClientTokenPrefix)
 	}
 	roundTrip, err := DecodeClientToken(encoded, now)
 	if err != nil {

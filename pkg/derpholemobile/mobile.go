@@ -96,16 +96,11 @@ func (p *ParsedPayload) Path() string {
 
 func ParsePayload(payload string) (*ParsedPayload, error) {
 	payload = strings.TrimSpace(payload)
-	if strings.HasPrefix(payload, derptun.CompactInvitePrefix) {
-		cred, err := derptun.DecodeClientInvite(payload, time.Now())
-		if err != nil {
+	if strings.HasPrefix(payload, derptun.ClientTokenPrefix) {
+		if _, err := derptun.DecodeClientToken(payload, time.Now()); err != nil {
 			return nil, err
 		}
-		clientToken, err := derptun.EncodeClientCredential(cred)
-		if err != nil {
-			return nil, err
-		}
-		return &ParsedPayload{kind: "tcp", token: clientToken}, nil
+		return &ParsedPayload{kind: "tcp", token: payload}, nil
 	}
 	parsed, err := qrpayload.Parse(payload)
 	if err != nil {

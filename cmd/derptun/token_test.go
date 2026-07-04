@@ -37,7 +37,7 @@ func TestRunTokenClientPrintsClientToken(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("code = %d stderr=%s", code, stderr.String())
 	}
-	if !strings.HasPrefix(strings.TrimSpace(stdout.String()), "dtc1_") {
+	if !strings.HasPrefix(strings.TrimSpace(stdout.String()), "DT1") {
 		t.Fatalf("stdout = %q, want client token", stdout.String())
 	}
 }
@@ -58,7 +58,7 @@ func TestRunTokenClientReadsServerTokenFromFile(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("code = %d stderr=%s", code, stderr.String())
 	}
-	if !strings.HasPrefix(strings.TrimSpace(stdout.String()), "dtc1_") {
+	if !strings.HasPrefix(strings.TrimSpace(stdout.String()), "DT1") {
 		t.Fatalf("stdout = %q, want client token", stdout.String())
 	}
 }
@@ -75,7 +75,7 @@ func TestRunTokenClientReadsServerTokenFromStdin(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("code = %d stderr=%s", code, stderr.String())
 	}
-	if !strings.HasPrefix(strings.TrimSpace(stdout.String()), "dtc1_") {
+	if !strings.HasPrefix(strings.TrimSpace(stdout.String()), "DT1") {
 		t.Fatalf("stdout = %q, want client token", stdout.String())
 	}
 }

@@ -11,10 +11,10 @@ final class SSHTunnelStateTests: XCTestCase {
         let connector = RecordingSSHConnector(session: RecordingSSHTerminalSession())
         let state = SSHTunnelState(tokenStore: store, connectorFactory: { connector })
 
-        state.acceptScannedPayload("derphole://tcp?token=dtc1_tcp_token&v=1")
+        state.acceptScannedPayload("derphole://tcp?token=tcp-token-for-test&v=1")
 
-        XCTAssertEqual(store.tcpToken, "dtc1_tcp_token")
-        XCTAssertEqual(state.rememberedTokenFingerprint, TransferFormatting.fingerprint("dtc1_tcp_token"))
+        XCTAssertEqual(store.tcpToken, "tcp-token-for-test")
+        XCTAssertEqual(state.rememberedTokenFingerprint, TransferFormatting.fingerprint("tcp-token-for-test"))
         XCTAssertTrue(state.isCredentialPromptPresented)
         XCTAssertFalse(state.isConnecting)
         XCTAssertFalse(state.isConnected)
@@ -34,7 +34,7 @@ final class SSHTunnelStateTests: XCTestCase {
         let connector = RecordingSSHConnector(session: RecordingSSHTerminalSession())
         let state = SSHTunnelState(tokenStore: store, connectorFactory: { connector })
 
-        state.acceptScannedPayload("derphole://web?path=%2F&scheme=http&token=dtc1_web_token&v=1")
+        state.acceptScannedPayload("derphole://web?path=%2F&scheme=http&token=web-token-for-test&v=1")
 
         XCTAssertNil(store.tcpToken)
         XCTAssertFalse(state.isCredentialPromptPresented)
@@ -49,7 +49,7 @@ final class SSHTunnelStateTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let store = TokenStore(defaults: defaults)
-        store.tcpToken = "dtc1_remembered"
+        store.tcpToken = "remembered-token-for-test"
         let session = RecordingSSHTerminalSession()
         let connector = RecordingSSHConnector(session: session)
         let state = SSHTunnelState(tokenStore: store, connectorFactory: { connector })
@@ -60,7 +60,7 @@ final class SSHTunnelStateTests: XCTestCase {
         await state.submitCredentials()
         state.disconnect()
 
-        XCTAssertEqual(store.tcpToken, "dtc1_remembered")
+        XCTAssertEqual(store.tcpToken, "remembered-token-for-test")
         XCTAssertTrue(session.closeCalled)
         XCTAssertEqual(state.username, "")
         XCTAssertEqual(state.password, "")
@@ -75,7 +75,7 @@ final class SSHTunnelStateTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let store = TokenStore(defaults: defaults)
-        store.tcpToken = "dtc1_tcp_token"
+        store.tcpToken = "tcp-token-for-test"
         let connector = RecordingSSHConnector(error: SSHConnectionError.terminalIntegrationPending)
         let state = SSHTunnelState(tokenStore: store, connectorFactory: { connector })
 
@@ -84,7 +84,7 @@ final class SSHTunnelStateTests: XCTestCase {
         state.password = "secret"
         await state.submitCredentials()
 
-        XCTAssertEqual(connector.connectedToken, "dtc1_tcp_token")
+        XCTAssertEqual(connector.connectedToken, "tcp-token-for-test")
         XCTAssertEqual(connector.connectedUsername, "derpuser")
         XCTAssertEqual(connector.connectedPassword, "secret")
         XCTAssertEqual(state.username, "")
@@ -104,7 +104,7 @@ final class SSHTunnelStateTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let store = TokenStore(defaults: defaults)
-        store.tcpToken = "dtc1_tcp_token"
+        store.tcpToken = "tcp-token-for-test"
         let session = RecordingSSHTerminalSession()
         let connector = RecordingSSHConnector(session: session)
         let state = SSHTunnelState(tokenStore: store, connectorFactory: { connector })
@@ -114,7 +114,7 @@ final class SSHTunnelStateTests: XCTestCase {
         state.password = "secret"
         await state.submitCredentials()
 
-        XCTAssertEqual(connector.connectedToken, "dtc1_tcp_token")
+        XCTAssertEqual(connector.connectedToken, "tcp-token-for-test")
         XCTAssertEqual(connector.connectedUsername, "derpuser")
         XCTAssertEqual(connector.connectedPassword, "secret")
         XCTAssertTrue(state.terminalSession === session)
@@ -131,7 +131,7 @@ final class SSHTunnelStateTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let store = TokenStore(defaults: defaults)
-        store.tcpToken = "dtc1_tcp_token"
+        store.tcpToken = "tcp-token-for-test"
         let session = RecordingSSHTerminalSession()
         let state = SSHTunnelState(tokenStore: store, connectorFactory: { RecordingSSHConnector(session: session) })
 
@@ -145,7 +145,7 @@ final class SSHTunnelStateTests: XCTestCase {
         XCTAssertFalse(state.isConnected)
         XCTAssertFalse(state.isConnecting)
         XCTAssertEqual(state.statusText, "SSH session ended.")
-        XCTAssertEqual(store.tcpToken, "dtc1_tcp_token")
+        XCTAssertEqual(store.tcpToken, "tcp-token-for-test")
         XCTAssertNotNil(state.rememberedTokenFingerprint)
     }
 
@@ -155,7 +155,7 @@ final class SSHTunnelStateTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let store = TokenStore(defaults: defaults)
-        store.tcpToken = "dtc1_tcp_token"
+        store.tcpToken = "tcp-token-for-test"
         let connector = RecordingSSHConnector(error: SSHConnectionError.terminalIntegrationPending)
         let state = SSHTunnelState(tokenStore: store, connectorFactory: { connector })
 
@@ -175,7 +175,7 @@ final class SSHTunnelStateTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let store = TokenStore(defaults: defaults)
-        store.tcpToken = "dtc1_tcp_token"
+        store.tcpToken = "tcp-token-for-test"
         let connector = DelayedSSHConnector()
         let state = SSHTunnelState(tokenStore: store, connectorFactory: { connector })
 
@@ -198,7 +198,7 @@ final class SSHTunnelStateTests: XCTestCase {
         XCTAssertNil(state.errorText)
         XCTAssertEqual(state.username, "")
         XCTAssertEqual(state.password, "")
-        XCTAssertEqual(store.tcpToken, "dtc1_tcp_token")
+        XCTAssertEqual(store.tcpToken, "tcp-token-for-test")
     }
 
     @MainActor
@@ -207,7 +207,7 @@ final class SSHTunnelStateTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let store = TokenStore(defaults: defaults)
-        store.tcpToken = "dtc1_tcp_token"
+        store.tcpToken = "tcp-token-for-test"
         let state = SSHTunnelState(tokenStore: store, connectorFactory: { RecordingSSHConnector() })
 
         state.reconnect()

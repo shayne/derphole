@@ -11,6 +11,9 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
+
+	derptunpkg "github.com/shayne/derphole/pkg/derptun"
 )
 
 type tokenSource struct {
@@ -31,6 +34,29 @@ func resolveTokenSource(stdin io.Reader, source tokenSource) (string, io.Reader,
 		return token, stdin, err
 	}
 	return readTokenStdin(stdin)
+}
+
+func resolveOptionalTokenSource(stdin io.Reader, source tokenSource) (string, io.Reader, bool, error) {
+	count := tokenSourceCount(source)
+	if count > 1 {
+		return "", stdin, false, errors.New("at most one of --token, --token-file, or --token-stdin may be set")
+	}
+	if count == 0 {
+		return "", stdin, false, nil
+	}
+	token, reader, err := resolveTokenSource(stdin, source)
+	return token, reader, true, err
+}
+
+func validateClientTokenForCLI(token string) error {
+	token = strings.TrimSpace(token)
+	if strings.HasPrefix(token, derptunpkg.ServerTokenPrefix) {
+		return errors.New("server tokens are for derptun serve; use a client token or copy the command printed by derptun serve")
+	}
+	if _, err := derptunpkg.DecodeClientToken(token, time.Now()); err != nil {
+		return err
+	}
+	return nil
 }
 
 func tokenSourceCount(source tokenSource) int {

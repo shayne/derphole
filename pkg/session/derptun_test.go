@@ -388,6 +388,9 @@ func TestDerptunRejectsWrongTokenRoles(t *testing.T) {
 	if err := DerptunConnect(ctx, DerptunConnectConfig{ClientToken: serverToken, StdioIn: strings.NewReader("x"), StdioOut: io.Discard}); !errors.Is(err, derptun.ErrInvalidToken) {
 		t.Fatalf("DerptunConnect(server) error = %v, want ErrInvalidToken", err)
 	}
+	if err := DerptunConnect(ctx, DerptunConnectConfig{ClientToken: "dtc1_legacy", StdioIn: strings.NewReader("x"), StdioOut: io.Discard}); !errors.Is(err, derptun.ErrInvalidToken) {
+		t.Fatalf("DerptunConnect(old client token) error = %v, want ErrInvalidToken", err)
+	}
 }
 
 func TestDerptunServerTokenForClaimRejectsTamperedClientProof(t *testing.T) {

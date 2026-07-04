@@ -28,7 +28,7 @@ var connectHelpConfig = yargs.HelpConfig{
 		Name:        "derptun",
 		Description: "Connect a single TCP stream through a derptun client token.",
 		Examples: []string{
-			"ssh -o ProxyCommand='derptun connect --token-file ~/.config/derptun/client.dtc --stdio' foo@serverhost",
+			"printf 'GET / HTTP/1.0\\r\\n\\r\\n' | derptun connect --token-file client.dt1 --stdio",
 			"printf '%s\\n' \"$DERPTUN_CLIENT_TOKEN\" | derptun connect --token-stdin --stdio",
 		},
 	},
@@ -38,7 +38,7 @@ var connectHelpConfig = yargs.HelpConfig{
 			Description: "Bridge one tunnel stream over stdin/stdout.",
 			Usage:       "(--token TOKEN|--token-file PATH|--token-stdin) --stdio [--force-relay]",
 			Examples: []string{
-				"ssh -o ProxyCommand='derptun connect --token-file ~/.config/derptun/client.dtc --stdio' foo@serverhost",
+				"printf 'GET / HTTP/1.0\\r\\n\\r\\n' | derptun connect --token-file client.dt1 --stdio",
 				"printf '%s\\n' \"$DERPTUN_CLIENT_TOKEN\" | derptun connect --token-stdin --stdio",
 			},
 		},
@@ -62,6 +62,11 @@ func runConnect(args []string, level telemetry.Level, stdin io.Reader, stdout, s
 		TokenStdin: parsed.SubCommandFlags.TokenStdin,
 	})
 	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprint(stderr, connectHelpText())
+		return 2
+	}
+	if err := validateClientTokenForCLI(token); err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		_, _ = fmt.Fprint(stderr, connectHelpText())
 		return 2

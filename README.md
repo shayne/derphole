@@ -2,7 +2,7 @@
 
 `derphole` is a standalone CLI for session-scoped byte transfer and temporary local TCP service sharing. Use it for one-shot transfers, receive-code flows, and short-lived service sharing.
 
-[`derptun`](#long-lived-tcp-tunnels) is its companion for long-lived TCP tunnels. Use it when a tunnel needs stable tokens, restartable endpoints, and repeated client reconnects.
+[`derptun`](#tcp-tunnels) is its companion for long-lived TCP tunnels. Use it when a tunnel needs stable tokens, restartable endpoints, and repeated client reconnects.
 
 [`derpssh`](#share-a-terminal) is its companion for interactive terminal sharing. Use it when two people need one shared PTY with host approval and no open ports.
 
@@ -33,11 +33,11 @@ Session tokens carry authorization. Public sessions fetch the DERP map at runtim
 - Use `share` and `open` for temporary access to a local TCP service.
 - Use `ssh invite` and `ssh accept` for SSH public key exchange.
 - Use [`derpssh`](#share-a-terminal) for approved terminal sharing.
-- Use [`derptun`](#long-lived-tcp-tunnels) for long-lived TCP tunnels with reusable tokens.
+- Use [`derptun`](#tcp-tunnels) for long-lived TCP tunnels with reusable tokens.
 
 ## Quick Start
 
-`listen` receives bytes and prints a token. `pipe` sends stdin into that token. `share` and `open` do the same for local TCP services. Use [`derptun`](#long-lived-tcp-tunnels) for reusable, longer-lived tunnels.
+`listen` receives bytes and prints a token. `pipe` sends stdin into that token. `share` and `open` do the same for local TCP services. Use [`derptun`](#tcp-tunnels) for reusable, longer-lived tunnels.
 
 ### Stream a Raw File
 
@@ -143,45 +143,50 @@ npx -y derpssh@latest connect <invite>
 
 The host approves the guest as read-only or read/write. The session uses the derptun transport path, so neither side needs an inbound port.
 
-### Long-Lived TCP Tunnels
+### TCP Tunnels
 
-`derptun` is the long-lived TCP tunnel companion to `derphole`. It uses stable tokens, survives restarts on either side, and lets one client reconnect many times without opening ports on `vps-server`. It fits SSH well.
+`derptun` exposes a local TCP service without requiring either side to open an inbound port. Start with a one-off tunnel:
 
-On `vps-server`:
+On the serving machine:
+
+```bash
+npx -y derptun@latest serve --tcp 127.0.0.1:3000
+```
+
+`serve` prints the command for the other side:
+
+```bash
+npx -y derptun@latest open --token DT1...
+```
+
+Run that command on the connecting machine. It opens a local listener and forwards connections through the tunnel.
+
+For a persistent tunnel, create both tokens on the serving machine and keep the server token there:
 
 ```bash
 npx -y derptun@latest token server > server.dts
-npx -y derptun@latest token client --token-file server.dts > client.dtc
-npx -y derptun@latest serve --token-file server.dts --tcp 127.0.0.1:22
+npx -y derptun@latest token client --token-file server.dts > client.dt1
+npx -y derptun@latest serve --token-file server.dts --tcp 127.0.0.1:3000
 ```
 
-Copy only `client.dtc` to `alice-laptop`.
+Copy only `client.dt1` to the connecting machine.
 
-On `alice-laptop`:
+On the connecting machine:
 
 ```bash
-npx -y derptun@latest open --token-file client.dtc --listen 127.0.0.1:2222
-ssh -p 2222 user@127.0.0.1
+npx -y derptun@latest open --token-file client.dt1 --listen 127.0.0.1:3001
 ```
 
-For SSH without a separate local listener, use `ProxyCommand`:
-
-```bash
-ssh -o ProxyCommand='npx -y derptun@latest connect --token-file ./client.dtc --stdio' foo@127.0.0.1
-```
-
-The server token is serving authority. Keep it on the serving machine or in its secret manager. The client token can connect until expiry, but cannot serve or mint tokens.
+The server token is serving authority. Keep it on the serving machine or in a secret manager. Client tokens can connect until expiry, but cannot serve or mint tokens.
 
 Server tokens default to 180 days. Client tokens default to 90 days and cannot outlive their server token. Set a relative lifetime with `--days`, or use an absolute expiry:
 
 ```bash
 npx -y derptun@latest token server --expires 2026-05-01T00:00:00Z > server.dts
-npx -y derptun@latest token client --token-file server.dts --expires 2026-04-25T00:00:00Z > client.dtc
+npx -y derptun@latest token client --token-file server.dts --expires 2026-04-25T00:00:00Z > client.dt1
 ```
 
 Use `--token TOKEN` for inline one-off commands. Prefer `--token-file PATH` for durable tokens. `--token-stdin` reads the token from the first stdin line.
-
-`derptun` is TCP-only for now. UDP forwarding is planned for use cases like Minecraft Bedrock servers.
 
 ### Useful Extras
 
