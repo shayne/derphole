@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta
       name="description"
-      content="Move files, open TCP tunnels, and share a terminal without opening ports or running a VPN. Built on DERP with direct paths when available and end-to-end encrypted payloads."
+      content="Move files, open TCP tunnels, and share a terminal across networks that refuse inbound connections. DERP gets peers connected; direct encrypted paths take over when they can."
     />
     <title>derphole</title>
     <link
@@ -31,11 +31,12 @@
     <main class="site-shell">
       <section id="top" class="intro" aria-labelledby="intro-title">
         <div class="intro-copy">
-          <p class="kicker">open source access tools built on derp</p>
+          <p class="kicker">open source access tools for awkward networks</p>
           <h1 id="intro-title">private access without a vpn</h1>
           <p class="intro-lede">
-            Move files, open TCP tunnels, and share a terminal without opening
-            ports or running a VPN.
+            Move a file, open a TCP tunnel, or share a terminal when both
+            machines can dial out but neither one should become public
+            infrastructure. It is one capability, not a whole new network.
           </p>
         </div>
 
@@ -49,7 +50,10 @@
         <article class="tool-entry">
           <p class="tool-name">derphole</p>
           <h2>move a file</h2>
-          <p>derphole is the one-session path for files, streams, and localhost shares.</p>
+          <p>
+            One token, one short-lived session: files, streams, receive codes,
+            and localhost shares without a permanent network to clean up later.
+          </p>
           <pre><code>npx -y derphole@latest receive &lt;code&gt;</code></pre>
         </article>
 
@@ -57,8 +61,8 @@
           <p class="tool-name">derptun</p>
           <h2>open a tcp tunnel</h2>
           <p>
-            Put any TCP service behind a durable tunnel, then share access with
-            client tokens or embed it in an app.
+            When a service needs to survive reconnects, use scoped server and
+            client tokens instead of a copy-pasted one-hour share.
           </p>
           <pre><code>npx -y derptun@latest token server &gt; server.dts
 npx -y derptun@latest serve --token-file server.dts --tcp 127.0.0.1:3000</code></pre>
@@ -67,7 +71,10 @@ npx -y derptun@latest serve --token-file server.dts --tcp 127.0.0.1:3000</code><
         <article class="tool-entry">
           <p class="tool-name">derpssh</p>
           <h2>share your terminal</h2>
-          <p>derpssh is terminal sharing over the same no-open-port transport.</p>
+          <p>
+            Share one PTY after host approval. No inbound SSH port, no tailnet,
+            no surprise machine on someone else's network.
+          </p>
           <pre><code>npx -y derpssh@latest connect &lt;invite&gt;</code></pre>
         </article>
       </section>
@@ -77,20 +84,20 @@ npx -y derptun@latest serve --token-file server.dts --tcp 127.0.0.1:3000</code><
           <p class="label">not a vpn</p>
           <h2>scoped access, not a network</h2>
           <p>
-            Scoped tokens authorize one transfer, one tunnel, or one terminal
-            session. No daemon, overlay interface, tailnet, subnet route, or
-            account-backed control plane.
+            A VPN is right when you want a network. These tools are for one
+            transfer, one tunnel, or one terminal session. Tokens authorize the
+            capability; no daemon, overlay interface, subnet route, or account
+            control plane follows you home.
           </p>
         </article>
         <article>
           <p class="label">derp explained</p>
-          <h2>direct paths when possible</h2>
+          <h2>relay first, direct when possible</h2>
           <p>
-            DERP is Tailscale's Designated Encrypted Relay for Packets.
-            Tailscale operates a public DERP network for rendezvous and
-            fallback; derphole uses it so peers can find each other when both
-            sides can only dial out. Sessions prefer direct paths when
-            available. Payloads stay end-to-end encrypted, and this project is
+            DERP gives both sides somewhere to meet when inbound ports are
+            blocked. It can relay encrypted traffic when direct paths fail, and
+            the session moves to direct encrypted UDP when the network allows
+            it. Relays are useful. They do not get payload keys. This project is
             not affiliated with Tailscale.
           </p>
         </article>
@@ -109,9 +116,9 @@ npx -y derpssh@latest share</code></pre>
           <p class="label">one transport family</p>
           <h2>small tools, shared path</h2>
           <p>
-            derphole handles one-shot transfers and temporary service shares.
-            derptun keeps TCP services reachable with persistent tunnels.
-            derpssh shares a shell over the same no-open-port transport.
+            Same transport family, different lifetime. derphole is temporary.
+            derptun is durable. derpssh is interactive. The point is to pick the
+            smallest amount of network state that does the job.
           </p>
         </article>
       </section>
@@ -120,9 +127,9 @@ npx -y derpssh@latest share</code></pre>
         <p class="label">browser demo</p>
         <h2 id="demo-title">try a small derphole transfer</h2>
         <p>
-          This page includes a browser derphole demo for small files. It is
-          useful for seeing the flow without installing anything. Use the CLI
-          for real transfers and throughput work.
+          This is the browser-sized version of the flow. It is useful for
+          seeing tokens and claims work without installing anything. Use the CLI
+          for real files, terminal sharing, and throughput work.
         </p>
       </section>
 
@@ -132,7 +139,7 @@ npx -y derpssh@latest share</code></pre>
             <span class="panel-index">send</span>
             <div>
               <h3>offer a file</h3>
-              <p>Select one file. Send the generated token to the receiver.</p>
+              <p>Pick one file. The generated token is the access capability.</p>
             </div>
           </div>
           <button id="select-send-file" type="button">select file</button>
@@ -150,7 +157,7 @@ npx -y derpssh@latest share</code></pre>
             <span class="panel-index">recv</span>
             <div>
               <h3>claim the token</h3>
-              <p>Paste the token, pick a save location, and receive the file.</p>
+              <p>Paste the token, choose where the file goes, and receive it.</p>
             </div>
           </div>
           <label class="token-label" for="receive-token">token</label>
@@ -163,7 +170,7 @@ npx -y derpssh@latest share</code></pre>
     </main>
 
     <footer class="footer">
-      <span>private access tools built on derp connectivity</span>
+      <span>small access tools for awkward networks</span>
       <a href="https://github.com/shayne/derphole">github.com/shayne/derphole</a>
     </footer>
 
