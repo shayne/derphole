@@ -39,6 +39,16 @@ func TestRootHelpIncludesRawStreamAndShareCommands(t *testing.T) {
 	}
 }
 
+func TestRootHelpDoesNotAdvertiseServiceLookup(t *testing.T) {
+	help := rootHelpText()
+	if strings.Contains(help, "\n    service") {
+		t.Fatalf("rootHelpText() = %q, should not list a service command", help)
+	}
+	if strings.Contains(help, "registry") {
+		t.Fatalf("rootHelpText() = %q, should not mention registry lookup", help)
+	}
+}
+
 func TestRunHelpReceiveShowsReceiveHelp(t *testing.T) {
 	for _, args := range [][]string{{"help", "receive"}, {"receive", "--help"}, {"rx", "--help"}, {"recv", "--help"}, {"recieve", "--help"}} {
 		t.Run(strings.Join(args, "_"), func(t *testing.T) {

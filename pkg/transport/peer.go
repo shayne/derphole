@@ -118,7 +118,7 @@ func (m *Manager) sendPeerDatagram(ctx context.Context, payload []byte) error {
 		} else if m.cfg.RelaySend == nil {
 			return writeErr
 		} else {
-			_ = m.MarkDirectBroken()
+			m.noteRelayAfterDirectWriteFailure(m.now(), addr)
 		}
 	}
 

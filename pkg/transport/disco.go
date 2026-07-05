@@ -142,9 +142,10 @@ func (m *Manager) sendDirectProbes(plan discoveryPlan) {
 		if err != nil {
 			continue
 		}
-		m.noteProbeSentIfCurrent(plan.generation, m.now(), target, token)
+		now := m.now()
+		m.noteProbeSentIfCurrent(plan.generation, now, target, token)
 		if _, err := m.cfg.DirectConn.WriteTo(payload, target); err != nil {
-			m.noteProbeFailedIfCurrent(plan.generation, target, token)
+			m.noteProbeFailedIfCurrent(plan.generation, m.now(), target, token)
 		}
 	}
 }

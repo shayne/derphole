@@ -124,6 +124,113 @@ func TestExternalTransferMetricsDirectValidationMovesTraceToDirect(t *testing.T)
 	}
 }
 
+func TestExternalTransferMetricsRecordsTransportPathEvents(t *testing.T) {
+	start := time.Unix(17, 0)
+	metrics := newExternalTransferMetrics(start)
+	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
+
+	selected := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 17), Port: 31717}
+	previous := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 17), Port: 41717}
+	metrics.RecordTransportPathEvent(transport.PathEvent{
+		At:           start.Add(250 * time.Millisecond),
+		Type:         transport.PathEventSelected,
+		Path:         transport.PathDirect,
+		PreviousPath: transport.PathRelay,
+		SelectedAddr: selected,
+		PreviousAddr: previous,
+		Reason:       transport.PathEventReasonProbeAck,
+		Source:       transport.PathEventSourceDirectProbe,
+		RTT:          37 * time.Millisecond,
+	})
+
+	if !metrics.directValidated {
+		t.Fatal("directValidated = false, want true after selected direct event")
+	}
+	if metrics.phase != transfertrace.PhaseDirectExecute {
+		t.Fatalf("phase = %q, want %q", metrics.phase, transfertrace.PhaseDirectExecute)
+	}
+	if metrics.lastState != string(StateDirect) {
+		t.Fatalf("lastState = %q, want %q", metrics.lastState, StateDirect)
+	}
+	if metrics.transportPath != transport.PathDirect {
+		t.Fatalf("transportPath = %v, want %v", metrics.transportPath, transport.PathDirect)
+	}
+	if metrics.transportSelectedAddr != selected.String() {
+		t.Fatalf("transportSelectedAddr = %q, want %q", metrics.transportSelectedAddr, selected.String())
+	}
+	if metrics.transportPreviousAddr != previous.String() {
+		t.Fatalf("transportPreviousAddr = %q, want %q", metrics.transportPreviousAddr, previous.String())
+	}
+	if metrics.transportReason != string(transport.PathEventReasonProbeAck) {
+		t.Fatalf("transportReason = %q, want %q", metrics.transportReason, transport.PathEventReasonProbeAck)
+	}
+	if metrics.transportSource != string(transport.PathEventSourceDirectProbe) {
+		t.Fatalf("transportSource = %q, want %q", metrics.transportSource, transport.PathEventSourceDirectProbe)
+	}
+	if metrics.transportRTTMS != 37 {
+		t.Fatalf("transportRTTMS = %d, want 37", metrics.transportRTTMS)
+	}
+
+	metrics.RecordTransportPathEvent(transport.PathEvent{
+		At:           start.Add(500 * time.Millisecond),
+		Type:         transport.PathEventFallback,
+		Path:         transport.PathRelay,
+		PreviousPath: transport.PathDirect,
+		PreviousAddr: selected,
+		Reason:       transport.PathEventReasonDirectBroken,
+		Source:       transport.PathEventSourceManual,
+	})
+
+	if metrics.transportPath != transport.PathRelay {
+		t.Fatalf("transportPath after fallback = %v, want %v", metrics.transportPath, transport.PathRelay)
+	}
+	if metrics.transportSelectedAddr != "" {
+		t.Fatalf("transportSelectedAddr after fallback = %q, want empty", metrics.transportSelectedAddr)
+	}
+	if metrics.transportPreviousAddr != selected.String() {
+		t.Fatalf("transportPreviousAddr after fallback = %q, want %q", metrics.transportPreviousAddr, selected.String())
+	}
+	if metrics.transportReason != string(transport.PathEventReasonDirectBroken) {
+		t.Fatalf("transportReason after fallback = %q, want %q", metrics.transportReason, transport.PathEventReasonDirectBroken)
+	}
+	if metrics.transportSource != string(transport.PathEventSourceManual) {
+		t.Fatalf("transportSource after fallback = %q, want %q", metrics.transportSource, transport.PathEventSourceManual)
+	}
+	if metrics.fallbackReason != string(transport.PathEventReasonDirectBroken) {
+		t.Fatalf("fallbackReason = %q, want %q", metrics.fallbackReason, transport.PathEventReasonDirectBroken)
+	}
+}
+
+func TestWatchExternalDirectPathRecordsInitialSnapshot(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := transport.NewManager(transport.ManagerConfig{
+		RelayAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443},
+	})
+	metrics := newExternalTransferMetrics(time.Unix(18, 0))
+	stop := watchExternalDirectPath(ctx, mgr, metrics)
+	defer stop()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		metrics.mu.Lock()
+		path := metrics.transportPath
+		directValidated := metrics.directValidated
+		metrics.mu.Unlock()
+		if path == transport.PathRelay {
+			if directValidated {
+				t.Fatal("directValidated = true after initial relay snapshot, want false")
+			}
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("transportPath = %v, want initial %v snapshot", path, transport.PathRelay)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestExternalTransferMetricsSamplesPeerRecvQueueDepthFromTransportManager(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

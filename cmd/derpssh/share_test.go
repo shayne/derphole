@@ -11,11 +11,13 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/shayne/derphole/pkg/endpointlookup"
 	"github.com/shayne/derphole/pkg/telemetry"
 )
 
@@ -48,6 +50,52 @@ func TestRunSharePrintsConnectCommand(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "npx -y derpssh@latest connect DSH1test") {
 		t.Fatalf("stderr missing connect command:\n%s", stderr.String())
+	}
+}
+
+func TestRunShareDoesNotRegisterByDefault(t *testing.T) {
+	invite := newDerpsshInvite(t)
+	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	old := runShareSession
+	defer func() { runShareSession = old }()
+	runShareSession = func(ctx context.Context, cfg shareSessionConfig) error {
+		_ = ctx
+		_, _ = fmt.Fprintf(cfg.Stderr, "npx -y derpssh@latest connect %s\n", invite)
+		return nil
+	}
+
+	var stderr bytes.Buffer
+	code := runShare([]string{"--registry", registryPath}, telemetry.LevelDefault, strings.NewReader(""), io.Discard, &stderr)
+	if code != 0 {
+		t.Fatalf("runShare() = %d stderr=%s", code, stderr.String())
+	}
+	if _, err := os.Stat(registryPath); !os.IsNotExist(err) {
+		t.Fatalf("registry stat error = %v, want not exist", err)
+	}
+}
+
+func TestRunShareRegisterWritesInviteRecord(t *testing.T) {
+	invite := newDerpsshInvite(t)
+	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	old := runShareSession
+	defer func() { runShareSession = old }()
+	runShareSession = func(ctx context.Context, cfg shareSessionConfig) error {
+		_ = ctx
+		_, _ = fmt.Fprintf(cfg.Stderr, "npx -y derpssh@latest connect %s\n", invite)
+		return nil
+	}
+
+	var stderr bytes.Buffer
+	code := runShare([]string{"--register", "ops-shell", "--registry", registryPath}, telemetry.LevelDefault, strings.NewReader(""), io.Discard, &stderr)
+	if code != 0 {
+		t.Fatalf("runShare() = %d stderr=%s", code, stderr.String())
+	}
+	got, err := (endpointlookup.FileRegistry{Path: registryPath}).Resolve(context.Background(), "ops-shell", endpointlookup.KindDerpsshInvite)
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if got.Value != invite {
+		t.Fatalf("registered invite = %q, want invite printed by share", got.Value)
 	}
 }
 

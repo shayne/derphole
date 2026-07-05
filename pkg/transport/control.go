@@ -30,7 +30,7 @@ const maxControlCandidates = candidate.MaxCount
 const maxControlCandidateLength = candidate.MaxLength
 
 func (m *Manager) MarkDirectBroken() error {
-	m.noteRelayOnly(m.now())
+	m.noteRelayOnly(m.now(), PathEventReasonDirectBroken, PathEventSourceManual)
 	return nil
 }
 
@@ -38,7 +38,7 @@ func (m *Manager) SeedRemoteCandidates(ctx context.Context, candidates []net.Add
 	if len(candidates) == 0 {
 		return
 	}
-	m.applyRemoteCandidates(m.now(), candidates)
+	m.applyRemoteCandidates(m.now(), candidates, PathEventSourceSeed)
 	m.requestDiscovery(ctx, false)
 }
 
@@ -74,7 +74,7 @@ func (m *Manager) handleControl(ctx context.Context, msg ControlMessage) error {
 		if len(msg.Candidates) > 0 && len(candidates) == 0 {
 			return nil
 		}
-		m.applyRemoteCandidates(m.now(), candidates)
+		m.applyRemoteCandidates(m.now(), candidates, PathEventSourceRemoteControl)
 		m.requestDiscovery(ctx, false)
 		return nil
 	case ControlCallMeMaybe:
@@ -113,10 +113,31 @@ func (m *Manager) sendCandidateUpdate(ctx context.Context) error {
 	return nil
 }
 
-func (m *Manager) applyRemoteCandidates(now time.Time, candidates []net.Addr) {
+func (m *Manager) applyRemoteCandidates(now time.Time, candidates []net.Addr, source PathEventSource) {
 	m.mu.Lock()
+	previousPath := m.state.current
+	previousAddr := m.selectedAddrLocked()
 	if m.state.noteCandidates(now, candidates) {
 		m.signalStateChangeLocked()
+		m.appendPathEventLocked(PathEvent{
+			At:           now,
+			Type:         PathEventCandidatesChanged,
+			Source:       source,
+			Path:         m.state.path(),
+			PreviousPath: previousPath,
+			PreviousAddr: previousAddr,
+		})
+		if previousPath == PathDirect && m.state.current != PathDirect {
+			m.appendPathEventLocked(PathEvent{
+				At:           now,
+				Type:         PathEventFallback,
+				Reason:       PathEventReasonCandidateLost,
+				Source:       source,
+				Path:         m.state.path(),
+				PreviousPath: previousPath,
+				PreviousAddr: previousAddr,
+			})
+		}
 	}
 	m.mu.Unlock()
 }

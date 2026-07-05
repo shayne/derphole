@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -64,45 +65,177 @@ var commandContext = func() (context.Context, context.CancelFunc) {
 }
 
 func runShare(args []string, level telemetry.Level, stdin io.Reader, stdout, stderr io.Writer) int {
-	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help" || args[0] == "help") {
-		_, _ = fmt.Fprintln(stderr, "Usage: derpssh share [--force-relay]")
+	if shareHelpRequested(args) {
+		_, _ = fmt.Fprintln(stderr, shareUsage())
 		return 0
 	}
-	forceRelay, ok := parseShareArgs(args, stderr)
+	parsed, ok := parseShareArgs(args, stderr)
 	if !ok {
 		return 2
 	}
+	stdout, stderr, registerer := shareRegisteringWriters(parsed, stdout, stderr)
 
 	ctx, stop := commandContext()
 	defer stop()
-	if err := runShareSession(ctx, shareSessionConfig{
+	err := runShareSession(ctx, shareSessionConfig{
 		Stdin:      stdin,
 		Stdout:     stdout,
 		Stderr:     stderr,
-		ForceRelay: forceRelay,
+		ForceRelay: parsed.forceRelay,
 		Emitter:    telemetry.New(stderr, commandSessionTelemetryLevel(level)),
-	}); err != nil && !errors.Is(err, context.Canceled) {
-		_, _ = fmt.Fprintln(stderr, err)
-		return 1
+	})
+	if code, failed := handleShareError(err, stderr); failed {
+		return code
 	}
-	return 0
+	return finishShareRegister(registerer, stderr)
 }
 
-func parseShareArgs(args []string, stderr io.Writer) (bool, bool) {
-	var forceRelay bool
-	for _, arg := range args {
-		switch arg {
-		case "--force-relay":
-			forceRelay = true
-		default:
-			if len(arg) > 0 && arg[0] == '-' {
-				_, _ = fmt.Fprintf(stderr, "unknown flag: %s\n", arg)
-			}
-			_, _ = fmt.Fprintln(stderr, "Usage: derpssh share [--force-relay]")
-			return false, false
+type parsedShareArgs struct {
+	forceRelay bool
+	register   string
+	registry   string
+}
+
+func parseShareArgs(args []string, stderr io.Writer) (parsedShareArgs, bool) {
+	var parsed parsedShareArgs
+	for i := 0; i < len(args); i++ {
+		if !parseShareArg(args, &i, stderr, &parsed) {
+			return parsedShareArgs{}, false
 		}
 	}
-	return forceRelay, true
+	return parsed, true
+}
+
+func shareHelpRequested(args []string) bool {
+	return len(args) == 1 && (args[0] == "-h" || args[0] == "--help" || args[0] == "help")
+}
+
+func shareRegisteringWriters(parsed parsedShareArgs, stdout, stderr io.Writer) (io.Writer, io.Writer, *shareInviteRegisterer) {
+	if parsed.register == "" {
+		return stdout, stderr, nil
+	}
+	registerer := &shareInviteRegisterer{name: parsed.register, registry: parsed.registry}
+	return registerer.wrap(stdout), registerer.wrap(stderr), registerer
+}
+
+func handleShareError(err error, stderr io.Writer) (int, bool) {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return 0, false
+	}
+	_, _ = fmt.Fprintln(stderr, err)
+	return 1, true
+}
+
+func finishShareRegister(registerer *shareInviteRegisterer, stderr io.Writer) int {
+	if registerer == nil || registerer.err == nil {
+		return 0
+	}
+	_, _ = fmt.Fprintln(stderr, registerer.err)
+	return serviceErrorCode(registerer.err)
+}
+
+func parseShareArg(args []string, index *int, stderr io.Writer, parsed *parsedShareArgs) bool {
+	arg := args[*index]
+	if handled, ok := parseShareFlagArg(args, index, stderr, parsed); handled {
+		return ok
+	}
+	if len(arg) > 0 && arg[0] == '-' {
+		_, _ = fmt.Fprintf(stderr, "unknown flag: %s\n", arg)
+		_, _ = fmt.Fprintln(stderr, shareUsage())
+		return false
+	}
+	_, _ = fmt.Fprintln(stderr, shareUsage())
+	return false
+}
+
+func parseShareFlagArg(args []string, index *int, stderr io.Writer, parsed *parsedShareArgs) (bool, bool) {
+	arg := args[*index]
+	switch {
+	case arg == "--force-relay":
+		parsed.forceRelay = true
+		return true, true
+	case arg == "--register":
+		value, ok := shareFlagValue(args, index, "--register", stderr)
+		parsed.register = value
+		return true, ok
+	case strings.HasPrefix(arg, "--register="):
+		parsed.register = strings.TrimPrefix(arg, "--register=")
+		return true, true
+	case arg == "--registry":
+		value, ok := shareFlagValue(args, index, "--registry", stderr)
+		parsed.registry = value
+		return true, ok
+	case strings.HasPrefix(arg, "--registry="):
+		parsed.registry = strings.TrimPrefix(arg, "--registry=")
+		return true, true
+	default:
+		return false, false
+	}
+}
+
+func shareFlagValue(args []string, index *int, flag string, stderr io.Writer) (string, bool) {
+	if *index+1 >= len(args) {
+		_, _ = fmt.Fprintf(stderr, "%s requires a value\n", flag)
+		_, _ = fmt.Fprintln(stderr, shareUsage())
+		return "", false
+	}
+	*index = *index + 1
+	return args[*index], true
+}
+
+type shareInviteRegisterer struct {
+	name     string
+	registry string
+	once     sync.Once
+	err      error
+}
+
+type shareInviteRegisteringWriter struct {
+	dst  io.Writer
+	reg  *shareInviteRegisterer
+	tail string
+}
+
+func (r *shareInviteRegisterer) wrap(dst io.Writer) io.Writer {
+	return &shareInviteRegisteringWriter{dst: dst, reg: r}
+}
+
+func (w *shareInviteRegisteringWriter) Write(p []byte) (int, error) {
+	n, err := w.dst.Write(p)
+	w.capture(string(p))
+	if err != nil {
+		return n, err
+	}
+	return n, w.reg.err
+}
+
+func (w *shareInviteRegisteringWriter) capture(chunk string) {
+	w.tail += chunk
+	if len(w.tail) > 4096 {
+		w.tail = w.tail[len(w.tail)-4096:]
+	}
+	if invite := firstInvite(w.tail); invite != "" {
+		w.reg.publish(invite)
+	}
+}
+
+func (r *shareInviteRegisterer) publish(invite string) {
+	r.once.Do(func() {
+		r.err = publishDerpsshInvite(context.Background(), r.name, invite, r.registry)
+	})
+}
+
+func firstInvite(text string) string {
+	for _, field := range strings.Fields(text) {
+		if strings.HasPrefix(field, derpsshsession.InvitePrefix) {
+			return field
+		}
+	}
+	return ""
+}
+
+func shareUsage() string {
+	return "Usage: derpssh share [--force-relay] [--register NAME] [--registry PATH]"
 }
 
 func commandSessionTelemetryLevel(level telemetry.Level) telemetry.Level {

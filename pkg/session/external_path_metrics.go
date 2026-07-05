@@ -6,7 +6,6 @@ package session
 
 import (
 	"context"
-	"time"
 
 	"github.com/shayne/derphole/pkg/transport"
 )
@@ -17,13 +16,17 @@ func watchExternalDirectPath(ctx context.Context, manager *transport.Manager, me
 	}
 	watchCtx, cancel := context.WithCancel(ctx)
 	go func() {
-		if manager.PathState() == transport.PathDirect {
-			metrics.MarkDirectValidated(time.Now())
+		events := manager.PathEvents(watchCtx)
+		snapshot := manager.PathSnapshot()
+		metrics.RecordTransportPathSnapshot(snapshot)
+		if snapshot.Path == transport.PathDirect {
+			cancel()
 			return
 		}
-		for update := range manager.Updates(watchCtx) {
-			if update.Path == transport.PathDirect {
-				metrics.MarkDirectValidated(time.Now())
+		for event := range events {
+			metrics.RecordTransportPathEvent(event)
+			if event.Type == transport.PathEventSelected && event.Path == transport.PathDirect {
+				cancel()
 				return
 			}
 		}

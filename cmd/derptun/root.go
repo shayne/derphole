@@ -28,12 +28,14 @@ var rootRegistry = yargs.Registry{
 			"derptun open --token DT1...",
 			"derptun token server > server.dts",
 			"derptun token client --token-file server.dts > client.dt1",
+			"derptun service set web --token-file client.dt1",
 			"derptun open --token-file client.dt1 --listen 127.0.0.1:8081",
 			"derptun netcheck",
 		},
 	},
 	SubCommands: map[string]yargs.CommandSpec{
 		"token":    {Info: yargs.SubCommandInfo{Name: "token", Description: "Generate server credentials or client access tokens."}},
+		"service":  {Info: yargs.SubCommandInfo{Name: "service", Description: "Manage local service-name lookup entries."}},
 		"serve":    {Info: yargs.SubCommandInfo{Name: "serve", Description: "Serve a local TCP target using a server token."}},
 		"open":     {Info: yargs.SubCommandInfo{Name: "open", Description: "Open a local TCP listener using a client token."}},
 		"connect":  {Info: yargs.SubCommandInfo{Name: "connect", Description: "Connect one client tunnel stream over stdin/stdout."}},
@@ -79,6 +81,9 @@ func rootCommandHandlers() map[string]rootCommandHandler {
 	return map[string]rootCommandHandler{
 		"token": func(args []string, _ telemetry.Level, stdin io.Reader, stdout, stderr io.Writer) int {
 			return runToken(args, stdin, stdout, stderr)
+		},
+		"service": func(args []string, _ telemetry.Level, stdin io.Reader, stdout, stderr io.Writer) int {
+			return runService(args, stdin, stdout, stderr)
 		},
 		"serve": func(args []string, level telemetry.Level, stdin io.Reader, _ io.Writer, stderr io.Writer) int {
 			return runServe(args, level, stdin, stderr)

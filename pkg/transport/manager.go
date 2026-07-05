@@ -65,6 +65,9 @@ type Manager struct {
 	directReadCancel      context.CancelFunc
 	state                 pathState
 	stateNotify           chan struct{}
+	pathNotify            chan struct{}
+	pathEventSeq          uint64
+	pathEvents            []sequencedPathEvent
 	discoveryGen          uint64
 	discoveryRun          bool
 	discoveryPending      bool
@@ -75,6 +78,11 @@ type Manager struct {
 	peerRecvDrops         atomic.Uint64
 	peerRecvMaxDepth      atomic.Uint64
 	directRecvRejects     atomic.Uint64
+}
+
+type sequencedPathEvent struct {
+	seq   uint64
+	event PathEvent
 }
 
 type Update struct {
@@ -92,6 +100,7 @@ type DirectBatchConn interface {
 }
 
 const defaultPeerRecvQueueDepth = 4096
+const maxPathEventLog = 256
 
 func NewManager(cfg ManagerConfig) *Manager {
 	cfg = normalizeConfig(cfg)
@@ -101,6 +110,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		candidateSourceBase: cfg.CandidateSource,
 		state:               newPathState(cfg.Clock.Now(), hasRelay, cfg.DirectConn != nil),
 		stateNotify:         make(chan struct{}),
+		pathNotify:          make(chan struct{}),
 		peerRecvCh:          make(chan peerPacket, defaultPeerRecvQueueDepth),
 		peerRecvErrCh:       make(chan error, 1),
 	}
@@ -175,7 +185,7 @@ func (m *Manager) Wait() {
 }
 
 func (m *Manager) StopDirect() {
-	m.noteRelayOnly(m.now())
+	m.noteRelayOnly(m.now(), PathEventReasonStopDirect, PathEventSourceStopDirect)
 	m.mu.Lock()
 	directCancel := m.directCancel
 	directReadCancel := m.directReadCancel
@@ -215,6 +225,86 @@ func (m *Manager) PathState() Path {
 	return m.state.path()
 }
 
+func (m *Manager) PathSnapshot() PathSnapshot {
+	now := m.now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.state.snapshot(now)
+}
+
+func (m *Manager) selectedAddrLocked() net.Addr {
+	if m.state.current != PathDirect || m.state.bestEndpoint == "" {
+		return nil
+	}
+	return cloneAddr(m.state.endpoints[m.state.bestEndpoint])
+}
+
+func (m *Manager) PathEvents(ctx context.Context) <-chan PathEvent {
+	events := make(chan PathEvent, 16)
+	m.mu.Lock()
+	cursor := m.pathEventSeq
+	var notify <-chan struct{} = m.pathNotify
+	m.mu.Unlock()
+	go func() {
+		defer close(events)
+		m.runPathEvents(ctx, events, cursor, notify)
+	}()
+	return events
+}
+
+func (m *Manager) runPathEvents(ctx context.Context, out chan<- PathEvent, cursor uint64, notify <-chan struct{}) {
+	for {
+		if !waitForStateNotify(ctx, notify) {
+			return
+		}
+		for {
+			batch, nextCursor, nextNotify := m.pathEventsSince(cursor)
+			if len(batch) == 0 {
+				notify = nextNotify
+				break
+			}
+			for _, event := range batch {
+				select {
+				case out <- event:
+				case <-ctx.Done():
+					return
+				}
+			}
+			cursor = nextCursor
+		}
+	}
+}
+
+func (m *Manager) PathSnapshots(ctx context.Context) <-chan PathSnapshot {
+	snapshots := make(chan PathSnapshot, 1)
+	snapshot, notify := m.snapshotPathSnapshot()
+	go func() {
+		defer close(snapshots)
+		m.runPathSnapshots(ctx, snapshots, snapshot, notify)
+	}()
+	return snapshots
+}
+
+func (m *Manager) runPathSnapshots(ctx context.Context, out chan<- PathSnapshot, snapshot PathSnapshot, notify <-chan struct{}) {
+	if !sendPathSnapshot(ctx, out, snapshot) {
+		return
+	}
+	last := snapshot
+	for {
+		if !waitForStateNotify(ctx, notify) {
+			return
+		}
+		snapshot, notify = m.snapshotPathSnapshot()
+		if pathSnapshotsEqual(snapshot, last) {
+			continue
+		}
+		if !sendPathSnapshot(ctx, out, snapshot) {
+			return
+		}
+		last = snapshot
+	}
+}
+
 func (m *Manager) DirectPath() (string, bool) {
 	now := m.now()
 	m.mu.Lock()
@@ -252,9 +342,20 @@ func (m *Manager) demoteStaleDirectLocked(now time.Time) bool {
 	if m.state.current != PathDirect || !m.state.directIsStale(now, m.directStaleTimeout()) {
 		return false
 	}
+	previousPath := m.state.current
+	previousAddr := m.selectedAddrLocked()
 	m.discoveryGen++
 	if m.state.noteRelay(now) {
 		m.signalStateChangeLocked()
+		m.appendPathEventLocked(PathEvent{
+			At:           now,
+			Type:         PathEventFallback,
+			Reason:       PathEventReasonDirectStale,
+			Source:       PathEventSourceStaleCheck,
+			Path:         m.state.path(),
+			PreviousPath: previousPath,
+			PreviousAddr: previousAddr,
+		})
 	}
 	return true
 }
@@ -263,11 +364,48 @@ func (m *Manager) now() time.Time {
 	return m.cfg.Clock.Now()
 }
 
-func (m *Manager) noteRelayOnly(now time.Time) {
+func (m *Manager) noteRelayOnly(now time.Time, reason PathEventReason, source PathEventSource) {
 	m.mu.Lock()
+	previousPath := m.state.current
+	previousAddr := m.selectedAddrLocked()
 	m.discoveryGen++
 	if m.state.noteRelay(now) {
 		m.signalStateChangeLocked()
+		m.appendPathEventLocked(PathEvent{
+			At:           now,
+			Type:         PathEventFallback,
+			Reason:       reason,
+			Source:       source,
+			Path:         m.state.path(),
+			PreviousPath: previousPath,
+			PreviousAddr: previousAddr,
+		})
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) noteRelayAfterDirectWriteFailure(now time.Time, addr net.Addr) {
+	m.mu.Lock()
+	previousPath := m.state.current
+	previousAddr := m.selectedAddrLocked()
+	m.discoveryGen++
+	if addr != nil {
+		key := addr.String()
+		m.state.noteCandidateSeen(now, key, addr)
+		m.state.markCandidateUnusable(now, key, defaultCandidateSuppressPeriod)
+	}
+	if m.state.noteRelay(now) {
+		m.signalStateChangeLocked()
+		m.appendPathEventLocked(PathEvent{
+			At:           now,
+			Type:         PathEventFallback,
+			Reason:       PathEventReasonDirectBroken,
+			Source:       PathEventSourceManual,
+			Path:         m.state.path(),
+			PreviousPath: previousPath,
+			PreviousAddr: previousAddr,
+			TargetAddr:   addr,
+		})
 	}
 	m.mu.Unlock()
 }
@@ -285,7 +423,7 @@ func (m *Manager) snapshotDiscoveryPlan() discoveryPlan {
 	now := m.now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	plan := m.state.discoveryPlan(now, m.endpointRefreshInterval(), m.directStaleTimeout())
+	plan := m.state.discoveryPlan(now, m.endpointRefreshInterval(), m.directStaleTimeout(), m.discoveryInterval())
 	plan.generation = m.discoveryGen
 	return plan
 }
@@ -296,11 +434,37 @@ func (m *Manager) tryPromoteDirect(now time.Time, addr net.Addr, token directPro
 		m.mu.Unlock()
 		return false
 	}
+	previousPath := m.state.current
+	previousAddr := m.selectedAddrLocked()
+	rtt := m.state.endpointLatency[addr.String()]
 	if !m.state.noteDirect(now, addr) {
+		m.appendPathEventLocked(PathEvent{
+			At:           now,
+			Type:         PathEventProbeSucceeded,
+			Reason:       PathEventReasonProbeAck,
+			Source:       PathEventSourceDirectProbe,
+			Path:         m.state.path(),
+			PreviousPath: previousPath,
+			PreviousAddr: previousAddr,
+			TargetAddr:   addr,
+			RTT:          rtt,
+		})
 		m.mu.Unlock()
 		return false
 	}
 	m.signalStateChangeLocked()
+	m.appendPathEventLocked(PathEvent{
+		At:           now,
+		Type:         PathEventSelected,
+		Reason:       PathEventReasonProbeAck,
+		Source:       PathEventSourceDirectProbe,
+		Path:         m.state.path(),
+		PreviousPath: previousPath,
+		PreviousAddr: previousAddr,
+		SelectedAddr: addr,
+		TargetAddr:   addr,
+		RTT:          rtt,
+	})
 	m.mu.Unlock()
 	return true
 }
@@ -351,15 +515,30 @@ func (m *Manager) noteProbeSentIfCurrent(generation uint64, now time.Time, addr 
 		return
 	}
 	m.state.noteProbeSent(now, addr, token)
+	m.appendPathEventLocked(PathEvent{
+		At:         now,
+		Type:       PathEventProbeSent,
+		Source:     PathEventSourceDiscovery,
+		Path:       m.state.path(),
+		TargetAddr: addr,
+	})
 }
 
-func (m *Manager) noteProbeFailedIfCurrent(generation uint64, addr net.Addr, token directProbeToken) {
+func (m *Manager) noteProbeFailedIfCurrent(generation uint64, now time.Time, addr net.Addr, token directProbeToken) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.discoveryGen != generation {
 		return
 	}
-	m.state.forgetProbe(addr, token)
+	m.state.noteProbeFailed(now, addr, token, defaultCandidateSuppressPeriod)
+	m.appendPathEventLocked(PathEvent{
+		At:         now,
+		Type:       PathEventProbeFailed,
+		Reason:     PathEventReasonProbeWriteFailed,
+		Source:     PathEventSourceDiscovery,
+		Path:       m.state.path(),
+		TargetAddr: addr,
+	})
 }
 
 func (m *Manager) stateChanged() <-chan struct{} {
@@ -372,6 +551,77 @@ func (m *Manager) snapshotUpdate() (Path, <-chan struct{}) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.state.path(), m.stateNotify
+}
+
+func (m *Manager) snapshotPathSnapshot() (PathSnapshot, <-chan struct{}) {
+	now := m.now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.state.snapshot(now), m.pathNotify
+}
+
+func (m *Manager) pathEventsSince(cursor uint64) ([]PathEvent, uint64, <-chan struct{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if cursor < m.oldestPathEventSeqLocked() {
+		return []PathEvent{m.laggedPathEventLocked()}, m.pathEventSeq, m.pathNotify
+	}
+
+	events := make([]PathEvent, 0, len(m.pathEvents))
+	nextCursor := cursor
+	for _, sequenced := range m.pathEvents {
+		if sequenced.seq <= cursor {
+			continue
+		}
+		events = append(events, clonePathEvent(sequenced.event))
+		nextCursor = sequenced.seq
+	}
+	return events, nextCursor, m.pathNotify
+}
+
+func (m *Manager) oldestPathEventSeqLocked() uint64 {
+	if len(m.pathEvents) == 0 {
+		return m.pathEventSeq
+	}
+	return m.pathEvents[0].seq - 1
+}
+
+func (m *Manager) appendPathEventLocked(event PathEvent) {
+	if event.At.IsZero() {
+		event.At = m.now()
+	}
+	snapshot := m.state.snapshot(event.At)
+	if event.Path == PathUnknown && snapshot.Path != PathUnknown {
+		event.Path = snapshot.Path
+	}
+	if event.SelectedAddr == nil {
+		event.SelectedAddr = cloneAddr(snapshot.SelectedAddr)
+	}
+	event.Snapshot = snapshot
+
+	m.pathEventSeq++
+	m.pathEvents = append(m.pathEvents, sequencedPathEvent{
+		seq:   m.pathEventSeq,
+		event: clonePathEvent(event),
+	})
+	if len(m.pathEvents) > maxPathEventLog {
+		copy(m.pathEvents, m.pathEvents[len(m.pathEvents)-maxPathEventLog:])
+		m.pathEvents = m.pathEvents[:maxPathEventLog]
+	}
+	m.signalPathEventLocked()
+}
+
+func (m *Manager) laggedPathEventLocked() PathEvent {
+	now := m.now()
+	snapshot := m.state.snapshot(now)
+	return PathEvent{
+		At:           now,
+		Type:         PathEventLagged,
+		Path:         snapshot.Path,
+		SelectedAddr: cloneAddr(snapshot.SelectedAddr),
+		Snapshot:     snapshot,
+	}
 }
 
 func (m *Manager) Updates(ctx context.Context) <-chan Update {
@@ -407,6 +657,47 @@ func (m *Manager) sendUpdateIfChanged(ctx context.Context, updates chan<- Update
 	case <-ctx.Done():
 		return false
 	}
+}
+
+func sendPathSnapshot(ctx context.Context, snapshots chan<- PathSnapshot, snapshot PathSnapshot) bool {
+	select {
+	case snapshots <- snapshot:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func pathSnapshotsEqual(a, b PathSnapshot) bool {
+	return pathSnapshotStateEqual(a, b) && pathSnapshotCandidatesEqual(a.Candidates, b.Candidates)
+}
+
+func pathSnapshotStateEqual(a, b PathSnapshot) bool {
+	return a.Path == b.Path &&
+		sameAddr(a.SelectedAddr, b.SelectedAddr) &&
+		a.SelectedRTT == b.SelectedRTT &&
+		a.Upgrades == b.Upgrades &&
+		a.Fallbacks == b.Fallbacks
+}
+
+func pathSnapshotCandidatesEqual(a, b []PathCandidateSnapshot) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !pathCandidateSnapshotsEqual(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func pathCandidateSnapshotsEqual(a, b PathCandidateSnapshot) bool {
+	return sameAddr(a.Addr, b.Addr) &&
+		a.RTT == b.RTT &&
+		a.Selected == b.Selected &&
+		a.ProbePending == b.ProbePending &&
+		a.ProbeSentAt.Equal(b.ProbeSentAt)
 }
 
 func waitForStateNotify(ctx context.Context, notify <-chan struct{}) bool {
@@ -449,6 +740,11 @@ func (m *Manager) notePeerRecvDepth(depth int) {
 func (m *Manager) signalStateChangeLocked() {
 	close(m.stateNotify)
 	m.stateNotify = make(chan struct{})
+}
+
+func (m *Manager) signalPathEventLocked() {
+	close(m.pathNotify)
+	m.pathNotify = make(chan struct{})
 }
 
 func normalizeConfig(cfg ManagerConfig) ManagerConfig {

@@ -19,6 +19,8 @@ type openFlags struct {
 	Token      string `flag:"token" help:"Client token for tunnel access"`
 	TokenFile  string `flag:"token-file" help:"Read the client token from a file"`
 	TokenStdin bool   `flag:"token-stdin" help:"Read the client token from the first stdin line"`
+	Service    string `flag:"service" help:"Resolve the client token from the local service registry"`
+	Registry   string `flag:"registry" help:"Path to the local service registry"`
 	Listen     string `flag:"listen" help:"Local TCP bind address, for example 127.0.0.1:2222"`
 	ForceRelay bool   `flag:"force-relay" help:"Disable direct probing"`
 }
@@ -29,6 +31,7 @@ var openHelpConfig = yargs.HelpConfig{
 		Description: "Open a local TCP listener that forwards through a derptun client token.",
 		Examples: []string{
 			"derptun open --token DT1...",
+			"derptun open --service web",
 			"derptun open --token-file client.dt1 --listen 127.0.0.1:8081",
 		},
 	},
@@ -36,8 +39,9 @@ var openHelpConfig = yargs.HelpConfig{
 		"open": {
 			Name:        "open",
 			Description: "Listen locally and forward each TCP connection through the tunnel.",
-			Usage:       "(--token TOKEN|--token-file PATH|--token-stdin) [--listen HOST:PORT] [--force-relay]",
+			Usage:       "(--service NAME|--token TOKEN|--token-file PATH|--token-stdin) [--registry PATH] [--listen HOST:PORT] [--force-relay]",
 			Examples: []string{
+				"derptun open --service web",
 				"derptun open --token-file client.dt1",
 				"printf '%s\\n' \"$DERPTUN_CLIENT_TOKEN\" | derptun open --token-stdin --listen 127.0.0.1:8081",
 			},
@@ -56,10 +60,15 @@ func runOpen(args []string, level telemetry.Level, stdin io.Reader, stderr io.Wr
 		_, _ = fmt.Fprint(stderr, openHelpText())
 		return 2
 	}
-	token, _, err := resolveTokenSource(stdin, tokenSource{
+	ctx, stop := commandContext()
+	defer stop()
+	token, _, err := resolveClientTokenSource(ctx, stdin, tokenSource{
 		Token:      parsed.SubCommandFlags.Token,
 		TokenFile:  parsed.SubCommandFlags.TokenFile,
 		TokenStdin: parsed.SubCommandFlags.TokenStdin,
+	}, serviceSource{
+		Service:  parsed.SubCommandFlags.Service,
+		Registry: parsed.SubCommandFlags.Registry,
 	})
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
@@ -72,8 +81,6 @@ func runOpen(args []string, level telemetry.Level, stdin io.Reader, stderr io.Wr
 		return 2
 	}
 
-	ctx, stop := commandContext()
-	defer stop()
 	return runOpenSession(ctx, token, parsed, level, stderr)
 }
 

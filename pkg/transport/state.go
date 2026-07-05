@@ -7,6 +7,7 @@ package transport
 import (
 	"net"
 	"net/netip"
+	"sort"
 	"time"
 )
 
@@ -25,6 +26,8 @@ type pathState struct {
 	directConfigured    bool
 	endpoints           map[string]net.Addr
 	endpointLatency     map[string]time.Duration
+	candidateLifecycle  map[string]directCandidateState
+	selector            pathSelector
 	bestEndpoint        string
 	lastRelayAt         time.Time
 	lastDirectAt        time.Time
@@ -60,18 +63,55 @@ func newPathState(now time.Time, hasRelay, hasDirect bool) pathState {
 	}
 
 	return pathState{
-		current:          current,
-		relayConfigured:  hasRelay,
-		directConfigured: hasDirect,
-		endpoints:        make(map[string]net.Addr),
-		endpointLatency:  make(map[string]time.Duration),
-		pendingProbes:    make(map[string]pendingDirectProbe),
-		lastRelayAt:      lastRelayAt,
+		current:            current,
+		relayConfigured:    hasRelay,
+		directConfigured:   hasDirect,
+		endpoints:          make(map[string]net.Addr),
+		endpointLatency:    make(map[string]time.Duration),
+		candidateLifecycle: make(map[string]directCandidateState),
+		selector:           defaultPathSelector(),
+		pendingProbes:      make(map[string]pendingDirectProbe),
+		lastRelayAt:        lastRelayAt,
 	}
 }
 
 func (s pathState) path() Path {
 	return s.current
+}
+
+func (s pathState) snapshot(now time.Time) PathSnapshot {
+	snapshot := PathSnapshot{
+		At:        now,
+		Path:      s.current,
+		Upgrades:  s.upgrades,
+		Fallbacks: s.fallbacks,
+	}
+	if s.current == PathDirect && s.bestEndpoint != "" {
+		snapshot.SelectedAddr = cloneAddr(s.endpoints[s.bestEndpoint])
+		snapshot.SelectedRTT = s.endpointLatency[s.bestEndpoint]
+	}
+
+	keys := make([]string, 0, len(s.endpoints))
+	for key := range s.endpoints {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	snapshot.Candidates = make([]PathCandidateSnapshot, 0, len(keys))
+	for _, key := range keys {
+		candidate := PathCandidateSnapshot{
+			Addr:     cloneAddr(s.endpoints[key]),
+			RTT:      s.endpointLatency[key],
+			Selected: s.current == PathDirect && key == s.bestEndpoint,
+		}
+		if pending, ok := s.pendingProbes[key]; ok {
+			candidate.ProbePending = true
+			candidate.ProbeSentAt = pending.sentAt
+		}
+		snapshot.Candidates = append(snapshot.Candidates, candidate)
+	}
+
+	return snapshot
 }
 
 func (s pathState) directPath() (string, bool) {
@@ -81,11 +121,12 @@ func (s pathState) directPath() (string, bool) {
 	return s.bestEndpoint, s.bestEndpoint != ""
 }
 
-func (s pathState) discoveryPlan(now time.Time, refreshInterval, staleAfter time.Duration) discoveryPlan {
+func (s *pathState) discoveryPlan(now time.Time, refreshInterval, staleAfter, probeTimeout time.Duration) discoveryPlan {
 	if !s.directConfigured {
 		return discoveryPlan{}
 	}
 
+	s.expirePendingProbes(now, probeTimeout, defaultCandidateSuppressPeriod)
 	if !s.shouldAttemptDiscovery(now, staleAfter) {
 		return discoveryPlan{}
 	}
@@ -93,7 +134,7 @@ func (s pathState) discoveryPlan(now time.Time, refreshInterval, staleAfter time
 	return discoveryPlan{
 		needRefresh:   s.needsEndpointRefresh(now, refreshInterval),
 		sendCallMe:    s.needsCallMeMaybe(now, refreshInterval),
-		probeTargets:  s.probeTargets(),
+		probeTargets:  s.probeTargets(now),
 		shouldAttempt: true,
 	}
 }
@@ -102,20 +143,35 @@ func (s pathState) shouldAttemptDiscovery(now time.Time, staleAfter time.Duratio
 	return s.current != PathDirect || s.directIsStale(now, staleAfter)
 }
 
-func (s pathState) probeTargets() []net.Addr {
+func (s pathState) probeTargets(now time.Time) []net.Addr {
 	targets := make([]net.Addr, 0, len(s.endpoints))
 	if s.bestEndpoint != "" {
 		if endpoint, ok := s.endpoints[s.bestEndpoint]; ok {
-			targets = append(targets, cloneAddr(endpoint))
+			if s.shouldProbeEndpoint(now, s.bestEndpoint) {
+				targets = append(targets, cloneAddr(endpoint))
+			}
 		}
 	}
 	for key, endpoint := range s.endpoints {
 		if key == s.bestEndpoint {
 			continue
 		}
+		if !s.shouldProbeEndpoint(now, key) {
+			continue
+		}
 		targets = append(targets, cloneAddr(endpoint))
 	}
 	return targets
+}
+
+func (s pathState) shouldProbeEndpoint(now time.Time, key string) bool {
+	if _, ok := s.pendingProbes[key]; ok {
+		return false
+	}
+	if state, ok := s.candidateLifecycle[key]; ok && state.suppressed(now) {
+		return false
+	}
+	return true
 }
 
 func (s pathState) needsEndpointRefresh(now time.Time, refreshInterval time.Duration) bool {
@@ -149,16 +205,20 @@ func (s *pathState) noteCandidates(now time.Time, candidates []net.Addr) bool {
 	prevBest := s.bestEndpoint
 	prevBestAddr := cloneAddr(s.endpoints[prevBest])
 	next := candidateMap(candidates)
+	for key, candidate := range next {
+		s.noteCandidateSeen(now, key, candidate)
+	}
 
 	if s.current == PathDirect && prevBest != "" {
 		if _, ok := next[prevBest]; !ok && prevBestAddr != nil {
 			next[prevBest] = prevBestAddr
+			s.markCandidateOpen(now, prevBest, prevBestAddr)
 		}
 	}
 
 	changed := candidateMapChanged(s.endpoints, next)
 	s.endpoints = next
-	s.pruneEndpointState()
+	s.pruneEndpointState(now)
 	changed = s.relayIfBestEndpointLost(now) || changed
 	s.lastPeerEndpointsAt = now
 	return changed
@@ -186,9 +246,10 @@ func candidateMapChanged(current map[string]net.Addr, next map[string]net.Addr) 
 	return false
 }
 
-func (s *pathState) pruneEndpointState() {
+func (s *pathState) pruneEndpointState(now time.Time) {
 	pruneMissingKeys(s.pendingProbes, s.endpoints)
 	pruneMissingKeys(s.endpointLatency, s.endpoints)
+	s.pruneTrackedCandidates(now)
 }
 
 func pruneMissingKeys[T any](values map[string]T, keep map[string]net.Addr) {
@@ -210,20 +271,17 @@ func (s *pathState) relayIfBestEndpointLost(now time.Time) bool {
 }
 
 func (s *pathState) noteDirect(now time.Time, addr net.Addr) bool {
-	if !s.directConfigured || addr == nil {
-		return false
-	}
-	key := addr.String()
-	candidate, ok := s.endpoints[key]
+	key, candidate, ok := s.directCandidate(addr)
 	if !ok {
 		return false
 	}
-
-	if !s.shouldSelectDirectEndpoint(key, candidate) {
+	if !s.shouldSelectDirectCandidate(key, candidate) {
+		s.markCandidateInactive(now, key)
 		s.lastDirectAt = now
 		return false
 	}
 
+	prevBest := s.bestEndpoint
 	changed := s.current != PathDirect || s.bestEndpoint != key
 	if s.current != PathDirect {
 		s.upgrades++
@@ -231,18 +289,57 @@ func (s *pathState) noteDirect(now time.Time, addr net.Addr) bool {
 	s.current = PathDirect
 	s.bestEndpoint = key
 	s.lastDirectAt = now
+	if changed && prevBest != "" && prevBest != key {
+		s.markCandidateInactive(now, prevBest)
+	}
+	s.markCandidateOpen(now, key, candidate)
 	return changed
 }
 
-func (s *pathState) shouldSelectDirectEndpoint(key string, candidate net.Addr) bool {
-	if s.current != PathDirect || s.bestEndpoint == "" || s.bestEndpoint == key {
-		return true
+func (s pathState) directCandidate(addr net.Addr) (string, net.Addr, bool) {
+	if !s.directConfigured || addr == nil {
+		return "", nil, false
 	}
-	best, ok := s.endpoints[s.bestEndpoint]
-	if !ok {
-		return true
+	key := addr.String()
+	candidate, ok := s.endpoints[key]
+	return key, candidate, ok
+}
+
+func (s pathState) shouldSelectDirectCandidate(key string, candidate net.Addr) bool {
+	selected, ok := s.selector.selectPath(s.currentSelectablePath(), s.hasCurrentSelectablePath(), []selectablePath{{
+		path: PathDirect,
+		key:  key,
+		addr: candidate,
+		rtt:  s.endpointLatency[key],
+	}})
+	return ok && selected.path == PathDirect && selected.key == key
+}
+
+func (s pathState) currentSelectablePath() selectablePath {
+	switch s.current {
+	case PathDirect:
+		if s.bestEndpoint == "" {
+			return selectablePath{}
+		}
+		addr, ok := s.endpoints[s.bestEndpoint]
+		if !ok {
+			return selectablePath{}
+		}
+		return selectablePath{
+			path: PathDirect,
+			key:  s.bestEndpoint,
+			addr: addr,
+			rtt:  s.endpointLatency[s.bestEndpoint],
+		}
+	case PathRelay:
+		return selectablePath{path: PathRelay}
+	default:
+		return selectablePath{}
 	}
-	return betterDirectAddr(candidate, s.endpointLatency[key], best, s.endpointLatency[s.bestEndpoint])
+}
+
+func (s pathState) hasCurrentSelectablePath() bool {
+	return s.currentSelectablePath().selectable()
 }
 
 func (s *pathState) noteDirectActivity(now time.Time, addr net.Addr) {
@@ -279,10 +376,17 @@ func (s *pathState) noteProbeSent(now time.Time, addr net.Addr, token directProb
 	if addr == nil {
 		return
 	}
-	s.pendingProbes[addr.String()] = pendingDirectProbe{sentAt: now, token: token}
+	key := addr.String()
+	s.pendingProbes[key] = pendingDirectProbe{sentAt: now, token: token}
+	s.noteCandidateSeen(now, key, addr)
+	state := s.candidateLifecycle[key]
+	state.status = candidatePending
+	state.lastProbeAt = now
+	state.suppressUntil = time.Time{}
+	s.candidateLifecycle[key] = state
 }
 
-func (s *pathState) forgetProbe(addr net.Addr, token directProbeToken) {
+func (s *pathState) noteProbeFailed(now time.Time, addr net.Addr, token directProbeToken, suppressFor time.Duration) {
 	if addr == nil {
 		return
 	}
@@ -292,6 +396,17 @@ func (s *pathState) forgetProbe(addr net.Addr, token directProbeToken) {
 		return
 	}
 	delete(s.pendingProbes, key)
+	s.markCandidateUnusable(now, key, suppressFor)
+}
+
+func (s *pathState) expirePendingProbes(now time.Time, maxAge, suppressFor time.Duration) {
+	for key, pending := range s.pendingProbes {
+		if !now.After(pending.sentAt.Add(maxAge)) {
+			continue
+		}
+		delete(s.pendingProbes, key)
+		s.markCandidateUnusable(now, key, suppressFor)
+	}
 }
 
 func (s *pathState) consumeProbe(addr net.Addr, maxAge time.Duration, now time.Time, token directProbeToken) bool {
@@ -342,43 +457,6 @@ func cloneAddr(addr net.Addr) net.Addr {
 		return &cp
 	default:
 		return addr
-	}
-}
-
-func betterDirectAddr(candidate net.Addr, candidateLatency time.Duration, current net.Addr, currentLatency time.Duration) bool {
-	candidateIP, candidateOK := addrIP(candidate)
-	currentIP, currentOK := addrIP(current)
-	if !currentOK {
-		return candidateOK
-	}
-	if !candidateOK {
-		return false
-	}
-
-	var candidatePoints, currentPoints int
-	if candidateLatency > currentLatency && candidateLatency > 0 {
-		currentPoints = int(100 - ((currentLatency * 100) / candidateLatency))
-	} else if currentLatency > 0 {
-		candidatePoints = int(100 - ((candidateLatency * 100) / currentLatency))
-	}
-	candidatePoints += directAddrPreferencePoints(candidateIP)
-	currentPoints += directAddrPreferencePoints(currentIP)
-	if candidatePoints <= 1 && currentPoints == 0 {
-		return false
-	}
-	return candidatePoints > currentPoints
-}
-
-func directAddrPreferencePoints(ip net.IP) int {
-	switch {
-	case ip.IsLoopback():
-		return 50
-	case ip.IsLinkLocalUnicast():
-		return 30
-	case ip.IsPrivate() || isCGNAT(ip):
-		return 20
-	default:
-		return 0
 	}
 }
 

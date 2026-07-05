@@ -23,5 +23,9 @@ jobs:
         with:
           install: true
           cache: true
+      - name: Install topology tools
+        run: sudo apt-get update && sudo apt-get install -y iproute2 iptables iputils-ping
       - name: Run checks
         run: mise run check
+      - name: Run topology simulations
+        run: mise run toposim

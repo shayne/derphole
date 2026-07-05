@@ -6,6 +6,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +22,8 @@ type tokenSource struct {
 	TokenFile  string
 	TokenStdin bool
 }
+
+var errServerTokenForClient = errors.New("server tokens are for derptun serve; use a client token or copy the command printed by derptun serve")
 
 func resolveTokenSource(stdin io.Reader, source tokenSource) (string, io.Reader, error) {
 	if tokenSourceCount(source) != 1 {
@@ -48,10 +51,21 @@ func resolveOptionalTokenSource(stdin io.Reader, source tokenSource) (string, io
 	return token, reader, true, err
 }
 
+func resolveClientTokenSource(ctx context.Context, stdin io.Reader, source tokenSource, service serviceSource) (string, io.Reader, error) {
+	if service.Service != "" {
+		if tokenSourceCount(source) != 0 {
+			return "", stdin, errors.New("at most one of --service, --token, --token-file, or --token-stdin may be set")
+		}
+		token, err := resolveDerptunServiceToken(ctx, service.Service, service.Registry)
+		return token, stdin, err
+	}
+	return resolveTokenSource(stdin, source)
+}
+
 func validateClientTokenForCLI(token string) error {
 	token = strings.TrimSpace(token)
 	if strings.HasPrefix(token, derptunpkg.ServerTokenPrefix) {
-		return errors.New("server tokens are for derptun serve; use a client token or copy the command printed by derptun serve")
+		return errServerTokenForClient
 	}
 	if _, err := derptunpkg.DecodeClientToken(token, time.Now()); err != nil {
 		return err

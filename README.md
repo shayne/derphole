@@ -165,6 +165,17 @@ npx -y derpssh@latest connect <invite>
 The host approves the guest as read-only or read/write. The session uses the
 `derptun` transport path, so neither side needs an inbound port.
 
+Optional local lookup keeps the invite behind a service name on the connecting
+machine:
+
+```bash
+npx -y derpssh@latest service set ops-shell <invite>
+npx -y derpssh@latest connect --service ops-shell
+```
+
+The host still approves the guest. The service name only finds the invite; it
+does not bypass approval.
+
 ### TCP Tunnels
 
 `derptun` exposes a local TCP service without asking either side to open an
@@ -217,6 +228,17 @@ npx -y derptun@latest token client --token-file server.dts --expires 2026-04-25T
 
 Use `--token TOKEN` for inline one-off commands. Prefer `--token-file PATH` for
 durable tokens. `--token-stdin` reads the token from the first stdin line.
+
+Optional local lookup keeps the client token behind a service name on the
+connecting machine:
+
+```bash
+npx -y derptun@latest service set web --token-file client.dt1
+npx -y derptun@latest open --service web --listen 127.0.0.1:3001
+```
+
+The registry is local name-to-token storage. It is not a hosted control plane,
+and no lookup server is contacted by default.
 
 ### Useful Extras
 
@@ -348,6 +370,11 @@ session or tunnel until expiry, so share tokens over a trusted channel.
 `derphole` session tokens expire after one hour. `derptun` server tokens default
 to 180 days and can mint shorter-lived client tokens. Client tokens default to
 90 days and cannot serve.
+
+Local service registry entries are bearer secrets because they contain derptun
+client tokens or derpssh invites. Protect the registry file like token files.
+List output redacts token and invite values, and no lookup server is contacted
+by default.
 
 Payload bytes are always end-to-end encrypted between token holders. Session and
 tunnel encryption is pinned to token-derived identity, so DERP relays do **not**

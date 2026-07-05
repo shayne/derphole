@@ -198,6 +198,462 @@ func TestManagerSeedsRemoteCandidatesWithoutWaitingForDiscoveryTick(t *testing.T
 	}
 }
 
+func TestManagerPathSnapshotIncludesSelectedAddrRTTAndCandidates(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000013, 0))
+	relay := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	relay.useClock(clock)
+	direct.useClock(clock)
+
+	selected := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 13), Port: 21313}
+	standby := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 13), Port: 31313}
+	baseTimers := clock.timerCount()
+
+	mgr := NewManager(ManagerConfig{
+		RelayConn:          relay,
+		DirectConn:         direct,
+		Clock:              clock,
+		DiscoveryInterval:  1 * time.Second,
+		DirectStaleTimeout: 4 * time.Second,
+	})
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+	if !waitForDiscoveryIdle(t, mgr, 200*time.Millisecond) {
+		t.Fatal("manager did not finish startup discovery before seeded candidates")
+	}
+
+	mgr.SeedRemoteCandidates(ctx, []net.Addr{standby, selected})
+	if !direct.waitForWritePayloadTo(selected, discoProbePayload, 200*time.Millisecond) {
+		t.Fatalf("manager did not probe selected candidate %v", selected)
+	}
+	if !direct.waitForWritePayloadTo(standby, discoProbePayload, 200*time.Millisecond) {
+		t.Fatalf("manager did not probe standby candidate %v", standby)
+	}
+
+	ack, ok := directAckPayloadForProbe(DiscoveryKey{}, discoProbePayload)
+	if !ok {
+		t.Fatal("directAckPayloadForProbe() ok = false, want true")
+	}
+	clock.Advance(42 * time.Millisecond)
+	direct.enqueueRead(ack, selected)
+	if !waitForPath(t, mgr, PathDirect, 200*time.Millisecond) {
+		t.Fatalf("PathState() after direct ack = %v, want %v", mgr.PathState(), PathDirect)
+	}
+
+	snapshot := mgr.PathSnapshot()
+	if snapshot.Path != PathDirect {
+		t.Fatalf("snapshot.Path = %v, want %v", snapshot.Path, PathDirect)
+	}
+	if snapshot.SelectedAddr.String() != selected.String() {
+		t.Fatalf("snapshot.SelectedAddr = %v, want %v", snapshot.SelectedAddr, selected)
+	}
+	if snapshot.SelectedRTT != 42*time.Millisecond {
+		t.Fatalf("snapshot.SelectedRTT = %v, want %v", snapshot.SelectedRTT, 42*time.Millisecond)
+	}
+	if len(snapshot.Candidates) != 2 {
+		t.Fatalf("len(snapshot.Candidates) = %d, want 2", len(snapshot.Candidates))
+	}
+
+	var selectedCandidate *PathCandidateSnapshot
+	for i := range snapshot.Candidates {
+		if snapshot.Candidates[i].Addr.String() == selected.String() {
+			selectedCandidate = &snapshot.Candidates[i]
+			break
+		}
+	}
+	if selectedCandidate == nil {
+		t.Fatalf("snapshot.Candidates missing selected addr %v: %#v", selected, snapshot.Candidates)
+	}
+	if !selectedCandidate.Selected {
+		t.Fatal("selected candidate Selected = false, want true")
+	}
+	if selectedCandidate.RTT != 42*time.Millisecond {
+		t.Fatalf("selected candidate RTT = %v, want %v", selectedCandidate.RTT, 42*time.Millisecond)
+	}
+	if selectedCandidate.ProbePending {
+		t.Fatal("selected candidate ProbePending = true, want false")
+	}
+	if !selectedCandidate.ProbeSentAt.IsZero() {
+		t.Fatalf("selected candidate ProbeSentAt = %v, want zero after ACK consumption", selectedCandidate.ProbeSentAt)
+	}
+}
+
+func TestManagerPathEventsReportCandidateProbeAndSelection(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000014, 0))
+	relay := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	relay.useClock(clock)
+	direct.useClock(clock)
+
+	selected := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 14), Port: 21414}
+	baseTimers := clock.timerCount()
+
+	mgr := NewManager(ManagerConfig{
+		RelayConn:          relay,
+		DirectConn:         direct,
+		Clock:              clock,
+		DiscoveryInterval:  1 * time.Second,
+		DirectStaleTimeout: 4 * time.Second,
+	})
+	events := mgr.PathEvents(ctx)
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+	if !waitForDiscoveryIdle(t, mgr, 200*time.Millisecond) {
+		t.Fatal("manager did not finish startup discovery before seeded candidates")
+	}
+
+	mgr.SeedRemoteCandidates(ctx, []net.Addr{selected})
+	candidateEvent := waitForPathEvent(t, events, PathEventCandidatesChanged)
+	if candidateEvent.Path != PathRelay {
+		t.Fatalf("candidate event Path = %v, want %v", candidateEvent.Path, PathRelay)
+	}
+
+	probeEvent := waitForPathEvent(t, events, PathEventProbeSent)
+	if probeEvent.TargetAddr.String() != selected.String() {
+		t.Fatalf("probe event TargetAddr = %v, want %v", probeEvent.TargetAddr, selected)
+	}
+	if !direct.waitForWritePayloadTo(selected, discoProbePayload, 200*time.Millisecond) {
+		t.Fatalf("manager did not probe selected candidate %v", selected)
+	}
+
+	ack, ok := directAckPayloadForProbe(DiscoveryKey{}, discoProbePayload)
+	if !ok {
+		t.Fatal("directAckPayloadForProbe() ok = false, want true")
+	}
+	clock.Advance(42 * time.Millisecond)
+	direct.enqueueRead(ack, selected)
+
+	selectedEvent := waitForPathEvent(t, events, PathEventSelected)
+	if selectedEvent.PreviousPath != PathRelay {
+		t.Fatalf("selected event PreviousPath = %v, want %v", selectedEvent.PreviousPath, PathRelay)
+	}
+	if selectedEvent.Path != PathDirect {
+		t.Fatalf("selected event Path = %v, want %v", selectedEvent.Path, PathDirect)
+	}
+	if selectedEvent.SelectedAddr.String() != selected.String() {
+		t.Fatalf("selected event SelectedAddr = %v, want %v", selectedEvent.SelectedAddr, selected)
+	}
+	if selectedEvent.Reason != PathEventReasonProbeAck {
+		t.Fatalf("selected event Reason = %q, want %q", selectedEvent.Reason, PathEventReasonProbeAck)
+	}
+	if selectedEvent.Source != PathEventSourceDirectProbe {
+		t.Fatalf("selected event Source = %q, want %q", selectedEvent.Source, PathEventSourceDirectProbe)
+	}
+	if selectedEvent.RTT != 42*time.Millisecond {
+		t.Fatalf("selected event RTT = %v, want %v", selectedEvent.RTT, 42*time.Millisecond)
+	}
+}
+
+func TestManagerPathEventsReportFallbackWithPreviousAddr(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000015, 0))
+	relay := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	relay.useClock(clock)
+	direct.useClock(clock)
+
+	selected := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 15), Port: 21515}
+	direct.enableResponder(selected)
+	baseTimers := clock.timerCount()
+
+	mgr := NewManager(ManagerConfig{
+		RelayConn:          relay,
+		DirectConn:         direct,
+		Clock:              clock,
+		DiscoveryInterval:  1 * time.Second,
+		DirectStaleTimeout: 4 * time.Second,
+	})
+	events := mgr.PathEvents(ctx)
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+	if !waitForDiscoveryIdle(t, mgr, 200*time.Millisecond) {
+		t.Fatal("manager did not finish startup discovery before seeded candidates")
+	}
+
+	mgr.SeedRemoteCandidates(ctx, []net.Addr{selected})
+	_ = waitForPathEvent(t, events, PathEventSelected)
+
+	if err := mgr.MarkDirectBroken(); err != nil {
+		t.Fatalf("MarkDirectBroken() error = %v", err)
+	}
+	fallbackEvent := waitForPathEvent(t, events, PathEventFallback)
+	if fallbackEvent.PreviousPath != PathDirect {
+		t.Fatalf("fallback event PreviousPath = %v, want %v", fallbackEvent.PreviousPath, PathDirect)
+	}
+	if fallbackEvent.Path != PathRelay {
+		t.Fatalf("fallback event Path = %v, want %v", fallbackEvent.Path, PathRelay)
+	}
+	if fallbackEvent.PreviousAddr.String() != selected.String() {
+		t.Fatalf("fallback event PreviousAddr = %v, want %v", fallbackEvent.PreviousAddr, selected)
+	}
+	if fallbackEvent.SelectedAddr != nil {
+		t.Fatalf("fallback event SelectedAddr = %v, want nil", fallbackEvent.SelectedAddr)
+	}
+	if fallbackEvent.Reason != PathEventReasonDirectBroken {
+		t.Fatalf("fallback event Reason = %q, want %q", fallbackEvent.Reason, PathEventReasonDirectBroken)
+	}
+	if fallbackEvent.Source != PathEventSourceManual {
+		t.Fatalf("fallback event Source = %q, want %q", fallbackEvent.Source, PathEventSourceManual)
+	}
+}
+
+func TestManagerPathEventsReportProbeFailureAndStaleFallback(t *testing.T) {
+	t.Run("probe failure", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		clock := newFakeClock(time.Unix(1700000016, 0))
+		relay := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		relay.useClock(clock)
+		direct.useClock(clock)
+
+		target := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 16), Port: 31616}
+		baseTimers := clock.timerCount()
+
+		mgr := NewManager(ManagerConfig{
+			RelayConn:          relay,
+			DirectConn:         direct,
+			Clock:              clock,
+			DiscoveryInterval:  1 * time.Second,
+			DirectStaleTimeout: 4 * time.Second,
+		})
+		events := mgr.PathEvents(ctx)
+
+		if err := mgr.Start(ctx); err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		waitForManagerTimers(t, clock, baseTimers, 2)
+		if !waitForDiscoveryIdle(t, mgr, 200*time.Millisecond) {
+			t.Fatal("manager did not finish startup discovery before seeded candidates")
+		}
+
+		direct.failNextWriteTo(target, syscall.EHOSTUNREACH)
+		mgr.SeedRemoteCandidates(ctx, []net.Addr{target})
+
+		failedEvent := waitForPathEvent(t, events, PathEventProbeFailed)
+		if failedEvent.TargetAddr.String() != target.String() {
+			t.Fatalf("probe failed event TargetAddr = %v, want %v", failedEvent.TargetAddr, target)
+		}
+		if failedEvent.Reason != PathEventReasonProbeWriteFailed {
+			t.Fatalf("probe failed event Reason = %q, want %q", failedEvent.Reason, PathEventReasonProbeWriteFailed)
+		}
+		if failedEvent.Source != PathEventSourceDiscovery {
+			t.Fatalf("probe failed event Source = %q, want %q", failedEvent.Source, PathEventSourceDiscovery)
+		}
+		if failedEvent.Path != PathRelay {
+			t.Fatalf("probe failed event Path = %v, want %v", failedEvent.Path, PathRelay)
+		}
+		if len(failedEvent.Snapshot.Candidates) != 1 {
+			t.Fatalf("probe failed event snapshot candidates = %d, want 1", len(failedEvent.Snapshot.Candidates))
+		}
+		if failedEvent.Snapshot.Candidates[0].ProbePending {
+			t.Fatal("probe failed event snapshot ProbePending = true, want false")
+		}
+	})
+
+	t.Run("stale fallback", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		clock := newFakeClock(time.Unix(1700000017, 0))
+		relay := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		relay.useClock(clock)
+		direct.useClock(clock)
+
+		selected := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 17), Port: 31717}
+		direct.enableResponder(selected)
+		baseTimers := clock.timerCount()
+
+		mgr := NewManager(ManagerConfig{
+			RelayConn:          relay,
+			DirectConn:         direct,
+			Clock:              clock,
+			DiscoveryInterval:  1 * time.Second,
+			DirectStaleTimeout: 4 * time.Second,
+		})
+		events := mgr.PathEvents(ctx)
+
+		if err := mgr.Start(ctx); err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		waitForManagerTimers(t, clock, baseTimers, 2)
+		if !waitForDiscoveryIdle(t, mgr, 200*time.Millisecond) {
+			t.Fatal("manager did not finish startup discovery before seeded candidates")
+		}
+
+		mgr.SeedRemoteCandidates(ctx, []net.Addr{selected})
+		_ = waitForPathEvent(t, events, PathEventSelected)
+
+		clock.Advance(4 * time.Second)
+		if endpoint, active := mgr.DirectPath(); endpoint != "" || active {
+			t.Fatalf("DirectPath() after stale timeout = (%q, %t), want (\"\", false)", endpoint, active)
+		}
+
+		fallbackEvent := waitForPathEvent(t, events, PathEventFallback)
+		if fallbackEvent.PreviousPath != PathDirect {
+			t.Fatalf("stale fallback PreviousPath = %v, want %v", fallbackEvent.PreviousPath, PathDirect)
+		}
+		if fallbackEvent.Path != PathRelay {
+			t.Fatalf("stale fallback Path = %v, want %v", fallbackEvent.Path, PathRelay)
+		}
+		if fallbackEvent.PreviousAddr.String() != selected.String() {
+			t.Fatalf("stale fallback PreviousAddr = %v, want %v", fallbackEvent.PreviousAddr, selected)
+		}
+		if fallbackEvent.Reason != PathEventReasonDirectStale {
+			t.Fatalf("stale fallback Reason = %q, want %q", fallbackEvent.Reason, PathEventReasonDirectStale)
+		}
+		if fallbackEvent.Source != PathEventSourceStaleCheck {
+			t.Fatalf("stale fallback Source = %q, want %q", fallbackEvent.Source, PathEventSourceStaleCheck)
+		}
+	})
+}
+
+func TestManagerPathSnapshotsReportCandidateProbeAndSelection(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000016, 0))
+	relay := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	relay.useClock(clock)
+	direct.useClock(clock)
+
+	selected := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 16), Port: 21616}
+	baseTimers := clock.timerCount()
+
+	mgr := NewManager(ManagerConfig{
+		RelayConn:          relay,
+		DirectConn:         direct,
+		Clock:              clock,
+		DiscoveryInterval:  1 * time.Second,
+		DirectStaleTimeout: 4 * time.Second,
+	})
+	snapshots := mgr.PathSnapshots(ctx)
+
+	initial := waitForPathSnapshot(t, snapshots, func(snapshot PathSnapshot) bool {
+		return snapshot.Path == PathRelay && len(snapshot.Candidates) == 0
+	})
+	if initial.SelectedRTT != 0 {
+		t.Fatalf("initial SelectedRTT = %v, want zero", initial.SelectedRTT)
+	}
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+	if !waitForDiscoveryIdle(t, mgr, 200*time.Millisecond) {
+		t.Fatal("manager did not finish startup discovery before seeded candidates")
+	}
+
+	mgr.SeedRemoteCandidates(ctx, []net.Addr{selected})
+	probeSnapshot := waitForPathSnapshot(t, snapshots, func(snapshot PathSnapshot) bool {
+		if snapshot.Path != PathRelay || len(snapshot.Candidates) != 1 {
+			return false
+		}
+		candidate := snapshot.Candidates[0]
+		return candidate.Addr.String() == selected.String() && candidate.ProbePending
+	})
+	if probeSnapshot.Candidates[0].ProbeSentAt.IsZero() {
+		t.Fatal("probe snapshot ProbeSentAt is zero, want send time")
+	}
+
+	ack, ok := directAckPayloadForProbe(DiscoveryKey{}, discoProbePayload)
+	if !ok {
+		t.Fatal("directAckPayloadForProbe() ok = false, want true")
+	}
+	clock.Advance(42 * time.Millisecond)
+	direct.enqueueRead(ack, selected)
+
+	directSnapshot := waitForPathSnapshot(t, snapshots, func(snapshot PathSnapshot) bool {
+		return snapshot.Path == PathDirect && snapshot.SelectedAddr != nil && snapshot.SelectedAddr.String() == selected.String()
+	})
+	if directSnapshot.SelectedRTT != 42*time.Millisecond {
+		t.Fatalf("direct snapshot SelectedRTT = %v, want %v", directSnapshot.SelectedRTT, 42*time.Millisecond)
+	}
+	if !directSnapshot.Candidates[0].Selected {
+		t.Fatal("direct snapshot selected candidate Selected = false, want true")
+	}
+	if directSnapshot.Candidates[0].ProbePending {
+		t.Fatal("direct snapshot selected candidate ProbePending = true, want false")
+	}
+}
+
+func TestManagerUpdatesIgnoreCandidateAndProbeOnlyEvents(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000018, 0))
+	relay := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	relay.useClock(clock)
+	direct.useClock(clock)
+
+	selected := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 18), Port: 31818}
+	baseTimers := clock.timerCount()
+
+	mgr := NewManager(ManagerConfig{
+		RelayConn:          relay,
+		DirectConn:         direct,
+		Clock:              clock,
+		DiscoveryInterval:  1 * time.Second,
+		DirectStaleTimeout: 4 * time.Second,
+	})
+	updates := mgr.Updates(ctx)
+	_ = waitForPathUpdate(t, updates, PathRelay)
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+	if !waitForDiscoveryIdle(t, mgr, 200*time.Millisecond) {
+		t.Fatal("manager did not finish startup discovery before seeded candidates")
+	}
+
+	mgr.SeedRemoteCandidates(ctx, []net.Addr{selected})
+	if !direct.waitForWritePayloadTo(selected, discoProbePayload, 200*time.Millisecond) {
+		t.Fatalf("manager did not probe selected candidate %v", selected)
+	}
+	assertNoPathUpdate(t, updates, 100*time.Millisecond)
+
+	ack, ok := directAckPayloadForProbe(DiscoveryKey{}, discoProbePayload)
+	if !ok {
+		t.Fatal("directAckPayloadForProbe() ok = false, want true")
+	}
+	clock.Advance(42 * time.Millisecond)
+	direct.enqueueRead(ack, selected)
+
+	_ = waitForPathUpdate(t, updates, PathDirect)
+}
+
 func TestManagerStartsDiscoveryWithoutWaitingForFirstTick(t *testing.T) {
 	t.Helper()
 
@@ -509,6 +965,201 @@ func TestManagerKeepsActiveDirectPathWhenCandidateSetReplacesEndpoint(t *testing
 	}
 }
 
+func TestManagerKeepsCurrentDirectPathWhenCandidateRTTImprovementIsBelowHysteresis(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000016, 0))
+	direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	direct.useClock(clock)
+	controls := newFakeControlPipe()
+	current := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 80), Port: 23800}
+	candidate := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 81), Port: 23800}
+	baseTimers := clock.timerCount()
+
+	mgr := NewManager(ManagerConfig{
+		DirectConn:              direct,
+		SendControl:             controls.send,
+		ReceiveControl:          controls.receive,
+		Clock:                   clock,
+		DiscoveryInterval:       time.Second,
+		EndpointRefreshInterval: 10 * time.Second,
+		DirectStaleTimeout:      100 * time.Millisecond,
+	})
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+	promoteManagerDirectCandidateWithRTT(t, mgr, controls, direct, clock, current, 20*time.Millisecond)
+
+	if !controls.deliver(ControlMessage{
+		Type:       ControlCandidates,
+		Candidates: []string{current.String(), candidate.String()},
+	}, 200*time.Millisecond) {
+		t.Fatal("failed to deliver candidate set with replacement endpoint")
+	}
+	if !waitForDiscoveryIdle(t, mgr, 200*time.Millisecond) {
+		t.Fatal("manager did not finish candidate-set discovery check")
+	}
+
+	direct.clearWrites()
+	events := mgr.PathEvents(ctx)
+	clock.Advance(100 * time.Millisecond)
+	if !controls.deliver(ControlMessage{Type: ControlCallMeMaybe}, 200*time.Millisecond) {
+		t.Fatal("failed to deliver call-me-maybe for stale direct discovery")
+	}
+	if !direct.waitForWritePayloadTo(candidate, discoProbePayload, 200*time.Millisecond) {
+		t.Fatalf("manager did not probe direct candidate %v", candidate)
+	}
+	clock.Advance(16 * time.Millisecond)
+	direct.enqueueRead(discoAckPayload, candidate)
+	_ = waitForPathEvent(t, events, PathEventProbeSucceeded)
+
+	if got := mgr.PathState(); got != PathDirect {
+		t.Fatalf("PathState() = %v, want %v", got, PathDirect)
+	}
+	if endpoint, active := mgr.DirectPath(); endpoint != current.String() || !active {
+		t.Fatalf("DirectPath() after close RTT candidate = (%q, %t), want (%q, true)", endpoint, active, current.String())
+	}
+}
+
+func TestManagerSwitchesDirectPathWhenCandidateRTTImprovementMeetsHysteresis(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000019, 0))
+	direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	direct.useClock(clock)
+	controls := newFakeControlPipe()
+	current := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 82), Port: 23820}
+	candidate := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 83), Port: 23820}
+	baseTimers := clock.timerCount()
+
+	mgr := NewManager(ManagerConfig{
+		DirectConn:              direct,
+		SendControl:             controls.send,
+		ReceiveControl:          controls.receive,
+		Clock:                   clock,
+		DiscoveryInterval:       time.Second,
+		EndpointRefreshInterval: 10 * time.Second,
+		DirectStaleTimeout:      100 * time.Millisecond,
+	})
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+	promoteManagerDirectCandidateWithRTT(t, mgr, controls, direct, clock, current, 20*time.Millisecond)
+
+	if !controls.deliver(ControlMessage{
+		Type:       ControlCandidates,
+		Candidates: []string{current.String(), candidate.String()},
+	}, 200*time.Millisecond) {
+		t.Fatal("failed to deliver candidate set with faster endpoint")
+	}
+	if !waitForDiscoveryIdle(t, mgr, 200*time.Millisecond) {
+		t.Fatal("manager did not finish candidate-set discovery check")
+	}
+
+	direct.clearWrites()
+	events := mgr.PathEvents(ctx)
+	clock.Advance(100 * time.Millisecond)
+	if !controls.deliver(ControlMessage{Type: ControlCallMeMaybe}, 200*time.Millisecond) {
+		t.Fatal("failed to deliver call-me-maybe for stale direct discovery")
+	}
+	if !direct.waitForWritePayloadTo(candidate, discoProbePayload, 200*time.Millisecond) {
+		t.Fatalf("manager did not probe direct candidate %v", candidate)
+	}
+	clock.Advance(15 * time.Millisecond)
+	direct.enqueueRead(discoAckPayload, candidate)
+	_ = waitForPathEvent(t, events, PathEventSelected)
+
+	if got := mgr.PathState(); got != PathDirect {
+		t.Fatalf("PathState() = %v, want %v", got, PathDirect)
+	}
+	if endpoint, active := mgr.DirectPath(); endpoint != candidate.String() || !active {
+		t.Fatalf("DirectPath() after faster candidate = (%q, %t), want (%q, true)", endpoint, active, candidate.String())
+	}
+}
+
+func TestManagerRelayFallbackBypassesDirectSwitchHysteresis(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000022, 0))
+	relay := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	relay.useClock(clock)
+	direct.useClock(clock)
+	controls := newFakeControlPipe()
+	current := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 84), Port: 23840}
+	candidate := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 85), Port: 23840}
+	baseTimers := clock.timerCount()
+
+	mgr := NewManager(ManagerConfig{
+		RelayConn:               relay,
+		DirectConn:              direct,
+		SendControl:             controls.send,
+		ReceiveControl:          controls.receive,
+		Clock:                   clock,
+		DiscoveryInterval:       time.Second,
+		EndpointRefreshInterval: 10 * time.Second,
+		DirectStaleTimeout:      100 * time.Millisecond,
+	})
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+	promoteManagerDirectCandidateWithRTT(t, mgr, controls, direct, clock, current, 20*time.Millisecond)
+
+	if !controls.deliver(ControlMessage{
+		Type:       ControlCandidates,
+		Candidates: []string{current.String(), candidate.String()},
+	}, 200*time.Millisecond) {
+		t.Fatal("failed to deliver candidate set before fallback")
+	}
+	if !waitForDiscoveryIdle(t, mgr, 200*time.Millisecond) {
+		t.Fatal("manager did not finish candidate-set discovery check")
+	}
+
+	if err := mgr.MarkDirectBroken(); err != nil {
+		t.Fatalf("MarkDirectBroken() error = %v", err)
+	}
+	if got := mgr.PathState(); got != PathRelay {
+		t.Fatalf("PathState() after fallback = %v, want %v", got, PathRelay)
+	}
+	if endpoint, active := mgr.DirectPath(); endpoint != "" || active {
+		t.Fatalf("DirectPath() after fallback = (%q, %t), want (\"\", false)", endpoint, active)
+	}
+
+	direct.clearWrites()
+	events := mgr.PathEvents(ctx)
+	if !controls.deliver(ControlMessage{Type: ControlCallMeMaybe}, 200*time.Millisecond) {
+		t.Fatal("failed to deliver call-me-maybe after fallback")
+	}
+	if !direct.waitForWritePayloadTo(candidate, discoProbePayload, 200*time.Millisecond) {
+		t.Fatalf("manager did not probe direct candidate %v after fallback", candidate)
+	}
+	clock.Advance(16 * time.Millisecond)
+	direct.enqueueRead(discoAckPayload, candidate)
+	_ = waitForPathEvent(t, events, PathEventSelected)
+
+	if got := mgr.PathState(); got != PathDirect {
+		t.Fatalf("PathState() after fallback recovery = %v, want %v", got, PathDirect)
+	}
+	if endpoint, active := mgr.DirectPath(); endpoint != candidate.String() || !active {
+		t.Fatalf("DirectPath() after fallback recovery = (%q, %t), want (%q, true)", endpoint, active, candidate.String())
+	}
+}
+
 func TestManagerIgnoresInvalidOnlyCandidateControlWithoutClearingEndpoint(t *testing.T) {
 	t.Helper()
 
@@ -644,6 +1295,141 @@ func TestManagerFallsBackToRelayAndRetriesDiscovery(t *testing.T) {
 	}
 	if !waitForPath(t, mgr, PathDirect, 200*time.Millisecond) {
 		t.Fatalf("PathState() after fallback recovery = %v, want %v", mgr.PathState(), PathDirect)
+	}
+}
+
+func TestManagerSuppressesRepeatedFailedCandidateProbe(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000021, 0))
+	relay := newFakeRelayDataPipe()
+	direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	direct.useClock(clock)
+
+	peerCandidate := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 41), Port: 34141}
+	controls := newFakeControlPipe()
+	controls.enablePeerCandidate(peerCandidate)
+	direct.enableResponder(peerCandidate)
+	baseTimers := clock.timerCount()
+
+	mgr := NewManager(ManagerConfig{
+		RelaySend:               relay.send,
+		ReceiveRelay:            relay.receive,
+		RelayAddr:               relay.remote,
+		DirectConn:              direct,
+		SendControl:             controls.send,
+		ReceiveControl:          controls.receive,
+		Clock:                   clock,
+		DiscoveryInterval:       1 * time.Second,
+		EndpointRefreshInterval: 2 * time.Second,
+		DirectStaleTimeout:      4 * time.Second,
+	})
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+	clock.Advance(time.Second)
+	if !waitForPath(t, mgr, PathDirect, 200*time.Millisecond) {
+		t.Fatalf("PathState() = %v, want %v before direct write failure", mgr.PathState(), PathDirect)
+	}
+	if !waitForDiscoveryIdle(t, mgr, 200*time.Millisecond) {
+		t.Fatal("manager did not finish direct discovery before direct write failure")
+	}
+
+	payload := []byte("payload")
+	direct.failNextWriteTo(peerCandidate, syscall.EHOSTUNREACH)
+	if err := mgr.sendPeerDatagram(ctx, payload); err != nil {
+		t.Fatalf("sendPeerDatagram() error = %v, want relay fallback", err)
+	}
+	if !relay.waitForSentCount(payload, 1, 200*time.Millisecond) {
+		t.Fatal("relay send did not receive fallback payload")
+	}
+	if got := mgr.PathState(); got != PathRelay {
+		t.Fatalf("PathState() after direct write failure = %v, want %v", got, PathRelay)
+	}
+
+	direct.clearWrites()
+	clock.Advance(time.Second)
+	if direct.waitForWritePayloadTo(peerCandidate, discoProbePayload, 100*time.Millisecond) {
+		t.Fatal("manager reprobed failed candidate during suppression")
+	}
+
+	clock.Advance(defaultCandidateSuppressPeriod)
+	if !direct.waitForWritePayloadTo(peerCandidate, discoProbePayload, 200*time.Millisecond) {
+		t.Fatal("manager did not retry failed candidate after suppression expired")
+	}
+}
+
+func TestManagerRetriesSuppressedCandidateWithMACBoundProbe(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clock := newFakeClock(time.Unix(1700000022, 0))
+	relay := newFakeRelayDataPipe()
+	direct := newFakePacketConn(&net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	direct.useClock(clock)
+
+	peerCandidate := &net.UDPAddr{IP: net.IPv4(100, 64, 0, 42), Port: 34242}
+	key := DiscoveryKey{1, 2, 3}
+	direct.useDiscoveryKey(key)
+	controls := newFakeControlPipe()
+	controls.enablePeerCandidate(peerCandidate)
+	direct.enableResponder(peerCandidate)
+	baseTimers := clock.timerCount()
+
+	mgr := NewManager(ManagerConfig{
+		RelaySend:               relay.send,
+		ReceiveRelay:            relay.receive,
+		RelayAddr:               relay.remote,
+		DirectConn:              direct,
+		SendControl:             controls.send,
+		ReceiveControl:          controls.receive,
+		Clock:                   clock,
+		DiscoveryInterval:       1 * time.Second,
+		EndpointRefreshInterval: 2 * time.Second,
+		DirectStaleTimeout:      4 * time.Second,
+		DiscoveryKey:            key,
+	})
+
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForManagerTimers(t, clock, baseTimers, 2)
+	clock.Advance(time.Second)
+	if !waitForPath(t, mgr, PathDirect, 200*time.Millisecond) {
+		t.Fatalf("PathState() = %v, want %v before MAC direct write failure", mgr.PathState(), PathDirect)
+	}
+	if !waitForDiscoveryIdle(t, mgr, 200*time.Millisecond) {
+		t.Fatal("manager did not finish MAC direct discovery before direct write failure")
+	}
+
+	payload := []byte("payload")
+	direct.failNextWriteTo(peerCandidate, syscall.EHOSTUNREACH)
+	if err := mgr.sendPeerDatagram(ctx, payload); err != nil {
+		t.Fatalf("sendPeerDatagram() error = %v, want relay fallback", err)
+	}
+	if !relay.waitForSentCount(payload, 1, 200*time.Millisecond) {
+		t.Fatal("relay send did not receive MAC fallback payload")
+	}
+
+	direct.clearWrites()
+	clock.Advance(time.Second)
+	if direct.waitForWritePayloadToMatching(peerCandidate, isDirectDiscoveryMACPayload, 100*time.Millisecond) {
+		t.Fatal("manager sent MAC-bound probe during suppression")
+	}
+
+	clock.Advance(defaultCandidateSuppressPeriod)
+	if !direct.waitForWritePayloadToMatching(peerCandidate, isDirectDiscoveryMACPayload, 200*time.Millisecond) {
+		t.Fatal("manager did not retry suppressed candidate with MAC-bound probe")
+	}
+	if direct.hasWritePayloadTo(peerCandidate, discoProbePayload) {
+		t.Fatal("manager retried suppressed candidate with legacy probe despite discovery key")
 	}
 }
 
@@ -2258,6 +3044,28 @@ func waitForManagerTimers(t *testing.T, clock *fakeClock, base, added int) {
 	}
 }
 
+func promoteManagerDirectCandidateWithRTT(t *testing.T, mgr *Manager, controls *fakeControlPipe, direct *fakePacketConn, clock *fakeClock, candidate net.Addr, rtt time.Duration) {
+	t.Helper()
+
+	if !controls.deliver(ControlMessage{
+		Type:       ControlCandidates,
+		Candidates: []string{candidate.String()},
+	}, 200*time.Millisecond) {
+		t.Fatalf("failed to deliver direct candidate %v", candidate)
+	}
+	if !direct.waitForWritePayloadTo(candidate, discoProbePayload, 200*time.Millisecond) {
+		t.Fatalf("manager did not probe direct candidate %v", candidate)
+	}
+	clock.Advance(rtt)
+	direct.enqueueRead(discoAckPayload, candidate)
+	if !waitForPath(t, mgr, PathDirect, 200*time.Millisecond) {
+		t.Fatalf("PathState() = %v, want %v after direct promotion", mgr.PathState(), PathDirect)
+	}
+	if endpoint, active := mgr.DirectPath(); endpoint != candidate.String() || !active {
+		t.Fatalf("DirectPath() after promotion = (%q, %t), want (%q, true)", endpoint, active, candidate.String())
+	}
+}
+
 func waitForPath(t *testing.T, mgr *Manager, want Path, timeout time.Duration) bool {
 	t.Helper()
 
@@ -2267,6 +3075,75 @@ func waitForPath(t *testing.T, mgr *Manager, want Path, timeout time.Duration) b
 		}
 		return false, mgr.stateChanged()
 	})
+}
+
+func waitForPathUpdate(t *testing.T, updates <-chan Update, want Path) Update {
+	t.Helper()
+
+	select {
+	case update, ok := <-updates:
+		if !ok {
+			t.Fatalf("Updates channel closed before %v update", want)
+		}
+		if update.Path != want {
+			t.Fatalf("Update.Path = %v, want %v", update.Path, want)
+		}
+		return update
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("timed out waiting for %v update", want)
+	}
+	return Update{}
+}
+
+func assertNoPathUpdate(t *testing.T, updates <-chan Update, wait time.Duration) {
+	t.Helper()
+
+	select {
+	case update, ok := <-updates:
+		if !ok {
+			t.Fatal("Updates channel closed while checking for no update")
+		}
+		t.Fatalf("unexpected update while path was unchanged: %#v", update)
+	case <-time.After(wait):
+	}
+}
+
+func waitForPathEvent(t *testing.T, events <-chan PathEvent, want PathEventType) PathEvent {
+	t.Helper()
+
+	timeout := time.After(500 * time.Millisecond)
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				t.Fatalf("PathEvents channel closed before %q event", want)
+			}
+			if event.Type == want {
+				return event
+			}
+		case <-timeout:
+			t.Fatalf("timed out waiting for %q event", want)
+		}
+	}
+}
+
+func waitForPathSnapshot(t *testing.T, snapshots <-chan PathSnapshot, match func(PathSnapshot) bool) PathSnapshot {
+	t.Helper()
+
+	timeout := time.After(500 * time.Millisecond)
+	for {
+		select {
+		case snapshot, ok := <-snapshots:
+			if !ok {
+				t.Fatal("PathSnapshots channel closed before matching snapshot")
+			}
+			if match(snapshot) {
+				return snapshot
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for matching PathSnapshot")
+		}
+	}
 }
 
 func waitForDiscoveryIdle(t *testing.T, mgr *Manager, timeout time.Duration) bool {

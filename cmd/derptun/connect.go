@@ -19,6 +19,8 @@ type connectFlags struct {
 	Token      string `flag:"token" help:"Client token for tunnel access"`
 	TokenFile  string `flag:"token-file" help:"Read the client token from a file"`
 	TokenStdin bool   `flag:"token-stdin" help:"Read the client token from the first stdin line"`
+	Service    string `flag:"service" help:"Resolve the client token from the local service registry"`
+	Registry   string `flag:"registry" help:"Path to the local service registry"`
 	Stdio      bool   `flag:"stdio" help:"Bridge one tunnel stream over stdin/stdout"`
 	ForceRelay bool   `flag:"force-relay" help:"Disable direct probing"`
 }
@@ -28,6 +30,7 @@ var connectHelpConfig = yargs.HelpConfig{
 		Name:        "derptun",
 		Description: "Connect a single TCP stream through a derptun client token.",
 		Examples: []string{
+			"printf 'GET / HTTP/1.0\\r\\n\\r\\n' | derptun connect --service web --stdio",
 			"printf 'GET / HTTP/1.0\\r\\n\\r\\n' | derptun connect --token-file client.dt1 --stdio",
 			"printf '%s\\n' \"$DERPTUN_CLIENT_TOKEN\" | derptun connect --token-stdin --stdio",
 		},
@@ -36,8 +39,9 @@ var connectHelpConfig = yargs.HelpConfig{
 		"connect": {
 			Name:        "connect",
 			Description: "Bridge one tunnel stream over stdin/stdout.",
-			Usage:       "(--token TOKEN|--token-file PATH|--token-stdin) --stdio [--force-relay]",
+			Usage:       "(--service NAME|--token TOKEN|--token-file PATH|--token-stdin) [--registry PATH] --stdio [--force-relay]",
 			Examples: []string{
+				"printf 'GET / HTTP/1.0\\r\\n\\r\\n' | derptun connect --service web --stdio",
 				"printf 'GET / HTTP/1.0\\r\\n\\r\\n' | derptun connect --token-file client.dt1 --stdio",
 				"printf '%s\\n' \"$DERPTUN_CLIENT_TOKEN\" | derptun connect --token-stdin --stdio",
 			},
@@ -56,10 +60,15 @@ func runConnect(args []string, level telemetry.Level, stdin io.Reader, stdout, s
 		_, _ = fmt.Fprint(stderr, connectHelpText())
 		return 2
 	}
-	token, streamIn, err := resolveTokenSource(stdin, tokenSource{
+	ctx, stop := commandContext()
+	defer stop()
+	token, streamIn, err := resolveClientTokenSource(ctx, stdin, tokenSource{
 		Token:      parsed.SubCommandFlags.Token,
 		TokenFile:  parsed.SubCommandFlags.TokenFile,
 		TokenStdin: parsed.SubCommandFlags.TokenStdin,
+	}, serviceSource{
+		Service:  parsed.SubCommandFlags.Service,
+		Registry: parsed.SubCommandFlags.Registry,
 	})
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
@@ -72,8 +81,6 @@ func runConnect(args []string, level telemetry.Level, stdin io.Reader, stdout, s
 		return 2
 	}
 
-	ctx, stop := commandContext()
-	defer stop()
 	if err := derptunConnect(ctx, session.DerptunConnectConfig{
 		ClientToken: token,
 		StdioIn:     streamIn,

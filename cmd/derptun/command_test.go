@@ -7,6 +7,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/shayne/derphole/pkg/derptun"
+	"github.com/shayne/derphole/pkg/endpointlookup"
 	"github.com/shayne/derphole/pkg/session"
 )
 
@@ -216,6 +219,75 @@ func TestRunOpenRejectsServerTokenWithRoleError(t *testing.T) {
 	}
 }
 
+func TestRunServiceSetAndOpenService(t *testing.T) {
+	clientToken := newDerptunClientToken(t)
+	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"service", "set", "web", "--token", clientToken, "--registry", registryPath}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("service set code = %d stderr=%s", code, stderr.String())
+	}
+	if strings.Contains(stdout.String()+stderr.String(), clientToken) {
+		t.Fatalf("service set output leaks client token")
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = run([]string{"service", "list", "--registry", registryPath}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("service list code = %d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "web") {
+		t.Fatalf("service list output = %q, want service name", stdout.String())
+	}
+	if strings.Contains(stdout.String()+stderr.String(), clientToken) {
+		t.Fatalf("service list output leaks client token")
+	}
+
+	oldOpen := derptunOpen
+	defer func() { derptunOpen = oldOpen }()
+	derptunOpen = func(ctx context.Context, cfg session.DerptunOpenConfig) error {
+		if cfg.ClientToken != clientToken {
+			t.Fatalf("ClientToken = %q, want registry client token", cfg.ClientToken)
+		}
+		if cfg.ListenAddr != "127.0.0.1:2222" {
+			t.Fatalf("ListenAddr = %q, want 127.0.0.1:2222", cfg.ListenAddr)
+		}
+		cfg.BindAddrSink <- "127.0.0.1:2222"
+		return nil
+	}
+
+	stderr.Reset()
+	code = run([]string{"open", "--service", "web", "--registry", registryPath, "--listen", "127.0.0.1:2222"}, strings.NewReader(""), &bytes.Buffer{}, &stderr)
+	if code != 0 {
+		t.Fatalf("open --service code = %d stderr=%s", code, stderr.String())
+	}
+}
+
+func TestRunServiceSetRejectsServerToken(t *testing.T) {
+	serverToken := newDerptunServerToken(t)
+	var stderr bytes.Buffer
+	code := run([]string{"service", "set", "web", "--token", serverToken, "--registry", filepath.Join(t.TempDir(), "registry.json")}, strings.NewReader(""), &bytes.Buffer{}, &stderr)
+	if code != 2 {
+		t.Fatalf("service set code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "server tokens are for derptun serve") {
+		t.Fatalf("stderr = %q, want server-token role error", stderr.String())
+	}
+}
+
+func TestRunOpenRejectsServiceWithTokenSource(t *testing.T) {
+	clientToken := newDerptunClientToken(t)
+	var stderr bytes.Buffer
+	code := run([]string{"open", "--service", "web", "--token", clientToken}, strings.NewReader(""), &bytes.Buffer{}, &stderr)
+	if code != 2 {
+		t.Fatalf("code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "at most one of --service, --token, --token-file, or --token-stdin") {
+		t.Fatalf("stderr = %q, want service/token conflict", stderr.String())
+	}
+}
+
 func TestRunConnectReadsClientTokenFromFile(t *testing.T) {
 	clientToken := newDerptunClientToken(t)
 	oldConnect := derptunConnect
@@ -234,6 +306,84 @@ func TestRunConnectReadsClientTokenFromFile(t *testing.T) {
 	code := run([]string{"connect", "--token-file", tokenPath, "--stdio"}, strings.NewReader("payload"), &bytes.Buffer{}, &bytes.Buffer{})
 	if code != 0 {
 		t.Fatalf("code = %d, want 0", code)
+	}
+}
+
+func TestRunConnectServicePreservesPayload(t *testing.T) {
+	clientToken := newDerptunClientToken(t)
+	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	var stderr bytes.Buffer
+	code := run([]string{"service", "set", "web", "--token", clientToken, "--registry", registryPath}, strings.NewReader(""), &bytes.Buffer{}, &stderr)
+	if code != 0 {
+		t.Fatalf("service set code = %d stderr=%s", code, stderr.String())
+	}
+
+	oldConnect := derptunConnect
+	defer func() { derptunConnect = oldConnect }()
+	derptunConnect = func(ctx context.Context, cfg session.DerptunConnectConfig) error {
+		if cfg.ClientToken != clientToken {
+			t.Fatalf("ClientToken = %q, want registry client token", cfg.ClientToken)
+		}
+		payload, err := io.ReadAll(cfg.StdioIn)
+		if err != nil {
+			t.Fatalf("ReadAll(StdioIn) error = %v", err)
+		}
+		if string(payload) != "GET / HTTP/1.0\r\n\r\n" {
+			t.Fatalf("payload = %q, want original stdin payload", payload)
+		}
+		return nil
+	}
+
+	code = run([]string{"connect", "--service", "web", "--registry", registryPath, "--stdio"}, strings.NewReader("GET / HTTP/1.0\r\n\r\n"), &bytes.Buffer{}, &stderr)
+	if code != 0 {
+		t.Fatalf("connect --service code = %d stderr=%s", code, stderr.String())
+	}
+}
+
+func TestRunServeRegisterRequiresPersistentServerToken(t *testing.T) {
+	oldServe := derptunServe
+	defer func() { derptunServe = oldServe }()
+	derptunServe = func(ctx context.Context, cfg session.DerptunServeConfig) error {
+		t.Fatal("derptunServe should not run when --register has no server token")
+		return nil
+	}
+
+	var stderr bytes.Buffer
+	code := run([]string{"serve", "--tcp", "127.0.0.1:22", "--register", "web", "--registry", filepath.Join(t.TempDir(), "registry.json")}, strings.NewReader(""), &bytes.Buffer{}, &stderr)
+	if code != 2 {
+		t.Fatalf("code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "--register requires --token, --token-file, or --token-stdin") {
+		t.Fatalf("stderr = %q, want register token-source error", stderr.String())
+	}
+}
+
+func TestRunServeRegisterWritesClientToken(t *testing.T) {
+	serverToken := newDerptunServerToken(t)
+	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	oldServe := derptunServe
+	defer func() { derptunServe = oldServe }()
+	derptunServe = func(ctx context.Context, cfg session.DerptunServeConfig) error {
+		if cfg.ServerToken != serverToken {
+			t.Fatalf("ServerToken = %q, want supplied server token", cfg.ServerToken)
+		}
+		return nil
+	}
+
+	var stderr bytes.Buffer
+	code := run([]string{"serve", "--token", serverToken, "--tcp", "127.0.0.1:22", "--register", "web", "--registry", registryPath}, strings.NewReader(""), &bytes.Buffer{}, &stderr)
+	if code != 0 {
+		t.Fatalf("code = %d stderr=%s", code, stderr.String())
+	}
+	got, err := (endpointlookup.FileRegistry{Path: registryPath}).Resolve(context.Background(), "web", endpointlookup.KindDerptunClientToken)
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if got.Value == serverToken {
+		t.Fatalf("registered value is server token, want derived client token")
+	}
+	if _, err := derptun.DecodeClientToken(got.Value, time.Now()); err != nil {
+		t.Fatalf("DecodeClientToken(registered) error = %v", err)
 	}
 }
 
@@ -272,6 +422,37 @@ func TestRunConnectRequiresStdio(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "--stdio") {
 		t.Fatalf("stderr = %q, want stdio usage", stderr.String())
+	}
+}
+
+func TestRunConnectRejectsServiceWithTokenSource(t *testing.T) {
+	clientToken := newDerptunClientToken(t)
+	var stderr bytes.Buffer
+	code := run([]string{"connect", "--service", "web", "--token", clientToken, "--stdio"}, strings.NewReader("payload"), &bytes.Buffer{}, &stderr)
+	if code != 2 {
+		t.Fatalf("code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "at most one of --service, --token, --token-file, or --token-stdin") {
+		t.Fatalf("stderr = %q, want service/token conflict", stderr.String())
+	}
+}
+
+func TestRunServiceRemoveDeletesClientToken(t *testing.T) {
+	clientToken := newDerptunClientToken(t)
+	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	var stderr bytes.Buffer
+	code := run([]string{"service", "set", "web", "--token", clientToken, "--registry", registryPath}, strings.NewReader(""), &bytes.Buffer{}, &stderr)
+	if code != 0 {
+		t.Fatalf("service set code = %d stderr=%s", code, stderr.String())
+	}
+
+	code = run([]string{"service", "rm", "web", "--registry", registryPath}, strings.NewReader(""), &bytes.Buffer{}, &stderr)
+	if code != 0 {
+		t.Fatalf("service rm code = %d stderr=%s", code, stderr.String())
+	}
+	_, err := (endpointlookup.FileRegistry{Path: registryPath}).Resolve(context.Background(), "web", endpointlookup.KindDerptunClientToken)
+	if !errors.Is(err, endpointlookup.ErrNotFound) {
+		t.Fatalf("Resolve(removed) error = %v, want ErrNotFound", err)
 	}
 }
 

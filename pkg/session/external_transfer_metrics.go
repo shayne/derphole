@@ -7,6 +7,7 @@ package session
 import (
 	"context"
 	"io"
+	"net"
 	"sync"
 	"time"
 
@@ -28,6 +29,12 @@ type externalTransferMetrics struct {
 	receiverTransferMS     int64
 	directValidated        bool
 	fallbackReason         string
+	transportPath          transport.Path
+	transportSelectedAddr  string
+	transportPreviousAddr  string
+	transportReason        string
+	transportSource        string
+	transportRTTMS         int64
 	directAppProgressBase  int64
 	directAppProgressSet   bool
 	trace                  *transfertrace.Recorder
@@ -171,12 +178,51 @@ func (m *externalTransferMetrics) MarkDirectValidated(at time.Time) {
 		return
 	}
 	m.mu.Lock()
-	m.directValidated = true
-	if m.phase != transfertrace.PhaseComplete && m.phase != transfertrace.PhaseError {
-		m.phase = transfertrace.PhaseDirectExecute
-		m.lastState = string(StateDirect)
-	}
+	m.markDirectValidatedLocked()
 	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
+	m.mu.Unlock()
+	sampleExternalTransferTrace(trace, snap, ok)
+}
+
+func (m *externalTransferMetrics) RecordTransportPathSnapshot(snapshot transport.PathSnapshot) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.transportPath = snapshot.Path
+	m.transportSelectedAddr = addrString(snapshot.SelectedAddr)
+	m.transportPreviousAddr = ""
+	m.transportRTTMS = snapshot.SelectedRTT.Milliseconds()
+	if snapshot.Path == transport.PathDirect {
+		m.markDirectValidatedLocked()
+	}
+	trace, snap, ok := m.updateTraceLocked(nonZeroTime(snapshot.At))
+	m.mu.Unlock()
+	sampleExternalTransferTrace(trace, snap, ok)
+}
+
+func (m *externalTransferMetrics) RecordTransportPathEvent(event transport.PathEvent) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	if event.Path != transport.PathUnknown {
+		m.transportPath = event.Path
+	} else if event.Snapshot.Path != transport.PathUnknown {
+		m.transportPath = event.Snapshot.Path
+	}
+	m.transportSelectedAddr = addrString(event.SelectedAddr)
+	m.transportPreviousAddr = addrString(event.PreviousAddr)
+	m.transportReason = string(event.Reason)
+	m.transportSource = string(event.Source)
+	m.transportRTTMS = event.RTT.Milliseconds()
+	if event.Type == transport.PathEventSelected && event.Path == transport.PathDirect {
+		m.markDirectValidatedLocked()
+	}
+	if event.Type == transport.PathEventFallback && event.Reason != "" {
+		m.fallbackReason = string(event.Reason)
+	}
+	trace, snap, ok := m.updateTraceLocked(nonZeroTime(event.At))
 	m.mu.Unlock()
 	sampleExternalTransferTrace(trace, snap, ok)
 }
@@ -493,11 +539,7 @@ func (m *externalTransferMetrics) recordDirectPathBytes(n int64, at time.Time, s
 	m.mu.Lock()
 	m.directTransport = transport
 	if !m.directValidated {
-		m.directValidated = true
-		if m.phase != transfertrace.PhaseComplete && m.phase != transfertrace.PhaseError {
-			m.phase = transfertrace.PhaseDirectExecute
-			m.lastState = string(StateDirect)
-		}
+		m.markDirectValidatedLocked()
 	}
 	m.directBytes += n
 	m.directPacketBytes += n
@@ -512,6 +554,21 @@ func (m *externalTransferMetrics) recordDirectPathBytes(n int64, at time.Time, s
 	trace, snap, ok := m.updateTraceLocked(at)
 	m.mu.Unlock()
 	sampleExternalTransferTrace(trace, snap, ok)
+}
+
+func (m *externalTransferMetrics) markDirectValidatedLocked() {
+	m.directValidated = true
+	if m.phase != transfertrace.PhaseComplete && m.phase != transfertrace.PhaseError {
+		m.phase = transfertrace.PhaseDirectExecute
+		m.lastState = string(StateDirect)
+	}
+}
+
+func addrString(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	return addr.String()
 }
 
 func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrace.Recorder, transfertrace.Snapshot, bool) {

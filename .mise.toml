@@ -69,6 +69,10 @@ mise run build
 mise run test
 """
 
+[tasks.toposim]
+description = "Run Linux-only local topology simulation tests"
+run = "bash ./scripts/toposim-linux.sh --quick"
+
 [tasks.install-githooks]
 description = "Install git hooks via pre-commit"
 shell = "bash -c"

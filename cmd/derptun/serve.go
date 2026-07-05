@@ -25,6 +25,8 @@ type serveFlags struct {
 	TCP        string `flag:"tcp" help:"Local TCP target to expose, for example 127.0.0.1:22"`
 	ForceRelay bool   `flag:"force-relay" help:"Disable direct probing"`
 	QR         bool   `flag:"qr" help:"Render a QR code for mobile tunnel clients"`
+	Register   string `flag:"register" help:"Publish the derived client token under a local service name"`
+	Registry   string `flag:"registry" help:"Path to the local service registry"`
 }
 
 var serveHelpConfig = yargs.HelpConfig{
@@ -34,6 +36,7 @@ var serveHelpConfig = yargs.HelpConfig{
 		Examples: []string{
 			"derptun serve --tcp 127.0.0.1:8080",
 			"derptun token server --days 365 > server.dts",
+			"derptun serve --token-file server.dts --tcp 127.0.0.1:8080 --register web",
 			"derptun serve --token-file server.dts --tcp 127.0.0.1:8080",
 		},
 	},
@@ -41,10 +44,11 @@ var serveHelpConfig = yargs.HelpConfig{
 		"serve": {
 			Name:        "serve",
 			Description: "Expose a local TCP target until Ctrl-C.",
-			Usage:       "[--token TOKEN|--token-file PATH|--token-stdin] --tcp HOST:PORT [--force-relay] [--qr]",
+			Usage:       "[--token TOKEN|--token-file PATH|--token-stdin] --tcp HOST:PORT [--force-relay] [--qr] [--register NAME] [--registry PATH]",
 			Examples: []string{
 				"derptun serve --tcp 127.0.0.1:8080",
 				"derptun token server --days 365 > server.dts",
+				"derptun serve --token-file server.dts --tcp 127.0.0.1:8080 --register web",
 				"derptun serve --token-file server.dts --tcp 127.0.0.1:8080",
 			},
 		},
@@ -58,7 +62,7 @@ func runServe(args []string, level telemetry.Level, stdin io.Reader, stderr io.W
 	if code, handled := handleYargsError(parsed, err, stderr, serveHelpText); handled {
 		return code
 	}
-	if parsed.SubCommandFlags.TCP == "" || len(parsed.Parser.Args) != 0 || len(parsed.RemainingArgs) != 0 {
+	if !validServeParse(parsed) {
 		_, _ = fmt.Fprint(stderr, serveHelpText())
 		return 2
 	}
@@ -66,17 +70,51 @@ func runServe(args []string, level telemetry.Level, stdin io.Reader, stderr io.W
 	if failed {
 		return code
 	}
-	if code, failed := writeServeClientAccess(parsed.SubCommandFlags.QR, token, stderr); failed {
+	clientToken, code, failed := prepareServeClientToken(token, stderr)
+	if failed {
 		return code
 	}
-
 	ctx, stop := commandContext()
 	defer stop()
+	if code, failed := publishServeRegistration(ctx, parsed.SubCommandFlags, clientToken, stderr); failed {
+		return code
+	}
+	if code, failed := writeServeClientAccess(parsed.SubCommandFlags.QR, clientToken, stderr); failed {
+		return code
+	}
+	return runServeSession(ctx, parsed.SubCommandFlags, token, level, stderr)
+}
+
+func validServeParse(parsed *yargs.TypedParseResult[struct{}, serveFlags, struct{}]) bool {
+	return parsed.SubCommandFlags.TCP != "" && len(parsed.Parser.Args) == 0 && len(parsed.RemainingArgs) == 0
+}
+
+func prepareServeClientToken(token string, stderr io.Writer) (string, int, bool) {
+	clientToken, err := deriveServeClientToken(token, time.Now())
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return "", 1, true
+	}
+	return clientToken, 0, false
+}
+
+func publishServeRegistration(ctx context.Context, flags serveFlags, clientToken string, stderr io.Writer) (int, bool) {
+	if flags.Register == "" {
+		return 0, false
+	}
+	if err := publishDerptunClientToken(ctx, flags.Register, clientToken, flags.Registry); err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return serviceErrorCode(err), true
+	}
+	return 0, false
+}
+
+func runServeSession(ctx context.Context, flags serveFlags, token string, level telemetry.Level, stderr io.Writer) int {
 	if err := derptunServe(ctx, session.DerptunServeConfig{
 		ServerToken: token,
-		TargetAddr:  parsed.SubCommandFlags.TCP,
+		TargetAddr:  flags.TCP,
 		Emitter:     telemetry.New(stderr, commandSessionTelemetryLevel(level)),
-		ForceRelay:  parsed.SubCommandFlags.ForceRelay,
+		ForceRelay:  flags.ForceRelay,
 	}); err != nil && !errors.Is(err, context.Canceled) {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1
@@ -98,6 +136,11 @@ func resolveServeServerToken(flags serveFlags, stdin io.Reader, stderr io.Writer
 	if hasToken {
 		return token, 0, false
 	}
+	if flags.Register != "" {
+		_, _ = fmt.Fprintln(stderr, "--register requires --token, --token-file, or --token-stdin")
+		_, _ = fmt.Fprint(stderr, serveHelpText())
+		return "", 2, true
+	}
 
 	token, err = derptunpkg.GenerateServerToken(derptunpkg.ServerTokenOptions{})
 	if err != nil {
@@ -107,12 +150,7 @@ func resolveServeServerToken(flags serveFlags, stdin io.Reader, stderr io.Writer
 	return token, 0, false
 }
 
-func writeServeClientAccess(qr bool, token string, stderr io.Writer) (int, bool) {
-	clientToken, err := deriveServeClientToken(token, time.Now())
-	if err != nil {
-		_, _ = fmt.Fprintln(stderr, err)
-		return 1, true
-	}
+func writeServeClientAccess(qr bool, clientToken string, stderr io.Writer) (int, bool) {
 	writeServeOpenCommand(stderr, clientToken)
 	if qr {
 		writeServeQRInstruction(stderr, clientToken)

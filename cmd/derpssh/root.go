@@ -26,12 +26,14 @@ var rootRegistry = yargs.Registry{
 		Examples: []string{
 			"derpssh share",
 			"derpssh connect <invite>",
+			"derpssh service set ops-shell <invite>",
 			"derpssh version",
 		},
 	},
 	SubCommands: map[string]yargs.CommandSpec{
 		"share":   {Info: yargs.SubCommandInfo{Name: "share", Description: "Share a fresh host PTY."}},
 		"connect": {Info: yargs.SubCommandInfo{Name: "connect", Description: "Connect to a derpssh invite."}},
+		"service": {Info: yargs.SubCommandInfo{Name: "service", Description: "Manage local service-name lookup entries."}},
 		"version": {Info: yargs.SubCommandInfo{Name: "version", Description: "Print the derpssh version."}},
 	},
 }
@@ -75,6 +77,9 @@ func rootCommandHandlers() map[string]rootCommandHandler {
 			return runShare(args, level, stdin, stdout, stderr)
 		},
 		"connect": runConnect,
+		"service": func(args []string, _ telemetry.Level, _ io.Reader, stdout, stderr io.Writer) int {
+			return runService(args, stdout, stderr)
+		},
 		"version": func(_ []string, _ telemetry.Level, _ io.Reader, stdout, stderr io.Writer) int {
 			return runVersion(stdout, stderr)
 		},
