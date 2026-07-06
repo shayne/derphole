@@ -924,6 +924,21 @@ func TestDerptunNativeTCPUsesMeasuredStripeCount(t *testing.T) {
 	}
 }
 
+func TestDerptunNativeControlHeaderRoundTrips(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writeDerptunNativeStreamHeader(&buf, derptunNativeStreamHeader{}); err != nil {
+		t.Fatalf("writeDerptunNativeStreamHeader() error = %v", err)
+	}
+
+	header, err := readDerptunNativeStreamHeader(&buf)
+	if err != nil {
+		t.Fatalf("readDerptunNativeStreamHeader() error = %v", err)
+	}
+	if header.laneCount != 0 || header.laneIndex != 0 {
+		t.Fatalf("control header = %+v, want zero lane count and index", header)
+	}
+}
+
 func TestDerptunStripedStreamConnStaysOpenUntilClose(t *testing.T) {
 	localLane, remoteLane := net.Pipe()
 	defer remoteLane.Close()

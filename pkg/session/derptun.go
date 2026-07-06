@@ -941,7 +941,7 @@ func watchDerptunServeQUICConn(tunnelCtx context.Context, tunnelCancel context.C
 	}()
 }
 
-func serveDerptunQUICListener(ctx context.Context, listener *quic.Listener, targetAddr string, emitter *telemetry.Emitter, onAccept func(*quic.Conn)) error {
+func serveDerptunQUICListener(ctx context.Context, listener *quic.Listener, targetAddr string, emitter *telemetry.Emitter, onControl func(*quic.Conn)) error {
 	var wg sync.WaitGroup
 	assembler := newDerptunNativeStreamAssembler(targetAddr, emitter)
 	defer wg.Wait()
@@ -957,11 +957,8 @@ func serveDerptunQUICListener(ctx context.Context, listener *quic.Listener, targ
 		if emitter != nil {
 			emitter.Debug("derptun-quic-connection-accepted")
 		}
-		if onAccept != nil {
-			onAccept(conn)
-		}
 		wg.Add(1)
-		go serveDerptunQUICConnection(ctx, &wg, conn, assembler, emitter)
+		go serveDerptunQUICConnection(ctx, &wg, conn, assembler, emitter, onControl)
 	}
 }
 
@@ -972,27 +969,52 @@ func derptunQUICAcceptDone(ctx context.Context, err error) bool {
 		errors.Is(err, quic.ErrServerClosed)
 }
 
-func serveDerptunQUICConnection(ctx context.Context, wg *sync.WaitGroup, conn *quic.Conn, assembler *derptunNativeStreamAssembler, emitter *telemetry.Emitter) {
+func serveDerptunQUICConnection(ctx context.Context, wg *sync.WaitGroup, conn *quic.Conn, assembler *derptunNativeStreamAssembler, emitter *telemetry.Emitter, onControl func(*quic.Conn)) {
 	defer wg.Done()
 	defer func() { _ = conn.CloseWithError(0, "") }()
 	for {
 		streamConn, err := conn.AcceptStream(ctx)
 		if err != nil {
-			if derptunServeTunnelErr(err) != nil && emitter != nil {
-				emitter.Debug("derptun-quic-connection-error")
-			}
+			emitDerptunQUICConnectionError(err, emitter)
 			return
 		}
-		lane := derptunNativeAcceptedLane{
-			conn:     quicpath.WrapStream(conn, streamConn),
-			quicConn: conn,
+		if !serveDerptunQUICStream(ctx, conn, streamConn, assembler, emitter, onControl) {
+			return
 		}
-		if err := assembler.addLane(ctx, lane); err != nil {
-			_ = lane.conn.Close()
-			if emitter != nil {
-				emitter.Debug("derptun-native-lane-rejected")
-			}
+	}
+}
+
+func serveDerptunQUICStream(ctx context.Context, conn *quic.Conn, streamConn *quic.Stream, assembler *derptunNativeStreamAssembler, emitter *telemetry.Emitter, onControl func(*quic.Conn)) bool {
+	laneConn := quicpath.WrapStream(conn, streamConn)
+	header, err := readDerptunNativeStreamHeader(laneConn)
+	if err != nil {
+		_ = laneConn.Close()
+		emitDerptunQUICConnectionError(err, emitter)
+		return false
+	}
+	if header.control() {
+		_ = laneConn.Close()
+		if onControl != nil {
+			onControl(conn)
 		}
+		return true
+	}
+	lane := derptunNativeAcceptedLane{
+		conn:     laneConn,
+		quicConn: conn,
+	}
+	if err := assembler.addLaneWithHeader(ctx, header, lane); err != nil {
+		_ = lane.conn.Close()
+		if emitter != nil {
+			emitter.Debug("derptun-native-lane-rejected")
+		}
+	}
+	return true
+}
+
+func emitDerptunQUICConnectionError(err error, emitter *telemetry.Emitter) {
+	if derptunServeTunnelErr(err) != nil && emitter != nil {
+		emitter.Debug("derptun-quic-connection-error")
 	}
 }
 
@@ -1023,10 +1045,9 @@ func newDerptunNativeStreamAssembler(targetAddr string, emitter *telemetry.Emitt
 	}
 }
 
-func (a *derptunNativeStreamAssembler) addLane(ctx context.Context, lane derptunNativeAcceptedLane) error {
-	header, err := readDerptunNativeStreamHeader(lane.conn)
-	if err != nil {
-		return err
+func (a *derptunNativeStreamAssembler) addLaneWithHeader(ctx context.Context, header derptunNativeStreamHeader, lane derptunNativeAcceptedLane) error {
+	if header.control() {
+		return errors.New("derptun control header is not a data lane")
 	}
 	lanes, complete, err := a.storeLane(header, lane)
 	if err != nil {
@@ -1256,6 +1277,7 @@ func DerptunConnect(ctx context.Context, cfg DerptunConnectConfig) error {
 		ClientToken: cfg.ClientToken,
 		Emitter:     cfg.Emitter,
 		ForceRelay:  cfg.ForceRelay,
+		KeepAlive:   true,
 	})
 	if err != nil {
 		return err
@@ -1379,6 +1401,21 @@ func newDerptunQUICStreamDialer(packetConn net.PacketConn, remoteAddr net.Addr, 
 func (d *derptunQUICStreamDialer) OpenControl(ctx context.Context) error {
 	conn, err := d.dialConn(ctx)
 	if err != nil {
+		return err
+	}
+	streamConn, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		_ = conn.CloseWithError(1, "open derptun control stream failed")
+		return err
+	}
+	controlConn := quicpath.WrapStream(conn, streamConn)
+	if err := writeDerptunNativeStreamHeader(controlConn, derptunNativeStreamHeader{}); err != nil {
+		_ = controlConn.Close()
+		_ = conn.CloseWithError(1, "write derptun control stream header failed")
+		return err
+	}
+	if err := controlConn.Close(); err != nil {
+		_ = conn.CloseWithError(1, "close derptun control stream failed")
 		return err
 	}
 	d.controlConn = conn
@@ -1567,6 +1604,12 @@ func readDerptunNativeStreamHeader(r io.Reader) (derptunNativeStreamHeader, erro
 }
 
 func (h derptunNativeStreamHeader) validate() error {
+	if h.control() {
+		if h.laneIndex != 0 {
+			return errors.New("derptun control stream lane index must be zero")
+		}
+		return nil
+	}
 	if h.laneCount == 0 {
 		return errors.New("derptun stream lane count is zero")
 	}
@@ -1574,6 +1617,10 @@ func (h derptunNativeStreamHeader) validate() error {
 		return errors.New("derptun stream lane index out of range")
 	}
 	return nil
+}
+
+func (h derptunNativeStreamHeader) control() bool {
+	return h.laneCount == 0
 }
 
 func writeFull(w io.Writer, p []byte) error {
