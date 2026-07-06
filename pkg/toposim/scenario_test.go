@@ -4,7 +4,11 @@
 
 package toposim
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+)
 
 func TestScenarioCatalogCoversBacklogItemOne(t *testing.T) {
 	t.Parallel()
@@ -73,5 +77,22 @@ func TestResultCandidateCountAtMost(t *testing.T) {
 	}
 	if result.CandidateCountAtMost("missing", 32) {
 		t.Fatal("CandidateCountAtMost(missing, 32) = true, want false")
+	}
+}
+
+func TestScenarioRunErrorIgnoresIntentionalCoordinatorCancel(t *testing.T) {
+	t.Parallel()
+
+	if err := scenarioRunError(context.Background(), context.Canceled); err != nil {
+		t.Fatalf("scenarioRunError(context.Canceled) = %v, want nil", err)
+	}
+}
+
+func TestScenarioRunErrorReturnsCoordinatorFailure(t *testing.T) {
+	t.Parallel()
+
+	want := errors.New("node failed")
+	if err := scenarioRunError(context.Background(), want); !errors.Is(err, want) {
+		t.Fatalf("scenarioRunError(node failed) = %v, want %v", err, want)
 	}
 }

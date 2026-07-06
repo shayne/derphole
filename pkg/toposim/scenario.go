@@ -4,7 +4,11 @@
 
 package toposim
 
-import "time"
+import (
+	"context"
+	"errors"
+	"time"
+)
 
 const (
 	PathRelayName  = "relay"
@@ -215,4 +219,11 @@ func relayThenDirect(within time.Duration) []ExpectedTransition {
 		{Node: "left", Path: PathDirectName, Within: within},
 		{Node: "right", Path: PathDirectName, Within: within},
 	}
+}
+
+func scenarioRunError(parent context.Context, err error) error {
+	if err == nil || errors.Is(err, context.Canceled) || parent.Err() != nil {
+		return nil
+	}
+	return err
 }

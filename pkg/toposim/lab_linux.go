@@ -70,7 +70,7 @@ func RunLinuxScenario(ctx context.Context, scenario Scenario) (Result, error) {
 	}
 
 	cancelRun()
-	if err := <-runErr; err != nil && ctx.Err() == nil {
+	if err := scenarioRunError(ctx, <-runErr); err != nil {
 		return coordinator.Result(), err
 	}
 	return coordinator.Result(), nil
