@@ -102,21 +102,79 @@ append_summary_row() {
   local tool="$3"
   local mbps="$4"
   local iperf_mbps="$5"
-  local trace_ok="$6"
-  local max_queue="$7"
-  local max_flatline="$8"
-  local sample_log_dir="$9"
+  local trace_mbps="$6"
+  local wall_mbps="$7"
+  local transfer_elapsed_ms="$8"
+  local command_duration_ms="$9"
+  local total_duration_ms="${10}"
+  local trace_ok="${11}"
+  local max_queue="${12}"
+  local max_flatline="${13}"
+  local sample_log_dir="${14}"
 
-  python3 - "${summary_csv}" "${host_label}" "${run}" "${tool}" "${direction}" "${mbps}" "${iperf_mbps}" "${trace_ok}" "${max_queue}" "${max_flatline}" "${sample_log_dir}" <<'PY'
+  python3 - \
+    "${summary_csv}" \
+    "${host_label}" \
+    "${run}" \
+    "${tool}" \
+    "${direction}" \
+    "${mbps}" \
+    "${iperf_mbps}" \
+    "${trace_mbps}" \
+    "${wall_mbps}" \
+    "${transfer_elapsed_ms}" \
+    "${command_duration_ms}" \
+    "${total_duration_ms}" \
+    "${trace_ok}" \
+    "${max_queue}" \
+    "${max_flatline}" \
+    "${sample_log_dir}" <<'PY'
 import csv
 import sys
 
-path, host, run, tool, direction, mbps, iperf_mbps, trace_ok, max_queue, max_flatline, log_dir = sys.argv[1:]
+(
+    path,
+    host,
+    run,
+    tool,
+    direction,
+    mbps,
+    iperf_mbps,
+    trace_mbps,
+    wall_mbps,
+    transfer_elapsed_ms,
+    command_duration_ms,
+    total_duration_ms,
+    trace_ok,
+    max_queue,
+    max_flatline,
+    log_dir,
+) = sys.argv[1:]
 ratio = ""
-if float(iperf_mbps) > 0:
+wall_ratio = ""
+if mbps and float(iperf_mbps) > 0:
     ratio = f"{float(mbps) / float(iperf_mbps):.3f}"
+if wall_mbps and float(iperf_mbps) > 0:
+    wall_ratio = f"{float(wall_mbps) / float(iperf_mbps):.3f}"
 with open(path, "a", newline="") as fh:
-    csv.writer(fh).writerow([host, run, tool, direction, mbps, ratio, trace_ok, max_queue, max_flatline, log_dir])
+    csv.writer(fh).writerow([
+        host,
+        run,
+        tool,
+        direction,
+        mbps,
+        ratio,
+        trace_mbps,
+        wall_mbps,
+        wall_ratio,
+        transfer_elapsed_ms,
+        command_duration_ms,
+        total_duration_ms,
+        trace_ok,
+        max_queue,
+        max_flatline,
+        log_dir,
+    ])
 PY
 }
 
@@ -131,23 +189,36 @@ latest_file() {
   find "${dir}" -type f -name "${pattern}" -print | sort | tail -n 1
 }
 
-extract_benchmark_goodput() {
+extract_benchmark_value() {
   local output="$1"
+  local field="$2"
+  local default_value="${3:-0}"
 
-  python3 - "${output}" <<'PY'
+  python3 - "${output}" "${field}" "${default_value}" <<'PY'
 import sys
 
+path, field, default = sys.argv[1:]
+prefix = field + "="
 value = ""
-with open(sys.argv[1], errors="replace") as fh:
+with open(path, errors="replace") as fh:
     for line in fh:
         line = line.strip()
-        for prefix in ("sender_goodput_mbps=", "benchmark-goodput-mbps="):
-            if line.startswith(prefix):
-                value = line[len(prefix):]
-if not value:
-    value = "0"
-print(value)
+        if line.startswith(prefix):
+            value = line[len(prefix):]
+print(value or default)
 PY
+}
+
+extract_benchmark_goodput() {
+  local output="$1"
+  local value
+
+  value="$(extract_benchmark_value "${output}" "benchmark-goodput-mbps")"
+  if [[ "${value}" != "0" ]]; then
+    printf '%s\n' "${value}"
+    return 0
+  fi
+  extract_benchmark_value "${output}" "sender_goodput_mbps"
 }
 
 extract_tracecheck_summary() {
@@ -173,6 +244,7 @@ def duration_seconds(value):
 max_queue = 0
 max_flatline = "0s"
 max_flatline_seconds = -1.0
+trace_sender_mbps = ""
 for path in sys.argv[1:]:
     with open(path, errors="replace") as fh:
         text = fh.read()
@@ -185,7 +257,10 @@ for path in sys.argv[1:]:
         if seconds > max_flatline_seconds:
             max_flatline = value
             max_flatline_seconds = seconds
-print(f"{max_queue}\t{max_flatline}")
+    match = re.search(r"sender_mbps=([0-9]+(?:\.[0-9]+)?)", text)
+    if match:
+        trace_sender_mbps = match.group(1)
+print(f"{max_queue}\t{max_flatline}\t{trace_sender_mbps}")
 PY
 }
 
@@ -201,14 +276,14 @@ run_trace_checks() {
   receiver_trace="$(latest_file "${case_log_dir}" "*-receiver.trace.csv")"
   if [[ -z "${sender_trace}" || -z "${receiver_trace}" ]]; then
     echo "missing preserved transfer traces in ${case_log_dir}" >&2
-    printf '0\t0s\n'
+    printf '0\t0s\t\n'
     return 1
   fi
 
-  if ! mise exec -- go run ./tools/transfertracecheck -role send -stall-window 1s -peer-trace "${receiver_trace}" "${sender_trace}" >"${sender_check}" 2>&1; then
+  if ! mise exec -- go run ./tools/transfertracecheck -role send -stall-window 999ms -peer-trace "${receiver_trace}" "${sender_trace}" >"${sender_check}" 2>&1; then
     status=1
   fi
-  if ! mise exec -- go run ./tools/transfertracecheck -role receive -stall-window 1s "${receiver_trace}" >"${receiver_check}" 2>&1; then
+  if ! mise exec -- go run ./tools/transfertracecheck -role receive -stall-window 999ms "${receiver_trace}" >"${receiver_check}" 2>&1; then
     status=1
   fi
   extract_tracecheck_summary "${sender_check}" "${receiver_check}"
@@ -221,7 +296,7 @@ main() {
   local trace_failures=0
 
   mkdir -p "${log_dir}"
-  printf 'host,run,tool,direction,mbps,ratio_to_iperf,trace_ok,max_peer_recv_queue_depth,max_flatline,log_dir\n' >"${summary_csv}"
+  printf 'host,run,tool,direction,mbps,ratio_to_iperf,trace_mbps,wall_mbps,wall_ratio_to_iperf,transfer_elapsed_ms,command_duration_ms,total_duration_ms,trace_ok,max_peer_recv_queue_depth,max_flatline,log_dir\n' >"${summary_csv}"
 
   read -r -a hosts <<<"${hosts_raw}"
   if [[ "${#hosts[@]}" -eq 0 ]]; then
@@ -249,13 +324,25 @@ main() {
       local trace_summary
       local max_queue
       local max_flatline
+      local trace_sender_mbps
+      local wall_mbps
+      local transfer_elapsed_ms
+      local command_duration_ms
+      local total_duration_ms
       local trace_ok
       local trace_status=0
       local promotion_status=0
 
       echo "public_path_sample host=${remote} run=${run} tool=iperf3"
       iperf_mbps="$(run_iperf_forward_sample "${remote}" "${host_label}" "${run}" "${ip}")"
-      append_summary_row "${host_label}" "${run}" "iperf3" "${iperf_mbps}" "${iperf_mbps}" "" "" "" "${log_dir}/${host_label}"
+      append_summary_row \
+        "${host_label}" \
+        "${run}" \
+        "iperf3" \
+        "${iperf_mbps}" \
+        "${iperf_mbps}" \
+        "" "" "" "" "" "" "" "" \
+        "${log_dir}/${host_label}"
 
       echo "public_path_sample host=${remote} run=${run} tool=derphole"
       mkdir -p "${case_log_dir}"
@@ -267,6 +354,10 @@ main() {
       fi
       cat "${promotion_out}"
       derphole_mbps="$(extract_benchmark_goodput "${promotion_out}")"
+      wall_mbps="$(extract_benchmark_value "${promotion_out}" "benchmark-wall-goodput-mbps")"
+      transfer_elapsed_ms="$(extract_benchmark_value "${promotion_out}" "benchmark-transfer-elapsed-ms")"
+      command_duration_ms="$(extract_benchmark_value "${promotion_out}" "benchmark-command-duration-ms")"
+      total_duration_ms="$(extract_benchmark_value "${promotion_out}" "benchmark-total-duration-ms")"
       if trace_summary="$(run_trace_checks "${case_log_dir}")"; then
         if [[ "${promotion_status}" -eq 0 ]]; then
           trace_ok="true"
@@ -277,8 +368,13 @@ main() {
         trace_status="$?"
         trace_ok="false"
       fi
-      IFS=$'\t' read -r max_queue max_flatline <<<"${trace_summary}"
-      append_summary_row "${host_label}" "${run}" "derphole" "${derphole_mbps}" "${iperf_mbps}" "${trace_ok}" "${max_queue}" "${max_flatline}" "${case_log_dir}"
+      IFS=$'\t' read -r max_queue max_flatline trace_sender_mbps <<<"${trace_summary}"
+      if [[ -z "${trace_sender_mbps}" || "${trace_sender_mbps}" != "${derphole_mbps}" ]]; then
+        echo "benchmark accounting mismatch: footer=${derphole_mbps} trace=${trace_sender_mbps:-missing}" >&2
+        trace_ok="false"
+        trace_status=1
+      fi
+      append_summary_row "${host_label}" "${run}" "derphole" "${derphole_mbps}" "${iperf_mbps}" "${trace_sender_mbps}" "${wall_mbps}" "${transfer_elapsed_ms}" "${command_duration_ms}" "${total_duration_ms}" "${trace_ok}" "${max_queue}" "${max_flatline}" "${case_log_dir}"
       if [[ "${trace_status}" -ne 0 || "${promotion_status}" -ne 0 ]]; then
         trace_failures=1
       fi

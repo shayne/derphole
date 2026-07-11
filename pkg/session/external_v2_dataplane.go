@@ -7,6 +7,7 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
@@ -252,7 +253,17 @@ func openExternalV2DataPacketPath(ctx context.Context, dm *tailcfg.DERPMap, emit
 		}
 		conns = append(conns, conn)
 		portmaps = append(portmaps, newBoundPublicPortmap(conn, emitter))
-		tuneExternalPacketConn(conn)
+		socketBuffers := tuneExternalPacketConn(conn)
+		emitExternalV2Debug(emitter, fmt.Sprintf(
+			"v2-raw-direct-socket-buffer=lane:%d requested:%d read:%d write:%d read_set_error:%t write_set_error:%t inspect_error:%t",
+			len(conns)-1,
+			socketBuffers.RequestedBytes,
+			socketBuffers.ReadBytes,
+			socketBuffers.WriteBytes,
+			socketBuffers.ReadSetError != nil,
+			socketBuffers.WriteSetError != nil,
+			socketBuffers.InspectError != nil,
+		))
 	}
 	cleanup := func() {
 		closeExternalV2DataPacketResources(conns, portmaps)

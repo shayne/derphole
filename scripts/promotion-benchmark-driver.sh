@@ -15,7 +15,14 @@ local_tmp_root="${DERPHOLE_BENCH_LOCAL_TMP_ROOT:-.tmp/promotion-benchmark}"
 mkdir -p "${local_tmp_root}"
 tmp="$(mktemp -d "${local_tmp_root%/}/${tool}-${direction}.XXXXXX")"
 start_ms=0
+command_end_ms=0
+command_duration_ms=0
 duration_ms=0
+sender_transfer_elapsed_ms=0
+sender_goodput_mbps=0
+sender_peak_goodput_mbps=0
+sender_first_byte_ms=0
+wall_goodput=0
 remote_suffix=""
 if [[ "${direction}" == "reverse" ]]; then
   remote_suffix="-reverse"
@@ -23,15 +30,17 @@ fi
 remote_output_root="${DERPHOLE_BENCH_REMOTE_OUTPUT_ROOT:-derphole-bench/promotion}"
 remote_run_dir="${remote_output_root%/}/${tool}-promotion${remote_suffix}-$$"
 remote_base="${remote_run_dir}/run"
-remote_upload="${remote_run_dir}/${tool}-linux-amd64"
 remote_target="${target}"
 if [[ "${target}" != *"@"* ]]; then
   remote_user="${DERPHOLE_REMOTE_USER:-root}"
   remote_target="${remote_user}@${target}"
 fi
-requested_remote_bin_dir="${DERPHOLE_REMOTE_BIN_DIR:-/usr/local/bin}"
-remote_bin_dir="${requested_remote_bin_dir}"
-remote_bin="${remote_bin_dir%/}/${tool}"
+remote_bin_dir="${remote_run_dir}/bin"
+if [[ -n "${DERPHOLE_REMOTE_BIN_DIR:-}" ]]; then
+  remote_bin_dir="${DERPHOLE_REMOTE_BIN_DIR%/}/${tool}-promotion${remote_suffix}-$$"
+fi
+remote_bin="${remote_bin_dir}/${tool}"
+remote_upload="${remote_bin_dir}/${tool}.upload"
 local_bin="./dist/${tool}"
 linux_bin="dist/${tool}-linux-amd64"
 sender_log="${tmp}/sender.err"
@@ -66,18 +75,10 @@ remote() {
   ssh "${remote_target}" "${remote_env[@]}" 'bash -se' <<<"$1"
 }
 
-remote_home="$(remote 'printf %s "$HOME"')"
-fallback_remote_bin_dirs=(
-  "${remote_home}/.local/share/${tool}-bench/bin"
-  "${remote_home}/.cache/${tool}-bench/bin"
-  "/var/tmp/${tool}-bench-bin"
-  "/tmp/${tool}-bench-bin"
-)
-
 install_remote_bin() {
   local desired_dir="$1"
   local desired_bin="${desired_dir%/}/${tool}"
-  remote "mkdir -p '${desired_dir}' && install -m 0755 '${remote_upload}' '${desired_bin}' && rm -f '${remote_upload}' && '${desired_bin}' --help >/dev/null 2>&1"
+  remote "install -m 0755 '${remote_upload}' '${desired_bin}' && rm -f '${remote_upload}' && '${desired_bin}' --help >/dev/null 2>&1"
 }
 
 now_ms() {
@@ -88,7 +89,7 @@ now_ms() {
   perl -MTime::HiRes=time -e 'print int(time() * 1000), "\n"'
 }
 
-wall_goodput_mbps() {
+goodput_mbps() {
   python3 - <<'PY' "$1" "$2"
 import sys
 size = int(sys.argv[1])
@@ -139,34 +140,16 @@ max_trace_value() {
   trace_metric_value max "$1" "$2"
 }
 
-trace_average_mbps() {
+trace_transfer_goodput_mbps() {
   local file="$1"
-  local bytes_key="$2"
-  local elapsed_key="$3"
+  local expected_bytes="$2"
+  local transfer_elapsed_ms
 
-  if [[ ! -s "${file}" ]]; then
-    return 0
+  transfer_elapsed_ms="$(last_trace_value "${file}" "transfer_elapsed_ms")"
+  if [[ ! "${transfer_elapsed_ms}" =~ ^[1-9][0-9]*$ ]]; then
+    return 1
   fi
-  python3 - "${file}" "${bytes_key}" "${elapsed_key}" <<'PY'
-import csv
-import sys
-
-path, bytes_key, elapsed_key = sys.argv[1:4]
-last = None
-with open(path, newline="") as fh:
-    for row in csv.DictReader(fh):
-        last = row
-if not last:
-    sys.exit(0)
-try:
-    byte_count = int((last.get(bytes_key) or "0").strip())
-    elapsed_ms = int((last.get(elapsed_key) or "0").strip())
-except ValueError:
-    sys.exit(0)
-if byte_count <= 0 or elapsed_ms <= 0:
-    sys.exit(0)
-print(f"{(byte_count * 8.0) / (elapsed_ms * 1000.0):.2f}")
-PY
+  goodput_mbps "${expected_bytes}" "${transfer_elapsed_ms}"
 }
 
 trace_has_direct_bytes() {
@@ -204,8 +187,11 @@ emit_benchmark_footer() {
     echo "benchmark-tool=${tool}"
     echo "benchmark-direction=${direction}"
     echo "benchmark-size-bytes=${expected_size}"
+    echo "benchmark-transfer-elapsed-ms=${sender_transfer_elapsed_ms:-0}"
+    echo "benchmark-command-duration-ms=${command_duration_ms:-0}"
     echo "benchmark-total-duration-ms=${duration_ms:-0}"
     echo "benchmark-goodput-mbps=${goodput_mbps}"
+    echo "benchmark-wall-goodput-mbps=${wall_goodput:-0}"
     echo "benchmark-peak-goodput-mbps=${peak_goodput_mbps}"
     echo "benchmark-first-byte-ms=${first_byte_ms}"
     echo "benchmark-success=${success}"
@@ -277,25 +263,40 @@ require_direct_trace() {
 
 preserve_logs() {
   local log_dir="${DERPHOLE_BENCH_LOG_DIR:-}"
+  local preserve_status=0
   if [[ -z "${log_dir}" ]]; then
     return 0
   fi
-  mkdir -p "${log_dir}"
+  if ! mkdir -p "${log_dir}"; then
+    preserve_status=1
+  fi
   local stamp
-  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  if ! stamp="$(date -u +%Y%m%dT%H%M%SZ)"; then
+    stamp="unknown"
+    preserve_status=1
+  fi
   local prefix="${tool}-${direction}-${target//[^A-Za-z0-9_.-]/_}-${size_mib}MiB-${stamp}"
   if [[ -f "${sender_log}" ]]; then
-    cp "${sender_log}" "${log_dir}/${prefix}-sender.log"
+    if ! cp "${sender_log}" "${log_dir}/${prefix}-sender.log"; then
+      preserve_status=1
+    fi
   fi
   if [[ -f "${receiver_log}" ]]; then
-    cp "${receiver_log}" "${log_dir}/${prefix}-receiver.log"
+    if ! cp "${receiver_log}" "${log_dir}/${prefix}-receiver.log"; then
+      preserve_status=1
+    fi
   fi
   if [[ -f "${sender_trace_csv}" ]]; then
-    cp "${sender_trace_csv}" "${log_dir}/${prefix}-sender.trace.csv"
+    if ! cp "${sender_trace_csv}" "${log_dir}/${prefix}-sender.trace.csv"; then
+      preserve_status=1
+    fi
   fi
   if [[ -f "${receiver_trace_csv}" ]]; then
-    cp "${receiver_trace_csv}" "${log_dir}/${prefix}-receiver.trace.csv"
+    if ! cp "${receiver_trace_csv}" "${log_dir}/${prefix}-receiver.trace.csv"; then
+      preserve_status=1
+    fi
   fi
+  return "${preserve_status}"
 }
 
 assert_no_tool_leaks() {
@@ -328,12 +329,74 @@ assert_no_tool_leaks() {
 }
 
 wait_remote_pid_exit() {
+  local state
+
   for _ in $(seq 1 400); do
-    if ! remote "if [[ -f '${remote_base}.pid' ]]; then kill -0 \$(cat '${remote_base}.pid') 2>/dev/null; else false; fi" >/dev/null 2>&1; then
-      return 0
+    if ! state="$(remote "if [[ ! -f '${remote_base}.pid' ]]; then printf 'exited\\n'; else pid=\$(cat '${remote_base}.pid') || exit 1; if [[ ! \"\${pid}\" =~ ^[0-9]+$ ]]; then exit 1; fi; if kill -0 \"\${pid}\" 2>/dev/null; then printf 'running\\n'; else printf 'exited\\n'; fi; fi")"; then
+      echo "failed to query remote ${tool} process on ${target}" >&2
+      return 1
     fi
+    case "${state}" in
+      exited)
+        return 0
+        ;;
+      running)
+        ;;
+      *)
+        echo "invalid remote ${tool} process state on ${target}: ${state:-empty}" >&2
+        return 1
+        ;;
+    esac
     sleep 0.25
   done
+  echo "timed out waiting for remote ${tool} process on ${target}" >&2
+  return 1
+}
+
+refresh_benchmark_operands() {
+  local value
+  local end_ms
+
+  if [[ "${command_end_ms}" -gt "${start_ms}" && "${start_ms}" -gt 0 ]]; then
+    command_duration_ms="$((command_end_ms - start_ms))"
+    if value="$(goodput_mbps "${expected_size}" "${command_duration_ms}")"; then
+      wall_goodput="${value}"
+    fi
+  fi
+
+  if [[ -s "${sender_trace_csv}" ]]; then
+    value="$(last_trace_value "${sender_trace_csv}" "transfer_elapsed_ms" 2>/dev/null || true)"
+    if [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
+      sender_transfer_elapsed_ms="${value}"
+      if value="$(trace_transfer_goodput_mbps "${sender_trace_csv}" "${expected_size}")"; then
+        sender_goodput_mbps="${value}"
+      fi
+    fi
+
+    value="$(max_trace_value "${sender_trace_csv}" "send_goodput_mbps" 2>/dev/null || true)"
+    if [[ -z "${value}" ]]; then
+      value="$(max_trace_value "${sender_trace_csv}" "app_mbps" 2>/dev/null || true)"
+    fi
+    if [[ -n "${value}" ]]; then
+      sender_peak_goodput_mbps="${value}"
+    fi
+
+    value="$(last_trace_value "${sender_trace_csv}" "quic_first_byte_ms" 2>/dev/null || true)"
+    if [[ -n "${value}" ]]; then
+      sender_first_byte_ms="${value}"
+    fi
+  fi
+
+  if [[ "${start_ms}" -gt 0 && "${duration_ms}" -eq 0 ]]; then
+    end_ms="$(now_ms 2>/dev/null || true)"
+    if [[ "${end_ms}" =~ ^[0-9]+$ && "${end_ms}" -gt "${start_ms}" ]]; then
+      duration_ms="$((end_ms - start_ms))"
+    else
+      duration_ms=1
+    fi
+  fi
+
+  return 0
 }
 
 dump_failure() {
@@ -362,41 +425,70 @@ dump_failure() {
 }
 
 cleanup() {
+  local cleanup_status=0
+
   if [[ -n "${send_pid}" ]]; then
     kill "${send_pid}" 2>/dev/null || true
   fi
   if [[ -n "${listener_pid}" ]]; then
     kill "${listener_pid}" 2>/dev/null || true
   fi
-  remote "if [[ -f '${remote_base}.pid' ]]; then kill \$(cat '${remote_base}.pid') 2>/dev/null || true; fi; rm -f '${remote_base}.pid' '${remote_base}.payload' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_upload}'; if [[ '${remote_bin_dir}' != '${requested_remote_bin_dir}' ]]; then rm -f '${remote_bin}'; fi; rmdir '${remote_run_dir}' 2>/dev/null || true" >/dev/null 2>&1 || true
-  rm -rf "${tmp}"
+  if ! remote "pid=''; if [[ -f '${remote_base}.pid' ]]; then pid=\$(cat '${remote_base}.pid'); kill \"\${pid}\" 2>/dev/null || true; fi; rm -f '${remote_base}.pid' '${remote_base}.payload' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_upload}'; rm -f '${remote_bin}'; rmdir '${remote_bin_dir}' '${remote_run_dir}' 2>/dev/null || true; if [[ -n \"\${pid}\" ]] && kill -0 \"\${pid}\" 2>/dev/null; then exit 1; fi; if [[ -e '${remote_upload}' || -e '${remote_bin}' || -e '${remote_bin_dir}' || -e '${remote_run_dir}' ]]; then exit 1; fi" >/dev/null 2>&1; then
+    echo "remote benchmark cleanup incomplete on ${target}" >&2
+    cleanup_status=1
+  fi
+  if ! rm -rf "${tmp}" || [[ -e "${tmp}" ]]; then
+    echo "local benchmark cleanup incomplete: ${tmp}" >&2
+    cleanup_status=1
+  fi
+  return "${cleanup_status}"
 }
 
-trap 'status=$?; if [[ ${status} -ne 0 ]]; then if [[ ${start_ms} -gt 0 && ${duration_ms} -eq 0 ]]; then end_ms="$(now_ms)"; duration_ms="$((end_ms - start_ms))"; fi; dump_failure; preserve_logs; emit_benchmark_footer 2 false "promotion-benchmark-driver-exit-${status}"; cleanup; fi; exit ${status}' EXIT
+handle_exit() {
+  local status="$1"
+  local preserve_status=0
+  local cleanup_status=0
+  local error_text
+
+  trap - EXIT
+  if [[ "${status}" -eq 0 ]]; then
+    return 0
+  fi
+
+  set +e
+  refresh_benchmark_operands
+  dump_failure
+  preserve_logs
+  preserve_status="$?"
+  if [[ "${preserve_status}" -ne 0 ]]; then
+    echo "failed to preserve benchmark logs" >&2
+  fi
+  cleanup
+  cleanup_status="$?"
+  if [[ "${cleanup_status}" -ne 0 ]]; then
+    echo "benchmark cleanup failed" >&2
+  fi
+
+  error_text="promotion-benchmark-driver-exit-${status}"
+  if [[ "${preserve_status}" -ne 0 ]]; then
+    error_text+="-log-preservation-failed"
+  fi
+  if [[ "${cleanup_status}" -ne 0 ]]; then
+    error_text+="-cleanup-failed"
+  fi
+  emit_benchmark_footer 2 false "${error_text}" "${sender_goodput_mbps:-0}" "${sender_peak_goodput_mbps:-0}" "${sender_first_byte_ms:-0}"
+  exit "${status}"
+}
+
+trap 'handle_exit "$?"' EXIT
 
 build_and_install_remote_binary() {
   mise run build
   mise run build-linux-amd64
-  remote "mkdir -p '${remote_run_dir}'"
+  remote "mkdir -p '${remote_run_dir}' '${remote_bin_dir}'"
   scp "${linux_bin}" "${remote_target}:${remote_upload}" >/dev/null
-  if install_remote_bin "${remote_bin_dir}"; then
-    return 0
-  fi
-  if [[ -n "${DERPHOLE_REMOTE_BIN_DIR:-}" ]]; then
-    exit 1
-  fi
-  local installed_fallback=0
-  for fallback_dir in "${fallback_remote_bin_dirs[@]}"; do
-    remote_bin_dir="${fallback_dir}"
-    remote_bin="${remote_bin_dir}/${tool}"
-    scp "${linux_bin}" "${remote_target}:${remote_upload}" >/dev/null
-    if install_remote_bin "${remote_bin_dir}"; then
-      installed_fallback=1
-      break
-    fi
-  done
-  if [[ "${installed_fallback}" != "1" ]]; then
-    echo "failed to install remote benchmark binary in any writable exec-capable directory" >&2
+  if ! install_remote_bin "${remote_bin_dir}"; then
+    echo "remote benchmark directory is not writable and executable; set DERPHOLE_REMOTE_BIN_DIR to a writable executable root" >&2
     exit 1
   fi
 }
@@ -429,6 +521,7 @@ run_forward_derphole() {
   fi
 
   wait_remote_pid_exit
+  command_end_ms="$(now_ms)"
   remote "cat '${remote_base}.err'" >"${receiver_log}"
   remote "cat '${remote_base}.trace.csv'" >"${receiver_trace_csv}"
   sink_sha="$(remote "sha256sum '${remote_base}.out' | awk '{print \$1}'")"
@@ -468,6 +561,7 @@ run_reverse_derphole() {
 
   wait "${listener_pid}"
   listener_pid=""
+  command_end_ms="$(now_ms)"
   remote "cat '${remote_base}.err'" >"${sender_log}"
   remote "cat '${remote_base}.trace.csv'" >"${sender_trace_csv}"
   sink_sha="$(shasum -a 256 "${receiver_out}" | awk '{print $1}')"
@@ -479,10 +573,6 @@ finalize_run() {
   local receiver_trace
   local sender_path_changed="false"
   local receiver_path_changed="false"
-  local sender_goodput_mbps
-  local sender_peak_goodput_mbps
-  local sender_first_byte_ms
-  local wall_goodput
 
   sender_trace="$(path_trace "${sender_log}")"
   receiver_trace="$(path_trace "${receiver_log}")"
@@ -503,13 +593,19 @@ finalize_run() {
   require_direct_trace "sender" "${sender_trace_csv}"
   require_direct_trace "receiver" "${receiver_trace_csv}"
 
-  sender_goodput_mbps="$(trace_average_mbps "${sender_trace_csv}" "app_bytes" "elapsed_ms")"
-  if [[ -z "${sender_goodput_mbps}" ]]; then
-    sender_goodput_mbps="$(last_trace_value "${sender_trace_csv}" "send_goodput_mbps")"
+  sender_transfer_elapsed_ms="$(last_trace_value "${sender_trace_csv}" "transfer_elapsed_ms")"
+  if ! sender_goodput_mbps="$(trace_transfer_goodput_mbps "${sender_trace_csv}" "${expected_size}")"; then
+    echo "sender trace missing positive transfer_elapsed_ms" >&2
+    exit 1
   fi
-  if [[ -z "${sender_goodput_mbps}" ]]; then
-    sender_goodput_mbps="$(last_trace_value "${sender_trace_csv}" "app_mbps")"
+
+  if [[ "${command_end_ms}" -le "${start_ms}" ]]; then
+    echo "invalid benchmark command timing" >&2
+    exit 1
   fi
+  command_duration_ms="$((command_end_ms - start_ms))"
+  wall_goodput="$(goodput_mbps "${expected_size}" "${command_duration_ms}")"
+
   sender_peak_goodput_mbps="$(max_trace_value "${sender_trace_csv}" "send_goodput_mbps")"
   if [[ -z "${sender_peak_goodput_mbps}" ]]; then
     sender_peak_goodput_mbps="$(max_trace_value "${sender_trace_csv}" "app_mbps")"
@@ -522,10 +618,6 @@ finalize_run() {
   if [[ "${duration_ms}" -le 0 ]]; then
     duration_ms=1
   fi
-  wall_goodput="$(wall_goodput_mbps "${expected_size}" "${duration_ms}")"
-  if [[ -z "${sender_goodput_mbps}" ]]; then
-    sender_goodput_mbps="${wall_goodput}"
-  fi
   if [[ -z "${sender_peak_goodput_mbps}" ]]; then
     sender_peak_goodput_mbps="${sender_goodput_mbps}"
   fi
@@ -533,9 +625,7 @@ finalize_run() {
     sender_first_byte_ms=0
   fi
 
-  echo "benchmark-wall-goodput-mbps=${wall_goodput}"
   preserve_logs
-  emit_benchmark_footer 1 true "" "${sender_goodput_mbps}" "${sender_peak_goodput_mbps}" "${sender_first_byte_ms}"
 
   echo "target=${target}"
   echo "size_mib=${size_mib}"
@@ -571,5 +661,9 @@ case "${tool}:${direction}" in
 esac
 
 finalize_run
-cleanup
+if ! cleanup; then
+  echo "benchmark cleanup failed" >&2
+  exit 1
+fi
+emit_benchmark_footer 1 true "" "${sender_goodput_mbps}" "${sender_peak_goodput_mbps}" "${sender_first_byte_ms}"
 trap - EXIT

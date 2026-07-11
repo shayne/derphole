@@ -335,6 +335,113 @@ func TestTransferTraceRoundsAccumulatedSubMillisecondStripedSendBlocked(t *testi
 	}
 }
 
+func TestExternalTransferMetricsPeerProgressSnapshot(t *testing.T) {
+	t.Parallel()
+
+	var nilMetrics *externalTransferMetrics
+	if got := nilMetrics.PeerProgressSnapshot(); got.Set {
+		t.Fatalf("nil snapshot = %#v, want unset", got)
+	}
+
+	metrics := newExternalTransferMetrics(time.Unix(100, 0))
+	if got := metrics.PeerProgressSnapshot(); got.Set {
+		t.Fatalf("initial snapshot = %#v, want unset", got)
+	}
+
+	metrics.RecordPeerProgress(64<<20, 750, time.Unix(101, 0))
+	got := metrics.PeerProgressSnapshot()
+	if !got.Set || got.BytesReceived != 64<<20 || got.TransferElapsedMS != 750 {
+		t.Fatalf("snapshot = %#v, want bytes=%d elapsed=750 set", got, 64<<20)
+	}
+}
+
+func TestExternalTransferMetricsRecordsControllerBeforeCompletion(t *testing.T) {
+	t.Parallel()
+
+	start := time.Unix(110, 0)
+	var out bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(start, rec, transfertrace.RoleSend)
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, string(StateDirect))
+	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
+		RateSelectedMbps:   1000,
+		RateTargetMbps:     1000,
+		RateCeilingMbps:    2400,
+		ActiveLanes:        8,
+		AvailableLanes:     8,
+		ControllerDecision: "hold",
+		ControllerReason:   "initial-target",
+	}, start.Add(100*time.Millisecond))
+	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
+		RateTargetMbps:     850,
+		ControllerDecision: "decrease",
+		ControllerReason:   "repair-pressure",
+		Retransmits:        12,
+		RepairRequests:     3,
+		RepairBytes:        16_296,
+	}, start.Add(600*time.Millisecond))
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := readTransferTraceRows(t, out.String())
+	if len(rows) != 2 {
+		t.Fatalf("trace rows = %d, want 2\n%s", len(rows), out.String())
+	}
+	if rows[0]["rate_target_mbps"] != "1000" ||
+		rows[0]["controller_decision"] != "hold" ||
+		rows[0]["controller_reason"] != "initial-target" {
+		t.Fatalf("initial controller row = %#v", rows[0])
+	}
+	if rows[1]["rate_target_mbps"] != "850" ||
+		rows[1]["controller_decision"] != "decrease" ||
+		rows[1]["controller_reason"] != "repair-pressure" ||
+		rows[1]["retransmits"] != "12" ||
+		rows[1]["repair_requests"] != "3" ||
+		rows[1]["repair_bytes"] != "16296" {
+		t.Fatalf("decrease controller row = %#v", rows[1])
+	}
+}
+
+func TestExternalTransferMetricsDirectCountersNeverRegress(t *testing.T) {
+	t.Parallel()
+
+	metrics := newExternalTransferMetrics(time.Unix(120, 0))
+	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
+		Retransmits:    12,
+		RepairRequests: 3,
+		RepairBytes:    16_296,
+	}, time.Unix(120, 1))
+	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
+		Retransmits:    4,
+		RepairRequests: 1,
+		RepairBytes:    5432,
+	}, time.Unix(120, 2))
+	metrics.SetDirectStatsWithoutByteProgress(externalDirectTransferStats{
+		Retransmits: 4,
+		Diagnostics: externalDirectTransferDiagnostics{
+			Retransmits:    4,
+			RepairRequests: 1,
+			RepairBytes:    5432,
+		},
+	})
+
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	if metrics.retransmitCount != 12 ||
+		metrics.repairRequests != 3 ||
+		metrics.repairBytes != 16_296 {
+		t.Fatalf("counters regressed: retransmits=%d requests=%d bytes=%d",
+			metrics.retransmitCount,
+			metrics.repairRequests,
+			metrics.repairBytes,
+		)
+	}
+}
+
 func TestExternalTransferMetricsSetDirectStatsUpdatesTrace(t *testing.T) {
 	var out bytes.Buffer
 	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(30, 0))

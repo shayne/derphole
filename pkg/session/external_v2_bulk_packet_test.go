@@ -7,6 +7,8 @@ package session
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"net"
 	"slices"
 	"sync"
@@ -15,10 +17,535 @@ import (
 	"time"
 
 	"github.com/shayne/derphole/pkg/token"
+	"github.com/shayne/derphole/pkg/transfertrace"
 	"go4.org/mem"
 	"golang.org/x/time/rate"
 	"tailscale.com/types/key"
 )
+
+func TestExternalV2BulkPacketSendPacketChargesIPv4WireBytes(t *testing.T) {
+	senders, receivers := listenExternalV2BulkPacketTestConns(t, 1)
+	payload := bytes.Repeat([]byte{0x5a}, externalV2BulkPacketPayloadSize)
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := newExternalV2BulkPacketSender(
+		context.Background(),
+		&BlockSource{
+			Payload:     bytes.NewReader(payload),
+			PayloadSize: int64(len(payload)),
+		},
+		externalV2BulkPacketPath{
+			Conns: senders,
+			Addrs: externalV2BulkPacketTestAddrs(receivers),
+		},
+		auth,
+		nil,
+	)
+	sender.pacer = rate.NewLimiter(0, externalV2BulkPacketPaceBurstBytes)
+
+	if err := sender.sendPacket(0, 0, false); err != nil {
+		t.Fatalf("sendPacket() error = %v", err)
+	}
+	if got, want := sender.primaryWireBytes.Load(), int64(1428); got != want {
+		t.Fatalf("primary wire bytes = %d, want %d", got, want)
+	}
+	if got := sender.repairWireBytes.Load(); got != 0 {
+		t.Fatalf("repair wire bytes = %d, want 0", got)
+	}
+}
+
+func TestExternalV2BulkPacketSendPacketCountsSuccessfulRepair(t *testing.T) {
+	senders, receivers := listenExternalV2BulkPacketTestConns(t, 1)
+	payload := bytes.Repeat([]byte{0x5a}, externalV2BulkPacketPayloadSize)
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := newExternalV2BulkPacketSender(
+		context.Background(),
+		&BlockSource{
+			Payload:     bytes.NewReader(payload),
+			PayloadSize: int64(len(payload)),
+		},
+		externalV2BulkPacketPath{
+			Conns: senders,
+			Addrs: externalV2BulkPacketTestAddrs(receivers),
+		},
+		auth,
+		nil,
+	)
+	sender.pacer = rate.NewLimiter(0, externalV2BulkPacketPaceBurstBytes)
+
+	if err := sender.sendPacket(0, 0, true); err != nil {
+		t.Fatalf("sendPacket() error = %v", err)
+	}
+	if got, want := sender.repairWireBytes.Load(), int64(1428); got != want {
+		t.Fatalf("repair wire bytes = %d, want %d", got, want)
+	}
+	if got, want := sender.repairPackets.Load(), int64(1); got != want {
+		t.Fatalf("repair packets = %d, want %d", got, want)
+	}
+	if got, want := sender.repairPayloadBytes.Load(), int64(externalV2BulkPacketPayloadSize); got != want {
+		t.Fatalf("repair payload bytes = %d, want %d", got, want)
+	}
+	if got := sender.primaryWireBytes.Load(); got != 0 {
+		t.Fatalf("primary wire bytes = %d, want 0", got)
+	}
+}
+
+func TestExternalV2BulkPacketSendPacketDoesNotCountShortWrite(t *testing.T) {
+	senders, receivers := listenExternalV2BulkPacketTestConns(t, 1)
+	payload := bytes.Repeat([]byte{0x5a}, externalV2BulkPacketPayloadSize)
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := newExternalV2BulkPacketSender(
+		context.Background(),
+		&BlockSource{
+			Payload:     bytes.NewReader(payload),
+			PayloadSize: int64(len(payload)),
+		},
+		externalV2BulkPacketPath{
+			Conns: []net.PacketConn{shortWriteBulkPacketConn{PacketConn: senders[0]}},
+			Addrs: externalV2BulkPacketTestAddrs(receivers),
+		},
+		auth,
+		nil,
+	)
+	sender.pacer = rate.NewLimiter(0, externalV2BulkPacketPaceBurstBytes)
+
+	if err := sender.sendPacket(0, 0, true); err != io.ErrShortWrite {
+		t.Fatalf("sendPacket() error = %v, want %v", err, io.ErrShortWrite)
+	}
+	if got := sender.sentPackets.Load(); got != 0 {
+		t.Fatalf("sent packets = %d, want 0", got)
+	}
+	if got := sender.sentPayload.Load(); got != 0 {
+		t.Fatalf("sent payload = %d, want 0", got)
+	}
+	if got := sender.repairPackets.Load(); got != 0 {
+		t.Fatalf("repair packets = %d, want 0", got)
+	}
+	if got := sender.repairPayloadBytes.Load(); got != 0 {
+		t.Fatalf("repair payload bytes = %d, want 0", got)
+	}
+}
+
+func TestExternalV2BulkPacketSenderCancellationUnblocksWrite(t *testing.T) {
+	senders, receivers := listenExternalV2BulkPacketTestConns(t, 1)
+	payload := bytes.Repeat([]byte{0x5a}, externalV2BulkPacketPayloadSize)
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockingConn := &deadlineBlockingBulkPacketConn{
+		PacketConn: senders[0],
+		started:    make(chan struct{}),
+		unblocked:  make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	sender := newExternalV2BulkPacketSender(
+		ctx,
+		&BlockSource{
+			Payload:     bytes.NewReader(payload),
+			PayloadSize: int64(len(payload)),
+		},
+		externalV2BulkPacketPath{
+			Conns: []net.PacketConn{blockingConn},
+			Addrs: externalV2BulkPacketTestAddrs(receivers),
+		},
+		auth,
+		nil,
+	)
+	sender.pacer = rate.NewLimiter(0, externalV2BulkPacketPaceBurstBytes)
+	deadlineDone := startExternalV2BulkPacketWriteDeadlineCancel(ctx, sender.path)
+
+	writeErrCh := make(chan error, 1)
+	go func() {
+		writeErrCh <- sender.sendPacket(0, 0, false)
+	}()
+	select {
+	case <-blockingConn.started:
+	case <-time.After(time.Second):
+		t.Fatal("sendPacket did not start WriteTo")
+	}
+	cancel()
+	select {
+	case <-deadlineDone:
+	case <-time.After(time.Second):
+		t.Fatal("write deadline watcher did not stop")
+	}
+	select {
+	case err := <-writeErrCh:
+		if err != context.DeadlineExceeded {
+			t.Fatalf("sendPacket() error = %v, want %v", err, context.DeadlineExceeded)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("sendPacket remained blocked after cancellation")
+	}
+	if err := clearExternalV2BulkPacketDeadlines(sender.path); err != nil {
+		t.Fatalf("clear deadlines: %v", err)
+	}
+	if got := blockingConn.writeDeadline(); !got.IsZero() {
+		t.Fatalf("write deadline = %v, want cleared", got)
+	}
+}
+
+func TestExternalV2BulkPacketTopLevelClearsReadAndWriteDeadlines(t *testing.T) {
+	senders, receivers := listenExternalV2BulkPacketTestConns(t, 1)
+	payload := bytes.Repeat([]byte{0x5a}, externalV2BulkPacketPayloadSize)
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := newLifecycleBulkPacketConn(senders[0])
+	ctx, cancel := context.WithCancel(context.Background())
+	stopHello := startExternalV2BulkPacketHelloLoop(ctx, externalV2BulkPacketPath{
+		Conns: receivers,
+		Addrs: externalV2BulkPacketTestAddrs(senders),
+	}, auth, 1)
+	defer stopHello()
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := sendExternalV2BulkBlockPackets(ctx, &BlockSource{
+			Payload:     bytes.NewReader(payload),
+			PayloadSize: int64(len(payload)),
+		}, externalV2BulkPacketPath{
+			Conns: []net.PacketConn{conn},
+			Addrs: externalV2BulkPacketTestAddrs(receivers),
+		}, auth, nil)
+		resultCh <- err
+	}()
+
+	select {
+	case <-conn.started:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("top-level sender did not start WriteTo")
+	}
+	cancel()
+	select {
+	case err := <-resultCh:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("sendExternalV2BulkBlockPackets() error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("top-level sender did not stop after cancellation")
+	}
+	readDeadline, writeDeadline := conn.deadlines()
+	if !readDeadline.IsZero() || !writeDeadline.IsZero() {
+		t.Fatalf("deadlines after return = read %v write %v, want both cleared", readDeadline, writeDeadline)
+	}
+}
+
+func TestExternalV2BulkPacketTopLevelStopsWhenReadDeadlineCannotBeSet(t *testing.T) {
+	senders, receivers := listenExternalV2BulkPacketTestConns(t, 1)
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &readDeadlineFailBulkPacketConn{
+		PacketConn: senders[0],
+		release:    make(chan struct{}),
+	}
+	defer conn.forceReadReturn()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := sendExternalV2BulkBlockPackets(ctx, &BlockSource{
+			Payload:     bytes.NewReader([]byte{0x5a}),
+			PayloadSize: 1,
+		}, externalV2BulkPacketPath{
+			Conns: []net.PacketConn{conn},
+			Addrs: externalV2BulkPacketTestAddrs(receivers),
+		}, auth, nil)
+		resultCh <- err
+	}()
+
+	select {
+	case err := <-resultCh:
+		if !errors.Is(err, errTestBulkPacketSetReadDeadline) {
+			t.Fatalf("sendExternalV2BulkBlockPackets() error = %v, want read deadline error", err)
+		}
+		if conn.readCalled.Load() {
+			t.Fatal("ReadFrom was called after SetReadDeadline failed")
+		}
+	case <-time.After(500 * time.Millisecond):
+		conn.forceReadReturn()
+		cancel()
+		<-resultCh
+		t.Fatal("top-level sender did not stop after SetReadDeadline failed")
+	}
+}
+
+func TestExternalV2BulkPacketTopLevelClosesBlockedWriteWhenDeadlinesFail(t *testing.T) {
+	senders, receivers := listenExternalV2BulkPacketTestConns(t, 1)
+	payload := bytes.Repeat([]byte{0x5a}, externalV2BulkPacketPayloadSize)
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := newDeadlineFailureBulkPacketConn(senders[0])
+	defer conn.forceClose()
+	ctx, cancel := context.WithCancel(context.Background())
+	stopHello := startExternalV2BulkPacketHelloLoop(ctx, externalV2BulkPacketPath{
+		Conns: receivers,
+		Addrs: externalV2BulkPacketTestAddrs(senders),
+	}, auth, 1)
+	defer stopHello()
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := sendExternalV2BulkBlockPackets(ctx, &BlockSource{
+			Payload:     bytes.NewReader(payload),
+			PayloadSize: int64(len(payload)),
+		}, externalV2BulkPacketPath{
+			Conns: []net.PacketConn{conn},
+			Addrs: externalV2BulkPacketTestAddrs(receivers),
+		}, auth, nil)
+		resultCh <- err
+	}()
+
+	select {
+	case <-conn.started:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("top-level sender did not start WriteTo")
+	}
+	cancel()
+	select {
+	case err := <-resultCh:
+		for name, target := range map[string]error{
+			"blocked write":      errTestBulkPacketBlockedWrite,
+			"write deadline":     errTestBulkPacketSetWriteDeadline,
+			"generic deadline":   errTestBulkPacketSetDeadline,
+			"unreusable cleanup": errTestBulkPacketCleanupState,
+		} {
+			if !errors.Is(err, target) {
+				t.Errorf("sendExternalV2BulkBlockPackets() error = %v, missing %s error %v", err, name, target)
+			}
+		}
+	case <-time.After(500 * time.Millisecond):
+		conn.forceClose()
+		<-resultCh
+		t.Fatal("top-level sender remained blocked after deadline setters failed")
+	}
+}
+
+func TestExternalV2BulkPacketTopLevelInterruptsInitialSendOnPostHelloWorkerError(t *testing.T) {
+	senders, receivers := listenExternalV2BulkPacketTestConns(t, 1)
+	payload := bytes.Repeat([]byte{0x5a}, externalV2BulkPacketPayloadSize)
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := newPostHelloWorkerFailureBulkPacketConn(senders[0])
+	defer conn.forceClose()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stopHello := startExternalV2BulkPacketHelloLoop(ctx, externalV2BulkPacketPath{
+		Conns: receivers,
+		Addrs: externalV2BulkPacketTestAddrs(senders),
+	}, auth, 1)
+	defer stopHello()
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := sendExternalV2BulkBlockPackets(ctx, &BlockSource{
+			Payload:     bytes.NewReader(payload),
+			PayloadSize: int64(len(payload)),
+		}, externalV2BulkPacketPath{
+			Conns: []net.PacketConn{conn},
+			Addrs: externalV2BulkPacketTestAddrs(receivers),
+		}, auth, nil)
+		resultCh <- err
+	}()
+
+	select {
+	case err := <-resultCh:
+		if !errors.Is(err, errTestBulkPacketPostHelloReadDeadline) {
+			t.Errorf("sendExternalV2BulkBlockPackets() error = %v, missing post-HELLO worker error", err)
+		}
+		if !errors.Is(err, errTestBulkPacketPostHelloWriteInterrupted) {
+			t.Errorf("sendExternalV2BulkBlockPackets() error = %v, missing interrupted write error", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		conn.forceClose()
+		cancel()
+		<-resultCh
+		t.Fatal("top-level sender did not interrupt the initial write after a post-HELLO worker error")
+	}
+}
+
+func TestExternalV2BulkPacketSendStatsUseExactRepairCounters(t *testing.T) {
+	stats := externalV2BulkPacketSendStats(
+		4096,
+		4096,
+		4608,
+		1,
+		512,
+		2,
+		1,
+		1000,
+		true,
+	)
+	if stats.Retransmits != 1 {
+		t.Fatalf("Retransmits = %d, want 1", stats.Retransmits)
+	}
+	if stats.Diagnostics.RepairBytes != 512 {
+		t.Fatalf("RepairBytes = %d, want 512", stats.Diagnostics.RepairBytes)
+	}
+	if stats.Diagnostics.RepairRequests != 2 {
+		t.Fatalf("RepairRequests = %d, want 2", stats.Diagnostics.RepairRequests)
+	}
+	if stats.Diagnostics.DirectPacketBytes != 4608 {
+		t.Fatalf("DirectPacketBytes = %d, want 4608", stats.Diagnostics.DirectPacketBytes)
+	}
+	if stats.Diagnostics.DirectCommittedBytes != 4096 {
+		t.Fatalf("DirectCommittedBytes = %d, want 4096", stats.Diagnostics.DirectCommittedBytes)
+	}
+	if stats.Diagnostics.ControllerDecision != "" || stats.Diagnostics.ControllerReason != "" {
+		t.Fatalf("terminal controller event = %q/%q, want empty", stats.Diagnostics.ControllerDecision, stats.Diagnostics.ControllerReason)
+	}
+}
+
+func TestExternalV2BulkPacketSendStatsPreservePartialProgressOnError(t *testing.T) {
+	stats := externalV2BulkPacketSendStats(
+		4096,
+		1358,
+		1870,
+		1,
+		512,
+		2,
+		1,
+		850,
+		false,
+	)
+	if stats.BytesSent != 1358 {
+		t.Fatalf("BytesSent = %d, want 1358", stats.BytesSent)
+	}
+	if stats.Retransmits != 1 {
+		t.Fatalf("Retransmits = %d, want 1", stats.Retransmits)
+	}
+	if stats.Diagnostics.DirectPacketBytes != 1870 {
+		t.Fatalf("DirectPacketBytes = %d, want 1870", stats.Diagnostics.DirectPacketBytes)
+	}
+	if stats.Diagnostics.DirectCommittedBytes != 0 {
+		t.Fatalf("DirectCommittedBytes = %d, want 0", stats.Diagnostics.DirectCommittedBytes)
+	}
+}
+
+func TestExternalV2BulkPacketSenderPublishesControllerBeforeCompletion(t *testing.T) {
+	start := time.Unix(230, 0)
+	var out bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(start, rec, transfertrace.RoleSend)
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, string(StateDirect))
+	sender := &externalV2BulkPacketSender{
+		metrics:    metrics,
+		laneCount:  8,
+		pacer:      rate.NewLimiter(externalV2BulkPacketRateLimit(1000), externalV2BulkPacketPaceBurstBytes),
+		controller: newExternalV2BulkPacketController(),
+	}
+	sender.currentPaceMbps.Store(1000)
+	sender.publishControllerDiagnostics(start, externalV2BulkPacketControllerDecision{
+		TargetMbps: 1000,
+		Action:     "hold",
+		Reason:     "initial-target",
+	})
+	sender.repairPackets.Store(12)
+	sender.repairPayloadBytes.Store(16_296)
+	sender.repairRequests.Store(3)
+	sender.publishControllerDiagnostics(start.Add(600*time.Millisecond), externalV2BulkPacketControllerDecision{
+		TargetMbps: 850,
+		Action:     "decrease",
+		Reason:     "repair-pressure",
+	})
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := readTransferTraceRows(t, out.String())
+	if len(rows) != 2 ||
+		rows[0]["rate_target_mbps"] != "1000" ||
+		rows[1]["rate_target_mbps"] != "850" ||
+		rows[1]["controller_decision"] != "decrease" ||
+		rows[1]["retransmits"] != "12" ||
+		rows[1]["repair_bytes"] != "16296" {
+		t.Fatalf("controller rows = %#v", rows)
+	}
+}
+
+func TestExternalV2BulkPacketControllerPublishDoesNotDoubleCountPacketProgress(t *testing.T) {
+	const successfulPayload = int64(externalV2BulkPacketPayloadSize)
+	metrics := newExternalTransferMetrics(time.Unix(231, 0))
+	sender := &externalV2BulkPacketSender{
+		metrics:   metrics,
+		laneCount: 1,
+	}
+	sender.sentPayload.Store(successfulPayload)
+
+	// Reproduce the dangerous sendPacket interleaving: the sender counters have
+	// advanced, the controller publishes, then RecordDirectPacketSend runs.
+	sender.publishControllerDiagnostics(time.Unix(231, 0), externalV2BulkPacketControllerDecision{
+		TargetMbps: 1000,
+		Action:     "hold",
+		Reason:     "healthy-delivery",
+	})
+	metrics.RecordDirectPacketSend(successfulPayload, time.Unix(231, int64(time.Millisecond)))
+
+	metrics.mu.Lock()
+	directPacketBytes := metrics.directPacketBytes
+	localSentBytes := metrics.localSentBytes
+	metrics.mu.Unlock()
+	if directPacketBytes > successfulPayload {
+		t.Fatalf("direct packet bytes = %d, exceed successful payload %d", directPacketBytes, successfulPayload)
+	}
+	if localSentBytes > successfulPayload {
+		t.Fatalf("local sent bytes = %d, exceed successful payload %d", localSentBytes, successfulPayload)
+	}
+}
 
 func TestExternalV2BulkPacketAuthMatchesTokenReceiverDERP(t *testing.T) {
 	senderDERP := key.NewNode().Public()
@@ -385,77 +912,6 @@ func TestExternalV2BulkPacketRepairLaneRotatesAwayFromPrimary(t *testing.T) {
 	}
 }
 
-func TestExternalV2BulkPacketBackoffMbpsClampsToMinimum(t *testing.T) {
-	if got, want := externalV2BulkPacketBackoffMbps(800), int64(680); got != want {
-		t.Fatalf("backoff from 800 = %d, want %d", got, want)
-	}
-	if got, want := externalV2BulkPacketBackoffMbps(140), int64(externalV2BulkPacketMinPaceMbps); got != want {
-		t.Fatalf("backoff near minimum = %d, want %d", got, want)
-	}
-	if got, want := externalV2BulkPacketBackoffMbps(20), int64(externalV2BulkPacketMinPaceMbps); got != want {
-		t.Fatalf("backoff below minimum = %d, want %d", got, want)
-	}
-}
-
-func TestExternalV2BulkPacketBackoffPaceUpdatesLimiter(t *testing.T) {
-	var current atomic.Int64
-	var lastBackoff atomic.Int64
-	current.Store(externalV2BulkPacketPaceMbps)
-	pacer := rate.NewLimiter(externalV2BulkPacketRateLimit(externalV2BulkPacketPaceMbps), externalV2BulkPacketPaceBurst)
-
-	if got, want := externalV2BulkPacketPaceMbps, 1000; got != want {
-		t.Fatalf("initial pace = %d, want %d", got, want)
-	}
-	externalV2BulkPacketBackoffPace(pacer, &current, &lastBackoff)
-	if got, want := current.Load(), int64(850); got != want {
-		t.Fatalf("current pace after first backoff = %d, want %d", got, want)
-	}
-	if got, want := pacer.Limit(), externalV2BulkPacketRateLimit(850); got != want {
-		t.Fatalf("pacer limit after first backoff = %v, want %v", got, want)
-	}
-
-	externalV2BulkPacketBackoffPace(pacer, &current, &lastBackoff)
-	if got, want := current.Load(), int64(850); got != want {
-		t.Fatalf("current pace after immediate backoff = %d, want %d", got, want)
-	}
-
-	lastBackoff.Store(time.Now().Add(-externalV2BulkPacketPaceBackoff - time.Millisecond).UnixNano())
-	externalV2BulkPacketBackoffPace(pacer, &current, &lastBackoff)
-	if got, want := current.Load(), int64(722); got != want {
-		t.Fatalf("current pace after delayed backoff = %d, want %d", got, want)
-	}
-}
-
-func TestExternalV2BulkPacketRecoverPaceRaisesLimiterAfterQuietPeriod(t *testing.T) {
-	var current atomic.Int64
-	var lastPaceChange atomic.Int64
-	current.Store(680)
-	lastPaceChange.Store(time.Now().Add(-externalV2BulkPacketPaceRecovery - time.Millisecond).UnixNano())
-	pacer := rate.NewLimiter(externalV2BulkPacketRateLimit(680), externalV2BulkPacketPaceBurst)
-
-	externalV2BulkPacketRecoverPace(pacer, &current, &lastPaceChange)
-	if got, want := current.Load(), int64(808); got != want {
-		t.Fatalf("current pace after quiet recovery = %d, want %d", got, want)
-	}
-	if got, want := pacer.Limit(), externalV2BulkPacketRateLimit(808); got != want {
-		t.Fatalf("pacer limit after quiet recovery = %v, want %v", got, want)
-	}
-
-	externalV2BulkPacketRecoverPace(pacer, &current, &lastPaceChange)
-	if got, want := current.Load(), int64(808); got != want {
-		t.Fatalf("current pace after immediate recovery = %d, want %d", got, want)
-	}
-}
-
-func TestExternalV2BulkPacketBackoffRequiresDenseMissingBatch(t *testing.T) {
-	if externalV2BulkPacketShouldBackoffForMissing(externalV2BulkPacketBackoffMissing - 1) {
-		t.Fatal("sparse missing batch triggered rate backoff")
-	}
-	if !externalV2BulkPacketShouldBackoffForMissing(externalV2BulkPacketBackoffMissing) {
-		t.Fatal("dense missing batch did not trigger rate backoff")
-	}
-}
-
 func listenExternalV2BulkPacketTestConns(t *testing.T, count int) ([]net.PacketConn, []net.PacketConn) {
 	t.Helper()
 	senders := make([]net.PacketConn, 0, count)
@@ -529,6 +985,256 @@ func (c *dropBulkControlPacketConn) WriteTo(p []byte, addr net.Addr) (int, error
 		return len(p), nil
 	}
 	return c.PacketConn.WriteTo(p, addr)
+}
+
+type shortWriteBulkPacketConn struct {
+	net.PacketConn
+}
+
+func (c shortWriteBulkPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	return len(p) - 1, nil
+}
+
+type deadlineBlockingBulkPacketConn struct {
+	net.PacketConn
+	started     chan struct{}
+	unblocked   chan struct{}
+	startOnce   sync.Once
+	unblockOnce sync.Once
+	mu          sync.Mutex
+	deadline    time.Time
+}
+
+type lifecycleBulkPacketConn struct {
+	net.PacketConn
+	started     chan struct{}
+	unblocked   chan struct{}
+	startOnce   sync.Once
+	unblockOnce sync.Once
+	mu          sync.Mutex
+	read        time.Time
+	write       time.Time
+}
+
+var errTestBulkPacketSetReadDeadline = errors.New("test bulk packet read deadline")
+
+var (
+	errTestBulkPacketSetWriteDeadline          = errors.New("test bulk packet write deadline")
+	errTestBulkPacketSetDeadline               = errors.New("test bulk packet generic deadline")
+	errTestBulkPacketBlockedWrite              = errors.New("test bulk packet blocked write")
+	errTestBulkPacketCleanupState              = errors.New("test bulk packet cleanup state")
+	errTestBulkPacketPostHelloReadDeadline     = errors.New("test bulk packet post-HELLO read deadline")
+	errTestBulkPacketPostHelloWriteInterrupted = errors.New("test bulk packet post-HELLO write interrupted")
+)
+
+type readDeadlineFailBulkPacketConn struct {
+	net.PacketConn
+	release     chan struct{}
+	releaseOnce sync.Once
+	readCalled  atomic.Bool
+}
+
+func (c *readDeadlineFailBulkPacketConn) ReadFrom(_ []byte) (int, net.Addr, error) {
+	c.readCalled.Store(true)
+	<-c.release
+	return 0, nil, net.ErrClosed
+}
+
+func (c *readDeadlineFailBulkPacketConn) SetReadDeadline(deadline time.Time) error {
+	if !deadline.IsZero() {
+		return errTestBulkPacketSetReadDeadline
+	}
+	return c.PacketConn.SetReadDeadline(deadline)
+}
+
+func (c *readDeadlineFailBulkPacketConn) forceReadReturn() {
+	c.releaseOnce.Do(func() { close(c.release) })
+}
+
+type deadlineFailureBulkPacketConn struct {
+	net.PacketConn
+	started   chan struct{}
+	unblocked chan struct{}
+	startOnce sync.Once
+	closeOnce sync.Once
+}
+
+func newDeadlineFailureBulkPacketConn(conn net.PacketConn) *deadlineFailureBulkPacketConn {
+	return &deadlineFailureBulkPacketConn{
+		PacketConn: conn,
+		started:    make(chan struct{}),
+		unblocked:  make(chan struct{}),
+	}
+}
+
+func (c *deadlineFailureBulkPacketConn) WriteTo(_ []byte, _ net.Addr) (int, error) {
+	c.startOnce.Do(func() { close(c.started) })
+	<-c.unblocked
+	return 0, errTestBulkPacketBlockedWrite
+}
+
+func (c *deadlineFailureBulkPacketConn) SetWriteDeadline(time.Time) error {
+	return errTestBulkPacketSetWriteDeadline
+}
+
+func (c *deadlineFailureBulkPacketConn) SetReadDeadline(deadline time.Time) error {
+	if deadline.IsZero() {
+		return errTestBulkPacketCleanupState
+	}
+	return c.PacketConn.SetReadDeadline(deadline)
+}
+
+func (c *deadlineFailureBulkPacketConn) SetDeadline(time.Time) error {
+	return errTestBulkPacketSetDeadline
+}
+
+func (c *deadlineFailureBulkPacketConn) Close() error {
+	var closeErr error
+	c.closeOnce.Do(func() {
+		close(c.unblocked)
+		closeErr = c.PacketConn.Close()
+	})
+	return closeErr
+}
+
+func (c *deadlineFailureBulkPacketConn) forceClose() {
+	_ = c.Close()
+}
+
+type postHelloWorkerFailureBulkPacketConn struct {
+	net.PacketConn
+	writeStarted chan struct{}
+	unblocked    chan struct{}
+	readCalls    atomic.Int64
+	startOnce    sync.Once
+	unblockOnce  sync.Once
+	closeOnce    sync.Once
+}
+
+func newPostHelloWorkerFailureBulkPacketConn(conn net.PacketConn) *postHelloWorkerFailureBulkPacketConn {
+	return &postHelloWorkerFailureBulkPacketConn{
+		PacketConn:   conn,
+		writeStarted: make(chan struct{}),
+		unblocked:    make(chan struct{}),
+	}
+}
+
+func (c *postHelloWorkerFailureBulkPacketConn) WriteTo(_ []byte, _ net.Addr) (int, error) {
+	c.startOnce.Do(func() { close(c.writeStarted) })
+	<-c.unblocked
+	return 0, errTestBulkPacketPostHelloWriteInterrupted
+}
+
+func (c *postHelloWorkerFailureBulkPacketConn) SetReadDeadline(deadline time.Time) error {
+	if deadline.IsZero() {
+		return c.PacketConn.SetReadDeadline(deadline)
+	}
+	if c.readCalls.Add(1) == 1 {
+		return c.PacketConn.SetReadDeadline(deadline)
+	}
+	<-c.writeStarted
+	return errTestBulkPacketPostHelloReadDeadline
+}
+
+func (c *postHelloWorkerFailureBulkPacketConn) SetWriteDeadline(deadline time.Time) error {
+	err := c.PacketConn.SetWriteDeadline(deadline)
+	if err == nil && !deadline.IsZero() {
+		c.unblockOnce.Do(func() { close(c.unblocked) })
+	}
+	return err
+}
+
+func (c *postHelloWorkerFailureBulkPacketConn) SetDeadline(deadline time.Time) error {
+	err := c.PacketConn.SetDeadline(deadline)
+	if err == nil && !deadline.IsZero() {
+		c.unblockOnce.Do(func() { close(c.unblocked) })
+	}
+	return err
+}
+
+func (c *postHelloWorkerFailureBulkPacketConn) Close() error {
+	var closeErr error
+	c.closeOnce.Do(func() {
+		c.unblockOnce.Do(func() { close(c.unblocked) })
+		closeErr = c.PacketConn.Close()
+	})
+	return closeErr
+}
+
+func (c *postHelloWorkerFailureBulkPacketConn) forceClose() {
+	_ = c.Close()
+}
+
+func newLifecycleBulkPacketConn(conn net.PacketConn) *lifecycleBulkPacketConn {
+	return &lifecycleBulkPacketConn{
+		PacketConn: conn,
+		started:    make(chan struct{}),
+		unblocked:  make(chan struct{}),
+	}
+}
+
+func (c *lifecycleBulkPacketConn) WriteTo(_ []byte, _ net.Addr) (int, error) {
+	c.startOnce.Do(func() { close(c.started) })
+	<-c.unblocked
+	return 0, context.DeadlineExceeded
+}
+
+func (c *lifecycleBulkPacketConn) SetReadDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	c.read = deadline
+	c.mu.Unlock()
+	return c.PacketConn.SetReadDeadline(deadline)
+}
+
+func (c *lifecycleBulkPacketConn) SetWriteDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	c.write = deadline
+	c.mu.Unlock()
+	err := c.PacketConn.SetWriteDeadline(deadline)
+	if err == nil && !deadline.IsZero() {
+		c.unblockOnce.Do(func() { close(c.unblocked) })
+	}
+	return err
+}
+
+func (c *lifecycleBulkPacketConn) SetDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	c.read = deadline
+	c.write = deadline
+	c.mu.Unlock()
+	err := c.PacketConn.SetDeadline(deadline)
+	if err == nil && !deadline.IsZero() {
+		c.unblockOnce.Do(func() { close(c.unblocked) })
+	}
+	return err
+}
+
+func (c *lifecycleBulkPacketConn) deadlines() (time.Time, time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.read, c.write
+}
+
+func (c *deadlineBlockingBulkPacketConn) WriteTo(_ []byte, _ net.Addr) (int, error) {
+	c.startOnce.Do(func() { close(c.started) })
+	<-c.unblocked
+	return 0, context.DeadlineExceeded
+}
+
+func (c *deadlineBlockingBulkPacketConn) SetWriteDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	c.deadline = deadline
+	c.mu.Unlock()
+	if !deadline.IsZero() {
+		c.unblockOnce.Do(func() { close(c.unblocked) })
+	}
+	return nil
+}
+
+func (c *deadlineBlockingBulkPacketConn) writeDeadline() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.deadline
 }
 
 type dropPrimaryBulkDataPacketConn struct {

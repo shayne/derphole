@@ -303,7 +303,7 @@ func externalTransportManagerConfig(
 
 func configureExternalDirectTransport(cfg *transport.ManagerConfig, conn net.PacketConn, dm *tailcfg.DERPMap, pm publicPortmap, localCandidates []net.Addr) {
 	stunPackets := make(chan traversal.STUNPacket, 256)
-	tuneExternalPacketConn(conn)
+	_ = tuneExternalPacketConn(conn)
 	cfg.DirectConn = conn
 	cfg.DirectBatchConn = publicDirectBatchConn(conn)
 	cfg.HandleSTUNPacket = func(payload []byte, addr net.Addr) {
@@ -318,17 +318,6 @@ func configureExternalDirectTransport(cfg *transport.ManagerConfig, conn net.Pac
 	}
 	cfg.CandidateSource = publicCandidateSource(conn, dm, pm, localCandidates, stunPackets)
 }
-
-func tuneExternalPacketConn(conn net.PacketConn) {
-	const socketBufferBytes = 8 << 20
-	if setter, ok := conn.(interface{ SetReadBuffer(int) error }); ok {
-		_ = setter.SetReadBuffer(socketBufferBytes)
-	}
-	if setter, ok := conn.(interface{ SetWriteBuffer(int) error }); ok {
-		_ = setter.SetWriteBuffer(socketBufferBytes)
-	}
-}
-
 func publicDirectBatchConn(conn net.PacketConn) transport.DirectBatchConn {
 	udpConn, ok := conn.(*net.UDPConn)
 	if !ok {

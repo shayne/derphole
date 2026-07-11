@@ -45,6 +45,34 @@ Normal public-path runs leave `DERPHOLE_BENCH_PARALLEL` unset. Set it only for a
 
 The primary pass condition is eric-nuc Mac -> remote derphole average within 10-15 percent of same-run `iperf3`, with zero steady direct-phase `transfertracecheck` stalls over 1s. The other hosts must not regress against the July 2 baseline matrix.
 
+### Throughput clocks
+
+The promotion footer separates three clocks:
+
+- `benchmark-transfer-elapsed-ms` is the receiver-anchored interval from first payload byte through committed completion. `benchmark-goodput-mbps` and summary `mbps` are verified payload bytes divided by this clock.
+- `benchmark-command-duration-ms` starts immediately before the active sender command and stops after both transfer processes exit. `benchmark-wall-goodput-mbps` uses this clock and includes command setup and teardown, but excludes postflight.
+- `benchmark-total-duration-ms` continues through log and trace collection, SHA and size checks, direct-path checks, and leak validation. It is operational duration, not a throughput denominator.
+
+Accepted derphole rows require the rounded `benchmark-goodput-mbps` footer to equal `transfertracecheck sender_mbps`. The public summary records canonical and wall rates, their same-run iperf ratios, all three timing operands, trace status, maximum peer queue depth, and maximum flatline.
+
+Benchmark binaries are installed under a unique remote run directory. `DERPHOLE_REMOTE_BIN_DIR` selects a writable executable root; the harness still appends a unique run directory and removes it during cleanup. The benchmark must never replace a managed binary at a stable path.
+
+### Bulk-packet pacing diagnostics
+
+Bulk-packet pace targets are aggregate IPv4-wire Mbps. A full packet carries 1,358 payload bytes in a 1,400-byte UDP datagram and costs 1,428 bytes after IPv4 and UDP headers. `rate_target_mbps` is the current target; `direct_rate_selected_mbps` is the 1,000 Mbps starting policy.
+
+The controller samples every 500 ms. An accepted primary sample contains at least 8 MiB of primary wire traffic. Backoff requires usable peer progress, repair of at least 2 percent, and receiver-confirmed delivery below 90 percent of the current target in two consecutive accepted pressure samples. The first holds with `repair-pressure-pending`; above the 128 Mbps floor, the second sets the target to integer 85 percent of its current value. That second sample chooses the exact decrease reason: `hard-repair-pressure` when its repair ratio is at least 8 percent, otherwise `repair-and-delivery-drop`. At the floor it holds as `minimum`.
+
+The pending-pressure count clears after a counter reset, after an accepted sample without usable peer progress, after an accepted peer-ready sample with repair below 2 percent or delivery at least 90 percent of the target, and after a decrease. An `insufficient-wire-sample` observation neither advances nor clears the count; its primary traffic continues accumulating toward the next accepted sample.
+
+A decrease loads a four-window cooldown. Repair of at least 2 percent with healthy delivery always holds as `repair-hold`, consuming one cooldown window when one remains. With repair below 2 percent, an active cooldown holds as `backoff-cooldown` and consumes one window. A pending pressure sample does not consume cooldown, and a second consecutive pressure sample may decrease the target again before cooldown expires. Once cooldown is clear, clean delivery below 2 percent repair increases the target by 64 Mbps up to the ceiling; low-repair delivery below 90 percent holds as `receiver-limited`.
+
+The controller also uses the exact guard reasons `initial-target`, `counter-reset`, `insufficient-wire-sample`, `awaiting-peer-progress`, `ceiling`, and `minimum`. Repair percentage is repair IPv4-wire bytes divided by primary plus repair IPv4-wire bytes for the accepted sample.
+
+Use the cumulative `retransmits`, `repair_requests`, and `repair_bytes` counters with the target and reason. Do not infer a decision from the final trace row alone; controller state must be present in non-terminal rows.
+
+Verbose `v2-raw-direct-socket-buffer` lines report the 8 MiB request and, for each opened lane, the raw receive and write values returned by `getsockopt(SO_RCVBUF)` and `getsockopt(SO_SNDBUF)`. The line also reports whether either set operation or the inspection failed. Linux may report a doubled kernel accounting value; preserve the returned number when comparing hosts.
+
 ## Interactive Latency Harness
 
 Use `cmd/derpssh-latency` when tuning interactive terminal latency. It compares a standard SSH line-echo baseline against derptun mux echo over the same SSH carrier, then writes machine-readable artifacts for agent feedback loops.

@@ -34,20 +34,12 @@ const (
 	externalV2BulkPacketActiveRepair      = 100 * time.Millisecond
 	externalV2BulkPacketActiveRepairTrail = 8192
 	externalV2BulkPacketRepairSkip        = 250 * time.Millisecond
-	externalV2BulkPacketPaceBackoff       = 500 * time.Millisecond
-	externalV2BulkPacketBackoffMissing    = 256
 	externalV2BulkPacketDoneRepeats       = 5
 	externalV2BulkPacketMaxMissing        = 300
 	externalV2BulkPacketMissingLookahead  = 4096
 	externalV2BulkPacketDataQueue         = 4096
 	externalV2BulkPacketRepairQueue       = 1024
 	externalV2BulkPacketReceiveGroupBytes = 64 << 10
-	externalV2BulkPacketPaceMbps          = 1000
-	externalV2BulkPacketPaceCeilingMbps   = 2400
-	externalV2BulkPacketMinPaceMbps       = 128
-	externalV2BulkPacketPaceRecovery      = 500 * time.Millisecond
-	externalV2BulkPacketPaceRecoveryStep  = 128
-	externalV2BulkPacketPaceBurst         = 512 << 10
 )
 
 const (
@@ -121,27 +113,40 @@ func sendExternalV2BulkBlockPackets(ctx context.Context, src *BlockSource, path 
 		return externalDirectTransferStats{}, err
 	}
 
-	sender := newExternalV2BulkPacketSender(ctx, src, path, auth, metrics)
 	sendCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	sender := newExternalV2BulkPacketSender(sendCtx, src, path, auth, metrics)
+	writeDeadlineDone := startExternalV2BulkPacketWriteDeadlineCancel(sendCtx, path)
 
 	missingCh := make(chan []uint32, externalV2BulkPacketRepairQueue)
 	doneCh := make(chan struct{}, 1)
 	helloCh := make(chan struct{}, 1)
-	var repairRequests atomic.Int64
-	startExternalV2BulkPacketControlReaders(sendCtx, path, auth, sender.runID, sender.totalPackets, missingCh, doneCh, helloCh, &repairRequests)
-	if err := waitExternalV2BulkPacketHello(ctx, helloCh); err != nil {
-		return sender.stats(0), err
+	workerErrCh := make(chan error, len(path.Conns)+1)
+	controlDone := startExternalV2BulkPacketControlReaders(sendCtx, path, auth, sender.runID, sender.totalPackets, missingCh, doneCh, helloCh, workerErrCh, &sender.repairRequests)
+	if err := waitExternalV2BulkPacketHello(ctx, helloCh, workerErrCh); err != nil {
+		cancel()
+		deadlineErr := <-writeDeadlineDone
+		<-controlDone
+		cleanupErr := clearExternalV2BulkPacketDeadlines(path)
+		return sender.stats(false), errors.Join(err, deadlineErr, cleanupErr)
 	}
 
+	controllerDone := sender.startController(sendCtx)
 	repairActivityCh := make(chan struct{}, 1)
-	repairErrCh := make(chan error, 1)
-	sender.startRepairWorker(sendCtx, missingCh, repairActivityCh, repairErrCh)
+	repairDone := sender.startRepairWorker(sendCtx, missingCh, repairActivityCh, workerErrCh)
 
-	if err := sender.sendInitialPackets(); err != nil {
-		return sender.stats(repairRequests.Load()), err
+	err := sender.sendInitialPacketsUntilWorkerFailure(sendCtx, cancel, workerErrCh)
+	committed := false
+	if err == nil {
+		err = sender.waitForCompletion(doneCh, repairActivityCh, workerErrCh)
+		committed = err == nil
 	}
-	return sender.waitForCompletion(doneCh, repairActivityCh, repairErrCh, &repairRequests)
+	cancel()
+	deadlineErr := <-writeDeadlineDone
+	<-controllerDone
+	<-repairDone
+	<-controlDone
+	cleanupErr := clearExternalV2BulkPacketDeadlines(path)
+	return sender.stats(committed), errors.Join(err, deadlineErr, cleanupErr)
 }
 
 func validateExternalV2BulkPacketSender(src *BlockSource, path externalV2BulkPacketPath, auth externalV2BulkPacketAuth) error {
@@ -157,24 +162,105 @@ func validateExternalV2BulkPacketSender(src *BlockSource, path externalV2BulkPac
 	return nil
 }
 
+func startExternalV2BulkPacketWriteDeadlineCancel(ctx context.Context, path externalV2BulkPacketPath) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		defer close(done)
+		<-ctx.Done()
+		done <- interruptExternalV2BulkPacketWrites(path, time.Now())
+	}()
+	return done
+}
+
+func interruptExternalV2BulkPacketWrites(path externalV2BulkPacketPath, deadline time.Time) error {
+	var errs []error
+	for lane, conn := range path.Conns {
+		writeErr := conn.SetWriteDeadline(deadline)
+		if writeErr == nil {
+			continue
+		}
+		deadlineErr := conn.SetDeadline(deadline)
+		if deadlineErr == nil {
+			continue
+		}
+		closeErr := conn.Close()
+		errs = append(errs, fmt.Errorf("bulk packet lane %d could not interrupt writes: %w", lane, errors.Join(
+			fmt.Errorf("set write deadline: %w", writeErr),
+			fmt.Errorf("set generic deadline: %w", deadlineErr),
+			wrapExternalV2BulkPacketCloseError(closeErr),
+		)))
+	}
+	return errors.Join(errs...)
+}
+
+func clearExternalV2BulkPacketDeadlines(path externalV2BulkPacketPath) error {
+	var errs []error
+	for lane, conn := range path.Conns {
+		if err := clearExternalV2BulkPacketConnDeadlines(conn); err != nil {
+			errs = append(errs, fmt.Errorf("bulk packet lane %d deadline cleanup: %w", lane, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func clearExternalV2BulkPacketConnDeadlines(conn net.PacketConn) error {
+	zero := time.Time{}
+	readErr := conn.SetReadDeadline(zero)
+	writeErr := conn.SetWriteDeadline(zero)
+	if readErr == nil && writeErr == nil {
+		return nil
+	}
+	deadlineErr := conn.SetDeadline(zero)
+	if deadlineErr == nil {
+		return nil
+	}
+	closeErr := conn.Close()
+	return errors.Join(
+		wrapExternalV2BulkPacketDeadlineError("clear read deadline", readErr),
+		wrapExternalV2BulkPacketDeadlineError("clear write deadline", writeErr),
+		fmt.Errorf("clear generic deadline: %w", deadlineErr),
+		wrapExternalV2BulkPacketCloseError(closeErr),
+	)
+}
+
+func wrapExternalV2BulkPacketDeadlineError(action string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", action, err)
+}
+
+func wrapExternalV2BulkPacketCloseError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("close connection: %w", err)
+}
+
 type externalV2BulkPacketSender struct {
-	ctx             context.Context
-	src             *BlockSource
-	path            externalV2BulkPacketPath
-	auth            externalV2BulkPacketAuth
-	metrics         *externalTransferMetrics
-	runID           uint64
-	totalPackets    uint32
-	laneCount       int
-	pacer           *rate.Limiter
-	sentPackets     atomic.Uint64
-	sentPayload     atomic.Int64
-	currentPaceMbps atomic.Int64
-	lastBackoff     atomic.Int64
-	lastRecovery    atomic.Int64
+	ctx                 context.Context
+	src                 *BlockSource
+	path                externalV2BulkPacketPath
+	auth                externalV2BulkPacketAuth
+	metrics             *externalTransferMetrics
+	runID               uint64
+	totalPackets        uint32
+	laneCount           int
+	pacer               *rate.Limiter
+	controller          *externalV2BulkPacketController
+	sentPackets         atomic.Uint64
+	sentPayload         atomic.Int64
+	primaryPayloadBytes atomic.Int64
+	primaryWireBytes    atomic.Int64
+	repairWireBytes     atomic.Int64
+	repairPackets       atomic.Int64
+	repairPayloadBytes  atomic.Int64
+	repairRequests      atomic.Int64
+	currentPaceMbps     atomic.Int64
 }
 
 func newExternalV2BulkPacketSender(ctx context.Context, src *BlockSource, path externalV2BulkPacketPath, auth externalV2BulkPacketAuth, metrics *externalTransferMetrics) *externalV2BulkPacketSender {
+	controller := newExternalV2BulkPacketController()
 	sender := &externalV2BulkPacketSender{
 		ctx:          ctx,
 		src:          src,
@@ -184,10 +270,13 @@ func newExternalV2BulkPacketSender(ctx context.Context, src *BlockSource, path e
 		runID:        randomExternalV2BulkPacketRunID(),
 		totalPackets: externalV2BulkPacketCount(src.PayloadSize),
 		laneCount:    min(len(path.Conns), len(path.Addrs)),
-		pacer:        rate.NewLimiter(externalV2BulkPacketRateLimit(externalV2BulkPacketPaceMbps), externalV2BulkPacketPaceBurst),
+		pacer: rate.NewLimiter(
+			externalV2BulkPacketRateLimit(externalV2BulkPacketInitialWireMbps),
+			externalV2BulkPacketPaceBurstBytes,
+		),
+		controller: controller,
 	}
-	sender.currentPaceMbps.Store(externalV2BulkPacketPaceMbps)
-	sender.lastRecovery.Store(time.Now().UnixNano())
+	sender.currentPaceMbps.Store(externalV2BulkPacketInitialWireMbps)
 	return sender
 }
 
@@ -196,14 +285,39 @@ func (s *externalV2BulkPacketSender) sendInitialPackets() error {
 		if err := s.ctx.Err(); err != nil {
 			return err
 		}
-		if err := s.sendPacket(index, externalV2BulkPacketPrimaryLane(index, s.laneCount)); err != nil {
+		if err := s.sendPacket(index, externalV2BulkPacketPrimaryLane(index, s.laneCount), false); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *externalV2BulkPacketSender) sendPacket(index uint32, lane int) error {
+func (s *externalV2BulkPacketSender) sendInitialPacketsUntilWorkerFailure(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	workerErrCh <-chan error,
+) error {
+	sendErrCh := make(chan error, 1)
+	go func() {
+		sendErrCh <- s.sendInitialPackets()
+	}()
+
+	select {
+	case err := <-sendErrCh:
+		return err
+	case workerErr := <-workerErrCh:
+		cancel()
+		return errors.Join(workerErr, <-sendErrCh)
+	case <-ctx.Done():
+		cancel()
+		return errors.Join(ctx.Err(), <-sendErrCh)
+	}
+}
+
+func (s *externalV2BulkPacketSender) sendPacket(index uint32, lane int, repair bool) error {
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
 	data, err := readExternalV2BulkPacketPayload(s.src, index)
 	if err != nil {
 		return err
@@ -218,28 +332,45 @@ func (s *externalV2BulkPacketSender) sendPacket(index uint32, lane int) error {
 	if err != nil {
 		return err
 	}
-	s.recoverPaceAfterQuietPeriod()
-	if err := s.pacer.WaitN(s.ctx, len(data)); err != nil {
+	wireBytes := externalV2BulkPacketIPv4WireBytes(len(packet))
+	if err := s.pacer.WaitN(s.ctx, wireBytes); err != nil {
 		return err
 	}
-	if _, err := s.path.Conns[lane].WriteTo(packet, s.path.Addrs[lane]); err != nil {
+	n, err := s.path.Conns[lane].WriteTo(packet, s.path.Addrs[lane])
+	if err != nil {
 		return err
+	}
+	if n != len(packet) {
+		return io.ErrShortWrite
 	}
 	s.sentPackets.Add(1)
 	s.sentPayload.Add(int64(len(data)))
+	if repair {
+		s.repairWireBytes.Add(int64(wireBytes))
+		s.repairPackets.Add(1)
+		s.repairPayloadBytes.Add(int64(len(data)))
+	} else {
+		s.primaryWireBytes.Add(int64(wireBytes))
+		s.primaryPayloadBytes.Add(int64(len(data)))
+	}
 	if s.metrics != nil {
 		s.metrics.RecordDirectPacketSend(int64(len(data)), time.Now())
 	}
 	return nil
 }
 
-func (s *externalV2BulkPacketSender) startRepairWorker(ctx context.Context, missingCh <-chan []uint32, repairActivityCh chan<- struct{}, repairErrCh chan<- error) {
+func (s *externalV2BulkPacketSender) startRepairWorker(ctx context.Context, missingCh <-chan []uint32, repairActivityCh chan<- struct{}, repairErrCh chan<- error) <-chan struct{} {
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		lastRepair := make(map[uint32]time.Time)
 		repairAttempt := make(map[uint32]uint64)
 		for {
 			select {
 			case missing := <-missingCh:
+				if ctx.Err() != nil {
+					return
+				}
 				sentRepair, err := s.repairMissing(missing, lastRepair, repairAttempt)
 				if err != nil {
 					offerExternalV2BulkPacketRepairError(repairErrCh, err)
@@ -253,6 +384,7 @@ func (s *externalV2BulkPacketSender) startRepairWorker(ctx context.Context, miss
 			}
 		}
 	}()
+	return done
 }
 
 func (s *externalV2BulkPacketSender) repairMissing(missing []uint32, lastRepair map[uint32]time.Time, repairAttempt map[uint32]uint64) (bool, error) {
@@ -264,10 +396,7 @@ func (s *externalV2BulkPacketSender) repairMissing(missing []uint32, lastRepair 
 		}
 		attempt := repairAttempt[index]
 		repairAttempt[index] = attempt + 1
-		if externalV2BulkPacketShouldBackoffForMissing(len(missing)) {
-			externalV2BulkPacketBackoffPace(s.pacer, &s.currentPaceMbps, &s.lastBackoff)
-		}
-		if err := s.sendPacket(index, externalV2BulkPacketRepairLane(index, s.laneCount, attempt)); err != nil {
+		if err := s.sendPacket(index, externalV2BulkPacketRepairLane(index, s.laneCount, attempt), true); err != nil {
 			return sentRepair, err
 		}
 		sentRepair = true
@@ -286,43 +415,98 @@ func (s *externalV2BulkPacketSender) shouldRepairMissing(index uint32, now time.
 	return true
 }
 
-func (s *externalV2BulkPacketSender) recoverPaceAfterQuietPeriod() {
-	lastBackoff := time.Unix(0, s.lastBackoff.Load())
-	if !lastBackoff.IsZero() && time.Since(lastBackoff) < externalV2BulkPacketPaceRecovery {
-		return
-	}
-	externalV2BulkPacketRecoverPace(s.pacer, &s.currentPaceMbps, &s.lastRecovery)
-}
-
-func (s *externalV2BulkPacketSender) waitForCompletion(doneCh <-chan struct{}, repairActivityCh <-chan struct{}, repairErrCh <-chan error, repairRequests *atomic.Int64) (externalDirectTransferStats, error) {
+func (s *externalV2BulkPacketSender) waitForCompletion(doneCh <-chan struct{}, repairActivityCh <-chan struct{}, repairErrCh <-chan error) error {
 	deadline := time.NewTimer(externalV2BulkPacketRepairWait)
 	defer deadline.Stop()
 	for {
 		select {
 		case <-doneCh:
-			return s.stats(repairRequests.Load()), nil
+			return nil
 		case err := <-repairErrCh:
-			return s.stats(repairRequests.Load()), err
+			return err
 		case <-repairActivityCh:
 			resetExternalV2BulkPacketTimer(deadline, externalV2BulkPacketRepairWait)
 		case <-deadline.C:
-			return s.stats(repairRequests.Load()), ErrPeerDisconnected
+			return ErrPeerDisconnected
 		case <-s.ctx.Done():
-			return s.stats(repairRequests.Load()), s.ctx.Err()
+			return s.ctx.Err()
 		}
 	}
 }
 
-func (s *externalV2BulkPacketSender) stats(repairRequests int64) externalDirectTransferStats {
+func (s *externalV2BulkPacketSender) stats(committed bool) externalDirectTransferStats {
 	return externalV2BulkPacketSendStats(
 		s.src.PayloadSize,
-		s.sentPackets.Load(),
-		s.totalPackets,
+		s.primaryPayloadBytes.Load(),
 		s.sentPayload.Load(),
-		repairRequests,
+		s.repairPackets.Load(),
+		s.repairPayloadBytes.Load(),
+		s.repairRequests.Load(),
 		s.laneCount,
 		int(s.currentPaceMbps.Load()),
+		committed,
 	)
+}
+
+func (s *externalV2BulkPacketSender) startController(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	s.observeController(time.Now())
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(externalV2BulkPacketControllerInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case at := <-ticker.C:
+				if ctx.Err() != nil {
+					return
+				}
+				s.observeController(at)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return done
+}
+
+func (s *externalV2BulkPacketSender) observeController(at time.Time) {
+	peer := s.metrics.PeerProgressSnapshot()
+	decision := s.controller.Observe(externalV2BulkPacketControllerSample{
+		At:                    at,
+		PrimaryWireBytes:      s.primaryWireBytes.Load(),
+		RepairWireBytes:       s.repairWireBytes.Load(),
+		PeerBytes:             peer.BytesReceived,
+		PeerTransferElapsedMS: peer.TransferElapsedMS,
+		PeerProgress:          peer.Set,
+	})
+	current := int(s.currentPaceMbps.Load())
+	if decision.TargetMbps != current {
+		s.currentPaceMbps.Store(int64(decision.TargetMbps))
+		s.pacer.SetLimitAt(at, externalV2BulkPacketRateLimit(decision.TargetMbps))
+	}
+	s.publishControllerDiagnostics(at, decision)
+}
+
+func (s *externalV2BulkPacketSender) publishControllerDiagnostics(
+	at time.Time,
+	decision externalV2BulkPacketControllerDecision,
+) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
+		RateSelectedMbps:   externalV2BulkPacketInitialWireMbps,
+		RateTargetMbps:     decision.TargetMbps,
+		RateCeilingMbps:    externalV2BulkPacketCeilingWireMbps,
+		ActiveLanes:        s.laneCount,
+		AvailableLanes:     s.laneCount,
+		ControllerDecision: decision.Action,
+		ControllerReason:   decision.Reason,
+		Retransmits:        s.repairPackets.Load(),
+		RepairRequests:     s.repairRequests.Load(),
+		RepairBytes:        s.repairPayloadBytes.Load(),
+	}, at)
 }
 
 func offerExternalV2BulkPacketRepairError(ch chan<- error, err error) {
@@ -611,16 +795,27 @@ func (a *externalV2BulkPacketReceiveAssembler) newGroup(groupID uint32) *externa
 	}
 }
 
-func startExternalV2BulkPacketControlReaders(ctx context.Context, path externalV2BulkPacketPath, auth externalV2BulkPacketAuth, runID uint64, totalPackets uint32, missingCh chan<- []uint32, doneCh chan<- struct{}, helloCh chan<- struct{}, repairRequests *atomic.Int64) {
+func startExternalV2BulkPacketControlReaders(ctx context.Context, path externalV2BulkPacketPath, auth externalV2BulkPacketAuth, runID uint64, totalPackets uint32, missingCh chan<- []uint32, doneCh chan<- struct{}, helloCh chan<- struct{}, errCh chan<- error, repairRequests *atomic.Int64) <-chan struct{} {
+	done := make(chan struct{})
+	var readers sync.WaitGroup
+	readers.Add(len(path.Conns))
 	for _, conn := range path.Conns {
-		go readExternalV2BulkPacketControlLoop(ctx, conn, auth, runID, totalPackets, missingCh, doneCh, helloCh, repairRequests)
+		go func(conn net.PacketConn) {
+			defer readers.Done()
+			readExternalV2BulkPacketControlLoop(ctx, conn, auth, runID, totalPackets, missingCh, doneCh, helloCh, errCh, repairRequests)
+		}(conn)
 	}
+	go func() {
+		readers.Wait()
+		close(done)
+	}()
+	return done
 }
 
-func readExternalV2BulkPacketControlLoop(ctx context.Context, conn net.PacketConn, auth externalV2BulkPacketAuth, runID uint64, totalPackets uint32, missingCh chan<- []uint32, doneCh chan<- struct{}, helloCh chan<- struct{}, repairRequests *atomic.Int64) {
+func readExternalV2BulkPacketControlLoop(ctx context.Context, conn net.PacketConn, auth externalV2BulkPacketAuth, runID uint64, totalPackets uint32, missingCh chan<- []uint32, doneCh chan<- struct{}, helloCh chan<- struct{}, errCh chan<- error, repairRequests *atomic.Int64) {
 	buf := make([]byte, externalV2BulkPacketMaxSize)
 	for {
-		header, payload, ok, stop := readExternalV2BulkPacketControl(ctx, conn, auth, buf)
+		header, payload, ok, stop := readExternalV2BulkPacketControl(ctx, conn, auth, buf, errCh)
 		if stop {
 			return
 		}
@@ -633,8 +828,8 @@ func readExternalV2BulkPacketControlLoop(ctx context.Context, conn net.PacketCon
 	}
 }
 
-func readExternalV2BulkPacketControl(ctx context.Context, conn net.PacketConn, auth externalV2BulkPacketAuth, buf []byte) (externalV2BulkPacketHeader, []byte, bool, bool) {
-	n, ok, stop := readExternalV2BulkPacketBytes(ctx, conn, buf, nil)
+func readExternalV2BulkPacketControl(ctx context.Context, conn net.PacketConn, auth externalV2BulkPacketAuth, buf []byte, errCh chan<- error) (externalV2BulkPacketHeader, []byte, bool, bool) {
+	n, ok, stop := readExternalV2BulkPacketBytes(ctx, conn, buf, errCh)
 	if !ok {
 		return externalV2BulkPacketHeader{}, nil, false, stop
 	}
@@ -686,12 +881,14 @@ func handleExternalV2BulkPacketDone(header externalV2BulkPacketHeader, runID uin
 	return true
 }
 
-func waitExternalV2BulkPacketHello(ctx context.Context, helloCh <-chan struct{}) error {
+func waitExternalV2BulkPacketHello(ctx context.Context, helloCh <-chan struct{}, errCh <-chan error) error {
 	timer := time.NewTimer(externalV2StreamOpenWait)
 	defer timer.Stop()
 	select {
 	case <-helloCh:
 		return nil
+	case err := <-errCh:
+		return err
 	case <-timer.C:
 		return ErrPeerDisconnected
 	case <-ctx.Done():
@@ -765,7 +962,12 @@ func readExternalV2BulkPacketData(ctx context.Context, conn net.PacketConn, auth
 }
 
 func readExternalV2BulkPacketBytes(ctx context.Context, conn net.PacketConn, buf []byte, errCh chan<- error) (int, bool, bool) {
-	_ = conn.SetReadDeadline(time.Now().Add(externalV2BulkPacketReadIdle))
+	if err := conn.SetReadDeadline(time.Now().Add(externalV2BulkPacketReadIdle)); err != nil {
+		if errCh != nil {
+			offerExternalV2BulkPacketRepairError(errCh, err)
+		}
+		return 0, false, true
+	}
 	n, _, err := conn.ReadFrom(buf)
 	if err == nil {
 		return n, true, false
@@ -975,83 +1177,6 @@ func externalV2BulkPacketRateLimit(mbps int) rate.Limit {
 	return rate.Limit(float64(mbps) * 1000 * 1000 / 8)
 }
 
-func externalV2BulkPacketShouldBackoffForMissing(missing int) bool {
-	return missing >= externalV2BulkPacketBackoffMissing
-}
-
-func externalV2BulkPacketBackoffPace(pacer *rate.Limiter, currentMbps *atomic.Int64, lastBackoff *atomic.Int64) {
-	now := time.Now()
-	for {
-		last := time.Unix(0, lastBackoff.Load())
-		if now.Sub(last) < externalV2BulkPacketPaceBackoff {
-			return
-		}
-		if lastBackoff.CompareAndSwap(last.UnixNano(), now.UnixNano()) {
-			break
-		}
-	}
-	for {
-		current := currentMbps.Load()
-		next := externalV2BulkPacketBackoffMbps(current)
-		if next >= current {
-			return
-		}
-		if currentMbps.CompareAndSwap(current, next) {
-			pacer.SetLimitAt(now, externalV2BulkPacketRateLimit(int(next)))
-			return
-		}
-	}
-}
-
-func externalV2BulkPacketBackoffMbps(current int64) int64 {
-	if current <= externalV2BulkPacketMinPaceMbps {
-		return externalV2BulkPacketMinPaceMbps
-	}
-	next := current * 85 / 100
-	if next < externalV2BulkPacketMinPaceMbps {
-		return externalV2BulkPacketMinPaceMbps
-	}
-	if next >= current {
-		return current - 1
-	}
-	return next
-}
-
-func externalV2BulkPacketRecoverPace(pacer *rate.Limiter, currentMbps *atomic.Int64, lastRecovery *atomic.Int64) {
-	now := time.Now()
-	for {
-		last := time.Unix(0, lastRecovery.Load())
-		if now.Sub(last) < externalV2BulkPacketPaceRecovery {
-			return
-		}
-		if lastRecovery.CompareAndSwap(last.UnixNano(), now.UnixNano()) {
-			break
-		}
-	}
-	for {
-		current := currentMbps.Load()
-		next := externalV2BulkPacketRecoverMbps(current)
-		if next <= current {
-			return
-		}
-		if currentMbps.CompareAndSwap(current, next) {
-			pacer.SetLimitAt(now, externalV2BulkPacketRateLimit(int(next)))
-			return
-		}
-	}
-}
-
-func externalV2BulkPacketRecoverMbps(current int64) int64 {
-	if current >= externalV2BulkPacketPaceCeilingMbps {
-		return externalV2BulkPacketPaceCeilingMbps
-	}
-	next := current + externalV2BulkPacketPaceRecoveryStep
-	if next > externalV2BulkPacketPaceCeilingMbps {
-		return externalV2BulkPacketPaceCeilingMbps
-	}
-	return next
-}
-
 func externalV2BulkPacketCount(sizeBytes int64) uint32 {
 	if sizeBytes <= 0 {
 		return 0
@@ -1075,29 +1200,35 @@ func randomExternalV2BulkPacketRunID() uint64 {
 	return binary.BigEndian.Uint64(b[:])
 }
 
-func externalV2BulkPacketSendStats(payloadSize int64, sentPackets uint64, totalPackets uint32, sentPayload int64, repairRequests int64, lanes int, paceMbps int) externalDirectTransferStats {
-	retransmits := int64(sentPackets)
-	if retransmits > int64(totalPackets) {
-		retransmits -= int64(totalPackets)
-	} else {
-		retransmits = 0
+func externalV2BulkPacketSendStats(
+	payloadSize int64,
+	primaryPayloadBytes int64,
+	directPacketBytes int64,
+	repairPackets int64,
+	repairBytes int64,
+	repairRequests int64,
+	lanes int,
+	paceMbps int,
+	committed bool,
+) externalDirectTransferStats {
+	committedBytes := int64(0)
+	if committed {
+		committedBytes = payloadSize
 	}
 	return externalDirectTransferStats{
-		BytesSent:   payloadSize,
-		Retransmits: retransmits,
+		BytesSent:   primaryPayloadBytes,
+		Retransmits: repairPackets,
 		Diagnostics: externalDirectTransferDiagnostics{
-			RateSelectedMbps:     paceMbps,
+			RateSelectedMbps:     externalV2BulkPacketInitialWireMbps,
 			RateTargetMbps:       paceMbps,
-			RateCeilingMbps:      externalV2BulkPacketPaceCeilingMbps,
+			RateCeilingMbps:      externalV2BulkPacketCeilingWireMbps,
 			ActiveLanes:          lanes,
 			AvailableLanes:       lanes,
-			ControllerDecision:   "bulk-packets",
-			ControllerReason:     "adaptive-paced-selective-repair",
-			Retransmits:          retransmits,
+			Retransmits:          repairPackets,
 			RepairRequests:       repairRequests,
-			RepairBytes:          sentPayload - payloadSize,
-			DirectPacketBytes:    sentPayload,
-			DirectCommittedBytes: payloadSize,
+			RepairBytes:          repairBytes,
+			DirectPacketBytes:    directPacketBytes,
+			DirectCommittedBytes: committedBytes,
 		},
 	}
 }

@@ -114,6 +114,12 @@ type externalDirectTransferDiagnostics struct {
 	ReceiverCommittedBytes     uint64
 }
 
+type externalPeerProgressSnapshot struct {
+	BytesReceived     int64
+	TransferElapsedMS int64
+	Set               bool
+}
+
 type externalTransferMetricsContextKey struct{}
 
 func newExternalTransferMetrics(startedAt time.Time) *externalTransferMetrics {
@@ -171,6 +177,19 @@ func (m *externalTransferMetrics) RecordPeerProgress(bytesReceived int64, transf
 	trace, snap, ok := m.updateTraceLocked(at)
 	m.mu.Unlock()
 	sampleExternalTransferTrace(trace, snap, ok)
+}
+
+func (m *externalTransferMetrics) PeerProgressSnapshot() externalPeerProgressSnapshot {
+	if m == nil {
+		return externalPeerProgressSnapshot{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return externalPeerProgressSnapshot{
+		BytesReceived:     m.peerReceivedBytes,
+		TransferElapsedMS: m.receiverTransferMS,
+		Set:               m.peerProgressSet,
+	}
 }
 
 func (m *externalTransferMetrics) MarkDirectValidated(at time.Time) {
@@ -427,6 +446,20 @@ func (m *externalTransferMetrics) SetDirectStatsWithoutByteProgress(stats extern
 	m.setDirectStats(stats, false)
 }
 
+func (m *externalTransferMetrics) SetDirectDiagnostics(
+	diagnostics externalDirectTransferDiagnostics,
+	at time.Time,
+) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.setDirectDiagnosticsLocked(diagnostics)
+	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
+	m.mu.Unlock()
+	recordExternalTransferTrace(trace, snap, ok)
+}
+
 func (m *externalTransferMetrics) setDirectStats(stats externalDirectTransferStats, updateDirectBytes bool) {
 	if m == nil {
 		return
@@ -444,7 +477,9 @@ func (m *externalTransferMetrics) setDirectStats(stats externalDirectTransferSta
 	if m.directBytes > 0 && m.firstByteAt.IsZero() {
 		m.firstByteAt = time.Now()
 	}
-	m.retransmitCount = stats.Retransmits
+	if stats.Retransmits > m.retransmitCount {
+		m.retransmitCount = stats.Retransmits
+	}
 	m.replayWindowBytes = stats.MaxReplayBytes
 	m.setDirectLocalSentLocked(stats, diagnostics)
 	m.setDirectDiagnosticsLocked(diagnostics)
@@ -742,25 +777,26 @@ func (m *externalTransferMetrics) setDirectControllerDiagnosticsLocked(diagnosti
 }
 
 func (m *externalTransferMetrics) setDirectCounterDiagnosticsLocked(diagnostics externalDirectTransferDiagnostics) {
-	if diagnostics.ReplayBytes > 0 {
+	if diagnostics.ReplayBytes > m.replayBytes {
 		m.replayBytes = diagnostics.ReplayBytes
 	}
-	if diagnostics.Retransmits > 0 {
+	if diagnostics.Retransmits > m.retransmitCount {
 		m.retransmitCount = diagnostics.Retransmits
 	}
-	if diagnostics.RepairRequests > 0 {
+	if diagnostics.RepairRequests > m.repairRequests {
 		m.repairRequests = diagnostics.RepairRequests
 	}
-	if diagnostics.RepairBytes > 0 {
+	if diagnostics.RepairBytes > m.repairBytes {
 		m.repairBytes = diagnostics.RepairBytes
 	}
-	if diagnostics.DirectPacketBytes > 0 {
+	if diagnostics.DirectPacketBytes > m.directPacketBytes {
 		m.directPacketBytes = diagnostics.DirectPacketBytes
 	}
-	if diagnostics.DirectCommittedBytes > 0 {
+	if diagnostics.DirectCommittedBytes > m.directCommittedBytes {
 		m.directCommittedBytes = diagnostics.DirectCommittedBytes
 	}
-	if diagnostics.ReceiverCommittedBytes > 0 && uint64ToInt64Saturating(diagnostics.ReceiverCommittedBytes) > m.directCommittedBytes {
+	if diagnostics.ReceiverCommittedBytes > 0 &&
+		uint64ToInt64Saturating(diagnostics.ReceiverCommittedBytes) > m.directCommittedBytes {
 		m.directCommittedBytes = uint64ToInt64Saturating(diagnostics.ReceiverCommittedBytes)
 	}
 }
