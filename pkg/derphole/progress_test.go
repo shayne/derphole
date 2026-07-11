@@ -83,6 +83,25 @@ func TestProgressReporterSetWithElapsedRunsCallbackWithThrottle(t *testing.T) {
 	}
 }
 
+func TestProgressReporterFinishUsesCompleteExternalElapsedForTimeAndRate(t *testing.T) {
+	start := time.Unix(0, 0)
+	now := start
+	prevProgressNow := progressNow
+	progressNow = func() time.Time { return now }
+	t.Cleanup(func() { progressNow = prevProgressNow })
+
+	var out bytes.Buffer
+	progress := NewProgressReporter(&out, 100*1024*1024)
+	progress.SetWithElapsed(100*1024*1024, 10*time.Second)
+	now = start.Add(20 * time.Second)
+	progress.Finish()
+
+	line := lastRawProgressLine(out.String())
+	if !strings.Contains(line, "[00:10<00:00, 10.0MiB/s]") {
+		t.Fatalf("final progress line = %q, want one receiver clock", line)
+	}
+}
+
 func TestProgressReporterFinishIgnoresStalePartialExternalElapsed(t *testing.T) {
 	start := time.Unix(0, 0)
 	now := start

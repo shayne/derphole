@@ -46,20 +46,23 @@ func externalV2RawDirectAllowUnverifiedFallback(ctx context.Context) bool {
 	return allow
 }
 
-func externalV2RawDirectActivateDirectPath(pathEmitter *transportPathEmitter, transportManager *transport.Manager, punchCancel context.CancelFunc) {
-	if pathEmitter != nil {
-		pathEmitter.SuppressRelayRegression()
-		pathEmitter.Emit(StateTryingDirect)
-	}
-	if transportManager != nil {
-		transportManager.StopDirectReads()
-	}
-	externalV2RawDirectStopPunchingForBlast(punchCancel)
-}
-
-func externalV2RawDirectStopPunchingForBlast(cancel context.CancelFunc) {
-	if cancel != nil {
-		cancel()
+func newExternalV2RawDirectActivation(pathEmitter *transportPathEmitter, manager *transport.Manager, cancels ...context.CancelFunc) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if pathEmitter != nil {
+				pathEmitter.SuppressRelayRegression()
+				pathEmitter.Emit(StateTryingDirect)
+			}
+			if manager != nil {
+				manager.StopDirectReads()
+			}
+			for _, cancel := range cancels {
+				if cancel != nil {
+					cancel()
+				}
+			}
+		})
 	}
 }
 

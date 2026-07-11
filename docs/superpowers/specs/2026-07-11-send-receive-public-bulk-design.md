@@ -80,7 +80,7 @@ The helper returns both the selected transfer mode and diagnostic inputs:
 - ignored Tailscale candidates
 - selected mode
 
-Verbose telemetry records those values so future reports can prove why a mode was chosen. Invalid candidate strings count as non-compact and force the conservative QUIC choice rather than silently steering the bulk policy.
+Verbose telemetry records those values so future reports can prove why a mode was chosen. Invalid candidate strings increment both the policy-candidate and invalid-candidate counters, and any nonzero invalid count forces the conservative QUIC choice rather than silently steering the bulk policy.
 
 No wire-mode names change. Peers still negotiate `blocks-v1` and `bulk-packets-v1` using existing capability fields. A peer without bulk-packet capability stays on QUIC blocks.
 

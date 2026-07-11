@@ -5,14 +5,60 @@
 package session
 
 import (
-	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/shayne/derphole/pkg/token"
 )
+
+type externalV2CompleteV1 struct {
+	Protocol      string `json:"protocol"`
+	BytesReceived int64  `json:"bytes_received"`
+}
+
+type externalV2CompleteEnvelopeV1 struct {
+	Type       string                `json:"type"`
+	MAC        string                `json:"mac,omitempty"`
+	V2Complete *externalV2CompleteV1 `json:"v2_complete,omitempty"`
+}
+
+func TestExternalV2CompleteAuthenticatedEnvelopeIsAcceptedByV1Schema(t *testing.T) {
+	auth := externalPeerControlAuth{EnvelopeKey: [32]byte{1, 2, 3}}
+	payload, err := marshalAuthenticatedEnvelope(envelope{
+		Type: envelopeV2Complete,
+		V2Complete: &externalV2Complete{
+			Protocol:      externalV2Protocol,
+			BytesReceived: 42,
+		},
+	}, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var oldEnvelope externalV2CompleteEnvelopeV1
+	if err := json.Unmarshal(payload, &oldEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	gotMAC := oldEnvelope.MAC
+	oldEnvelope.MAC = ""
+	oldPayload, err := json.Marshal(oldEnvelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mac := hmac.New(sha256.New, auth.EnvelopeKey[:])
+	mac.Write([]byte("envelope"))
+	mac.Write(oldPayload)
+	wantMAC := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	if !hmac.Equal([]byte(gotMAC), []byte(wantMAC)) {
+		t.Fatalf("v1 schema rejected authenticated v2_complete: got MAC %q, want %q; payload=%s old-payload=%s", gotMAC, wantMAC, payload, oldPayload)
+	}
+}
 
 func TestExternalV2TokenSupportsTransferV2(t *testing.T) {
 	tok := token.Token{Capabilities: token.CapabilityStdio | token.CapabilityTransferV2}
@@ -73,67 +119,105 @@ func TestExternalV2CopyBufferSizeMatchesLatencyFriendlyStripedChunk(t *testing.T
 	}
 }
 
-func TestExternalV2BlockTransferModePrefersBulkPacketsWhenBothPeersSupportIt(t *testing.T) {
-	payload := []byte("bulk packet capable")
-	var claim externalV2Claim
-	externalV2BlockSourceClaim(&BlockSource{
-		Payload:     bytes.NewReader(payload),
-		PayloadSize: int64(len(payload)),
-	}, &claim)
-	if !claim.BlockPacketCapable {
-		t.Fatal("claim BlockPacketCapable = false, want true")
-	}
-	if got := externalV2AcceptedBlockTransferMode(claim, true, nil); got != externalV2TransferModeBulkPackets {
-		t.Fatalf("accepted block mode = %q, want %q", got, externalV2TransferModeBulkPackets)
-	}
-	claim.Candidates = []string{
+func TestExternalV2BlockTransferPolicyUsesFileReceiverInBothTopologies(t *testing.T) {
+	compact := []string{
 		"203.0.113.20:20000",
 		"203.0.113.20:20001",
 		"203.0.113.20:20002",
 		"203.0.113.20:20003",
-		"203.0.113.20:20004",
 	}
-	compactAcceptCandidates := []string{
+	large := []string{
 		"203.0.113.10:10000",
 		"203.0.113.10:10001",
 		"203.0.113.10:10002",
 		"203.0.113.10:10003",
+		"203.0.113.10:10004",
 	}
-	if got := externalV2AcceptedBlockTransferMode(claim, true, compactAcceptCandidates); got != externalV2TransferModeBulkPackets {
-		t.Fatalf("accepted block mode for compact accept candidate set = %q, want %q", got, externalV2TransferModeBulkPackets)
-	}
-	claim.Candidates = []string{
-		"203.0.113.10:10000",
-		"203.0.113.10:10001",
-		"203.0.113.10:10002",
-		"203.0.113.10:10003",
-	}
-	if got := externalV2AcceptedBlockTransferMode(claim, true, claim.Candidates); got != externalV2TransferModeBulkPackets {
-		t.Fatalf("accepted block mode for compact public candidate set = %q, want %q", got, externalV2TransferModeBulkPackets)
-	}
-	claim.BlockPacketCapable = false
-	if got := externalV2AcceptedBlockTransferMode(claim, true, nil); got != externalV2TransferModeBlocks {
-		t.Fatalf("accepted block mode without packet support = %q, want %q", got, externalV2TransferModeBlocks)
-	}
-}
 
-func TestExternalV2BlockTransferModeKeepsQUICForPublicServerCandidateSet(t *testing.T) {
-	claim := externalV2Claim{
-		TransferMode:       externalV2TransferModeBlocks,
-		BlockSize:          1024,
-		BlockChunkSize:     externalV2DefaultBlockChunkSize,
-		BlockPacketCapable: true,
-		Candidates: []string{
-			"203.0.113.10:10000",
-			"203.0.113.10:10001",
-			"203.0.113.10:10002",
-			"203.0.113.10:10003",
-			"203.0.113.10:10004",
+	tests := []struct {
+		name             string
+		claim            externalV2Claim
+		acceptCandidates []string
+		wantReceiver     string
+		wantMode         string
+	}{
+		{
+			name: "receiver is claimant in send receive",
+			claim: externalV2Claim{
+				BlockCapable:       true,
+				BlockPacketCapable: true,
+				Candidates:         compact,
+			},
+			acceptCandidates: large,
+			wantReceiver:     "claimant",
+			wantMode:         externalV2TransferModeBulkPackets,
+		},
+		{
+			name: "receiver is acceptor in pipe listen",
+			claim: externalV2Claim{
+				TransferMode:       externalV2TransferModeBlocks,
+				BlockSize:          1024,
+				BlockChunkSize:     externalV2DefaultBlockChunkSize,
+				BlockPacketCapable: true,
+				Candidates:         large,
+			},
+			acceptCandidates: compact,
+			wantReceiver:     "acceptor",
+			wantMode:         externalV2TransferModeBulkPackets,
+		},
+		{
+			name: "tailscale noise does not change compact receiver",
+			claim: externalV2Claim{
+				BlockCapable:       true,
+				BlockPacketCapable: true,
+				Candidates: append(append([]string{}, compact...),
+					"100.91.76.77:30000", "[fd7a:115c:a1e0::1]:30001"),
+			},
+			acceptCandidates: large,
+			wantReceiver:     "claimant",
+			wantMode:         externalV2TransferModeBulkPackets,
+		},
+		{
+			name: "five public receiver candidates keep quic",
+			claim: externalV2Claim{
+				BlockCapable:       true,
+				BlockPacketCapable: true,
+				Candidates:         large,
+			},
+			acceptCandidates: compact,
+			wantReceiver:     "claimant",
+			wantMode:         externalV2TransferModeBlocks,
+		},
+		{
+			name: "invalid receiver candidate keeps quic",
+			claim: externalV2Claim{
+				BlockCapable:       true,
+				BlockPacketCapable: true,
+				Candidates:         append(append([]string{}, compact...), "not-an-addr-port"),
+			},
+			acceptCandidates: large,
+			wantReceiver:     "claimant",
+			wantMode:         externalV2TransferModeBlocks,
+		},
+		{
+			name: "missing packet capability keeps quic",
+			claim: externalV2Claim{
+				BlockCapable: true,
+				Candidates:   compact,
+			},
+			acceptCandidates: large,
+			wantReceiver:     "claimant",
+			wantMode:         externalV2TransferModeBlocks,
 		},
 	}
 
-	if got := externalV2AcceptedBlockTransferMode(claim, true, claim.Candidates); got != externalV2TransferModeBlocks {
-		t.Fatalf("accepted block mode for public server candidate set = %q, want %q", got, externalV2TransferModeBlocks)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := externalV2AcceptedBlockTransferPolicy(tt.claim, true, tt.acceptCandidates)
+			if got.Receiver != tt.wantReceiver || got.Mode != tt.wantMode {
+				t.Fatalf("policy = %#v, want receiver=%q mode=%q", got, tt.wantReceiver, tt.wantMode)
+			}
+		})
 	}
 }
 

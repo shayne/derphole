@@ -90,6 +90,7 @@ run_derphole_forward_sample() {
   -u DERPHOLE_V2_RAW_DIRECT_BUDGET_MS \
   -u DERPHOLE_V2_MANAGER_QUIC_FANOUT \
   DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 \
+  DERPHOLE_BENCH_WORKLOAD=file \
   DERPHOLE_BENCH_DIRECTION="${direction}" \
   DERPHOLE_BENCH_LOG_DIR="${case_log_dir}" \
   DERPHOLE_BENCH_REMOTE_OUTPUT_ROOT="${remote_output_root}/${host_label}/run-${run}" \
@@ -100,17 +101,19 @@ append_summary_row() {
   local host_label="$1"
   local run="$2"
   local tool="$3"
-  local mbps="$4"
-  local iperf_mbps="$5"
-  local trace_mbps="$6"
-  local wall_mbps="$7"
-  local transfer_elapsed_ms="$8"
-  local command_duration_ms="$9"
-  local total_duration_ms="${10}"
-  local trace_ok="${11}"
-  local max_queue="${12}"
-  local max_flatline="${13}"
-  local sample_log_dir="${14}"
+  local workload="$4"
+  local transfer_mode="$5"
+  local mbps="$6"
+  local iperf_mbps="$7"
+  local trace_mbps="$8"
+  local wall_mbps="$9"
+  local transfer_elapsed_ms="${10}"
+  local command_duration_ms="${11}"
+  local total_duration_ms="${12}"
+  local trace_ok="${13}"
+  local max_queue="${14}"
+  local max_flatline="${15}"
+  local sample_log_dir="${16}"
 
   python3 - \
     "${summary_csv}" \
@@ -118,6 +121,8 @@ append_summary_row() {
     "${run}" \
     "${tool}" \
     "${direction}" \
+    "${workload}" \
+    "${transfer_mode}" \
     "${mbps}" \
     "${iperf_mbps}" \
     "${trace_mbps}" \
@@ -138,6 +143,8 @@ import sys
     run,
     tool,
     direction,
+    workload,
+    transfer_mode,
     mbps,
     iperf_mbps,
     trace_mbps,
@@ -162,6 +169,8 @@ with open(path, "a", newline="") as fh:
         run,
         tool,
         direction,
+        workload,
+        transfer_mode,
         mbps,
         ratio,
         trace_mbps,
@@ -296,7 +305,7 @@ main() {
   local trace_failures=0
 
   mkdir -p "${log_dir}"
-  printf 'host,run,tool,direction,mbps,ratio_to_iperf,trace_mbps,wall_mbps,wall_ratio_to_iperf,transfer_elapsed_ms,command_duration_ms,total_duration_ms,trace_ok,max_peer_recv_queue_depth,max_flatline,log_dir\n' >"${summary_csv}"
+  printf 'host,run,tool,direction,workload,transfer_mode,mbps,ratio_to_iperf,trace_mbps,wall_mbps,wall_ratio_to_iperf,transfer_elapsed_ms,command_duration_ms,total_duration_ms,trace_ok,max_peer_recv_queue_depth,max_flatline,log_dir\n' >"${summary_csv}"
 
   read -r -a hosts <<<"${hosts_raw}"
   if [[ "${#hosts[@]}" -eq 0 ]]; then
@@ -329,6 +338,8 @@ main() {
       local transfer_elapsed_ms
       local command_duration_ms
       local total_duration_ms
+      local workload
+      local transfer_mode
       local trace_ok
       local trace_status=0
       local promotion_status=0
@@ -339,6 +350,8 @@ main() {
         "${host_label}" \
         "${run}" \
         "iperf3" \
+        "stream" \
+        "tcp" \
         "${iperf_mbps}" \
         "${iperf_mbps}" \
         "" "" "" "" "" "" "" "" \
@@ -358,6 +371,8 @@ main() {
       transfer_elapsed_ms="$(extract_benchmark_value "${promotion_out}" "benchmark-transfer-elapsed-ms")"
       command_duration_ms="$(extract_benchmark_value "${promotion_out}" "benchmark-command-duration-ms")"
       total_duration_ms="$(extract_benchmark_value "${promotion_out}" "benchmark-total-duration-ms")"
+      workload="$(extract_benchmark_value "${promotion_out}" "benchmark-workload" "unknown")"
+      transfer_mode="$(extract_benchmark_value "${promotion_out}" "benchmark-transfer-mode" "unknown")"
       if trace_summary="$(run_trace_checks "${case_log_dir}")"; then
         if [[ "${promotion_status}" -eq 0 ]]; then
           trace_ok="true"
@@ -374,7 +389,7 @@ main() {
         trace_ok="false"
         trace_status=1
       fi
-      append_summary_row "${host_label}" "${run}" "derphole" "${derphole_mbps}" "${iperf_mbps}" "${trace_sender_mbps}" "${wall_mbps}" "${transfer_elapsed_ms}" "${command_duration_ms}" "${total_duration_ms}" "${trace_ok}" "${max_queue}" "${max_flatline}" "${case_log_dir}"
+      append_summary_row "${host_label}" "${run}" "derphole" "${workload}" "${transfer_mode}" "${derphole_mbps}" "${iperf_mbps}" "${trace_sender_mbps}" "${wall_mbps}" "${transfer_elapsed_ms}" "${command_duration_ms}" "${total_duration_ms}" "${trace_ok}" "${max_queue}" "${max_flatline}" "${case_log_dir}"
       if [[ "${trace_status}" -ne 0 || "${promotion_status}" -ne 0 ]]; then
         trace_failures=1
       fi

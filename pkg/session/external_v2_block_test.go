@@ -354,7 +354,197 @@ func TestExternalV2BlockTransferUsesBulkPacketsOnRawDirect(t *testing.T) {
 	}
 }
 
-func TestExternalV2OfferBlockTransferRoundTrip(t *testing.T) {
+func TestExternalV2OfferReceiveRawDirectBulk(t *testing.T) {
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+
+	prevInterfaceAddrs := publicInterfaceAddrs
+	publicInterfaceAddrs = func() ([]net.Addr, error) {
+		return []net.Addr{
+			&net.IPNet{
+				IP:   net.IPv4(127, 0, 0, 1),
+				Mask: net.CIDRMask(8, 32),
+			},
+		}, nil
+	}
+	t.Cleanup(func() { publicInterfaceAddrs = prevInterfaceAddrs })
+
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	header := []byte("offer-header")
+	payload := bytes.Repeat([]byte("offer-block-payload"), 256)
+	sink := newGatedMemoryBlockSink(int64(len(payload)))
+	t.Cleanup(sink.releaseWrites)
+	var offerStatus syncBuffer
+	var receiveStatus syncBuffer
+	type progressSample struct {
+		bytesReceived     int64
+		transferElapsedMS int64
+	}
+	var progressMu sync.Mutex
+	var progressSamples []progressSample
+	progressCh := make(chan progressSample, 16)
+	receiverComplete := make(chan struct{})
+	releaseReceiver := make(chan struct{})
+	var releaseReceiverOnce sync.Once
+	releaseReceiverFn := func() { releaseReceiverOnce.Do(func() { close(releaseReceiver) }) }
+	t.Cleanup(releaseReceiverFn)
+	receiveEmitter := telemetry.WithStatusHook(
+		telemetry.New(&receiveStatus, telemetry.LevelVerbose),
+		func(status string) {
+			if status != string(StateComplete) {
+				return
+			}
+			close(receiverComplete)
+			<-releaseReceiver
+		},
+	)
+	tokenSink := make(chan string, 1)
+	offerErr := make(chan error, 1)
+	go func() {
+		_, err := Offer(ctx, OfferConfig{
+			TokenSink:     tokenSink,
+			Emitter:       telemetry.New(&offerStatus, telemetry.LevelVerbose),
+			UsePublicDERP: true,
+			Progress: func(bytesReceived int64, transferElapsedMS int64) {
+				sample := progressSample{bytesReceived: bytesReceived, transferElapsedMS: transferElapsedMS}
+				progressMu.Lock()
+				progressSamples = append(progressSamples, sample)
+				progressMu.Unlock()
+				progressCh <- sample
+			},
+			BlockSource: &BlockSource{
+				Header:      header,
+				Payload:     bytes.NewReader(payload),
+				PayloadSize: int64(len(payload)),
+				ChunkSize:   4,
+			},
+		})
+		offerErr <- err
+	}()
+
+	var raw string
+	select {
+	case raw = <-tokenSink:
+	case err := <-offerErr:
+		t.Fatalf("Offer() returned before token: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for token: %v", ctx.Err())
+	}
+
+	receiveErr := make(chan error, 1)
+	go func() {
+		receiveErr <- Receive(ctx, ReceiveConfig{
+			Token:         raw,
+			Emitter:       receiveEmitter,
+			UsePublicDERP: true,
+			BlockReceiver: func(_ context.Context, req BlockReceiveRequest) (BlockReceiveSink, error) {
+				if !bytes.Equal(req.Header, header) {
+					t.Errorf("block header = %q, want %q", string(req.Header), string(header))
+				}
+				if req.PayloadSize != int64(len(payload)) {
+					t.Errorf("payload size = %d, want %d", req.PayloadSize, len(payload))
+				}
+				return sink, nil
+			},
+		})
+	}()
+
+	select {
+	case <-sink.firstWrite:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for first receive write: %v", ctx.Err())
+	}
+	totalBytes := int64(len(header) + len(payload))
+	var partial progressSample
+	for partial.bytesReceived == 0 {
+		select {
+		case sample := <-progressCh:
+			if sample.bytesReceived > int64(len(header)) && sample.bytesReceived < totalBytes && sample.transferElapsedMS > 0 {
+				partial = sample
+			}
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for partial receiver-clock progress: %v", ctx.Err())
+		}
+	}
+	sink.releaseWrites()
+
+	select {
+	case <-receiverComplete:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for receiver completion status: %v", ctx.Err())
+	}
+	select {
+	case err := <-offerErr:
+		if err != nil {
+			t.Fatalf("Offer() error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for offer: %v", ctx.Err())
+	}
+	progressMu.Lock()
+	progressAtOfferReturn := append([]progressSample(nil), progressSamples...)
+	progressMu.Unlock()
+	releaseReceiverFn()
+	select {
+	case err := <-receiveErr:
+		if err != nil {
+			t.Fatalf("Receive() error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for receiver: %v", ctx.Err())
+	}
+	progressMu.Lock()
+	progressAfterReceiverShutdown := append([]progressSample(nil), progressSamples...)
+	progressMu.Unlock()
+	if len(progressAtOfferReturn) == 0 {
+		t.Fatal("Offer() returned without progress callbacks")
+	}
+	final := progressAtOfferReturn[len(progressAtOfferReturn)-1]
+	if final.bytesReceived != totalBytes || final.transferElapsedMS <= 0 {
+		t.Fatalf("final progress before Offer returned = (%d, %d), want (%d, >0); all progress = %#v",
+			final.bytesReceived, final.transferElapsedMS, totalBytes, progressAtOfferReturn)
+	}
+	if len(progressAfterReceiverShutdown) != len(progressAtOfferReturn) {
+		t.Fatalf("progress changed after Offer returned and receiver shut down: before=%#v after=%#v",
+			progressAtOfferReturn, progressAfterReceiverShutdown)
+	}
+	for i := range progressAtOfferReturn {
+		if progressAfterReceiverShutdown[i] != progressAtOfferReturn[i] {
+			t.Fatalf("progress changed after Offer returned and receiver shut down: before=%#v after=%#v",
+				progressAtOfferReturn, progressAfterReceiverShutdown)
+		}
+	}
+	for i, sample := range progressAfterReceiverShutdown {
+		if sample.transferElapsedMS <= 0 {
+			t.Fatalf("non-positive elapsed progress at index %d: %#v", i, progressAfterReceiverShutdown)
+		}
+		if sample.bytesReceived > totalBytes || (i > 0 && sample.bytesReceived < progressAfterReceiverShutdown[i-1].bytesReceived) {
+			t.Fatalf("out-of-order progress at index %d: %#v", i, progressAfterReceiverShutdown)
+		}
+		if sample.bytesReceived == totalBytes && i != len(progressAfterReceiverShutdown)-1 {
+			t.Fatalf("completion progress was not terminal: %#v", progressAfterReceiverShutdown)
+		}
+	}
+	if !strings.Contains(offerStatus.String(), "v2-block-policy=mode:bulk-packets-v1 receiver:claimant") {
+		t.Fatalf("offer status = %q, want claimant receiver bulk policy", offerStatus.String())
+	}
+	if !strings.Contains(offerStatus.String(), "v2-block-transfer=bulk-packets") ||
+		!strings.Contains(receiveStatus.String(), "v2-block-transfer=bulk-packets") {
+		t.Fatalf("missing bulk packet marker: offer=%q receive=%q", offerStatus.String(), receiveStatus.String())
+	}
+	gotPayload := sink.bytes()
+	if !bytes.Equal(gotPayload, payload) {
+		t.Fatal("offer/receive block payload mismatch")
+	}
+}
+
+func TestExternalV2OfferReceiveRelayBlockRoundTrip(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
@@ -425,6 +615,15 @@ type memoryBlockSink struct {
 	b  []byte
 }
 
+type gatedMemoryBlockSink struct {
+	*memoryBlockSink
+	firstWrite  chan struct{}
+	release     chan struct{}
+	writeCount  int
+	mu          sync.Mutex
+	releaseOnce sync.Once
+}
+
 type errorBlockSink struct{}
 
 type writeCountingBuffer struct {
@@ -439,6 +638,32 @@ func (b *writeCountingBuffer) Write(p []byte) (int, error) {
 
 func newMemoryBlockSink(size int64) *memoryBlockSink {
 	return &memoryBlockSink{b: make([]byte, size)}
+}
+
+func newGatedMemoryBlockSink(size int64) *gatedMemoryBlockSink {
+	return &gatedMemoryBlockSink{
+		memoryBlockSink: newMemoryBlockSink(size),
+		firstWrite:      make(chan struct{}),
+		release:         make(chan struct{}),
+	}
+}
+
+func (s *gatedMemoryBlockSink) WriteAt(p []byte, off int64) (int, error) {
+	s.mu.Lock()
+	s.writeCount++
+	writeCount := s.writeCount
+	s.mu.Unlock()
+	if writeCount == 1 {
+		n, err := s.memoryBlockSink.WriteAt(p, off)
+		close(s.firstWrite)
+		return n, err
+	}
+	<-s.release
+	return s.memoryBlockSink.WriteAt(p, off)
+}
+
+func (s *gatedMemoryBlockSink) releaseWrites() {
+	s.releaseOnce.Do(func() { close(s.release) })
 }
 
 func (s *memoryBlockSink) WriteAt(p []byte, off int64) (int, error) {

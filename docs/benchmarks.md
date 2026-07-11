@@ -13,9 +13,9 @@ Use the checked-in harnesses first:
 - `./scripts/smoke-remote.sh my-server.example.com`
 - `./scripts/smoke-remote-share.sh my-server.example.com`
 
-`promotion-test.sh` is the main throughput benchmark for one-shot `listen/pipe`. It verifies byte count, SHA-256, path transition logs, and now fails if any `derphole` process or UDP socket survives after cleanup.
+`promotion-test.sh` defaults to the primary product file workload: one-shot `send FILE` followed by `receive -o FILE TOKEN`. It verifies byte count, SHA-256, path transition logs, and now fails if any `derphole` process or UDP socket survives after cleanup. Set `DERPHOLE_BENCH_WORKLOAD=stream` only when running the explicit `listen/pipe` control.
 
-When comparing direct-path striping diagnostics, set `DERPHOLE_BENCH_PARALLEL` to the value that would be passed to `--parallel`. The harness passes that diagnostic override to the active side only: local `pipe/open` in forward runs and remote `pipe/open` in reverse runs. Leave `DERPHOLE_BENCH_PARALLEL` unset for product-default runs.
+For `DERPHOLE_BENCH_WORKLOAD=stream` direct-path striping diagnostics, set `DERPHOLE_BENCH_PARALLEL` to the value that would be passed to `--parallel`. The harness passes that diagnostic override to the active side only: local `pipe/open` in forward runs and remote `pipe/open` in reverse runs. `DERPHOLE_BENCH_PARALLEL` is not valid for the file workload; leave it unset for product-default runs.
 
 ## Baseline Comparisons
 
@@ -23,11 +23,31 @@ Measure raw network capacity separately before blaming tunnel overhead.
 
 - `iperf3` between the same two hosts for a TCP baseline
 - `nc` plus `pv` for a simple streaming baseline
-- then the matching `derphole listen/pipe` or `share/open` path
+- then the matching default `derphole send/receive` file workload; use `listen/pipe` only as an explicit stream control
 
 Keep source payload size, host pair, and direction fixed when comparing variants. Record duration, throughput, final path state, and whether the session upgraded from `connected-relay` to `connected-direct`.
 
 ## Public Path Performance Harness
+
+Use the file workload for primary product acceptance:
+
+```bash
+# Primary product file benchmark.
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 \
+DERPHOLE_BENCH_WORKLOAD=file \
+./scripts/promotion-test.sh ubuntu@eric-nuc 3072
+```
+
+Use the stream workload only as an explicit control. Never report it as file validation:
+
+```bash
+# Explicit stream control; never report this as file validation.
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 \
+DERPHOLE_BENCH_WORKLOAD=stream \
+./scripts/promotion-test.sh ubuntu@eric-nuc 3072
+```
+
+Production leaves `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES` unset so route discovery can use Tailscale candidates. The primary public harness defaults to the file workload, and benchmark summaries always record the workload and negotiated transfer mode.
 
 The public-path throughput gate is Mac -> remote by default:
 
@@ -41,7 +61,7 @@ DERPHOLE_PUBLIC_IPERF_PORT=8123 \
 
 The harness sets `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1` for derphole runs so the measurement stays on the public Internet path. This is a test-only guard; production defaults still allow Tailscale candidates.
 
-Normal public-path runs leave `DERPHOLE_BENCH_PARALLEL` unset. Set it only for a diagnostic policy comparison, for example `DERPHOLE_BENCH_PARALLEL=auto ./scripts/public-path-performance-harness.sh`.
+Normal public-path runs use the file workload and leave `DERPHOLE_BENCH_PARALLEL` unset. For an explicit stream diagnostic, set both controls, for example `DERPHOLE_BENCH_WORKLOAD=stream DERPHOLE_BENCH_PARALLEL=auto ./scripts/public-path-performance-harness.sh`.
 
 The primary pass condition is eric-nuc Mac -> remote derphole average within 10-15 percent of same-run `iperf3`, with zero steady direct-phase `transfertracecheck` stalls over 1s. The other hosts must not regress against the July 2 baseline matrix.
 
@@ -189,13 +209,13 @@ Default production runs allow Tailscale CGNAT/ULA candidates, because those rout
 
 Examples:
 
-- `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_BENCH_PARALLEL=8 ./scripts/promotion-test.sh ktzlxc 1024`
-- `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_BENCH_PARALLEL=auto ./scripts/promotion-test.sh canlxc 1024`
-- `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_BENCH_PARALLEL=8 ./scripts/promotion-test-reverse.sh ktzlxc 1024`
+- `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_BENCH_WORKLOAD=stream DERPHOLE_BENCH_PARALLEL=8 ./scripts/promotion-test.sh ktzlxc 1024`
+- `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_BENCH_WORKLOAD=stream DERPHOLE_BENCH_PARALLEL=auto ./scripts/promotion-test.sh canlxc 1024`
+- `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 DERPHOLE_BENCH_WORKLOAD=stream DERPHOLE_BENCH_PARALLEL=8 ./scripts/promotion-test-reverse.sh ktzlxc 1024`
 
 ## Production Matrix Runner
 
-The old raw/blast packet-engine probe harness has been retired. Use production promotion scripts for transport validation, because they exercise the same v2 session path as `listen/pipe`, `send/receive`, and `share/open`.
+The old raw/blast packet-engine probe harness has been retired. Use production promotion scripts for transport validation. Their default file workload exercises normal `send/receive`; the explicit stream workload exercises `listen/pipe` over the same v2 session path.
 
 Use these harnesses for proof runs:
 
@@ -205,8 +225,8 @@ Use these harnesses for proof runs:
 
 Useful diagnostic override knobs:
 
-- `DERPHOLE_BENCH_PARALLEL=auto` lets the active side choose direct-path striping.
-- `DERPHOLE_BENCH_PARALLEL=<n>` forces a specific striping request for controlled comparisons.
+- With `DERPHOLE_BENCH_WORKLOAD=stream`, `DERPHOLE_BENCH_PARALLEL=auto` lets the active side choose direct-path striping.
+- With `DERPHOLE_BENCH_WORKLOAD=stream`, `DERPHOLE_BENCH_PARALLEL=<n>` forces a specific striping request for controlled comparisons.
 - `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1` removes Tailscale CGNAT/ULA candidates from test runs only.
 
 The matrix runner covers:

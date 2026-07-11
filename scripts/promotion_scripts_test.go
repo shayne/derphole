@@ -10,8 +10,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestPromotionWrappersUseSharedDriver(t *testing.T) {
@@ -104,6 +107,338 @@ func TestPromotionDriverUsesV2TransferTraceMetrics(t *testing.T) {
 	}
 }
 
+func readPromotionDriver(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(".", "promotion-benchmark-driver.sh"))
+	if err != nil {
+		t.Fatalf("read promotion-benchmark-driver.sh: %v", err)
+	}
+	return string(data)
+}
+
+func TestPromotionBenchmarkDefaultsToFileSendReceive(t *testing.T) {
+	body := readPromotionDriver(t)
+	for _, want := range []string{
+		`workload="${DERPHOLE_BENCH_WORKLOAD:-file}"`,
+		`--verbose send "${payload}"`,
+		`--verbose receive -o '${remote_base}.out'`,
+		`benchmark-workload=${workload}`,
+		`benchmark-transfer-mode=${transfer_mode}`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("promotion driver missing %q", want)
+		}
+	}
+}
+
+func TestPromotionStreamWorkloadIsExplicit(t *testing.T) {
+	body := readPromotionDriver(t)
+	if !strings.Contains(body, `stream) run_forward_derphole_stream ;;`) {
+		t.Fatal("promotion driver does not isolate listen/pipe as stream workload")
+	}
+}
+
+type promotionDriverTest struct {
+	root     string
+	fakeBin  string
+	stateDir string
+}
+
+func newPromotionDriverTest(t *testing.T) promotionDriverTest {
+	t.Helper()
+	root := t.TempDir()
+	scriptDir := filepath.Join(root, "scripts")
+	fakeBin := filepath.Join(root, "bin")
+	distDir := filepath.Join(root, "dist")
+	stateDir := filepath.Join(root, "state")
+	for _, dir := range []string{scriptDir, fakeBin, distDir, stateDir} {
+		mustMkdirAll(t, dir)
+	}
+
+	driver, err := os.ReadFile(filepath.Join(".", "promotion-benchmark-driver.sh"))
+	if err != nil {
+		t.Fatalf("read promotion driver: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(scriptDir, "promotion-benchmark-driver.sh"), driver, 0o755); err != nil {
+		t.Fatalf("write promotion driver: %v", err)
+	}
+
+	fakeDerphole := `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "--help" ]]; then
+  exit 0
+fi
+if [[ "${1:-}" == "--verbose" ]]; then
+  shift
+fi
+command="${1:?missing command}"
+shift
+trace="${DERPHOLE_TRANSFER_TRACE_CSV:?missing trace path}"
+case "${command}" in
+  send)
+    payload="${1:?missing payload}"
+    printf 'send\n' >>"${FAKE_DERPHOLE_STATE}/events"
+    printf '%s\n' "${payload}" >"${FAKE_DERPHOLE_STATE}/payload-path"
+	if [[ "${FAKE_SEND_STAY_RUNNING:-0}" == "1" ]]; then
+	  printf '%s\n' "$$" >"${FAKE_DERPHOLE_STATE}/remote-child-pid"
+	  trap 'touch "${FAKE_DERPHOLE_STATE}/remote-child-term"' TERM INT
+	fi
+    printf 'derphole receive AAAAAAAAAAAAAAAAAAAAAAAA\n' >&2
+    printf 'connected-relay\nconnected-direct\nv2-block-transfer=bulk-packets\n' >&2
+	if [[ "${FAKE_SEND_STAY_RUNNING:-0}" == "1" ]]; then
+	  while :; do
+	    sleep 1
+	  done
+	fi
+    for _ in $(seq 1 200); do
+      [[ -f "${FAKE_DERPHOLE_STATE}/received" ]] && break
+      sleep 0.01
+    done
+    [[ -f "${FAKE_DERPHOLE_STATE}/received" ]]
+    printf 'app_bytes,transfer_elapsed_ms,send_goodput_mbps,quic_first_byte_ms,direct_bytes,direct_validated\n1048576,10,838.86,1,1048576,true\n' >"${trace}"
+    touch "${FAKE_DERPHOLE_STATE}/send-finished"
+    exit "${FAKE_SEND_STATUS:-0}"
+    ;;
+  receive)
+    [[ "${1:-}" == "-o" ]]
+    output="${2:?missing output}"
+    token="${3:?missing token}"
+    [[ "${token}" == "AAAAAAAAAAAAAAAAAAAAAAAA" ]]
+    printf 'receive\n' >>"${FAKE_DERPHOLE_STATE}/events"
+    payload="$(cat "${FAKE_DERPHOLE_STATE}/payload-path")"
+    printf 'connected-relay\nconnected-direct\nv2-block-transfer=bulk-packets\nremote-receive-diagnostic\n' >&2
+    printf 'app_bytes,transfer_elapsed_ms,send_goodput_mbps,quic_first_byte_ms,direct_bytes,direct_validated\n1048576,10,838.86,1,1048576,true\n' >"${trace}"
+    if [[ "${FAKE_RECEIVE_STATUS:-0}" != "0" ]]; then
+      if [[ "${FAKE_SIGNAL_SENDER_ON_RECEIVE_FAILURE:-0}" == "1" ]]; then
+        touch "${FAKE_DERPHOLE_STATE}/received"
+        for _ in $(seq 1 200); do
+          [[ -f "${FAKE_DERPHOLE_STATE}/send-finished" ]] && break
+          sleep 0.01
+        done
+      fi
+      exit "${FAKE_RECEIVE_STATUS}"
+    fi
+    cp "${payload}" "${output}"
+    touch "${FAKE_DERPHOLE_STATE}/received"
+    ;;
+  *)
+    printf 'unexpected derphole command: %s\n' "${command}" >&2
+    exit 64
+    ;;
+esac
+`
+	writeExecutable(t, filepath.Join(distDir, "derphole"), fakeDerphole)
+	writeExecutable(t, filepath.Join(distDir, "derphole-linux-amd64"), fakeDerphole)
+	writeExecutable(t, filepath.Join(fakeBin, "mise"), "#!/bin/sh\nexit 0\n")
+	writeExecutable(t, filepath.Join(fakeBin, "pgrep"), "#!/bin/sh\nexit 1\n")
+	writeExecutable(t, filepath.Join(fakeBin, "sha256sum"), `#!/bin/sh
+exec shasum -a 256 "$@"
+`)
+	writeExecutable(t, filepath.Join(fakeBin, "wc"), `#!/bin/sh
+/usr/bin/wc "$@" | tr -d '[:space:]'
+printf '\n'
+`)
+	writeExecutable(t, filepath.Join(fakeBin, "ssh"), `#!/bin/sh
+exec /bin/bash -se
+`)
+	writeExecutable(t, filepath.Join(fakeBin, "scp"), `#!/bin/sh
+set -eu
+source=$1
+destination=${2#*:}
+mkdir -p "$(dirname "${destination}")"
+cp "${source}" "${destination}"
+`)
+	return promotionDriverTest{root: root, fakeBin: fakeBin, stateDir: stateDir}
+}
+
+func (h promotionDriverTest) command(direction string, extraEnv map[string]string) *exec.Cmd {
+	values := map[string]string{
+		"DERPHOLE_BENCH_TOOL":                 "derphole",
+		"DERPHOLE_BENCH_DIRECTION":            direction,
+		"DERPHOLE_BENCH_LOCAL_TMP_ROOT":       filepath.Join(h.root, "tmp"),
+		"DERPHOLE_BENCH_REMOTE_OUTPUT_ROOT":   filepath.Join(h.root, "remote"),
+		"DERPHOLE_BENCH_EXPECT_TRANSFER_MODE": "bulk-packets-v1",
+		"FAKE_DERPHOLE_STATE":                 h.stateDir,
+	}
+	for key, value := range extraEnv {
+		values[key] = value
+	}
+	cmd := exec.Command("bash", "scripts/promotion-benchmark-driver.sh", "stub@example", "1")
+	cmd.Dir = h.root
+	cmd.Env = harnessTestEnv(h.fakeBin, values)
+	return cmd
+}
+
+func (h promotionDriverTest) assertCleaned(t *testing.T, direction string) {
+	t.Helper()
+	for _, pattern := range []string{
+		filepath.Join(h.root, "tmp", "derphole-"+direction+".*"),
+		filepath.Join(h.root, "remote", "derphole-promotion-*"),
+	} {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			t.Fatalf("glob cleanup path %s: %v", pattern, err)
+		}
+		if len(matches) != 0 {
+			t.Fatalf("benchmark cleanup left paths matching %s: %v", pattern, matches)
+		}
+	}
+}
+
+func TestPromotionBenchmarkDefaultExecutesSendBeforeReceive(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+
+	cmd := harness.command("forward", nil)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("default file benchmark failed: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "benchmark-workload=file") ||
+		!strings.Contains(string(output), "benchmark-transfer-mode=bulk-packets-v1") {
+		t.Fatalf("default file benchmark output missing workload or mode:\n%s", output)
+	}
+
+	events, err := os.ReadFile(filepath.Join(harness.stateDir, "events"))
+	if err != nil {
+		t.Fatalf("read derphole events: %v", err)
+	}
+	if got, want := string(events), "send\nreceive\n"; got != want {
+		t.Fatalf("derphole command order = %q, want %q", got, want)
+	}
+	if strings.Contains(string(events), "listen") || strings.Contains(string(events), "pipe") {
+		t.Fatalf("default file benchmark invoked stream command:\n%s", events)
+	}
+	harness.assertCleaned(t, "forward")
+}
+
+func TestPromotionBenchmarkReverseRejectsRemoteSenderFailure(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+	cmd := harness.command("reverse", map[string]string{"FAKE_SEND_STATUS": "23"})
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("reverse benchmark accepted remote sender failure:\n%s", output)
+	}
+	if !strings.Contains(string(output), "remote derphole process exited with status 23") {
+		t.Fatalf("reverse sender failure output missing exit status:\n%s", output)
+	}
+	harness.assertCleaned(t, "reverse")
+}
+
+func TestPromotionBenchmarkReverseAcceptsRemoteSenderSuccess(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+	cmd := harness.command("reverse", nil)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("reverse benchmark rejected successful remote sender: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "benchmark-success=true") {
+		t.Fatalf("reverse sender success output missing success footer:\n%s", output)
+	}
+	harness.assertCleaned(t, "reverse")
+}
+
+func TestPromotionBenchmarkReverseFailureTerminatesRemoteSenderChild(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+	cmd := harness.command("reverse", map[string]string{
+		"FAKE_RECEIVE_STATUS":    "42",
+		"FAKE_SEND_STAY_RUNNING": "1",
+	})
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("reverse benchmark accepted local receiver failure:\n%s", output)
+	}
+
+	childPIDData, readErr := os.ReadFile(filepath.Join(harness.stateDir, "remote-child-pid"))
+	if readErr != nil {
+		t.Fatalf("read exact remote child PID: %v\n%s", readErr, output)
+	}
+	childPID, parseErr := strconv.Atoi(strings.TrimSpace(string(childPIDData)))
+	if parseErr != nil || childPID <= 0 {
+		t.Fatalf("parse exact remote child PID %q: %v", childPIDData, parseErr)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Kill(childPID, syscall.SIGKILL)
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for processExists(childPID) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if processExists(childPID) {
+		t.Fatalf("remote sender child PID %d survived wrapper cleanup; output:\n%s", childPID, output)
+	}
+	if _, statErr := os.Stat(filepath.Join(harness.stateDir, "remote-child-term")); statErr != nil {
+		t.Fatalf("remote sender child PID %d did not receive TERM before cleanup: %v", childPID, statErr)
+	}
+	harness.assertCleaned(t, "reverse")
+}
+
+func processExists(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || err == syscall.EPERM
+}
+
+func TestPromotionBenchmarkPreservesRemoteFailureArtifacts(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		direction string
+		role      string
+		extraEnv  map[string]string
+	}{
+		{
+			name:      "forward remote receive failure",
+			direction: "forward",
+			role:      "receiver",
+			extraEnv:  map[string]string{"FAKE_RECEIVE_STATUS": "42"},
+		},
+		{
+			name:      "reverse local receive failure",
+			direction: "reverse",
+			role:      "sender",
+			extraEnv: map[string]string{
+				"FAKE_RECEIVE_STATUS":                   "42",
+				"FAKE_SIGNAL_SENDER_ON_RECEIVE_FAILURE": "1",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			harness := newPromotionDriverTest(t)
+			logDir := filepath.Join(harness.root, "logs")
+			tc.extraEnv["DERPHOLE_BENCH_LOG_DIR"] = logDir
+			cmd := harness.command(tc.direction, tc.extraEnv)
+			output, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("%s benchmark accepted receiver failure:\n%s", tc.direction, output)
+			}
+
+			for _, artifact := range []struct {
+				suffix string
+				want   string
+			}{
+				{suffix: ".log", want: "connected-direct"},
+				{suffix: ".trace.csv", want: "direct_validated"},
+			} {
+				pattern := "*-" + tc.role + artifact.suffix
+				matches, globErr := filepath.Glob(filepath.Join(logDir, pattern))
+				if globErr != nil {
+					t.Fatalf("glob preserved artifact %s: %v", pattern, globErr)
+				}
+				if len(matches) != 1 {
+					t.Fatalf("preserved artifacts matching %s = %v, want one; output:\n%s", pattern, matches, output)
+				}
+				data, readErr := os.ReadFile(matches[0])
+				if readErr != nil {
+					t.Fatalf("read preserved artifact %s: %v", matches[0], readErr)
+				}
+				if !strings.Contains(string(data), artifact.want) {
+					t.Fatalf("preserved artifact %s missing %q:\n%s", matches[0], artifact.want, data)
+				}
+			}
+			harness.assertCleaned(t, tc.direction)
+		})
+	}
+}
+
 func scriptSection(t *testing.T, body, start, end string) string {
 	t.Helper()
 	startIndex := strings.Index(body, start)
@@ -116,6 +451,86 @@ func scriptSection(t *testing.T, body, start, end string) string {
 		t.Fatalf("script section %q missing end %q", start, end)
 	}
 	return rest[:endIndex]
+}
+
+func TestPromotionRemoteArtifactRecollectionIsAtomic(t *testing.T) {
+	t.Parallel()
+
+	body := readPromotionDriver(t)
+	collectDefinition := scriptSection(
+		t,
+		body,
+		"collect_remote_artifacts() {",
+		"\nrefresh_benchmark_operands() {",
+	)
+
+	for _, mode := range []string{"failure", "empty"} {
+		mode := mode
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+
+			root := t.TempDir()
+			logPath := filepath.Join(root, "sender.err")
+			tracePath := filepath.Join(root, "sender.trace.csv")
+			if err := os.WriteFile(logPath, []byte("valid earlier log\n"), 0o600); err != nil {
+				t.Fatalf("write canonical log: %v", err)
+			}
+			if err := os.WriteFile(tracePath, []byte("valid,earlier,trace\n"), 0o600); err != nil {
+				t.Fatalf("write canonical trace: %v", err)
+			}
+
+			cmd := exec.Command("bash", "-c", `
+direction=reverse
+remote_base=run
+sender_log="$1"
+sender_trace_csv="$2"
+receiver_log=/unused/receiver.err
+receiver_trace_csv=/unused/receiver.trace.csv
+mode="$3"
+remote() {
+  if [[ "${mode}" == "failure" ]]; then
+    return 23
+  fi
+  return 0
+}
+`+collectDefinition+`
+collect_remote_artifacts
+collect_status=$?
+if [[ "${collect_status}" == "0" ]]; then
+  echo "collection unexpectedly succeeded"
+  exit 90
+fi
+printf 'collect-status=%s\n' "${collect_status}"
+`, "test", logPath, tracePath, mode)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("artifact recollection probe failed: %v\n%s", err, output)
+			}
+			if !strings.Contains(string(output), "collect-status=1") {
+				t.Fatalf("artifact recollection output = %q, want failed collection", output)
+			}
+
+			for path, want := range map[string]string{
+				logPath:   "valid earlier log\n",
+				tracePath: "valid,earlier,trace\n",
+			} {
+				data, readErr := os.ReadFile(path)
+				if readErr != nil {
+					t.Fatalf("read canonical artifact %s: %v", path, readErr)
+				}
+				if got := string(data); got != want {
+					t.Fatalf("canonical artifact %s = %q after %s recollection, want %q", path, got, mode, want)
+				}
+				matches, globErr := filepath.Glob(path + ".collect.*")
+				if globErr != nil {
+					t.Fatalf("glob temporary artifacts for %s: %v", path, globErr)
+				}
+				if len(matches) != 0 {
+					t.Fatalf("temporary recollection artifacts remain for %s: %v", path, matches)
+				}
+			}
+		})
+	}
 }
 
 func assertScriptOrder(t *testing.T, body string, markers ...string) {
@@ -227,17 +642,36 @@ func TestPromotionDriverStopsCommandClockBeforePostflight(t *testing.T) {
 	}
 	body := string(data)
 
-	forward := scriptSection(t, body, "run_forward_derphole() {", "\nrun_reverse_derphole() {")
-	assertScriptOrder(t, forward,
+	forwardStream := scriptSection(t, body, "run_forward_derphole_stream() {", "\nrun_forward_derphole_file() {")
+	assertScriptOrder(t, forwardStream,
 		"wait_remote_pid_exit",
 		`command_end_ms="$(now_ms)"`,
 		`remote "cat '${remote_base}.err'"`,
 	)
 
-	reverse := scriptSection(t, body, "run_reverse_derphole() {", "\nfinalize_run() {")
-	assertScriptOrder(t, reverse,
+	forwardFile := scriptSection(t, body, "run_forward_derphole_file() {", "\nrun_reverse_derphole_stream() {")
+	assertScriptOrder(t, forwardFile,
+		`start_ms="$(now_ms)"`,
+		`--verbose send "${payload}"`,
+		`--verbose receive -o '${remote_base}.out'`,
+		`wait "${send_pid}"`,
+		`command_end_ms="$(now_ms)"`,
+		`remote "cat '${remote_base}.err'"`,
+	)
+
+	reverseStream := scriptSection(t, body, "run_reverse_derphole_stream() {", "\nrun_reverse_derphole_file() {")
+	assertScriptOrder(t, reverseStream,
 		`wait "${listener_pid}"`,
 		`listener_pid=""`,
+		`command_end_ms="$(now_ms)"`,
+		`remote "cat '${remote_base}.err'"`,
+	)
+
+	reverseFile := scriptSection(t, body, "run_reverse_derphole_file() {", "\nfinalize_run() {")
+	assertScriptOrder(t, reverseFile,
+		`start_ms="$(now_ms)"`,
+		`--verbose receive -o "${receiver_out}"`,
+		"wait_remote_pid_status",
 		`command_end_ms="$(now_ms)"`,
 		`remote "cat '${remote_base}.err'"`,
 	)
@@ -282,7 +716,7 @@ fi
 		t.Fatalf("timeout output = %q, want hard timeout error", output)
 	}
 
-	forward := scriptSection(t, body, "run_forward_derphole() {", "\nrun_reverse_derphole() {")
+	forward := scriptSection(t, body, "run_forward_derphole_stream() {", "\nrun_forward_derphole_file() {")
 	assertScriptOrder(t, forward,
 		"wait_remote_pid_exit",
 		`command_end_ms="$(now_ms)"`,
@@ -521,7 +955,7 @@ func TestPromotionCleanupFailurePreventsSuccessFooter(t *testing.T) {
 		t.Fatalf("read promotion-benchmark-driver.sh: %v", err)
 	}
 	body := string(data)
-	cleanupDefinition := scriptSection(t, body, "cleanup() {", "\nhandle_exit() {")
+	cleanupDefinition := scriptSection(t, body, "terminate_remote_processes() {", "\nhandle_exit() {")
 
 	tmp := filepath.Join(t.TempDir(), "local-tmp")
 	if err := os.MkdirAll(tmp, 0o755); err != nil {
@@ -604,6 +1038,8 @@ func TestPublicPathPerformanceHarnessCarriesBenchmarkOperands(t *testing.T) {
 	}
 	body := string(data)
 	for _, want := range []string{
+		"DERPHOLE_BENCH_WORKLOAD=file",
+		"workload,transfer_mode",
 		"trace_mbps",
 		"wall_mbps",
 		"wall_ratio_to_iperf",
@@ -781,7 +1217,7 @@ func TestPublicPathPerformanceHarnessRecordsFailedTraceSamples(t *testing.T) {
 		`trace_ok="true"`,
 		`trace_ok="false"`,
 		`trace_status=0`,
-		`append_summary_row "${host_label}" "${run}" "derphole" "${derphole_mbps}" "${iperf_mbps}" "${trace_sender_mbps}" "${wall_mbps}"`,
+		`append_summary_row "${host_label}" "${run}" "derphole" "${workload}" "${transfer_mode}" "${derphole_mbps}" "${iperf_mbps}" "${trace_sender_mbps}" "${wall_mbps}"`,
 		`trace_failures=1`,
 	} {
 		if !strings.Contains(body, want) {
@@ -822,8 +1258,11 @@ mkdir -p "${DERPHOLE_BENCH_LOG_DIR}"
   printf 'budget=%s\n' "${DERPHOLE_V2_RAW_DIRECT_BUDGET_MS:-unset}"
   printf 'fanout=%s\n' "${DERPHOLE_V2_MANAGER_QUIC_FANOUT:-unset}"
   printf 'parallel=%s\n' "${DERPHOLE_BENCH_PARALLEL:-unset}"
+  printf 'workload=%s\n' "${DERPHOLE_BENCH_WORKLOAD:-unset}"
 } >"${DERPHOLE_BENCH_LOG_DIR}/env.txt"
 printf 'benchmark-goodput-mbps=12.34\n'
+printf 'benchmark-workload=file\n'
+printf 'benchmark-transfer-mode=bulk-packets-v1\n'
 exit 42
 `)
 
@@ -861,6 +1300,12 @@ exit 42
 	if got := derphole["trace_ok"]; got != "false" {
 		t.Fatalf("derphole trace_ok = %q, want false; output:\n%s", got, output.String())
 	}
+	if got := derphole["workload"]; got != "file" {
+		t.Fatalf("derphole workload = %q, want file", got)
+	}
+	if got := derphole["transfer_mode"]; got != "bulk-packets-v1" {
+		t.Fatalf("derphole transfer_mode = %q, want bulk-packets-v1", got)
+	}
 	if got := derphole["max_peer_recv_queue_depth"]; got != "0" {
 		t.Fatalf("derphole max_peer_recv_queue_depth = %q, want 0", got)
 	}
@@ -882,6 +1327,7 @@ exit 42
 		"budget=unset\n",
 		"fanout=unset\n",
 		"parallel=auto\n",
+		"workload=file\n",
 	} {
 		if !strings.Contains(envBody, want) {
 			t.Fatalf("promotion env capture missing %q; got:\n%s", want, envBody)

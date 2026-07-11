@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -1016,7 +1017,7 @@ func TestDirectFallbackDoesNotEmitConnectedDirect(t *testing.T) {
 
 		pathEmitter.Emit(StateRelay)
 		pathEmitter.SuppressWatcherDirect()
-		externalV2RawDirectActivateDirectPath(pathEmitter, manager, nil)
+		newExternalV2RawDirectActivation(pathEmitter, manager)()
 		pathEmitter.Emit(StateDirectFallbackRelay)
 		forceTransportManagerPathState(t, manager, transport.PathDirect)
 		pathEmitter.Complete(manager)
@@ -1049,6 +1050,71 @@ func TestTransportPathEmitterCanSuppressTemporaryRelayRegression(t *testing.T) {
 
 	if got := sessionStatusLines(status.String()); len(got) != 3 || got[0] != string(StateRelay) || got[1] != string(StateDirect) || got[2] != string(StateRelay) {
 		t.Fatalf("status lines = %q, want [%q %q %q] after suppression lifted", got, StateRelay, StateDirect, StateRelay)
+	}
+}
+
+func TestExternalV2RawDirectActivationRunsOnce(t *testing.T) {
+	var calls atomic.Int32
+	activate := newExternalV2RawDirectActivation(nil, nil,
+		func() { calls.Add(1) },
+		func() { calls.Add(1) },
+		func() { calls.Add(1) },
+	)
+	activate()
+	activate()
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("cancel calls = %d, want 3 exactly once each", got)
+	}
+}
+
+func TestExternalV2ListenTransportActivatesRawDirect(t *testing.T) {
+	var calls atomic.Int32
+	tr := externalV2ListenTransport{activateRawDirect: func() { calls.Add(1) }}
+	tr.ActivateRawDirect()
+	tr.ActivateRawDirect()
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("activation forwarding calls = %d, want 2; idempotence belongs to activation closure", got)
+	}
+}
+
+type countingPunchPacketConn struct {
+	writes atomic.Int32
+}
+
+func (c *countingPunchPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	return 0, nil, net.ErrClosed
+}
+func (c *countingPunchPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	c.writes.Add(1)
+	return len(p), nil
+}
+func (c *countingPunchPacketConn) Close() error                     { return nil }
+func (c *countingPunchPacketConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
+func (c *countingPunchPacketConn) SetDeadline(time.Time) error      { return nil }
+func (c *countingPunchPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *countingPunchPacketConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestExternalV2RawDirectActivationStopsPunchLoop(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	conn := &countingPunchPacketConn{}
+	peer := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 8), Port: 9000}
+	externalV2RawDirectStartPunching(ctx, []net.PacketConn{conn}, []net.Addr{peer})
+
+	deadline := time.Now().Add(time.Second)
+	for conn.writes.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if conn.writes.Load() == 0 {
+		t.Fatal("punch loop did not write")
+	}
+
+	activate := newExternalV2RawDirectActivation(nil, nil, cancel)
+	activate()
+	before := conn.writes.Load()
+	time.Sleep(3 * externalV2RawDirectPunchInterval)
+	if got := conn.writes.Load(); got != before {
+		t.Fatalf("writes after activation = %d, want stable %d", got, before)
 	}
 }
 

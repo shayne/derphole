@@ -7,6 +7,16 @@ set -euo pipefail
 
 tool="${DERPHOLE_BENCH_TOOL:?DERPHOLE_BENCH_TOOL is required}"
 direction="${DERPHOLE_BENCH_DIRECTION:?DERPHOLE_BENCH_DIRECTION is required}"
+workload="${DERPHOLE_BENCH_WORKLOAD:-file}"
+case "${workload}" in
+  file|stream) ;;
+  *) echo "DERPHOLE_BENCH_WORKLOAD must be file or stream (got: ${workload})" >&2; exit 2 ;;
+esac
+if [[ "${workload}" == "file" && -n "${DERPHOLE_BENCH_PARALLEL:-}" ]]; then
+  echo "DERPHOLE_BENCH_PARALLEL is only valid for the stream workload" >&2
+  exit 2
+fi
+transfer_mode="unknown"
 
 target="${1:?usage: $0 <target> [size-mib]}"
 size_mib="${2:-1024}"
@@ -186,6 +196,8 @@ emit_benchmark_footer() {
     echo "benchmark-host=${target}"
     echo "benchmark-tool=${tool}"
     echo "benchmark-direction=${direction}"
+    echo "benchmark-workload=${workload}"
+    echo "benchmark-transfer-mode=${transfer_mode}"
     echo "benchmark-size-bytes=${expected_size}"
     echo "benchmark-transfer-elapsed-ms=${sender_transfer_elapsed_ms:-0}"
     echo "benchmark-command-duration-ms=${command_duration_ms:-0}"
@@ -353,6 +365,79 @@ wait_remote_pid_exit() {
   return 1
 }
 
+wait_remote_pid_status() {
+  local state
+  local remote_status
+
+  for _ in $(seq 1 400); do
+    if ! state="$(remote "if [[ -f '${remote_base}.status' ]]; then status=\$(cat '${remote_base}.status') || exit 1; if [[ ! \"\${status}\" =~ ^[0-9]+$ ]]; then exit 1; fi; pid=''; if [[ -f '${remote_base}.pid' ]]; then pid=\$(cat '${remote_base}.pid') || exit 1; fi; if [[ -n \"\${pid}\" && ! \"\${pid}\" =~ ^[0-9]+$ ]]; then exit 1; fi; if [[ -n \"\${pid}\" ]] && kill -0 \"\${pid}\" 2>/dev/null; then printf 'running\\n'; else printf 'exited:%s\\n' \"\${status}\"; fi; elif [[ ! -f '${remote_base}.pid' ]]; then printf 'status-missing\\n'; else pid=\$(cat '${remote_base}.pid') || exit 1; if [[ ! \"\${pid}\" =~ ^[0-9]+$ ]]; then exit 1; fi; if kill -0 \"\${pid}\" 2>/dev/null; then printf 'running\\n'; else printf 'status-missing\\n'; fi; fi")"; then
+      echo "failed to query remote ${tool} process status on ${target}" >&2
+      return 1
+    fi
+    case "${state}" in
+      exited:*)
+        remote_status="${state#exited:}"
+        if [[ "${remote_status}" == "0" ]]; then
+          return 0
+        fi
+        echo "remote ${tool} process exited with status ${remote_status}" >&2
+        return 1
+        ;;
+      running)
+        ;;
+      status-missing)
+        echo "remote ${tool} process exited without a status on ${target}" >&2
+        return 1
+        ;;
+      *)
+        echo "invalid remote ${tool} process status on ${target}: ${state:-empty}" >&2
+        return 1
+        ;;
+    esac
+    sleep 0.25
+  done
+  echo "timed out waiting for remote ${tool} process status on ${target}" >&2
+  return 1
+}
+
+collect_remote_artifacts() {
+  local collect_status=0
+  local remote_log="${receiver_log}"
+  local remote_trace="${receiver_trace_csv}"
+
+  collect_remote_artifact() {
+    local remote_path="$1"
+    local local_path="$2"
+    local temporary_path="${local_path}.collect.$$"
+
+    rm -f "${temporary_path}"
+    if ! remote "if [[ -s '${remote_path}' ]]; then cat '${remote_path}'; else exit 1; fi" >"${temporary_path}"; then
+      rm -f "${temporary_path}"
+      return 1
+    fi
+    if [[ ! -s "${temporary_path}" ]]; then
+      rm -f "${temporary_path}"
+      return 1
+    fi
+    if ! mv "${temporary_path}" "${local_path}"; then
+      rm -f "${temporary_path}"
+      return 1
+    fi
+  }
+
+  if [[ "${direction}" == "reverse" ]]; then
+    remote_log="${sender_log}"
+    remote_trace="${sender_trace_csv}"
+  fi
+  if ! collect_remote_artifact "${remote_base}.err" "${remote_log}"; then
+    collect_status=1
+  fi
+  if ! collect_remote_artifact "${remote_base}.trace.csv" "${remote_trace}"; then
+    collect_status=1
+  fi
+  return "${collect_status}"
+}
+
 refresh_benchmark_operands() {
   local value
   local end_ms
@@ -424,8 +509,66 @@ dump_failure() {
   fi
 }
 
+terminate_remote_processes() {
+  remote "set +e
+cleanup_status=0
+wrapper_pid=''
+child_pid=''
+if [[ -f '${remote_base}.pid' ]]; then
+  wrapper_pid=\$(cat '${remote_base}.pid') || cleanup_status=1
+  if [[ ! \"\${wrapper_pid}\" =~ ^[0-9]+$ ]]; then
+    wrapper_pid=''
+    cleanup_status=1
+  fi
+fi
+if [[ -f '${remote_base}.child.pid' ]]; then
+  child_pid=\$(cat '${remote_base}.child.pid') || cleanup_status=1
+  if [[ ! \"\${child_pid}\" =~ ^[0-9]+$ ]]; then
+    child_pid=''
+    cleanup_status=1
+  fi
+fi
+for process_pid in \"\${wrapper_pid}\" \"\${child_pid}\"; do
+  if [[ -n \"\${process_pid}\" ]] && kill -0 \"\${process_pid}\" 2>/dev/null; then
+    kill -TERM \"\${process_pid}\" 2>/dev/null || cleanup_status=1
+  fi
+done
+for _ in \$(seq 1 40); do
+  running=0
+  for process_pid in \"\${wrapper_pid}\" \"\${child_pid}\"; do
+    if [[ -n \"\${process_pid}\" ]] && kill -0 \"\${process_pid}\" 2>/dev/null; then
+      running=1
+    fi
+  done
+  [[ \"\${running}\" == '0' ]] && break
+  sleep 0.05
+done
+for process_pid in \"\${wrapper_pid}\" \"\${child_pid}\"; do
+  if [[ -n \"\${process_pid}\" ]] && kill -0 \"\${process_pid}\" 2>/dev/null; then
+    kill -KILL \"\${process_pid}\" 2>/dev/null || cleanup_status=1
+  fi
+done
+for _ in \$(seq 1 40); do
+  running=0
+  for process_pid in \"\${wrapper_pid}\" \"\${child_pid}\"; do
+    if [[ -n \"\${process_pid}\" ]] && kill -0 \"\${process_pid}\" 2>/dev/null; then
+      running=1
+    fi
+  done
+  [[ \"\${running}\" == '0' ]] && break
+  sleep 0.05
+done
+for process_pid in \"\${wrapper_pid}\" \"\${child_pid}\"; do
+  if [[ -n \"\${process_pid}\" ]] && kill -0 \"\${process_pid}\" 2>/dev/null; then
+    cleanup_status=1
+  fi
+done
+exit \"\${cleanup_status}\""
+}
+
 cleanup() {
   local cleanup_status=0
+  local remote_cleanup_status=0
 
   if [[ -n "${send_pid}" ]]; then
     kill "${send_pid}" 2>/dev/null || true
@@ -433,7 +576,13 @@ cleanup() {
   if [[ -n "${listener_pid}" ]]; then
     kill "${listener_pid}" 2>/dev/null || true
   fi
-  if ! remote "pid=''; if [[ -f '${remote_base}.pid' ]]; then pid=\$(cat '${remote_base}.pid'); kill \"\${pid}\" 2>/dev/null || true; fi; rm -f '${remote_base}.pid' '${remote_base}.payload' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_upload}'; rm -f '${remote_bin}'; rmdir '${remote_bin_dir}' '${remote_run_dir}' 2>/dev/null || true; if [[ -n \"\${pid}\" ]] && kill -0 \"\${pid}\" 2>/dev/null; then exit 1; fi; if [[ -e '${remote_upload}' || -e '${remote_bin}' || -e '${remote_bin_dir}' || -e '${remote_run_dir}' ]]; then exit 1; fi" >/dev/null 2>&1; then
+  if ! terminate_remote_processes >/dev/null 2>&1; then
+    remote_cleanup_status=1
+  fi
+  if ! remote "rm -f '${remote_base}.pid' '${remote_base}.child.pid' '${remote_base}.child.pid.tmp' '${remote_base}.status' '${remote_base}.status.tmp' '${remote_base}.payload' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_upload}'; rm -f '${remote_bin}'; rmdir '${remote_bin_dir}' '${remote_run_dir}' 2>/dev/null || true; if [[ -e '${remote_base}.pid' || -e '${remote_base}.child.pid' || -e '${remote_base}.child.pid.tmp' || -e '${remote_base}.status' || -e '${remote_base}.status.tmp' || -e '${remote_upload}' || -e '${remote_bin}' || -e '${remote_bin_dir}' || -e '${remote_run_dir}' ]]; then exit 1; fi" >/dev/null 2>&1; then
+    remote_cleanup_status=1
+  fi
+  if [[ "${remote_cleanup_status}" -ne 0 ]]; then
     echo "remote benchmark cleanup incomplete on ${target}" >&2
     cleanup_status=1
   fi
@@ -457,6 +606,9 @@ handle_exit() {
 
   set +e
   refresh_benchmark_operands
+  if ! collect_remote_artifacts; then
+    echo "failed to collect remote benchmark artifacts" >&2
+  fi
   dump_failure
   preserve_logs
   preserve_status="$?"
@@ -493,7 +645,7 @@ build_and_install_remote_binary() {
   fi
 }
 
-run_forward_derphole() {
+run_forward_derphole_stream() {
   echo "generating ${size_mib} MiB random payload"
   dd if=/dev/urandom of="${payload}" bs=1048576 count="${size_mib}" 2>/dev/null
   source_sha="$(shasum -a 256 "${payload}" | awk '{print $1}')"
@@ -528,7 +680,38 @@ run_forward_derphole() {
   sink_size="$(remote "wc -c < '${remote_base}.out'")"
 }
 
-run_reverse_derphole() {
+run_forward_derphole_file() {
+  echo "generating ${size_mib} MiB random payload"
+  dd if=/dev/urandom of="${payload}" bs=1048576 count="${size_mib}" 2>/dev/null
+  source_sha="$(shasum -a 256 "${payload}" | awk '{print $1}')"
+  rm -f "${sender_log}" "${sender_trace_csv}"
+  remote "rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv'"
+
+  start_ms="$(now_ms)"
+  DERPHOLE_TRANSFER_TRACE_CSV="${sender_trace_csv}" "${local_bin}" --verbose send "${payload}" >/dev/null 2>"${sender_log}" &
+  send_pid="$!"
+
+  token=""
+  for _ in $(seq 1 200); do
+    token="$(sed -nE 's/.* receive ([A-Za-z0-9_-]{20,})$/\1/p' "${sender_log}" | head -n 1)"
+    [[ -n "${token}" ]] && break
+    kill -0 "${send_pid}" 2>/dev/null || break
+    sleep 0.1
+  done
+  [[ -n "${token}" ]] || { echo "failed to capture send token" >&2; exit 1; }
+
+  remote "DERPHOLE_TRANSFER_TRACE_CSV='${remote_base}.trace.csv' '${remote_bin}' --verbose receive -o '${remote_base}.out' '${token}' >/dev/null 2>'${remote_base}.err'"
+  wait "${send_pid}"
+  send_pid=""
+  command_end_ms="$(now_ms)"
+
+  remote "cat '${remote_base}.err'" >"${receiver_log}"
+  remote "cat '${remote_base}.trace.csv'" >"${receiver_trace_csv}"
+  sink_sha="$(remote "sha256sum '${remote_base}.out' | awk '{print \$1}'")"
+  sink_size="$(remote "wc -c < '${remote_base}.out'")"
+}
+
+run_reverse_derphole_stream() {
   echo "generating ${size_mib} MiB random payload on ${target}"
   remote "dd if=/dev/urandom of='${remote_base}.payload' bs=1048576 count='${size_mib}' 2>/dev/null"
   source_sha="$(remote "sha256sum '${remote_base}.payload' | awk '{print \$1}'")"
@@ -568,6 +751,31 @@ run_reverse_derphole() {
   sink_size="$(wc -c < "${receiver_out}" | tr -d '[:space:]')"
 }
 
+run_reverse_derphole_file() {
+  echo "generating ${size_mib} MiB random payload on ${target}"
+  remote "dd if=/dev/urandom of='${remote_base}.payload' bs=1048576 count='${size_mib}' 2>/dev/null"
+  source_sha="$(remote "sha256sum '${remote_base}.payload' | awk '{print \$1}'")"
+  remote "rm -f '${remote_base}.pid' '${remote_base}.child.pid' '${remote_base}.child.pid.tmp' '${remote_base}.status' '${remote_base}.status.tmp' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv'; nohup sh -c 'set +e; child_pid=; forward_signal() { signal=\$1; if [ -n \"\${child_pid}\" ]; then kill -\"\${signal}\" \"\${child_pid}\" 2>/dev/null || true; fi; }; trap \"forward_signal TERM\" TERM; trap \"forward_signal INT\" INT; DERPHOLE_TRANSFER_TRACE_CSV=\"${remote_base}.trace.csv\" \"${remote_bin}\" --verbose send \"${remote_base}.payload\" >\"${remote_base}.out\" 2>\"${remote_base}.err\" & child_pid=\$!; printf \"%s\\n\" \"\${child_pid}\" >\"${remote_base}.child.pid.tmp\"; mv \"${remote_base}.child.pid.tmp\" \"${remote_base}.child.pid\"; wait \"\${child_pid}\"; status=\$?; printf \"%s\\n\" \"\${status}\" >\"${remote_base}.status.tmp\"; mv \"${remote_base}.status.tmp\" \"${remote_base}.status\"; exit \"\${status}\"' >/dev/null 2>&1 </dev/null & echo \$! >'${remote_base}.pid'"
+
+  token=""
+  for _ in $(seq 1 200); do
+    token="$(remote "sed -nE 's/.* receive ([A-Za-z0-9_-]{20,})$/\\1/p' '${remote_base}.err' | head -n 1")"
+    [[ -n "${token}" ]] && break
+    sleep 0.1
+  done
+  [[ -n "${token}" ]] || { echo "failed to capture remote send token" >&2; exit 1; }
+
+  start_ms="$(now_ms)"
+  DERPHOLE_TRANSFER_TRACE_CSV="${receiver_trace_csv}" "${local_bin}" --verbose receive -o "${receiver_out}" "${token}" >/dev/null 2>"${receiver_log}"
+  wait_remote_pid_status
+  command_end_ms="$(now_ms)"
+
+  remote "cat '${remote_base}.err'" >"${sender_log}"
+  remote "cat '${remote_base}.trace.csv'" >"${sender_trace_csv}"
+  sink_sha="$(shasum -a 256 "${receiver_out}" | awk '{print $1}')"
+  sink_size="$(wc -c < "${receiver_out}" | tr -d '[:space:]')"
+}
+
 finalize_run() {
   local sender_trace
   local receiver_trace
@@ -576,6 +784,16 @@ finalize_run() {
 
   sender_trace="$(path_trace "${sender_log}")"
   receiver_trace="$(path_trace "${receiver_log}")"
+
+  if grep -Fq 'v2-block-transfer=bulk-packets' "${sender_log}" && grep -Fq 'v2-block-transfer=bulk-packets' "${receiver_log}"; then
+    transfer_mode="bulk-packets-v1"
+  elif grep -Fq 'v2-block-policy=mode:blocks-v1' "${sender_log}" || grep -Fq 'v2-block-policy=mode:blocks-v1' "${receiver_log}"; then
+    transfer_mode="blocks-v1"
+  fi
+  if [[ -n "${DERPHOLE_BENCH_EXPECT_TRANSFER_MODE:-}" && "${DERPHOLE_BENCH_EXPECT_TRANSFER_MODE}" != "${transfer_mode}" ]]; then
+    echo "unexpected benchmark transfer mode: got ${transfer_mode}, want ${DERPHOLE_BENCH_EXPECT_TRANSFER_MODE}" >&2
+    exit 1
+  fi
 
   if path_changed_mid_run "${sender_trace}"; then
     sender_path_changed="true"
@@ -647,17 +865,12 @@ finalize_run() {
 
 build_and_install_remote_binary
 
-case "${tool}:${direction}" in
-  derphole:forward)
-    run_forward_derphole
-    ;;
-  derphole:reverse)
-    run_reverse_derphole
-    ;;
-  *)
-    echo "unsupported benchmark mode: ${tool}:${direction}" >&2
-    exit 1
-    ;;
+case "${tool}:${direction}:${workload}" in
+  derphole:forward:file) run_forward_derphole_file ;;
+  derphole:reverse:file) run_reverse_derphole_file ;;
+  derphole:forward:stream) run_forward_derphole_stream ;;
+  derphole:reverse:stream) run_reverse_derphole_stream ;;
+  *) echo "unsupported benchmark mode: ${tool}:${direction}:${workload}" >&2; exit 1 ;;
 esac
 
 finalize_run

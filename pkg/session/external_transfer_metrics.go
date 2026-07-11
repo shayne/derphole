@@ -822,7 +822,10 @@ func (m *externalTransferMetrics) appBytesLocked() int64 {
 	if !m.directAppProgressSet {
 		return m.relayBytes + m.directBytes
 	}
-	directProgress := m.directAppProgressBase + m.directBytes
+	directProgress := m.directBytes
+	if m.directBytes > 0 || m.phase == transfertrace.PhaseComplete {
+		directProgress += m.directAppProgressBase
+	}
 	if directProgress > m.relayBytes {
 		return directProgress
 	}

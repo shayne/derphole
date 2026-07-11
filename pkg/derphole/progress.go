@@ -181,6 +181,9 @@ func (p *ProgressReporter) renderLocked(final bool, now time.Time) {
 	}
 
 	elapsed := progressElapsed(p.start, now)
+	if p.externalRate && p.externalElapsed > 0 && p.current >= p.total {
+		elapsed = p.externalElapsed
+	}
 	rate := p.rateLocked(final, now, elapsed)
 	line := formatProgressLine(
 		progressPercent(p.current, p.total),

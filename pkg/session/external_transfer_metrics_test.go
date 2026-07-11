@@ -729,6 +729,99 @@ func TestExternalTransferMetricsTraceUsesDirectStreamOffsetForOverlap(t *testing
 	}
 }
 
+func TestExternalTransferMetricsReceiverBlockHeaderDoesNotStartPayloadFlatline(t *testing.T) {
+	const (
+		headerBytes  = int64(105)
+		payloadBytes = int64(4096)
+	)
+
+	t.Run("payload", func(t *testing.T) {
+		start := time.Unix(45, 0)
+		var out bytes.Buffer
+		trace, err := transfertrace.NewRecorder(&out, transfertrace.RoleReceive, start)
+		if err != nil {
+			t.Fatalf("NewRecorder() error = %v", err)
+		}
+		metrics := newExternalTransferMetricsWithTrace(start, trace, transfertrace.RoleReceive)
+		metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
+		metrics.SetDirectAppProgressBase(headerBytes)
+		metrics.MarkDirectValidated(start.Add(250 * time.Millisecond))
+		metrics.Tick(start.Add(500 * time.Millisecond))
+		metrics.Tick(start.Add(time.Second))
+		metrics.Tick(start.Add(1500 * time.Millisecond))
+		metrics.RecordDirectPacketReceive(payloadBytes, start.Add(1600*time.Millisecond))
+		metrics.Tick(start.Add(1600 * time.Millisecond))
+		metrics.Complete(start.Add(1700 * time.Millisecond))
+		if err := trace.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+
+		result, err := transfertrace.Check(strings.NewReader(out.String()), transfertrace.Options{
+			Role:             transfertrace.RoleReceive,
+			StallWindow:      999 * time.Millisecond,
+			ExpectedBytes:    headerBytes + payloadBytes,
+			ExpectedBytesSet: true,
+		})
+		if err != nil {
+			t.Fatalf("Check() error = %v\ntrace:\n%s", err, out.String())
+		}
+		if result.FinalAppBytes != headerBytes+payloadBytes {
+			t.Fatalf("FinalAppBytes = %d, want %d", result.FinalAppBytes, headerBytes+payloadBytes)
+		}
+
+		rows := readTransferTraceRows(t, out.String())
+		for i, row := range rows[:3] {
+			if row["app_bytes"] != "0" {
+				t.Fatalf("header-only row %d app_bytes = %q, want 0; row = %#v", i+1, row["app_bytes"], row)
+			}
+		}
+		if got := rows[3]["app_bytes"]; got != "4201" {
+			t.Fatalf("first payload row app_bytes = %q, want 4201; row = %#v", got, rows[3])
+		}
+	})
+
+	t.Run("empty payload counts header at completion", func(t *testing.T) {
+		start := time.Unix(46, 0)
+		var out bytes.Buffer
+		trace, err := transfertrace.NewRecorder(&out, transfertrace.RoleReceive, start)
+		if err != nil {
+			t.Fatalf("NewRecorder() error = %v", err)
+		}
+		metrics := newExternalTransferMetricsWithTrace(start, trace, transfertrace.RoleReceive)
+		metrics.SetDirectAppProgressBase(headerBytes)
+		metrics.MarkDirectValidated(start.Add(250 * time.Millisecond))
+		metrics.Tick(start.Add(500 * time.Millisecond))
+		metrics.Tick(start.Add(1500 * time.Millisecond))
+		metrics.Complete(start.Add(1600 * time.Millisecond))
+		if err := trace.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+
+		result, err := transfertrace.Check(strings.NewReader(out.String()), transfertrace.Options{
+			Role:             transfertrace.RoleReceive,
+			StallWindow:      999 * time.Millisecond,
+			ExpectedBytes:    headerBytes,
+			ExpectedBytesSet: true,
+		})
+		if err != nil {
+			t.Fatalf("Check() error = %v\ntrace:\n%s", err, out.String())
+		}
+		if result.FinalAppBytes != headerBytes {
+			t.Fatalf("FinalAppBytes = %d, want %d", result.FinalAppBytes, headerBytes)
+		}
+
+		rows := readTransferTraceRows(t, out.String())
+		for i, row := range rows[:2] {
+			if row["app_bytes"] != "0" {
+				t.Fatalf("header-only row %d app_bytes = %q, want 0; row = %#v", i+1, row["app_bytes"], row)
+			}
+		}
+		if got := rows[len(rows)-1]["app_bytes"]; got != "105" {
+			t.Fatalf("terminal app_bytes = %q, want 105; row = %#v", got, rows[len(rows)-1])
+		}
+	})
+}
+
 func TestExternalTransferMetricsUsesPeerProgressForSenderAppBytes(t *testing.T) {
 	var out bytes.Buffer
 	trace, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(50, 0))
