@@ -2,7 +2,7 @@
 
 Date: 2026-07-11
 
-Status: approved in session; implementation planning follows this written-spec review.
+Status: reviewed and approved in session; implementation plan is ready for execution.
 
 ## Summary
 
@@ -80,7 +80,7 @@ The helper returns both the selected transfer mode and diagnostic inputs:
 - ignored Tailscale candidates
 - selected mode
 
-Verbose telemetry records those values so future reports can prove why a mode was chosen. Invalid candidates continue to be rejected by existing protocol validation rather than silently influencing the policy.
+Verbose telemetry records those values so future reports can prove why a mode was chosen. Invalid candidate strings count as non-compact and force the conservative QUIC choice rather than silently steering the bulk policy.
 
 No wire-mode names change. Peers still negotiate `blocks-v1` and `bulk-packets-v1` using existing capability fields. A peer without bulk-packet capability stays on QUIC blocks.
 
