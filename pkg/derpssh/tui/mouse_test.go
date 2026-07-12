@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 func TestMouseClickTopBarChatToggle(t *testing.T) {
@@ -17,7 +17,7 @@ func TestMouseClickTopBarChatToggle(t *testing.T) {
 	drainCommands(app)
 	chat := topBarActionRect(t, app, ActionToggleChat)
 
-	app.Update(leftClick(chat.X+chat.W/2, chat.Y))
+	dispatchViewMouse(t, app, leftClick(chat.X+chat.W/2, chat.Y))
 
 	if !app.sidebarOpen {
 		t.Fatalf("sidebarOpen = false, want true after top-bar chat click")
@@ -37,7 +37,7 @@ func TestMouseClickTopBarChatToggle(t *testing.T) {
 		t.Fatalf("resize command = %+v, want %+v", got, want)
 	}
 
-	app.Update(leftClick(chat.X+chat.W/2, chat.Y))
+	dispatchViewMouse(t, app, leftClick(chat.X+chat.W/2, chat.Y))
 
 	if app.sidebarOpen {
 		t.Fatalf("sidebarOpen = true, want false after second top-bar chat click")
@@ -53,7 +53,7 @@ func TestMouseClickTopBarQuitOpensConfirmation(t *testing.T) {
 	drainCommands(app)
 	quit := topBarActionRect(t, app, ActionQuit)
 
-	app.Update(leftClick(quit.X+quit.W/2, quit.Y))
+	dispatchViewMouse(t, app, leftClick(quit.X+quit.W/2, quit.Y))
 
 	if !app.quitOpen {
 		t.Fatalf("quitOpen = false, want true after top-bar X click")
@@ -73,7 +73,7 @@ func TestMouseClickPeerTopBarOpensPeerDialog(t *testing.T) {
 	drainCommands(app)
 	peer := topBarPeerRect(t, app, "guest-2")
 
-	app.Update(leftClick(peer.X+peer.W/2, peer.Y))
+	dispatchViewMouse(t, app, leftClick(peer.X+peer.W/2, peer.Y))
 
 	if !app.peerDialogOpen {
 		t.Fatal("peer dialog did not open after clicking peer chip")
@@ -95,15 +95,15 @@ func TestMouseClickPeerDialogReadChangesClickedPeer(t *testing.T) {
 	}})
 	drainCommands(app)
 	peer := topBarPeerRect(t, app, "guest-2")
-	app.Update(leftClick(peer.X+peer.W/2, peer.Y))
+	dispatchViewMouse(t, app, leftClick(peer.X+peer.W/2, peer.Y))
 	read, _, _ := app.peerActionButtonRects()
 
-	app.Update(leftClick(read.X+read.W/2, read.Y))
+	dispatchViewMouse(t, app, leftClick(read.X+read.W/2, read.Y))
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("peer dialog press emitted command %+v, want none until release", cmd)
 	}
 
-	app.Update(leftRelease(read.X+read.W/2, read.Y))
+	dispatchViewMouse(t, app, leftRelease(read.X+read.W/2, read.Y))
 
 	got, ok := readCommand(app).(RoleChangeCommand)
 	if !ok {
@@ -122,12 +122,12 @@ func TestMouseClickQuitConfirmationButtons(t *testing.T) {
 	app.openQuitConfirm()
 	quit, _ := app.quitButtonRects()
 
-	app.Update(leftClick(quit.X+quit.W/2, quit.Y))
+	dispatchViewMouse(t, app, leftClick(quit.X+quit.W/2, quit.Y))
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("quit confirmation press emitted command %+v, want none until release", cmd)
 	}
 
-	app.Update(leftRelease(quit.X+quit.W/2, quit.Y))
+	dispatchViewMouse(t, app, leftRelease(quit.X+quit.W/2, quit.Y))
 
 	if _, ok := readCommand(app).(QuitCommand); !ok {
 		t.Fatalf("quit confirmation click did not emit QuitCommand")
@@ -141,19 +141,19 @@ func TestMouseQuitPressDoesNotSurviveKeyboardClose(t *testing.T) {
 	app.openQuitConfirm()
 	quit, _ := app.quitButtonRects()
 
-	app.Update(leftClick(quit.X+quit.W/2, quit.Y))
+	dispatchViewMouse(t, app, leftClick(quit.X+quit.W/2, quit.Y))
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("quit confirmation press emitted command %+v, want none until release", cmd)
 	}
 
-	app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	app.Update(keyCode(tea.KeyEsc))
 	if app.quitOpen {
 		t.Fatal("quit confirmation still open after Esc")
 	}
 
 	app.openQuitConfirm()
 	quit, _ = app.quitButtonRects()
-	app.Update(leftRelease(quit.X+quit.W/2, quit.Y))
+	dispatchViewMouse(t, app, leftRelease(quit.X+quit.W/2, quit.Y))
 
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("stale mouse release emitted command %+v, want none without fresh press", cmd)
@@ -168,12 +168,12 @@ func TestMouseClickQuitConfirmationWorksInCopyMode(t *testing.T) {
 	app.openQuitConfirm()
 	quit, _ := app.quitButtonRects()
 
-	app.Update(leftClick(quit.X+quit.W/2, quit.Y))
+	dispatchViewMouse(t, app, leftClick(quit.X+quit.W/2, quit.Y))
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("quit confirmation press in copy mode emitted command %+v, want none until release", cmd)
 	}
 
-	app.Update(leftRelease(quit.X+quit.W/2, quit.Y))
+	dispatchViewMouse(t, app, leftRelease(quit.X+quit.W/2, quit.Y))
 
 	if _, ok := readCommand(app).(QuitCommand); !ok {
 		t.Fatalf("quit confirmation click in copy mode did not emit QuitCommand")
@@ -186,13 +186,16 @@ func TestSelectionModeClickOutsideTerminalRestoresMouse(t *testing.T) {
 	drainCommands(app)
 	app.copyMode = true
 
-	_, cmd := app.Update(leftClick(0, 0))
+	_, cmd := app.Update(viewMouseCmd(t, app, leftClick(0, 0))())
 
 	if app.copyMode {
 		t.Fatalf("copyMode = true, want false after click outside terminal")
 	}
-	if cmd == nil {
-		t.Fatalf("click outside selection mode returned nil command, want mouse restore command")
+	if cmd != nil {
+		t.Fatalf("click outside selection mode command = %T, want nil", cmd)
+	}
+	if got := app.View().MouseMode; got != tea.MouseModeCellMotion {
+		t.Fatalf("mouse mode after click = %v, want cell motion", got)
 	}
 }
 
@@ -202,13 +205,48 @@ func TestSelectionModeTerminalClickDoesNotForwardMouse(t *testing.T) {
 	drainCommands(app)
 	app.copyMode = true
 
-	app.Update(leftClick(app.layout.Terminal.X+1, app.layout.Terminal.Y+1))
+	dispatchViewMouse(t, app, leftClick(app.layout.Terminal.X+1, app.layout.Terminal.Y+1))
 
 	if !app.copyMode {
 		t.Fatalf("copyMode = false, want true after terminal-area selection click")
 	}
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("selection-mode terminal click emitted command %+v, want none", cmd)
+	}
+}
+
+func TestSelectionModeUsesSemanticTerminalTarget(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok", mouse: MouseMode{Enabled: true, SGR: true}}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	app.copyMode = true
+
+	for _, event := range []tea.MouseMsg{
+		leftClick(0, 0),
+		tea.MouseMotionMsg{X: 0, Y: 0, Button: tea.MouseLeft},
+		leftRelease(0, 0),
+	} {
+		app.Update(newPointerMsg(targetTerminal, event))
+	}
+
+	if !app.copyMode {
+		t.Fatal("copyMode = false after terminal-target selection sequence")
+	}
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("terminal-target selection sequence emitted command %+v, want none", cmd)
+	}
+}
+
+func TestSelectionModeRejectsNonterminalTargetAtTerminalCoordinates(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok", mouse: MouseMode{Enabled: true, SGR: true}}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	app.copyMode = true
+	terminal := app.layout.Terminal
+
+	app.Update(newPointerMsg(targetSidebar, leftClick(terminal.X+1, terminal.Y+1)))
+
+	if app.copyMode {
+		t.Fatal("copyMode = true after nonterminal semantic target")
 	}
 }
 
@@ -220,12 +258,12 @@ func TestMouseClickShellExitQuitCommitsOnRelease(t *testing.T) {
 	app.shellExitChoice = shellExitChoiceQuit
 	_, quit := app.shellExitButtonRects()
 
-	app.Update(leftClick(quit.X+quit.W/2, quit.Y))
+	dispatchViewMouse(t, app, leftClick(quit.X+quit.W/2, quit.Y))
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("shell-exit quit press emitted command %+v, want none until release", cmd)
 	}
 
-	app.Update(leftRelease(quit.X+quit.W/2, quit.Y))
+	dispatchViewMouse(t, app, leftRelease(quit.X+quit.W/2, quit.Y))
 
 	if _, ok := readCommand(app).(QuitCommand); !ok {
 		t.Fatalf("shell-exit quit release did not emit QuitCommand")
@@ -238,26 +276,26 @@ func TestMouseMenuShowsHostInvite(t *testing.T) {
 	drainCommands(app)
 	menu := topBarActionRect(t, app, ActionShowMenu)
 
-	app.Update(leftClick(menu.X+menu.W/2, menu.Y))
+	dispatchViewMouse(t, app, leftClick(menu.X+menu.W/2, menu.Y))
 
-	if !strings.Contains(app.View(), "Show Invite") || !strings.Contains(app.View(), "Ctrl-X I") {
-		t.Fatalf("menu missing invite action:\n%s", app.View())
+	if !strings.Contains(appContent(app), "Show Invite") || !strings.Contains(appContent(app), "Ctrl-X I") {
+		t.Fatalf("menu missing invite action:\n%s", appContent(app))
 	}
 }
 
 func TestMouseClickFocusesTerminalAndChat(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("s"))
 	drainCommands(app)
 
-	app.Update(leftClick(app.layout.Terminal.X+1, app.layout.Terminal.Y+1))
+	dispatchViewMouse(t, app, leftClick(app.layout.Terminal.X+1, app.layout.Terminal.Y+1))
 	if app.focus != FocusTerminal {
 		t.Fatalf("focus after terminal click = %v, want terminal", app.focus)
 	}
 
-	app.Update(leftClick(app.layout.Composer.X+1, app.layout.Composer.Y))
+	dispatchViewMouse(t, app, leftClick(app.layout.Composer.X+1, app.layout.Composer.Y))
 	if app.focus != FocusChat {
 		t.Fatalf("focus after composer click = %v, want chat", app.focus)
 	}
@@ -266,14 +304,14 @@ func TestMouseClickFocusesTerminalAndChat(t *testing.T) {
 func TestMouseDragDividerResizesChat(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("s"))
 	drainCommands(app)
 	start := app.layout.Divider.X
 
-	app.Update(leftClick(start, app.layout.Divider.Y+2))
-	app.Update(tea.MouseMsg{X: 70, Y: app.layout.Divider.Y + 2, Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft})
-	app.Update(tea.MouseMsg{X: 70, Y: app.layout.Divider.Y + 2, Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft})
+	dispatchViewMouse(t, app, leftClick(start, app.layout.Divider.Y+2))
+	dispatchViewMouse(t, app, tea.MouseMotionMsg{X: 70, Y: app.layout.Divider.Y + 2, Button: tea.MouseLeft})
+	dispatchViewMouse(t, app, releaseAt(70, app.layout.Divider.Y+2, tea.MouseLeft))
 
 	if app.layout.Sidebar.W != 49 {
 		t.Fatalf("Sidebar.W = %d, want 49 after dragging divider", app.layout.Sidebar.W)
@@ -287,22 +325,67 @@ func TestMouseDragDividerRepaintsTerminalDuringMotion(t *testing.T) {
 	pane := &recordingViewPane{fakePane: fakePane{view: "ok"}}
 	app := NewApp(Options{Terminal: pane})
 	app.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("s"))
 	drainCommands(app)
 	start := app.layout.Divider.X
 
-	_ = app.View()
+	_ = appContent(app)
 	initialWidth := pane.lastViewWidth()
-	app.Update(leftClick(start, app.layout.Divider.Y+2))
-	app.Update(tea.MouseMsg{X: 70, Y: app.layout.Divider.Y + 2, Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft})
-	_ = app.View()
+	dispatchViewMouse(t, app, leftClick(start, app.layout.Divider.Y+2))
+	dispatchViewMouse(t, app, tea.MouseMotionMsg{X: 70, Y: app.layout.Divider.Y + 2, Button: tea.MouseLeft})
+	_ = appContent(app)
 
 	if got := pane.lastViewWidth(); got == initialWidth {
 		t.Fatalf("terminal view width did not change during divider drag: got %d", got)
 	}
 	if got := pane.lastViewWidth(); got != app.layout.Terminal.W {
 		t.Fatalf("terminal view width = %d, want current layout width %d", got, app.layout.Terminal.W)
+	}
+}
+
+func TestViewOnMouseUsesRenderedLayerAndCapturesDividerDrag(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "shell$"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	app.setSidebarOpen(true)
+	divider := app.layout.Divider
+
+	dispatchViewMouse(t, app, clickAt(divider.X, divider.Y+1, tea.MouseLeft))
+	if app.pointerCapture != targetDivider {
+		t.Fatalf("capture = %q, want divider", app.pointerCapture)
+	}
+	dispatchViewMouse(t, app, tea.MouseMotionMsg{X: divider.X - 8, Y: divider.Y + 2, Button: tea.MouseLeft})
+	dispatchViewMouse(t, app, releaseAt(divider.X-8, divider.Y+2, tea.MouseLeft))
+	if app.pointerCapture != "" {
+		t.Fatalf("capture after release = %q, want empty", app.pointerCapture)
+	}
+}
+
+func TestPointerCaptureClearsWhenModalOpens(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "shell$"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	app.setSidebarOpen(true)
+	divider := app.layout.Divider
+	dispatchViewMouse(t, app, clickAt(divider.X, divider.Y+1, tea.MouseLeft))
+
+	app.openQuitConfirm()
+
+	if app.pointerCapture != "" || app.draggingDivider {
+		t.Fatalf("capture, dragging = %q, %v; want cleared when modal opens", app.pointerCapture, app.draggingDivider)
+	}
+}
+
+func TestPointerCaptureClearsWhenMouseModeDisabled(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "shell$"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	app.setSidebarOpen(true)
+	divider := app.layout.Divider
+	dispatchViewMouse(t, app, clickAt(divider.X, divider.Y+1, tea.MouseLeft))
+
+	app.setCopyMode(true)
+
+	if app.pointerCapture != "" || app.draggingDivider {
+		t.Fatalf("capture, dragging = %q, %v; want cleared when mouse mode is disabled", app.pointerCapture, app.draggingDivider)
 	}
 }
 
@@ -324,12 +407,12 @@ func TestMouseClickApprovalButtons(t *testing.T) {
 			read, write, deny := app.approvalButtonRects()
 			button := tt.pick(read, write, deny)
 
-			app.Update(leftClick(button.X+button.W/2, button.Y))
+			dispatchViewMouse(t, app, leftClick(button.X+button.W/2, button.Y))
 			if cmd := readCommand(app); cmd != nil {
 				t.Fatalf("approval press emitted command %+v, want none until release", cmd)
 			}
 
-			app.Update(leftRelease(button.X+button.W/2, button.Y))
+			dispatchViewMouse(t, app, leftRelease(button.X+button.W/2, button.Y))
 
 			got, ok := readCommand(app).(ApprovalDecisionCommand)
 			if !ok {
@@ -349,7 +432,7 @@ func TestMouseDuringApprovalDoesNotReachTerminalOrChangeFocus(t *testing.T) {
 	drainCommands(app)
 	app.Update(ApprovalRequestMsg{Peer: "Alex"})
 
-	app.Update(leftClick(app.layout.Terminal.X+4, app.layout.Terminal.Y+2))
+	dispatchViewMouse(t, app, leftClick(app.layout.Terminal.X+4, app.layout.Terminal.Y+2))
 
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("approval terminal click emitted command %+v, want none", cmd)
@@ -359,7 +442,7 @@ func TestMouseDuringApprovalDoesNotReachTerminalOrChangeFocus(t *testing.T) {
 	}
 }
 
-func TestHostApprovalClickAtDisplayedWriteButtonConsumesMouseAndRepaints(t *testing.T) {
+func TestHostApprovalClickAtDisplayedWriteButtonRendersDeclaratively(t *testing.T) {
 	pane := &fakePane{view: "ubuntu@host:~$ ", mouse: MouseMode{Enabled: true, SGR: true}}
 	app := NewApp(Options{Side: "host", Terminal: pane})
 	app.Update(tea.WindowSizeMsg{Width: 101, Height: 30})
@@ -370,14 +453,14 @@ func TestHostApprovalClickAtDisplayedWriteButtonConsumesMouseAndRepaints(t *test
 	x := write.X + write.W/2
 	y := write.Y
 
-	app.Update(leftClick(x, y))
+	dispatchViewMouse(t, app, leftClick(x, y))
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("approval press emitted command %+v, want none until release", cmd)
 	}
 
-	_, repaint := app.Update(leftRelease(x, y))
-	if repaint == nil {
-		t.Fatal("approval release returned nil command, want repaint command")
+	_, repaint := app.Update(viewMouseCmd(t, app, leftRelease(x, y))())
+	if repaint != nil {
+		t.Fatalf("approval release returned command %T, want declarative render", repaint())
 	}
 	got, ok := readCommand(app).(ApprovalDecisionCommand)
 	if !ok {
@@ -387,14 +470,14 @@ func TestHostApprovalClickAtDisplayedWriteButtonConsumesMouseAndRepaints(t *test
 	if got != want {
 		t.Fatalf("approval command = %+v, want %+v", got, want)
 	}
-	view := app.View()
+	view := appContent(app)
 	for _, stale := range []string{"wants to join", "Select access"} {
 		if strings.Contains(view, stale) {
 			t.Fatalf("view contains stale approval text %q after approval:\n%s", stale, view)
 		}
 	}
 
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	app.Update(textKey("l"))
 	keyCmd, ok := readCommand(app).(TerminalInputCommand)
 	if !ok {
 		t.Fatalf("post-approval key command = %T, want TerminalInputCommand", keyCmd)
@@ -411,7 +494,7 @@ func TestPassiveModalMouseDoesNotReachTerminal(t *testing.T) {
 	drainCommands(app)
 	app.Update(RuntimeStateMsg{Transport: "direct", HostCols: 101, HostRows: 29, LocalRole: RolePending})
 
-	app.Update(leftClick(app.layout.Terminal.X+50, app.layout.Terminal.Y+16))
+	dispatchViewMouse(t, app, leftClick(app.layout.Terminal.X+50, app.layout.Terminal.Y+16))
 
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("passive modal mouse emitted command %+v, want none", cmd)
@@ -424,12 +507,12 @@ func TestApprovalDecisionIncludesPeerIDForDuplicateNames(t *testing.T) {
 	app.Update(ApprovalRequestMsg{PeerID: "guest-2", Peer: "Alex"})
 	read, _, _ := app.approvalButtonRects()
 
-	app.Update(leftClick(read.X+read.W/2, read.Y))
+	dispatchViewMouse(t, app, leftClick(read.X+read.W/2, read.Y))
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("approval press emitted command %+v, want none until release", cmd)
 	}
 
-	app.Update(leftRelease(read.X+read.W/2, read.Y))
+	dispatchViewMouse(t, app, leftRelease(read.X+read.W/2, read.Y))
 
 	got, ok := readCommand(app).(ApprovalDecisionCommand)
 	if !ok {
@@ -447,13 +530,13 @@ func TestTerminalMouseOnlyForwardsWhenEnabled(t *testing.T) {
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	drainCommands(app)
 
-	app.Update(leftClick(app.layout.Terminal.X+4, app.layout.Terminal.Y+2))
+	dispatchViewMouse(t, app, leftClick(app.layout.Terminal.X+4, app.layout.Terminal.Y+2))
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("mouse with disabled terminal mode emitted %+v, want none", cmd)
 	}
 
 	pane.mouse = MouseMode{Enabled: true, SGR: true}
-	app.Update(leftClick(app.layout.Terminal.X+4, app.layout.Terminal.Y+2))
+	dispatchViewMouse(t, app, leftClick(app.layout.Terminal.X+4, app.layout.Terminal.Y+2))
 	cmd, ok := readCommand(app).(TerminalInputCommand)
 	if !ok {
 		t.Fatalf("command = %T, want TerminalInputCommand", cmd)
@@ -464,53 +547,82 @@ func TestTerminalMouseOnlyForwardsWhenEnabled(t *testing.T) {
 	}
 }
 
-func TestMouseButtonCodeMapsButtons(t *testing.T) {
+func TestEncodeSGRMouseMapsButtons(t *testing.T) {
 	tests := []struct {
 		name   string
 		button tea.MouseButton
-		want   int
+		want   string
 	}{
-		{name: "left", button: tea.MouseButtonLeft, want: 0},
-		{name: "middle", button: tea.MouseButtonMiddle, want: 1},
-		{name: "right", button: tea.MouseButtonRight, want: 2},
-		{name: "wheel up", button: tea.MouseButtonWheelUp, want: 64},
-		{name: "wheel down", button: tea.MouseButtonWheelDown, want: 65},
+		{name: "left", button: tea.MouseLeft, want: "\x1b[<0;3;4M"},
+		{name: "middle", button: tea.MouseMiddle, want: "\x1b[<1;3;4M"},
+		{name: "right", button: tea.MouseRight, want: "\x1b[<2;3;4M"},
+		{name: "wheel up", button: tea.MouseWheelUp, want: "\x1b[<64;3;4M"},
+		{name: "wheel down", button: tea.MouseWheelDown, want: "\x1b[<65;3;4M"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := mouseButtonCode(tea.MouseMsg{Action: tea.MouseActionPress, Button: tt.button})
-			if !ok || got != tt.want {
-				t.Fatalf("mouseButtonCode() = %d, %v; want %d, true", got, ok, tt.want)
+			var event tea.MouseMsg = clickAt(2, 4, tt.button)
+			if tt.button == tea.MouseWheelUp || tt.button == tea.MouseWheelDown {
+				event = tea.MouseWheelMsg{X: 2, Y: 4, Button: tt.button}
+			}
+			got, ok := EncodeSGRMouse(event, Rect{X: 0, Y: 1, W: 20, H: 10})
+			if !ok || string(got) != tt.want {
+				t.Fatalf("EncodeSGRMouse() = %q, %v; want %q, true", got, ok, tt.want)
 			}
 		})
 	}
 }
 
-func TestMouseButtonCodeReleaseAndUnknown(t *testing.T) {
-	if got, ok := mouseButtonCode(tea.MouseMsg{Action: tea.MouseActionRelease}); !ok || got != 0 {
-		t.Fatalf("release mouseButtonCode() = %d, %v; want 0, true", got, ok)
-	}
-	if got, ok := mouseButtonCode(tea.MouseMsg{Action: tea.MouseActionPress}); ok || got != 0 {
-		t.Fatalf("unknown mouseButtonCode() = %d, %v; want 0, false", got, ok)
-	}
-}
-
-func leftClick(x int, y int) tea.MouseMsg {
-	return tea.MouseMsg{
-		X:      x,
-		Y:      y,
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonLeft,
+func TestEncodeSGRMouseReleaseWithoutButtonPreservesModifier(t *testing.T) {
+	msg := tea.MouseReleaseMsg{X: 3, Y: 4, Button: tea.MouseNone, Mod: tea.ModCtrl}
+	got, ok := EncodeSGRMouse(msg, Rect{X: 0, Y: 1, W: 20, H: 10})
+	if !ok || string(got) != "\x1b[<16;4;4m" {
+		t.Fatalf("EncodeSGRMouse() = %q, %v, want ctrl-release sequence", got, ok)
 	}
 }
 
-func leftRelease(x int, y int) tea.MouseMsg {
-	return tea.MouseMsg{
-		X:      x,
-		Y:      y,
-		Action: tea.MouseActionRelease,
-		Button: tea.MouseButtonLeft,
+func TestEncodeSGRMouseRejectsUnknownClickButton(t *testing.T) {
+	if got, ok := EncodeSGRMouse(clickAt(0, 1, tea.MouseNone), Rect{W: 20, H: 10}); ok || got != nil {
+		t.Fatalf("EncodeSGRMouse() = %q, %v; want nil, false", got, ok)
 	}
+}
+
+func TestEncodeSGRMousePreservesCtrlModifier(t *testing.T) {
+	msg := tea.MouseClickMsg{X: 3, Y: 4, Button: tea.MouseLeft, Mod: tea.ModCtrl}
+	got, ok := EncodeSGRMouse(msg, Rect{X: 0, Y: 1, W: 20, H: 10})
+	if !ok || string(got) != "\x1b[<16;4;4M" {
+		t.Fatalf("EncodeSGRMouse() = %q, %v, want ctrl-left sequence", got, ok)
+	}
+}
+
+func TestEncodeSGRMousePreservesShiftAndAltModifiers(t *testing.T) {
+	msg := tea.MouseClickMsg{X: 3, Y: 4, Button: tea.MouseLeft, Mod: tea.ModShift | tea.ModAlt}
+	got, ok := EncodeSGRMouse(msg, Rect{X: 0, Y: 1, W: 20, H: 10})
+	if !ok || string(got) != "\x1b[<12;4;4M" {
+		t.Fatalf("EncodeSGRMouse() = %q, %v, want shift-alt-left sequence", got, ok)
+	}
+}
+
+func dispatchViewMouse(t *testing.T, app *App, msg tea.MouseMsg) {
+	t.Helper()
+	app.Update(viewMouseCmd(t, app, msg)())
+}
+
+func viewMouseCmd(t *testing.T, app *App, msg tea.MouseMsg) tea.Cmd {
+	t.Helper()
+	cmd := app.View().OnMouse(msg)
+	if cmd == nil {
+		t.Fatal("View().OnMouse returned nil command")
+	}
+	return cmd
+}
+
+func leftClick(x int, y int) tea.MouseClickMsg {
+	return clickAt(x, y, tea.MouseLeft)
+}
+
+func leftRelease(x int, y int) tea.MouseReleaseMsg {
+	return releaseAt(x, y, tea.MouseLeft)
 }
 
 type recordingViewPane struct {
@@ -532,25 +644,33 @@ func (p *recordingViewPane) lastViewWidth() int {
 
 func topBarActionRect(t *testing.T, app *App, action ActionID) Rect {
 	t.Helper()
-	app.renderTopBar()
-	for _, hit := range app.topBarHits {
-		if hit.action == action {
-			return hit.rect
-		}
-	}
-	t.Fatalf("missing top-bar action %v in hits %+v", action, app.topBarHits)
-	return Rect{}
+	return topBarTargetRect(t, app, actionTarget(action))
 }
 
 func topBarPeerRect(t *testing.T, app *App, peerID string) Rect {
 	t.Helper()
-	app.renderTopBar()
-	for _, hit := range app.topBarHits {
-		if hit.action == ActionManagePeer && hit.peer.ID == peerID {
-			return hit.rect
+	return topBarTargetRect(t, app, peerTarget(peerID))
+}
+
+func topBarTargetRect(t *testing.T, app *App, target layerTarget) Rect {
+	t.Helper()
+	scene := app.buildScene()
+	start := -1
+	for x := 0; x < scene.Width; x++ {
+		if scene.TargetAt(x, 0) == target {
+			if start < 0 {
+				start = x
+			}
+			continue
+		}
+		if start >= 0 {
+			return Rect{X: start, Y: 0, W: x - start, H: 1}
 		}
 	}
-	t.Fatalf("missing top-bar peer %q in hits %+v", peerID, app.topBarHits)
+	if start >= 0 {
+		return Rect{X: start, Y: 0, W: scene.Width - start, H: 1}
+	}
+	t.Fatalf("missing top-bar target %q", target)
 	return Rect{}
 }
 

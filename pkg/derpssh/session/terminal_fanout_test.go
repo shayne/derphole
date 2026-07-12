@@ -5,7 +5,6 @@
 package session
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"testing"
@@ -14,8 +13,8 @@ import (
 
 func TestTerminalFanoutReplaysThenStreamsFutureData(t *testing.T) {
 	pr, pw := io.Pipe()
-	var local bytes.Buffer
-	fanout := newTerminalFanout(pr, &local)
+	local := newStringCapture()
+	fanout := newTerminalFanout(pr, local)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = fanout.Run(ctx) }()

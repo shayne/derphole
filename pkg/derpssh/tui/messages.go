@@ -39,12 +39,6 @@ type RestartShellCommand struct{}
 
 func (RestartShellCommand) command() {}
 
-type CopyInviteCommand struct {
-	Command string
-}
-
-func (CopyInviteCommand) command() {}
-
 type RoleChangeCommand struct {
 	PeerID string
 	Peer   string

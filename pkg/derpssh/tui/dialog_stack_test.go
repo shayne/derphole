@@ -4,18 +4,12 @@
 
 package tui
 
-import (
-	"strings"
-	"testing"
+import "testing"
 
-	"github.com/charmbracelet/lipgloss"
-)
-
-func TestModalStackDrawsFrontDialogLast(t *testing.T) {
-	canvas := NewFrameCanvas(48, 14, lipgloss.NewStyle())
+func TestModalStackKeepsFrontDialogLast(t *testing.T) {
 	stack := NewModalStack()
-	stack.Push(NewLineDialog(ModalNotice, []string{labelStyle.Render("Back")}))
-	stack.Push(NewLineDialog(ModalQuit, []string{labelStyle.Render("Front")}))
+	stack.Push(NewLineDialog(ModalNotice, []string{"Back"}))
+	stack.Push(NewLineDialog(ModalQuit, []string{"Front"}))
 
 	if !stack.HasDialogs() {
 		t.Fatal("stack should report active dialogs")
@@ -23,32 +17,22 @@ func TestModalStackDrawsFrontDialogLast(t *testing.T) {
 	if got := stack.Front().ID(); got != ModalQuit {
 		t.Fatalf("front dialog = %q, want %q", got, ModalQuit)
 	}
-
-	stack.Draw(canvas, ModalFrame{Width: 48, Height: 14})
-
-	view := ansiPattern.ReplaceAllString(canvas.Render(), "")
-	if !strings.Contains(view, "Front") {
-		t.Fatalf("front dialog not drawn:\n%s", view)
-	}
-	if strings.Contains(view, "Back") {
-		t.Fatalf("back dialog cut through front dialog:\n%s", view)
+	if got := stack.Front().Lines(); len(got) != 1 || got[0] != "Front" {
+		t.Fatalf("front dialog lines = %v, want Front", got)
 	}
 }
 
-func TestLineDialogFillsInteriorBlankCells(t *testing.T) {
-	canvas := NewFrameCanvas(48, 14, lipgloss.NewStyle())
+func TestLineDialogCopiesLines(t *testing.T) {
+	lines := []string{"Notice", ""}
 	dialog := NewLineDialog(ModalNotice, []string{
-		labelStyle.Render("Notice"),
-		modalInteriorStyle.Render(""),
+		lines[0],
+		lines[1],
 	})
-	frame := ModalFrame{Width: 48, Height: 14}
-
-	dialog.Draw(canvas, frame)
-
-	bounds := modalBounds(frame, dialog.Lines())
-	cell := canvas.Cell(bounds.X+1, bounds.Y+2)
-	if got, want := cell.Style.GetBackground(), modalInteriorStyle.GetBackground(); got != want {
-		t.Fatalf("blank interior background = %v, want %v", got, want)
+	lines[0] = "Changed"
+	got := dialog.Lines()
+	got[0] = "Mutated"
+	if want := "Notice"; dialog.Lines()[0] != want {
+		t.Fatalf("dialog line = %q, want %q", dialog.Lines()[0], want)
 	}
 }
 

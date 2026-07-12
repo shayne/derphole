@@ -142,6 +142,36 @@ func TestTrackInputModeApplicationCursorEnableDisable(t *testing.T) {
 	}
 }
 
+func TestTrackInputModeBracketedPasteEnableDisable(t *testing.T) {
+	mode := TrackInputMode(TerminalInputMode{}, []byte("\x1b[?2004h"))
+	if !mode.BracketedPaste {
+		t.Fatalf("TrackInputMode enable = %+v, want bracketed paste enabled", mode)
+	}
+
+	mode = TrackInputMode(mode, []byte("\x1b[?25l\x1b[?2004l"))
+	if mode.BracketedPaste {
+		t.Fatalf("TrackInputMode disable = %+v, want bracketed paste disabled", mode)
+	}
+}
+
+func TestVTTerminalPaneTracksSplitBracketedPasteMode(t *testing.T) {
+	pane := NewVTTerminalPane(20, 4)
+
+	if _, err := pane.Write([]byte("\x1b[?20")); err != nil {
+		t.Fatalf("first Write() error = %v", err)
+	}
+	if mode := pane.InputMode(); mode.BracketedPaste {
+		t.Fatalf("InputMode after partial sequence = %+v, want disabled", mode)
+	}
+
+	if _, err := pane.Write([]byte("04h")); err != nil {
+		t.Fatalf("second Write() error = %v", err)
+	}
+	if mode := pane.InputMode(); !mode.BracketedPaste {
+		t.Fatalf("InputMode after split enable = %+v, want bracketed paste enabled", mode)
+	}
+}
+
 func TestTrackInputModePreservesStateForUnrelatedPrivateModes(t *testing.T) {
 	mode := TrackInputMode(TerminalInputMode{ApplicationCursor: true}, []byte("\x1b[?25l\x1b[?1006h\x1b[?bad?h"))
 	if !mode.ApplicationCursor {

@@ -6,7 +6,6 @@ package session
 
 import (
 	"context"
-	"encoding/base64"
 	"io"
 	"os"
 	"strconv"
@@ -14,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 	"github.com/shayne/derphole/pkg/derpssh/protocol"
 	"github.com/shayne/derphole/pkg/derpssh/pty"
 	"github.com/shayne/derphole/pkg/derpssh/tui"
@@ -103,6 +102,7 @@ type tuiConsole struct {
 	programQueue          []tea.Msg
 	programNotify         chan struct{}
 	programQuitOnce       sync.Once
+	programWaitOnce       sync.Once
 	startOnce             sync.Once
 	cancel                context.CancelFunc
 	lifecycleMu           sync.Mutex
@@ -208,8 +208,6 @@ func (c *tuiConsole) configureProgram(opts tuiConsoleOptions) {
 		c.app,
 		tea.WithInput(opts.Stdin),
 		tea.WithOutput(opts.Stdout),
-		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(),
 	)
 }
 
@@ -492,7 +490,7 @@ func closeReasonCode(message string) string {
 func (c *tuiConsole) View() string {
 	c.appMu.Lock()
 	defer c.appMu.Unlock()
-	return c.app.View()
+	return c.app.View().Content
 }
 
 func (c *tuiConsole) consumeCommands(ctx context.Context) {
@@ -517,8 +515,6 @@ func (c *tuiConsole) handleCommand(ctx context.Context, cmd tui.Command) {
 		c.handleChatCommand(ctx, cmd)
 	case tui.QuitCommand:
 		c.handleQuitCommand(ctx)
-	case tui.CopyInviteCommand:
-		c.handleCopyInviteCommand(cmd)
 	case tui.RoleChangeCommand:
 		c.handleRoleChangeCommand(ctx, cmd)
 	case tui.KickCommand:
@@ -563,14 +559,6 @@ func (c *tuiConsole) handleProgramExit(ctx context.Context) {
 	if callbacks.Quit != nil {
 		_ = callbacks.Quit(ctx)
 	}
-}
-
-func (c *tuiConsole) handleCopyInviteCommand(cmd tui.CopyInviteCommand) {
-	command := strings.TrimSpace(cmd.Command)
-	if command == "" || c.output == nil {
-		return
-	}
-	_, _ = io.WriteString(c.output, osc52(command))
 }
 
 func (c *tuiConsole) handleTerminalInputCommand(ctx context.Context, cmd tui.TerminalInputCommand) {
@@ -653,10 +641,6 @@ func (c *tuiConsole) currentCallbacks() tuiConsoleCallbacks {
 	c.callbackMu.Lock()
 	defer c.callbackMu.Unlock()
 	return c.callbacks
-}
-
-func osc52(text string) string {
-	return "\x1b]52;c;" + base64.StdEncoding.EncodeToString([]byte(text)) + "\x07"
 }
 
 func hostConsoleCallbacks(host *HostRuntime) tuiConsoleCallbacks {
@@ -1044,7 +1028,7 @@ func (c *tuiConsole) quitProgramIfStarted() bool {
 		return false
 	}
 	c.programQuitOnce.Do(func() {
-		c.terminalLifecycle().End(CloseReason{Code: "program_quit"})
+		c.program.Quit()
 	})
 	return true
 }
@@ -1053,15 +1037,17 @@ func (c *tuiConsole) waitForProgramExit(timeout time.Duration) {
 	if c.program == nil {
 		return
 	}
-	done := make(chan struct{})
-	go func() {
-		c.program.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(timeout):
-	}
+	c.programWaitOnce.Do(func() {
+		done := make(chan struct{})
+		go func() {
+			c.program.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(timeout):
+		}
+	})
 }
 
 func (c *tuiConsole) restoreTerminal() {
@@ -1074,21 +1060,11 @@ func (c *tuiConsole) terminalLifecycle() *TerminalLifecycle {
 	if c.lifecycle == nil {
 		c.lifecycle = newTerminalLifecycle(terminalLifecycleOptions{
 			Output:  c.output,
-			Program: c.startedProgram(),
 			Restore: []byte(terminalRestoreSequence),
 			IsTTY:   c.tty,
 		})
 	}
 	return c.lifecycle
-}
-
-func (c *tuiConsole) startedProgram() teaProgram {
-	c.programMu.Lock()
-	defer c.programMu.Unlock()
-	if c.programStartRequested {
-		return c.program
-	}
-	return nil
 }
 
 func (c *tuiConsole) runTeaCommand(cmd tea.Cmd) {

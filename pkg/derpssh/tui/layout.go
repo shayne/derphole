@@ -11,21 +11,6 @@ type Rect struct {
 	H int
 }
 
-type HitTarget int
-
-const (
-	HitNone HitTarget = iota
-	HitTopBar
-	HitTerminal
-	HitDivider
-	HitSidebar
-	HitStatus
-	HitComposer
-	HitApprovalRead
-	HitApprovalWrite
-	HitApprovalDeny
-)
-
 type Layout struct {
 	Outer       Rect
 	TopBar      Rect
@@ -142,27 +127,6 @@ func clampInt(v int, min int, max int) int {
 		return max
 	}
 	return v
-}
-
-func (l Layout) Hit(x int, y int) HitTarget {
-	switch {
-	case !l.Outer.contains(x, y):
-		return HitNone
-	case l.TopBar.contains(x, y):
-		return HitTopBar
-	case l.Status.contains(x, y):
-		return HitStatus
-	case l.Composer.contains(x, y):
-		return HitComposer
-	case l.Divider.contains(x, y):
-		return HitDivider
-	case l.Sidebar.contains(x, y):
-		return HitSidebar
-	case l.Terminal.contains(x, y):
-		return HitTerminal
-	default:
-		return HitNone
-	}
 }
 
 func (r Rect) contains(x int, y int) bool {

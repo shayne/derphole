@@ -61,32 +61,6 @@ func TestComputeLayoutCollapsedSidebar(t *testing.T) {
 	}
 }
 
-func TestLayoutHitTargets(t *testing.T) {
-	l := ComputeLayout(100, 30, true)
-
-	tests := []struct {
-		name string
-		x    int
-		y    int
-		want HitTarget
-	}{
-		{name: "top bar", x: 5, y: 0, want: HitTopBar},
-		{name: "terminal", x: l.Terminal.X + 1, y: l.Terminal.Y + 1, want: HitTerminal},
-		{name: "divider", x: l.Divider.X, y: l.Divider.Y + 1, want: HitDivider},
-		{name: "sidebar", x: l.Sidebar.X + 1, y: l.Sidebar.Y + 1, want: HitSidebar},
-		{name: "composer", x: l.Composer.X + 1, y: l.Composer.Y, want: HitComposer},
-		{name: "outside negative", x: -1, y: 0, want: HitNone},
-		{name: "outside after edge", x: 100, y: 30, want: HitNone},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := l.Hit(tt.x, tt.y); got != tt.want {
-				t.Fatalf("Hit(%d, %d) = %v, want %v", tt.x, tt.y, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestComputeLayoutUsesPreferredSidebarWidth(t *testing.T) {
 	l := ComputeLayoutWithSidebarWidth(120, 32, true, 48)
 

@@ -5,35 +5,41 @@
 package tui
 
 import (
+	"fmt"
+	"image/color"
 	"testing"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 )
 
-func TestStructuralStylesUseAdaptiveBackgrounds(t *testing.T) {
-	tests := []struct {
-		name  string
-		style lipgloss.Style
-	}{
-		{name: "top bar", style: topBarStyle},
-		{name: "status bar", style: statusBarStyle},
-		{name: "sidebar", style: sidebarStyle},
-		{name: "modal", style: modalStyle},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if _, ok := tt.style.GetBackground().(lipgloss.AdaptiveColor); !ok {
-				t.Fatalf("%s background = %T, want lipgloss.AdaptiveColor", tt.name, tt.style.GetBackground())
-			}
-		})
+func TestStructuralStylesUseConcreteSchemeBackgrounds(t *testing.T) {
+	for _, scheme := range []ColorScheme{SchemeLight, SchemeDark} {
+		styles := NewStyleSet(scheme)
+		tests := []struct {
+			name  string
+			style lipgloss.Style
+		}{
+			{name: "top bar", style: styles.TopBar},
+			{name: "status bar", style: styles.StatusBar},
+			{name: "sidebar", style: styles.Sidebar},
+			{name: "modal", style: styles.Modal},
+		}
+		for _, tt := range tests {
+			t.Run(string(scheme)+"/"+tt.name, func(t *testing.T) {
+				if got := tt.style.GetBackground(); got == nil {
+					t.Fatalf("%s background = nil, want concrete color", tt.name)
+				}
+			})
+		}
 	}
 }
 
-func TestSeparatorStyleUsesAdaptiveForegroundOnly(t *testing.T) {
-	if _, ok := separatorStyle.GetForeground().(lipgloss.AdaptiveColor); !ok {
-		t.Fatalf("separator foreground = %T, want lipgloss.AdaptiveColor", separatorStyle.GetForeground())
+func TestSeparatorStyleUsesConcreteForegroundOnly(t *testing.T) {
+	styles := NewStyleSet(SchemeDark)
+	if got := colorString(styles.Separator.GetForeground()); got != "#74C7EC" {
+		t.Fatalf("separator foreground = %q, want #74C7EC", got)
 	}
-	if got := separatorStyle.GetBackground(); got != nil {
+	if got := styles.Separator.GetBackground(); got != nil {
 		if _, ok := got.(lipgloss.NoColor); !ok {
 			t.Fatalf("separator background = %T, want foreground-only divider", got)
 		}
@@ -41,79 +47,36 @@ func TestSeparatorStyleUsesAdaptiveForegroundOnly(t *testing.T) {
 }
 
 func TestLightThemeChromeUsesRestrainedCatppuccinSurfaces(t *testing.T) {
+	styles := NewStyleSet(SchemeLight)
 	tests := []struct {
 		name       string
 		style      lipgloss.Style
 		foreground string
 		background string
 	}{
-		{
-			name:       "muted top bar text",
-			style:      topBarMutedStyle,
-			foreground: "#5C5F77",
-			background: "#DCE0E8",
-		},
-		{
-			name:       "warning top bar chip",
-			style:      topBarWarnStyle,
-			foreground: "#D20F39",
-			background: "#E6E9EF",
-		},
-		{
-			name:       "modal interior",
-			style:      modalInteriorStyle,
-			foreground: "#4C4F69",
-			background: "#E6E9EF",
-		},
-		{
-			name:       "modal label",
-			style:      labelStyle,
-			foreground: "#209FB5",
-			background: "#E6E9EF",
-		},
-		{
-			name:       "default modal button",
-			style:      approvalButtonStyle,
-			foreground: "#4C4F69",
-			background: "#DCE0E8",
-		},
+		{name: "muted top bar text", style: styles.TopBarMuted, foreground: "#5C5F77", background: "#DCE0E8"},
+		{name: "warning top bar chip", style: styles.TopBarWarn, foreground: "#D20F39", background: "#E6E9EF"},
+		{name: "modal interior", style: styles.ModalInterior, foreground: "#4C4F69", background: "#E6E9EF"},
+		{name: "modal label", style: styles.Label, foreground: "#209FB5", background: "#E6E9EF"},
+		{name: "default modal button", style: styles.ApprovalButton, foreground: "#4C4F69", background: "#DCE0E8"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := lightColor(t, tt.style.GetForeground()); got != tt.foreground {
+			if got := colorString(tt.style.GetForeground()); got != tt.foreground {
 				t.Fatalf("foreground = %q, want %q", got, tt.foreground)
 			}
-			if got := lightColor(t, tt.style.GetBackground()); got != tt.background {
+			if got := colorString(tt.style.GetBackground()); got != tt.background {
 				t.Fatalf("background = %q, want %q", got, tt.background)
 			}
 		})
 	}
 }
 
-func TestModalBorderMatchesNeutralPanel(t *testing.T) {
-	if got := lightColor(t, modalBorderStyle.GetBackground()); got != lightColor(t, modalInteriorStyle.GetBackground()) {
-		t.Fatalf("modal border background = %q, want modal interior background", got)
+func colorString(value any) string {
+	if c, ok := value.(color.Color); ok {
+		r, g, b, _ := c.RGBA()
+		return fmt.Sprintf("#%02X%02X%02X", uint8(r>>8), uint8(g>>8), uint8(b>>8))
 	}
-	if got := darkColor(t, modalBorderStyle.GetBackground()); got != darkColor(t, modalInteriorStyle.GetBackground()) {
-		t.Fatalf("modal border dark background = %q, want modal interior background", got)
-	}
-}
-
-func lightColor(t *testing.T, color any) string {
-	t.Helper()
-	adaptiveColor, ok := color.(lipgloss.AdaptiveColor)
-	if !ok {
-		t.Fatalf("color = %T, want lipgloss.AdaptiveColor", color)
-	}
-	return adaptiveColor.Light
-}
-
-func darkColor(t *testing.T, color any) string {
-	t.Helper()
-	adaptiveColor, ok := color.(lipgloss.AdaptiveColor)
-	if !ok {
-		t.Fatalf("color = %T, want lipgloss.AdaptiveColor", color)
-	}
-	return adaptiveColor.Dark
+	return fmt.Sprint(value)
 }

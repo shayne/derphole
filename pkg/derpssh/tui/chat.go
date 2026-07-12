@@ -17,7 +17,6 @@ type ChatPane struct {
 	open        bool
 	messages    []ChatLine
 	wasAtBottom bool
-	composer    Composer
 	unread      int
 	width       int
 	peers       []DisplayName
@@ -36,7 +35,6 @@ func NewChatPane(opts ChatPaneOptions) *ChatPane {
 		width:       maxInt(opts.Width, 1),
 		peers:       append([]DisplayName(nil), opts.Peers...),
 		wasAtBottom: true,
-		composer:    NewComposer(ComposerOptions{Width: opts.Width, MaxVisibleLines: 3}),
 		seenIDs:     make(map[string]struct{}),
 	}
 }

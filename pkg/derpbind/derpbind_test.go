@@ -501,10 +501,12 @@ func TestRaceDERPDialDoesNotReturnFirstFailedTarget(t *testing.T) {
 }
 
 func TestRaceDERPDialReportsPendingTargetsOnTimeout(t *testing.T) {
+	dialExited := make(chan struct{})
 	restore := stubDERPDial(t, func(ctx context.Context, _ logger.Logf, _ *netmon.Monitor, network, _ string) (net.Conn, error) {
 		if network == "tcp6" {
 			return nil, errors.New("network unreachable")
 		}
+		defer close(dialExited)
 		<-ctx.Done()
 		return nil, ctx.Err()
 	})
@@ -529,6 +531,11 @@ func TestRaceDERPDialReportsPendingTargetsOnTimeout(t *testing.T) {
 		if !bytes.Contains([]byte(msg), []byte(want)) {
 			t.Fatalf("raceDERPDial() error = %q, want substring %q", msg, want)
 		}
+	}
+	select {
+	case <-dialExited:
+	case <-time.After(time.Second):
+		t.Fatal("pending DERP dial did not exit after timeout")
 	}
 }
 

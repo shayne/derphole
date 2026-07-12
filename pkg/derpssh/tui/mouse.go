@@ -6,206 +6,230 @@ package tui
 
 import (
 	"fmt"
+	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 var mouseButtonCodes = map[tea.MouseButton]int{
-	tea.MouseButtonLeft:      0,
-	tea.MouseButtonMiddle:    1,
-	tea.MouseButtonRight:     2,
-	tea.MouseButtonWheelUp:   64,
-	tea.MouseButtonWheelDown: 65,
+	tea.MouseLeft:      0,
+	tea.MouseMiddle:    1,
+	tea.MouseRight:     2,
+	tea.MouseWheelUp:   64,
+	tea.MouseWheelDown: 65,
+}
+
+type layerTarget string
+
+type pointerMsg struct {
+	Target layerTarget
+	Event  tea.MouseMsg
+	Mouse  tea.Mouse
+}
+
+func newPointerMsg(target layerTarget, msg tea.MouseMsg) pointerMsg {
+	return pointerMsg{Target: target, Event: msg, Mouse: msg.Mouse()}
+}
+
+type pointerAction int
+
+const (
+	pointerUnknown pointerAction = iota
+	pointerClick
+	pointerRelease
+	pointerMotion
+)
+
+func (m pointerMsg) action() pointerAction {
+	switch m.Event.(type) {
+	case tea.MouseClickMsg, tea.MouseWheelMsg:
+		return pointerClick
+	case tea.MouseReleaseMsg:
+		return pointerRelease
+	case tea.MouseMotionMsg:
+		return pointerMotion
+	default:
+		return pointerUnknown
+	}
 }
 
 func EncodeSGRMouse(msg tea.MouseMsg, terminal Rect) ([]byte, bool) {
-	if !terminal.contains(msg.X, msg.Y) {
+	mouse := msg.Mouse()
+	if !terminal.contains(mouse.X, mouse.Y) {
 		return nil, false
 	}
-
-	code, ok := mouseButtonCode(msg)
-	if !ok {
-		return nil, false
-	}
-	if msg.Action == tea.MouseActionMotion {
-		code += 32
-	}
-
+	code := 0
 	suffix := "M"
-	if msg.Action == tea.MouseActionRelease {
+	if _, release := msg.(tea.MouseReleaseMsg); release {
 		suffix = "m"
+	} else {
+		var ok bool
+		code, ok = mouseButtonCodes[mouse.Button]
+		if !ok {
+			return nil, false
+		}
+		if _, motion := msg.(tea.MouseMotionMsg); motion {
+			code += 32
+		}
 	}
-	x := msg.X - terminal.X + 1
-	y := msg.Y - terminal.Y + 1
+	if mouse.Mod.Contains(tea.ModShift) {
+		code += 4
+	}
+	if mouse.Mod.Contains(tea.ModAlt) {
+		code += 8
+	}
+	if mouse.Mod.Contains(tea.ModCtrl) {
+		code += 16
+	}
+	x := mouse.X - terminal.X + 1
+	y := mouse.Y - terminal.Y + 1
 	return []byte(fmt.Sprintf("\x1b[<%d;%d;%d%s", code, x, y, suffix)), true
 }
 
-func HandleMouse(app *App, msg tea.MouseMsg) tea.Cmd {
-	if app == nil || !supportedMouseAction(msg.Action) {
+func HandleMouse(app *App, pointer pointerMsg) tea.Cmd {
+	if app == nil {
 		return nil
 	}
-	if cmd, handled := app.handleModalMouse(msg); handled {
+	if pointer.action() == pointerRelease {
+		defer app.clearPointerCapture()
+	}
+	if cmd, handled := app.handleModalMouse(pointer); handled {
 		return cmd
 	}
 	if app.copyMode {
-		if msg.Action == tea.MouseActionPress && !app.currentTerminalRect().contains(msg.X, msg.Y) {
+		if isMouseClick(pointer) && pointer.Target != targetTerminal {
 			return app.setCopyMode(false)
 		}
 		return nil
 	}
-	if cmd, handled := app.handleTopBarMouse(msg); handled {
-		return cmd
-	}
-	if app.handleDividerMouse(msg) {
+	return app.handleTargetMouse(pointer)
+}
+
+func (a *App) handleTargetMouse(pointer pointerMsg) tea.Cmd {
+	switch {
+	case pointer.Target == targetDivider:
+		a.handleDividerMouse(pointer)
+		return nil
+	case pointer.Target == targetSidebar || pointer.Target == targetComposer:
+		a.handleChatMouse(pointer)
+		return nil
+	case pointer.Target == targetTerminal:
+		a.handleTerminalMouse(pointer)
+		return nil
+	case strings.HasPrefix(string(pointer.Target), "action:"):
+		return a.handleActionMouse(pointer)
+	case strings.HasPrefix(string(pointer.Target), "peer:"):
+		a.handlePeerTargetMouse(pointer)
+		return nil
+	default:
 		return nil
 	}
-
-	app.handleContentMouse(msg)
-	return nil
 }
 
-func supportedMouseAction(action tea.MouseAction) bool {
-	return action == tea.MouseActionPress || action == tea.MouseActionRelease || action == tea.MouseActionMotion
+func isMouseClick(msg pointerMsg) bool {
+	_, ok := msg.Event.(tea.MouseClickMsg)
+	return ok
 }
 
-type modalMouseHandler func(*App, tea.MouseMsg) (tea.Cmd, bool)
-
-var modalMouseHandlers = map[ModalID]modalMouseHandler{
-	ModalResizeWarning:   handlePassiveModalMouse,
-	ModalWaitingApproval: handlePassiveModalMouse,
-	ModalHelp:            (*App).handleHelpMouse,
-	ModalKick:            handleKickModalMouse,
-	ModalPeerAction:      (*App).handlePeerDialogMouse,
-	ModalApproval:        (*App).handleApprovalMouse,
-	ModalQuit:            (*App).handleQuitMouse,
-	ModalShellExit:       (*App).handleShellExitMouse,
-	ModalNotice:          handleNoticeModalMouse,
-}
-
-func (a *App) handleModalMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
+func (a *App) handleModalMouse(msg pointerMsg) (tea.Cmd, bool) {
 	id, ok := a.frontModalID()
 	if !ok {
 		return nil, false
 	}
-	handler := modalMouseHandlers[id]
-	if handler == nil {
+	switch id {
+	case ModalHelp:
+		return a.handleHelpMouse(msg), true
+	case ModalKick:
+		return nil, a.handleKickMouse(msg)
+	case ModalPeerAction:
+		return a.handlePeerDialogMouse(msg), true
+	case ModalApproval:
+		return a.handleApprovalMouse(msg)
+	case ModalQuit:
+		return a.handleQuitMouse(msg), true
+	case ModalShellExit:
+		return a.handleShellExitMouse(msg), true
+	case ModalNotice:
+		return nil, a.handleNoticeMouse(msg)
+	default:
 		a.clearMousePress()
 		return nil, true
 	}
-	if cmd, handled := handler(a, msg); handled {
-		return cmd, true
-	}
-	a.clearMousePress()
-	return nil, true
 }
 
-func handlePassiveModalMouse(app *App, msg tea.MouseMsg) (tea.Cmd, bool) {
-	app.clearMousePress()
-	return nil, true
-}
-
-func handleNoticeModalMouse(app *App, msg tea.MouseMsg) (tea.Cmd, bool) {
-	return nil, app.handleNoticeMouse(msg)
-}
-
-func (a *App) handleShellExitMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
-	if !a.shellExitOpen {
-		return nil, false
-	}
-	switch msg.Action {
-	case tea.MouseActionPress:
-		if choice := a.shellExitHit(msg.X, msg.Y); choice >= 0 {
-			a.shellExitChoice = choice
-			a.armMousePress(mousePressShellExit, int(choice))
-		} else {
+func (a *App) handleShellExitMouse(msg pointerMsg) tea.Cmd {
+	choice, ok := shellExitChoiceFromTarget(msg.Target)
+	switch msg.action() {
+	case pointerClick:
+		if !ok {
 			a.clearMousePress()
+			return nil
 		}
-	case tea.MouseActionRelease:
-		choice := a.shellExitHit(msg.X, msg.Y)
-		if choice >= 0 && a.releaseMousePress(mousePressShellExit, int(choice)) {
+		a.shellExitChoice = choice
+		a.armMousePress(mousePressShellExit, int(a.shellExitChoice))
+	case pointerRelease:
+		if ok && a.releaseMousePress(mousePressShellExit, int(choice)) {
 			a.shellExitChoice = choice
 			a.confirmShellExitChoice()
 		} else {
 			a.clearMousePress()
 		}
 	}
-	return nil, true
+	return nil
 }
 
-func (a *App) handleQuitMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
-	if !a.quitOpen {
-		return nil, false
-	}
-	switch msg.Action {
-	case tea.MouseActionPress:
-		if choice := a.quitHit(msg.X, msg.Y); choice >= 0 {
-			a.quitChoice = choice
-			a.armMousePress(mousePressQuit, int(choice))
-		} else {
+func (a *App) handleQuitMouse(msg pointerMsg) tea.Cmd {
+	choice, ok := quitChoiceFromTarget(msg.Target)
+	switch msg.action() {
+	case pointerClick:
+		if !ok {
 			a.clearMousePress()
+			return nil
 		}
-	case tea.MouseActionRelease:
-		choice := a.quitHit(msg.X, msg.Y)
-		if choice >= 0 && a.releaseMousePress(mousePressQuit, int(choice)) {
+		a.quitChoice = choice
+		a.armMousePress(mousePressQuit, int(a.quitChoice))
+	case pointerRelease:
+		if ok && a.releaseMousePress(mousePressQuit, int(choice)) {
 			a.quitChoice = choice
 			a.confirmQuitChoice()
 		} else {
 			a.clearMousePress()
 		}
 	}
-	return nil, true
+	return nil
 }
 
-func (a *App) handlePeerDialogMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
-	if !a.peerDialogOpen {
-		return nil, false
-	}
-	switch msg.Action {
-	case tea.MouseActionPress:
-		if choice := a.peerActionHit(msg.X, msg.Y); choice >= 0 {
-			a.peerDialogChoice = choice
-			a.armMousePress(mousePressPeerAction, int(choice))
-		} else {
+func (a *App) handlePeerDialogMouse(msg pointerMsg) tea.Cmd {
+	choice, ok := peerActionChoiceFromTarget(msg.Target)
+	switch msg.action() {
+	case pointerClick:
+		if !ok {
 			a.clearMousePress()
+			return nil
 		}
-	case tea.MouseActionRelease:
-		choice := a.peerActionHit(msg.X, msg.Y)
-		if choice >= 0 && a.releaseMousePress(mousePressPeerAction, int(choice)) {
+		a.peerDialogChoice = choice
+		a.armMousePress(mousePressPeerAction, int(a.peerDialogChoice))
+	case pointerRelease:
+		if ok && a.releaseMousePress(mousePressPeerAction, int(choice)) {
 			a.peerDialogChoice = choice
 			a.confirmPeerActionChoice()
 		} else {
 			a.clearMousePress()
 		}
 	}
-	return nil, true
+	return nil
 }
 
-func (a *App) handleHelpMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
-	if !a.helpOpen {
-		return nil, false
-	}
-	if msg.Action == tea.MouseActionPress {
-		action, ok := a.helpActionAt(msg.X, msg.Y)
+func (a *App) handleHelpMouse(msg pointerMsg) tea.Cmd {
+	if msg.action() == pointerClick {
+		action, ok := actionIDFromTarget(msg.Target)
 		if !ok {
 			a.helpOpen = false
-			return nil, true
+			return nil
 		}
-		return a.runMenuAction(action), true
+		return a.runMenuAction(action)
 	}
-	return nil, true
-}
-
-func (a *App) helpActionAt(x int, y int) (ActionID, bool) {
-	contentX, contentY := a.helpContentOrigin()
-	width := a.helpContentWidth()
-	row := contentY + 2
-	for _, entry := range a.menuEntries() {
-		if y == row && x >= contentX && x < contentX+width {
-			return entry.action, true
-		}
-		row++
-	}
-	return "", false
+	return nil
 }
 
 func (a *App) runMenuAction(action ActionID) tea.Cmd {
@@ -213,35 +237,30 @@ func (a *App) runMenuAction(action ActionID) tea.Cmd {
 	return a.runAction(action)
 }
 
-func (a *App) handleNoticeMouse(msg tea.MouseMsg) bool {
+func (a *App) handleNoticeMouse(msg pointerMsg) bool {
 	if !a.noticeOpen() {
 		return false
 	}
-	if msg.Action == tea.MouseActionPress {
+	if msg.action() == pointerClick {
 		a.closeNotice()
 	}
 	return true
 }
 
-func (a *App) handleApprovalMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
-	if !a.approvalActive() {
-		return nil, false
-	}
-	switch msg.Action {
-	case tea.MouseActionPress:
-		hit := a.approvalHit(msg.X, msg.Y)
-		if hit != HitNone {
-			a.selectApprovalHit(hit)
-			a.armMousePress(mousePressApproval, int(hit))
-		} else {
+func (a *App) handleApprovalMouse(msg pointerMsg) (tea.Cmd, bool) {
+	choice, ok := approvalChoiceFromTarget(msg.Target)
+	switch msg.action() {
+	case pointerClick:
+		if !ok {
 			a.clearMousePress()
+			return nil, true
 		}
-	case tea.MouseActionRelease:
-		hit := a.approvalHit(msg.X, msg.Y)
-		if hit != HitNone && a.releaseMousePress(mousePressApproval, int(hit)) {
-			if a.handleApprovalClick(msg.X, msg.Y) {
-				return tea.ClearScreen, true
-			}
+		a.approvalChoice = choice
+		a.armMousePress(mousePressApproval, int(a.approvalChoice))
+	case pointerRelease:
+		if ok && a.releaseMousePress(mousePressApproval, int(choice)) {
+			a.approvalChoice = choice
+			a.approveSelected()
 		} else {
 			a.clearMousePress()
 		}
@@ -249,38 +268,11 @@ func (a *App) handleApprovalMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
 	return nil, true
 }
 
-func (a *App) selectApprovalHit(hit HitTarget) {
-	switch hit {
-	case HitApprovalRead:
-		a.approvalChoice = approvalChoiceRead
-	case HitApprovalWrite:
-		a.approvalChoice = approvalChoiceWrite
-	case HitApprovalDeny:
-		a.approvalChoice = approvalChoiceDeny
-	}
-}
-
-func (a *App) handleApprovalClick(x int, y int) bool {
-	switch a.approvalHit(x, y) {
-	case HitApprovalRead:
-		return a.approve(RoleRead, false)
-	case HitApprovalWrite:
-		return a.approve(RoleWrite, false)
-	case HitApprovalDeny:
-		return a.approve("", true)
-	}
-	return false
-}
-
-func handleKickModalMouse(app *App, msg tea.MouseMsg) (tea.Cmd, bool) {
-	return nil, app.handleKickMouse(msg)
-}
-
-func (a *App) handleKickMouse(msg tea.MouseMsg) bool {
+func (a *App) handleKickMouse(msg pointerMsg) bool {
 	if a.kickPeer == "" {
 		return false
 	}
-	if msg.Action == tea.MouseActionPress {
+	if msg.action() == pointerClick {
 		a.kickPeerID = ""
 		a.kickPeer = ""
 		a.focusTerminal()
@@ -302,81 +294,133 @@ func (a *App) clearMousePress() {
 	a.mousePress = mousePressTarget{}
 }
 
-func (a *App) handleTopBarMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
-	if msg.Action != tea.MouseActionPress || !a.layout.TopBar.contains(msg.X, msg.Y) {
-		return nil, false
-	}
-	_ = a.renderTopBar()
-	hit, ok := a.topBarHitAt(msg.X, msg.Y)
-	if !ok {
-		return nil, true
-	}
-	if hit.action == ActionManagePeer {
-		a.openPeerDialog(hit.peer)
-		return nil, true
-	}
-	return a.runAction(hit.action), true
+func (a *App) clearPointerCapture() {
+	a.pointerCapture = ""
+	a.draggingDivider = false
 }
 
-func (a *App) topBarHitAt(x int, y int) (topBarHit, bool) {
-	for _, hit := range a.topBarHits {
-		if hit.rect.contains(x, y) {
-			return hit, true
-		}
-	}
-	return topBarHit{}, false
-}
-
-func (a *App) handleDividerMouse(msg tea.MouseMsg) bool {
+func (a *App) handleDividerMouse(msg pointerMsg) bool {
 	if a.draggingDivider {
-		switch msg.Action {
-		case tea.MouseActionMotion:
-			a.setSidebarWidth(a.width - msg.X - 1)
-		case tea.MouseActionRelease:
-			a.draggingDivider = false
+		switch msg.action() {
+		case pointerMotion:
+			a.setSidebarWidth(a.width - msg.Mouse.X - 1)
+		case pointerRelease:
+			a.clearPointerCapture()
 		}
 		return true
 	}
-	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
-		return false
-	}
-	if a.layout.Hit(msg.X, msg.Y) != HitDivider {
+	if msg.action() != pointerClick || msg.Mouse.Button != tea.MouseLeft {
 		return false
 	}
 	a.draggingDivider = true
+	a.pointerCapture = targetDivider
 	return true
 }
 
-func (a *App) handleContentMouse(msg tea.MouseMsg) {
-	switch a.layout.Hit(msg.X, msg.Y) {
-	case HitSidebar:
-		if a.handleChatScrollMouse(msg) {
-			return
-		}
-		if msg.Action == tea.MouseActionPress {
-			a.focusChat()
-		}
-	case HitComposer:
-		if a.handleChatScrollMouse(msg) {
-			return
-		}
-		if msg.Action == tea.MouseActionPress {
-			a.focusChat()
-		}
-	case HitTerminal:
-		a.handleTerminalMouse(msg)
+func (a *App) handleActionMouse(msg pointerMsg) tea.Cmd {
+	if !isMouseClick(msg) {
+		return nil
+	}
+	action, ok := actionIDFromTarget(msg.Target)
+	if !ok {
+		return nil
+	}
+	cmd, _ := NewActionRegistry().Run(a, action)
+	return cmd
+}
+
+func actionIDFromTarget(target layerTarget) (ActionID, bool) {
+	value, ok := strings.CutPrefix(string(target), "action:")
+	return ActionID(value), ok && value != ""
+}
+
+func modalChoice(target layerTarget, id ModalID) (string, bool) {
+	value, ok := strings.CutPrefix(string(target), string(id)+":")
+	return value, ok && value != ""
+}
+
+func approvalChoiceFromTarget(target layerTarget) (approvalChoice, bool) {
+	switch choice, ok := modalChoice(target, ModalApproval); choice {
+	case "read":
+		return approvalChoiceRead, ok
+	case "write":
+		return approvalChoiceWrite, ok
+	case "deny":
+		return approvalChoiceDeny, ok
+	default:
+		return 0, false
 	}
 }
 
-func (a *App) handleChatScrollMouse(msg tea.MouseMsg) bool {
-	if msg.Action != tea.MouseActionPress {
+func peerActionChoiceFromTarget(target layerTarget) (peerActionChoice, bool) {
+	switch choice, ok := modalChoice(target, ModalPeerAction); choice {
+	case "read":
+		return peerActionRead, ok
+	case "write":
+		return peerActionWrite, ok
+	case "kick":
+		return peerActionKick, ok
+	default:
+		return 0, false
+	}
+}
+
+func quitChoiceFromTarget(target layerTarget) (quitChoice, bool) {
+	switch choice, ok := modalChoice(target, ModalQuit); choice {
+	case "quit":
+		return quitChoiceQuit, ok
+	case "cancel":
+		return quitChoiceCancel, ok
+	default:
+		return 0, false
+	}
+}
+
+func shellExitChoiceFromTarget(target layerTarget) (shellExitChoice, bool) {
+	switch choice, ok := modalChoice(target, ModalShellExit); choice {
+	case "restart":
+		return shellExitChoiceRestart, ok
+	case "quit":
+		return shellExitChoiceQuit, ok
+	default:
+		return 0, false
+	}
+}
+
+func (a *App) handlePeerTargetMouse(msg pointerMsg) {
+	if !isMouseClick(msg) {
+		return
+	}
+	id, ok := strings.CutPrefix(string(msg.Target), "peer:")
+	if !ok || strings.TrimSpace(id) == "" {
+		return
+	}
+	for _, peer := range a.peers {
+		if peer.ID == id {
+			a.openPeerDialog(peer)
+			return
+		}
+	}
+}
+
+func (a *App) handleChatMouse(msg pointerMsg) {
+	if a.handleChatScrollMouse(msg) {
+		return
+	}
+	if isMouseClick(msg) {
+		a.focusChat()
+	}
+}
+
+func (a *App) handleChatScrollMouse(msg pointerMsg) bool {
+	if msg.action() != pointerClick {
 		return false
 	}
-	switch msg.Button {
-	case tea.MouseButtonWheelUp:
+	switch msg.Mouse.Button {
+	case tea.MouseWheelUp:
 		a.chatScroll++
 		return true
-	case tea.MouseButtonWheelDown:
+	case tea.MouseWheelDown:
 		if a.chatScroll > 0 {
 			a.chatScroll--
 		}
@@ -386,23 +430,15 @@ func (a *App) handleChatScrollMouse(msg tea.MouseMsg) bool {
 	}
 }
 
-func (a *App) handleTerminalMouse(msg tea.MouseMsg) {
-	if msg.Action == tea.MouseActionPress {
+func (a *App) handleTerminalMouse(msg pointerMsg) {
+	if msg.action() == pointerClick {
 		a.focusTerminal()
 	}
 	mode := a.terminal.MouseMode()
 	if !mode.Enabled || !mode.SGR {
 		return
 	}
-	if data, ok := EncodeSGRMouse(msg, a.currentTerminalRect()); ok {
+	if data, ok := EncodeSGRMouse(msg.Event, a.currentTerminalRect()); ok {
 		a.emit(TerminalInputCommand{Data: data})
 	}
-}
-
-func mouseButtonCode(msg tea.MouseMsg) (int, bool) {
-	if msg.Action == tea.MouseActionRelease {
-		return 0, true
-	}
-	code, ok := mouseButtonCodes[msg.Button]
-	return code, ok
 }

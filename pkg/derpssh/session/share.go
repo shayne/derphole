@@ -579,11 +579,14 @@ func startRawShareInvitePreflight(_ context.Context, cfg ShareConfig, command st
 }
 
 func (p *rawShareInvitePreflight) read() {
-	defer close(p.done)
-	defer func() { _ = pty.Restore(p.inFile.Fd(), p.rawState) }()
-	defer func() { _ = p.wakeRead.Close() }()
-	defer p.closeWakeWriter()
-	p.done <- readInvitePreflightInputInterruptible(p.inFile, p.wakeRead)
+	result := func() shareInvitePreflightResult {
+		defer func() { _ = pty.Restore(p.inFile.Fd(), p.rawState) }()
+		defer func() { _ = p.wakeRead.Close() }()
+		defer p.closeWakeWriter()
+		return readInvitePreflightInputInterruptible(p.inFile, p.wakeRead)
+	}()
+	p.done <- result
+	close(p.done)
 }
 
 func (p *rawShareInvitePreflight) Interrupt() {

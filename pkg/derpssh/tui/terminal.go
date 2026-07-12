@@ -28,6 +28,7 @@ type MouseMode struct {
 
 type TerminalInputMode struct {
 	ApplicationCursor bool
+	BracketedPaste    bool
 }
 
 type vtTerminalPane struct {
@@ -308,8 +309,11 @@ func TrackInputMode(current TerminalInputMode, output []byte) TerminalInputMode 
 			if err != nil {
 				continue
 			}
-			if param == 1 {
+			switch param {
+			case 1:
 				next.ApplicationCursor = enable
+			case 2004:
+				next.BracketedPaste = enable
 			}
 		}
 	}

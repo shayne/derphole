@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 	"github.com/shayne/derphole/pkg/derpssh/protocol"
 	"github.com/shayne/derphole/pkg/derpssh/tui"
 )
@@ -331,27 +331,6 @@ func TestTUIConsoleNonTTYTranscriptWritesSnapshots(t *testing.T) {
 	}
 }
 
-func TestTUIConsoleCopyInviteWritesOSC52(t *testing.T) {
-	var out strings.Builder
-	console := newTerminalConsoleWithOptions(tuiConsoleOptions{
-		Mode:     tui.ModeHost,
-		Cols:     100,
-		Rows:     30,
-		Stdout:   &out,
-		Terminal: &recordingTerminalPane{view: "shell$"},
-	})
-
-	console.handleCommand(context.Background(), tui.CopyInviteCommand{Command: "npx -y derpssh@latest connect DSH1copyme"})
-
-	got := out.String()
-	if !strings.HasPrefix(got, "\x1b]52;c;") || !strings.HasSuffix(got, "\x07") {
-		t.Fatalf("OSC52 output malformed: %q", got)
-	}
-	if strings.Contains(got, "\n") {
-		t.Fatalf("OSC52 output contains newline: %q", got)
-	}
-}
-
 func TestTerminalRestoreSequenceDisablesInteractiveModes(t *testing.T) {
 	var out strings.Builder
 
@@ -445,6 +424,34 @@ func TestTUIConsoleStopWaitsForProgramRunCleanup(t *testing.T) {
 	}
 }
 
+func TestTUIConsoleNormalQuitWaitsOnceBeforeDefensiveRestore(t *testing.T) {
+	var events strings.Builder
+	program := &viewTransitionProgram{events: &events}
+	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, &recordingTerminalPane{view: "shell$"})
+	console.program = program
+	console.programStartRequested = true
+	console.tty = true
+	console.output = &events
+	console.lifecycle = newTerminalLifecycle(terminalLifecycleOptions{
+		Output:  &events,
+		Restore: []byte("defensive:restore\n"),
+		IsTTY:   true,
+	})
+
+	console.Stop()
+	console.Stop()
+
+	if got := program.quitCalls; got != 1 {
+		t.Fatalf("Program.Quit calls = %d, want 1", got)
+	}
+	if got := program.waitCalls; got != 1 {
+		t.Fatalf("Program.Wait calls = %d, want 1", got)
+	}
+	if got, want := events.String(), "view:quit\nview:wait\ndefensive:restore\n"; got != want {
+		t.Fatalf("normal shutdown transitions = %q, want %q", got, want)
+	}
+}
+
 func TestTUIConsoleProgramExitRunsQuitCallback(t *testing.T) {
 	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, &recordingTerminalPane{view: "shell$"})
 	program := newExternallyClosedProgram()
@@ -518,13 +525,13 @@ func TestTUIConsoleQuitCommandStopsWhenCallbackBlocks(t *testing.T) {
 }
 
 func TestTUIConsoleStopRestoresTerminalExactlyOnce(t *testing.T) {
-	var out strings.Builder
+	out := newStringCapture()
 	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, &recordingTerminalPane{view: "shell$"})
 	program := &sendBeforeRunProgram{}
 	console.program = program
 	console.programNotify = make(chan struct{}, 1)
 	console.tty = true
-	console.output = &out
+	console.output = out
 
 	console.Start(context.Background())
 
@@ -810,9 +817,9 @@ func TestTUIConsoleRuntimeEventsUpdateApp(t *testing.T) {
 		Chat: ChatMessage{ParticipantID: "guest-1", DisplayName: "Alex", Text: "hello"},
 	})
 	console.OnRuntimeEvent(RuntimeEvent{Kind: RuntimeEventClose, Message: "done"})
-	console.send(tea.KeyMsg{Type: tea.KeyEnter})
-	console.send(tea.KeyMsg{Type: tea.KeyCtrlX})
-	console.send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	console.send(tea.KeyPressMsg{Code: tea.KeyEnter})
+	console.send(tea.KeyPressMsg{Code: 'x', Mod: tea.ModCtrl})
+	console.send(tea.KeyPressMsg{Code: 's', Text: "s"})
 
 	view := console.View()
 	for _, want := range []string{"closed: done", "120x40", "write", "Alex", "read", "Blair", "denied", "Alex: hello"} {
@@ -1150,6 +1157,28 @@ type blockingQuitProgram struct {
 	release     chan struct{}
 	done        chan struct{}
 	once        sync.Once
+}
+
+type viewTransitionProgram struct {
+	events    *strings.Builder
+	quitCalls int
+	waitCalls int
+}
+
+func (p *viewTransitionProgram) Send(tea.Msg) {}
+
+func (p *viewTransitionProgram) Run() (tea.Model, error) {
+	return nil, nil
+}
+
+func (p *viewTransitionProgram) Quit() {
+	p.quitCalls++
+	_, _ = p.events.WriteString("view:quit\n")
+}
+
+func (p *viewTransitionProgram) Wait() {
+	p.waitCalls++
+	_, _ = p.events.WriteString("view:wait\n")
 }
 
 func newBlockingQuitProgram() *blockingQuitProgram {

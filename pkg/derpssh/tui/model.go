@@ -174,7 +174,7 @@ func (m Model) View() string {
 	if m.app == nil {
 		return ""
 	}
-	return m.app.View()
+	return m.app.View().Content
 }
 
 func (m *Model) decide(role protocol.Role) {

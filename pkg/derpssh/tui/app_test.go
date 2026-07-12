@@ -5,16 +5,81 @@
 package tui
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/mattn/go-runewidth"
-	"github.com/muesli/termenv"
 	"github.com/shayne/derphole/pkg/derpssh/brand"
 )
+
+var _ tea.Model = (*App)(nil)
+
+func TestViewDeclaresTerminalModes(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "shell$"}})
+	view := app.View()
+	if !view.AltScreen {
+		t.Fatal("View().AltScreen = false, want true")
+	}
+	if view.MouseMode != tea.MouseModeCellMotion {
+		t.Fatalf("View().MouseMode = %v, want cell motion", view.MouseMode)
+	}
+	if !view.KeyboardEnhancements.ReportAlternateKeys ||
+		!view.KeyboardEnhancements.ReportAllKeysAsEscapeCodes ||
+		!view.KeyboardEnhancements.ReportAssociatedText ||
+		view.KeyboardEnhancements.ReportEventTypes {
+		t.Fatalf("unexpected keyboard enhancements: %+v", view.KeyboardEnhancements)
+	}
+}
+
+func TestInviteCopyUsesBubbleTeaClipboardCommand(t *testing.T) {
+	app := NewApp(Options{
+		Side: "host", InviteCommand: "  derpssh connect invite \n",
+		Terminal: &fakePane{view: "shell$"},
+	})
+	app.inviteOpen = true
+	cmd := app.handleInviteKey(textKey("c"))
+	if cmd == nil {
+		t.Fatal("copy command = nil, want Bubble Tea clipboard message")
+	}
+	if got, want := fmt.Sprint(cmd()), "derpssh connect invite"; got != want {
+		t.Fatalf("clipboard content = %q, want %q", got, want)
+	}
+}
+
+func TestViewDeclarativelyDisablesMouseForSelectionAndInvite(t *testing.T) {
+	app := NewApp(Options{Side: "host", InviteCommand: "invite"})
+	app.copyMode = true
+	if got := app.View().MouseMode; got != tea.MouseModeNone {
+		t.Fatalf("selection mouse mode = %v", got)
+	}
+	app.copyMode = false
+	app.inviteOpen = true
+	if got := app.View().MouseMode; got != tea.MouseModeNone {
+		t.Fatalf("invite mouse mode = %v", got)
+	}
+}
+
+func TestBackgroundColorMessageRebuildsConcreteStyles(t *testing.T) {
+	app := NewApp(Options{})
+	if app.styles.Scheme != SchemeDark {
+		t.Fatalf("initial scheme = %q, want dark", app.styles.Scheme)
+	}
+	app.Update(backgroundMsg(lipgloss.Color("#ffffff")))
+	if app.styles.Scheme != SchemeLight {
+		t.Fatalf("scheme after white background = %q, want light", app.styles.Scheme)
+	}
+	composerStyles := app.composer.Styles()
+	if got, want := colorString(composerStyles.Focused.Base.GetBackground()), colorString(app.styles.Composer.GetBackground()); got != want {
+		t.Fatalf("textarea background after scheme change = %q, want %q", got, want)
+	}
+	if got, want := colorString(composerStyles.Cursor.Color), colorString(app.styles.ComposerCursor.GetForeground()); got != want {
+		t.Fatalf("textarea cursor after scheme change = %q, want %q", got, want)
+	}
+}
 
 func TestAppUsesAltScreenCompatibleView(t *testing.T) {
 	pane := &fakePane{view: "shell$ ready"}
@@ -26,7 +91,7 @@ func TestAppUsesAltScreenCompatibleView(t *testing.T) {
 	})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
-	view := app.View()
+	view := appContent(app)
 	for _, want := range []string{"derpssh", "host", "shell$ ready"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("View() missing %q:\n%s", want, view)
@@ -55,7 +120,7 @@ func TestShellExitedNoticeShowsRestartDialog(t *testing.T) {
 	app.SetWindowSize(100, 30)
 	app.Update(NoticeMsg{Title: "Shell exited", Body: "The shared shell exited."})
 
-	view := app.View()
+	view := appContent(app)
 	for _, want := range []string{"Shell exited", "Restart Shell", "Quit"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("view missing %q:\n%s", want, view)
@@ -68,7 +133,7 @@ func TestShellExitedRestartChoiceEmitsRestartCommand(t *testing.T) {
 	app.SetWindowSize(100, 30)
 	app.Update(NoticeMsg{Title: "Shell exited", Body: "The shared shell exited."})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	app.Update(keyCode(tea.KeyEnter))
 	if _, ok := readCommand(app).(RestartShellCommand); !ok {
 		t.Fatal("command is not RestartShellCommand")
 	}
@@ -85,7 +150,7 @@ func TestRuntimeStateUpdatesTopBar(t *testing.T) {
 		Peers:     []Peer{{Name: "Alex", Role: RoleRead}},
 	})
 
-	view := app.View()
+	view := appContent(app)
 	for _, want := range []string{"relay", "120x40", "Alex", "read"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("View() missing %q:\n%s", want, view)
@@ -120,7 +185,7 @@ func TestApprovalRequestRendersModal(t *testing.T) {
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	app.Update(ApprovalRequestMsg{Peer: "Alex"})
 
-	view := app.View()
+	view := appContent(app)
 	for _, want := range []string{"Alex wants to join", "Read", "Write", "Deny"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("View() missing %q:\n%s", want, view)
@@ -133,7 +198,7 @@ func TestGuestPendingRoleRendersWaitingApprovalModal(t *testing.T) {
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
 	app.Update(RuntimeStateMsg{Transport: "direct", LocalRole: RolePending})
 
-	view := app.View()
+	view := appContent(app)
 	for _, want := range []string{"Waiting for host approval", "The host will choose read or write access."} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("View() missing %q:\n%s", want, view)
@@ -141,7 +206,7 @@ func TestGuestPendingRoleRendersWaitingApprovalModal(t *testing.T) {
 	}
 
 	app.Update(RuntimeStateMsg{Transport: "direct", LocalRole: RoleWrite})
-	if view := app.View(); strings.Contains(view, "Waiting for host approval") {
+	if view := appContent(app); strings.Contains(view, "Waiting for host approval") {
 		t.Fatalf("waiting approval modal still visible after approval:\n%s", view)
 	}
 }
@@ -158,7 +223,7 @@ func TestGuestWaitingApprovalSuppressesResizeWarning(t *testing.T) {
 		t.Fatal("pending guest opened resize warning while waiting for approval")
 	}
 
-	view := app.View()
+	view := appContent(app)
 	if !strings.Contains(view, "Waiting for host approval") {
 		t.Fatalf("View() missing waiting approval modal:\n%s", view)
 	}
@@ -173,12 +238,12 @@ func TestNoticeMsgRendersDismissibleModal(t *testing.T) {
 
 	app.Update(NoticeMsg{Title: "Guest left", Body: "guest quit"})
 
-	view := app.View()
+	view := appContent(app)
 	if !strings.Contains(view, "Guest left") || !strings.Contains(view, "guest quit") {
 		t.Fatalf("notice missing from view:\n%s", view)
 	}
-	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	view = app.View()
+	app.Update(keyCode(tea.KeyEnter))
+	view = appContent(app)
 	if strings.Contains(view, "Guest left") || strings.Contains(view, "guest quit") {
 		t.Fatalf("notice still visible after Enter:\n%s", view)
 	}
@@ -192,7 +257,7 @@ func TestApprovalModalCapturesPrintableKeys(t *testing.T) {
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	app.Update(ApprovalRequestMsg{Peer: "Alex"})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	app.Update(textKey("x"))
 
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("approval key emitted command %+v, want none", cmd)
@@ -207,7 +272,7 @@ func TestApprovalEscapeDeniesPendingRequest(t *testing.T) {
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	app.Update(ApprovalRequestMsg{PeerID: "guest-2", Peer: "Alex"})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	app.Update(keyCode(tea.KeyEsc))
 
 	got, ok := readCommand(app).(ApprovalDecisionCommand)
 	if !ok {
@@ -228,12 +293,12 @@ func TestApprovalEscapeDeniesPendingRequest(t *testing.T) {
 func TestApprovalEnterConfirmsSelectedAccessNotHiddenKick(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 	app.Update(RuntimeStateMsg{Peers: []Peer{{ID: "guest-1", Name: "Alex", Role: RoleRead}}})
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("k"))
 	app.Update(ApprovalRequestMsg{PeerID: "guest-2", Peer: "Blair"})
 	expireApprovalGrace(app)
 
-	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	app.Update(keyCode(tea.KeyEnter))
 
 	got, ok := readCommand(app).(ApprovalDecisionCommand)
 	if !ok {
@@ -254,32 +319,32 @@ func TestApprovalEnterConfirmsSelectedAccessNotHiddenKick(t *testing.T) {
 func TestApprovalKeyboardSelection(t *testing.T) {
 	tests := []struct {
 		name string
-		keys []tea.KeyMsg
+		keys []tea.KeyPressMsg
 		want ApprovalDecisionCommand
 	}{
 		{
 			name: "default write",
-			keys: []tea.KeyMsg{{Type: tea.KeyEnter}},
+			keys: []tea.KeyPressMsg{keyCode(tea.KeyEnter)},
 			want: ApprovalDecisionCommand{PeerID: "guest-2", Peer: "Alex", Role: RoleWrite},
 		},
 		{
 			name: "left selects read",
-			keys: []tea.KeyMsg{{Type: tea.KeyLeft}, {Type: tea.KeyEnter}},
+			keys: []tea.KeyPressMsg{keyCode(tea.KeyLeft), keyCode(tea.KeyEnter)},
 			want: ApprovalDecisionCommand{PeerID: "guest-2", Peer: "Alex", Role: RoleRead},
 		},
 		{
 			name: "right selects deny",
-			keys: []tea.KeyMsg{{Type: tea.KeyRight}, {Type: tea.KeyEnter}},
+			keys: []tea.KeyPressMsg{keyCode(tea.KeyRight), keyCode(tea.KeyEnter)},
 			want: ApprovalDecisionCommand{PeerID: "guest-2", Peer: "Alex", Deny: true},
 		},
 		{
 			name: "tab wraps selection",
-			keys: []tea.KeyMsg{{Type: tea.KeyTab}, {Type: tea.KeyTab}, {Type: tea.KeyEnter}},
+			keys: []tea.KeyPressMsg{keyCode(tea.KeyTab), keyCode(tea.KeyTab), keyCode(tea.KeyEnter)},
 			want: ApprovalDecisionCommand{PeerID: "guest-2", Peer: "Alex", Role: RoleRead},
 		},
 		{
 			name: "shift tab wraps backward",
-			keys: []tea.KeyMsg{{Type: tea.KeyShiftTab}, {Type: tea.KeyEnter}},
+			keys: []tea.KeyPressMsg{modifiedKey(tea.KeyTab, "", tea.ModShift), keyCode(tea.KeyEnter)},
 			want: ApprovalDecisionCommand{PeerID: "guest-2", Peer: "Alex", Role: RoleRead},
 		},
 	}
@@ -312,11 +377,11 @@ func expireApprovalGrace(app *App) {
 func TestApprovalEscapeWinsOverHiddenKick(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 	app.Update(RuntimeStateMsg{Peers: []Peer{{ID: "guest-1", Name: "Alex", Role: RoleRead}}})
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("k"))
 	app.Update(ApprovalRequestMsg{PeerID: "guest-2", Peer: "Blair"})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	app.Update(keyCode(tea.KeyEsc))
 
 	got, ok := readCommand(app).(ApprovalDecisionCommand)
 	if !ok {
@@ -339,7 +404,7 @@ func TestViewDoesNotExposeFullInviteTokenInMainLayout(t *testing.T) {
 	app := NewApp(Options{Side: "host", InviteCommand: invite, Terminal: &fakePane{view: "shell$"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
-	view := app.View()
+	view := appContent(app)
 	if strings.Contains(view, invite) || strings.Contains(view, "DSH1verysecretinvitetoken1234567890") {
 		t.Fatalf("View() exposes full invite token:\n%s", view)
 	}
@@ -352,7 +417,7 @@ func TestViewRendersSingleQuietTopBar(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
-	view := app.View()
+	view := appContent(app)
 	firstLine := strings.Split(view, "\n")[0]
 	for _, want := range []string{"derpssh", "host", "Chat", "☰"} {
 		if !strings.Contains(view, want) {
@@ -374,7 +439,7 @@ func TestTopBarHidesInviteBehindMenu(t *testing.T) {
 	app := NewApp(Options{Side: "host", InviteCommand: invite, Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
 
-	firstLine := strings.Split(app.View(), "\n")[0]
+	firstLine := strings.Split(appContent(app), "\n")[0]
 	if strings.Contains(firstLine, "Invite") {
 		t.Fatalf("top bar exposes invite chip:\n%s", firstLine)
 	}
@@ -390,9 +455,9 @@ func TestGuestPrefixHintsDoNotShowInvite(t *testing.T) {
 	app := NewApp(Options{Side: "guest", InviteCommand: "npx -y derpssh@latest connect DSH1copyme", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
 
-	firstLine := strings.Split(app.View(), "\n")[0]
+	firstLine := strings.Split(appContent(app), "\n")[0]
 	if strings.Contains(firstLine, "Invite") || strings.Contains(firstLine, "Ctrl-X I") {
 		t.Fatalf("guest prefix hints expose invite:\n%s", firstLine)
 	}
@@ -401,18 +466,18 @@ func TestGuestPrefixHintsDoNotShowInvite(t *testing.T) {
 func TestMenuShowsInviteForHostOnly(t *testing.T) {
 	host := NewApp(Options{Side: "host", InviteCommand: "npx -y derpssh@latest connect DSH1copyme", Terminal: &fakePane{view: "ok"}})
 	host.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
-	host.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	host.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
-	if !strings.Contains(host.View(), "Show Invite") || !strings.Contains(host.View(), "Ctrl-X I") {
-		t.Fatalf("host menu missing invite action:\n%s", host.View())
+	host.Update(modifiedKey('x', "", tea.ModCtrl))
+	host.Update(textKey("?"))
+	if !strings.Contains(appContent(host), "Show Invite") || !strings.Contains(appContent(host), "Ctrl-X I") {
+		t.Fatalf("host menu missing invite action:\n%s", appContent(host))
 	}
 
 	guest := NewApp(Options{Side: "guest", InviteCommand: "npx -y derpssh@latest connect DSH1copyme", Terminal: &fakePane{view: "ok"}})
 	guest.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
-	guest.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	guest.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
-	if strings.Contains(guest.View(), "Show Invite") || strings.Contains(guest.View(), "Ctrl-X I") {
-		t.Fatalf("guest menu exposes invite action:\n%s", guest.View())
+	guest.Update(modifiedKey('x', "", tea.ModCtrl))
+	guest.Update(textKey("?"))
+	if strings.Contains(appContent(guest), "Show Invite") || strings.Contains(appContent(guest), "Ctrl-X I") {
+		t.Fatalf("guest menu exposes invite action:\n%s", appContent(guest))
 	}
 }
 
@@ -421,7 +486,7 @@ func TestGuestTooSmallShowsHostSizeWarning(t *testing.T) {
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	app.Update(RuntimeStateMsg{Transport: "connected-direct", HostCols: 101, HostRows: 30, LocalRole: RoleWrite})
 
-	view := app.View()
+	view := appContent(app)
 	for _, want := range []string{"101x30", "Resize terminal", "80x23"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("resize warning missing %q:\n%s", want, view)
@@ -436,19 +501,19 @@ func TestGuestSidebarDoesNotResizeHostTerminalBuffer(t *testing.T) {
 	drainCommands(app)
 	app.Update(RuntimeStateMsg{Transport: "connected-direct", HostCols: 101, HostRows: 30, LocalRole: RoleWrite})
 
-	_ = app.View()
+	_ = appContent(app)
 	if pane.cols != 101 || pane.rows != 30 {
 		t.Fatalf("guest terminal buffer = %dx%d, want host 101x30", pane.cols, pane.rows)
 	}
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
-	_ = app.View()
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("s"))
+	_ = appContent(app)
 	if pane.cols != 101 || pane.rows != 30 {
 		t.Fatalf("guest terminal buffer changed after chat opened = %dx%d, want host 101x30", pane.cols, pane.rows)
 	}
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
-	_ = app.View()
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("s"))
+	_ = appContent(app)
 	if pane.cols != 101 || pane.rows != 30 {
 		t.Fatalf("guest terminal buffer changed after chat closed = %dx%d, want host 101x30", pane.cols, pane.rows)
 	}
@@ -459,12 +524,12 @@ func TestGuestChatOverlayDoesNotShrinkEffectiveTerminalViewport(t *testing.T) {
 	app.Update(tea.WindowSizeMsg{Width: 120, Height: 31})
 	drainCommands(app)
 	app.Update(RuntimeStateMsg{Transport: "direct", HostCols: 101, HostRows: 30, LocalRole: RoleWrite})
-	if view := app.View(); strings.Contains(view, "Resize terminal") {
+	if view := appContent(app); strings.Contains(view, "Resize terminal") {
 		t.Fatalf("unexpected resize warning before chat opens:\n%s", view)
 	}
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("s"))
 
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("guest chat overlay emitted resize command %+v, want none", cmd)
@@ -473,7 +538,7 @@ func TestGuestChatOverlayDoesNotShrinkEffectiveTerminalViewport(t *testing.T) {
 	if cols != 120 || rows != 30 {
 		t.Fatalf("TerminalSize with guest chat = %dx%d, want 120x30", cols, rows)
 	}
-	if view := app.View(); strings.Contains(view, "Resize terminal") {
+	if view := appContent(app); strings.Contains(view, "Resize terminal") {
 		t.Fatalf("guest chat overlay triggered resize warning:\n%s", view)
 	}
 }
@@ -482,53 +547,23 @@ func TestClosingChatRestoresTerminalContent(t *testing.T) {
 	pane := &fakePane{view: "terminal-left " + strings.Repeat(".", 48) + " terminal-right"}
 	app := NewApp(Options{Side: "host", Terminal: pane})
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 10})
-	closedLine := ansiPattern.ReplaceAllString(strings.Split(app.View(), "\n")[1], "")
+	closedLine := ansiPattern.ReplaceAllString(strings.Split(appContent(app), "\n")[1], "")
 	if !strings.Contains(closedLine, "terminal-right") {
 		t.Fatalf("closed chat baseline missing right edge terminal content: %q", closedLine)
 	}
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
-	openLine := ansiPattern.ReplaceAllString(strings.Split(app.View(), "\n")[1], "")
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("s"))
+	openLine := ansiPattern.ReplaceAllString(strings.Split(appContent(app), "\n")[1], "")
 	if strings.Contains(openLine, "terminal-right") {
 		t.Fatalf("open chat did not cover right edge terminal content: %q", openLine)
 	}
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
-	restoredLine := ansiPattern.ReplaceAllString(strings.Split(app.View(), "\n")[1], "")
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("s"))
+	restoredLine := ansiPattern.ReplaceAllString(strings.Split(appContent(app), "\n")[1], "")
 	if restoredLine != closedLine {
 		t.Fatalf("closed chat did not repaint terminal line\n got: %q\nwant: %q", restoredLine, closedLine)
-	}
-}
-
-func TestOverlayLinePreservesContentAfterModal(t *testing.T) {
-	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
-	app.Update(tea.WindowSizeMsg{Width: 40, Height: 5})
-	lines := []string{fitLine("abcdefghijklmnopqrstuvwxyz", 40)}
-
-	app.overlayLine(lines, 0, 10, "BOX", 3)
-
-	got := ansiPattern.ReplaceAllString(lines[0], "")
-	want := "abcdefghijBOXnopqrstuvwxyz              "
-	if got != want {
-		t.Fatalf("overlay line = %q, want %q", got, want)
-	}
-}
-
-func TestModalBoxUsesConsistentFilledWidth(t *testing.T) {
-	box := renderModalBox([]string{
-		labelStyle.Render("Resize terminal"),
-		dimStyle.Render("short"),
-	})
-	if len(box) == 0 {
-		t.Fatal("renderModalBox returned no rows")
-	}
-	want := displayWidth(box[0])
-	for i, line := range box {
-		if got := displayWidth(line); got != want {
-			t.Fatalf("modal row %d width = %d, want %d: %q", i, got, want, line)
-		}
 	}
 }
 
@@ -536,14 +571,14 @@ func TestLocalChatAuthorDefaultsToUser(t *testing.T) {
 	t.Setenv("USER", "shayne")
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("c"))
 	for _, r := range "hello" {
-		app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		app.Update(textKey(string(r)))
 	}
-	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	app.Update(keyCode(tea.KeyEnter))
 
-	view := app.View()
+	view := appContent(app)
 	if !strings.Contains(view, "shayne: hello") {
 		t.Fatalf("View() missing USER chat author:\n%s", view)
 	}
@@ -556,15 +591,15 @@ func TestLocalChatEchoIsDeduplicated(t *testing.T) {
 	app := NewApp(Options{Side: "host", DisplayName: "root@hetz", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("c"))
 	for _, r := range "hello" {
-		app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		app.Update(textKey(string(r)))
 	}
-	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	app.Update(keyCode(tea.KeyEnter))
 	app.Update(ChatMsg{Author: "root@hetz", Body: "hello"})
 
-	view := app.View()
+	view := appContent(app)
 	if got := strings.Count(view, "root@hetz: hello"); got != 0 {
 		t.Fatalf("chat message rendered with host-qualified local name %d times, want compact username:\n%s", got, view)
 	}
@@ -581,29 +616,62 @@ func TestInviteShortcutOpensHostInvite(t *testing.T) {
 	app := NewApp(Options{Side: "host", InviteCommand: invite, Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 40, Height: 12})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("i"))
 
-	view := app.View()
+	view := appContent(app)
 	if !app.inviteOpen {
 		t.Fatalf("inviteOpen = false, want true")
 	}
-	if !strings.Contains(view, invite) {
-		t.Fatalf("invite screen missing invite command:\n%s", view)
+	for _, line := range hardWrapPlainLine(invite, 40) {
+		if !strings.Contains(view, line) {
+			t.Fatalf("invite screen missing command line %q:\n%s", line, view)
+		}
 	}
 	if !strings.Contains(view, brand.Wordmark()) {
 		t.Fatalf("invite screen missing derpssh wordmark:\n%s", view)
 	}
 }
 
+func TestCopyModeInviteUsesSceneRendering(t *testing.T) {
+	invite := "npx -y derpssh@latest connect DSH1copyme"
+	app := NewApp(Options{Side: "host", InviteCommand: invite, Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 40, Height: 12})
+
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("y"))
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("i"))
+
+	if !app.copyMode || !app.inviteOpen {
+		t.Fatalf("copyMode, inviteOpen = %v, %v; want true, true", app.copyMode, app.inviteOpen)
+	}
+	if got, want := app.View().Content, app.buildScene().Content; got != want {
+		t.Fatalf("invite View content differs from Scene content:\ngot:\n%s\nwant:\n%s", got, want)
+	}
+	if got := app.View().Content; !strings.Contains(got, "DSH1copyme") {
+		t.Fatalf("invite Scene missing command:\n%s", got)
+	}
+}
+
+func TestCopyModeUsesSceneRendering(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "shell$"}})
+	app.Update(tea.WindowSizeMsg{Width: 40, Height: 12})
+	app.copyMode = true
+
+	if got, want := app.View().Content, app.buildScene().Content; got != want {
+		t.Fatalf("copy-mode View content differs from Scene content:\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
 func TestChatPaneUsesChatLabelAndWrapsMessages(t *testing.T) {
 	app := NewApp(Options{Side: "guest", DisplayName: "shayne", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 72, Height: 12})
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("s"))
 	app.Update(ChatMsg{Author: "eric@Erics-mini.local", Body: "this message should wrap instead of disappearing off the side of the chat pane"})
 
-	view := app.View()
+	view := appContent(app)
 	if !strings.Contains(view, "Chat") {
 		t.Fatalf("View() missing Chat label:\n%s", view)
 	}
@@ -651,13 +719,13 @@ func TestHardWrapPlainLine(t *testing.T) {
 func TestChatAutoScrollsToNewestMessages(t *testing.T) {
 	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 9})
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("s"))
 	for i := 0; i < 12; i++ {
 		app.Update(ChatMsg{Author: "alex", Body: "message " + intStringForTest(i)})
 	}
 
-	view := app.View()
+	view := appContent(app)
 	if strings.Contains(view, "message 0") {
 		t.Fatalf("chat did not scroll away from oldest message:\n%s", view)
 	}
@@ -669,18 +737,18 @@ func TestChatAutoScrollsToNewestMessages(t *testing.T) {
 func TestChatComposerGrowsToThreeRows(t *testing.T) {
 	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("c"))
 
 	for _, r := range "this message is long enough to wrap across multiple visible composer rows" {
-		app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		app.Update(textKey(string(r)))
 	}
-	app.View()
+	appContent(app)
 
 	if app.layout.Composer.H != 3 {
 		t.Fatalf("composer height = %d, want 3", app.layout.Composer.H)
 	}
-	view := app.View()
+	view := appContent(app)
 	for _, want := range []string{"this message is long", "composer rows"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("composer missing visible text fragment %q:\n%s", want, view)
@@ -691,35 +759,42 @@ func TestChatComposerGrowsToThreeRows(t *testing.T) {
 func TestChatComposerShowsAllRowsWhileGrowingToThree(t *testing.T) {
 	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
-	app.View()
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("c"))
+	appContent(app)
 	width := app.layout.Composer.W
 	if width < 10 {
 		t.Fatalf("composer width = %d, want useful test width", width)
 	}
 
-	first := strings.Repeat("a", width)
-	second := strings.Repeat("b", width)
-	third := strings.Repeat("c", width)
+	// Bubbles reserves the trailing cell at an exact wrap boundary so the real
+	// cursor can move consistently. Keep each input segment just below that
+	// boundary when asserting the dynamic one-to-three row growth.
+	first := strings.Repeat("a", width-1)
+	second := strings.Repeat("b", width-1)
+	third := strings.Repeat("c", width-1)
 	typeRunes(app, first)
 	typeRunes(app, second)
-	view := ansiPattern.ReplaceAllString(app.View(), "")
+	view := ansiPattern.ReplaceAllString(appContent(app), "")
 	if app.layout.Composer.H != 2 {
 		t.Fatalf("composer height after two wrapped rows = %d, want 2", app.layout.Composer.H)
 	}
-	for _, want := range []string{first, second} {
+	for _, want := range []string{strings.Repeat("a", width-3), strings.Repeat("b", width-3)} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("composer missing wrapped row %q while growing to two rows:\n%s", want, view)
 		}
 	}
 
 	typeRunes(app, third)
-	view = ansiPattern.ReplaceAllString(app.View(), "")
+	view = ansiPattern.ReplaceAllString(appContent(app), "")
 	if app.layout.Composer.H != 3 {
 		t.Fatalf("composer height after three wrapped rows = %d, want 3", app.layout.Composer.H)
 	}
-	for _, want := range []string{first, second, third} {
+	for _, want := range []string{
+		strings.Repeat("a", width-3),
+		strings.Repeat("b", width-3),
+		strings.Repeat("c", width-3),
+	} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("composer missing wrapped row %q while growing to three rows:\n%s", want, view)
 		}
@@ -727,55 +802,59 @@ func TestChatComposerShowsAllRowsWhileGrowingToThree(t *testing.T) {
 }
 
 func TestChatComposerPlaceholderUsesInputBackground(t *testing.T) {
-	forceStyledTestOutput(t)
 	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
-	app.View()
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("c"))
+	appContent(app)
 
-	lines := app.composerVisibleLines(24, 1)
-	if len(lines) != 1 {
-		t.Fatalf("composerVisibleLines() returned %d lines, want 1", len(lines))
+	styles := app.composer.Styles()
+	if got, want := colorString(styles.Focused.Placeholder.GetForeground()), colorString(app.styles.ComposerPlaceholder.GetForeground()); got != want {
+		t.Fatalf("placeholder foreground = %q, want %q", got, want)
 	}
-	if !strings.Contains(lines[0], composerPlaceholderStyle.Render("Message")) {
-		t.Fatalf("placeholder does not use composer input background:\n%q", lines[0])
+	if got, want := colorString(styles.Focused.Placeholder.GetBackground()), colorString(app.styles.Composer.GetBackground()); got != want {
+		t.Fatalf("placeholder background = %q, want composer background %q", got, want)
 	}
-	if strings.Contains(lines[0], dimStyle.Render("Message")) {
-		t.Fatalf("placeholder uses generic dim style instead of composer input style:\n%q", lines[0])
+	if got := app.View().Content; !strings.Contains(got, "Message") {
+		t.Fatalf("textarea view missing placeholder:\n%s", got)
 	}
 }
 
 func TestFocusedEmptyChatComposerShowsBlockCursor(t *testing.T) {
-	forceStyledTestOutput(t)
 	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
-	app.View()
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("c"))
+	appContent(app)
 
-	lines := app.composerVisibleLines(24, 1)
-	cursor := composerStyle.Reverse(true).Render(" ")
-	if !strings.Contains(lines[0], cursor) {
-		t.Fatalf("focused empty composer missing visible block cursor %q:\n%q", cursor, lines[0])
+	view := app.View()
+	if view.Cursor == nil {
+		t.Fatal("focused empty composer cursor = nil")
+	}
+	if view.Cursor.Shape != tea.CursorBlock {
+		t.Fatalf("cursor shape = %v, want block", view.Cursor.Shape)
+	}
+	if got, want := colorString(view.Cursor.Color), colorString(app.styles.ComposerCursor.GetForeground()); got != want {
+		t.Fatalf("cursor color = %q, want %q", got, want)
 	}
 }
 
 func TestFocusedEmptyChatComposerShowsCursorBeforePlaceholder(t *testing.T) {
-	forceStyledTestOutput(t)
 	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
-	app.View()
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("c"))
+	appContent(app)
 
-	lines := app.composerVisibleLines(24, 1)
-	if len(lines) != 1 {
-		t.Fatalf("composerVisibleLines() returned %d lines, want 1", len(lines))
+	view := app.View()
+	if view.Cursor == nil {
+		t.Fatal("focused empty composer cursor = nil")
 	}
-	got := ansiPattern.ReplaceAllString(lines[0], "")
-	if !strings.HasPrefix(got, " Message") {
-		t.Fatalf("empty focused composer cursor should occupy first cell and keep placeholder visible, got %q", got)
+	if got, want := view.Cursor.Position.X, app.layout.Composer.X; got != want {
+		t.Fatalf("empty composer cursor X = %d, want placeholder start %d", got, want)
+	}
+	if !strings.Contains(view.Content, "Message") {
+		t.Fatalf("focused empty composer missing placeholder:\n%s", view.Content)
 	}
 }
 
@@ -785,19 +864,18 @@ func TestClosedChatShowsUnreadNotification(t *testing.T) {
 
 	app.Update(ChatMsg{Author: "alex", Body: "ping"})
 
-	view := app.View()
+	view := appContent(app)
 	if !strings.Contains(strings.Split(view, "\n")[0], "Chat 1") {
 		t.Fatalf("closed chat missing unread top-bar notification:\n%s", view)
 	}
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
-	if strings.Contains(strings.Split(app.View(), "\n")[0], "Chat 1") {
-		t.Fatalf("unread notification did not clear after opening chat:\n%s", app.View())
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("s"))
+	if strings.Contains(strings.Split(appContent(app), "\n")[0], "Chat 1") {
+		t.Fatalf("unread notification did not clear after opening chat:\n%s", appContent(app))
 	}
 }
 
 func TestClosedChatUnreadPulsesTopBar(t *testing.T) {
-	forceStyledTestOutput(t)
 	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
 
@@ -805,14 +883,14 @@ func TestClosedChatUnreadPulsesTopBar(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("remote unread chat did not start a pulse tick")
 	}
-	firstLine := strings.Split(app.View(), "\n")[0]
+	firstLine := strings.Split(appContent(app), "\n")[0]
 	firstPlain := ansiPattern.ReplaceAllString(firstLine, "")
 	if !strings.Contains(firstPlain, "Chat 1") {
-		t.Fatalf("closed chat missing unread top-bar notification:\n%s", app.View())
+		t.Fatalf("closed chat missing unread top-bar notification:\n%s", appContent(app))
 	}
 
 	app.Update(unreadChatPulseMsg{seq: app.unreadPulseSeq})
-	secondLine := strings.Split(app.View(), "\n")[0]
+	secondLine := strings.Split(appContent(app), "\n")[0]
 	if secondLine == firstLine {
 		t.Fatalf("unread top-bar style did not pulse:\nfirst:  %q\nsecond: %q", firstLine, secondLine)
 	}
@@ -821,7 +899,7 @@ func TestClosedChatUnreadPulsesTopBar(t *testing.T) {
 	}
 
 	app.Update(unreadChatPulseMsg{seq: app.unreadPulseSeq})
-	thirdLine := strings.Split(app.View(), "\n")[0]
+	thirdLine := strings.Split(appContent(app), "\n")[0]
 	if thirdLine != firstLine {
 		t.Fatalf("unread top-bar pulse did not return to original style:\nfirst: %q\nthird: %q", firstLine, thirdLine)
 	}
@@ -864,8 +942,8 @@ func TestClosedChatUnreadEmitsBellCommand(t *testing.T) {
 		t.Fatal("next remote unread chat did not emit another TerminalBellCommand")
 	}
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("s"))
 	app.Update(ChatMsg{Author: "alex", Body: "open chat"})
 	for cmd := readCommand(app); cmd != nil; cmd = readCommand(app) {
 		if _, ok := cmd.(TerminalBellCommand); ok {
@@ -887,7 +965,7 @@ func TestTransportStatusIsReducedToPath(t *testing.T) {
 
 	app.Update(RuntimeStateMsg{Transport: "connected-relay"})
 
-	view := app.View()
+	view := appContent(app)
 	if !strings.Contains(strings.Split(view, "\n")[0], "relay") {
 		t.Fatalf("top bar missing relay status:\n%s", view)
 	}
@@ -901,9 +979,9 @@ func TestTerminalCursorSuppressedWhenChatFocused(t *testing.T) {
 	app := NewApp(Options{Terminal: pane})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
-	app.View()
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("c"))
+	appContent(app)
 
 	if pane.cursorActive {
 		t.Fatalf("terminal cursor active while chat is focused")
@@ -919,9 +997,9 @@ func TestInviteScreenEscapeReturnsToTerminal(t *testing.T) {
 	})
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	app.Update(keyCode(tea.KeyEsc))
 
-	view := app.View()
+	view := appContent(app)
 	if !strings.Contains(view, "shell$") {
 		t.Fatalf("Esc did not return to terminal view:\n%s", view)
 	}
@@ -941,7 +1019,7 @@ func TestApprovalRequestDismissesInitialInviteScreen(t *testing.T) {
 
 	app.Update(ApprovalRequestMsg{PeerID: "guest-1", Peer: "shayne"})
 
-	view := app.View()
+	view := appContent(app)
 	if strings.Contains(view, "npx -y derpssh@latest connect") {
 		t.Fatalf("approval did not dismiss invite screen:\n%s", view)
 	}
@@ -960,13 +1038,13 @@ func TestInviteScreenQReturnsToTerminal(t *testing.T) {
 	app.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
 	drainCommands(app)
 
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	app.Update(textKey("q"))
 
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("invite q emitted command %+v, want none", cmd)
 	}
-	if !strings.Contains(app.View(), "shell$") {
-		t.Fatalf("invite q did not return to terminal:\n%s", app.View())
+	if !strings.Contains(appContent(app), "shell$") {
+		t.Fatalf("invite q did not return to terminal:\n%s", appContent(app))
 	}
 }
 
@@ -995,7 +1073,7 @@ func TestViewFitsNarrowWindow(t *testing.T) {
 		Peers:     []Peer{{Name: "Peer With A Long Name", Role: RoleWrite}},
 	})
 
-	for i, line := range strings.Split(app.View(), "\n") {
+	for i, line := range strings.Split(appContent(app), "\n") {
 		if got := visibleWidth(line); got > 40 {
 			t.Fatalf("line %d width = %d, want <= 40: %q", i+1, got, line)
 		}
@@ -1009,7 +1087,7 @@ func TestViewFitsWideGlyphNarrowWindow(t *testing.T) {
 	})
 	app.Update(tea.WindowSizeMsg{Width: 11, Height: 8})
 
-	for i, line := range strings.Split(app.View(), "\n") {
+	for i, line := range strings.Split(appContent(app), "\n") {
 		if got := visibleWidth(line); got > 11 {
 			t.Fatalf("line %d cell width = %d, want <= 11: %q", i+1, got, line)
 		}
@@ -1018,19 +1096,13 @@ func TestViewFitsWideGlyphNarrowWindow(t *testing.T) {
 
 var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 
-func forceStyledTestOutput(t *testing.T) {
-	t.Helper()
-	lipgloss.SetColorProfile(termenv.TrueColor)
-	lipgloss.SetHasDarkBackground(true)
-}
-
 func visibleWidth(line string) int {
 	return runewidth.StringWidth(ansiPattern.ReplaceAllString(line, ""))
 }
 
 func typeRunes(app *App, text string) {
 	for _, r := range text {
-		app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		app.Update(textKey(string(r)))
 	}
 }
 

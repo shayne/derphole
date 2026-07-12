@@ -6,11 +6,12 @@ package tui
 
 import (
 	"fmt"
+	"image/color"
 	"math"
 	"strconv"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 )
 
 type ColorScheme string
@@ -72,6 +73,18 @@ func (t Theme) Role(role ThemeRole) lipgloss.Style {
 		Background(lipgloss.Color(colors.background))
 }
 
+func (t Theme) RoleColor(role ThemeRole, foreground bool) color.Color {
+	colors := t.roles[role]
+	if colors.foreground == "" || colors.background == "" {
+		colors = t.roles[ChromeBase]
+	}
+	value := colors.background
+	if foreground {
+		value = colors.foreground
+	}
+	return lipgloss.Color(value)
+}
+
 func (t Theme) ContrastRatio(role ThemeRole) float64 {
 	colors := t.roles[role]
 	return contrastRatio(colors.foreground, colors.background)
@@ -100,25 +113,6 @@ func allThemeRoles() []ThemeRole {
 		ComposerCursor,
 		SelectionMode,
 	}
-}
-
-func adaptiveRoleStyle(role ThemeRole) lipgloss.Style {
-	return lipgloss.NewStyle().
-		Foreground(adaptiveRoleColor(role, true)).
-		Background(adaptiveRoleColor(role, false))
-}
-
-func adaptiveRoleColor(role ThemeRole, foreground bool) lipgloss.AdaptiveColor {
-	light := newTheme(SchemeLight).roles[role]
-	dark := newTheme(SchemeDark).roles[role]
-	if light.foreground == "" || dark.foreground == "" {
-		light = newTheme(SchemeLight).roles[ChromeBase]
-		dark = newTheme(SchemeDark).roles[ChromeBase]
-	}
-	if foreground {
-		return lipgloss.AdaptiveColor{Light: light.foreground, Dark: dark.foreground}
-	}
-	return lipgloss.AdaptiveColor{Light: light.background, Dark: dark.background}
 }
 
 func themeRolesForScheme(scheme ColorScheme) map[ThemeRole]themeColorPair {

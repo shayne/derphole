@@ -10,16 +10,16 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 func TestEncodeTerminalKeyPrintable(t *testing.T) {
-	got, ok := EncodeTerminalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	got, ok := EncodeTerminalKey(textKey("a"))
 	if !ok || string(got) != "a" {
 		t.Fatalf("EncodeTerminalKey(a) = %q, %v; want a, true", got, ok)
 	}
 
-	got, ok = EncodeTerminalKey(tea.KeyMsg{Type: tea.KeySpace})
+	got, ok = EncodeTerminalKey(keyCode(tea.KeySpace))
 	if !ok || string(got) != " " {
 		t.Fatalf("EncodeTerminalKey(space) = %q, %v; want space, true", got, ok)
 	}
@@ -28,15 +28,16 @@ func TestEncodeTerminalKeyPrintable(t *testing.T) {
 func TestEncodeTerminalKeyControlBytes(t *testing.T) {
 	tests := []struct {
 		name string
-		msg  tea.KeyMsg
+		msg  tea.KeyPressMsg
 		want []byte
 	}{
-		{name: "ctrl-c", msg: tea.KeyMsg{Type: tea.KeyCtrlC}, want: []byte{0x03}},
-		{name: "ctrl-x", msg: tea.KeyMsg{Type: tea.KeyCtrlX}, want: []byte{0x18}},
-		{name: "enter", msg: tea.KeyMsg{Type: tea.KeyEnter}, want: []byte{'\r'}},
-		{name: "tab", msg: tea.KeyMsg{Type: tea.KeyTab}, want: []byte{'\t'}},
-		{name: "backspace", msg: tea.KeyMsg{Type: tea.KeyBackspace}, want: []byte{0x7f}},
-		{name: "escape", msg: tea.KeyMsg{Type: tea.KeyEsc}, want: []byte{0x1b}},
+		{name: "ctrl-c", msg: modifiedKey('c', "", tea.ModCtrl), want: []byte{0x03}},
+		{name: "ctrl-x", msg: modifiedKey('x', "", tea.ModCtrl), want: []byte{0x18}},
+		{name: "ctrl-space", msg: modifiedKey(tea.KeySpace, "", tea.ModCtrl), want: []byte{0x00}},
+		{name: "enter", msg: keyCode(tea.KeyEnter), want: []byte{'\r'}},
+		{name: "tab", msg: keyCode(tea.KeyTab), want: []byte{'\t'}},
+		{name: "backspace", msg: keyCode(tea.KeyBackspace), want: []byte{0x7f}},
+		{name: "escape", msg: keyCode(tea.KeyEsc), want: []byte{0x1b}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -51,18 +52,18 @@ func TestEncodeTerminalKeyControlBytes(t *testing.T) {
 func TestEncodeTerminalKeyNavigation(t *testing.T) {
 	tests := []struct {
 		name string
-		msg  tea.KeyMsg
+		msg  tea.KeyPressMsg
 		want string
 	}{
-		{name: "up", msg: tea.KeyMsg{Type: tea.KeyUp}, want: "\x1b[A"},
-		{name: "down", msg: tea.KeyMsg{Type: tea.KeyDown}, want: "\x1b[B"},
-		{name: "right", msg: tea.KeyMsg{Type: tea.KeyRight}, want: "\x1b[C"},
-		{name: "left", msg: tea.KeyMsg{Type: tea.KeyLeft}, want: "\x1b[D"},
-		{name: "home", msg: tea.KeyMsg{Type: tea.KeyHome}, want: "\x1b[H"},
-		{name: "end", msg: tea.KeyMsg{Type: tea.KeyEnd}, want: "\x1b[F"},
-		{name: "delete", msg: tea.KeyMsg{Type: tea.KeyDelete}, want: "\x1b[3~"},
-		{name: "page up", msg: tea.KeyMsg{Type: tea.KeyPgUp}, want: "\x1b[5~"},
-		{name: "page down", msg: tea.KeyMsg{Type: tea.KeyPgDown}, want: "\x1b[6~"},
+		{name: "up", msg: keyCode(tea.KeyUp), want: "\x1b[A"},
+		{name: "down", msg: keyCode(tea.KeyDown), want: "\x1b[B"},
+		{name: "right", msg: keyCode(tea.KeyRight), want: "\x1b[C"},
+		{name: "left", msg: keyCode(tea.KeyLeft), want: "\x1b[D"},
+		{name: "home", msg: keyCode(tea.KeyHome), want: "\x1b[H"},
+		{name: "end", msg: keyCode(tea.KeyEnd), want: "\x1b[F"},
+		{name: "delete", msg: keyCode(tea.KeyDelete), want: "\x1b[3~"},
+		{name: "page up", msg: keyCode(tea.KeyPgUp), want: "\x1b[5~"},
+		{name: "page down", msg: keyCode(tea.KeyPgDown), want: "\x1b[6~"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -77,13 +78,13 @@ func TestEncodeTerminalKeyNavigation(t *testing.T) {
 func TestEncodeTerminalKeyHtopFunctionKeys(t *testing.T) {
 	tests := []struct {
 		name string
-		msg  tea.KeyMsg
+		msg  tea.KeyPressMsg
 		want string
 	}{
-		{name: "f1", msg: tea.KeyMsg{Type: tea.KeyF1}, want: "\x1bOP"},
-		{name: "f5", msg: tea.KeyMsg{Type: tea.KeyF5}, want: "\x1b[15~"},
-		{name: "f10", msg: tea.KeyMsg{Type: tea.KeyF10}, want: "\x1b[21~"},
-		{name: "f12", msg: tea.KeyMsg{Type: tea.KeyF12}, want: "\x1b[24~"},
+		{name: "f1", msg: keyCode(tea.KeyF1), want: "\x1bOP"},
+		{name: "f5", msg: keyCode(tea.KeyF5), want: "\x1b[15~"},
+		{name: "f10", msg: keyCode(tea.KeyF10), want: "\x1b[21~"},
+		{name: "f12", msg: keyCode(tea.KeyF12), want: "\x1b[24~"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -98,13 +99,13 @@ func TestEncodeTerminalKeyHtopFunctionKeys(t *testing.T) {
 func TestEncodeTerminalKeyApplicationCursorMode(t *testing.T) {
 	tests := []struct {
 		name string
-		msg  tea.KeyMsg
+		msg  tea.KeyPressMsg
 		want string
 	}{
-		{name: "up", msg: tea.KeyMsg{Type: tea.KeyUp}, want: "\x1bOA"},
-		{name: "down", msg: tea.KeyMsg{Type: tea.KeyDown}, want: "\x1bOB"},
-		{name: "right", msg: tea.KeyMsg{Type: tea.KeyRight}, want: "\x1bOC"},
-		{name: "left", msg: tea.KeyMsg{Type: tea.KeyLeft}, want: "\x1bOD"},
+		{name: "up", msg: keyCode(tea.KeyUp), want: "\x1bOA"},
+		{name: "down", msg: keyCode(tea.KeyDown), want: "\x1bOB"},
+		{name: "right", msg: keyCode(tea.KeyRight), want: "\x1bOC"},
+		{name: "left", msg: keyCode(tea.KeyLeft), want: "\x1bOD"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -116,10 +117,157 @@ func TestEncodeTerminalKeyApplicationCursorMode(t *testing.T) {
 	}
 }
 
+func TestEncodeTerminalKeyV2Modifiers(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  tea.KeyPressMsg
+		want string
+	}{
+		{"unicode", textKey("界"), "界"},
+		{"alt text", modifiedKey('x', "x", tea.ModAlt), "\x1bx"},
+		{"ctrl c", modifiedKey('c', "", tea.ModCtrl), "\x03"},
+		{"ctrl shift right", modifiedKey(tea.KeyRight, "", tea.ModCtrl|tea.ModShift), "\x1b[1;6C"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := EncodeTerminalKeyWithMode(tt.msg, TerminalInputMode{})
+			if !ok || string(got) != tt.want {
+				t.Fatalf("EncodeTerminalKeyWithMode() = %q, %v, want %q, true", got, ok, tt.want)
+			}
+		})
+	}
+}
+
+func TestEncodeTerminalKeyAltPrintableFallback(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  tea.KeyPressMsg
+		want string
+	}{
+		{name: "ascii code", msg: modifiedKey('x', "", tea.ModAlt), want: "\x1bx"},
+		{name: "unicode code", msg: modifiedKey('界', "", tea.ModAlt), want: "\x1b界"},
+		{name: "shifted code", msg: tea.KeyPressMsg{Code: '1', ShiftedCode: '!', Mod: tea.ModAlt | tea.ModShift}, want: "\x1b!"},
+		{name: "alt ctrl ascii", msg: modifiedKey('c', "", tea.ModAlt|tea.ModCtrl), want: "\x1b\x03"},
+		{name: "text is authoritative", msg: modifiedKey('x', "é", tea.ModAlt), want: "\x1bé"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := EncodeTerminalKey(tt.msg)
+			if !ok || string(got) != tt.want {
+				t.Fatalf("EncodeTerminalKey() = %q, %v; want %q, true", got, ok, tt.want)
+			}
+		})
+	}
+}
+
+func TestEncodeTerminalKeyAltShiftFallbackWithoutShiftedCode(t *testing.T) {
+	t.Run("letter", func(t *testing.T) {
+		msg := tea.KeyPressMsg{Code: 'p', Mod: tea.ModAlt | tea.ModShift}
+		got, ok := EncodeTerminalKey(msg)
+		if !ok || string(got) != "\x1bP" {
+			t.Fatalf("EncodeTerminalKey(alt+shift+p) = %q, %v; want %q, true", got, ok, "\x1bP")
+		}
+	})
+
+	t.Run("unrecoverable non-letter", func(t *testing.T) {
+		msg := tea.KeyPressMsg{Code: '1', Mod: tea.ModAlt | tea.ModShift}
+		got, ok := EncodeTerminalKey(msg)
+		if ok || got != nil {
+			t.Fatalf("EncodeTerminalKey(alt+shift+1) = %q, %v; want nil, false", got, ok)
+		}
+	})
+}
+
+func TestEncodeTerminalKeyAltPrefixDoesNotInspectPayload(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  tea.KeyPressMsg
+		want []byte
+	}{
+		{name: "ctrl bracket", msg: modifiedKey('[', "", tea.ModAlt|tea.ModCtrl), want: []byte{0x1b, 0x1b}},
+		{name: "authoritative escape text", msg: modifiedKey('x', "\x1bx", tea.ModAlt), want: []byte{0x1b, 0x1b, 'x'}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := EncodeTerminalKey(tt.msg)
+			if !ok || !bytes.Equal(got, tt.want) {
+				t.Fatalf("EncodeTerminalKey() = %v, %v; want %v, true", got, ok, tt.want)
+			}
+		})
+	}
+}
+
+func TestEncodeTerminalKeyModifiedSpecialKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  tea.KeyPressMsg
+		mode TerminalInputMode
+		want string
+	}{
+		{name: "shift up", msg: modifiedKey(tea.KeyUp, "", tea.ModShift), want: "\x1b[1;2A"},
+		{name: "alt down", msg: modifiedKey(tea.KeyDown, "", tea.ModAlt), want: "\x1b[1;3B"},
+		{name: "ctrl right", msg: modifiedKey(tea.KeyRight, "", tea.ModCtrl), want: "\x1b[1;5C"},
+		{name: "meta left", msg: modifiedKey(tea.KeyLeft, "", tea.ModMeta), want: "\x1b[1;9D"},
+		{name: "modified application cursor", msg: modifiedKey(tea.KeyUp, "", tea.ModShift), mode: TerminalInputMode{ApplicationCursor: true}, want: "\x1b[1;2A"},
+		{name: "shift insert", msg: modifiedKey(tea.KeyInsert, "", tea.ModShift), want: "\x1b[2;2~"},
+		{name: "alt delete", msg: modifiedKey(tea.KeyDelete, "", tea.ModAlt), want: "\x1b[3;3~"},
+		{name: "ctrl page up", msg: modifiedKey(tea.KeyPgUp, "", tea.ModCtrl), want: "\x1b[5;5~"},
+		{name: "meta page down", msg: modifiedKey(tea.KeyPgDown, "", tea.ModMeta), want: "\x1b[6;9~"},
+		{name: "shift f1", msg: modifiedKey(tea.KeyF1, "", tea.ModShift), want: "\x1b[1;2P"},
+		{name: "alt f4", msg: modifiedKey(tea.KeyF4, "", tea.ModAlt), want: "\x1b[1;3S"},
+		{name: "ctrl f5", msg: modifiedKey(tea.KeyF5, "", tea.ModCtrl), want: "\x1b[15;5~"},
+		{name: "meta f12", msg: modifiedKey(tea.KeyF12, "", tea.ModMeta), want: "\x1b[24;9~"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := EncodeTerminalKeyWithMode(tt.msg, tt.mode)
+			if !ok || string(got) != tt.want {
+				t.Fatalf("EncodeTerminalKeyWithMode() = %q, %v; want %q, true", got, ok, tt.want)
+			}
+		})
+	}
+}
+
+func TestEncodeTerminalKeyRejectsUnsupportedSpecialKeyModifiers(t *testing.T) {
+	for _, mod := range []tea.KeyMod{tea.ModHyper, tea.ModSuper} {
+		if got, ok := EncodeTerminalKey(modifiedKey(tea.KeyRight, "", mod)); ok || got != nil {
+			t.Fatalf("EncodeTerminalKey(%v+right) = %q, %v; want nil, false", mod, got, ok)
+		}
+	}
+}
+
+func TestEncodeTerminalKeyRejectsUnsupportedFallbackModifiers(t *testing.T) {
+	tests := []tea.KeyPressMsg{
+		modifiedKey('c', "", tea.ModHyper|tea.ModCtrl),
+		modifiedKey('x', "", tea.ModSuper|tea.ModAlt),
+	}
+	for _, msg := range tests {
+		if got, ok := EncodeTerminalKey(msg); ok || got != nil {
+			t.Fatalf("EncodeTerminalKey(%v) = %q, %v; want nil, false", msg.Mod, got, ok)
+		}
+	}
+}
+
+func TestEncodeTerminalKeyModifiedSpecialDoesNotDegrade(t *testing.T) {
+	t.Run("shift tab", func(t *testing.T) {
+		got, ok := EncodeTerminalKey(modifiedKey(tea.KeyTab, "", tea.ModShift))
+		if !ok || string(got) != "\x1b[Z" {
+			t.Fatalf("EncodeTerminalKey(shift+tab) = %q, %v; want backtab, true", got, ok)
+		}
+	})
+
+	t.Run("meta enter", func(t *testing.T) {
+		got, ok := EncodeTerminalKey(modifiedKey(tea.KeyEnter, "", tea.ModMeta))
+		if ok || got != nil {
+			t.Fatalf("EncodeTerminalKey(meta+enter) = %q, %v; want nil, false", got, ok)
+		}
+	})
+}
+
 func TestTerminalFocusHtopFunctionKeyReachesPTY(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyF10})
+	app.Update(keyCode(tea.KeyF10))
 
 	cmd := readCommand(app)
 	got, ok := cmd.(TerminalInputCommand)
@@ -133,8 +281,8 @@ func TestTerminalFocusHtopFunctionKeyReachesPTY(t *testing.T) {
 
 func TestPrefixDoesNotReachPTY(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("s"))
 
 	cmd := readCommand(app)
 	if _, ok := cmd.(TerminalInputCommand); ok {
@@ -153,8 +301,8 @@ func TestPrefixSidebarToggleEmitsTerminalResize(t *testing.T) {
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	drainCommands(app)
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("s"))
 
 	got, ok := readCommand(app).(TerminalResizeCommand)
 	if !ok {
@@ -171,8 +319,8 @@ func TestPrefixSidebarToggleEmitsTerminalResize(t *testing.T) {
 		t.Fatalf("composer focus = false, want true after Ctrl-X S opens chat")
 	}
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("s"))
 
 	if app.sidebarOpen {
 		t.Fatalf("sidebarOpen = true, want false after Ctrl-X S closes chat")
@@ -187,8 +335,8 @@ func TestPrefixChatOpenEmitsTerminalResize(t *testing.T) {
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	drainCommands(app)
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("c"))
 
 	got, ok := readCommand(app).(TerminalResizeCommand)
 	if !ok {
@@ -202,7 +350,7 @@ func TestPrefixChatOpenEmitsTerminalResize(t *testing.T) {
 
 func TestColonIsPlainShellInput(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{':'}})
+	app.Update(textKey(":"))
 
 	cmd := readCommand(app)
 	got, ok := cmd.(TerminalInputCommand)
@@ -217,7 +365,7 @@ func TestColonIsPlainShellInput(t *testing.T) {
 func TestTerminalFocusEscapeReachesPTY(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	app.Update(keyCode(tea.KeyEsc))
 
 	cmd := readCommand(app)
 	got, ok := cmd.(TerminalInputCommand)
@@ -232,7 +380,7 @@ func TestTerminalFocusEscapeReachesPTY(t *testing.T) {
 func TestTerminalFocusCtrlRReachesPTY(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+	app.Update(modifiedKey('r', "", tea.ModCtrl))
 
 	cmd := readCommand(app)
 	got, ok := cmd.(TerminalInputCommand)
@@ -247,7 +395,7 @@ func TestTerminalFocusCtrlRReachesPTY(t *testing.T) {
 func TestTerminalFocusUsesApplicationCursorMode(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok", input: TerminalInputMode{ApplicationCursor: true}}})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyUp})
+	app.Update(keyCode(tea.KeyUp))
 
 	cmd := readCommand(app)
 	got, ok := cmd.(TerminalInputCommand)
@@ -263,7 +411,7 @@ func TestCommandQueueDoesNotDropWhenBufferWouldOverflow(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 
 	for i := 0; i < 100; i++ {
-		app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+		app.Update(textKey("a"))
 	}
 
 	for i := 0; i < 100; i++ {
@@ -314,9 +462,9 @@ func TestPrefixKickCommandIncludesSelectedPeerID(t *testing.T) {
 		{ID: "guest-2", Name: "Alex", Role: RoleWrite},
 	}})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
-	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("k"))
+	app.Update(keyCode(tea.KeyEnter))
 
 	got, ok := readCommand(app).(KickCommand)
 	if !ok {
@@ -332,8 +480,8 @@ func TestPrefixRoleCommandsUseSelectedPeerID(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 	app.Update(RuntimeStateMsg{Peers: []Peer{{ID: "guest-1", Name: "Alex", Role: RoleRead}}})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("w"))
 
 	got, ok := readCommand(app).(RoleChangeCommand)
 	if !ok {
@@ -344,8 +492,8 @@ func TestPrefixRoleCommandsUseSelectedPeerID(t *testing.T) {
 		t.Fatalf("role command = %+v, want %+v", got, want)
 	}
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("r"))
 
 	got, ok = readCommand(app).(RoleChangeCommand)
 	if !ok {
@@ -361,23 +509,23 @@ func TestPeerDialogKeyboardNavigationAndConfirm(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 	app.openPeerDialog(Peer{ID: "guest-2", Name: "Blair", Role: RoleWrite})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyRight})
+	app.Update(keyCode(tea.KeyRight))
 	if app.peerDialogChoice != peerActionKick {
 		t.Fatalf("right key choice = %v, want kick", app.peerDialogChoice)
 	}
-	app.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	app.Update(keyCode(tea.KeyLeft))
 	if app.peerDialogChoice != peerActionWrite {
 		t.Fatalf("left key choice = %v, want write", app.peerDialogChoice)
 	}
-	app.Update(tea.KeyMsg{Type: tea.KeyTab})
+	app.Update(keyCode(tea.KeyTab))
 	if app.peerDialogChoice != peerActionKick {
 		t.Fatalf("tab key choice = %v, want kick", app.peerDialogChoice)
 	}
-	app.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	app.Update(modifiedKey(tea.KeyTab, "", tea.ModShift))
 	if app.peerDialogChoice != peerActionWrite {
 		t.Fatalf("shift-tab key choice = %v, want write", app.peerDialogChoice)
 	}
-	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	app.Update(keyCode(tea.KeyEnter))
 
 	got, ok := readCommand(app).(RoleChangeCommand)
 	if !ok {
@@ -407,7 +555,7 @@ func TestPeerDialogRuneShortcuts(t *testing.T) {
 			app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 			app.openPeerDialog(Peer{ID: "guest-2", Name: "Blair", Role: RoleWrite})
 
-			app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{tt.key}})
+			app.Update(textKey(string(tt.key)))
 
 			if got := readCommand(app); got != tt.want {
 				t.Fatalf("command = %+v, want %+v", got, tt.want)
@@ -423,24 +571,24 @@ func TestPeerDialogShortcutAndCancelKeys(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 	app.openPeerDialog(Peer{ID: "guest-2", Name: "Blair", Role: RoleWrite})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
 	if !app.prefix {
 		t.Fatalf("Ctrl-X did not enable prefix while peer dialog was open")
 	}
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	app.Update(textKey("q"))
 	if !app.quitOpen {
 		t.Fatalf("Ctrl-X Q did not open quit confirmation while peer dialog was open")
 	}
 
 	app.closeQuitConfirm()
 	app.openPeerDialog(Peer{ID: "guest-2", Name: "Blair", Role: RoleWrite})
-	app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	app.Update(keyCode(tea.KeyEsc))
 	if app.peerDialogOpen {
 		t.Fatalf("Esc did not close peer dialog")
 	}
 
 	app.openPeerDialog(Peer{ID: "guest-2", Name: "Blair", Role: RoleWrite})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	app.Update(textKey("q"))
 	if app.peerDialogOpen {
 		t.Fatalf("q did not close peer dialog")
 	}
@@ -451,7 +599,7 @@ func TestEscapeClosesActiveOverlays(t *testing.T) {
 		app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 		app.Update(ApprovalRequestMsg{PeerID: "guest-1", Peer: "Alex"})
 
-		app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		app.Update(keyCode(tea.KeyEsc))
 
 		got, ok := readCommand(app).(ApprovalDecisionCommand)
 		if !ok {
@@ -469,7 +617,7 @@ func TestEscapeClosesActiveOverlays(t *testing.T) {
 		app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 		app.openQuitConfirm()
 
-		app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		app.Update(keyCode(tea.KeyEsc))
 
 		if app.quitOpen {
 			t.Fatalf("quit confirmation still open after Esc")
@@ -478,9 +626,9 @@ func TestEscapeClosesActiveOverlays(t *testing.T) {
 
 	t.Run("prefix", func(t *testing.T) {
 		app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
-		app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+		app.Update(modifiedKey('x', "", tea.ModCtrl))
 
-		app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		app.Update(keyCode(tea.KeyEsc))
 
 		if app.prefix {
 			t.Fatalf("prefix still active after Esc")
@@ -491,7 +639,7 @@ func TestEscapeClosesActiveOverlays(t *testing.T) {
 		app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 		app.helpOpen = true
 
-		app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		app.Update(keyCode(tea.KeyEsc))
 
 		if app.helpOpen {
 			t.Fatalf("help still open after Esc")
@@ -502,7 +650,7 @@ func TestEscapeClosesActiveOverlays(t *testing.T) {
 		app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 		app.inviteOpen = true
 
-		app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		app.Update(keyCode(tea.KeyEsc))
 
 		if app.inviteOpen {
 			t.Fatalf("invite still open after Esc")
@@ -514,7 +662,7 @@ func TestEscapeClosesActiveOverlays(t *testing.T) {
 		app.kickPeerID = "guest-1"
 		app.kickPeer = "Alex"
 
-		app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		app.Update(keyCode(tea.KeyEsc))
 
 		if app.kickPeerID != "" || app.kickPeer != "" {
 			t.Fatalf("kick confirmation still open after Esc")
@@ -526,7 +674,7 @@ func TestEscapeClosesActiveOverlays(t *testing.T) {
 		app.noticeTitle = "Disconnected"
 		app.noticeBody = "Guest quit"
 
-		app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		app.Update(keyCode(tea.KeyEsc))
 
 		if app.noticeOpen() {
 			t.Fatalf("notice still open after Esc")
@@ -537,7 +685,7 @@ func TestEscapeClosesActiveOverlays(t *testing.T) {
 		app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 		app.shellExitOpen = true
 
-		app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		app.Update(keyCode(tea.KeyEsc))
 
 		if !app.shellExitOpen {
 			t.Fatalf("shell-exit dialog closed on Esc, want it to stay open")
@@ -551,7 +699,7 @@ func TestApprovalIgnoresSelectionKeysDuringInputGrace(t *testing.T) {
 	app.now = func() time.Time { return now }
 	app.Update(ApprovalRequestMsg{PeerID: "guest-1", Peer: "Alex"})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	app.Update(keyCode(tea.KeyEnter))
 
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("immediate Enter emitted command %+v, want none during grace", cmd)
@@ -561,7 +709,7 @@ func TestApprovalIgnoresSelectionKeysDuringInputGrace(t *testing.T) {
 	}
 
 	now = now.Add(approvalInputGrace + time.Millisecond)
-	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	app.Update(keyCode(tea.KeyEnter))
 
 	got, ok := readCommand(app).(ApprovalDecisionCommand)
 	if !ok {
@@ -582,7 +730,7 @@ func TestFrontModalReceivesKeysWhenHelpIsBehind(t *testing.T) {
 		t.Fatalf("front modal = %q, want approval", got)
 	}
 
-	app.Update(tea.KeyMsg{Type: tea.KeyRight})
+	app.Update(keyCode(tea.KeyRight))
 
 	if app.approvalChoice != approvalChoiceDeny {
 		t.Fatalf("approval choice = %v, want deny after right key", app.approvalChoice)
@@ -605,8 +753,8 @@ func TestResizeWarningAllowsPrefixQuit(t *testing.T) {
 		t.Fatalf("front modal = %q, want resize warning", got)
 	}
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("q"))
 
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("Ctrl-X Q emitted command %+v before confirmation", cmd)
@@ -620,8 +768,8 @@ func TestPrefixInviteOpensHostInvite(t *testing.T) {
 	invite := "npx -y derpssh@latest connect DSH1copyme"
 	app := NewApp(Options{Side: "host", InviteCommand: invite, Terminal: &fakePane{view: "ok"}})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("i"))
 
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("Ctrl-X I emitted command %+v, want none", cmd)
@@ -635,8 +783,8 @@ func TestPrefixInviteIgnoredForGuest(t *testing.T) {
 	invite := "npx -y derpssh@latest connect DSH1copyme"
 	app := NewApp(Options{Side: "guest", InviteCommand: invite, Terminal: &fakePane{view: "ok"}})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("i"))
 
 	if app.inviteOpen {
 		t.Fatalf("guest inviteOpen = true, want false")
@@ -649,36 +797,42 @@ func TestPrefixInviteIgnoredForGuest(t *testing.T) {
 func TestPrefixCopyModeTogglesSelectionMode(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 
-	_, cmd := app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	_, cmd := app.Update(modifiedKey('x', "", tea.ModCtrl))
 	if cmd != nil {
 		t.Fatalf("Ctrl-X command = %T, want nil", cmd)
 	}
-	_, cmd = app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	_, cmd = app.Update(textKey("y"))
 
 	if !app.copyMode {
 		t.Fatalf("copyMode = false, want true")
 	}
-	if cmd == nil {
-		t.Fatalf("copy mode toggle returned nil command, want mouse disable command")
+	if cmd != nil {
+		t.Fatalf("copy mode toggle command = %T, want nil", cmd)
+	}
+	if got := app.View().MouseMode; got != tea.MouseModeNone {
+		t.Fatalf("copy mode mouse mode = %v, want none", got)
 	}
 }
 
 func TestCopyModeEscapeLeavesSelectionMode(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("y"))
 	if !app.copyMode {
 		t.Fatalf("copyMode = false, want true before escape")
 	}
 
-	_, cmd := app.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	_, cmd := app.Update(keyCode(tea.KeyEsc))
 
 	if app.copyMode {
 		t.Fatalf("copyMode = true, want false after escape")
 	}
-	if cmd == nil {
-		t.Fatalf("escape in copy mode returned nil command, want mouse re-enable command")
+	if cmd != nil {
+		t.Fatalf("escape in copy mode command = %T, want nil", cmd)
+	}
+	if got := app.View().MouseMode; got != tea.MouseModeCellMotion {
+		t.Fatalf("mouse mode after escape = %v, want cell motion", got)
 	}
 	if got := readCommand(app); got != nil {
 		t.Fatalf("escape in copy mode emitted terminal command %+v, want none", got)
@@ -689,11 +843,11 @@ func TestCopyModeCtrlXShowsExitHint(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("y"))
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
 
-	firstLine := strings.Split(app.View(), "\n")[0]
+	firstLine := strings.Split(appContent(app), "\n")[0]
 	for _, want := range []string{"Y Select off", "Q Quit"} {
 		if !strings.Contains(firstLine, want) {
 			t.Fatalf("copy-mode prefix bar missing %q:\n%s", want, firstLine)
@@ -707,8 +861,8 @@ func TestCopyModeCtrlXShowsExitHint(t *testing.T) {
 func TestPrefixQuitOpensConfirmation(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("q"))
 
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("Ctrl-X Q emitted command %+v before confirmation", cmd)
@@ -716,7 +870,7 @@ func TestPrefixQuitOpensConfirmation(t *testing.T) {
 	if !app.quitOpen {
 		t.Fatalf("quitOpen = false, want true")
 	}
-	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	app.Update(keyCode(tea.KeyEnter))
 	if _, ok := readCommand(app).(QuitCommand); !ok {
 		t.Fatalf("confirmed quit did not emit QuitCommand")
 	}
@@ -727,7 +881,7 @@ func TestQuitConfirmationEnterWorksInCopyMode(t *testing.T) {
 	app.copyMode = true
 	app.openQuitConfirm()
 
-	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	app.Update(keyCode(tea.KeyEnter))
 
 	if _, ok := readCommand(app).(QuitCommand); !ok {
 		t.Fatalf("enter on quit confirmation in copy mode did not emit QuitCommand")
@@ -738,8 +892,8 @@ func TestPrefixQuitWorksDuringApproval(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 	app.Update(ApprovalRequestMsg{PeerID: "guest-1", Peer: "Alex"})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("q"))
 
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("Ctrl-X Q emitted command %+v before confirmation", cmd)
@@ -750,7 +904,7 @@ func TestPrefixQuitWorksDuringApproval(t *testing.T) {
 	if !app.approvalActive() {
 		t.Fatalf("approval should remain active until shutdown resolves it")
 	}
-	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	app.Update(keyCode(tea.KeyEnter))
 	if _, ok := readCommand(app).(QuitCommand); !ok {
 		t.Fatalf("confirmed quit did not emit QuitCommand")
 	}
@@ -758,11 +912,11 @@ func TestPrefixQuitWorksDuringApproval(t *testing.T) {
 
 func TestPrefixQuitWorksDuringHelp(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("?"))
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("q"))
 
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("Ctrl-X Q emitted command %+v before confirmation", cmd)
@@ -770,7 +924,7 @@ func TestPrefixQuitWorksDuringHelp(t *testing.T) {
 	if !app.quitOpen {
 		t.Fatalf("quitOpen = false, want true")
 	}
-	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	app.Update(keyCode(tea.KeyEnter))
 	if _, ok := readCommand(app).(QuitCommand); !ok {
 		t.Fatalf("confirmed quit did not emit QuitCommand")
 	}
@@ -780,8 +934,8 @@ func TestPrefixQuitWorksDuringNotice(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 	app.Update(NoticeMsg{Title: "Shell exited", Body: "Press Ctrl-X Q to quit."})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("q"))
 
 	if _, ok := readCommand(app).(QuitCommand); !ok {
 		t.Fatalf("Ctrl-X Q during shell-exit quit confirm did not emit QuitCommand")
@@ -791,10 +945,10 @@ func TestPrefixQuitWorksDuringNotice(t *testing.T) {
 func TestQuitConfirmationCancel(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
-	app.Update(tea.KeyMsg{Type: tea.KeyRight})
-	app.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("q"))
+	app.Update(keyCode(tea.KeyRight))
+	app.Update(keyCode(tea.KeyEnter))
 
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("cancel emitted command %+v, want none", cmd)
@@ -806,10 +960,10 @@ func TestQuitConfirmationCancel(t *testing.T) {
 
 func TestHelpOverlayCapturesPrintableKeys(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("?"))
 
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	app.Update(textKey("a"))
 
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("help overlay emitted command %+v, want none", cmd)
@@ -822,10 +976,10 @@ func TestHelpOverlayCapturesPrintableKeys(t *testing.T) {
 func TestKickOverlayCapturesPrintableKeys(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 	app.Update(RuntimeStateMsg{Peers: []Peer{{ID: "guest-1", Name: "Alex", Role: RoleRead}}})
-	app.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("k"))
 
-	app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	app.Update(textKey("x"))
 
 	if cmd := readCommand(app); cmd != nil {
 		t.Fatalf("kick overlay emitted command %+v, want none", cmd)

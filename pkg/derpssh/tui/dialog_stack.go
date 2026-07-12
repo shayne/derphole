@@ -19,14 +19,15 @@ const (
 )
 
 type ModalFrame struct {
-	Width  int
-	Height int
+	Width    int
+	Height   int
+	Styles   StyleSet
+	Backdrop string
 }
 
 type ModalDialog interface {
 	ID() ModalID
 	Lines() []string
-	Draw(*FrameCanvas, ModalFrame)
 }
 
 type LineDialog struct {
@@ -44,10 +45,6 @@ func (d LineDialog) ID() ModalID {
 
 func (d LineDialog) Lines() []string {
 	return append([]string(nil), d.lines...)
-}
-
-func (d LineDialog) Draw(canvas *FrameCanvas, frame ModalFrame) {
-	drawModalLines(canvas, frame, d.lines)
 }
 
 type ModalStack struct {
@@ -91,47 +88,21 @@ func (s *ModalStack) IDs() []ModalID {
 	return ids
 }
 
-func (s *ModalStack) Draw(canvas *FrameCanvas, frame ModalFrame) {
-	if s == nil {
-		return
-	}
-	for _, dialog := range s.dialogs {
-		dialog.Draw(canvas, frame)
-	}
-}
-
-func drawModalLines(canvas *FrameCanvas, frame ModalFrame, body []string) {
-	if canvas == nil || frame.Width <= 0 || frame.Height <= 0 {
-		return
-	}
-	box := renderModalBox(body)
-	bounds := modalBounds(frame, body)
-	overlay := NewFrameCanvas(bounds.W, bounds.H, modalInteriorStyle)
-	for i, line := range box {
-		overlay.DrawANSIText(0, i, fitLine(line, bounds.W), modalInteriorStyle)
-	}
-	canvas.Overlay(overlay, Point{X: bounds.X, Y: bounds.Y})
-}
-
 func modalBounds(frame ModalFrame, body []string) Rect {
-	box := renderModalBox(body)
-	boxW := modalOverlayWidth(frame.Width, box)
-	boxH := len(box)
+	boxW := modalBodyWidth(body) +
+		frame.Styles.Modal.GetHorizontalBorderSize() +
+		frame.Styles.Modal.GetHorizontalPadding()
+	if frame.Width > 0 {
+		boxW = minInt(boxW, frame.Width-2)
+	}
+	boxW = maxInt(boxW, 1)
+	boxH := len(body) +
+		frame.Styles.Modal.GetVerticalBorderSize() +
+		frame.Styles.Modal.GetVerticalPadding()
 	return Rect{
 		X: maxInt((frame.Width-boxW)/2, 0),
 		Y: maxInt((frame.Height-boxH)/2, 1),
 		W: boxW,
 		H: boxH,
 	}
-}
-
-func modalOverlayWidth(frameWidth int, box []string) int {
-	boxW := 0
-	for _, line := range box {
-		boxW = maxInt(boxW, displayWidth(line))
-	}
-	if frameWidth > 0 {
-		boxW = minInt(boxW, frameWidth-2)
-	}
-	return maxInt(boxW, 1)
 }
