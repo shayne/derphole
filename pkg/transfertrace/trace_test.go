@@ -200,6 +200,9 @@ func TestRecorderWritesDirectPathDiagnosticFields(t *testing.T) {
 		RetransmitCount:            3_600,
 		RepairRequests:             12,
 		RepairBytes:                98_304,
+		LocalENOBUFSRetries:        7,
+		LocalENOBUFSWaitUS:         913,
+		LocalENOBUFSMaxConsecutive: 3,
 		PeerRecvQueueDepth:         512,
 		PeerRecvQueueDepthMax:      1_069,
 		DirectPacketBytes:          1_250_000,
@@ -225,6 +228,9 @@ func TestRecorderWritesDirectPathDiagnosticFields(t *testing.T) {
 		RetransmitCount:            3_600,
 		RepairRequests:             12,
 		RepairBytes:                98_304,
+		LocalENOBUFSRetries:        7,
+		LocalENOBUFSWaitUS:         913,
+		LocalENOBUFSMaxConsecutive: 3,
 		PeerRecvQueueDepth:         512,
 		PeerRecvQueueDepthMax:      1_069,
 
@@ -262,6 +268,9 @@ func TestRecorderWritesDirectPathDiagnosticFields(t *testing.T) {
 	assertColumn(t, sendRow, sendIndexes, "retransmits", "3600")
 	assertColumn(t, sendRow, sendIndexes, "repair_requests", "12")
 	assertColumn(t, sendRow, sendIndexes, "repair_bytes", "98304")
+	assertColumn(t, sendRow, sendIndexes, "local_enobufs_retries", "7")
+	assertColumn(t, sendRow, sendIndexes, "local_enobufs_wait_us", "913")
+	assertColumn(t, sendRow, sendIndexes, "local_enobufs_max_consecutive", "3")
 	assertColumn(t, sendRow, sendIndexes, "peer_recv_queue_depth", "512")
 	assertColumn(t, sendRow, sendIndexes, "peer_recv_queue_depth_max", "1069")
 	assertColumn(t, sendRow, sendIndexes, "striped_send_blocked_ms", "250")
@@ -303,6 +312,9 @@ func TestRecorderWritesDirectPathDiagnosticFields(t *testing.T) {
 	assertColumn(t, receiveRow, receiveIndexes, "receiver_committed_mbps", "4.00")
 	assertColumn(t, receiveRow, receiveIndexes, "direct_packet_bytes", "2000000")
 	assertColumn(t, receiveRow, receiveIndexes, "direct_committed_bytes", "1250000")
+	assertColumn(t, receiveRow, receiveIndexes, "local_enobufs_retries", "")
+	assertColumn(t, receiveRow, receiveIndexes, "local_enobufs_wait_us", "")
+	assertColumn(t, receiveRow, receiveIndexes, "local_enobufs_max_consecutive", "")
 }
 
 func TestRecorderWritesQUICTransportFields(t *testing.T) {
@@ -573,6 +585,9 @@ func directPathDiagnosticHeader() []string {
 		"retransmits",
 		"repair_requests",
 		"repair_bytes",
+		"local_enobufs_retries",
+		"local_enobufs_wait_us",
+		"local_enobufs_max_consecutive",
 		"peer_recv_queue_depth",
 		"peer_recv_queue_depth_max",
 		"striped_send_blocked_ms",

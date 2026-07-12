@@ -7,6 +7,9 @@ package session
 import (
 	"math"
 	"math/big"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -14,19 +17,20 @@ const (
 	externalV2BulkPacketIPv4HeaderBytes = 20
 	externalV2BulkPacketUDPHeaderBytes  = 8
 
-	externalV2BulkPacketInitialWireMbps          = 1000
-	externalV2BulkPacketCeilingWireMbps          = 2400
-	externalV2BulkPacketMinimumWireMbps          = 128
-	externalV2BulkPacketIncreaseWireMbps         = 64
-	externalV2BulkPacketBackoffNumerator         = 85
-	externalV2BulkPacketBackoffDenominator       = 100
-	externalV2BulkPacketPaceBurstBytes           = 64 << 10
-	externalV2BulkPacketMinimumSampleWire        = 8 << 20
-	externalV2BulkPacketSoftRepairPPM      int64 = 20_000
-	externalV2BulkPacketHardRepairPPM      int64 = 80_000
-	externalV2BulkPacketHealthyPPM         int64 = 900_000
-	externalV2BulkPacketControllerCooldown       = 4
-	externalV2BulkPacketPressureWindows          = 2
+	externalV2BulkPacketInitialWireMbpsEnv           = "DERPHOLE_TEST_BULK_INITIAL_WIRE_MBPS"
+	externalV2BulkPacketDefaultInitialWireMbps       = 1000
+	externalV2BulkPacketCeilingWireMbps              = 2400
+	externalV2BulkPacketMinimumWireMbps              = 128
+	externalV2BulkPacketIncreaseWireMbps             = 64
+	externalV2BulkPacketBackoffNumerator             = 85
+	externalV2BulkPacketBackoffDenominator           = 100
+	externalV2BulkPacketPaceBurstBytes               = 64 << 10
+	externalV2BulkPacketMinimumSampleWire            = 8 << 20
+	externalV2BulkPacketSoftRepairPPM          int64 = 20_000
+	externalV2BulkPacketHardRepairPPM          int64 = 80_000
+	externalV2BulkPacketHealthyPPM             int64 = 900_000
+	externalV2BulkPacketControllerCooldown           = 4
+	externalV2BulkPacketPressureWindows              = 2
 
 	externalV2BulkPacketControllerInterval = 500 * time.Millisecond
 )
@@ -57,10 +61,20 @@ type externalV2BulkPacketController struct {
 	pressureWindows int
 }
 
-func newExternalV2BulkPacketController() *externalV2BulkPacketController {
-	return &externalV2BulkPacketController{
-		targetMbps: externalV2BulkPacketInitialWireMbps,
+func externalV2BulkPacketInitialWireMbps() int {
+	raw := strings.TrimSpace(os.Getenv(externalV2BulkPacketInitialWireMbpsEnv))
+	if raw == "" {
+		return externalV2BulkPacketDefaultInitialWireMbps
 	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < externalV2BulkPacketMinimumWireMbps || value > externalV2BulkPacketCeilingWireMbps {
+		return externalV2BulkPacketDefaultInitialWireMbps
+	}
+	return value
+}
+
+func newExternalV2BulkPacketController(initialMbps int) *externalV2BulkPacketController {
+	return &externalV2BulkPacketController{targetMbps: initialMbps}
 }
 
 func externalV2BulkPacketIPv4WireBytes(datagramBytes int) int {

@@ -9,6 +9,41 @@ import (
 	"time"
 )
 
+func TestExternalV2BulkPacketInitialWireMbpsFromEnvironment(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want int
+	}{
+		{name: "unset", raw: "", want: 1000},
+		{name: "eight hundred", raw: "800", want: 800},
+		{name: "nine hundred", raw: "900", want: 900},
+		{name: "minimum", raw: "128", want: 128},
+		{name: "ceiling", raw: "2400", want: 2400},
+		{name: "below minimum", raw: "127", want: 1000},
+		{name: "above ceiling", raw: "2401", want: 1000},
+		{name: "invalid", raw: "fast", want: 1000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(externalV2BulkPacketInitialWireMbpsEnv, tt.raw)
+			if got := externalV2BulkPacketInitialWireMbps(); got != tt.want {
+				t.Fatalf("initial wire Mbps = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExternalV2BulkPacketControllerUsesSuppliedInitialTarget(t *testing.T) {
+	for _, initial := range []int{800, 900, 1000} {
+		controller := newExternalV2BulkPacketController(initial)
+		decision := controller.Observe(externalV2BulkPacketControllerSample{At: time.Unix(240, 0)})
+		if decision.TargetMbps != initial || decision.Reason != "initial-target" {
+			t.Fatalf("initial %d decision = %#v", initial, decision)
+		}
+	}
+}
+
 func TestExternalV2BulkPacketIPv4WireBytes(t *testing.T) {
 	t.Parallel()
 
@@ -33,7 +68,7 @@ func observeExternalV2BulkPacketController(
 	peerBytes int64,
 ) externalV2BulkPacketControllerDecision {
 	t.Helper()
-	controller := newExternalV2BulkPacketController()
+	controller := newExternalV2BulkPacketController(externalV2BulkPacketDefaultInitialWireMbps)
 	start := time.Unix(200, 0)
 	controller.Observe(externalV2BulkPacketControllerSample{
 		At:           start,
@@ -55,7 +90,7 @@ type externalV2BulkPacketControllerTestSeries struct {
 }
 
 func newExternalV2BulkPacketControllerTestSeries(at time.Time) *externalV2BulkPacketControllerTestSeries {
-	controller := newExternalV2BulkPacketController()
+	controller := newExternalV2BulkPacketController(externalV2BulkPacketDefaultInitialWireMbps)
 	sample := externalV2BulkPacketControllerSample{
 		At:           at,
 		PeerProgress: true,
@@ -408,7 +443,7 @@ func TestExternalV2BulkPacketControllerFastRunOneReplayAvoidsCompoundedCollapse(
 func TestExternalV2BulkPacketControllerNeedsEnoughTrafficAndPeerProgress(t *testing.T) {
 	t.Parallel()
 
-	controller := newExternalV2BulkPacketController()
+	controller := newExternalV2BulkPacketController(externalV2BulkPacketDefaultInitialWireMbps)
 	start := time.Unix(220, 0)
 	if got := controller.Observe(externalV2BulkPacketControllerSample{At: start}); got.Reason != "initial-target" {
 		t.Fatalf("initial decision = %#v, want initial-target", got)
@@ -430,7 +465,7 @@ func TestExternalV2BulkPacketControllerNeedsEnoughTrafficAndPeerProgress(t *test
 func TestExternalV2BulkPacketControllerAccumulatesFloorRateSamples(t *testing.T) {
 	t.Parallel()
 
-	controller := newExternalV2BulkPacketController()
+	controller := newExternalV2BulkPacketController(externalV2BulkPacketDefaultInitialWireMbps)
 	controller.targetMbps = externalV2BulkPacketMinimumWireMbps
 	start := time.Unix(223, 0)
 	controller.Observe(externalV2BulkPacketControllerSample{
@@ -468,7 +503,7 @@ func TestExternalV2BulkPacketControllerAccumulatesFloorRateSamples(t *testing.T)
 func TestExternalV2BulkPacketControllerResetsAfterObservedCounterRegression(t *testing.T) {
 	t.Parallel()
 
-	controller := newExternalV2BulkPacketController()
+	controller := newExternalV2BulkPacketController(externalV2BulkPacketDefaultInitialWireMbps)
 	start := time.Unix(224, 0)
 	controller.Observe(externalV2BulkPacketControllerSample{At: start})
 
@@ -511,7 +546,7 @@ func TestExternalV2BulkPacketControllerClampsTargets(t *testing.T) {
 	t.Parallel()
 
 	start := time.Unix(225, 0)
-	ceiling := newExternalV2BulkPacketController()
+	ceiling := newExternalV2BulkPacketController(externalV2BulkPacketDefaultInitialWireMbps)
 	ceiling.targetMbps = externalV2BulkPacketCeilingWireMbps
 	ceiling.Observe(externalV2BulkPacketControllerSample{
 		At:           start,
@@ -530,7 +565,7 @@ func TestExternalV2BulkPacketControllerClampsTargets(t *testing.T) {
 		t.Fatalf("ceiling decision = %#v", gotCeiling)
 	}
 
-	floor := newExternalV2BulkPacketController()
+	floor := newExternalV2BulkPacketController(externalV2BulkPacketDefaultInitialWireMbps)
 	floor.targetMbps = externalV2BulkPacketMinimumWireMbps
 	floor.Observe(externalV2BulkPacketControllerSample{At: start, PeerProgress: true})
 	firstFloor := floor.Observe(externalV2BulkPacketControllerSample{

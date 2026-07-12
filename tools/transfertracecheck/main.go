@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"time"
 
@@ -42,9 +43,9 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 		return 1
 	}
 
-	result, err := checkPath(opts)
+	result, senderACKSummary, err := checkPayloadPaths(opts)
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "transfertracecheck: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "transfertracecheck: %v max_flatline=%s\n", err, result.MaxFlatline)
 		return 1
 	}
 
@@ -59,7 +60,7 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 	}
 
 	diagnosticSummary := formatDiagnosticsSummary(result.Diagnostics)
-	_, _ = fmt.Fprintf(stdout, "trace-ok rows=%d final_app_bytes=%d max_flatline=%s%s%s\n", result.Rows, result.FinalAppBytes, result.MaxFlatline, pairSummary, diagnosticSummary)
+	_, _ = fmt.Fprintf(stdout, "trace-ok rows=%d final_app_bytes=%d max_flatline=%s%s%s%s\n", result.Rows, result.FinalAppBytes, result.MaxFlatline, pairSummary, senderACKSummary, diagnosticSummary)
 	return 0
 }
 
@@ -70,9 +71,6 @@ func formatDiagnosticsSummary(diagnostics transfertrace.DiagnosticsSummary) stri
 	}
 	if diagnostics.MaxReplayBytes > 0 {
 		summary += fmt.Sprintf(" max_replay_bytes=%d", diagnostics.MaxReplayBytes)
-	}
-	if diagnostics.MaxRetransmits > 0 {
-		summary += fmt.Sprintf(" max_retransmits=%d", diagnostics.MaxRetransmits)
 	}
 	if diagnostics.MaxPeerRecvQueueDepth > 0 {
 		summary += fmt.Sprintf(" max_peer_recv_queue_depth=%d", diagnostics.MaxPeerRecvQueueDepth)
@@ -92,7 +90,38 @@ func formatDiagnosticsSummary(diagnostics transfertrace.DiagnosticsSummary) stri
 	if diagnostics.ReceiverCommittedMbpsObserved {
 		summary += fmt.Sprintf(" receiver_committed_mbps_min=%.2f receiver_committed_mbps_max=%.2f", diagnostics.ReceiverCommittedMbpsMin, diagnostics.ReceiverCommittedMbpsMax)
 	}
+	summary += formatSenderHealthSummary(diagnostics)
+	summary += formatReceiverRateSummary(diagnostics)
 	return summary
+}
+
+func formatSenderHealthSummary(diagnostics transfertrace.DiagnosticsSummary) string {
+	if diagnostics.SenderHealthObserved {
+		return fmt.Sprintf(" min_rate_target_mbps=%d final_rate_target_mbps=%d controller_decreases=%d final_repair_bytes=%d max_retransmits=%d local_enobufs_retries=%d local_enobufs_wait_us=%d local_enobufs_max_consecutive=%d",
+			diagnostics.MinRateTargetMbps,
+			diagnostics.FinalRateTargetMbps,
+			diagnostics.ControllerDecreases,
+			diagnostics.FinalRepairBytes,
+			diagnostics.MaxRetransmits,
+			diagnostics.LocalENOBUFSRetries,
+			diagnostics.LocalENOBUFSWaitUS,
+			diagnostics.LocalENOBUFSMaxConsecutive,
+		)
+	}
+	return ""
+}
+
+func formatReceiverRateSummary(diagnostics transfertrace.DiagnosticsSummary) string {
+	if diagnostics.ReceiverRateObserved {
+		return fmt.Sprintf(" receiver_rate_p10_mbps=%.2f receiver_rate_p50_mbps=%.2f receiver_rate_p90_mbps=%.2f receiver_rate_cv=%.3f receiver_windows_below_500_mbps=%d",
+			diagnostics.ReceiverRateP10Mbps,
+			diagnostics.ReceiverRateP50Mbps,
+			diagnostics.ReceiverRateP90Mbps,
+			diagnostics.ReceiverRateCV,
+			diagnostics.ReceiverWindowsBelow500Mbps,
+		)
+	}
+	return ""
 }
 
 func parseOptions(args []string, stderr io.Writer) (options, error) {
@@ -164,21 +193,44 @@ func flagProvided(flags *flag.FlagSet, name string) bool {
 	return provided
 }
 
-func checkPath(opts options) (transfertrace.Result, error) {
-	f, err := os.Open(opts.Path)
+func checkPayloadPaths(opts options) (transfertrace.Result, string, error) {
+	checkOpts := transfertrace.Options{
+		Role:             transfertrace.Role(opts.Role),
+		ExpectedBytes:    opts.ExpectedBytes,
+		ExpectedBytesSet: opts.ExpectedBytesSet,
+		StallWindow:      opts.StallWindow,
+	}
+	pairedSender := opts.Role == string(transfertrace.RoleSend) && opts.PeerTrace != ""
+	if pairedSender {
+		checkOpts.StallWindow = time.Duration(math.MaxInt64)
+	}
+	result, err := checkTracePath(opts.Path, checkOpts)
+	if err != nil || !pairedSender {
+		return result, "", err
+	}
+
+	peerResult, err := checkTracePath(opts.PeerTrace, transfertrace.Options{
+		Role:        transfertrace.RoleReceive,
+		StallWindow: opts.StallWindow,
+	})
 	if err != nil {
-		return transfertrace.Result{}, fmt.Errorf("open %s: %w", opts.Path, err)
+		return peerResult, "", err
+	}
+	senderACKSummary := fmt.Sprintf(" sender_ack_max_flatline=%s", result.MaxFlatline)
+	result.MaxFlatline = peerResult.MaxFlatline
+	return result, senderACKSummary, nil
+}
+
+func checkTracePath(path string, opts transfertrace.Options) (transfertrace.Result, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return transfertrace.Result{}, fmt.Errorf("open %s: %w", path, err)
 	}
 	defer func() {
 		_ = f.Close()
 	}()
 
-	return transfertrace.Check(f, transfertrace.Options{
-		Role:             transfertrace.Role(opts.Role),
-		ExpectedBytes:    opts.ExpectedBytes,
-		ExpectedBytesSet: opts.ExpectedBytesSet,
-		StallWindow:      opts.StallWindow,
-	})
+	return transfertrace.Check(f, opts)
 }
 
 func checkPairPaths(opts options) (transfertrace.PairResult, error) {

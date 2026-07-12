@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 	"strconv"
 	"time"
 )
@@ -31,6 +32,13 @@ type Result struct {
 
 type DiagnosticsSummary struct {
 	MaxRateTargetMbps              int
+	MinRateTargetMbps              int
+	FinalRateTargetMbps            int
+	ControllerDecreases            int
+	FinalRepairBytes               int64
+	LocalENOBUFSRetries            int64
+	LocalENOBUFSWaitUS             int64
+	LocalENOBUFSMaxConsecutive     int64
 	MaxReplayBytes                 uint64
 	MaxRetransmits                 int64
 	MaxPeerRecvQueueDepth          int
@@ -41,6 +49,13 @@ type DiagnosticsSummary struct {
 	ReceiverCommittedMbpsMin       float64
 	ReceiverCommittedMbpsMax       float64
 	ReceiverCommittedMbpsObserved  bool
+	ReceiverRateP10Mbps            float64
+	ReceiverRateP50Mbps            float64
+	ReceiverRateP90Mbps            float64
+	ReceiverRateCV                 float64
+	ReceiverWindowsBelow500Mbps    int
+	ReceiverRateObserved           bool
+	SenderHealthObserved           bool
 }
 
 type PairOptions struct {
@@ -68,37 +83,48 @@ type checkerIndexes struct {
 	phase              int
 	elapsedMS          int
 	appBytes           int
+	appMbps            int
 	peerReceivedBytes  int
 	transferElapsedMS  int
 	directValidated    int
 	fallbackReason     int
 	lastState          int
 	lastError          int
+	controllerDecision int
 	directTransport    int
+	senderHealthSchema bool
 	numericDiagnostics []checkerNumericDiagnostic
 }
 
 type checkerRow struct {
-	rowNo             int
-	timestamp         time.Time
-	elapsedMS         int64
-	phase             Phase
-	appBytes          int64
-	peerReceivedBytes int64
-	transferElapsedMS int64
-	directValidated   bool
-	fallbackReason    string
-	lastState         string
-	lastError         string
-	diagnostics       checkerRowDiagnostics
+	rowNo              int
+	role               Role
+	timestamp          time.Time
+	elapsedMS          int64
+	phase              Phase
+	appBytes           int64
+	peerReceivedBytes  int64
+	transferElapsedMS  int64
+	directValidated    bool
+	fallbackReason     string
+	lastState          string
+	lastError          string
+	controllerDecision string
+	diagnostics        checkerRowDiagnostics
 }
 
 type checkerRowDiagnostics struct {
 	rateTargetMbps                 int
+	appMbps                        float64
+	appMbpsObserved                bool
 	receiverCommittedMbps          float64
 	receiverCommittedMbpsObserved  bool
 	replayBytes                    uint64
 	retransmits                    int64
+	repairBytes                    int64
+	localENOBUFSRetries            int64
+	localENOBUFSWaitUS             int64
+	localENOBUFSMaxConsecutive     int64
 	peerRecvQueueDepth             int
 	peerRecvQueueDepthMax          int
 	stripedSendBlockedMS           int64
@@ -122,6 +148,18 @@ var checkerRowDiagnosticRecorders = map[string]func(*checkerRowDiagnostics, chec
 	},
 	"retransmits": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
 		d.retransmits = value.int64Value
+	},
+	"repair_bytes": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.repairBytes = value.int64Value
+	},
+	"local_enobufs_retries": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.localENOBUFSRetries = value.int64Value
+	},
+	"local_enobufs_wait_us": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.localENOBUFSWaitUS = value.int64Value
+	},
+	"local_enobufs_max_consecutive": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.localENOBUFSMaxConsecutive = value.int64Value
 	},
 	"peer_recv_queue_depth": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
 		d.peerRecvQueueDepth = value.intValue
@@ -189,6 +227,9 @@ var checkerNumericDiagnosticColumns = []checkerNumericDiagnosticColumn{
 	{name: "retransmits", kind: checkerNumericDiagnosticInt64},
 	{name: "repair_requests", kind: checkerNumericDiagnosticInt64},
 	{name: "repair_bytes", kind: checkerNumericDiagnosticInt64},
+	{name: "local_enobufs_retries", kind: checkerNumericDiagnosticInt64},
+	{name: "local_enobufs_wait_us", kind: checkerNumericDiagnosticInt64},
+	{name: "local_enobufs_max_consecutive", kind: checkerNumericDiagnosticInt64},
 	{name: "peer_recv_queue_depth", kind: checkerNumericDiagnosticInt},
 	{name: "peer_recv_queue_depth_max", kind: checkerNumericDiagnosticInt},
 	{name: "striped_send_blocked_ms", kind: checkerNumericDiagnosticInt64},
@@ -207,12 +248,14 @@ var checkerNumericDiagnosticColumns = []checkerNumericDiagnosticColumn{
 }
 
 type checker struct {
-	opts         Options
-	result       Result
-	lastAppBytes int64
-	active       bool
-	activeSince  time.Time
-	lastPhase    Phase
+	opts               Options
+	result             Result
+	lastAppBytes       int64
+	lastRateTargetMbps int
+	receiverRates      []float64
+	active             bool
+	activeSince        time.Time
+	lastPhase          Phase
 }
 
 func Check(r io.Reader, opts Options) (Result, error) {
@@ -276,6 +319,9 @@ func (c *checker) scanRows(cr *csv.Reader, indexes checkerIndexes) error {
 		if c.opts.Role != "" && role != c.opts.Role {
 			continue
 		}
+		if role == RoleSend && indexes.senderHealthSchema {
+			c.result.Diagnostics.SenderHealthObserved = true
+		}
 		row, err := parseCheckerRow(record, indexes, rowNo)
 		if err != nil {
 			return err
@@ -336,6 +382,33 @@ func (c *checker) recordDiagnostics(row checkerRow) {
 		diagnostics.DirectTransport = rowDiagnostics.directTransport
 	}
 	recordReceiverCommittedMbps(diagnostics, rowDiagnostics)
+	if row.role == RoleSend {
+		c.recordSenderHealth(row)
+	}
+	if row.role == RoleReceive && row.phase == PhaseDirectExecute && row.appBytes > 0 && rowDiagnostics.appMbpsObserved {
+		c.receiverRates = append(c.receiverRates, rowDiagnostics.appMbps)
+	}
+}
+
+func (c *checker) recordSenderHealth(row checkerRow) {
+	diagnostics := &c.result.Diagnostics
+	target := row.diagnostics.rateTargetMbps
+	if target > 0 {
+		if diagnostics.MinRateTargetMbps == 0 || target < diagnostics.MinRateTargetMbps {
+			diagnostics.MinRateTargetMbps = target
+		}
+		diagnostics.FinalRateTargetMbps = target
+		if target != c.lastRateTargetMbps {
+			if row.controllerDecision == "decrease" && c.lastRateTargetMbps > target {
+				diagnostics.ControllerDecreases++
+			}
+			c.lastRateTargetMbps = target
+		}
+	}
+	diagnostics.FinalRepairBytes = maxInt64(diagnostics.FinalRepairBytes, row.diagnostics.repairBytes)
+	diagnostics.LocalENOBUFSRetries = maxInt64(diagnostics.LocalENOBUFSRetries, row.diagnostics.localENOBUFSRetries)
+	diagnostics.LocalENOBUFSWaitUS = maxInt64(diagnostics.LocalENOBUFSWaitUS, row.diagnostics.localENOBUFSWaitUS)
+	diagnostics.LocalENOBUFSMaxConsecutive = maxInt64(diagnostics.LocalENOBUFSMaxConsecutive, row.diagnostics.localENOBUFSMaxConsecutive)
 }
 
 func recordReceiverCommittedMbps(diagnostics *DiagnosticsSummary, row checkerRowDiagnostics) {
@@ -428,7 +501,60 @@ func (c *checker) finish() (Result, error) {
 	if c.result.FinalPhase != PhaseComplete {
 		return c.result, fmt.Errorf("final phase = %s, want %s", c.result.FinalPhase, PhaseComplete)
 	}
+	c.recordReceiverRateSummary()
 	return c.result, nil
+}
+
+func (c *checker) recordReceiverRateSummary() {
+	if len(c.receiverRates) == 0 {
+		return
+	}
+	diagnostics := &c.result.Diagnostics
+	diagnostics.ReceiverRateP10Mbps = checkerPercentile(c.receiverRates, 0.10)
+	diagnostics.ReceiverRateP50Mbps = checkerPercentile(c.receiverRates, 0.50)
+	diagnostics.ReceiverRateP90Mbps = checkerPercentile(c.receiverRates, 0.90)
+	diagnostics.ReceiverRateCV = checkerCoefficientOfVariation(c.receiverRates)
+	for _, rate := range c.receiverRates {
+		if rate < 500 {
+			diagnostics.ReceiverWindowsBelow500Mbps++
+		}
+	}
+	diagnostics.ReceiverRateObserved = true
+}
+
+func checkerPercentile(values []float64, percentile float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	slices.Sort(values)
+	position := float64(len(values)-1) * percentile
+	lower := int(math.Floor(position))
+	upper := int(math.Ceil(position))
+	if lower == upper {
+		return values[lower]
+	}
+	weight := position - float64(lower)
+	return values[lower]*(1-weight) + values[upper]*weight
+}
+
+func checkerCoefficientOfVariation(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	mean := 0.0
+	for _, value := range values {
+		mean += value
+	}
+	mean /= float64(len(values))
+	if mean == 0 {
+		return 0
+	}
+	variance := 0.0
+	for _, value := range values {
+		delta := value - mean
+		variance += delta * delta
+	}
+	return math.Sqrt(variance/float64(len(values))) / mean
 }
 
 func readCheckerRows(r io.Reader, role Role) ([]checkerRow, error) {
@@ -694,15 +820,35 @@ func checkerHeaderIndexes(header []string) (checkerIndexes, error) {
 		phase:              phase,
 		elapsedMS:          optional("elapsed_ms"),
 		appBytes:           appBytes,
+		appMbps:            optional("app_mbps"),
 		peerReceivedBytes:  optional("peer_received_bytes"),
 		transferElapsedMS:  optional("transfer_elapsed_ms"),
 		directValidated:    optional("direct_validated"),
 		fallbackReason:     optional("fallback_reason"),
 		lastState:          optional("last_state"),
 		lastError:          lastError,
+		controllerDecision: optional("controller_decision"),
 		directTransport:    optional("direct_transport"),
+		senderHealthSchema: checkerSenderHealthSchema(positions),
 		numericDiagnostics: checkerNumericDiagnostics(positions),
 	}, nil
+}
+
+func checkerSenderHealthSchema(positions map[string]int) bool {
+	for _, name := range []string{
+		"rate_target_mbps",
+		"controller_decision",
+		"retransmits",
+		"repair_bytes",
+		"local_enobufs_retries",
+		"local_enobufs_wait_us",
+		"local_enobufs_max_consecutive",
+	} {
+		if _, ok := positions[name]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func checkerNumericDiagnostics(positions map[string]int) []checkerNumericDiagnostic {
@@ -752,6 +898,8 @@ func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int) (checke
 	if err != nil {
 		return checkerRow{}, err
 	}
+	role := Role(field(record, indexes.role))
+	phase := Phase(field(record, indexes.phase))
 	peerReceivedBytes, err := parseOptionalIntField(record, indexes.peerReceivedBytes, "peer_received_bytes", rowNo)
 	if err != nil {
 		return checkerRow{}, err
@@ -764,27 +912,44 @@ func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int) (checke
 	if err != nil {
 		return checkerRow{}, err
 	}
-	diagnostics, err := parseCheckerRowDiagnostics(record, indexes, rowNo)
+	diagnostics, err := parseCheckerRowDiagnostics(record, indexes, rowNo, role, phase)
 	if err != nil {
 		return checkerRow{}, err
 	}
 	return checkerRow{
-		rowNo:             rowNo,
-		timestamp:         time.UnixMilli(timestampMS),
-		elapsedMS:         elapsedMS,
-		phase:             Phase(field(record, indexes.phase)),
-		appBytes:          appBytes,
-		peerReceivedBytes: peerReceivedBytes,
-		transferElapsedMS: transferElapsedMS,
-		directValidated:   directValidated,
-		fallbackReason:    field(record, indexes.fallbackReason),
-		lastState:         field(record, indexes.lastState),
-		lastError:         field(record, indexes.lastError),
-		diagnostics:       diagnostics,
+		rowNo:              rowNo,
+		role:               role,
+		timestamp:          time.UnixMilli(timestampMS),
+		elapsedMS:          elapsedMS,
+		phase:              phase,
+		appBytes:           appBytes,
+		peerReceivedBytes:  peerReceivedBytes,
+		transferElapsedMS:  transferElapsedMS,
+		directValidated:    directValidated,
+		fallbackReason:     field(record, indexes.fallbackReason),
+		lastState:          field(record, indexes.lastState),
+		lastError:          field(record, indexes.lastError),
+		controllerDecision: field(record, indexes.controllerDecision),
+		diagnostics:        diagnostics,
 	}, nil
 }
 
-func parseCheckerRowDiagnostics(record []string, indexes checkerIndexes, rowNo int) (checkerRowDiagnostics, error) {
+func parseReceiverAppMbps(record []string, indexes checkerIndexes, rowNo int, role Role, phase Phase) (float64, bool, error) {
+	if role != RoleReceive || phase != PhaseDirectExecute {
+		return 0, false, nil
+	}
+	value := field(record, indexes.appMbps)
+	if value == "" {
+		return 0, false, nil
+	}
+	appMbps, err := parseCheckerDiagnosticFloat(value)
+	if err != nil {
+		return 0, false, formatCheckerNumericDiagnosticError(err, rowNo, "app_mbps", value)
+	}
+	return appMbps, true, nil
+}
+
+func parseCheckerRowDiagnostics(record []string, indexes checkerIndexes, rowNo int, role Role, phase Phase) (checkerRowDiagnostics, error) {
 	var diagnostics checkerRowDiagnostics
 	for _, column := range indexes.numericDiagnostics {
 		value, observed, err := parseCheckerNumericDiagnostic(record, column, rowNo)
@@ -795,6 +960,12 @@ func parseCheckerRowDiagnostics(record []string, indexes checkerIndexes, rowNo i
 			diagnostics.record(column.name, value)
 		}
 	}
+	appMbps, appMbpsObserved, err := parseReceiverAppMbps(record, indexes, rowNo, role, phase)
+	if err != nil {
+		return checkerRowDiagnostics{}, err
+	}
+	diagnostics.appMbps = appMbps
+	diagnostics.appMbpsObserved = appMbpsObserved
 	diagnostics.directTransport = field(record, indexes.directTransport)
 	return diagnostics, nil
 }
@@ -848,6 +1019,9 @@ func isOptionalTrailingDiagnosticColumn(name string) bool {
 		"retransmits",
 		"repair_requests",
 		"repair_bytes",
+		"local_enobufs_retries",
+		"local_enobufs_wait_us",
+		"local_enobufs_max_consecutive",
 		"peer_recv_queue_depth",
 		"peer_recv_queue_depth_max",
 		"striped_send_blocked_ms",

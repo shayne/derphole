@@ -376,12 +376,15 @@ func TestExternalTransferMetricsRecordsControllerBeforeCompletion(t *testing.T) 
 		ControllerReason:   "initial-target",
 	}, start.Add(100*time.Millisecond))
 	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
-		RateTargetMbps:     850,
-		ControllerDecision: "decrease",
-		ControllerReason:   "repair-pressure",
-		Retransmits:        12,
-		RepairRequests:     3,
-		RepairBytes:        16_296,
+		RateTargetMbps:             850,
+		ControllerDecision:         "decrease",
+		ControllerReason:           "repair-pressure",
+		Retransmits:                12,
+		RepairRequests:             3,
+		RepairBytes:                16_296,
+		LocalENOBUFSRetries:        7,
+		LocalENOBUFSWaitUS:         913,
+		LocalENOBUFSMaxConsecutive: 3,
 	}, start.Add(600*time.Millisecond))
 	if err := rec.Close(); err != nil {
 		t.Fatal(err)
@@ -404,6 +407,11 @@ func TestExternalTransferMetricsRecordsControllerBeforeCompletion(t *testing.T) 
 		rows[1]["repair_bytes"] != "16296" {
 		t.Fatalf("decrease controller row = %#v", rows[1])
 	}
+	if rows[1]["local_enobufs_retries"] != "7" ||
+		rows[1]["local_enobufs_wait_us"] != "913" ||
+		rows[1]["local_enobufs_max_consecutive"] != "3" {
+		t.Fatalf("local ENOBUFS trace columns = %#v", rows[1])
+	}
 }
 
 func TestExternalTransferMetricsDirectCountersNeverRegress(t *testing.T) {
@@ -411,14 +419,20 @@ func TestExternalTransferMetricsDirectCountersNeverRegress(t *testing.T) {
 
 	metrics := newExternalTransferMetrics(time.Unix(120, 0))
 	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
-		Retransmits:    12,
-		RepairRequests: 3,
-		RepairBytes:    16_296,
+		Retransmits:                12,
+		RepairRequests:             3,
+		RepairBytes:                16_296,
+		LocalENOBUFSRetries:        7,
+		LocalENOBUFSWaitUS:         913,
+		LocalENOBUFSMaxConsecutive: 3,
 	}, time.Unix(120, 1))
 	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
-		Retransmits:    4,
-		RepairRequests: 1,
-		RepairBytes:    5432,
+		Retransmits:                4,
+		RepairRequests:             1,
+		RepairBytes:                5432,
+		LocalENOBUFSRetries:        2,
+		LocalENOBUFSWaitUS:         100,
+		LocalENOBUFSMaxConsecutive: 1,
 	}, time.Unix(120, 2))
 	metrics.SetDirectStatsWithoutByteProgress(externalDirectTransferStats{
 		Retransmits: 4,
@@ -433,11 +447,17 @@ func TestExternalTransferMetricsDirectCountersNeverRegress(t *testing.T) {
 	defer metrics.mu.Unlock()
 	if metrics.retransmitCount != 12 ||
 		metrics.repairRequests != 3 ||
-		metrics.repairBytes != 16_296 {
-		t.Fatalf("counters regressed: retransmits=%d requests=%d bytes=%d",
+		metrics.repairBytes != 16_296 ||
+		metrics.localENOBUFSRetries != 7 ||
+		metrics.localENOBUFSWaitUS != 913 ||
+		metrics.localENOBUFSMaxConsecutive != 3 {
+		t.Fatalf("counters regressed: retransmits=%d requests=%d bytes=%d local_enobufs=%d/%d/%d",
 			metrics.retransmitCount,
 			metrics.repairRequests,
 			metrics.repairBytes,
+			metrics.localENOBUFSRetries,
+			metrics.localENOBUFSWaitUS,
+			metrics.localENOBUFSMaxConsecutive,
 		)
 	}
 }

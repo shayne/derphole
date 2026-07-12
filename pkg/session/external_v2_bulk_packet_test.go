@@ -189,6 +189,83 @@ func TestExternalV2BulkPacketSendPacketRetriesTransientNoBufferSpace(t *testing.
 	}
 }
 
+func TestExternalV2BulkPacketSendPacketCountsLocalENOBUFSPressure(t *testing.T) {
+	senders, receivers := listenExternalV2BulkPacketTestConns(t, 1)
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &transientWriteFailureBulkPacketConn{PacketConn: senders[0]}
+	conn.remaining.Store(3)
+	sender := newExternalV2BulkPacketSender(
+		context.Background(),
+		&BlockSource{Payload: bytes.NewReader([]byte{0x5a}), PayloadSize: 1},
+		externalV2BulkPacketPath{
+			Conns: []net.PacketConn{conn},
+			Addrs: externalV2BulkPacketTestAddrs(receivers),
+		},
+		auth,
+		nil,
+	)
+	sender.pacer = rate.NewLimiter(0, externalV2BulkPacketPaceBurstBytes)
+
+	if err := sender.sendPacket(0, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := sender.localENOBUFSRetries.Load(); got != 3 {
+		t.Fatalf("local ENOBUFS retries = %d, want 3", got)
+	}
+	if got := sender.localENOBUFSMaxConsecutive.Load(); got != 3 {
+		t.Fatalf("max consecutive local ENOBUFS = %d, want 3", got)
+	}
+	if got := sender.localENOBUFSWaitNanos.Load(); got <= 0 {
+		t.Fatalf("local ENOBUFS wait nanos = %d, want positive", got)
+	}
+}
+
+func TestExternalV2BulkPacketCancellationPublishesENOBUFSEvent(t *testing.T) {
+	senders, receivers := listenExternalV2BulkPacketTestConns(t, 1)
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &transientWriteFailureBulkPacketConn{
+		PacketConn: senders[0],
+		attempted:  make(chan struct{}),
+	}
+	conn.remaining.Store(3)
+	ctx, cancel := context.WithCancel(context.Background())
+	sender := newExternalV2BulkPacketSender(
+		ctx,
+		&BlockSource{Payload: bytes.NewReader([]byte{0x5a}), PayloadSize: 1},
+		externalV2BulkPacketPath{
+			Conns: []net.PacketConn{conn},
+			Addrs: externalV2BulkPacketTestAddrs(receivers),
+		},
+		auth,
+		nil,
+	)
+	sender.pacer = rate.NewLimiter(0, externalV2BulkPacketPaceBurstBytes)
+	errCh := make(chan error, 1)
+	go func() { errCh <- sender.sendPacket(0, 0, false) }()
+	<-conn.attempted
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("sendPacket() error = %v, want context canceled", err)
+	}
+	if got := sender.localENOBUFSRetries.Load(); got != 1 {
+		t.Fatalf("local ENOBUFS retries = %d, want 1", got)
+	}
+}
+
 func TestExternalV2BulkPacketSendPacketStopsNoBufferSpaceRetriesOnCancellation(t *testing.T) {
 	senders, receivers := listenExternalV2BulkPacketTestConns(t, 1)
 	payload := bytes.Repeat([]byte{0x5a}, externalV2BulkPacketPayloadSize)
@@ -520,6 +597,7 @@ func TestExternalV2BulkPacketSendStatsUseExactRepairCounters(t *testing.T) {
 		2,
 		1,
 		1000,
+		1000,
 		true,
 	)
 	if stats.Retransmits != 1 {
@@ -551,6 +629,7 @@ func TestExternalV2BulkPacketSendStatsPreservePartialProgressOnError(t *testing.
 		512,
 		2,
 		1,
+		1000,
 		850,
 		false,
 	)
@@ -578,10 +657,11 @@ func TestExternalV2BulkPacketSenderPublishesControllerBeforeCompletion(t *testin
 	metrics := newExternalTransferMetricsWithTrace(start, rec, transfertrace.RoleSend)
 	metrics.SetPhase(transfertrace.PhaseDirectExecute, string(StateDirect))
 	sender := &externalV2BulkPacketSender{
-		metrics:    metrics,
-		laneCount:  8,
-		pacer:      rate.NewLimiter(externalV2BulkPacketRateLimit(1000), externalV2BulkPacketPaceBurstBytes),
-		controller: newExternalV2BulkPacketController(),
+		metrics:         metrics,
+		initialPaceMbps: 1000,
+		laneCount:       8,
+		pacer:           rate.NewLimiter(externalV2BulkPacketRateLimit(1000), externalV2BulkPacketPaceBurstBytes),
+		controller:      newExternalV2BulkPacketController(externalV2BulkPacketDefaultInitialWireMbps),
 	}
 	sender.currentPaceMbps.Store(1000)
 	sender.publishControllerDiagnostics(start, externalV2BulkPacketControllerDecision{
@@ -592,6 +672,9 @@ func TestExternalV2BulkPacketSenderPublishesControllerBeforeCompletion(t *testin
 	sender.repairPackets.Store(12)
 	sender.repairPayloadBytes.Store(16_296)
 	sender.repairRequests.Store(3)
+	sender.localENOBUFSRetries.Store(7)
+	sender.localENOBUFSWaitNanos.Store(int64(912*time.Microsecond + 1))
+	sender.localENOBUFSMaxConsecutive.Store(3)
 	sender.publishControllerDiagnostics(start.Add(600*time.Millisecond), externalV2BulkPacketControllerDecision{
 		TargetMbps: 850,
 		Action:     "decrease",
@@ -607,8 +690,51 @@ func TestExternalV2BulkPacketSenderPublishesControllerBeforeCompletion(t *testin
 		rows[1]["rate_target_mbps"] != "850" ||
 		rows[1]["controller_decision"] != "decrease" ||
 		rows[1]["retransmits"] != "12" ||
-		rows[1]["repair_bytes"] != "16296" {
+		rows[1]["repair_bytes"] != "16296" ||
+		rows[1]["local_enobufs_retries"] != "7" ||
+		rows[1]["local_enobufs_wait_us"] != "913" ||
+		rows[1]["local_enobufs_max_consecutive"] != "3" {
 		t.Fatalf("controller rows = %#v", rows)
+	}
+}
+
+func TestExternalV2BulkPacketSenderUsesEnvironmentInitialRate(t *testing.T) {
+	t.Setenv(externalV2BulkPacketInitialWireMbpsEnv, "800")
+	start := time.Unix(232, 0)
+	var out bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(start, rec, transfertrace.RoleSend)
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, string(StateDirect))
+	sender := newExternalV2BulkPacketSender(
+		context.Background(),
+		&BlockSource{PayloadSize: 4096},
+		externalV2BulkPacketPath{},
+		externalV2BulkPacketAuth{},
+		metrics,
+	)
+
+	// The test override is sampled once per sender. Later environment changes
+	// must not make periodic and terminal diagnostics disagree.
+	t.Setenv(externalV2BulkPacketInitialWireMbpsEnv, "900")
+	sender.observeController(start)
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := readTransferTraceRows(t, out.String())
+	if len(rows) != 1 ||
+		rows[0]["rate_target_mbps"] != "800" ||
+		rows[0]["rate_selected_mbps"] != "800" {
+		t.Fatalf("initial controller rows = %#v", rows)
+	}
+	stats := sender.stats(false)
+	if sender.initialPaceMbps != 800 ||
+		stats.Diagnostics.RateTargetMbps != 800 ||
+		stats.Diagnostics.RateSelectedMbps != 800 {
+		t.Fatalf("initial sender rate = %d, terminal diagnostics = %#v", sender.initialPaceMbps, stats.Diagnostics)
 	}
 }
 

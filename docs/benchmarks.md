@@ -63,7 +63,7 @@ The harness sets `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1` for derphole run
 
 Normal public-path runs use the file workload and leave `DERPHOLE_BENCH_PARALLEL` unset. For an explicit stream diagnostic, set both controls, for example `DERPHOLE_BENCH_WORKLOAD=stream DERPHOLE_BENCH_PARALLEL=auto ./scripts/public-path-performance-harness.sh`.
 
-The primary pass condition is eric-nuc Mac -> remote derphole average within 10-15 percent of same-run `iperf3`, with zero steady direct-phase `transfertracecheck` stalls over 1s. The other hosts must not regress against the July 2 baseline matrix.
+The July 2 baseline expected eric-nuc Mac -> remote derphole average within 10-15 percent of same-run `iperf3`, with zero steady direct-phase `transfertracecheck` stalls over 1s. Keep that result as historical context. Use the bulk-pacing decision gate below when selecting an initial rate; the old average is not the selection rule.
 
 ### Throughput clocks
 
@@ -92,6 +92,118 @@ The controller also uses the exact guard reasons `initial-target`, `counter-rese
 Use the cumulative `retransmits`, `repair_requests`, and `repair_bytes` counters with the target and reason. Do not infer a decision from the final trace row alone; controller state must be present in non-terminal rows.
 
 Verbose `v2-raw-direct-socket-buffer` lines report the 8 MiB request and, for each opened lane, the raw receive and write values returned by `getsockopt(SO_RCVBUF)` and `getsockopt(SO_SNDBUF)`. The line also reports whether either set operation or the inspection failed. Linux may report a doubled kernel accounting value; preserve the returned number when comparing hosts.
+
+### Eric bulk-pacing experiment
+
+Run the tuning matrix against Eric separately from the fleet gate:
+
+```bash
+DERPHOLE_PUBLIC_PATH_HOSTS='ubuntu@eric-nuc' \
+DERPHOLE_PUBLIC_PATH_SIZE_MIB=3072 \
+DERPHOLE_PUBLIC_PATH_INITIAL_RATES='1000 900 800 800 1000 900 900 800 1000' \
+DERPHOLE_PUBLIC_IPERF_PORT=8123 \
+DERPHOLE_BENCH_LOG_DIR=.tmp/bulk-pacing-ab-20260712 \
+./scripts/public-path-performance-harness.sh
+```
+
+The order rotates all three rates through early, middle, and late path conditions. Each derphole row in `summary.csv` is paired with its same-run iperf sample. The useful columns are:
+
+- `mbps`: canonical goodput, calculated from verified payload bytes and the receiver-anchored `benchmark-transfer-elapsed-ms` clock.
+- `ratio_to_iperf`: canonical goodput divided by the same run's iperf result.
+- `repair_bytes`: the trace checker's `final_repair_bytes`, copied into `summary.csv` under the shorter name. It is the final cumulative repair payload-byte count.
+- `repair_ratio`: `repair_bytes` divided by `benchmark-size-bytes`.
+- `retransmits`: the trace checker's `max_retransmits`, copied into `summary.csv` under the shorter name. It is the maximum cumulative retransmit count observed in the sender trace.
+- `min_rate_target_mbps`: the lowest non-zero pacing target observed in the sender trace.
+- `final_rate_target_mbps`: the last non-zero pacing target observed in the sender trace.
+- `controller_decreases`: the number of distinct downward pacing-target transitions made by the controller.
+- `receiver_rate_p10_mbps`, `receiver_rate_p50_mbps`, and `receiver_rate_p90_mbps`: the p10, median, and p90 of the receiver's direct-execute rate samples after payload progress begins. Zero-throughput windows after progress are included; setup windows before the first payload byte are excluded.
+- `receiver_rate_cv`: the coefficient of variation across those post-progress receiver direct-execute rate samples, including zero-throughput windows.
+- `receiver_windows_below_500_mbps`: the number of post-progress receiver direct-execute samples below 500 Mbps, including zero-throughput windows.
+- `local_enobufs_retries`: cumulative UDP writes retried after the local kernel returned `ENOBUFS`.
+- `local_enobufs_wait_us`: cumulative microseconds spent in those retry waits.
+- `local_enobufs_max_consecutive`: the largest consecutive `ENOBUFS` run before a write succeeded or the transfer stopped.
+
+For the wait ratio, the CSV `transfer_elapsed_ms` column is the `benchmark-transfer-elapsed-ms` footer value. `local_enobufs_wait_us / 1000 / benchmark-transfer-elapsed-ms >= 0.01` means local buffer waiting consumed at least one percent of transfer time.
+
+This command defines the experiment; it does not claim the live matrix has run or that a candidate has won.
+
+The July 12 fleet disproof rejected the 900 Mbps Eric candidate: on the completed `derphole-testing` forward bulk cell, its median ratio to same-run iperf regressed 7.278 percent. The fleet-safe production selection therefore remains 1,000 Mbps.
+
+The reverse cell then negotiated `blocks-v1` because the Mac receiver advertised 16 non-Tailscale policy candidates. That is intentional adaptive policy, not removable legacy. Receivers with five or more non-Tailscale policy candidates retain QUIC because it measured faster on high-capacity paths, and QUIC remains the compatibility fallback for peers without bulk-packet capability. Bulk-rate A/B rules apply only when the host-direction negotiates `bulk-packets-v1`; `blocks-v1` never runs the bulk controller or exercises `DERPHOLE_TEST_BULK_INITIAL_WIRE_MBPS`, so judge it only from unoverridden QUIC evidence.
+
+### Reachable-fleet bidirectional gate
+
+Run this only after the Eric matrix selects a candidate `C` other than 1,000 Mbps. Put every reachable canonical host in `.tmp/bulk-pacing-fleet-20260712/reachable-hosts.txt`, one SSH target per line, and run a 1 GiB normal file in both directions. The candidate-versus-control order is `1000 C C 1000`:
+
+```bash
+candidate="$(cat .tmp/bulk-pacing-ab-20260712/candidate-rate.txt)"
+while IFS= read -r host; do
+  host_label="${host//[^A-Za-z0-9_.-]/_}"
+  iperf_host_env=()
+  if [[ "${host}" == "root@pve1" ]]; then
+    lan_interface="$(route -n get pve1 | awk '/interface:/{print $2; exit}')"
+    lan_address="$(ipconfig getifaddr "${lan_interface}")"
+    iperf_host_env+=(DERPHOLE_PUBLIC_IPERF_SERVER_HOST="${lan_address}")
+  fi
+  for direction in forward reverse; do
+    env "${iperf_host_env[@]}" \
+      DERPHOLE_PUBLIC_PATH_HOSTS="${host}" \
+      DERPHOLE_PUBLIC_PATH_DIRECTION="${direction}" \
+      DERPHOLE_PUBLIC_PATH_SIZE_MIB=1024 \
+      DERPHOLE_PUBLIC_PATH_INITIAL_RATES="1000 ${candidate} ${candidate} 1000" \
+      DERPHOLE_PUBLIC_IPERF_PORT=8123 \
+      DERPHOLE_BENCH_LOG_DIR=".tmp/bulk-pacing-fleet-20260712/${host_label}/${direction}" \
+      ./scripts/public-path-performance-harness.sh
+  done
+done < .tmp/bulk-pacing-fleet-20260712/reachable-hosts.txt
+```
+
+`pve1` is the same-LAN topology. Every other host must remain on a public, non-Tailscale path. The harness disables Tailscale candidates, but the result still has to prove the selected route; an environment variable is not a packet path.
+
+After selecting the fleet-safe default, run three unoverridden normal 1 GiB file transfers in both directions on every reachable host. Each host-direction must produce exactly three derphole rows and three paired iperf rows, and all three derphole rows must negotiate one consistent mode:
+
+```bash
+while IFS= read -r host; do
+  host_label="${host//[^A-Za-z0-9_.-]/_}"
+  iperf_host_env=()
+  if [[ "${host}" == "root@pve1" ]]; then
+    lan_interface="$(route -n get pve1 | awk '/interface:/{print $2; exit}')"
+    lan_address="$(ipconfig getifaddr "${lan_interface}")"
+    iperf_host_env+=(DERPHOLE_PUBLIC_IPERF_SERVER_HOST="${lan_address}")
+  fi
+  for direction in forward reverse; do
+    env -u DERPHOLE_PUBLIC_PATH_INITIAL_RATES "${iperf_host_env[@]}" \
+      DERPHOLE_PUBLIC_PATH_HOSTS="${host}" \
+      DERPHOLE_PUBLIC_PATH_DIRECTION="${direction}" \
+      DERPHOLE_PUBLIC_PATH_SIZE_MIB=1024 \
+      DERPHOLE_PUBLIC_PATH_RUNS=3 \
+      DERPHOLE_PUBLIC_IPERF_PORT=8123 \
+      DERPHOLE_BENCH_LOG_DIR=".tmp/bulk-pacing-default-acceptance-20260712/${host_label}/${direction}" \
+      ./scripts/public-path-performance-harness.sh
+  done
+done < .tmp/bulk-pacing-fleet-20260712/reachable-hosts.txt
+```
+
+The exact acceptance audit requires empty `initial_rate_mbps` values on every derphole row. For `pve1`, it also requires private, non-Tailscale selected transport addresses and verifies that the paired iperf endpoints are the same two LAN endpoints seen in the transfer logs. Merely exempting `pve1` from the public-address check is not sufficient.
+
+- For `bulk-packets-v1`, every non-empty sender-trace `rate_selected_mbps` value must equal the selected production default of 1,000 Mbps. Repair, retransmit, controller, receiver-rate, and local-pressure fields must be numeric, including healthy zeroes.
+- For `blocks-v1`, require QUIC direct transport and successful direct progress. Do not require a bulk selected rate or bulk-only health fields because the controller did not run.
+
+Both modes require matching SHA and size, `trace_ok=true`, no flatline of at least one second, no process or socket leak, and public non-Tailscale selected addresses except for the labeled `pve1` LAN path. Report canonical and wall median/CV, paired iperf median/CV, and derphole-to-iperf ratios. Canonical goodput CV above 15 percent triggers one same-host-direction three-run rerun; a second result above 15 percent fails stability rather than being waived.
+
+### Bulk-pacing decision gate
+
+Rules 1-6 select a candidate on Eric's public path. Rules 7-9 are the separate fleet gate; `pve1` is its explicit same-LAN exception to the public-path requirement.
+
+1. For Eric candidate selection and fleet A/B cells that exercise the bulk controller, reject any rate with a failed SHA, non-public path, transfer mode other than `bulk-packets-v1`, trace failure, flatline of at least one second, or process/socket leak. Final unoverridden fleet acceptance evaluates intentional `blocks-v1` cells under the mode-aware rules above.
+2. Group the three accepted rows per rate and compare median canonical goodput first.
+3. A median difference above 3 percent selects the faster rate.
+4. Within 3 percent, select the rate with at least 20 percent lower median repair ratio and no lower receiver p10 rate.
+5. If neither rule separates the top two and same-run iperf coefficient of variation exceeds 15 percent, rerun only those two rates in `A B B A` order.
+6. Keep 1,000 Mbps when no alternative wins. Do not lower the default merely because one run had lower repair traffic.
+7. On a host-direction that negotiates `bulk-packets-v1`, a non-1,000 candidate may not regress median canonical goodput or median iperf ratio more than 5 percent from that host-direction's 1,000-control median. An intentional `blocks-v1` cell does not exercise the bulk candidate and moves to the unoverridden mode-aware gate.
+8. On each bulk A/B cell, the candidate must have no flatline of at least one second, no higher median receiver-rate CV by more than 0.05, no greater median local `ENOBUFS` wait ratio, and no greater median repair ratio by more than 20 percent relative to the 1,000-control rows.
+9. If a bulk A/B cell has iperf CV above 15 percent or only one accepted row at either rate, rerun that host-direction as `1000 C C 1000`; do not waive it from the candidate decision. Final acceptance still requires three unoverridden runs on every reachable host-direction in its intentionally negotiated mode.
 
 ## Interactive Latency Harness
 
@@ -181,6 +293,8 @@ mise exec -- go run ./tools/transfertracecheck -role receive -stall-window 1s /t
 Trace `app_bytes` are session stream bytes and include derphole framing, so payload byte counts should be verified with the transferred file size and SHA. Use `-expected-bytes` only when checking an exact session stream byte count.
 
 Sender `app_bytes` are receiver-confirmed session stream bytes once progress ACKs start. `local_sent_bytes` records sender-side enqueue/spool progress and can be ahead of receiver progress. Use `transfer_elapsed_ms` for throughput comparisons; `elapsed_ms` includes setup and direct probing time.
+
+When a sender trace is checked with `-peer-trace`, payload-stall health comes from the peer receiver's `app_bytes`. Sender `app_bytes` are receiver-confirmed ACK progress and may arrive in batches even while the receiver commits bytes every sample. The paired summary reports that cadence separately as `sender_ack_max_flatline`; it does not call it a payload stall while receiver progress continues. A standalone sender check has no peer evidence and retains the original sender-flatline behavior. Failed `transfertrace.Check` calls on a standalone trace or either trace in paired sender mode include their observed `max_flatline` so summary tooling does not turn a threshold failure into `0s`; pair-consistency errors do not promise that field.
 
 `connected-direct` means a direct path has delivered probe or payload bytes. A run that attempts direct but falls back to relay records `direct-fallback-relay` and a non-empty `fallback_reason`.
 Relay fallback should continue making trace progress after a direct setup failure; v2 keeps the application stream on one QUIC path instead of reviving the retired split-stream protocol.

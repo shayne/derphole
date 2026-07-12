@@ -80,6 +80,9 @@ var header = [...]string{
 	"retransmits",
 	"repair_requests",
 	"repair_bytes",
+	"local_enobufs_retries",
+	"local_enobufs_wait_us",
+	"local_enobufs_max_consecutive",
 	"peer_recv_queue_depth",
 	"peer_recv_queue_depth_max",
 	"striped_send_blocked_ms",
@@ -135,6 +138,9 @@ type Snapshot struct {
 	RetransmitCount            int64
 	RepairRequests             int64
 	RepairBytes                int64
+	LocalENOBUFSRetries        int64
+	LocalENOBUFSWaitUS         int64
+	LocalENOBUFSMaxConsecutive int64
 	OutOfOrderBytes            uint64
 	PeerRecvQueueDepth         int
 	PeerRecvQueueDepthMax      int
@@ -410,6 +416,9 @@ func (r *Recorder) row(snap Snapshot, deltaBytes int64, deltaMS int64, localSent
 		formatOptionalInt64(snap.RetransmitCount),
 		formatOptionalInt64(snap.RepairRequests),
 		formatOptionalInt64(snap.RepairBytes),
+		formatOptionalInt64(snap.LocalENOBUFSRetries),
+		formatOptionalInt64(snap.LocalENOBUFSWaitUS),
+		formatOptionalInt64(snap.LocalENOBUFSMaxConsecutive),
 		formatOptionalInt(snap.PeerRecvQueueDepth),
 		formatOptionalInt(snap.PeerRecvQueueDepthMax),
 		strconv.FormatInt(snap.StripedSendBlockedMS, 10),

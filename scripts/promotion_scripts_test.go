@@ -1199,12 +1199,65 @@ func TestPromotionBenchmarkDriverPropagatesTransportExperimentEnv(t *testing.T) 
 
 	for _, want := range []string{
 		"DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES",
+		"DERPHOLE_TEST_BULK_INITIAL_WIRE_MBPS",
 		"DERPHOLE_V2_RAW_DIRECT",
 		"DERPHOLE_V2_RAW_DIRECT_BUDGET_MS",
 		"DERPHOLE_V2_MANAGER_QUIC_FANOUT",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("promotion-benchmark-driver.sh missing remote env propagation for %s", want)
+		}
+	}
+}
+
+func TestPromotionBenchmarkRejectsInvalidInitialRateBeforeSetup(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+	cmd := harness.command("forward", map[string]string{
+		"DERPHOLE_TEST_BULK_INITIAL_WIRE_MBPS": "127",
+	})
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("promotion benchmark accepted invalid initial rate:\n%s", output)
+	}
+	if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 2 {
+		t.Fatalf("invalid initial rate error = %v, want exit status 2; output:\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "DERPHOLE_TEST_BULK_INITIAL_WIRE_MBPS must be an integer from 128 through 2400") {
+		t.Fatalf("invalid initial rate output missing validation error:\n%s", output)
+	}
+	harness.assertCleaned(t, "forward")
+}
+
+func TestPublicPathPerformanceHarnessSupportsInitialRateSchedule(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(filepath.Join(".", "public-path-performance-harness.sh"))
+	if err != nil {
+		t.Fatalf("read public-path-performance-harness.sh: %v", err)
+	}
+	body := string(data)
+
+	for _, want := range []string{
+		"DERPHOLE_PUBLIC_PATH_INITIAL_RATES",
+		"DERPHOLE_TEST_BULK_INITIAL_WIRE_MBPS",
+		"initial_rate_mbps",
+		"repair_ratio",
+		"local_enobufs_retries",
+		"local_enobufs_wait_us",
+		"local_enobufs_max_consecutive",
+		"min_rate_target_mbps",
+		"final_rate_target_mbps",
+		"controller_decreases",
+		"receiver_rate_p10_mbps",
+		"receiver_rate_p50_mbps",
+		"receiver_rate_p90_mbps",
+		"receiver_rate_cv",
+		"promotion-test-reverse.sh",
+		"DERPHOLE_PUBLIC_PATH_DIRECTION",
+		"DERPHOLE_PUBLIC_IPERF_SERVER_HOST",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("public-path-performance-harness.sh missing %q", want)
 		}
 	}
 }
@@ -1309,7 +1362,8 @@ func TestPublicPathPerformanceHarnessRecordsFailedTraceSamples(t *testing.T) {
 		`trace_ok="true"`,
 		`trace_ok="false"`,
 		`trace_status=0`,
-		`append_summary_row "${host_label}" "${run}" "derphole" "${workload}" "${transfer_mode}" "${derphole_mbps}" "${iperf_mbps}" "${trace_sender_mbps}" "${wall_mbps}"`,
+		`"${trace_sender_mbps}"`,
+		`"${wall_mbps}"`,
 		`trace_failures=1`,
 	} {
 		if !strings.Contains(body, want) {
@@ -1351,6 +1405,7 @@ mkdir -p "${DERPHOLE_BENCH_LOG_DIR}"
   printf 'fanout=%s\n' "${DERPHOLE_V2_MANAGER_QUIC_FANOUT:-unset}"
   printf 'parallel=%s\n' "${DERPHOLE_BENCH_PARALLEL:-unset}"
   printf 'workload=%s\n' "${DERPHOLE_BENCH_WORKLOAD:-unset}"
+  printf 'initial_rate=%s\n' "${DERPHOLE_TEST_BULK_INITIAL_WIRE_MBPS:-unset}"
 } >"${DERPHOLE_BENCH_LOG_DIR}/env.txt"
 printf 'benchmark-goodput-mbps=12.34\n'
 printf 'benchmark-workload=file\n'
@@ -1420,6 +1475,7 @@ exit 42
 		"fanout=unset\n",
 		"parallel=auto\n",
 		"workload=file\n",
+		"initial_rate=unset\n",
 	} {
 		if !strings.Contains(envBody, want) {
 			t.Fatalf("promotion env capture missing %q; got:\n%s", want, envBody)
@@ -1427,7 +1483,191 @@ exit 42
 	}
 }
 
-func TestPublicPathPerformanceHarnessRejectsNonForwardDirection(t *testing.T) {
+func TestPublicPathPerformanceHarnessUnsetsAmbientInitialRateWithoutSchedule(t *testing.T) {
+	t.Parallel()
+
+	root := copyPublicPathHarness(t)
+	fakeBin := filepath.Join(root, "bin")
+	scriptDir := filepath.Join(root, "scripts")
+	logDir := filepath.Join(root, "logs")
+	mustMkdirAll(t, fakeBin)
+
+	writeExecutable(t, filepath.Join(fakeBin, "curl"), `#!/bin/sh
+printf '203.0.113.9\n'
+`)
+	writeExecutable(t, filepath.Join(fakeBin, "ssh"), `#!/bin/sh
+case "$*" in
+  *"-J"*) printf '{"end":{"sum_received":{"bits_per_second":100000000}}}\n' ;;
+  *) exit 0 ;;
+esac
+`)
+	writeExecutable(t, filepath.Join(fakeBin, "iperf3"), `#!/bin/sh
+exit 0
+`)
+	writeExecutable(t, filepath.Join(scriptDir, "promotion-test.sh"), `#!/bin/sh
+set -eu
+mkdir -p "${DERPHOLE_BENCH_LOG_DIR}"
+printf 'initial_rate=%s\n' "${DERPHOLE_TEST_BULK_INITIAL_WIRE_MBPS:-unset}" >"${DERPHOLE_BENCH_LOG_DIR}/env.txt"
+printf 'benchmark-goodput-mbps=12.34\n'
+printf 'benchmark-workload=file\n'
+printf 'benchmark-transfer-mode=bulk-packets-v1\n'
+exit 42
+`)
+
+	cmd := exec.Command("bash", "scripts/public-path-performance-harness.sh")
+	cmd.Dir = root
+	cmd.Env = harnessTestEnv(fakeBin, map[string]string{
+		"DERPHOLE_PUBLIC_PATH_HOSTS":           "stub@example",
+		"DERPHOLE_PUBLIC_PATH_RUNS":            "1",
+		"DERPHOLE_PUBLIC_PATH_SIZE_MIB":        "1",
+		"DERPHOLE_BENCH_LOG_DIR":               logDir,
+		"DERPHOLE_TEST_BULK_INITIAL_WIRE_MBPS": "900",
+	})
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("public-path harness succeeded despite promotion-test failure:\n%s", output)
+	}
+
+	envData, err := os.ReadFile(filepath.Join(logDir, "stub_example", "derphole-run-1", "env.txt"))
+	if err != nil {
+		t.Fatalf("read promotion env capture: %v", err)
+	}
+	if got := string(envData); got != "initial_rate=unset\n" {
+		t.Fatalf("promotion initial-rate environment = %q, want ambient value unset", got)
+	}
+}
+
+func TestPublicPathPerformanceHarnessDoesNotConsumeFleetLoopInput(t *testing.T) {
+	t.Parallel()
+
+	root := copyPublicPathHarness(t)
+	fakeBin := filepath.Join(root, "bin")
+	scriptDir := filepath.Join(root, "scripts")
+	mustMkdirAll(t, fakeBin)
+
+	writeExecutable(t, filepath.Join(fakeBin, "ssh"), `#!/usr/bin/env bash
+set -euo pipefail
+no_stdin=0
+for arg in "$@"; do
+  [[ "${arg}" == "-n" ]] && no_stdin=1
+done
+case "$*" in
+  *"bash -se"*) cat >/dev/null ;;
+  *"-J"*)
+    if [[ "${no_stdin}" == "0" ]]; then
+      cat >/dev/null
+    fi
+    printf '{"end":{"sum_received":{"bits_per_second":100000000}}}\n'
+    ;;
+esac
+`)
+	writeExecutable(t, filepath.Join(fakeBin, "iperf3"), "#!/bin/sh\nexit 0\n")
+	writeExecutable(t, filepath.Join(scriptDir, "promotion-test.sh"), `#!/bin/sh
+printf 'benchmark-goodput-mbps=12.34\n'
+printf 'benchmark-workload=file\n'
+printf 'benchmark-transfer-mode=bulk-packets-v1\n'
+exit 42
+`)
+
+	hostsPath := filepath.Join(root, "hosts.txt")
+	if err := os.WriteFile(hostsPath, []byte("first.example\nsecond.example\n"), 0o600); err != nil {
+		t.Fatalf("write hosts: %v", err)
+	}
+	seenPath := filepath.Join(root, "seen.txt")
+	command := `
+while IFS= read -r host; do
+  printf '%s\n' "${host}" >>"$2"
+  DERPHOLE_PUBLIC_PATH_HOSTS="${host}" \
+  DERPHOLE_PUBLIC_PATH_RUNS=1 \
+  DERPHOLE_PUBLIC_PATH_SIZE_MIB=1 \
+  DERPHOLE_PUBLIC_IPERF_SERVER_HOST=192.0.2.25 \
+  DERPHOLE_BENCH_LOG_DIR="$3/${host}" \
+    ./scripts/public-path-performance-harness.sh || true
+done <"$1"
+`
+	cmd := exec.Command("bash", "-c", command, "test", hostsPath, seenPath, filepath.Join(root, "logs"))
+	cmd.Dir = root
+	cmd.Env = harnessTestEnv(fakeBin, nil)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fleet loop failed: %v\n%s", err, output)
+	}
+	seen, err := os.ReadFile(seenPath)
+	if err != nil {
+		t.Fatalf("read fleet loop state: %v", err)
+	}
+	if got, want := string(seen), "first.example\nsecond.example\n"; got != want {
+		t.Fatalf("fleet loop hosts = %q, want %q; output:\n%s", got, want, output)
+	}
+}
+
+func TestBulkPacingAcceptanceRecipeIsUnscheduledAndRouteExact(t *testing.T) {
+	t.Parallel()
+
+	planData, err := os.ReadFile(filepath.Join("..", "docs", "superpowers", "plans", "2026-07-12-bulk-pacing-health-ab.md"))
+	if err != nil {
+		t.Fatalf("read bulk pacing plan: %v", err)
+	}
+	acceptance := scriptSection(
+		t,
+		string(planData),
+		"### Task 8: Promote the fleet-safe default",
+		"- [ ] **Step 5: Run the final three 3 GiB Eric forward transfers**",
+	)
+	for _, want := range []string{
+		"env -u DERPHOLE_PUBLIC_PATH_INITIAL_RATES",
+		"'initial_rate_mbps',",
+		"if any(row['initial_rate_mbps'].strip() for row in derphole):",
+		"import json",
+		`iperf3-run-{row["run"]}.json`,
+		"iperf_endpoints",
+		"selected_addresses",
+		"exact_lan_endpoints",
+		"not ip.is_private",
+	} {
+		if !strings.Contains(acceptance, want) {
+			t.Fatalf("Task 8 acceptance recipe missing %q", want)
+		}
+	}
+
+	exactLANDefinition := scriptSection(
+		t,
+		acceptance,
+		"def exact_lan_endpoints(",
+		"\n\npath_labels =",
+	)
+	probe := exactLANDefinition + `
+import ipaddress
+pair = {ipaddress.ip_address("10.0.4.2"), ipaddress.ip_address("10.0.4.184")}
+if not exact_lan_endpoints(pair, set(pair)):
+    raise SystemExit("exact LAN pair rejected")
+with_extra = set(pair)
+with_extra.add(ipaddress.ip_address("10.0.4.99"))
+if exact_lan_endpoints(pair, with_extra):
+    raise SystemExit("extra selected LAN endpoint accepted")
+`
+	cmd := exec.Command("python3", "-c", probe)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("exact LAN endpoint audit probe failed: %v\n%s", err, output)
+	}
+
+	docsData, err := os.ReadFile(filepath.Join("..", "docs", "benchmarks.md"))
+	if err != nil {
+		t.Fatalf("read benchmark docs: %v", err)
+	}
+	docs := string(docsData)
+	for _, want := range []string{
+		"env -u DERPHOLE_PUBLIC_PATH_INITIAL_RATES",
+		"empty `initial_rate_mbps`",
+		"paired iperf endpoints",
+	} {
+		if !strings.Contains(docs, want) {
+			t.Fatalf("benchmark docs missing acceptance isolation %q", want)
+		}
+	}
+}
+
+func TestPublicPathPerformanceHarnessRejectsInvalidDirection(t *testing.T) {
 	t.Parallel()
 
 	root := copyPublicPathHarness(t)
@@ -1441,7 +1681,7 @@ exit 73
 	cmd := exec.Command("bash", "scripts/public-path-performance-harness.sh")
 	cmd.Dir = root
 	cmd.Env = harnessTestEnv(fakeBin, map[string]string{
-		"DERPHOLE_PUBLIC_PATH_DIRECTION": "reverse",
+		"DERPHOLE_PUBLIC_PATH_DIRECTION": "sideways",
 		"DERPHOLE_BENCH_LOG_DIR":         filepath.Join(root, "logs"),
 	})
 	var output bytes.Buffer
@@ -1450,13 +1690,187 @@ exit 73
 
 	err := cmd.Run()
 	if err == nil {
-		t.Fatal("public-path harness accepted non-forward direction")
+		t.Fatal("public-path harness accepted invalid direction")
 	}
-	if !strings.Contains(output.String(), "DERPHOLE_PUBLIC_PATH_DIRECTION only supports forward") {
-		t.Fatalf("non-forward direction output = %q, want clear direction error", output.String())
+	if !strings.Contains(output.String(), "DERPHOLE_PUBLIC_PATH_DIRECTION must be forward or reverse") {
+		t.Fatalf("invalid direction output = %q, want clear direction error", output.String())
 	}
 	if strings.Contains(output.String(), "curl should not run") {
-		t.Fatalf("non-forward direction reached network setup:\n%s", output.String())
+		t.Fatalf("invalid direction reached network setup:\n%s", output.String())
+	}
+}
+
+func TestPublicPathPerformanceHarnessRunsInitialRateScheduleInBothDirections(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		direction        string
+		promotionScript  string
+		wantIperfReverse bool
+	}{
+		{name: "forward", direction: "forward", promotionScript: "promotion-test.sh", wantIperfReverse: true},
+		{name: "reverse", direction: "reverse", promotionScript: "promotion-test-reverse.sh", wantIperfReverse: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := copyPublicPathHarness(t)
+			fakeBin := filepath.Join(root, "bin")
+			scriptDir := filepath.Join(root, "scripts")
+			logDir := filepath.Join(root, "logs")
+			sshState := filepath.Join(root, "ssh-state")
+			mustMkdirAll(t, fakeBin)
+
+			writeExecutable(t, filepath.Join(fakeBin, "curl"), `#!/bin/sh
+echo curl should not run >&2
+exit 73
+`)
+			writeExecutable(t, filepath.Join(fakeBin, "ssh"), `#!/bin/sh
+printf '%s\n' "$*" >>"${FAKE_SSH_STATE}"
+case "$*" in
+  *"-J"*) printf '{"end":{"sum_received":{"bits_per_second":100000000}}}\n' ;;
+  *) exit 0 ;;
+esac
+`)
+			writeExecutable(t, filepath.Join(fakeBin, "iperf3"), `#!/bin/sh
+exit 0
+`)
+			writeExecutable(t, filepath.Join(fakeBin, "mise"), `#!/bin/sh
+case "$*" in
+  *"-role send"*)
+    printf 'trace-ok rows=2 final_app_bytes=1048576 max_flatline=0s peer_delta_bytes=0 sender_mbps=12.34 receiver_mbps=12.34 max_peer_recv_queue_depth=3 min_rate_target_mbps=800 final_rate_target_mbps=900 controller_decreases=1 final_repair_bytes=1024 max_retransmits=2 local_enobufs_retries=0 local_enobufs_wait_us=0 local_enobufs_max_consecutive=0\n'
+    ;;
+  *"-role receive"*)
+    printf 'trace-ok rows=2 final_app_bytes=1048576 max_flatline=0s receiver_rate_p10_mbps=700.00 receiver_rate_p50_mbps=850.00 receiver_rate_p90_mbps=950.00 receiver_rate_cv=0.125 receiver_windows_below_500_mbps=0\n'
+    ;;
+  *) exit 74 ;;
+esac
+`)
+			writeExecutable(t, filepath.Join(scriptDir, tc.promotionScript), `#!/bin/sh
+set -eu
+mkdir -p "${DERPHOLE_BENCH_LOG_DIR}"
+rate="${DERPHOLE_TEST_BULK_INITIAL_WIRE_MBPS:?missing initial rate}"
+printf 'timestamp_unix_ms,role,phase,app_bytes,last_error,rate_selected_mbps,local_enobufs_retries\n1000,send,direct_execute,1048576,,%s,0\n' "${rate}" >"${DERPHOLE_BENCH_LOG_DIR}/fake-sender.trace.csv"
+printf 'timestamp_unix_ms,role,phase,app_bytes,last_error\n1000,receive,direct_execute,1048576,\n' >"${DERPHOLE_BENCH_LOG_DIR}/fake-receiver.trace.csv"
+printf 'initial_rate=%s\ndirection=%s\nscript=%s\n' "${rate}" "${DERPHOLE_BENCH_DIRECTION}" "$(basename "$0")" >"${DERPHOLE_BENCH_LOG_DIR}/env.txt"
+printf 'benchmark-goodput-mbps=12.34\n'
+printf 'benchmark-wall-goodput-mbps=12.00\n'
+printf 'benchmark-transfer-elapsed-ms=680\n'
+printf 'benchmark-command-duration-ms=700\n'
+printf 'benchmark-total-duration-ms=750\n'
+printf 'benchmark-size-bytes=1048576\n'
+printf 'benchmark-workload=file\n'
+printf 'benchmark-transfer-mode=bulk-packets-v1\n'
+`)
+
+			cmd := exec.Command("bash", "scripts/public-path-performance-harness.sh")
+			cmd.Dir = root
+			cmd.Env = harnessTestEnv(fakeBin, map[string]string{
+				"DERPHOLE_PUBLIC_PATH_HOSTS":         "stub@example",
+				"DERPHOLE_PUBLIC_PATH_RUNS":          "99",
+				"DERPHOLE_PUBLIC_PATH_SIZE_MIB":      "1",
+				"DERPHOLE_PUBLIC_PATH_INITIAL_RATES": "1000 900 800",
+				"DERPHOLE_PUBLIC_PATH_DIRECTION":     tc.direction,
+				"DERPHOLE_PUBLIC_IPERF_SERVER_HOST":  "192.0.2.25",
+				"DERPHOLE_BENCH_LOG_DIR":             logDir,
+				"FAKE_SSH_STATE":                     sshState,
+			})
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("public-path harness failed: %v\n%s", err, output)
+			}
+
+			records := readSummaryCSV(t, filepath.Join(logDir, "summary.csv"))
+			if got := len(records); got != 6 {
+				t.Fatalf("summary row count = %d, want 6", got)
+			}
+			var derpholeRates []string
+			for _, record := range records {
+				if got := record["direction"]; got != tc.direction {
+					t.Fatalf("summary direction = %q, want %q", got, tc.direction)
+				}
+				if record["tool"] == "iperf3" {
+					for _, field := range []string{"repair_bytes", "repair_ratio", "retransmits", "local_enobufs_retries", "min_rate_target_mbps", "receiver_rate_p10_mbps"} {
+						if got := record[field]; got != "" {
+							t.Fatalf("iperf %s = %q, want empty", field, got)
+						}
+					}
+					continue
+				}
+				derpholeRates = append(derpholeRates, record["initial_rate_mbps"])
+				for field, want := range map[string]string{
+					"repair_bytes":                    "1024",
+					"repair_ratio":                    "0.0010",
+					"retransmits":                     "2",
+					"local_enobufs_retries":           "0",
+					"local_enobufs_wait_us":           "0",
+					"local_enobufs_max_consecutive":   "0",
+					"min_rate_target_mbps":            "800",
+					"final_rate_target_mbps":          "900",
+					"controller_decreases":            "1",
+					"receiver_rate_p10_mbps":          "700.00",
+					"receiver_rate_p50_mbps":          "850.00",
+					"receiver_rate_p90_mbps":          "950.00",
+					"receiver_rate_cv":                "0.125",
+					"receiver_windows_below_500_mbps": "0",
+				} {
+					if got := record[field]; got != want {
+						t.Fatalf("derphole %s = %q, want %q", field, got, want)
+					}
+				}
+			}
+			if got, want := strings.Join(derpholeRates, " "), "1000 900 800"; got != want {
+				t.Fatalf("derphole initial-rate order = %q, want %q", got, want)
+			}
+
+			sshData, err := os.ReadFile(sshState)
+			if err != nil {
+				t.Fatalf("read ssh state: %v", err)
+			}
+			var iperfCommands []string
+			for _, line := range strings.Split(string(sshData), "\n") {
+				if strings.Contains(line, " -J ") {
+					iperfCommands = append(iperfCommands, line)
+				}
+			}
+			if got := len(iperfCommands); got != 3 {
+				t.Fatalf("iperf command count = %d, want 3; state:\n%s", got, sshData)
+			}
+			for _, command := range iperfCommands {
+				if got := strings.Contains(command, " -R "); got != tc.wantIperfReverse {
+					t.Fatalf("iperf command %q reverse flag = %t, want %t", command, got, tc.wantIperfReverse)
+				}
+				if !strings.Contains(command, "192.0.2.25") {
+					t.Fatalf("iperf command %q missing configured server host", command)
+				}
+			}
+		})
+	}
+}
+
+func TestPublicPathPerformanceHarnessRejectsInvalidInitialRate(t *testing.T) {
+	t.Parallel()
+
+	root := copyPublicPathHarness(t)
+	fakeBin := filepath.Join(root, "bin")
+	mustMkdirAll(t, fakeBin)
+	writeExecutable(t, filepath.Join(fakeBin, "curl"), `#!/bin/sh
+echo curl should not run >&2
+exit 73
+`)
+
+	cmd := exec.Command("bash", "scripts/public-path-performance-harness.sh")
+	cmd.Dir = root
+	cmd.Env = harnessTestEnv(fakeBin, map[string]string{
+		"DERPHOLE_PUBLIC_PATH_INITIAL_RATES": "1000 127 800",
+		"DERPHOLE_BENCH_LOG_DIR":             filepath.Join(root, "logs"),
+	})
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatal("public-path harness accepted invalid initial rate")
+	}
+	if !strings.Contains(string(output), "DERPHOLE_PUBLIC_PATH_INITIAL_RATES contains invalid rate: 127") {
+		t.Fatalf("invalid rate output = %q, want clear validation error", output)
+	}
+	if strings.Contains(string(output), "curl should not run") {
+		t.Fatalf("invalid rate reached network setup:\n%s", output)
 	}
 }
 

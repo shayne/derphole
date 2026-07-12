@@ -125,6 +125,14 @@ func TestRunPrintsDiagnosticSummary(t *testing.T) {
 	}
 }
 
+func TestFormatDiagnosticsSummaryPrintsCurrentSenderZeroHealth(t *testing.T) {
+	got := formatDiagnosticsSummary(transfertrace.DiagnosticsSummary{SenderHealthObserved: true})
+	want := " min_rate_target_mbps=0 final_rate_target_mbps=0 controller_decreases=0 final_repair_bytes=0 max_retransmits=0 local_enobufs_retries=0 local_enobufs_wait_us=0 local_enobufs_max_consecutive=0"
+	if got != want {
+		t.Fatalf("formatDiagnosticsSummary() = %q, want %q", got, want)
+	}
+}
+
 func TestRunChecksPeerTraceSuccess(t *testing.T) {
 	sendPath := writeTrace(t, transfertrace.HeaderLine+"\n"+
 		"1000,0,send,complete,1024,0,1024,1024,0.00,1024,1024,,500,false,,,,,,,,,,,,stream-complete,\n")
@@ -155,6 +163,225 @@ func TestRunChecksPeerTraceFailure(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "sender peer_received_bytes") {
 		t.Fatalf("stderr = %q, want peer progress error", stderr.String())
+	}
+}
+
+func TestRunPairedSenderUsesReceiverForPayloadFlatline(t *testing.T) {
+	sendPath := writeTrace(t, transfertrace.HeaderLine+"\n"+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "1000", "elapsed_ms": "0", "role": "send", "phase": "direct_execute",
+			"direct_bytes": "1000", "app_bytes": "1000", "delta_app_bytes": "1000", "local_sent_bytes": "1000",
+			"peer_received_bytes": "1000", "transfer_elapsed_ms": "0", "direct_validated": "true", "last_state": "connected-direct",
+		})+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "1500", "elapsed_ms": "500", "role": "send", "phase": "direct_execute",
+			"direct_bytes": "2000", "app_bytes": "1000", "delta_app_bytes": "0", "local_sent_bytes": "2000",
+			"peer_received_bytes": "1000", "transfer_elapsed_ms": "500", "direct_validated": "true", "last_state": "connected-direct",
+		})+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "2000", "elapsed_ms": "1000", "role": "send", "phase": "direct_execute",
+			"direct_bytes": "3000", "app_bytes": "1000", "delta_app_bytes": "0", "local_sent_bytes": "3000",
+			"peer_received_bytes": "1000", "transfer_elapsed_ms": "1000", "direct_validated": "true", "last_state": "connected-direct",
+		})+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "2500", "elapsed_ms": "1500", "role": "send", "phase": "direct_execute",
+			"direct_bytes": "4000", "app_bytes": "1000", "delta_app_bytes": "0", "local_sent_bytes": "4000",
+			"peer_received_bytes": "1000", "transfer_elapsed_ms": "1500", "direct_validated": "true", "last_state": "connected-direct",
+		})+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "3000", "elapsed_ms": "2000", "role": "send", "phase": "complete",
+			"direct_bytes": "5000", "app_bytes": "5000", "delta_app_bytes": "4000", "local_sent_bytes": "5000",
+			"peer_received_bytes": "5000", "transfer_elapsed_ms": "2000", "direct_validated": "true", "last_state": "stream-complete",
+		}))
+	receivePath := writeTrace(t, transfertrace.HeaderLine+"\n"+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "1000", "elapsed_ms": "0", "role": "receive", "phase": "direct_execute",
+			"direct_bytes": "1000", "app_bytes": "1000", "delta_app_bytes": "1000", "transfer_elapsed_ms": "0",
+			"direct_validated": "true", "last_state": "connected-direct",
+		})+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "1500", "elapsed_ms": "500", "role": "receive", "phase": "direct_execute",
+			"direct_bytes": "2000", "app_bytes": "2000", "delta_app_bytes": "1000", "transfer_elapsed_ms": "500",
+			"direct_validated": "true", "last_state": "connected-direct",
+		})+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "2000", "elapsed_ms": "1000", "role": "receive", "phase": "direct_execute",
+			"direct_bytes": "3000", "app_bytes": "2000", "delta_app_bytes": "0", "transfer_elapsed_ms": "1000",
+			"direct_validated": "true", "last_state": "connected-direct",
+		})+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "2500", "elapsed_ms": "1500", "role": "receive", "phase": "direct_execute",
+			"direct_bytes": "4000", "app_bytes": "4000", "delta_app_bytes": "2000", "transfer_elapsed_ms": "1500",
+			"direct_validated": "true", "last_state": "connected-direct",
+		})+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "3000", "elapsed_ms": "2000", "role": "receive", "phase": "complete",
+			"direct_bytes": "5000", "app_bytes": "5000", "delta_app_bytes": "1000", "transfer_elapsed_ms": "2000",
+			"direct_validated": "true", "last_state": "stream-complete",
+		}))
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-role", "send", "-stall-window", "999ms", "-peer-trace", receivePath, sendPath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() exit = %d, stderr = %q", code, stderr.String())
+	}
+	for _, want := range []string{"max_flatline=500ms", "sender_ack_max_flatline=1.5s"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+		}
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestRunPairedSenderRejectsReceiverPayloadFlatline(t *testing.T) {
+	sendPath := writeTrace(t, transfertrace.HeaderLine+"\n"+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "1000", "elapsed_ms": "0", "role": "send", "phase": "direct_execute",
+			"app_bytes": "1000", "delta_app_bytes": "1000", "peer_received_bytes": "1000", "transfer_elapsed_ms": "0",
+			"direct_validated": "true", "last_state": "connected-direct",
+		})+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "1500", "elapsed_ms": "500", "role": "send", "phase": "direct_execute",
+			"app_bytes": "2000", "delta_app_bytes": "1000", "peer_received_bytes": "2000", "transfer_elapsed_ms": "500",
+			"direct_validated": "true", "last_state": "connected-direct",
+		})+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "2000", "elapsed_ms": "1000", "role": "send", "phase": "direct_execute",
+			"app_bytes": "3000", "delta_app_bytes": "1000", "peer_received_bytes": "3000", "transfer_elapsed_ms": "1000",
+			"direct_validated": "true", "last_state": "connected-direct",
+		})+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "2500", "elapsed_ms": "1500", "role": "send", "phase": "direct_execute",
+			"app_bytes": "4000", "delta_app_bytes": "1000", "peer_received_bytes": "4000", "transfer_elapsed_ms": "1500",
+			"direct_validated": "true", "last_state": "connected-direct",
+		})+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "3000", "elapsed_ms": "2000", "role": "send", "phase": "complete",
+			"app_bytes": "5000", "delta_app_bytes": "1000", "peer_received_bytes": "5000", "transfer_elapsed_ms": "2000",
+			"direct_validated": "true", "last_state": "stream-complete",
+		}))
+	receivePath := writeTrace(t, transfertrace.HeaderLine+"\n"+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "1000", "elapsed_ms": "0", "role": "receive", "phase": "direct_execute",
+			"app_bytes": "1000", "delta_app_bytes": "1000", "transfer_elapsed_ms": "0",
+			"direct_validated": "true", "last_state": "connected-direct",
+		})+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "1500", "elapsed_ms": "500", "role": "receive", "phase": "direct_execute",
+			"app_bytes": "2000", "delta_app_bytes": "1000", "transfer_elapsed_ms": "500",
+			"direct_validated": "true", "last_state": "connected-direct",
+		})+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "2000", "elapsed_ms": "1000", "role": "receive", "phase": "direct_execute",
+			"app_bytes": "2000", "delta_app_bytes": "0", "transfer_elapsed_ms": "1000",
+			"direct_validated": "true", "last_state": "connected-direct",
+		})+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "2500", "elapsed_ms": "1500", "role": "receive", "phase": "direct_execute",
+			"app_bytes": "2000", "delta_app_bytes": "0", "transfer_elapsed_ms": "1500",
+			"direct_validated": "true", "last_state": "connected-direct",
+		})+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "3000", "elapsed_ms": "2000", "role": "receive", "phase": "complete",
+			"app_bytes": "5000", "delta_app_bytes": "3000", "transfer_elapsed_ms": "2000",
+			"direct_validated": "true", "last_state": "stream-complete",
+		}))
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-role", "send", "-stall-window", "999ms", "-progress-lead-tolerance", "2000", "-peer-trace", receivePath, sendPath}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run() exit = %d, want 1; stdout = %q, stderr = %q", code, stdout.String(), stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "max_flatline=1s") {
+		t.Fatalf("stderr = %q, want receiver max_flatline=1s", stderr.String())
+	}
+}
+
+func TestRunPairedSenderKeepsSenderFailuresFatal(t *testing.T) {
+	receivePath := writeTrace(t, transfertrace.HeaderLine+"\n"+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "1000", "role": "receive", "phase": "complete", "app_bytes": "1024",
+			"delta_app_bytes": "1024", "transfer_elapsed_ms": "500", "last_state": "stream-complete",
+		}))
+	tests := []struct {
+		name        string
+		senderTrace string
+		extraArgs   []string
+		wantError   string
+	}{
+		{
+			name: "terminal error",
+			senderTrace: transfertrace.HeaderLine + "\n" +
+				traceCSVRow(t, map[string]string{
+					"timestamp_unix_ms": "1000", "role": "send", "phase": "direct_execute", "app_bytes": "1024",
+					"delta_app_bytes": "1024", "peer_received_bytes": "1024", "direct_validated": "true",
+					"last_state": "connected-direct", "last_error": "sender exploded",
+				}),
+			wantError: "terminal error: sender exploded",
+		},
+		{
+			name: "expected byte mismatch",
+			senderTrace: transfertrace.HeaderLine + "\n" +
+				traceCSVRow(t, map[string]string{
+					"timestamp_unix_ms": "1000", "role": "send", "phase": "complete", "app_bytes": "1024",
+					"delta_app_bytes": "1024", "peer_received_bytes": "1024", "transfer_elapsed_ms": "500",
+					"last_state": "stream-complete",
+				}),
+			extraArgs: []string{"-expected-bytes", "2048"},
+			wantError: "final app bytes = 1024, want 2048",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sendPath := writeTrace(t, tt.senderTrace)
+			args := []string{"-role", "send", "-peer-trace", receivePath}
+			args = append(args, tt.extraArgs...)
+			args = append(args, sendPath)
+			var stdout, stderr bytes.Buffer
+			code := run(args, &stdout, &stderr)
+			if code != 1 {
+				t.Fatalf("run() exit = %d, want 1; stdout = %q, stderr = %q", code, stdout.String(), stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			if !strings.Contains(stderr.String(), tt.wantError) {
+				t.Fatalf("stderr = %q, want %q", stderr.String(), tt.wantError)
+			}
+		})
+	}
+}
+
+func TestRunStandaloneFailureReportsObservedFlatline(t *testing.T) {
+	path := writeTrace(t, transfertrace.HeaderLine+"\n"+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "1000", "role": "receive", "phase": "direct_execute", "app_bytes": "1000",
+			"delta_app_bytes": "1000", "direct_validated": "true", "last_state": "connected-direct",
+		})+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "1500", "role": "receive", "phase": "direct_execute", "app_bytes": "1000",
+			"delta_app_bytes": "0", "direct_validated": "true", "last_state": "connected-direct",
+		})+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "2000", "role": "receive", "phase": "direct_execute", "app_bytes": "1000",
+			"delta_app_bytes": "0", "direct_validated": "true", "last_state": "connected-direct",
+		}))
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-role", "receive", "-stall-window", "999ms", path}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run() exit = %d, want 1", code)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "max_flatline=1s") {
+		t.Fatalf("stderr = %q, want max_flatline=1s", stderr.String())
 	}
 }
 

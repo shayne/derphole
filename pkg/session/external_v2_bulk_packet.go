@@ -245,6 +245,7 @@ type externalV2BulkPacketSender struct {
 	path                externalV2BulkPacketPath
 	auth                externalV2BulkPacketAuth
 	metrics             *externalTransferMetrics
+	initialPaceMbps     int
 	runID               uint64
 	totalPackets        uint32
 	laneCount           int
@@ -259,26 +260,32 @@ type externalV2BulkPacketSender struct {
 	repairPayloadBytes  atomic.Int64
 	repairRequests      atomic.Int64
 	currentPaceMbps     atomic.Int64
+
+	localENOBUFSRetries        atomic.Int64
+	localENOBUFSWaitNanos      atomic.Int64
+	localENOBUFSMaxConsecutive atomic.Int64
 }
 
 func newExternalV2BulkPacketSender(ctx context.Context, src *BlockSource, path externalV2BulkPacketPath, auth externalV2BulkPacketAuth, metrics *externalTransferMetrics) *externalV2BulkPacketSender {
-	controller := newExternalV2BulkPacketController()
+	initialPaceMbps := externalV2BulkPacketInitialWireMbps()
+	controller := newExternalV2BulkPacketController(initialPaceMbps)
 	sender := &externalV2BulkPacketSender{
-		ctx:          ctx,
-		src:          src,
-		path:         path,
-		auth:         auth,
-		metrics:      metrics,
-		runID:        randomExternalV2BulkPacketRunID(),
-		totalPackets: externalV2BulkPacketCount(src.PayloadSize),
-		laneCount:    min(len(path.Conns), len(path.Addrs)),
+		ctx:             ctx,
+		src:             src,
+		path:            path,
+		auth:            auth,
+		metrics:         metrics,
+		initialPaceMbps: initialPaceMbps,
+		runID:           randomExternalV2BulkPacketRunID(),
+		totalPackets:    externalV2BulkPacketCount(src.PayloadSize),
+		laneCount:       min(len(path.Conns), len(path.Addrs)),
 		pacer: rate.NewLimiter(
-			externalV2BulkPacketRateLimit(externalV2BulkPacketInitialWireMbps),
+			externalV2BulkPacketRateLimit(initialPaceMbps),
 			externalV2BulkPacketPaceBurstBytes,
 		),
 		controller: controller,
 	}
-	sender.currentPaceMbps.Store(externalV2BulkPacketInitialWireMbps)
+	sender.currentPaceMbps.Store(int64(initialPaceMbps))
 	return sender
 }
 
@@ -338,7 +345,7 @@ func (s *externalV2BulkPacketSender) sendPacket(index uint32, lane int, repair b
 	if err := s.pacer.WaitN(s.ctx, wireBytes); err != nil {
 		return err
 	}
-	n, err := writeExternalV2BulkPacketData(s.ctx, s.path.Conns[lane], packet, s.path.Addrs[lane])
+	n, err := s.writeDataPacket(lane, packet)
 	if err != nil {
 		return err
 	}
@@ -361,20 +368,44 @@ func (s *externalV2BulkPacketSender) sendPacket(index uint32, lane int, repair b
 	return nil
 }
 
-func writeExternalV2BulkPacketData(ctx context.Context, conn net.PacketConn, packet []byte, addr net.Addr) (int, error) {
+func (s *externalV2BulkPacketSender) writeDataPacket(lane int, packet []byte) (int, error) {
+	consecutive := int64(0)
 	for {
-		n, err := conn.WriteTo(packet, addr)
+		n, err := s.path.Conns[lane].WriteTo(packet, s.path.Addrs[lane])
 		if !errors.Is(err, syscall.ENOBUFS) {
 			return n, err
 		}
+
+		consecutive++
+		s.localENOBUFSRetries.Add(1)
+		updateExternalV2BulkPacketAtomicMax(&s.localENOBUFSMaxConsecutive, consecutive)
+		waitStarted := time.Now()
 		timer := time.NewTimer(externalV2BulkPacketWriteRetryDelay)
 		select {
 		case <-timer.C:
-		case <-ctx.Done():
+			s.localENOBUFSWaitNanos.Add(time.Since(waitStarted).Nanoseconds())
+		case <-s.ctx.Done():
 			timer.Stop()
-			return 0, ctx.Err()
+			s.localENOBUFSWaitNanos.Add(time.Since(waitStarted).Nanoseconds())
+			return 0, s.ctx.Err()
 		}
 	}
+}
+
+func updateExternalV2BulkPacketAtomicMax(counter *atomic.Int64, candidate int64) {
+	for {
+		current := counter.Load()
+		if candidate <= current || counter.CompareAndSwap(current, candidate) {
+			return
+		}
+	}
+}
+
+func externalV2BulkPacketRoundedUpMicroseconds(nanos int64) int64 {
+	if nanos <= 0 {
+		return 0
+	}
+	return (nanos + int64(time.Microsecond) - 1) / int64(time.Microsecond)
 }
 
 func (s *externalV2BulkPacketSender) startRepairWorker(ctx context.Context, missingCh <-chan []uint32, repairActivityCh chan<- struct{}, repairErrCh chan<- error) <-chan struct{} {
@@ -453,7 +484,7 @@ func (s *externalV2BulkPacketSender) waitForCompletion(doneCh <-chan struct{}, r
 }
 
 func (s *externalV2BulkPacketSender) stats(committed bool) externalDirectTransferStats {
-	return externalV2BulkPacketSendStats(
+	stats := externalV2BulkPacketSendStats(
 		s.src.PayloadSize,
 		s.primaryPayloadBytes.Load(),
 		s.sentPayload.Load(),
@@ -461,9 +492,14 @@ func (s *externalV2BulkPacketSender) stats(committed bool) externalDirectTransfe
 		s.repairPayloadBytes.Load(),
 		s.repairRequests.Load(),
 		s.laneCount,
+		s.initialPaceMbps,
 		int(s.currentPaceMbps.Load()),
 		committed,
 	)
+	stats.Diagnostics.LocalENOBUFSRetries = s.localENOBUFSRetries.Load()
+	stats.Diagnostics.LocalENOBUFSWaitUS = externalV2BulkPacketRoundedUpMicroseconds(s.localENOBUFSWaitNanos.Load())
+	stats.Diagnostics.LocalENOBUFSMaxConsecutive = s.localENOBUFSMaxConsecutive.Load()
+	return stats
 }
 
 func (s *externalV2BulkPacketSender) startController(ctx context.Context) <-chan struct{} {
@@ -514,16 +550,19 @@ func (s *externalV2BulkPacketSender) publishControllerDiagnostics(
 		return
 	}
 	s.metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
-		RateSelectedMbps:   externalV2BulkPacketInitialWireMbps,
-		RateTargetMbps:     decision.TargetMbps,
-		RateCeilingMbps:    externalV2BulkPacketCeilingWireMbps,
-		ActiveLanes:        s.laneCount,
-		AvailableLanes:     s.laneCount,
-		ControllerDecision: decision.Action,
-		ControllerReason:   decision.Reason,
-		Retransmits:        s.repairPackets.Load(),
-		RepairRequests:     s.repairRequests.Load(),
-		RepairBytes:        s.repairPayloadBytes.Load(),
+		RateSelectedMbps:           s.initialPaceMbps,
+		RateTargetMbps:             decision.TargetMbps,
+		RateCeilingMbps:            externalV2BulkPacketCeilingWireMbps,
+		ActiveLanes:                s.laneCount,
+		AvailableLanes:             s.laneCount,
+		ControllerDecision:         decision.Action,
+		ControllerReason:           decision.Reason,
+		Retransmits:                s.repairPackets.Load(),
+		RepairRequests:             s.repairRequests.Load(),
+		RepairBytes:                s.repairPayloadBytes.Load(),
+		LocalENOBUFSRetries:        s.localENOBUFSRetries.Load(),
+		LocalENOBUFSWaitUS:         externalV2BulkPacketRoundedUpMicroseconds(s.localENOBUFSWaitNanos.Load()),
+		LocalENOBUFSMaxConsecutive: s.localENOBUFSMaxConsecutive.Load(),
 	}, at)
 }
 
@@ -1226,6 +1265,7 @@ func externalV2BulkPacketSendStats(
 	repairBytes int64,
 	repairRequests int64,
 	lanes int,
+	initialPaceMbps int,
 	paceMbps int,
 	committed bool,
 ) externalDirectTransferStats {
@@ -1237,7 +1277,7 @@ func externalV2BulkPacketSendStats(
 		BytesSent:   primaryPayloadBytes,
 		Retransmits: repairPackets,
 		Diagnostics: externalDirectTransferDiagnostics{
-			RateSelectedMbps:     externalV2BulkPacketInitialWireMbps,
+			RateSelectedMbps:     initialPaceMbps,
 			RateTargetMbps:       paceMbps,
 			RateCeilingMbps:      externalV2BulkPacketCeilingWireMbps,
 			ActiveLanes:          lanes,

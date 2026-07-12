@@ -16,6 +16,14 @@ if [[ "${workload}" == "file" && -n "${DERPHOLE_BENCH_PARALLEL:-}" ]]; then
   echo "DERPHOLE_BENCH_PARALLEL is only valid for the stream workload" >&2
   exit 2
 fi
+bulk_initial_rate="${DERPHOLE_TEST_BULK_INITIAL_WIRE_MBPS:-}"
+if [[ -n "${bulk_initial_rate}" ]]; then
+  if [[ ! "${bulk_initial_rate}" =~ ^[0-9]+$ ]] ||
+     ((bulk_initial_rate < 128 || bulk_initial_rate > 2400)); then
+    echo "DERPHOLE_TEST_BULK_INITIAL_WIRE_MBPS must be an integer from 128 through 2400" >&2
+    exit 2
+  fi
+fi
 transfer_mode="unknown"
 
 target="${1:?usage: $0 <target> [size-mib]}"
@@ -80,6 +88,9 @@ if [[ -n "${DERPHOLE_V2_RAW_DIRECT_BUDGET_MS:-}" ]]; then
 fi
 if [[ -n "${DERPHOLE_V2_MANAGER_QUIC_FANOUT:-}" ]]; then
   remote_env+=(DERPHOLE_V2_MANAGER_QUIC_FANOUT="${DERPHOLE_V2_MANAGER_QUIC_FANOUT}")
+fi
+if [[ -n "${bulk_initial_rate}" ]]; then
+  remote_env+=(DERPHOLE_TEST_BULK_INITIAL_WIRE_MBPS="${bulk_initial_rate}")
 fi
 remote() {
   ssh "${remote_target}" "${remote_env[@]}" 'bash -se' <<<"$1"

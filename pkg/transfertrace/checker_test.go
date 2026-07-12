@@ -315,6 +315,198 @@ func TestCheckReportsDiagnosticsSummaryFromDirectPathFields(t *testing.T) {
 	}
 }
 
+func TestCheckReportsSenderHealthDiagnostics(t *testing.T) {
+	csvText := HeaderLine + "\n" +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:        1000,
+			role:               RoleSend,
+			phase:              PhaseDirectExecute,
+			appBytes:           1024,
+			deltaAppBytes:      1024,
+			directValidated:    true,
+			lastState:          "connected-direct",
+			rateTargetMbps:     1000,
+			controllerDecision: "hold",
+		}) +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:        1500,
+			elapsedMS:          500,
+			role:               RoleSend,
+			phase:              PhaseDirectExecute,
+			appBytes:           1536,
+			deltaAppBytes:      512,
+			directValidated:    true,
+			lastState:          "connected-direct",
+			rateTargetMbps:     850,
+			controllerDecision: "decrease",
+			repairBytes:        256 << 20,
+		}) +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:        1750,
+			elapsedMS:          750,
+			role:               RoleSend,
+			phase:              PhaseDirectExecute,
+			appBytes:           1536,
+			deltaAppBytes:      0,
+			directValidated:    true,
+			lastState:          "connected-direct",
+			rateTargetMbps:     850,
+			controllerDecision: "decrease",
+			repairBytes:        256 << 20,
+		}) +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:                2000,
+			elapsedMS:                  1000,
+			role:                       RoleSend,
+			phase:                      PhaseComplete,
+			appBytes:                   2048,
+			deltaAppBytes:              512,
+			directValidated:            true,
+			lastState:                  "stream-complete",
+			rateTargetMbps:             722,
+			controllerDecision:         "decrease",
+			repairBytes:                512 << 20,
+			localENOBUFSRetries:        9,
+			localENOBUFSWaitUS:         1400,
+			localENOBUFSMaxConsecutive: 4,
+		})
+	result, err := Check(strings.NewReader(csvText), Options{
+		Role: RoleSend, StallWindow: time.Second,
+		ExpectedBytes: 2048, ExpectedBytesSet: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Diagnostics.MinRateTargetMbps; got != 722 {
+		t.Fatalf("MinRateTargetMbps = %d, want 722", got)
+	}
+	if got := result.Diagnostics.FinalRateTargetMbps; got != 722 {
+		t.Fatalf("FinalRateTargetMbps = %d, want 722", got)
+	}
+	if got := result.Diagnostics.ControllerDecreases; got != 2 {
+		t.Fatalf("ControllerDecreases = %d, want 2", got)
+	}
+	if got := result.Diagnostics.FinalRepairBytes; got != 512<<20 {
+		t.Fatalf("FinalRepairBytes = %d, want %d", got, 512<<20)
+	}
+	if got := result.Diagnostics.LocalENOBUFSRetries; got != 9 {
+		t.Fatalf("LocalENOBUFSRetries = %d, want 9", got)
+	}
+	if got := result.Diagnostics.LocalENOBUFSWaitUS; got != 1400 {
+		t.Fatalf("LocalENOBUFSWaitUS = %d, want 1400", got)
+	}
+	if got := result.Diagnostics.LocalENOBUFSMaxConsecutive; got != 4 {
+		t.Fatalf("LocalENOBUFSMaxConsecutive = %d, want 4", got)
+	}
+
+	var receiverTrace strings.Builder
+	receiverTrace.WriteString(HeaderLine + "\n")
+	for index, rate := range []string{"200", "400", "600", "800", "1000"} {
+		receiverTrace.WriteString(testTraceRow(testTraceRowConfig{
+			timestampMS:     1000 + int64(index)*500,
+			elapsedMS:       int64(index) * 500,
+			role:            RoleReceive,
+			phase:           PhaseDirectExecute,
+			appBytes:        int64(index+1) * 1024,
+			deltaAppBytes:   1024,
+			appMbps:         rate,
+			directValidated: true,
+			lastState:       "connected-direct",
+		}))
+	}
+	receiverTrace.WriteString(testTraceRow(testTraceRowConfig{
+		timestampMS:     3500,
+		elapsedMS:       2500,
+		role:            RoleReceive,
+		phase:           PhaseComplete,
+		appBytes:        5120,
+		deltaAppBytes:   0,
+		directValidated: true,
+		lastState:       "stream-complete",
+	}))
+	result, err = Check(strings.NewReader(receiverTrace.String()), Options{
+		Role: RoleReceive, StallWindow: time.Second,
+		ExpectedBytes: 5120, ExpectedBytesSet: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Diagnostics.ReceiverRateP10Mbps; got != 280 {
+		t.Fatalf("ReceiverRateP10Mbps = %.2f, want 280", got)
+	}
+	if got := result.Diagnostics.ReceiverRateP50Mbps; got != 600 {
+		t.Fatalf("ReceiverRateP50Mbps = %.2f, want 600", got)
+	}
+	if got := result.Diagnostics.ReceiverRateP90Mbps; got != 920 {
+		t.Fatalf("ReceiverRateP90Mbps = %.2f, want 920", got)
+	}
+	if got := result.Diagnostics.ReceiverWindowsBelow500Mbps; got != 2 {
+		t.Fatalf("ReceiverWindowsBelow500Mbps = %d, want 2", got)
+	}
+}
+
+func TestCheckReceiverRatesIncludeZeroWindowsAfterProgress(t *testing.T) {
+	var trace strings.Builder
+	trace.WriteString(HeaderLine + "\n")
+	for _, row := range []testTraceRowConfig{
+		{
+			timestampMS: 1000, role: RoleReceive, phase: PhaseDirectExecute,
+			appBytes: 0, appMbps: "0.00", directValidated: true,
+		},
+		{
+			timestampMS: 1500, role: RoleReceive, phase: PhaseDirectExecute,
+			appBytes: 1024, deltaAppBytes: 1024, appMbps: "800.00", directValidated: true,
+		},
+		{
+			timestampMS: 2000, role: RoleReceive, phase: PhaseDirectExecute,
+			appBytes: 1024, appMbps: "0.00", directValidated: true,
+		},
+		{
+			timestampMS: 2500, role: RoleReceive, phase: PhaseDirectExecute,
+			appBytes: 2048, deltaAppBytes: 1024, appMbps: "800.00", directValidated: true,
+		},
+		{
+			timestampMS: 3000, role: RoleReceive, phase: PhaseComplete,
+			appBytes: 2048, directValidated: true,
+		},
+	} {
+		trace.WriteString(testTraceRow(row))
+	}
+
+	result, err := Check(strings.NewReader(trace.String()), Options{
+		Role: RoleReceive, StallWindow: time.Second,
+		ExpectedBytes: 2048, ExpectedBytesSet: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Diagnostics.ReceiverWindowsBelow500Mbps; got != 1 {
+		t.Fatalf("ReceiverWindowsBelow500Mbps = %d, want one post-progress zero window", got)
+	}
+	if got := result.Diagnostics.ReceiverRateP10Mbps; got != 160 {
+		t.Fatalf("ReceiverRateP10Mbps = %.2f, want 160", got)
+	}
+	if got := result.Diagnostics.ReceiverRateCV; got <= 0 {
+		t.Fatalf("ReceiverRateCV = %.3f, want post-progress zero reflected in variation", got)
+	}
+}
+
+func TestCheckReceiverRatesIgnoreLegacyRowsWithoutRateMetric(t *testing.T) {
+	csvText := "timestamp_unix_ms,role,phase,app_bytes,last_error\n" +
+		"1000,receive,direct_execute,1024,\n" +
+		"1500,receive,complete,1024,\n"
+	result, err := Check(strings.NewReader(csvText), Options{
+		Role: RoleReceive, StallWindow: time.Second,
+		ExpectedBytes: 1024, ExpectedBytesSet: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Diagnostics.ReceiverRateObserved {
+		t.Fatal("ReceiverRateObserved = true for legacy trace without app_mbps")
+	}
+}
+
 func TestCheckReportsQUICDiagnosticsSummary(t *testing.T) {
 	csvText := HeaderLine + "\n" +
 		testTraceRow(testTraceRowConfig{
@@ -730,6 +922,7 @@ type testTraceRowConfig struct {
 	directBytes                    int64
 	appBytes                       int64
 	deltaAppBytes                  int64
+	appMbps                        string
 	localSentBytes                 int64
 	peerReceivedBytes              int64
 	transferElapsedMS              int64
@@ -738,9 +931,14 @@ type testTraceRowConfig struct {
 	lastState                      string
 	lastError                      string
 	rateTargetMbps                 int
+	controllerDecision             string
 	receiverCommittedMbps          string
 	replayBytes                    uint64
 	retransmits                    int64
+	repairBytes                    int64
+	localENOBUFSRetries            int64
+	localENOBUFSWaitUS             int64
+	localENOBUFSMaxConsecutive     int64
 	peerRecvQueueDepth             int
 	peerRecvQueueDepthMax          int
 	stripedSendBlockedMS           int64
@@ -773,7 +971,11 @@ func testTraceRow(cfg testTraceRowConfig) string {
 	set("direct_bytes", strconv.FormatInt(cfg.directBytes, 10))
 	set("app_bytes", strconv.FormatInt(cfg.appBytes, 10))
 	set("delta_app_bytes", strconv.FormatInt(cfg.deltaAppBytes, 10))
-	set("app_mbps", "0.00")
+	appMbps := cfg.appMbps
+	if appMbps == "" {
+		appMbps = "0.00"
+	}
+	set("app_mbps", appMbps)
 	set("local_sent_bytes", strconv.FormatInt(cfg.localSentBytes, 10))
 	set("peer_received_bytes", strconv.FormatInt(cfg.peerReceivedBytes, 10))
 	set("transfer_elapsed_ms", formatTestOptionalInt64(cfg.transferElapsedMS))
@@ -782,9 +984,14 @@ func testTraceRow(cfg testTraceRowConfig) string {
 	set("last_state", cfg.lastState)
 	set("last_error", cfg.lastError)
 	set("rate_target_mbps", formatTestOptionalInt(cfg.rateTargetMbps))
+	set("controller_decision", cfg.controllerDecision)
 	set("receiver_committed_mbps", cfg.receiverCommittedMbps)
 	set("replay_bytes", formatTestOptionalUint64(cfg.replayBytes))
 	set("retransmits", formatTestOptionalInt64(cfg.retransmits))
+	set("repair_bytes", formatTestOptionalInt64(cfg.repairBytes))
+	set("local_enobufs_retries", formatTestOptionalInt64(cfg.localENOBUFSRetries))
+	set("local_enobufs_wait_us", formatTestOptionalInt64(cfg.localENOBUFSWaitUS))
+	set("local_enobufs_max_consecutive", formatTestOptionalInt64(cfg.localENOBUFSMaxConsecutive))
 	set("peer_recv_queue_depth", formatTestOptionalInt(cfg.peerRecvQueueDepth))
 	set("peer_recv_queue_depth_max", formatTestOptionalInt(cfg.peerRecvQueueDepthMax))
 	set("striped_send_blocked_ms", formatTestOptionalInt64(cfg.stripedSendBlockedMS))

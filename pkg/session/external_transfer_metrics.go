@@ -64,19 +64,24 @@ type externalTransferMetrics struct {
 	retransmitCount        int64
 	repairRequests         int64
 	repairBytes            int64
-	outOfOrderBytes        uint64
-	directPacketBytes      int64
-	directCommittedBytes   int64
-	directTransport        string
-	quicHandshakeMS        int64
-	quicFirstByteMS        int64
-	quicStreamBytesSent    int64
-	quicStreamBytesRecv    int64
-	quicStreamGoodputMbps  string
-	quicSmoothedRTTMS      string
-	quicLossEvents         int64
-	quicCloseReason        string
-	transportManager       *transport.Manager
+
+	localENOBUFSRetries        int64
+	localENOBUFSWaitUS         int64
+	localENOBUFSMaxConsecutive int64
+
+	outOfOrderBytes       uint64
+	directPacketBytes     int64
+	directCommittedBytes  int64
+	directTransport       string
+	quicHandshakeMS       int64
+	quicFirstByteMS       int64
+	quicStreamBytesSent   int64
+	quicStreamBytesRecv   int64
+	quicStreamGoodputMbps string
+	quicSmoothedRTTMS     string
+	quicLossEvents        int64
+	quicCloseReason       string
+	transportManager      *transport.Manager
 
 	stripedSendBlocked             time.Duration
 	stripedReceivePendingChunks    int
@@ -109,6 +114,9 @@ type externalDirectTransferDiagnostics struct {
 	Retransmits                int64
 	RepairRequests             int64
 	RepairBytes                int64
+	LocalENOBUFSRetries        int64
+	LocalENOBUFSWaitUS         int64
+	LocalENOBUFSMaxConsecutive int64
 	DirectPacketBytes          int64
 	DirectCommittedBytes       int64
 	ReceiverCommittedBytes     uint64
@@ -658,6 +666,9 @@ func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrac
 		RetransmitCount:            m.retransmitCount,
 		RepairRequests:             m.repairRequests,
 		RepairBytes:                m.repairBytes,
+		LocalENOBUFSRetries:        m.localENOBUFSRetries,
+		LocalENOBUFSWaitUS:         m.localENOBUFSWaitUS,
+		LocalENOBUFSMaxConsecutive: m.localENOBUFSMaxConsecutive,
 		OutOfOrderBytes:            m.outOfOrderBytes,
 
 		StripedSendBlockedMS:           roundedUpMilliseconds(m.stripedSendBlocked),
@@ -789,6 +800,7 @@ func (m *externalTransferMetrics) setDirectCounterDiagnosticsLocked(diagnostics 
 	if diagnostics.RepairBytes > m.repairBytes {
 		m.repairBytes = diagnostics.RepairBytes
 	}
+	m.setLocalENOBUFSDiagnosticsLocked(diagnostics)
 	if diagnostics.DirectPacketBytes > m.directPacketBytes {
 		m.directPacketBytes = diagnostics.DirectPacketBytes
 	}
@@ -798,6 +810,18 @@ func (m *externalTransferMetrics) setDirectCounterDiagnosticsLocked(diagnostics 
 	if diagnostics.ReceiverCommittedBytes > 0 &&
 		uint64ToInt64Saturating(diagnostics.ReceiverCommittedBytes) > m.directCommittedBytes {
 		m.directCommittedBytes = uint64ToInt64Saturating(diagnostics.ReceiverCommittedBytes)
+	}
+}
+
+func (m *externalTransferMetrics) setLocalENOBUFSDiagnosticsLocked(diagnostics externalDirectTransferDiagnostics) {
+	if diagnostics.LocalENOBUFSRetries > m.localENOBUFSRetries {
+		m.localENOBUFSRetries = diagnostics.LocalENOBUFSRetries
+	}
+	if diagnostics.LocalENOBUFSWaitUS > m.localENOBUFSWaitUS {
+		m.localENOBUFSWaitUS = diagnostics.LocalENOBUFSWaitUS
+	}
+	if diagnostics.LocalENOBUFSMaxConsecutive > m.localENOBUFSMaxConsecutive {
+		m.localENOBUFSMaxConsecutive = diagnostics.LocalENOBUFSMaxConsecutive
 	}
 }
 
