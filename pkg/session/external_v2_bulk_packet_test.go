@@ -10,9 +10,11 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -143,6 +145,99 @@ func TestExternalV2BulkPacketSendPacketDoesNotCountShortWrite(t *testing.T) {
 	}
 	if got := sender.repairPayloadBytes.Load(); got != 0 {
 		t.Fatalf("repair payload bytes = %d, want 0", got)
+	}
+}
+
+func TestExternalV2BulkPacketSendPacketRetriesTransientNoBufferSpace(t *testing.T) {
+	senders, receivers := listenExternalV2BulkPacketTestConns(t, 1)
+	payload := bytes.Repeat([]byte{0x5a}, externalV2BulkPacketPayloadSize)
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &transientWriteFailureBulkPacketConn{
+		PacketConn: senders[0],
+	}
+	conn.remaining.Store(3)
+	sender := newExternalV2BulkPacketSender(
+		context.Background(),
+		&BlockSource{
+			Payload:     bytes.NewReader(payload),
+			PayloadSize: int64(len(payload)),
+		},
+		externalV2BulkPacketPath{
+			Conns: []net.PacketConn{conn},
+			Addrs: externalV2BulkPacketTestAddrs(receivers),
+		},
+		auth,
+		nil,
+	)
+	sender.pacer = rate.NewLimiter(0, externalV2BulkPacketPaceBurstBytes)
+
+	if err := sender.sendPacket(0, 0, false); err != nil {
+		t.Fatalf("sendPacket() error = %v, want transient write retry", err)
+	}
+	if got := conn.attempts.Load(); got != 4 {
+		t.Fatalf("write attempts = %d, want 4", got)
+	}
+	if got := sender.sentPackets.Load(); got != 1 {
+		t.Fatalf("sent packets = %d, want 1", got)
+	}
+}
+
+func TestExternalV2BulkPacketSendPacketStopsNoBufferSpaceRetriesOnCancellation(t *testing.T) {
+	senders, receivers := listenExternalV2BulkPacketTestConns(t, 1)
+	payload := bytes.Repeat([]byte{0x5a}, externalV2BulkPacketPayloadSize)
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &transientWriteFailureBulkPacketConn{
+		PacketConn: senders[0],
+		attempted:  make(chan struct{}),
+	}
+	conn.remaining.Store(3)
+	ctx, cancel := context.WithCancel(context.Background())
+	sender := newExternalV2BulkPacketSender(
+		ctx,
+		&BlockSource{
+			Payload:     bytes.NewReader(payload),
+			PayloadSize: int64(len(payload)),
+		},
+		externalV2BulkPacketPath{
+			Conns: []net.PacketConn{conn},
+			Addrs: externalV2BulkPacketTestAddrs(receivers),
+		},
+		auth,
+		nil,
+	)
+	sender.pacer = rate.NewLimiter(0, externalV2BulkPacketPaceBurstBytes)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sender.sendPacket(0, 0, false)
+	}()
+	select {
+	case <-conn.attempted:
+	case <-time.After(time.Second):
+		t.Fatal("sendPacket did not attempt WriteTo")
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("sendPacket() error = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("sendPacket did not stop after cancellation")
 	}
 }
 
@@ -993,6 +1088,34 @@ type shortWriteBulkPacketConn struct {
 
 func (c shortWriteBulkPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	return len(p) - 1, nil
+}
+
+type transientWriteFailureBulkPacketConn struct {
+	net.PacketConn
+	remaining   atomic.Int64
+	attempts    atomic.Int64
+	attempted   chan struct{}
+	attemptOnce sync.Once
+}
+
+func (c *transientWriteFailureBulkPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.attempts.Add(1)
+	if c.attempted != nil {
+		c.attemptOnce.Do(func() { close(c.attempted) })
+	}
+	if c.remaining.Add(-1) >= 0 {
+		return 0, &net.OpError{
+			Op:     "write",
+			Net:    "udp4",
+			Source: c.LocalAddr(),
+			Addr:   addr,
+			Err: &os.SyscallError{
+				Syscall: "sendto",
+				Err:     syscall.ENOBUFS,
+			},
+		}
+	}
+	return c.PacketConn.WriteTo(p, addr)
 }
 
 type deadlineBlockingBulkPacketConn struct {

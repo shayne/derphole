@@ -17,6 +17,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/shayne/derphole/pkg/token"
@@ -40,6 +41,7 @@ const (
 	externalV2BulkPacketDataQueue         = 4096
 	externalV2BulkPacketRepairQueue       = 1024
 	externalV2BulkPacketReceiveGroupBytes = 64 << 10
+	externalV2BulkPacketWriteRetryDelay   = 100 * time.Microsecond
 )
 
 const (
@@ -336,7 +338,7 @@ func (s *externalV2BulkPacketSender) sendPacket(index uint32, lane int, repair b
 	if err := s.pacer.WaitN(s.ctx, wireBytes); err != nil {
 		return err
 	}
-	n, err := s.path.Conns[lane].WriteTo(packet, s.path.Addrs[lane])
+	n, err := writeExternalV2BulkPacketData(s.ctx, s.path.Conns[lane], packet, s.path.Addrs[lane])
 	if err != nil {
 		return err
 	}
@@ -357,6 +359,22 @@ func (s *externalV2BulkPacketSender) sendPacket(index uint32, lane int, repair b
 		s.metrics.RecordDirectPacketSend(int64(len(data)), time.Now())
 	}
 	return nil
+}
+
+func writeExternalV2BulkPacketData(ctx context.Context, conn net.PacketConn, packet []byte, addr net.Addr) (int, error) {
+	for {
+		n, err := conn.WriteTo(packet, addr)
+		if !errors.Is(err, syscall.ENOBUFS) {
+			return n, err
+		}
+		timer := time.NewTimer(externalV2BulkPacketWriteRetryDelay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return 0, ctx.Err()
+		}
+	}
 }
 
 func (s *externalV2BulkPacketSender) startRepairWorker(ctx context.Context, missingCh <-chan []uint32, repairActivityCh chan<- struct{}, repairErrCh chan<- error) <-chan struct{} {
