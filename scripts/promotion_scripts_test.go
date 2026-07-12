@@ -175,6 +175,25 @@ command="${1:?missing command}"
 shift
 trace="${DERPHOLE_TRANSFER_TRACE_CSV:?missing trace path}"
 case "${command}" in
+  listen)
+    printf 'AAAAAAAAAAAAAAAAAAAAAAAA\n' >&2
+    printf 'connected-relay\nconnected-direct\nv2-block-transfer=bulk-packets\n' >&2
+    for _ in $(seq 1 200); do
+      [[ -f "${FAKE_DERPHOLE_STATE}/stream-payload" ]] && break
+      sleep 0.01
+    done
+    [[ -f "${FAKE_DERPHOLE_STATE}/stream-payload" ]]
+    cat "${FAKE_DERPHOLE_STATE}/stream-payload"
+    printf 'app_bytes,transfer_elapsed_ms,send_goodput_mbps,quic_first_byte_ms,direct_bytes,direct_validated\n1048576,10,838.86,1,1048576,true\n' >"${trace}"
+    exit "${FAKE_LISTEN_STATUS:-0}"
+    ;;
+  pipe)
+    token="${1:?missing token}"
+    [[ "${token}" == "AAAAAAAAAAAAAAAAAAAAAAAA" ]]
+    cat >"${FAKE_DERPHOLE_STATE}/stream-payload"
+    printf 'connected-relay\nconnected-direct\nv2-block-transfer=bulk-packets\n' >&2
+    printf 'app_bytes,transfer_elapsed_ms,send_goodput_mbps,quic_first_byte_ms,direct_bytes,direct_validated\n1048576,10,838.86,1,1048576,true\n' >"${trace}"
+    ;;
   send)
     payload="${1:?missing payload}"
     printf 'send\n' >>"${FAKE_DERPHOLE_STATE}/events"
@@ -229,7 +248,81 @@ esac
 `
 	writeExecutable(t, filepath.Join(distDir, "derphole"), fakeDerphole)
 	writeExecutable(t, filepath.Join(distDir, "derphole-linux-amd64"), fakeDerphole)
-	writeExecutable(t, filepath.Join(fakeBin, "mise"), "#!/bin/sh\nexit 0\n")
+	writeExecutable(t, filepath.Join(fakeBin, "mise"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${FAKE_DERPHOLE_STATE}/mise-events"
+if [[ "$*" != *"go build"* || "$*" != *"./tools/runstats"* ]]; then
+  exit 0
+fi
+out=""
+previous=""
+for arg in "$@"; do
+  if [[ "${previous}" == "-o" ]]; then
+    out="${arg}"
+    break
+  fi
+  previous="${arg}"
+done
+[[ -n "${out}" ]]
+mkdir -p "$(dirname "${out}")"
+cat >"${out}" <<'RUNSTATS'
+#!/usr/bin/env bash
+set -uo pipefail
+[[ "${1:-}" == "-out" ]]
+out="${2:?missing resource output}"
+shift 2
+[[ "${1:-}" == "--" ]]
+shift
+if [[ "${out}" == *"sender.resource.json" && "$0" != *"/remote/"* ]]; then
+  printf '%s\n' "$$" >"${FAKE_DERPHOLE_STATE}/local-runstats-pid"
+fi
+set +e
+child_pid=""
+forward_signal() {
+  if [[ -n "${child_pid}" ]]; then
+    kill -"$1" "${child_pid}" 2>/dev/null || true
+    (sleep 1.5; kill -KILL "${child_pid}" 2>/dev/null || true) &
+  fi
+}
+trap 'forward_signal TERM' TERM
+trap 'forward_signal INT' INT
+"$@" &
+child_pid=$!
+wait "${child_pid}"
+status=$?
+if kill -0 "${child_pid}" 2>/dev/null; then
+  wait "${child_pid}"
+  status=$?
+fi
+trap - TERM INT
+set -e
+printf '%s|%s|%s\n' "${out}" "${status}" "$*" >>"${FAKE_DERPHOLE_STATE}/runstats-events"
+case "${FAKE_RUNSTATS_MODE:-valid}" in
+  missing) rm -f "${out}" ;;
+  malformed) printf '{bad json\n' >"${out}" ;;
+  valid|unavailable)
+    available=true
+    if [[ "${FAKE_RUNSTATS_MODE:-valid}" == "unavailable" ]]; then
+      available=false
+    fi
+    if [[ "$0" == *"/remote/"* ]]; then
+      user=3.25
+      system=4.5
+      rss=200
+    else
+      user=1.25
+      system=2.5
+      rss=100
+    fi
+    printf '{"user_cpu_seconds":%s,"system_cpu_seconds":%s,"max_rss_bytes":%s,"resource_stats_available":%s,"exit_code":%s}\n' \
+      "${user}" "${system}" "${rss}" "${available}" "${status}" >"${out}"
+    ;;
+  *) exit 98 ;;
+esac
+exit "${status}"
+RUNSTATS
+chmod 0755 "${out}"
+`)
 	writeExecutable(t, filepath.Join(fakeBin, "pgrep"), "#!/bin/sh\nexit 1\n")
 	writeExecutable(t, filepath.Join(fakeBin, "sha256sum"), `#!/bin/sh
 exec shasum -a 256 "$@"
@@ -299,6 +392,8 @@ func (h promotionDriverTest) command(direction string, extraEnv map[string]strin
 	values := map[string]string{
 		"DERPHOLE_BENCH_TOOL":                 "derphole",
 		"DERPHOLE_BENCH_DIRECTION":            direction,
+		"DERPHOLE_BENCH_LOCAL_BIN":            filepath.Join(h.root, "dist", "derphole"),
+		"DERPHOLE_BENCH_LINUX_BIN":            filepath.Join(h.root, "dist", "derphole-linux-amd64"),
 		"DERPHOLE_BENCH_LOCAL_TMP_ROOT":       filepath.Join(h.root, "tmp"),
 		"DERPHOLE_BENCH_REMOTE_OUTPUT_ROOT":   filepath.Join(h.root, "remote"),
 		"DERPHOLE_BENCH_EXPECT_TRANSFER_MODE": "bulk-packets-v1",
@@ -355,6 +450,149 @@ func TestPromotionBenchmarkDefaultExecutesSendBeforeReceive(t *testing.T) {
 	harness.assertCleaned(t, "forward")
 }
 
+func TestPromotionBenchmarkBinaryOverridesStillBuildRunstats(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+	cmd := harness.command("forward", nil)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("benchmark with binary overrides failed: %v\n%s", err, output)
+	}
+
+	data, err := os.ReadFile(filepath.Join(harness.stateDir, "mise-events"))
+	if err != nil {
+		t.Fatalf("read mise events: %v", err)
+	}
+	events := string(data)
+	if strings.Contains(events, "run build\n") || strings.Contains(events, "run build-linux-amd64\n") {
+		t.Fatalf("binary overrides did not bypass derphole builds:\n%s", events)
+	}
+	if got := strings.Count(events, "go build"); got != 2 || strings.Count(events, "./tools/runstats") != 2 {
+		t.Fatalf("runstats build events = %q, want local and linux builds", events)
+	}
+	runstatsEvents, err := os.ReadFile(filepath.Join(harness.stateDir, "runstats-events"))
+	if err != nil {
+		t.Fatalf("read runstats events: %v", err)
+	}
+	if got := strings.Count(strings.TrimSpace(string(runstatsEvents)), "\n") + 1; got != 2 {
+		t.Fatalf("runstats invocation count = %d, want 2; events:\n%s", got, runstatsEvents)
+	}
+}
+
+func TestPromotionBenchmarkResourceFootersFollowFileRoles(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		direction string
+		want      map[string]string
+	}{
+		{
+			name:      "forward",
+			direction: "forward",
+			want: map[string]string{
+				"benchmark-sender-user-cpu-seconds":           "1.25",
+				"benchmark-sender-system-cpu-seconds":         "2.5",
+				"benchmark-sender-max-rss-bytes":              "100",
+				"benchmark-receiver-user-cpu-seconds":         "3.25",
+				"benchmark-receiver-system-cpu-seconds":       "4.5",
+				"benchmark-receiver-max-rss-bytes":            "200",
+				"benchmark-sender-resource-stats-available":   "true",
+				"benchmark-receiver-resource-stats-available": "true",
+				"benchmark-revision-label":                    "candidate-sha",
+			},
+		},
+		{
+			name:      "reverse",
+			direction: "reverse",
+			want: map[string]string{
+				"benchmark-sender-user-cpu-seconds":           "3.25",
+				"benchmark-sender-system-cpu-seconds":         "4.5",
+				"benchmark-sender-max-rss-bytes":              "200",
+				"benchmark-receiver-user-cpu-seconds":         "1.25",
+				"benchmark-receiver-system-cpu-seconds":       "2.5",
+				"benchmark-receiver-max-rss-bytes":            "100",
+				"benchmark-sender-resource-stats-available":   "true",
+				"benchmark-receiver-resource-stats-available": "true",
+				"benchmark-revision-label":                    "candidate-sha",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			harness := newPromotionDriverTest(t)
+			cmd := harness.command(tc.direction, map[string]string{
+				"DERPHOLE_BENCH_REVISION_LABEL": "candidate-sha",
+			})
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("%s benchmark failed: %v\n%s", tc.direction, err, output)
+			}
+			for field, want := range tc.want {
+				if got := benchmarkOutputValue(string(output), field); got != want {
+					t.Fatalf("%s = %q, want %q; output:\n%s", field, got, want, output)
+				}
+			}
+			harness.assertCleaned(t, tc.direction)
+		})
+	}
+}
+
+func TestPromotionBenchmarkPreservesChildExitAfterResourceJSON(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+	cmd := harness.command("reverse", map[string]string{"FAKE_RECEIVE_STATUS": "42"})
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("benchmark accepted failed receiver:\n%s", output)
+	}
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 42 {
+		t.Fatalf("benchmark exit = %v, want child exit 42; output:\n%s", err, output)
+	}
+	if got := benchmarkOutputValue(string(output), "benchmark-receiver-user-cpu-seconds"); got != "1.25" {
+		t.Fatalf("receiver resource footer = %q, want JSON written before exit; output:\n%s", got, output)
+	}
+	harness.assertCleaned(t, "reverse")
+}
+
+func TestPromotionBenchmarkRejectsMissingOrMalformedResourceJSON(t *testing.T) {
+	for _, mode := range []string{"missing", "malformed", "unavailable"} {
+		t.Run(mode, func(t *testing.T) {
+			harness := newPromotionDriverTest(t)
+			cmd := harness.command("forward", map[string]string{"FAKE_RUNSTATS_MODE": mode})
+			output, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("benchmark accepted %s resource stats:\n%s", mode, output)
+			}
+			if !strings.Contains(string(output), "resource") {
+				t.Fatalf("%s failure missing resource diagnostic:\n%s", mode, output)
+			}
+			harness.assertCleaned(t, "forward")
+		})
+	}
+}
+
+func TestPromotionBenchmarkRejectsPartialBinaryOverridePair(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+	cmd := harness.command("forward", map[string]string{"DERPHOLE_BENCH_LINUX_BIN": ""})
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("benchmark accepted partial binary override:\n%s", output)
+	}
+	if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 2 {
+		t.Fatalf("partial override error = %v, want exit 2; output:\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "DERPHOLE_BENCH_LOCAL_BIN and DERPHOLE_BENCH_LINUX_BIN") {
+		t.Fatalf("partial override output missing pair diagnostic:\n%s", output)
+	}
+}
+
+func benchmarkOutputValue(output, field string) string {
+	prefix := field + "="
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimPrefix(line, prefix)
+		}
+	}
+	return ""
+}
+
 func TestPromotionBenchmarkReverseRejectsRemoteSenderFailure(t *testing.T) {
 	harness := newPromotionDriverTest(t)
 	cmd := harness.command("reverse", map[string]string{"FAKE_SEND_STATUS": "23"})
@@ -365,7 +603,29 @@ func TestPromotionBenchmarkReverseRejectsRemoteSenderFailure(t *testing.T) {
 	if !strings.Contains(string(output), "remote derphole process exited with status 23") {
 		t.Fatalf("reverse sender failure output missing exit status:\n%s", output)
 	}
+	if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 23 {
+		t.Fatalf("reverse sender failure exit = %v, want 23; output:\n%s", err, output)
+	}
 	harness.assertCleaned(t, "reverse")
+}
+
+func TestPromotionBenchmarkForwardStreamPreservesRemoteReceiverExit(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+	cmd := harness.command("forward", map[string]string{
+		"DERPHOLE_BENCH_WORKLOAD": "stream",
+		"FAKE_LISTEN_STATUS":      "23",
+	})
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("forward stream accepted remote receiver failure:\n%s", output)
+	}
+	if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 23 {
+		t.Fatalf("forward receiver failure exit = %v, want 23; output:\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "remote derphole process exited with status 23") {
+		t.Fatalf("forward receiver failure output missing exit status:\n%s", output)
+	}
+	harness.assertCleaned(t, "forward")
 }
 
 func TestPromotionBenchmarkReverseWaitsForDelayedRemoteStatusVisibility(t *testing.T) {
@@ -465,6 +725,51 @@ func TestPromotionBenchmarkReverseFailureTerminatesRemoteSenderChild(t *testing.
 	harness.assertCleaned(t, "reverse")
 }
 
+func TestPromotionBenchmarkFailureWaitsForLocalRunstatsAndChild(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+	cmd := harness.command("forward", map[string]string{
+		"FAKE_RECEIVE_STATUS":    "42",
+		"FAKE_SEND_STAY_RUNNING": "1",
+	})
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("forward benchmark accepted remote receiver failure:\n%s", output)
+	}
+
+	childPID := readProcessID(t, filepath.Join(harness.stateDir, "remote-child-pid"), output)
+	wrapperPID := readProcessID(t, filepath.Join(harness.stateDir, "local-runstats-pid"), output)
+	for label, pid := range map[string]int{"measured child": childPID, "runstats wrapper": wrapperPID} {
+		if processExists(pid) {
+			t.Fatalf("local %s PID %d survived benchmark cleanup; output:\n%s", label, pid, output)
+		}
+	}
+
+	eventsPath := filepath.Join(harness.stateDir, "runstats-events")
+	before, _ := os.ReadFile(eventsPath)
+	time.Sleep(1800 * time.Millisecond)
+	after, _ := os.ReadFile(eventsPath)
+	if !bytes.Equal(after, before) {
+		t.Fatalf("runstats wrote after benchmark return: before=%q after=%q", before, after)
+	}
+	harness.assertCleaned(t, "forward")
+}
+
+func readProcessID(t *testing.T, path string, output []byte) int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read process PID %s: %v\n%s", path, err, output)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		t.Fatalf("parse process PID %q: %v", data, err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	})
+	return pid
+}
+
 func processExists(pid int) bool {
 	err := syscall.Kill(pid, 0)
 	return err == nil || err == syscall.EPERM
@@ -509,6 +814,7 @@ func TestPromotionBenchmarkPreservesRemoteFailureArtifacts(t *testing.T) {
 			}{
 				{suffix: ".log", want: "connected-direct"},
 				{suffix: ".trace.csv", want: "direct_validated"},
+				{suffix: ".resource.json", want: `"resource_stats_available":true`},
 			} {
 				pattern := "*-" + tc.role + artifact.suffix
 				matches, globErr := filepath.Glob(filepath.Join(logDir, pattern))
@@ -1146,6 +1452,141 @@ func TestPublicPathPerformanceHarnessCarriesBenchmarkOperands(t *testing.T) {
 	}
 }
 
+func TestPublicPathPerformanceHarnessAccountingMbpsMatch(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(filepath.Join(".", "public-path-performance-harness.sh"))
+	if err != nil {
+		t.Fatalf("read public-path-performance-harness.sh: %v", err)
+	}
+	definitions := scriptSection(
+		t,
+		string(data),
+		"accounting_mbps_match() {",
+		"\nextract_tracecheck_summary() {",
+	)
+
+	for _, tc := range []struct {
+		name      string
+		footer    string
+		trace     string
+		wantMatch bool
+	}{
+		{name: "one display unit", footer: "603.90", trace: "603.91", wantMatch: true},
+		{name: "one display unit reverse", footer: "603.91", trace: "603.90", wantMatch: true},
+		{name: "two display units", footer: "603.90", trace: "603.92"},
+		{name: "missing footer", footer: "", trace: "603.90"},
+		{name: "missing trace", footer: "603.90", trace: ""},
+		{name: "malformed footer", footer: "not-a-number", trace: "603.90"},
+		{name: "malformed trace", footer: "603.90", trace: "not-a-number"},
+		{name: "non-finite footer", footer: "NaN", trace: "603.90"},
+		{name: "non-finite trace", footer: "603.90", trace: "Infinity"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command(
+				"bash",
+				"-c",
+				definitions+"\n"+`accounting_mbps_match "$1" "$2"`,
+				"test",
+				tc.footer,
+				tc.trace,
+			)
+			output, err := cmd.CombinedOutput()
+			if tc.wantMatch && err != nil {
+				t.Fatalf("accounting values unexpectedly mismatched: %v\n%s", err, output)
+			}
+			if !tc.wantMatch && err == nil {
+				t.Fatalf("accounting values unexpectedly matched: footer=%q trace=%q", tc.footer, tc.trace)
+			}
+		})
+	}
+}
+
+func TestPublicPathPerformanceHarnessExtractsAccountingGoodputFailClosed(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(filepath.Join(".", "public-path-performance-harness.sh"))
+	if err != nil {
+		t.Fatalf("read public-path-performance-harness.sh: %v", err)
+	}
+	definitions := scriptSection(
+		t,
+		string(data),
+		"extract_benchmark_value() {",
+		"\nextract_tracecheck_summary() {",
+	)
+
+	for _, tc := range []struct {
+		name       string
+		fields     string
+		trace      string
+		wantFooter string
+		wantMatch  bool
+	}{
+		{
+			name:       "primary value",
+			fields:     "benchmark-goodput-mbps=603.90\nsender_goodput_mbps=12.34\n",
+			trace:      "603.90",
+			wantFooter: "603.90",
+			wantMatch:  true,
+		},
+		{
+			name:       "legacy fallback value",
+			fields:     "sender_goodput_mbps=603.90\n",
+			trace:      "603.90",
+			wantFooter: "603.90",
+			wantMatch:  true,
+		},
+		{
+			name:       "primary zero",
+			fields:     "benchmark-goodput-mbps=0\nsender_goodput_mbps=12.34\n",
+			trace:      "0.00",
+			wantFooter: "0",
+			wantMatch:  true,
+		},
+		{
+			name:       "legacy fallback zero",
+			fields:     "sender_goodput_mbps=0\n",
+			trace:      "0.00",
+			wantFooter: "0",
+			wantMatch:  true,
+		},
+		{
+			name:       "both fields absent",
+			fields:     "",
+			trace:      "0.00",
+			wantFooter: "",
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			outputPath := filepath.Join(t.TempDir(), "promotion.out")
+			if err := os.WriteFile(outputPath, []byte(tc.fields), 0o600); err != nil {
+				t.Fatalf("write promotion output: %v", err)
+			}
+			cmd := exec.Command(
+				"bash",
+				"-c",
+				definitions+"\n"+`footer="$(extract_benchmark_goodput "$1")"; printf '%s\n' "$footer"; accounting_mbps_match "$footer" "$2"`,
+				"test",
+				outputPath,
+				tc.trace,
+			)
+			output, err := cmd.CombinedOutput()
+			if got := strings.TrimSuffix(string(output), "\n"); got != tc.wantFooter {
+				t.Fatalf("extracted footer = %q, want %q", got, tc.wantFooter)
+			}
+			if tc.wantMatch && err != nil {
+				t.Fatalf("accounting values unexpectedly mismatched: %v", err)
+			}
+			if !tc.wantMatch && err == nil {
+				t.Fatalf("accounting values unexpectedly matched: footer=%q trace=%q", tc.wantFooter, tc.trace)
+			}
+		})
+	}
+}
+
 func TestPublicPathPerformanceHarnessRejectsOneSecondFlatline(t *testing.T) {
 	t.Parallel()
 
@@ -1259,6 +1700,19 @@ func TestPublicPathPerformanceHarnessSupportsInitialRateSchedule(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("public-path-performance-harness.sh missing %q", want)
 		}
+	}
+}
+
+func TestPublicPathPerformanceHarnessAppendsEfficiencyColumns(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(filepath.Join(".", "public-path-performance-harness.sh"))
+	if err != nil {
+		t.Fatalf("read public-path-performance-harness.sh: %v", err)
+	}
+	want := "revision_label,sender_user_cpu_seconds,sender_system_cpu_seconds,sender_cpu_seconds_per_gib,sender_max_rss_bytes,receiver_user_cpu_seconds,receiver_system_cpu_seconds,receiver_cpu_seconds_per_gib,receiver_max_rss_bytes,missing_scan_checks,pending_missing,pending_missing_peak,repair_requested_packets,repair_request_batches,reorder_trail_packets,receive_packet_rate_pps,scan_checks_per_packet"
+	if !strings.Contains(string(data), "receiver_windows_below_500_mbps,"+want+`\n' >"${summary_csv}"`) {
+		t.Fatalf("summary.csv does not append exact efficiency columns %q", want)
 	}
 }
 
@@ -1452,6 +1906,9 @@ exit 42
 	}
 	if got := derphole["transfer_mode"]; got != "bulk-packets-v1" {
 		t.Fatalf("derphole transfer_mode = %q, want bulk-packets-v1", got)
+	}
+	if got := derphole["revision_label"]; got != "" {
+		t.Fatalf("derphole revision_label = %q, want empty for unlabeled run", got)
 	}
 	if got := derphole["max_peer_recv_queue_depth"]; got != "0" {
 		t.Fatalf("derphole max_peer_recv_queue_depth = %q, want 0", got)
@@ -1738,7 +2195,7 @@ case "$*" in
     printf 'trace-ok rows=2 final_app_bytes=1048576 max_flatline=0s peer_delta_bytes=0 sender_mbps=12.34 receiver_mbps=12.34 max_peer_recv_queue_depth=3 min_rate_target_mbps=800 final_rate_target_mbps=900 controller_decreases=1 final_repair_bytes=1024 max_retransmits=2 local_enobufs_retries=0 local_enobufs_wait_us=0 local_enobufs_max_consecutive=0\n'
     ;;
   *"-role receive"*)
-    printf 'trace-ok rows=2 final_app_bytes=1048576 max_flatline=0s receiver_rate_p10_mbps=700.00 receiver_rate_p50_mbps=850.00 receiver_rate_p90_mbps=950.00 receiver_rate_cv=0.125 receiver_windows_below_500_mbps=0\n'
+    printf 'trace-ok rows=2 final_app_bytes=1048576 max_flatline=0s receiver_rate_p10_mbps=700.00 receiver_rate_p50_mbps=850.00 receiver_rate_p90_mbps=950.00 receiver_rate_cv=0.125 receiver_windows_below_500_mbps=0 missing_scan_checks=773 pending_missing=0 pending_missing_peak=9 repair_requested_packets=11 repair_request_batches=2 reorder_trail_packets=8192 receive_packet_rate_pps=45000\n'
     ;;
   *) exit 74 ;;
 esac
@@ -1758,6 +2215,15 @@ printf 'benchmark-total-duration-ms=750\n'
 printf 'benchmark-size-bytes=1048576\n'
 printf 'benchmark-workload=file\n'
 printf 'benchmark-transfer-mode=bulk-packets-v1\n'
+printf 'benchmark-sender-user-cpu-seconds=1.25\n'
+printf 'benchmark-sender-system-cpu-seconds=2.5\n'
+printf 'benchmark-sender-max-rss-bytes=100\n'
+printf 'benchmark-sender-resource-stats-available=true\n'
+printf 'benchmark-receiver-user-cpu-seconds=3.25\n'
+printf 'benchmark-receiver-system-cpu-seconds=4.5\n'
+printf 'benchmark-receiver-max-rss-bytes=200\n'
+printf 'benchmark-receiver-resource-stats-available=true\n'
+printf 'benchmark-revision-label=%s\n' "${DERPHOLE_BENCH_REVISION_LABEL}"
 `)
 
 			cmd := exec.Command("bash", "scripts/public-path-performance-harness.sh")
@@ -1770,6 +2236,7 @@ printf 'benchmark-transfer-mode=bulk-packets-v1\n'
 				"DERPHOLE_PUBLIC_PATH_DIRECTION":     tc.direction,
 				"DERPHOLE_PUBLIC_IPERF_SERVER_HOST":  "192.0.2.25",
 				"DERPHOLE_BENCH_LOG_DIR":             logDir,
+				"DERPHOLE_BENCH_REVISION_LABEL":      "candidate-sha",
 				"FAKE_SSH_STATE":                     sshState,
 			})
 			output, err := cmd.CombinedOutput()
@@ -1787,7 +2254,7 @@ printf 'benchmark-transfer-mode=bulk-packets-v1\n'
 					t.Fatalf("summary direction = %q, want %q", got, tc.direction)
 				}
 				if record["tool"] == "iperf3" {
-					for _, field := range []string{"repair_bytes", "repair_ratio", "retransmits", "local_enobufs_retries", "min_rate_target_mbps", "receiver_rate_p10_mbps"} {
+					for _, field := range []string{"repair_bytes", "repair_ratio", "retransmits", "local_enobufs_retries", "min_rate_target_mbps", "receiver_rate_p10_mbps", "revision_label", "sender_user_cpu_seconds", "scan_checks_per_packet"} {
 						if got := record[field]; got != "" {
 							t.Fatalf("iperf %s = %q, want empty", field, got)
 						}
@@ -1810,6 +2277,23 @@ printf 'benchmark-transfer-mode=bulk-packets-v1\n'
 					"receiver_rate_p90_mbps":          "950.00",
 					"receiver_rate_cv":                "0.125",
 					"receiver_windows_below_500_mbps": "0",
+					"revision_label":                  "candidate-sha",
+					"sender_user_cpu_seconds":         "1.25",
+					"sender_system_cpu_seconds":       "2.5",
+					"sender_cpu_seconds_per_gib":      "3840.000000",
+					"sender_max_rss_bytes":            "100",
+					"receiver_user_cpu_seconds":       "3.25",
+					"receiver_system_cpu_seconds":     "4.5",
+					"receiver_cpu_seconds_per_gib":    "7936.000000",
+					"receiver_max_rss_bytes":          "200",
+					"missing_scan_checks":             "773",
+					"pending_missing":                 "0",
+					"pending_missing_peak":            "9",
+					"repair_requested_packets":        "11",
+					"repair_request_batches":          "2",
+					"reorder_trail_packets":           "8192",
+					"receive_packet_rate_pps":         "45000",
+					"scan_checks_per_packet":          "1.000000",
 				} {
 					if got := record[field]; got != want {
 						t.Fatalf("derphole %s = %q, want %q", field, got, want)

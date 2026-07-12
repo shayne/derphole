@@ -26,6 +26,14 @@ if [[ -n "${bulk_initial_rate}" ]]; then
 fi
 transfer_mode="unknown"
 
+local_override="${DERPHOLE_BENCH_LOCAL_BIN:-}"
+linux_override="${DERPHOLE_BENCH_LINUX_BIN:-}"
+if [[ -n "${local_override}" && -z "${linux_override}" ]] ||
+   [[ -z "${local_override}" && -n "${linux_override}" ]]; then
+  echo "DERPHOLE_BENCH_LOCAL_BIN and DERPHOLE_BENCH_LINUX_BIN must be set together" >&2
+  exit 2
+fi
+
 target="${1:?usage: $0 <target> [size-mib]}"
 size_mib="${2:-1024}"
 expected_size="$((size_mib * 1048576))"
@@ -59,14 +67,33 @@ if [[ -n "${DERPHOLE_REMOTE_BIN_DIR:-}" ]]; then
 fi
 remote_bin="${remote_bin_dir}/${tool}"
 remote_upload="${remote_bin_dir}/${tool}.upload"
-local_bin="./dist/${tool}"
-linux_bin="dist/${tool}-linux-amd64"
+local_bin="${DERPHOLE_BENCH_LOCAL_BIN:-./dist/${tool}}"
+linux_bin="${DERPHOLE_BENCH_LINUX_BIN:-dist/${tool}-linux-amd64}"
+local_runstats="${tmp}/runstats"
+linux_runstats="${tmp}/runstats-linux-amd64"
+remote_runstats="${remote_bin_dir}/runstats"
+remote_runstats_upload="${remote_runstats}.upload"
 sender_log="${tmp}/sender.err"
 receiver_log="${tmp}/receiver.err"
 sender_trace_csv="${tmp}/sender.trace.csv"
 receiver_trace_csv="${tmp}/receiver.trace.csv"
+sender_resource_json="${tmp}/sender.resource.json"
+receiver_resource_json="${tmp}/receiver.resource.json"
+remote_sender_resource_json="${remote_base}.sender.resource.json"
+remote_receiver_resource_json="${remote_base}.receiver.resource.json"
 receiver_out="${tmp}/receiver.out"
 payload="${tmp}/payload.bin"
+revision_label="${DERPHOLE_BENCH_REVISION_LABEL:-}"
+sender_user_cpu_seconds=""
+sender_system_cpu_seconds=""
+sender_max_rss_bytes=""
+sender_resource_stats_available="false"
+sender_resource_exit_code=""
+receiver_user_cpu_seconds=""
+receiver_system_cpu_seconds=""
+receiver_max_rss_bytes=""
+receiver_resource_stats_available="false"
+receiver_resource_exit_code=""
 send_pid=""
 listener_pid=""
 remote_env=()
@@ -99,7 +126,8 @@ remote() {
 install_remote_bin() {
   local desired_dir="$1"
   local desired_bin="${desired_dir%/}/${tool}"
-  remote "install -m 0755 '${remote_upload}' '${desired_bin}' && rm -f '${remote_upload}' && '${desired_bin}' --help >/dev/null 2>&1"
+  local desired_runstats="${desired_dir%/}/runstats"
+  remote "install -m 0755 '${remote_upload}' '${desired_bin}' && install -m 0755 '${remote_runstats_upload}' '${desired_runstats}' && rm -f '${remote_upload}' '${remote_runstats_upload}' && '${desired_bin}' --help >/dev/null 2>&1"
 }
 
 now_ms() {
@@ -217,11 +245,125 @@ emit_benchmark_footer() {
     echo "benchmark-wall-goodput-mbps=${wall_goodput:-0}"
     echo "benchmark-peak-goodput-mbps=${peak_goodput_mbps}"
     echo "benchmark-first-byte-ms=${first_byte_ms}"
+    echo "benchmark-sender-user-cpu-seconds=${sender_user_cpu_seconds}"
+    echo "benchmark-sender-system-cpu-seconds=${sender_system_cpu_seconds}"
+    echo "benchmark-sender-max-rss-bytes=${sender_max_rss_bytes}"
+    echo "benchmark-sender-resource-stats-available=${sender_resource_stats_available}"
+    echo "benchmark-receiver-user-cpu-seconds=${receiver_user_cpu_seconds}"
+    echo "benchmark-receiver-system-cpu-seconds=${receiver_system_cpu_seconds}"
+    echo "benchmark-receiver-max-rss-bytes=${receiver_max_rss_bytes}"
+    echo "benchmark-receiver-resource-stats-available=${receiver_resource_stats_available}"
+    echo "benchmark-revision-label=${revision_label}"
     echo "benchmark-success=${success}"
     if [[ -n "${error_text}" ]]; then
       echo "benchmark-error=${error_text}"
     fi
   } >&"${stream}"
+}
+
+load_resource_stats_for_role() {
+  local role="$1"
+  local file="$2"
+  local summary
+  local user_cpu_seconds
+  local system_cpu_seconds
+  local max_rss_bytes
+  local available
+  local exit_code
+
+  if [[ ! -s "${file}" ]]; then
+    echo "missing ${role} resource JSON: ${file}" >&2
+    return 1
+  fi
+  if ! summary="$(python3 - "${file}" <<'PY'
+import json
+import math
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path) as fh:
+        value = json.load(fh)
+    required = {
+        "user_cpu_seconds",
+        "system_cpu_seconds",
+        "max_rss_bytes",
+        "resource_stats_available",
+        "exit_code",
+    }
+    if not isinstance(value, dict) or not required.issubset(value):
+        raise ValueError("missing required fields")
+    user = value["user_cpu_seconds"]
+    system = value["system_cpu_seconds"]
+    rss = value["max_rss_bytes"]
+    available = value["resource_stats_available"]
+    exit_code = value["exit_code"]
+    if isinstance(user, bool) or not isinstance(user, (int, float)) or not math.isfinite(user) or user < 0:
+        raise ValueError("invalid user_cpu_seconds")
+    if isinstance(system, bool) or not isinstance(system, (int, float)) or not math.isfinite(system) or system < 0:
+        raise ValueError("invalid system_cpu_seconds")
+    if isinstance(rss, bool) or not isinstance(rss, int) or rss < 0:
+        raise ValueError("invalid max_rss_bytes")
+    if not isinstance(available, bool):
+        raise ValueError("invalid resource_stats_available")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int) or exit_code < 0 or exit_code > 255:
+        raise ValueError("invalid exit_code")
+except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+    print(f"malformed resource JSON {path}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+print("\x1f".join((str(user), str(system), str(rss), str(available).lower(), str(exit_code))))
+PY
+)"; then
+    return 1
+  fi
+  IFS=$'\x1f' read -r user_cpu_seconds system_cpu_seconds max_rss_bytes available exit_code <<<"${summary}"
+  printf -v "${role}_user_cpu_seconds" '%s' "${user_cpu_seconds}"
+  printf -v "${role}_system_cpu_seconds" '%s' "${system_cpu_seconds}"
+  printf -v "${role}_max_rss_bytes" '%s' "${max_rss_bytes}"
+  printf -v "${role}_resource_stats_available" '%s' "${available}"
+  printf -v "${role}_resource_exit_code" '%s' "${exit_code}"
+}
+
+load_resource_stats() {
+  local status=0
+  load_resource_stats_for_role sender "${sender_resource_json}" || status=1
+  load_resource_stats_for_role receiver "${receiver_resource_json}" || status=1
+  return "${status}"
+}
+
+require_resource_stats() {
+  local local_role="sender"
+  local remote_role="receiver"
+  local sender_location="local"
+  local receiver_location="remote"
+  if [[ "${direction}" == "reverse" ]]; then
+    local_role="receiver"
+    remote_role="sender"
+    sender_location="remote"
+    receiver_location="local"
+  fi
+  if [[ "${sender_resource_exit_code}" != "0" ]]; then
+    echo "${sender_location} ${tool} process exited with status ${sender_resource_exit_code}" >&2
+    return "${sender_resource_exit_code}"
+  fi
+  if [[ "${receiver_resource_exit_code}" != "0" ]]; then
+    echo "${receiver_location} ${tool} process exited with status ${receiver_resource_exit_code}" >&2
+    return "${receiver_resource_exit_code}"
+  fi
+  if [[ "${remote_role}" == "sender" && "${sender_resource_stats_available}" != "true" ]] ||
+     [[ "${remote_role}" == "receiver" && "${receiver_resource_stats_available}" != "true" ]]; then
+    echo "remote Linux ${remote_role} resource stats are unavailable" >&2
+    return 1
+  fi
+  case "$(uname -s)" in
+    Darwin|Linux)
+      if [[ "${local_role}" == "sender" && "${sender_resource_stats_available}" != "true" ]] ||
+         [[ "${local_role}" == "receiver" && "${receiver_resource_stats_available}" != "true" ]]; then
+        echo "local ${local_role} resource stats are unavailable" >&2
+        return 1
+      fi
+      ;;
+  esac
 }
 
 count_local_udp_sockets() {
@@ -319,6 +461,16 @@ preserve_logs() {
       preserve_status=1
     fi
   fi
+  if [[ -f "${sender_resource_json}" ]]; then
+    if ! cp "${sender_resource_json}" "${log_dir}/${prefix}-sender.resource.json"; then
+      preserve_status=1
+    fi
+  fi
+  if [[ -f "${receiver_resource_json}" ]]; then
+    if ! cp "${receiver_resource_json}" "${log_dir}/${prefix}-receiver.resource.json"; then
+      preserve_status=1
+    fi
+  fi
   return "${preserve_status}"
 }
 
@@ -396,7 +548,7 @@ wait_remote_pid_status() {
           return 0
         fi
         echo "remote ${tool} process exited with status ${remote_status}" >&2
-        return 1
+        return "${remote_status}"
         ;;
       running)
         status_missing_polls=0
@@ -423,6 +575,8 @@ collect_remote_artifacts() {
   local collect_status=0
   local remote_log="${receiver_log}"
   local remote_trace="${receiver_trace_csv}"
+  local remote_resource="${remote_receiver_resource_json}"
+  local local_resource="${receiver_resource_json}"
 
   collect_remote_artifact() {
     local remote_path="$1"
@@ -447,11 +601,16 @@ collect_remote_artifacts() {
   if [[ "${direction}" == "reverse" ]]; then
     remote_log="${sender_log}"
     remote_trace="${sender_trace_csv}"
+    remote_resource="${remote_sender_resource_json}"
+    local_resource="${sender_resource_json}"
   fi
   if ! collect_remote_artifact "${remote_base}.err" "${remote_log}"; then
     collect_status=1
   fi
   if ! collect_remote_artifact "${remote_base}.trace.csv" "${remote_trace}"; then
+    collect_status=1
+  fi
+  if ! collect_remote_artifact "${remote_resource}" "${local_resource}"; then
     collect_status=1
   fi
   return "${collect_status}"
@@ -585,20 +744,63 @@ done
 exit \"\${cleanup_status}\""
 }
 
+local_process_running() {
+  local pid="$1"
+  local state
+  if ! kill -0 "${pid}" 2>/dev/null; then
+    return 1
+  fi
+  state="$(ps -o stat= -p "${pid}" 2>/dev/null | tr -d '[:space:]')"
+  [[ -n "${state}" && "${state}" != Z* ]]
+}
+
+terminate_local_process() {
+  local pid="$1"
+  if [[ ! "${pid}" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  if local_process_running "${pid}"; then
+    kill -TERM "${pid}" 2>/dev/null || true
+  fi
+  for _ in $(seq 1 40); do
+    local_process_running "${pid}" || break
+    sleep 0.05
+  done
+  if local_process_running "${pid}"; then
+    kill -KILL "${pid}" 2>/dev/null || true
+  fi
+  for _ in $(seq 1 40); do
+    local_process_running "${pid}" || break
+    sleep 0.05
+  done
+  if local_process_running "${pid}"; then
+    return 1
+  fi
+  wait "${pid}" 2>/dev/null || true
+}
+
 cleanup() {
   local cleanup_status=0
   local remote_cleanup_status=0
 
   if [[ -n "${send_pid}" ]]; then
-    kill "${send_pid}" 2>/dev/null || true
+    if ! terminate_local_process "${send_pid}"; then
+      echo "local sender cleanup incomplete: ${send_pid}" >&2
+      cleanup_status=1
+    fi
+    send_pid=""
   fi
   if [[ -n "${listener_pid}" ]]; then
-    kill "${listener_pid}" 2>/dev/null || true
+    if ! terminate_local_process "${listener_pid}"; then
+      echo "local receiver cleanup incomplete: ${listener_pid}" >&2
+      cleanup_status=1
+    fi
+    listener_pid=""
   fi
   if ! terminate_remote_processes >/dev/null 2>&1; then
     remote_cleanup_status=1
   fi
-  if ! remote "rm -f '${remote_base}.pid' '${remote_base}.child.pid' '${remote_base}.child.pid.tmp' '${remote_base}.status' '${remote_base}.status.tmp' '${remote_base}.payload' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_upload}'; rm -f '${remote_bin}'; rmdir '${remote_bin_dir}' '${remote_run_dir}' 2>/dev/null || true; if [[ -e '${remote_base}.pid' || -e '${remote_base}.child.pid' || -e '${remote_base}.child.pid.tmp' || -e '${remote_base}.status' || -e '${remote_base}.status.tmp' || -e '${remote_upload}' || -e '${remote_bin}' || -e '${remote_bin_dir}' || -e '${remote_run_dir}' ]]; then exit 1; fi" >/dev/null 2>&1; then
+  if ! remote "rm -f '${remote_base}.pid' '${remote_base}.child.pid' '${remote_base}.child.pid.tmp' '${remote_base}.status' '${remote_base}.status.tmp' '${remote_base}.payload' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_sender_resource_json}' '${remote_receiver_resource_json}' '${remote_upload}' '${remote_runstats_upload}'; rm -f '${remote_bin}' '${remote_runstats}'; rmdir '${remote_bin_dir}' '${remote_run_dir}' 2>/dev/null || true; if [[ -e '${remote_base}.pid' || -e '${remote_base}.child.pid' || -e '${remote_base}.child.pid.tmp' || -e '${remote_base}.status' || -e '${remote_base}.status.tmp' || -e '${remote_sender_resource_json}' || -e '${remote_receiver_resource_json}' || -e '${remote_upload}' || -e '${remote_runstats_upload}' || -e '${remote_bin}' || -e '${remote_runstats}' || -e '${remote_bin_dir}' || -e '${remote_run_dir}' ]]; then exit 1; fi" >/dev/null 2>&1; then
     remote_cleanup_status=1
   fi
   if [[ "${remote_cleanup_status}" -ne 0 ]]; then
@@ -628,6 +830,7 @@ handle_exit() {
   if ! collect_remote_artifacts; then
     echo "failed to collect remote benchmark artifacts" >&2
   fi
+  load_resource_stats || true
   dump_failure
   preserve_logs
   preserve_status="$?"
@@ -654,10 +857,15 @@ handle_exit() {
 trap 'handle_exit "$?"' EXIT
 
 build_and_install_remote_binary() {
-  mise run build
-  mise run build-linux-amd64
+  if [[ -z "${local_override}" ]]; then
+    mise run build
+    mise run build-linux-amd64
+  fi
+  mise exec -- go build -o "${local_runstats}" ./tools/runstats
+  GOOS=linux GOARCH=amd64 mise exec -- go build -o "${linux_runstats}" ./tools/runstats
   remote "mkdir -p '${remote_run_dir}' '${remote_bin_dir}'"
   scp "${linux_bin}" "${remote_target}:${remote_upload}" >/dev/null
+  scp "${linux_runstats}" "${remote_target}:${remote_runstats_upload}" >/dev/null
   if ! install_remote_bin "${remote_bin_dir}"; then
     echo "remote benchmark directory is not writable and executable; set DERPHOLE_REMOTE_BIN_DIR to a writable executable root" >&2
     exit 1
@@ -669,7 +877,7 @@ run_forward_derphole_stream() {
   dd if=/dev/urandom of="${payload}" bs=1048576 count="${size_mib}" 2>/dev/null
   source_sha="$(shasum -a 256 "${payload}" | awk '{print $1}')"
 
-  remote "rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv'; nohup env DERPHOLE_TRANSFER_TRACE_CSV='${remote_base}.trace.csv' '${remote_bin}' --verbose listen >'${remote_base}.out' 2>'${remote_base}.err' </dev/null & echo \$! > '${remote_base}.pid'"
+  remote "rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_receiver_resource_json}'; nohup env DERPHOLE_TRANSFER_TRACE_CSV='${remote_base}.trace.csv' '${remote_runstats}' -out '${remote_receiver_resource_json}' -- '${remote_bin}' --verbose listen >'${remote_base}.out' 2>'${remote_base}.err' </dev/null & echo \$! > '${remote_base}.pid'"
 
   token=""
   for _ in $(seq 1 200); do
@@ -686,15 +894,16 @@ run_forward_derphole_stream() {
 
   start_ms="$(now_ms)"
   if ((${#parallel_args[@]})); then
-    DERPHOLE_TRANSFER_TRACE_CSV="${sender_trace_csv}" "${local_bin}" --verbose pipe "${parallel_args[@]}" "${token}" < "${payload}" >/dev/null 2>"${sender_log}"
+    DERPHOLE_TRANSFER_TRACE_CSV="${sender_trace_csv}" "${local_runstats}" -out "${sender_resource_json}" -- "${local_bin}" --verbose pipe "${parallel_args[@]}" "${token}" < "${payload}" >/dev/null 2>"${sender_log}"
   else
-    DERPHOLE_TRANSFER_TRACE_CSV="${sender_trace_csv}" "${local_bin}" --verbose pipe "${token}" < "${payload}" >/dev/null 2>"${sender_log}"
+    DERPHOLE_TRANSFER_TRACE_CSV="${sender_trace_csv}" "${local_runstats}" -out "${sender_resource_json}" -- "${local_bin}" --verbose pipe "${token}" < "${payload}" >/dev/null 2>"${sender_log}"
   fi
 
   wait_remote_pid_exit
   command_end_ms="$(now_ms)"
   remote "cat '${remote_base}.err'" >"${receiver_log}"
   remote "cat '${remote_base}.trace.csv'" >"${receiver_trace_csv}"
+  remote "cat '${remote_receiver_resource_json}'" >"${receiver_resource_json}"
   sink_sha="$(remote "sha256sum '${remote_base}.out' | awk '{print \$1}'")"
   sink_size="$(remote "wc -c < '${remote_base}.out'")"
 }
@@ -703,11 +912,11 @@ run_forward_derphole_file() {
   echo "generating ${size_mib} MiB random payload"
   dd if=/dev/urandom of="${payload}" bs=1048576 count="${size_mib}" 2>/dev/null
   source_sha="$(shasum -a 256 "${payload}" | awk '{print $1}')"
-  rm -f "${sender_log}" "${sender_trace_csv}"
-  remote "rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv'"
+  rm -f "${sender_log}" "${sender_trace_csv}" "${sender_resource_json}"
+  remote "rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_receiver_resource_json}'"
 
   start_ms="$(now_ms)"
-  DERPHOLE_TRANSFER_TRACE_CSV="${sender_trace_csv}" "${local_bin}" --verbose send "${payload}" >/dev/null 2>"${sender_log}" &
+  DERPHOLE_TRANSFER_TRACE_CSV="${sender_trace_csv}" "${local_runstats}" -out "${sender_resource_json}" -- "${local_bin}" --verbose send "${payload}" >/dev/null 2>"${sender_log}" &
   send_pid="$!"
 
   token=""
@@ -719,13 +928,14 @@ run_forward_derphole_file() {
   done
   [[ -n "${token}" ]] || { echo "failed to capture send token" >&2; exit 1; }
 
-  remote "DERPHOLE_TRANSFER_TRACE_CSV='${remote_base}.trace.csv' '${remote_bin}' --verbose receive -o '${remote_base}.out' '${token}' >/dev/null 2>'${remote_base}.err'"
+  remote "DERPHOLE_TRANSFER_TRACE_CSV='${remote_base}.trace.csv' '${remote_runstats}' -out '${remote_receiver_resource_json}' -- '${remote_bin}' --verbose receive -o '${remote_base}.out' '${token}' >/dev/null 2>'${remote_base}.err'"
   wait "${send_pid}"
   send_pid=""
   command_end_ms="$(now_ms)"
 
   remote "cat '${remote_base}.err'" >"${receiver_log}"
   remote "cat '${remote_base}.trace.csv'" >"${receiver_trace_csv}"
+  remote "cat '${remote_receiver_resource_json}'" >"${receiver_resource_json}"
   sink_sha="$(remote "sha256sum '${remote_base}.out' | awk '{print \$1}'")"
   sink_size="$(remote "wc -c < '${remote_base}.out'")"
 }
@@ -735,7 +945,7 @@ run_reverse_derphole_stream() {
   remote "dd if=/dev/urandom of='${remote_base}.payload' bs=1048576 count='${size_mib}' 2>/dev/null"
   source_sha="$(remote "sha256sum '${remote_base}.payload' | awk '{print \$1}'")"
 
-  DERPHOLE_TRANSFER_TRACE_CSV="${receiver_trace_csv}" "${local_bin}" --verbose listen >"${receiver_out}" 2>"${receiver_log}" &
+  DERPHOLE_TRANSFER_TRACE_CSV="${receiver_trace_csv}" "${local_runstats}" -out "${receiver_resource_json}" -- "${local_bin}" --verbose listen >"${receiver_out}" 2>"${receiver_log}" &
   listener_pid="$!"
 
   token=""
@@ -752,7 +962,7 @@ run_reverse_derphole_stream() {
   fi
 
   local remote_send_cmd
-  remote_send_cmd="DERPHOLE_TRANSFER_TRACE_CSV='${remote_base}.trace.csv' '${remote_bin}' --verbose pipe"
+  remote_send_cmd="DERPHOLE_TRANSFER_TRACE_CSV='${remote_base}.trace.csv' '${remote_runstats}' -out '${remote_sender_resource_json}' -- '${remote_bin}' --verbose pipe"
   if [[ -n "${parallel_args_remote}" ]]; then
     remote_send_cmd+=" ${parallel_args_remote}"
   fi
@@ -766,6 +976,7 @@ run_reverse_derphole_stream() {
   command_end_ms="$(now_ms)"
   remote "cat '${remote_base}.err'" >"${sender_log}"
   remote "cat '${remote_base}.trace.csv'" >"${sender_trace_csv}"
+  remote "cat '${remote_sender_resource_json}'" >"${sender_resource_json}"
   sink_sha="$(shasum -a 256 "${receiver_out}" | awk '{print $1}')"
   sink_size="$(wc -c < "${receiver_out}" | tr -d '[:space:]')"
 }
@@ -774,7 +985,7 @@ run_reverse_derphole_file() {
   echo "generating ${size_mib} MiB random payload on ${target}"
   remote "dd if=/dev/urandom of='${remote_base}.payload' bs=1048576 count='${size_mib}' 2>/dev/null"
   source_sha="$(remote "sha256sum '${remote_base}.payload' | awk '{print \$1}'")"
-  remote "rm -f '${remote_base}.pid' '${remote_base}.child.pid' '${remote_base}.child.pid.tmp' '${remote_base}.status' '${remote_base}.status.tmp' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv'; nohup sh -c 'set +e; child_pid=; forward_signal() { signal=\$1; if [ -n \"\${child_pid}\" ]; then kill -\"\${signal}\" \"\${child_pid}\" 2>/dev/null || true; fi; }; trap \"forward_signal TERM\" TERM; trap \"forward_signal INT\" INT; DERPHOLE_TRANSFER_TRACE_CSV=\"${remote_base}.trace.csv\" \"${remote_bin}\" --verbose send \"${remote_base}.payload\" >\"${remote_base}.out\" 2>\"${remote_base}.err\" & child_pid=\$!; printf \"%s\\n\" \"\${child_pid}\" >\"${remote_base}.child.pid.tmp\"; mv \"${remote_base}.child.pid.tmp\" \"${remote_base}.child.pid\"; wait \"\${child_pid}\"; status=\$?; printf \"%s\\n\" \"\${status}\" >\"${remote_base}.status.tmp\"; mv \"${remote_base}.status.tmp\" \"${remote_base}.status\"; exit \"\${status}\"' >/dev/null 2>&1 </dev/null & echo \$! >'${remote_base}.pid'"
+  remote "rm -f '${remote_base}.pid' '${remote_base}.child.pid' '${remote_base}.child.pid.tmp' '${remote_base}.status' '${remote_base}.status.tmp' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_sender_resource_json}'; nohup sh -c 'set +e; child_pid=; forward_signal() { signal=\$1; if [ -n \"\${child_pid}\" ]; then kill -\"\${signal}\" \"\${child_pid}\" 2>/dev/null || true; fi; }; trap \"forward_signal TERM\" TERM; trap \"forward_signal INT\" INT; DERPHOLE_TRANSFER_TRACE_CSV=\"${remote_base}.trace.csv\" \"${remote_runstats}\" -out \"${remote_sender_resource_json}\" -- \"${remote_bin}\" --verbose send \"${remote_base}.payload\" >\"${remote_base}.out\" 2>\"${remote_base}.err\" & child_pid=\$!; printf \"%s\\n\" \"\${child_pid}\" >\"${remote_base}.child.pid.tmp\"; mv \"${remote_base}.child.pid.tmp\" \"${remote_base}.child.pid\"; wait \"\${child_pid}\"; status=\$?; printf \"%s\\n\" \"\${status}\" >\"${remote_base}.status.tmp\"; mv \"${remote_base}.status.tmp\" \"${remote_base}.status\"; exit \"\${status}\"' >/dev/null 2>&1 </dev/null & echo \$! >'${remote_base}.pid'"
 
   token=""
   for _ in $(seq 1 200); do
@@ -785,12 +996,13 @@ run_reverse_derphole_file() {
   [[ -n "${token}" ]] || { echo "failed to capture remote send token" >&2; exit 1; }
 
   start_ms="$(now_ms)"
-  DERPHOLE_TRANSFER_TRACE_CSV="${receiver_trace_csv}" "${local_bin}" --verbose receive -o "${receiver_out}" "${token}" >/dev/null 2>"${receiver_log}"
+  DERPHOLE_TRANSFER_TRACE_CSV="${receiver_trace_csv}" "${local_runstats}" -out "${receiver_resource_json}" -- "${local_bin}" --verbose receive -o "${receiver_out}" "${token}" >/dev/null 2>"${receiver_log}"
   wait_remote_pid_status
   command_end_ms="$(now_ms)"
 
   remote "cat '${remote_base}.err'" >"${sender_log}"
   remote "cat '${remote_base}.trace.csv'" >"${sender_trace_csv}"
+  remote "cat '${remote_sender_resource_json}'" >"${sender_resource_json}"
   sink_sha="$(shasum -a 256 "${receiver_out}" | awk '{print $1}')"
   sink_size="$(wc -c < "${receiver_out}" | tr -d '[:space:]')"
 }
@@ -813,6 +1025,11 @@ finalize_run() {
     echo "unexpected benchmark transfer mode: got ${transfer_mode}, want ${DERPHOLE_BENCH_EXPECT_TRANSFER_MODE}" >&2
     exit 1
   fi
+  if ! load_resource_stats; then
+    echo "benchmark resource JSON validation failed" >&2
+    exit 1
+  fi
+  require_resource_stats
 
   if path_changed_mid_run "${sender_trace}"; then
     sender_path_changed="true"

@@ -462,6 +462,66 @@ func TestExternalTransferMetricsDirectCountersNeverRegress(t *testing.T) {
 	}
 }
 
+func TestExternalTransferMetricsCarriesRepairEfficiencyDiagnostics(t *testing.T) {
+	var out bytes.Buffer
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleReceive, time.Unix(125, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(125, 0), rec, transfertrace.RoleReceive)
+	metrics.SetPhase(transfertrace.PhaseDirectExecute, "direct")
+	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
+		MissingScanChecks:      790_545,
+		PendingMissing:         1234,
+		PendingMissingPeak:     1234,
+		RepairRequestedPackets: 4567,
+		RepairRequestBatches:   32,
+		ReorderTrailPackets:    22_000,
+		ReceivePacketRatePPS:   88_000,
+	}, time.Unix(125, int64(100*time.Millisecond)))
+	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
+		MissingScanChecks:      790_000,
+		PendingMissing:         0,
+		PendingMissingPeak:     1200,
+		RepairRequestedPackets: 4500,
+		RepairRequestBatches:   30,
+		ReorderTrailPackets:    21_000,
+		ReceivePacketRatePPS:   87_000,
+	}, time.Unix(125, int64(200*time.Millisecond)))
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	metrics.mu.Lock()
+	if metrics.missingScanChecks != 790_545 ||
+		metrics.pendingMissing != 0 ||
+		metrics.pendingMissingPeak != 1234 ||
+		metrics.repairRequestedPackets != 4567 ||
+		metrics.repairRequestBatches != 32 ||
+		metrics.reorderTrailPackets != 22_000 ||
+		metrics.receivePacketRatePPS != 88_000 {
+		t.Fatalf("repair efficiency metrics = %#v", metrics)
+	}
+	metrics.mu.Unlock()
+
+	rows := readTransferTraceRows(t, out.String())
+	row := rows[len(rows)-1]
+	want := map[string]string{
+		"missing_scan_checks":      "790545",
+		"pending_missing":          "0",
+		"pending_missing_peak":     "1234",
+		"repair_requested_packets": "4567",
+		"repair_request_batches":   "32",
+		"reorder_trail_packets":    "22000",
+		"receive_packet_rate_pps":  "88000",
+	}
+	for column, value := range want {
+		if row[column] != value {
+			t.Fatalf("trace row[%q] = %q, want %q; row = %#v", column, row[column], value, row)
+		}
+	}
+}
+
 func TestExternalTransferMetricsSetDirectStatsUpdatesTrace(t *testing.T) {
 	var out bytes.Buffer
 	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(30, 0))

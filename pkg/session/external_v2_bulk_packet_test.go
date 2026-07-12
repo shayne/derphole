@@ -7,11 +7,12 @@ package session
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -21,6 +22,7 @@ import (
 	"github.com/shayne/derphole/pkg/token"
 	"github.com/shayne/derphole/pkg/transfertrace"
 	"go4.org/mem"
+	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/time/rate"
 	"tailscale.com/types/key"
 )
@@ -434,6 +436,689 @@ func TestExternalV2BulkPacketTopLevelClearsReadAndWriteDeadlines(t *testing.T) {
 	}
 }
 
+func TestExternalV2BulkPacketControlReaderReusesDeadlineAcrossSuccessfulReads(t *testing.T) {
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const runID = 7
+	conn := &scriptedReadBulkPacketConn{reads: []scriptedBulkPacketRead{
+		{packet: testExternalV2BulkPacketControlPacket(t, auth, externalV2BulkPacketHeader{kind: externalV2BulkPacketHello, total: 1})},
+		{packet: testExternalV2BulkPacketControlPacket(t, auth, externalV2BulkPacketHeader{kind: externalV2BulkPacketHello, total: 1})},
+		{packet: testExternalV2BulkPacketControlPacket(t, auth, externalV2BulkPacketHeader{kind: externalV2BulkPacketDone, runID: runID})},
+	}}
+
+	readExternalV2BulkPacketControlLoop(
+		context.Background(),
+		conn,
+		auth,
+		runID,
+		1,
+		make(chan []uint32, 1),
+		make(chan struct{}, 1),
+		make(chan struct{}, 2),
+		make(chan error, 1),
+		nil,
+	)
+
+	if got := conn.nonzeroReadDeadlines.Load(); got != 1 {
+		t.Fatalf("nonzero SetReadDeadline calls = %d, want 1 for three successful reads", got)
+	}
+}
+
+func TestExternalV2BulkPacketControlReaderRefreshesDeadlineAfterTimeout(t *testing.T) {
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const runID = 7
+	conn := &scriptedReadBulkPacketConn{reads: []scriptedBulkPacketRead{
+		{packet: testExternalV2BulkPacketControlPacket(t, auth, externalV2BulkPacketHeader{kind: externalV2BulkPacketHello, total: 1})},
+		{err: context.DeadlineExceeded},
+		{packet: testExternalV2BulkPacketControlPacket(t, auth, externalV2BulkPacketHeader{kind: externalV2BulkPacketDone, runID: runID})},
+	}}
+
+	readExternalV2BulkPacketControlLoop(
+		context.Background(),
+		conn,
+		auth,
+		runID,
+		1,
+		make(chan []uint32, 1),
+		make(chan struct{}, 1),
+		make(chan struct{}, 1),
+		make(chan error, 1),
+		nil,
+	)
+
+	if got := conn.nonzeroReadDeadlines.Load(); got != 2 {
+		t.Fatalf("nonzero SetReadDeadline calls = %d, want 2 after one timeout", got)
+	}
+}
+
+func TestExternalV2BulkPacketDataReadOwnsPayloadAfterReadBufferReuse(t *testing.T) {
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte{0x5a}, externalV2BulkPacketPayloadSize)
+	packet, err := sealExternalV2BulkPacket(auth.data, externalV2BulkPacketHeader{
+		kind:  externalV2BulkPacketData,
+		runID: 7,
+		index: 3,
+		total: 9,
+	}, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &repeatingReadBulkPacketConn{packet: packet}
+	reader := externalV2BulkPacketReader{conn: conn}
+	buf := make([]byte, externalV2BulkPacketMaxSize)
+	pool := newTrackingExternalV2BulkPacketPayloadPool()
+
+	result, ok, stop := readExternalV2BulkPacketDataWithPool(context.Background(), &reader, auth, buf, nil, pool)
+	if !ok || stop {
+		t.Fatalf("readExternalV2BulkPacketDataWithPool() = ok %v, stop %v", ok, stop)
+	}
+	for i := range buf {
+		buf[i] = 0xa5
+	}
+	if !bytes.Equal(result.data, payload) {
+		t.Fatalf("result data changed after encrypted read buffer reuse")
+	}
+	if got := pool.putCount(); got != 0 {
+		t.Fatalf("pool returns before result release = %d, want 0", got)
+	}
+	result.release()
+	result.release()
+	if got := pool.putCount(); got != 1 {
+		t.Fatalf("pool returns after two result releases = %d, want 1", got)
+	}
+	if result.data != nil {
+		t.Fatalf("result data after release = %d bytes, want nil", len(result.data))
+	}
+}
+
+func TestExternalV2BulkPacketDataReadRecyclesPayloadAllocation(t *testing.T) {
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte{0x5a}, externalV2BulkPacketPayloadSize)
+	packet, err := sealExternalV2BulkPacket(auth.data, externalV2BulkPacketHeader{
+		kind:  externalV2BulkPacketData,
+		runID: 7,
+		index: 3,
+		total: 9,
+	}, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &repeatingReadBulkPacketConn{packet: packet}
+	reader := externalV2BulkPacketReader{conn: conn}
+	buf := make([]byte, externalV2BulkPacketMaxSize)
+
+	header, ok := parseExternalV2BulkPacketHeader(packet)
+	if !ok {
+		t.Fatal("parseExternalV2BulkPacketHeader() failed")
+	}
+	nonce := externalV2BulkPacketNonce(header)
+	openBuf := make([]byte, 0, externalV2BulkPacketPayloadSize)
+	directOpenAllocs := testing.AllocsPerRun(1000, func() {
+		openedPayload, err := auth.data.Open(openBuf[:0], nonce[:], header.payload, packet[:externalV2BulkPacketHeaderSize])
+		if err != nil || len(openedPayload) != len(payload) {
+			t.Fatalf("AEAD.Open() = len %d, error %v", len(openedPayload), err)
+		}
+	})
+	openIntoAllocs := testing.AllocsPerRun(1000, func() {
+		_, openedPayload, opened := openExternalV2BulkPacketInto(auth.data, packet, openBuf[:0])
+		if !opened || len(openedPayload) != len(payload) {
+			t.Fatalf("openExternalV2BulkPacketInto() = len %d, opened %v", len(openedPayload), opened)
+		}
+	})
+	readAllocs := testing.AllocsPerRun(1000, func() {
+		result, ok, stop := readExternalV2BulkPacketData(context.Background(), &reader, auth, buf, nil)
+		if !ok || stop || len(result.data) != len(payload) {
+			t.Fatalf("readExternalV2BulkPacketData() = len %d, ok %v, stop %v", len(result.data), ok, stop)
+		}
+		result.release()
+	})
+	// Direct preallocated AEAD open measures zero payload allocations. The
+	// open-into wrapper independently measures the nonce/interface escape.
+	// Successful data read plus release must also be allocation-free.
+	t.Logf("allocations per successful data read plus release = %.0f, packet open-into = %.0f, direct preallocated AEAD open = %.0f", readAllocs, openIntoAllocs, directOpenAllocs)
+	if readAllocs != 0 {
+		t.Fatalf("allocations per successful data read plus release = %.0f, want 0", readAllocs)
+	}
+}
+
+func TestExternalV2BulkPacketReaderNonceScratchHandlesSequentialVariedHeaders(t *testing.T) {
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		header  externalV2BulkPacketHeader
+		payload []byte
+	}{
+		{
+			header: externalV2BulkPacketHeader{
+				kind: externalV2BulkPacketHello, runID: 0x0102030405060708, index: 0x11121314, total: 0x21222324,
+			},
+			payload: []byte{0x31},
+		},
+		{
+			header: externalV2BulkPacketHeader{
+				kind: externalV2BulkPacketMiss, runID: 0xf1e2d3c4b5a69788, index: 0xa1b2c3d4, total: 0xe5f60718,
+			},
+			payload: []byte{0x41, 0x42, 0x43, 0x44, 0x45},
+		},
+		{
+			header: externalV2BulkPacketHeader{
+				kind: externalV2BulkPacketDone, runID: 0x8070605040302010, index: 0x99887766, total: 0x55443322,
+			},
+			payload: []byte{0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59},
+		},
+	}
+
+	conn := &scriptedReadBulkPacketConn{}
+	for _, tt := range tests {
+		packet, err := sealExternalV2BulkPacket(auth.control, tt.header, tt.payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn.reads = append(conn.reads, scriptedBulkPacketRead{packet: packet})
+	}
+	reader := externalV2BulkPacketReader{conn: conn}
+	buf := make([]byte, externalV2BulkPacketMaxSize)
+	for i, tt := range tests {
+		header, payload, ok, stop := readExternalV2BulkPacketControl(context.Background(), &reader, auth, buf, nil)
+		if !ok || stop {
+			t.Fatalf("read %d = ok %v, stop %v", i, ok, stop)
+		}
+		if header.kind != tt.header.kind || header.runID != tt.header.runID || header.index != tt.header.index || header.total != tt.header.total || header.length != uint16(len(tt.payload)) {
+			t.Fatalf("read %d header = %+v, want kind %d run ID %x index %x total %x length %d", i, header, tt.header.kind, tt.header.runID, tt.header.index, tt.header.total, len(tt.payload))
+		}
+		if !bytes.Equal(payload, tt.payload) {
+			t.Fatalf("read %d payload = %x, want %x", i, payload, tt.payload)
+		}
+	}
+}
+
+func TestExternalV2BulkPacketReaderNonceScratchIsConcurrentReaderLocal(t *testing.T) {
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		readerCount = 8
+		readCount   = 250
+	)
+	start := make(chan struct{})
+	errCh := make(chan error, readerCount)
+	var readers sync.WaitGroup
+	readers.Add(readerCount)
+	for i := range readerCount {
+		header := externalV2BulkPacketHeader{
+			kind:  externalV2BulkPacketData,
+			runID: uint64(i+1) * 0x1011121314151617,
+			index: uint32(i)*0x01020304 + 1,
+			total: uint32(i)*0x10203040 + 7,
+		}
+		payload := bytes.Repeat([]byte{byte(0x80 + i)}, i+1)
+		packet, err := sealExternalV2BulkPacket(auth.data, header, payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			defer readers.Done()
+			<-start
+			reader := externalV2BulkPacketReader{conn: &repeatingReadBulkPacketConn{packet: packet}}
+			buf := make([]byte, externalV2BulkPacketMaxSize)
+			for read := range readCount {
+				result, ok, stop := readExternalV2BulkPacketData(context.Background(), &reader, auth, buf, nil)
+				if !ok || stop {
+					errCh <- fmt.Errorf("reader %d read %d = ok %v, stop %v", i, read, ok, stop)
+					return
+				}
+				if result.header.runID != header.runID || result.header.index != header.index || result.header.total != header.total || !bytes.Equal(result.data, payload) {
+					resultErr := fmt.Errorf("reader %d read %d result = header %+v payload %x, want header %+v payload %x", i, read, result.header, result.data, header, payload)
+					result.release()
+					errCh <- resultErr
+					return
+				}
+				result.release()
+			}
+		}()
+	}
+	close(start)
+	readers.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+}
+
+func TestExternalV2BulkPacketNonceAndWireVector(t *testing.T) {
+	keyBytes := [chacha20poly1305.KeySize]byte{
+		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+		0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+		0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+		0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+	}
+	aead, err := chacha20poly1305.NewX(keyBytes[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := externalV2BulkPacketHeader{
+		kind:   externalV2BulkPacketData,
+		runID:  0x0102030405060708,
+		index:  0x090a0b0c,
+		total:  0x0d0e0f10,
+		length: 3,
+	}
+	nonce := externalV2BulkPacketNonce(header)
+	if got, want := hex.EncodeToString(nonce[:]), "010203040506070801090a0b0c0d0e0f1000030000000000"; got != want {
+		t.Fatalf("nonce = %s, want %s", got, want)
+	}
+	packet, err := sealExternalV2BulkPacket(aead, header, []byte{0x11, 0x22, 0x33})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := hex.EncodeToString(packet), "44563242010000000102030405060708090a0b0c0d0e0f100003c01fd34ec5f7fc29b8c1329cc7e4bcb9e0168f"; got != want {
+		t.Fatalf("wire packet = %s, want %s", got, want)
+	}
+	openedHeader, openedPayload, ok := openExternalV2BulkPacket(aead, packet)
+	if !ok || openedHeader.kind != header.kind || openedHeader.runID != header.runID || openedHeader.index != header.index || openedHeader.total != header.total || openedHeader.length != header.length || !bytes.Equal(openedPayload, []byte{0x11, 0x22, 0x33}) {
+		t.Fatalf("open vector = header %+v payload %x ok %v", openedHeader, openedPayload, ok)
+	}
+}
+
+func TestExternalV2BulkPacketDataReadReturnsPayloadOnRejection(t *testing.T) {
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataPacket, err := sealExternalV2BulkPacket(auth.data, externalV2BulkPacketHeader{
+		kind:  externalV2BulkPacketData,
+		runID: 7,
+		index: 3,
+		total: 9,
+	}, bytes.Repeat([]byte{0x5a}, externalV2BulkPacketPayloadSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonDataPacket, err := sealExternalV2BulkPacket(auth.data, externalV2BulkPacketHeader{
+		kind:  externalV2BulkPacketMiss,
+		runID: 7,
+		index: 3,
+		total: 9,
+	}, []byte{0, 0, 0, 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authFailurePacket := append([]byte(nil), dataPacket...)
+	authFailurePacket[len(authFailurePacket)-1] ^= 0xff
+
+	for _, tt := range []struct {
+		name   string
+		packet []byte
+	}{
+		{name: "authentication failure", packet: authFailurePacket},
+		{name: "non-data packet", packet: nonDataPacket},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			pool := newTrackingExternalV2BulkPacketPayloadPool()
+			reader := externalV2BulkPacketReader{conn: &repeatingReadBulkPacketConn{packet: tt.packet}}
+			result, ok, stop := readExternalV2BulkPacketDataWithPool(
+				context.Background(),
+				&reader,
+				auth,
+				make([]byte, externalV2BulkPacketMaxSize),
+				nil,
+				pool,
+			)
+			if ok || stop {
+				t.Fatalf("readExternalV2BulkPacketDataWithPool() = result %#v, ok %v, stop %v", result, ok, stop)
+			}
+			if gets, puts := pool.counts(); gets != 1 || puts != 1 {
+				t.Fatalf("pool lifecycle = gets %d, puts %d, want 1, 1", gets, puts)
+			}
+		})
+	}
+}
+
+func TestExternalV2BulkPacketDataReaderReturnsPayloadOnEnqueueCancellation(t *testing.T) {
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, err := sealExternalV2BulkPacket(auth.data, externalV2BulkPacketHeader{
+		kind:  externalV2BulkPacketData,
+		runID: 7,
+		index: 0,
+		total: 1,
+	}, []byte("payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := make(chan struct{})
+	conn := &notifyingReadBulkPacketConn{
+		repeatingReadBulkPacketConn: repeatingReadBulkPacketConn{packet: packet},
+		read:                        read,
+	}
+	pool := newTrackingExternalV2BulkPacketPayloadPool()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		readExternalV2BulkPacketDataLoopWithPool(
+			ctx,
+			conn,
+			auth,
+			make(chan externalV2BulkPacketReceiveResult),
+			make(chan error, 1),
+			pool,
+		)
+	}()
+	<-read
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("data reader did not stop after enqueue cancellation")
+	}
+	if gets, puts := pool.counts(); gets != 1 || puts != 1 {
+		t.Fatalf("pool lifecycle = gets %d, puts %d, want 1, 1", gets, puts)
+	}
+}
+
+func TestExternalV2BulkPacketReceiverReturnsPayloadAfterHandling(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		configure   func(*externalV2BulkPacketReceiver)
+		header      externalV2BulkPacketHeader
+		data        []byte
+		payloadSize int64
+		wantRunErr  bool
+		wantContext bool
+	}{
+		{
+			name: "success",
+			header: externalV2BulkPacketHeader{
+				kind: externalV2BulkPacketData, runID: 7, index: 0, total: 1,
+			},
+			data:        []byte("payload"),
+			payloadSize: int64(len("payload")),
+		},
+		{
+			name: "duplicate",
+			configure: func(receiver *externalV2BulkPacketReceiver) {
+				receiver.runID = 7
+				receiver.seen[0] = true
+			},
+			header: externalV2BulkPacketHeader{
+				kind: externalV2BulkPacketData, runID: 7, index: 0, total: 2,
+			},
+			data:        bytes.Repeat([]byte{0x5a}, externalV2BulkPacketPayloadSize),
+			payloadSize: externalV2BulkPacketPayloadSize + 1,
+			wantRunErr:  true,
+			wantContext: true,
+		},
+		{
+			name: "invalid header",
+			header: externalV2BulkPacketHeader{
+				kind: externalV2BulkPacketData, runID: 7, index: 0, total: 3,
+			},
+			data:        bytes.Repeat([]byte{0x5a}, externalV2BulkPacketPayloadSize),
+			payloadSize: externalV2BulkPacketPayloadSize + 1,
+			wantRunErr:  true,
+			wantContext: true,
+		},
+		{
+			name: "invalid payload",
+			header: externalV2BulkPacketHeader{
+				kind: externalV2BulkPacketData, runID: 7, index: 0, total: 2,
+			},
+			data:        []byte("short"),
+			payloadSize: externalV2BulkPacketPayloadSize + 1,
+			wantRunErr:  true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			sink := newMemoryBlockSink(tt.payloadSize)
+			receiver := newExternalV2BulkPacketReceiver(
+				sink,
+				externalV2BlockReceiveConfig{PayloadSize: tt.payloadSize, ChunkSize: externalV2BulkPacketPayloadSize},
+				externalV2BulkPacketPath{},
+				externalV2BulkPacketAuth{},
+				nil,
+			)
+			receiver.stopHello = func() {}
+			if tt.configure != nil {
+				tt.configure(receiver)
+			}
+			pool := newTrackingExternalV2BulkPacketPayloadPool()
+			result := pool.result(tt.header, tt.data)
+			dataCh := make(chan externalV2BulkPacketReceiveResult)
+			ctx, cancel := context.WithCancel(context.Background())
+			sent := make(chan struct{})
+			go func() {
+				dataCh <- result
+				close(sent)
+			}()
+			if tt.wantContext {
+				go func() {
+					<-sent
+					cancel()
+				}()
+			} else {
+				defer cancel()
+			}
+			_, _, runErr := receiver.run(ctx, dataCh, make(chan error))
+			if tt.wantRunErr != (runErr != nil) {
+				t.Fatalf("receiver.run() error = %v, want error %v", runErr, tt.wantRunErr)
+			}
+			if tt.wantContext && !errors.Is(runErr, context.Canceled) {
+				t.Fatalf("receiver.run() error = %v, want context canceled", runErr)
+			}
+			if gets, puts := pool.counts(); gets != 1 || puts != 1 {
+				t.Fatalf("pool lifecycle = gets %d, puts %d, want 1, 1", gets, puts)
+			}
+		})
+	}
+}
+
+func TestExternalV2BulkPacketAssemblerCopiesBeforePayloadRelease(t *testing.T) {
+	first := bytes.Repeat([]byte{0x11}, externalV2BulkPacketPayloadSize)
+	second := bytes.Repeat([]byte{0x22}, externalV2BulkPacketPayloadSize)
+	sink := newMemoryBlockSink(int64(len(first) + len(second)))
+	receiver := newExternalV2BulkPacketReceiver(
+		sink,
+		externalV2BlockReceiveConfig{
+			PayloadSize: int64(len(first) + len(second)),
+			ChunkSize:   len(first) + len(second),
+		},
+		externalV2BulkPacketPath{},
+		externalV2BulkPacketAuth{},
+		nil,
+	)
+	receiver.stopHello = func() {}
+	pool := newTrackingExternalV2BulkPacketPayloadPool()
+	result := pool.result(externalV2BulkPacketHeader{
+		kind: externalV2BulkPacketData, runID: 7, index: 0, total: 2,
+	}, first)
+	dataCh := make(chan externalV2BulkPacketReceiveResult)
+	ctx, cancel := context.WithCancel(context.Background())
+	sent := make(chan struct{})
+	go func() {
+		dataCh <- result
+		close(sent)
+	}()
+	go func() {
+		<-sent
+		cancel()
+	}()
+	_, _, err := receiver.run(ctx, dataCh, make(chan error))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("receiver.run() error = %v, want context canceled", err)
+	}
+	reused := pool.get()
+	if len(reused.data) != 0 {
+		t.Fatalf("reused payload buffer length = %d, want 0", len(reused.data))
+	}
+	reused.data = reused.data[:externalV2BulkPacketPayloadSize]
+	for i := range reused.data {
+		reused.data[i] = 0xee
+	}
+	if _, err := receiver.assembler.add(1, second); err != nil {
+		t.Fatal(err)
+	}
+	want := append(append([]byte(nil), first...), second...)
+	if got := sink.bytes(); !bytes.Equal(got, want) {
+		t.Fatal("assembler retained released payload storage instead of its synchronous copy")
+	}
+	pool.put(reused)
+}
+
+func TestExternalV2BulkPacketManualReceiveResultReleaseIsNoOp(t *testing.T) {
+	result := externalV2BulkPacketReceiveResult{data: []byte("manual")}
+	result.release()
+	result.release()
+	if !bytes.Equal(result.data, []byte("manual")) {
+		t.Fatalf("manual result data = %q, want unchanged", result.data)
+	}
+}
+
+func TestExternalV2BulkPacketReceiverShutdownReturnsQueuedPayloads(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		payloadSize int64
+		firstHeader externalV2BulkPacketHeader
+		firstData   []byte
+		cancelFirst bool
+		wantRunErr  bool
+	}{
+		{
+			name:        "success",
+			payloadSize: int64(len("payload")),
+			firstHeader: externalV2BulkPacketHeader{
+				kind: externalV2BulkPacketData, runID: 7, index: 0, total: 1,
+			},
+			firstData: []byte("payload"),
+		},
+		{
+			name:        "receiver error",
+			payloadSize: externalV2BulkPacketPayloadSize + 1,
+			firstHeader: externalV2BulkPacketHeader{
+				kind: externalV2BulkPacketData, runID: 7, index: 0, total: 2,
+			},
+			firstData:  []byte("short"),
+			wantRunErr: true,
+		},
+		{
+			name:        "context cancellation",
+			payloadSize: externalV2BulkPacketPayloadSize + 1,
+			firstHeader: externalV2BulkPacketHeader{
+				kind: externalV2BulkPacketData, runID: 7, index: 0, total: 2,
+			},
+			firstData:   bytes.Repeat([]byte{0x5a}, externalV2BulkPacketPayloadSize),
+			cancelFirst: true,
+			wantRunErr:  true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			receiver := newExternalV2BulkPacketReceiver(
+				newMemoryBlockSink(tt.payloadSize),
+				externalV2BlockReceiveConfig{PayloadSize: tt.payloadSize, ChunkSize: externalV2BulkPacketPayloadSize},
+				externalV2BulkPacketPath{},
+				externalV2BulkPacketAuth{},
+				nil,
+			)
+			receiver.stopHello = func() {}
+			pool := newTrackingExternalV2BulkPacketPayloadPool()
+			results := []externalV2BulkPacketReceiveResult{
+				pool.result(tt.firstHeader, tt.firstData),
+				pool.result(externalV2BulkPacketHeader{
+					kind: externalV2BulkPacketData, runID: 7, index: 1, total: 2,
+				}, []byte{0x99}),
+			}
+			dataCh := make(chan externalV2BulkPacketReceiveResult, len(results))
+			readersDone := make(chan struct{})
+			ctx, cancel := context.WithCancel(context.Background())
+			if tt.cancelFirst {
+				cancel()
+				readersCancel := make(chan struct{})
+				cancel = func() { close(readersCancel) }
+				go func() {
+					<-readersCancel
+					for _, result := range results {
+						dataCh <- result
+					}
+					close(readersDone)
+				}()
+			} else {
+				for _, result := range results {
+					dataCh <- result
+				}
+				close(readersDone)
+			}
+			_, _, err := runExternalV2BulkPacketReceiver(
+				ctx,
+				receiver,
+				cancel,
+				readersDone,
+				dataCh,
+				make(chan error),
+			)
+			if tt.wantRunErr != (err != nil) {
+				t.Fatalf("runExternalV2BulkPacketReceiver() error = %v, want error %v", err, tt.wantRunErr)
+			}
+			if tt.cancelFirst && !errors.Is(err, context.Canceled) {
+				t.Fatalf("runExternalV2BulkPacketReceiver() error = %v, want context canceled", err)
+			}
+			if gets, puts := pool.counts(); gets != 2 || puts != 2 {
+				t.Fatalf("pool lifecycle after receiver shutdown = gets %d, puts %d, want 2, 2", gets, puts)
+			}
+			if got := len(dataCh); got != 0 {
+				t.Fatalf("queued receive results after shutdown = %d, want 0", got)
+			}
+		})
+	}
+}
+
 func TestExternalV2BulkPacketTopLevelStopsWhenReadDeadlineCannotBeSet(t *testing.T) {
 	senders, receivers := listenExternalV2BulkPacketTestConns(t, 1)
 	auth, err := externalV2BulkPacketAuthForToken(
@@ -644,6 +1329,49 @@ func TestExternalV2BulkPacketSendStatsPreservePartialProgressOnError(t *testing.
 	}
 	if stats.Diagnostics.DirectCommittedBytes != 0 {
 		t.Fatalf("DirectCommittedBytes = %d, want 0", stats.Diagnostics.DirectCommittedBytes)
+	}
+}
+
+func TestExternalV2BulkPacketReceiverResultReportsRepairEfficiency(t *testing.T) {
+	receiver := &externalV2BulkPacketReceiver{
+		cfg: externalV2BlockReceiveConfig{
+			PayloadSize: 8192,
+			HeaderBytes: 7,
+		},
+		laneCount:        4,
+		committedPayload: 4096,
+		repairRequests:   32,
+		missing: &externalV2BulkPacketMissingTracker{
+			scanChecks:       790_545,
+			pendingCount:     0,
+			pendingPeak:      1234,
+			requestedPackets: 4567,
+			requestBatches:   32,
+		},
+		receiveRate: externalV2BulkPacketReceiveRate{
+			trail:   22_000,
+			ewmaPPS: 88_000,
+		},
+	}
+
+	received, stats, err := receiver.result(nil)
+	if err != nil {
+		t.Fatalf("result() error = %v", err)
+	}
+	if received != 4103 || stats.BytesReceived != 4096 ||
+		stats.Diagnostics.DirectPacketBytes != 4096 ||
+		stats.Diagnostics.DirectCommittedBytes != 4096 {
+		t.Fatalf("byte accounting changed: received=%d stats=%#v", received, stats)
+	}
+	diagnostics := stats.Diagnostics
+	if diagnostics.MissingScanChecks != 790_545 ||
+		diagnostics.PendingMissing != 0 ||
+		diagnostics.PendingMissingPeak != 1234 ||
+		diagnostics.RepairRequestedPackets != 4567 ||
+		diagnostics.RepairRequestBatches != 32 ||
+		diagnostics.ReorderTrailPackets != 22_000 ||
+		diagnostics.ReceivePacketRatePPS != 88_000 {
+		t.Fatalf("repair efficiency diagnostics = %#v", diagnostics)
 	}
 }
 
@@ -1083,23 +1811,105 @@ func TestExternalV2BulkPacketDataPacketUsesConservativeMTU(t *testing.T) {
 	}
 }
 
-func TestExternalV2BulkPacketMissingBatchesHonorsLimit(t *testing.T) {
-	seen := []bool{true, false, false, true, false}
+func TestExternalV2BulkPacketActiveRepairDoesNotRescanHistory(t *testing.T) {
+	receiver := newExternalV2BulkPacketReceiver(nil, externalV2BlockReceiveConfig{PayloadSize: 100_000 * externalV2BulkPacketPayloadSize}, externalV2BulkPacketPath{}, externalV2BulkPacketAuth{}, nil)
+	receiver.runID = 1
+	receiver.highestSeenPlusOne = 80_000
+	for i := range 80_000 {
+		receiver.seen[i] = true
+	}
+	receiver.seen[10] = false
+	receiver.receiveRate.update(88_000, time.Second)
+	start := time.Unix(50, 0)
 
-	batches := externalV2BulkPacketMissingBatches(seen, 3)
-	if got, want := len(batches), 1; got != want {
-		t.Fatalf("len(batches) = %d, want %d", got, want)
+	receiver.sendActiveMissing(start)
+	first := receiver.missing.stats().ScanChecks
+	receiver.sendActiveMissing(start.Add(externalV2BulkPacketActiveRequestInterval))
+	second := receiver.missing.stats().ScanChecks
+	if first == 0 || second != first {
+		t.Fatalf("scan checks first=%d second=%d, want no historical rescan", first, second)
 	}
-	if got, want := batches[0], []uint32{1, 2}; !slices.Equal(got, want) {
-		t.Fatalf("limited missing batch = %v, want %v", got, want)
+}
+
+func TestExternalV2BulkPacketActiveRepairKeepsRecentReorder(t *testing.T) {
+	receiver := newExternalV2BulkPacketReceiver(nil, externalV2BlockReceiveConfig{PayloadSize: 100_000 * externalV2BulkPacketPayloadSize}, externalV2BulkPacketPath{}, externalV2BulkPacketAuth{}, nil)
+	receiver.runID = 1
+	receiver.highestSeenPlusOne = 50_000
+	receiver.receiveRate.update(88_000, time.Second)
+	for i := range 50_000 {
+		receiver.seen[i] = true
+	}
+	receiver.seen[49_000] = false
+	receiver.sendActiveMissing(time.Unix(60, 0))
+	if receiver.repairRequests != 0 {
+		t.Fatalf("repair requests = %d, want recent gap inside reorder window", receiver.repairRequests)
+	}
+}
+
+func TestExternalV2BulkPacketIdleRepairForcesTailGap(t *testing.T) {
+	receiver := newExternalV2BulkPacketReceiver(nil, externalV2BlockReceiveConfig{PayloadSize: 20 * externalV2BulkPacketPayloadSize}, externalV2BulkPacketPath{}, externalV2BulkPacketAuth{}, nil)
+	receiver.runID = 1
+	receiver.highestSeenPlusOne = 20
+	for i := range 20 {
+		receiver.seen[i] = true
+	}
+	receiver.seen[19] = false
+	receiver.sendIdleMissing(time.Unix(70, 0))
+	if receiver.repairRequests != 1 {
+		t.Fatalf("repair requests = %d, want immediate idle request", receiver.repairRequests)
+	}
+}
+
+func TestExternalV2BulkPacketIdleRepairWaitsForRun(t *testing.T) {
+	receiver := newExternalV2BulkPacketReceiver(nil, externalV2BlockReceiveConfig{PayloadSize: 20 * externalV2BulkPacketPayloadSize}, externalV2BulkPacketPath{}, externalV2BulkPacketAuth{}, nil)
+	receiver.highestSeenPlusOne = 20
+	for i := range 20 {
+		receiver.seen[i] = true
+	}
+	receiver.seen[19] = false
+	now := time.Unix(80, 0)
+
+	receiver.sendIdleMissing(now)
+	if got := receiver.missing.stats().ScanChecks; got != 0 {
+		t.Fatalf("pre-run scan checks = %d, want 0", got)
+	}
+	if receiver.repairRequests != 0 || receiver.controlSeq != 0 {
+		t.Fatalf("pre-run repair requests = %d, control writes = %d, want 0, 0", receiver.repairRequests, receiver.controlSeq)
 	}
 
-	batches = externalV2BulkPacketMissingBatches(seen, 99)
-	if got, want := len(batches), 1; got != want {
-		t.Fatalf("len(batches) after clamped limit = %d, want %d", got, want)
+	receiver.runID = 1
+	receiver.sendIdleMissing(now)
+	if got := receiver.missing.stats().ScanChecks; got != 20 {
+		t.Fatalf("started scan checks = %d, want 20", got)
 	}
-	if got, want := batches[0], []uint32{1, 2, 4}; !slices.Equal(got, want) {
-		t.Fatalf("clamped missing batch = %v, want %v", got, want)
+	if receiver.repairRequests != 1 || receiver.controlSeq != 1 {
+		t.Fatalf("started repair requests = %d, control writes = %d, want 1, 1", receiver.repairRequests, receiver.controlSeq)
+	}
+}
+
+func TestExternalV2BulkPacketRepairNoOpAfterReceiveComplete(t *testing.T) {
+	tests := []struct {
+		name string
+		send func(*externalV2BulkPacketReceiver, time.Time)
+	}{
+		{name: "active", send: (*externalV2BulkPacketReceiver).sendActiveMissing},
+		{name: "idle", send: (*externalV2BulkPacketReceiver).sendIdleMissing},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			receiver := newExternalV2BulkPacketReceiver(nil, externalV2BlockReceiveConfig{PayloadSize: 10_000 * externalV2BulkPacketPayloadSize}, externalV2BulkPacketPath{}, externalV2BulkPacketAuth{}, nil)
+			receiver.runID = 1
+			receiver.receivedPackets = receiver.totalPackets
+			receiver.highestSeenPlusOne = receiver.totalPackets
+
+			tt.send(receiver, time.Unix(90, 0))
+			if got := receiver.missing.stats().ScanChecks; got != 0 {
+				t.Fatalf("scan checks = %d, want 0", got)
+			}
+			if receiver.repairRequests != 0 || receiver.controlSeq != 0 {
+				t.Fatalf("repair requests = %d, control writes = %d, want 0, 0", receiver.repairRequests, receiver.controlSeq)
+			}
+		})
 	}
 }
 
@@ -1174,6 +1984,127 @@ type dropFirstBulkDataPacketConn struct {
 	mu      sync.Mutex
 	modulo  uint32
 	dropped map[uint32]struct{}
+}
+
+type scriptedBulkPacketRead struct {
+	packet []byte
+	err    error
+}
+
+type scriptedReadBulkPacketConn struct {
+	net.PacketConn
+	reads                []scriptedBulkPacketRead
+	nextRead             atomic.Int64
+	nonzeroReadDeadlines atomic.Int64
+}
+
+type repeatingReadBulkPacketConn struct {
+	net.PacketConn
+	packet []byte
+}
+
+type notifyingReadBulkPacketConn struct {
+	repeatingReadBulkPacketConn
+	read chan struct{}
+	once sync.Once
+}
+
+func (c *notifyingReadBulkPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, addr, err := c.repeatingReadBulkPacketConn.ReadFrom(p)
+	c.once.Do(func() { close(c.read) })
+	return n, addr, err
+}
+
+type trackingExternalV2BulkPacketPayloadPool struct {
+	mu      sync.Mutex
+	gets    int
+	puts    int
+	buffers []*externalV2BulkPacketPayloadBuffer
+}
+
+func newTrackingExternalV2BulkPacketPayloadPool() *trackingExternalV2BulkPacketPayloadPool {
+	return &trackingExternalV2BulkPacketPayloadPool{
+		buffers: []*externalV2BulkPacketPayloadBuffer{{
+			data: make([]byte, 0, externalV2BulkPacketPayloadSize),
+		}},
+	}
+}
+
+func (p *trackingExternalV2BulkPacketPayloadPool) get() *externalV2BulkPacketPayloadBuffer {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.gets++
+	if len(p.buffers) == 0 {
+		return &externalV2BulkPacketPayloadBuffer{data: make([]byte, 0, externalV2BulkPacketPayloadSize)}
+	}
+	last := len(p.buffers) - 1
+	buffer := p.buffers[last]
+	p.buffers = p.buffers[:last]
+	buffer.data = buffer.data[:0]
+	return buffer
+}
+
+func (p *trackingExternalV2BulkPacketPayloadPool) put(buffer *externalV2BulkPacketPayloadBuffer) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.puts++
+	buffer.data = buffer.data[:0]
+	p.buffers = append(p.buffers, buffer)
+}
+
+func (p *trackingExternalV2BulkPacketPayloadPool) counts() (int, int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.gets, p.puts
+}
+
+func (p *trackingExternalV2BulkPacketPayloadPool) putCount() int {
+	_, puts := p.counts()
+	return puts
+}
+
+func (p *trackingExternalV2BulkPacketPayloadPool) result(header externalV2BulkPacketHeader, data []byte) externalV2BulkPacketReceiveResult {
+	buffer := p.get()
+	buffer.data = append(buffer.data[:0], data...)
+	return externalV2BulkPacketReceiveResult{
+		header:        header,
+		data:          buffer.data,
+		payloadBuffer: buffer,
+		payloadPool:   p,
+	}
+}
+
+func (c *repeatingReadBulkPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	return copy(p, c.packet), nil, nil
+}
+
+func (c *repeatingReadBulkPacketConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (c *scriptedReadBulkPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	index := int(c.nextRead.Add(1) - 1)
+	if index >= len(c.reads) {
+		return 0, nil, errors.New("unexpected bulk packet read")
+	}
+	read := c.reads[index]
+	return copy(p, read.packet), nil, read.err
+}
+
+func (c *scriptedReadBulkPacketConn) SetReadDeadline(deadline time.Time) error {
+	if !deadline.IsZero() {
+		c.nonzeroReadDeadlines.Add(1)
+	}
+	return nil
+}
+
+func testExternalV2BulkPacketControlPacket(t *testing.T, auth externalV2BulkPacketAuth, header externalV2BulkPacketHeader) []byte {
+	t.Helper()
+	packet, err := sealExternalV2BulkPacket(auth.control, header, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return packet
 }
 
 func (c *dropFirstBulkDataPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {

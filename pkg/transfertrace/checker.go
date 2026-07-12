@@ -55,6 +55,14 @@ type DiagnosticsSummary struct {
 	ReceiverRateCV                 float64
 	ReceiverWindowsBelow500Mbps    int
 	ReceiverRateObserved           bool
+	MissingScanChecks              uint64
+	PendingMissing                 uint32
+	PendingMissingPeak             uint32
+	RepairRequestedPackets         uint64
+	RepairRequestBatches           uint64
+	ReorderTrailPackets            uint32
+	ReceivePacketRatePPS           uint32
+	ReceiverRepairObserved         bool
 	SenderHealthObserved           bool
 }
 
@@ -75,25 +83,26 @@ type PairResult struct {
 }
 
 type checkerIndexes struct {
-	fields             int
-	header             []string
-	timestamp          int
-	timestampName      string
-	role               int
-	phase              int
-	elapsedMS          int
-	appBytes           int
-	appMbps            int
-	peerReceivedBytes  int
-	transferElapsedMS  int
-	directValidated    int
-	fallbackReason     int
-	lastState          int
-	lastError          int
-	controllerDecision int
-	directTransport    int
-	senderHealthSchema bool
-	numericDiagnostics []checkerNumericDiagnostic
+	fields               int
+	header               []string
+	timestamp            int
+	timestampName        string
+	role                 int
+	phase                int
+	elapsedMS            int
+	appBytes             int
+	appMbps              int
+	peerReceivedBytes    int
+	transferElapsedMS    int
+	directValidated      int
+	fallbackReason       int
+	lastState            int
+	lastError            int
+	controllerDecision   int
+	directTransport      int
+	senderHealthSchema   bool
+	receiverRepairSchema bool
+	numericDiagnostics   []checkerNumericDiagnostic
 }
 
 type checkerRow struct {
@@ -132,6 +141,14 @@ type checkerRowDiagnostics struct {
 	stripedReceivePendingChunksMax int
 	stripedReceivePendingBytes     int64
 	stripedReceivePendingBytesMax  int64
+	missingScanChecks              uint64
+	pendingMissing                 uint32
+	pendingMissingPeak             uint32
+	repairRequestedPackets         uint64
+	repairRequestBatches           uint64
+	reorderTrailPackets            uint32
+	receivePacketRatePPS           uint32
+	receiverRepairObserved         bool
 	directTransport                string
 }
 
@@ -182,6 +199,27 @@ var checkerRowDiagnosticRecorders = map[string]func(*checkerRowDiagnostics, chec
 	"striped_receive_pending_bytes_max": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
 		d.stripedReceivePendingBytesMax = value.int64Value
 	},
+	"missing_scan_checks": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.missingScanChecks = value.uint64Value
+	},
+	"pending_missing": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.pendingMissing = value.uint32Value
+	},
+	"pending_missing_peak": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.pendingMissingPeak = value.uint32Value
+	},
+	"repair_requested_packets": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.repairRequestedPackets = value.uint64Value
+	},
+	"repair_request_batches": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.repairRequestBatches = value.uint64Value
+	},
+	"reorder_trail_packets": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.reorderTrailPackets = value.uint32Value
+	},
+	"receive_packet_rate_pps": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.receivePacketRatePPS = value.uint32Value
+	},
 }
 
 type checkerNumericDiagnosticKind int
@@ -189,6 +227,7 @@ type checkerNumericDiagnosticKind int
 const (
 	checkerNumericDiagnosticInt checkerNumericDiagnosticKind = iota
 	checkerNumericDiagnosticInt64
+	checkerNumericDiagnosticUint32
 	checkerNumericDiagnosticUint64
 	checkerNumericDiagnosticFloat
 )
@@ -207,6 +246,7 @@ type checkerNumericDiagnostic struct {
 type checkerNumericDiagnosticValue struct {
 	intValue    int
 	int64Value  int64
+	uint32Value uint32
 	uint64Value uint64
 	floatValue  float64
 }
@@ -245,6 +285,23 @@ var checkerNumericDiagnosticColumns = []checkerNumericDiagnosticColumn{
 	{name: "quic_stream_bytes_received", kind: checkerNumericDiagnosticInt64},
 	{name: "quic_stream_goodput_mbps", kind: checkerNumericDiagnosticFloat},
 	{name: "quic_loss_events", kind: checkerNumericDiagnosticInt64},
+	{name: "missing_scan_checks", kind: checkerNumericDiagnosticUint64},
+	{name: "pending_missing", kind: checkerNumericDiagnosticUint32},
+	{name: "pending_missing_peak", kind: checkerNumericDiagnosticUint32},
+	{name: "repair_requested_packets", kind: checkerNumericDiagnosticUint64},
+	{name: "repair_request_batches", kind: checkerNumericDiagnosticUint64},
+	{name: "reorder_trail_packets", kind: checkerNumericDiagnosticUint32},
+	{name: "receive_packet_rate_pps", kind: checkerNumericDiagnosticUint32},
+}
+
+var receiverRepairDiagnosticColumns = [...]string{
+	"missing_scan_checks",
+	"pending_missing",
+	"pending_missing_peak",
+	"repair_requested_packets",
+	"repair_request_batches",
+	"reorder_trail_packets",
+	"receive_packet_rate_pps",
 }
 
 type checker struct {
@@ -382,6 +439,16 @@ func (c *checker) recordDiagnostics(row checkerRow) {
 		diagnostics.DirectTransport = rowDiagnostics.directTransport
 	}
 	recordReceiverCommittedMbps(diagnostics, rowDiagnostics)
+	if row.role == RoleReceive && rowDiagnostics.receiverRepairObserved {
+		diagnostics.ReceiverRepairObserved = true
+		diagnostics.MissingScanChecks = max(diagnostics.MissingScanChecks, rowDiagnostics.missingScanChecks)
+		diagnostics.PendingMissing = rowDiagnostics.pendingMissing
+		diagnostics.PendingMissingPeak = max(diagnostics.PendingMissingPeak, rowDiagnostics.pendingMissingPeak)
+		diagnostics.RepairRequestedPackets = max(diagnostics.RepairRequestedPackets, rowDiagnostics.repairRequestedPackets)
+		diagnostics.RepairRequestBatches = max(diagnostics.RepairRequestBatches, rowDiagnostics.repairRequestBatches)
+		diagnostics.ReorderTrailPackets = max(diagnostics.ReorderTrailPackets, rowDiagnostics.reorderTrailPackets)
+		diagnostics.ReceivePacketRatePPS = max(diagnostics.ReceivePacketRatePPS, rowDiagnostics.receivePacketRatePPS)
+	}
 	if row.role == RoleSend {
 		c.recordSenderHealth(row)
 	}
@@ -621,7 +688,7 @@ func compareCheckerPair(primaryRows []checkerRow, peerRows []checkerRow, opts Pa
 		ProgressDeltaBytes:   delta,
 		MaxProgressLeadBytes: maxLead,
 		SenderRateMbps:       mbps(senderFinal.peerReceivedBytes, senderFinal.transferElapsedMS),
-		ReceiverRateMbps:     mbps(receiverFinal.appBytes, receiverTransferElapsedMS(receiverRows)),
+		ReceiverRateMbps:     mbps(receiverFinal.appBytes, receiverFinal.transferElapsedMS),
 	}
 	if delta != 0 {
 		return result, fmt.Errorf("sender peer_received_bytes = %d, receiver app_bytes = %d", senderFinal.peerReceivedBytes, receiverFinal.appBytes)
@@ -691,21 +758,6 @@ func firstReceiverAppElapsedMS(rows []checkerRow) int64 {
 		if row.appBytes > 0 && row.elapsedMS > 0 {
 			return row.elapsedMS
 		}
-	}
-	return 0
-}
-
-func receiverTransferElapsedMS(rows []checkerRow) int64 {
-	if len(rows) == 0 {
-		return 0
-	}
-	final := rows[len(rows)-1]
-	if final.transferElapsedMS > 0 {
-		return final.transferElapsedMS
-	}
-	base := firstReceiverAppElapsedMS(rows)
-	if base > 0 && final.elapsedMS > base {
-		return final.elapsedMS - base
 	}
 	return 0
 }
@@ -812,26 +864,36 @@ func checkerHeaderIndexes(header []string) (checkerIndexes, error) {
 		return checkerIndexes{}, err
 	}
 	return checkerIndexes{
-		fields:             len(header),
-		header:             append([]string(nil), header...),
-		timestamp:          timestamp,
-		timestampName:      timestampName,
-		role:               role,
-		phase:              phase,
-		elapsedMS:          optional("elapsed_ms"),
-		appBytes:           appBytes,
-		appMbps:            optional("app_mbps"),
-		peerReceivedBytes:  optional("peer_received_bytes"),
-		transferElapsedMS:  optional("transfer_elapsed_ms"),
-		directValidated:    optional("direct_validated"),
-		fallbackReason:     optional("fallback_reason"),
-		lastState:          optional("last_state"),
-		lastError:          lastError,
-		controllerDecision: optional("controller_decision"),
-		directTransport:    optional("direct_transport"),
-		senderHealthSchema: checkerSenderHealthSchema(positions),
-		numericDiagnostics: checkerNumericDiagnostics(positions),
+		fields:               len(header),
+		header:               append([]string(nil), header...),
+		timestamp:            timestamp,
+		timestampName:        timestampName,
+		role:                 role,
+		phase:                phase,
+		elapsedMS:            optional("elapsed_ms"),
+		appBytes:             appBytes,
+		appMbps:              optional("app_mbps"),
+		peerReceivedBytes:    optional("peer_received_bytes"),
+		transferElapsedMS:    optional("transfer_elapsed_ms"),
+		directValidated:      optional("direct_validated"),
+		fallbackReason:       optional("fallback_reason"),
+		lastState:            optional("last_state"),
+		lastError:            lastError,
+		controllerDecision:   optional("controller_decision"),
+		directTransport:      optional("direct_transport"),
+		senderHealthSchema:   checkerSenderHealthSchema(positions),
+		receiverRepairSchema: checkerReceiverRepairSchema(positions),
+		numericDiagnostics:   checkerNumericDiagnostics(positions),
 	}, nil
+}
+
+func checkerReceiverRepairSchema(positions map[string]int) bool {
+	for _, name := range receiverRepairDiagnosticColumns {
+		if _, ok := positions[name]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func checkerSenderHealthSchema(positions map[string]int) bool {
@@ -951,6 +1013,7 @@ func parseReceiverAppMbps(record []string, indexes checkerIndexes, rowNo int, ro
 
 func parseCheckerRowDiagnostics(record []string, indexes checkerIndexes, rowNo int, role Role, phase Phase) (checkerRowDiagnostics, error) {
 	var diagnostics checkerRowDiagnostics
+	diagnostics.receiverRepairObserved = checkerReceiverRepairObserved(record, indexes)
 	for _, column := range indexes.numericDiagnostics {
 		value, observed, err := parseCheckerNumericDiagnostic(record, column, rowNo)
 		if err != nil {
@@ -968,6 +1031,32 @@ func parseCheckerRowDiagnostics(record []string, indexes checkerIndexes, rowNo i
 	diagnostics.appMbpsObserved = appMbpsObserved
 	diagnostics.directTransport = field(record, indexes.directTransport)
 	return diagnostics, nil
+}
+
+func checkerReceiverRepairObserved(record []string, indexes checkerIndexes) bool {
+	if !indexes.receiverRepairSchema {
+		return false
+	}
+	observed := 0
+	for _, column := range indexes.numericDiagnostics {
+		if !isReceiverRepairDiagnosticColumn(column.name) {
+			continue
+		}
+		if field(record, column.index) == "" {
+			return false
+		}
+		observed++
+	}
+	return observed == len(receiverRepairDiagnosticColumns)
+}
+
+func isReceiverRepairDiagnosticColumn(name string) bool {
+	for _, column := range receiverRepairDiagnosticColumns {
+		if name == column {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *checkerRowDiagnostics) record(name string, value checkerNumericDiagnosticValue) {
@@ -1039,7 +1128,14 @@ func isOptionalTrailingDiagnosticColumn(name string) bool {
 		"quic_stream_goodput_mbps",
 		"quic_smoothed_rtt_ms",
 		"quic_loss_events",
-		"quic_close_reason":
+		"quic_close_reason",
+		"missing_scan_checks",
+		"pending_missing",
+		"pending_missing_peak",
+		"repair_requested_packets",
+		"repair_request_batches",
+		"reorder_trail_packets",
+		"receive_packet_rate_pps":
 		return true
 	default:
 		return false
@@ -1131,6 +1227,9 @@ func parseCheckerNumericDiagnostic(record []string, column checkerNumericDiagnos
 	case checkerNumericDiagnosticInt64:
 		n, err := strconv.ParseInt(value, 10, 64)
 		return checkerNumericDiagnosticValue{int64Value: n}, err == nil, formatCheckerNumericDiagnosticError(err, rowNo, column.name, value)
+	case checkerNumericDiagnosticUint32:
+		n, err := strconv.ParseUint(value, 10, 32)
+		return checkerNumericDiagnosticValue{uint32Value: uint32(n)}, err == nil, formatCheckerNumericDiagnosticError(err, rowNo, column.name, value)
 	case checkerNumericDiagnosticUint64:
 		n, err := strconv.ParseUint(value, 10, 64)
 		return checkerNumericDiagnosticValue{uint64Value: n}, err == nil, formatCheckerNumericDiagnosticError(err, rowNo, column.name, value)

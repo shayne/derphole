@@ -64,6 +64,13 @@ type externalTransferMetrics struct {
 	retransmitCount        int64
 	repairRequests         int64
 	repairBytes            int64
+	missingScanChecks      uint64
+	pendingMissing         uint32
+	pendingMissingPeak     uint32
+	repairRequestedPackets uint64
+	repairRequestBatches   uint64
+	reorderTrailPackets    uint32
+	receivePacketRatePPS   uint32
 
 	localENOBUFSRetries        int64
 	localENOBUFSWaitUS         int64
@@ -120,6 +127,13 @@ type externalDirectTransferDiagnostics struct {
 	DirectPacketBytes          int64
 	DirectCommittedBytes       int64
 	ReceiverCommittedBytes     uint64
+	MissingScanChecks          uint64
+	PendingMissing             uint32
+	PendingMissingPeak         uint32
+	RepairRequestedPackets     uint64
+	RepairRequestBatches       uint64
+	ReorderTrailPackets        uint32
+	ReceivePacketRatePPS       uint32
 }
 
 type externalPeerProgressSnapshot struct {
@@ -666,6 +680,13 @@ func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrac
 		RetransmitCount:            m.retransmitCount,
 		RepairRequests:             m.repairRequests,
 		RepairBytes:                m.repairBytes,
+		MissingScanChecks:          m.missingScanChecks,
+		PendingMissing:             m.pendingMissing,
+		PendingMissingPeak:         m.pendingMissingPeak,
+		RepairRequestedPackets:     m.repairRequestedPackets,
+		RepairRequestBatches:       m.repairRequestBatches,
+		ReorderTrailPackets:        m.reorderTrailPackets,
+		ReceivePacketRatePPS:       m.receivePacketRatePPS,
 		LocalENOBUFSRetries:        m.localENOBUFSRetries,
 		LocalENOBUFSWaitUS:         m.localENOBUFSWaitUS,
 		LocalENOBUFSMaxConsecutive: m.localENOBUFSMaxConsecutive,
@@ -800,6 +821,7 @@ func (m *externalTransferMetrics) setDirectCounterDiagnosticsLocked(diagnostics 
 	if diagnostics.RepairBytes > m.repairBytes {
 		m.repairBytes = diagnostics.RepairBytes
 	}
+	m.setRepairEfficiencyDiagnosticsLocked(diagnostics)
 	m.setLocalENOBUFSDiagnosticsLocked(diagnostics)
 	if diagnostics.DirectPacketBytes > m.directPacketBytes {
 		m.directPacketBytes = diagnostics.DirectPacketBytes
@@ -810,6 +832,28 @@ func (m *externalTransferMetrics) setDirectCounterDiagnosticsLocked(diagnostics 
 	if diagnostics.ReceiverCommittedBytes > 0 &&
 		uint64ToInt64Saturating(diagnostics.ReceiverCommittedBytes) > m.directCommittedBytes {
 		m.directCommittedBytes = uint64ToInt64Saturating(diagnostics.ReceiverCommittedBytes)
+	}
+}
+
+func (m *externalTransferMetrics) setRepairEfficiencyDiagnosticsLocked(diagnostics externalDirectTransferDiagnostics) {
+	if diagnostics.MissingScanChecks > m.missingScanChecks {
+		m.missingScanChecks = diagnostics.MissingScanChecks
+	}
+	m.pendingMissing = diagnostics.PendingMissing
+	if diagnostics.PendingMissingPeak > m.pendingMissingPeak {
+		m.pendingMissingPeak = diagnostics.PendingMissingPeak
+	}
+	if diagnostics.RepairRequestedPackets > m.repairRequestedPackets {
+		m.repairRequestedPackets = diagnostics.RepairRequestedPackets
+	}
+	if diagnostics.RepairRequestBatches > m.repairRequestBatches {
+		m.repairRequestBatches = diagnostics.RepairRequestBatches
+	}
+	if diagnostics.ReorderTrailPackets > m.reorderTrailPackets {
+		m.reorderTrailPackets = diagnostics.ReorderTrailPackets
+	}
+	if diagnostics.ReceivePacketRatePPS > m.receivePacketRatePPS {
+		m.receivePacketRatePPS = diagnostics.ReceivePacketRatePPS
 	}
 }
 

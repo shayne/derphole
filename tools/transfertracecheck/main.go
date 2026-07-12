@@ -92,6 +92,7 @@ func formatDiagnosticsSummary(diagnostics transfertrace.DiagnosticsSummary) stri
 	}
 	summary += formatSenderHealthSummary(diagnostics)
 	summary += formatReceiverRateSummary(diagnostics)
+	summary += formatReceiverRepairSummary(diagnostics)
 	return summary
 }
 
@@ -122,6 +123,21 @@ func formatReceiverRateSummary(diagnostics transfertrace.DiagnosticsSummary) str
 		)
 	}
 	return ""
+}
+
+func formatReceiverRepairSummary(d transfertrace.DiagnosticsSummary) string {
+	if !d.ReceiverRepairObserved {
+		return ""
+	}
+	return fmt.Sprintf(" missing_scan_checks=%d pending_missing=%d pending_missing_peak=%d repair_requested_packets=%d repair_request_batches=%d reorder_trail_packets=%d receive_packet_rate_pps=%d",
+		d.MissingScanChecks,
+		d.PendingMissing,
+		d.PendingMissingPeak,
+		d.RepairRequestedPackets,
+		d.RepairRequestBatches,
+		d.ReorderTrailPackets,
+		d.ReceivePacketRatePPS,
+	)
 }
 
 func parseOptions(args []string, stderr io.Writer) (options, error) {

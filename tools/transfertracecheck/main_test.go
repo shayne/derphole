@@ -133,6 +133,24 @@ func TestFormatDiagnosticsSummaryPrintsCurrentSenderZeroHealth(t *testing.T) {
 	}
 }
 
+func TestRunPrintsRepairEfficiencySummary(t *testing.T) {
+	path := writeTrace(t,
+		"timestamp_unix_ms,role,phase,app_bytes,last_error,missing_scan_checks,pending_missing,pending_missing_peak,repair_requested_packets,repair_request_batches,reorder_trail_packets,receive_packet_rate_pps\n"+
+			"1000,receive,complete,4096,,790545,0,1234,4567,32,22000,88000\n")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-role", "receive", "-expected-bytes", "4096", path}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() exit = %d, stderr = %q", code, stderr.String())
+	}
+	want := "missing_scan_checks=790545 pending_missing=0 pending_missing_peak=1234 repair_requested_packets=4567 repair_request_batches=32 reorder_trail_packets=22000 receive_packet_rate_pps=88000"
+	if !strings.Contains(stdout.String(), want) {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
 func TestRunChecksPeerTraceSuccess(t *testing.T) {
 	sendPath := writeTrace(t, transfertrace.HeaderLine+"\n"+
 		"1000,0,send,complete,1024,0,1024,1024,0.00,1024,1024,,500,false,,,,,,,,,,,,stream-complete,\n")

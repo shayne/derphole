@@ -79,6 +79,47 @@ func TestRecorderComputesDeltaAndMbps(t *testing.T) {
 	assertColumn(t, row, indexes, "app_mbps", "8.39")
 }
 
+func TestRecorderWritesRepairEfficiencyDiagnostics(t *testing.T) {
+	var out bytes.Buffer
+	rec, err := NewRecorder(&out, RoleReceive, time.Unix(250, 0))
+	if err != nil {
+		t.Fatalf("NewRecorder() error = %v", err)
+	}
+	rec.Observe(Snapshot{
+		At:                     time.Unix(251, 0),
+		Phase:                  PhaseComplete,
+		MissingScanChecks:      790_545,
+		PendingMissing:         0,
+		PendingMissingPeak:     1234,
+		RepairRequestedPackets: 4567,
+		RepairRequestBatches:   32,
+		ReorderTrailPackets:    22_000,
+		ReceivePacketRatePPS:   88_000,
+	})
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	records, indexes := readTraceCSV(t, out.String())
+	assertHeaderSuffix(t, records[0], []string{
+		"missing_scan_checks",
+		"pending_missing",
+		"pending_missing_peak",
+		"repair_requested_packets",
+		"repair_request_batches",
+		"reorder_trail_packets",
+		"receive_packet_rate_pps",
+	})
+	row := records[1]
+	assertColumn(t, row, indexes, "missing_scan_checks", "790545")
+	assertColumn(t, row, indexes, "pending_missing", "0")
+	assertColumn(t, row, indexes, "pending_missing_peak", "1234")
+	assertColumn(t, row, indexes, "repair_requested_packets", "4567")
+	assertColumn(t, row, indexes, "repair_request_batches", "32")
+	assertColumn(t, row, indexes, "reorder_trail_packets", "22000")
+	assertColumn(t, row, indexes, "receive_packet_rate_pps", "88000")
+}
+
 func TestRecorderErrorRowIsTerminal(t *testing.T) {
 	var out bytes.Buffer
 	rec, err := NewRecorder(&out, RoleSend, time.Unix(300, 0))
@@ -606,6 +647,13 @@ func directPathDiagnosticHeader() []string {
 		"quic_smoothed_rtt_ms",
 		"quic_loss_events",
 		"quic_close_reason",
+		"missing_scan_checks",
+		"pending_missing",
+		"pending_missing_peak",
+		"repair_requested_packets",
+		"repair_request_batches",
+		"reorder_trail_packets",
+		"receive_packet_rate_pps",
 	}
 }
 

@@ -101,6 +101,13 @@ var header = [...]string{
 	"quic_smoothed_rtt_ms",
 	"quic_loss_events",
 	"quic_close_reason",
+	"missing_scan_checks",
+	"pending_missing",
+	"pending_missing_peak",
+	"repair_requested_packets",
+	"repair_request_batches",
+	"reorder_trail_packets",
+	"receive_packet_rate_pps",
 }
 
 var Header = append([]string(nil), header[:]...)
@@ -162,6 +169,13 @@ type Snapshot struct {
 	QUICSmoothedRTTMS       string
 	QUICLossEvents          int64
 	QUICCloseReason         string
+	MissingScanChecks       uint64
+	PendingMissing          uint32
+	PendingMissingPeak      uint32
+	RepairRequestedPackets  uint64
+	RepairRequestBatches    uint64
+	ReorderTrailPackets     uint32
+	ReceivePacketRatePPS    uint32
 	LastState               string
 	LastError               string
 }
@@ -437,6 +451,13 @@ func (r *Recorder) row(snap Snapshot, deltaBytes int64, deltaMS int64, localSent
 		snap.QUICSmoothedRTTMS,
 		formatOptionalInt64(snap.QUICLossEvents),
 		snap.QUICCloseReason,
+		strconv.FormatUint(snap.MissingScanChecks, 10),
+		strconv.FormatUint(uint64(snap.PendingMissing), 10),
+		strconv.FormatUint(uint64(snap.PendingMissingPeak), 10),
+		strconv.FormatUint(snap.RepairRequestedPackets, 10),
+		strconv.FormatUint(snap.RepairRequestBatches, 10),
+		strconv.FormatUint(uint64(snap.ReorderTrailPackets), 10),
+		strconv.FormatUint(uint64(snap.ReceivePacketRatePPS), 10),
 	}
 }
 

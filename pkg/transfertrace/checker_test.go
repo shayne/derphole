@@ -5,6 +5,7 @@
 package transfertrace
 
 import (
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -549,6 +550,59 @@ func TestCheckReportsQUICDiagnosticsSummary(t *testing.T) {
 	}
 }
 
+func TestCheckReportsRepairEfficiencyDiagnostics(t *testing.T) {
+	csvText := "timestamp_unix_ms,role,phase,app_bytes,last_error,missing_scan_checks,pending_missing,pending_missing_peak,repair_requested_packets,repair_request_batches,reorder_trail_packets,receive_packet_rate_pps\n" +
+		"1000,receive,direct_execute,1024,,790545,1234,1234,4567,32,22000,88000\n" +
+		"1500,receive,complete,2048,,790000,0,1200,4500,30,21000,87000\n"
+	result, err := Check(strings.NewReader(csvText), Options{
+		Role: RoleReceive, ExpectedBytes: 2048, ExpectedBytesSet: true,
+	})
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	diagnostics := result.Diagnostics
+	if !diagnostics.ReceiverRepairObserved {
+		t.Fatal("ReceiverRepairObserved = false, want true")
+	}
+	if diagnostics.MissingScanChecks != 790_545 ||
+		diagnostics.PendingMissing != 0 ||
+		diagnostics.PendingMissingPeak != 1234 ||
+		diagnostics.RepairRequestedPackets != 4567 ||
+		diagnostics.RepairRequestBatches != 32 ||
+		diagnostics.ReorderTrailPackets != 22_000 ||
+		diagnostics.ReceivePacketRatePPS != 88_000 {
+		t.Fatalf("repair efficiency diagnostics = %#v", diagnostics)
+	}
+}
+
+func TestCheckTreatsZeroRepairEfficiencyDiagnosticsAsObserved(t *testing.T) {
+	csvText := "timestamp_unix_ms,role,phase,app_bytes,last_error,missing_scan_checks,pending_missing,pending_missing_peak,repair_requested_packets,repair_request_batches,reorder_trail_packets,receive_packet_rate_pps\n" +
+		"1000,receive,complete,0,,0,0,0,0,0,0,0\n"
+	result, err := Check(strings.NewReader(csvText), Options{
+		Role: RoleReceive, ExpectedBytes: 0, ExpectedBytesSet: true,
+	})
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if !result.Diagnostics.ReceiverRepairObserved {
+		t.Fatalf("Diagnostics = %#v, want zero repair values observed", result.Diagnostics)
+	}
+}
+
+func TestCheckAcceptsLegacyRowWithoutRepairEfficiencyDiagnostics(t *testing.T) {
+	csvText := "timestamp_unix_ms,role,phase,app_bytes,last_error,missing_scan_checks,pending_missing,pending_missing_peak,repair_requested_packets,repair_request_batches,reorder_trail_packets,receive_packet_rate_pps\n" +
+		"1000,receive,complete,4096,\n"
+	result, err := Check(strings.NewReader(csvText), Options{
+		Role: RoleReceive, ExpectedBytes: 4096, ExpectedBytesSet: true,
+	})
+	if err != nil {
+		t.Fatalf("Check() legacy row error = %v", err)
+	}
+	if result.Diagnostics.ReceiverRepairObserved {
+		t.Fatalf("Diagnostics = %#v, want repair diagnostics absent", result.Diagnostics)
+	}
+}
+
 func TestCheckKeepsDiagnosticsAbsentForMinimalAndEmptyTrace(t *testing.T) {
 	tests := []struct {
 		name string
@@ -707,6 +761,60 @@ func TestCheckPairFailsSenderPeerProgressDivergence(t *testing.T) {
 	_, err := CheckPair(strings.NewReader(sendTrace), strings.NewReader(receiveTrace), PairOptions{Role: RoleSend})
 	if err == nil || !strings.Contains(err.Error(), "sender peer_received_bytes") {
 		t.Fatalf("CheckPair() error = %v, want peer progress divergence", err)
+	}
+}
+
+func TestCheckPairSkipsRateDivergenceWithoutReceiverTransferClock(t *testing.T) {
+	const transferredBytes = int64(67108967)
+	sendTrace := HeaderLine + "\n" +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:       4438,
+			elapsedMS:         4438,
+			role:              RoleSend,
+			phase:             PhaseComplete,
+			appBytes:          transferredBytes,
+			deltaAppBytes:     transferredBytes,
+			peerReceivedBytes: transferredBytes,
+			transferElapsedMS: 908,
+			lastState:         "stream-complete",
+		})
+	receiveTrace := HeaderLine + "\n" +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:     4001,
+			elapsedMS:       4001,
+			role:            RoleReceive,
+			phase:           PhaseDirectExecute,
+			appBytes:        51951751,
+			deltaAppBytes:   51951751,
+			lastState:       "connected-direct",
+			directValidated: true,
+		}) +
+		testTraceRow(testTraceRowConfig{
+			timestampMS:     4438,
+			elapsedMS:       4438,
+			role:            RoleReceive,
+			phase:           PhaseComplete,
+			appBytes:        transferredBytes,
+			deltaAppBytes:   transferredBytes - 51951751,
+			lastState:       "stream-complete",
+			directValidated: true,
+		})
+
+	result, err := CheckPair(strings.NewReader(sendTrace), strings.NewReader(receiveTrace), PairOptions{Role: RoleSend})
+	if err != nil {
+		t.Fatalf("CheckPair() error = %v", err)
+	}
+	if result.ProgressDeltaBytes != 0 {
+		t.Fatalf("ProgressDeltaBytes = %d, want 0", result.ProgressDeltaBytes)
+	}
+	if result.MaxProgressLeadBytes != 0 {
+		t.Fatalf("MaxProgressLeadBytes = %d, want 0", result.MaxProgressLeadBytes)
+	}
+	if math.Abs(result.SenderRateMbps-591.27) > 0.01 {
+		t.Fatalf("SenderRateMbps = %.2f, want about 591.27", result.SenderRateMbps)
+	}
+	if result.ReceiverRateMbps != 0 {
+		t.Fatalf("ReceiverRateMbps = %.2f, want 0 without an explicit transfer clock", result.ReceiverRateMbps)
 	}
 }
 

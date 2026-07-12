@@ -171,6 +171,20 @@ append_summary_row() {
   local receiver_rate_cv="${29}"
   local receiver_windows_below_500_mbps="${30}"
   local benchmark_size_bytes="${31}"
+  local revision_label="${32}"
+  local sender_user_cpu_seconds="${33}"
+  local sender_system_cpu_seconds="${34}"
+  local sender_max_rss_bytes="${35}"
+  local receiver_user_cpu_seconds="${36}"
+  local receiver_system_cpu_seconds="${37}"
+  local receiver_max_rss_bytes="${38}"
+  local missing_scan_checks="${39}"
+  local pending_missing="${40}"
+  local pending_missing_peak="${41}"
+  local repair_requested_packets="${42}"
+  local repair_request_batches="${43}"
+  local reorder_trail_packets="${44}"
+  local receive_packet_rate_pps="${45}"
 
   python3 - \
     "${summary_csv}" \
@@ -205,8 +219,23 @@ append_summary_row() {
     "${receiver_rate_p90_mbps}" \
     "${receiver_rate_cv}" \
     "${receiver_windows_below_500_mbps}" \
-    "${benchmark_size_bytes}" <<'PY'
+    "${benchmark_size_bytes}" \
+    "${revision_label}" \
+    "${sender_user_cpu_seconds}" \
+    "${sender_system_cpu_seconds}" \
+    "${sender_max_rss_bytes}" \
+    "${receiver_user_cpu_seconds}" \
+    "${receiver_system_cpu_seconds}" \
+    "${receiver_max_rss_bytes}" \
+    "${missing_scan_checks}" \
+    "${pending_missing}" \
+    "${pending_missing_peak}" \
+    "${repair_requested_packets}" \
+    "${repair_request_batches}" \
+    "${reorder_trail_packets}" \
+    "${receive_packet_rate_pps}" <<'PY'
 import csv
+import math
 import sys
 
 (
@@ -243,16 +272,54 @@ import sys
     receiver_rate_cv,
     receiver_windows_below_500_mbps,
     benchmark_size_bytes,
+    revision_label,
+    sender_user_cpu_seconds,
+    sender_system_cpu_seconds,
+    sender_max_rss_bytes,
+    receiver_user_cpu_seconds,
+    receiver_system_cpu_seconds,
+    receiver_max_rss_bytes,
+    missing_scan_checks,
+    pending_missing,
+    pending_missing_peak,
+    repair_requested_packets,
+    repair_request_batches,
+    reorder_trail_packets,
+    receive_packet_rate_pps,
 ) = sys.argv[1:]
 ratio = ""
 wall_ratio = ""
 repair_ratio = ""
+sender_cpu_seconds_per_gib = ""
+receiver_cpu_seconds_per_gib = ""
+scan_checks_per_packet = ""
 if mbps and float(iperf_mbps) > 0:
     ratio = f"{float(mbps) / float(iperf_mbps):.3f}"
 if wall_mbps and float(iperf_mbps) > 0:
     wall_ratio = f"{float(wall_mbps) / float(iperf_mbps):.3f}"
 if repair_bytes and int(benchmark_size_bytes) > 0:
     repair_ratio = f"{int(repair_bytes) / int(benchmark_size_bytes):.4f}"
+if benchmark_size_bytes and int(benchmark_size_bytes) > 0:
+    gib = int(benchmark_size_bytes) / float(1 << 30)
+    if sender_user_cpu_seconds and sender_system_cpu_seconds:
+        sender_cpu_seconds_per_gib = f"{(float(sender_user_cpu_seconds) + float(sender_system_cpu_seconds)) / gib:.6f}"
+    if receiver_user_cpu_seconds and receiver_system_cpu_seconds:
+        receiver_cpu_seconds_per_gib = f"{(float(receiver_user_cpu_seconds) + float(receiver_system_cpu_seconds)) / gib:.6f}"
+    if missing_scan_checks:
+        packets = math.ceil(int(benchmark_size_bytes) / 1358)
+        scan_checks_per_packet = f"{int(missing_scan_checks) / packets:.6f}"
+bulk_values = [
+    missing_scan_checks,
+    pending_missing,
+    pending_missing_peak,
+    repair_requested_packets,
+    repair_request_batches,
+    reorder_trail_packets,
+    receive_packet_rate_pps,
+    scan_checks_per_packet,
+]
+if transfer_mode == "blocks-v1":
+    bulk_values = [""] * len(bulk_values)
 with open(path, "a", newline="") as fh:
     csv.writer(fh).writerow([
         host,
@@ -288,6 +355,16 @@ with open(path, "a", newline="") as fh:
         receiver_rate_p90_mbps,
         receiver_rate_cv,
         receiver_windows_below_500_mbps,
+        revision_label,
+        sender_user_cpu_seconds,
+        sender_system_cpu_seconds,
+        sender_cpu_seconds_per_gib,
+        sender_max_rss_bytes,
+        receiver_user_cpu_seconds,
+        receiver_system_cpu_seconds,
+        receiver_cpu_seconds_per_gib,
+        receiver_max_rss_bytes,
+        *bulk_values,
     ])
 PY
 }
@@ -306,7 +383,7 @@ latest_file() {
 extract_benchmark_value() {
   local output="$1"
   local field="$2"
-  local default_value="${3:-0}"
+  local default_value="${3-0}"
 
   python3 - "${output}" "${field}" "${default_value}" <<'PY'
 import sys
@@ -327,12 +404,30 @@ extract_benchmark_goodput() {
   local output="$1"
   local value
 
-  value="$(extract_benchmark_value "${output}" "benchmark-goodput-mbps")"
-  if [[ "${value}" != "0" ]]; then
+  value="$(extract_benchmark_value "${output}" "benchmark-goodput-mbps" "")"
+  if [[ -n "${value}" ]]; then
     printf '%s\n' "${value}"
     return 0
   fi
-  extract_benchmark_value "${output}" "sender_goodput_mbps"
+  extract_benchmark_value "${output}" "sender_goodput_mbps" ""
+}
+
+accounting_mbps_match() {
+  local footer_mbps="$1"
+  local trace_mbps="$2"
+
+  python3 - "${footer_mbps}" "${trace_mbps}" <<'PY'
+from decimal import Decimal, InvalidOperation
+import sys
+
+try:
+    footer, trace = (Decimal(value) for value in sys.argv[1:])
+    matches = footer.is_finite() and trace.is_finite() and abs(footer - trace) <= Decimal("0.01")
+except (InvalidOperation, ValueError):
+    matches = False
+
+raise SystemExit(0 if matches else 1)
+PY
 }
 
 extract_tracecheck_summary() {
@@ -366,6 +461,13 @@ keys = [
     "receiver_rate_p90_mbps",
     "receiver_rate_cv",
     "receiver_windows_below_500_mbps",
+    "missing_scan_checks",
+    "pending_missing",
+    "pending_missing_peak",
+    "repair_requested_packets",
+    "repair_request_batches",
+    "reorder_trail_packets",
+    "receive_packet_rate_pps",
 ]
 print("\t".join(metric(combined_text, key) for key in keys))
 PY
@@ -469,7 +571,7 @@ main() {
   local trace_failures=0
 
   mkdir -p "${log_dir}"
-  printf 'host,run,tool,direction,workload,transfer_mode,mbps,ratio_to_iperf,trace_mbps,wall_mbps,wall_ratio_to_iperf,transfer_elapsed_ms,command_duration_ms,total_duration_ms,trace_ok,max_peer_recv_queue_depth,max_flatline,log_dir,initial_rate_mbps,repair_bytes,repair_ratio,retransmits,local_enobufs_retries,local_enobufs_wait_us,local_enobufs_max_consecutive,min_rate_target_mbps,final_rate_target_mbps,controller_decreases,receiver_rate_p10_mbps,receiver_rate_p50_mbps,receiver_rate_p90_mbps,receiver_rate_cv,receiver_windows_below_500_mbps\n' >"${summary_csv}"
+  printf 'host,run,tool,direction,workload,transfer_mode,mbps,ratio_to_iperf,trace_mbps,wall_mbps,wall_ratio_to_iperf,transfer_elapsed_ms,command_duration_ms,total_duration_ms,trace_ok,max_peer_recv_queue_depth,max_flatline,log_dir,initial_rate_mbps,repair_bytes,repair_ratio,retransmits,local_enobufs_retries,local_enobufs_wait_us,local_enobufs_max_consecutive,min_rate_target_mbps,final_rate_target_mbps,controller_decreases,receiver_rate_p10_mbps,receiver_rate_p50_mbps,receiver_rate_p90_mbps,receiver_rate_cv,receiver_windows_below_500_mbps,revision_label,sender_user_cpu_seconds,sender_system_cpu_seconds,sender_cpu_seconds_per_gib,sender_max_rss_bytes,receiver_user_cpu_seconds,receiver_system_cpu_seconds,receiver_cpu_seconds_per_gib,receiver_max_rss_bytes,missing_scan_checks,pending_missing,pending_missing_peak,repair_requested_packets,repair_request_batches,reorder_trail_packets,receive_packet_rate_pps,scan_checks_per_packet\n' >"${summary_csv}"
 
   read -r -a hosts <<<"${hosts_raw}"
   if [[ "${#hosts[@]}" -eq 0 ]]; then
@@ -522,6 +624,20 @@ main() {
       local receiver_rate_p90_mbps
       local receiver_rate_cv
       local receiver_windows_below_500_mbps
+      local revision_label
+      local sender_user_cpu_seconds
+      local sender_system_cpu_seconds
+      local sender_max_rss_bytes
+      local receiver_user_cpu_seconds
+      local receiver_system_cpu_seconds
+      local receiver_max_rss_bytes
+      local missing_scan_checks
+      local pending_missing
+      local pending_missing_peak
+      local repair_requested_packets
+      local repair_request_batches
+      local reorder_trail_packets
+      local receive_packet_rate_pps
       local trace_status=0
       local promotion_status=0
 
@@ -538,6 +654,7 @@ main() {
         "" "" "" "" "" "" "" "" \
         "${log_dir}/${host_label}" \
         "${initial_rate}" \
+        "" "" "" "" "" "" "" "" "" "" "" "" "" "" \
         "" "" "" "" "" "" "" "" "" "" "" "" "" ""
 
       echo "public_path_sample host=${remote} run=${run} tool=derphole"
@@ -557,6 +674,13 @@ main() {
       benchmark_size_bytes="$(extract_benchmark_value "${promotion_out}" "benchmark-size-bytes")"
       workload="$(extract_benchmark_value "${promotion_out}" "benchmark-workload" "unknown")"
       transfer_mode="$(extract_benchmark_value "${promotion_out}" "benchmark-transfer-mode" "unknown")"
+      revision_label="$(extract_benchmark_value "${promotion_out}" "benchmark-revision-label" "")"
+      sender_user_cpu_seconds="$(extract_benchmark_value "${promotion_out}" "benchmark-sender-user-cpu-seconds" "")"
+      sender_system_cpu_seconds="$(extract_benchmark_value "${promotion_out}" "benchmark-sender-system-cpu-seconds" "")"
+      sender_max_rss_bytes="$(extract_benchmark_value "${promotion_out}" "benchmark-sender-max-rss-bytes" "")"
+      receiver_user_cpu_seconds="$(extract_benchmark_value "${promotion_out}" "benchmark-receiver-user-cpu-seconds" "")"
+      receiver_system_cpu_seconds="$(extract_benchmark_value "${promotion_out}" "benchmark-receiver-system-cpu-seconds" "")"
+      receiver_max_rss_bytes="$(extract_benchmark_value "${promotion_out}" "benchmark-receiver-max-rss-bytes" "")"
       if trace_summary="$(run_trace_checks "${case_log_dir}" "${initial_rate}")"; then
         if [[ "${promotion_status}" -eq 0 ]]; then
           trace_ok="true"
@@ -584,8 +708,15 @@ main() {
         receiver_rate_p50_mbps \
         receiver_rate_p90_mbps \
         receiver_rate_cv \
-        receiver_windows_below_500_mbps <<<"${trace_summary}"
-      if [[ -z "${trace_sender_mbps}" || "${trace_sender_mbps}" != "${derphole_mbps}" ]]; then
+        receiver_windows_below_500_mbps \
+        missing_scan_checks \
+        pending_missing \
+        pending_missing_peak \
+        repair_requested_packets \
+        repair_request_batches \
+        reorder_trail_packets \
+        receive_packet_rate_pps <<<"${trace_summary}"
+      if ! accounting_mbps_match "${derphole_mbps}" "${trace_sender_mbps}"; then
         echo "benchmark accounting mismatch: footer=${derphole_mbps} trace=${trace_sender_mbps:-missing}" >&2
         trace_ok="false"
         trace_status=1
@@ -621,7 +752,21 @@ main() {
         "${receiver_rate_p90_mbps}" \
         "${receiver_rate_cv}" \
         "${receiver_windows_below_500_mbps}" \
-        "${benchmark_size_bytes}"
+        "${benchmark_size_bytes}" \
+        "${revision_label}" \
+        "${sender_user_cpu_seconds}" \
+        "${sender_system_cpu_seconds}" \
+        "${sender_max_rss_bytes}" \
+        "${receiver_user_cpu_seconds}" \
+        "${receiver_system_cpu_seconds}" \
+        "${receiver_max_rss_bytes}" \
+        "${missing_scan_checks}" \
+        "${pending_missing}" \
+        "${pending_missing_peak}" \
+        "${repair_requested_packets}" \
+        "${repair_request_batches}" \
+        "${reorder_trail_packets}" \
+        "${receive_packet_rate_pps}"
       if [[ "${trace_status}" -ne 0 || "${promotion_status}" -ne 0 ]]; then
         trace_failures=1
       fi
