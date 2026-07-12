@@ -12,7 +12,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -30,6 +32,7 @@ type testDERPServer struct {
 	DERPURL string
 	Map     *tailcfg.DERPMap
 	http    *httptest.Server
+	server  *derpserver.Server
 }
 
 type fakeDERPClientConn struct {
@@ -116,6 +119,7 @@ func newTestDERPServer(t *testing.T) *testDERPServer {
 		DERPURL: derpHTTP.URL + "/derp",
 		Map:     dm,
 		http:    derpHTTP,
+		server:  server,
 	}
 }
 
@@ -236,6 +240,120 @@ func TestClientRecoversAfterTransientTransportDisconnect(t *testing.T) {
 	}
 	if string(got.Payload) != string(payload) {
 		t.Fatalf("Receive().Payload = %q, want %q", got.Payload, payload)
+	}
+}
+
+func TestClientsExchangePacketAndReconnectThroughHTTPProxy(t *testing.T) {
+	srv := newTestDERPServer(t)
+	derpTarget := strings.TrimPrefix(srv.DERPURL, "http://")
+	derpTarget = strings.TrimSuffix(derpTarget, "/derp")
+	proxy := newForwardingConnectProxy(t, derpTarget)
+	proxyURL, err := url.Parse(proxy.URL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldProxyFromEnvironment := derpProxyFromEnvironment
+	derpProxyFromEnvironment = func(*url.URL) (*url.URL, error) {
+		return proxyURL, nil
+	}
+	t.Cleanup(func() { derpProxyFromEnvironment = oldProxyFromEnvironment })
+
+	node := *srv.Map.Regions[1].Nodes[0]
+	node.HostName = "derp.proxy-test.invalid"
+	node.IPv4 = "192.0.2.1"
+	serverURL := "http://derp.proxy-test.invalid/derp"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	a, err := NewClient(ctx, &node, serverURL)
+	if err != nil {
+		t.Fatalf("NewClient(a) error = %v", err)
+	}
+	defer a.Close()
+	b, err := NewClient(ctx, &node, serverURL)
+	if err != nil {
+		t.Fatalf("NewClient(b) error = %v", err)
+	}
+	defer b.Close()
+	waitForTestDERPClient(t, ctx, srv.server, a.PublicKey())
+	waitForTestDERPClient(t, ctx, srv.server, b.PublicKey())
+
+	payload := []byte("proxied DERP packet")
+	if err := a.Send(ctx, b.PublicKey(), payload); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	got, err := b.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Receive() error = %v", err)
+	}
+	if !bytes.Equal(got.Payload, payload) {
+		t.Fatalf("payload = %q, want %q", got.Payload, payload)
+	}
+	if proxy.ConnectCount() != 2 {
+		t.Fatalf("CONNECT count = %d, want 2", proxy.ConnectCount())
+	}
+	if info, ok := a.ProxyInfo(); !ok || info.TargetAddr != "derp.proxy-test.invalid:80" {
+		t.Fatalf("ProxyInfo = %#v, %v", info, ok)
+	}
+
+	connectsBeforeReconnect := proxy.ConnectCount()
+	srv.http.CloseClientConnections()
+	proxy.CloseConnections()
+	time.Sleep(50 * time.Millisecond)
+	second := []byte("proxied after reconnect")
+	if err := a.Send(ctx, b.PublicKey(), second); err != nil {
+		t.Fatalf("Send() after disconnect error = %v", err)
+	}
+	got, err = b.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Receive() after disconnect error = %v", err)
+	}
+	if !bytes.Equal(got.Payload, second) {
+		t.Fatalf("reconnected payload = %q, want %q", got.Payload, second)
+	}
+	if proxy.ConnectCount() <= connectsBeforeReconnect {
+		t.Fatalf("CONNECT count did not increase across reconnect: before=%d after=%d", connectsBeforeReconnect, proxy.ConnectCount())
+	}
+}
+
+func waitForTestDERPClient(t *testing.T, ctx context.Context, server *derpserver.Server, clientKey key.NodePublic) {
+	t.Helper()
+	for !server.IsClientConnectedForTest(clientKey) {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("DERP client %v was not registered: %v", clientKey, ctx.Err())
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+func TestCanonicalDERPTarget(t *testing.T) {
+	tests := []struct {
+		name    string
+		rawURL  string
+		want    string
+		wantErr bool
+	}{
+		{name: "https default port", rawURL: "https://derp.example/derp", want: "derp.example:443"},
+		{name: "http default port", rawURL: "http://derp.example/derp", want: "derp.example:80"},
+		{name: "explicit port", rawURL: "https://derp.example:8443/derp", want: "derp.example:8443"},
+		{name: "unsupported scheme", rawURL: "ftp://derp.example:21/derp", wantErr: true},
+		{name: "missing hostname", rawURL: "https:///derp", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			derpURL, err := url.Parse(tt.rawURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := canonicalDERPTarget(derpURL)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("canonicalDERPTarget() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Fatalf("canonicalDERPTarget() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -415,7 +533,10 @@ func TestNewDERPNodeDialerFallsBackToIPv4WhenIPv6TargetFails(t *testing.T) {
 		IPv4:     "127.0.0.1",
 		IPv6:     "2001:db8::1",
 	}
-	dialer := newDERPNodeDialer(node, t.Logf, netmon.NewStatic())
+	oldProxyFromEnvironment := derpProxyFromEnvironment
+	derpProxyFromEnvironment = func(*url.URL) (*url.URL, error) { return nil, nil }
+	t.Cleanup(func() { derpProxyFromEnvironment = oldProxyFromEnvironment })
+	dialer := newDERPNodeDialer(node, &url.URL{Scheme: "https", Host: node.HostName}, &proxyInfoRecorder{}, t.Logf, netmon.NewStatic())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -454,7 +575,10 @@ func TestNewDERPNodeDialerUsesOverrideHostInsteadOfNodeIPs(t *testing.T) {
 		IPv4:     "203.0.113.10",
 		IPv6:     "2001:db8::1",
 	}
-	dialer := newDERPNodeDialer(node, t.Logf, netmon.NewStatic())
+	oldProxyFromEnvironment := derpProxyFromEnvironment
+	derpProxyFromEnvironment = func(*url.URL) (*url.URL, error) { return nil, nil }
+	t.Cleanup(func() { derpProxyFromEnvironment = oldProxyFromEnvironment })
+	dialer := newDERPNodeDialer(node, &url.URL{Scheme: "https", Host: node.HostName}, &proxyInfoRecorder{}, t.Logf, netmon.NewStatic())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

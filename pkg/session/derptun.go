@@ -143,7 +143,7 @@ func newDerptunServeRuntime(ctx context.Context, cfg derptunServeSessionConfig) 
 	if err != nil {
 		return nil, err
 	}
-	dm, derpClient, err := openDerptunServeDERP(ctx, tok, server)
+	dm, derpClient, err := openDerptunServeDERP(ctx, tok, server, cfg.Emitter)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +182,7 @@ func loadDerptunServeIdentity(serverToken string) (derptun.ServerCredential, ses
 	return cred, tok, identity, nil
 }
 
-func openDerptunServeDERP(ctx context.Context, tok sessiontoken.Token, cred derptun.ServerCredential) (*tailcfg.DERPMap, *derpbind.Client, error) {
+func openDerptunServeDERP(ctx context.Context, tok sessiontoken.Token, cred derptun.ServerCredential, emitter *telemetry.Emitter) (*tailcfg.DERPMap, *derpbind.Client, error) {
 	derpPriv, err := cred.DERPKey()
 	if err != nil {
 		return nil, nil, err
@@ -199,6 +199,7 @@ func openDerptunServeDERP(ctx context.Context, tok sessiontoken.Token, cred derp
 	if err != nil {
 		return nil, nil, err
 	}
+	emitDERPProxyDebug(emitter, derpClient)
 	return dm, derpClient, nil
 }
 
@@ -1784,7 +1785,7 @@ func newDerptunDialRuntime(ctx context.Context, clientToken string, emitter *tel
 	if err != nil {
 		return nil, err
 	}
-	dm, derpClient, err := openDerptunDialDERP(ctx, tok)
+	dm, derpClient, err := openDerptunDialDERP(ctx, tok, emitter)
 	if err != nil {
 		return nil, err
 	}
@@ -1812,7 +1813,7 @@ func loadDerptunDialToken(clientToken string) (derptun.ClientCredential, session
 	return cred, tok, listenerDERP, nil
 }
 
-func openDerptunDialDERP(ctx context.Context, tok sessiontoken.Token) (*tailcfg.DERPMap, *derpbind.Client, error) {
+func openDerptunDialDERP(ctx context.Context, tok sessiontoken.Token, emitter *telemetry.Emitter) (*tailcfg.DERPMap, *derpbind.Client, error) {
 	dm, err := derpbind.FetchMap(ctx, publicDERPMapURL())
 	if err != nil {
 		return nil, nil, err
@@ -1825,6 +1826,7 @@ func openDerptunDialDERP(ctx context.Context, tok sessiontoken.Token) (*tailcfg.
 	if err != nil {
 		return nil, nil, err
 	}
+	emitDERPProxyDebug(emitter, derpClient)
 	return dm, derpClient, nil
 }
 

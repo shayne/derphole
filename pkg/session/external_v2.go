@@ -151,6 +151,7 @@ func (rt *externalV2SendRuntime) openDERP(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	emitDERPProxyDebug(rt.cfg.Emitter, client)
 	rt.dm = dm
 	rt.derp = client
 	return nil
@@ -607,7 +608,7 @@ func listenExternalViaV2(ctx context.Context, cfg ListenConfig) (string, error) 
 }
 
 func newExternalV2ListenRuntime(ctx context.Context, cfg ListenConfig) (*externalV2ListenRuntime, error) {
-	tok, session, err := issuePublicQUICSession(ctx, token.CapabilityStdio|token.CapabilityTransferV2)
+	tok, session, err := issuePublicQUICSession(ctx, token.CapabilityStdio|token.CapabilityTransferV2, cfg.Emitter)
 	if err != nil {
 		return nil, err
 	}

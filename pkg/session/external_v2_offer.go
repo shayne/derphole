@@ -86,7 +86,7 @@ func offerExternalViaV2(ctx context.Context, cfg OfferConfig) (string, error) {
 }
 
 func newExternalV2OfferRuntime(ctx context.Context, cfg OfferConfig) (*externalV2OfferRuntime, error) {
-	tok, session, err := issuePublicQUICSession(ctx, token.CapabilityStdioOffer|token.CapabilityTransferV2)
+	tok, session, err := issuePublicQUICSession(ctx, token.CapabilityStdioOffer|token.CapabilityTransferV2, cfg.Emitter)
 	if err != nil {
 		return nil, err
 	}
@@ -601,6 +601,7 @@ func (rt *externalV2OfferReceiveRuntime) openDERP(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	emitDERPProxyDebug(rt.cfg.Emitter, client)
 	rt.dm = dm
 	rt.derp = client
 	return nil

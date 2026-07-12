@@ -90,6 +90,14 @@ func TestExternalV2OfferReceiveRoundTrip(t *testing.T) {
 }
 
 func TestExternalV2OfferReceivePromotesToDirectWhenBothSidesReady(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+	testExternalV2OfferReceivePromotesToDirectWhenBothSidesReady(t)
+}
+
+func testExternalV2OfferReceivePromotesToDirectWhenBothSidesReady(t *testing.T) {
+	t.Helper()
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
 
@@ -103,10 +111,6 @@ func TestExternalV2OfferReceivePromotesToDirectWhenBothSidesReady(t *testing.T) 
 		}, nil
 	}
 	t.Cleanup(func() { publicInterfaceAddrs = prevInterfaceAddrs })
-
-	srv := newSessionTestDERPServer(t)
-	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
-	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

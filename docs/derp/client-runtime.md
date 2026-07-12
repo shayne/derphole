@@ -10,6 +10,26 @@ The client runtime is spread across three layers:
 
 This split is important because "DERP client behavior" is not just a socket dial. It includes measurement, ranking, stickiness, fallback, and route learning.
 
+## Constrained Egress Through an HTTP Proxy
+
+derphole, derptun, and derpssh do not add proxy flags. Set the standard proxy environment variables before starting the process. Public `https://` DERP endpoints use `HTTPS_PROXY`; `HTTP_PROXY` applies to `http://` DERP endpoints. The lowercase forms and `NO_PROXY`/`no_proxy` follow Go's standard proxy resolver semantics.
+
+```sh
+export HTTPS_PROXY=http://proxy.example:3128
+export NO_PROXY=localhost,127.0.0.1
+derphole send
+```
+
+The proxy URL may use `http://` or `https://`. The proxy and network path must permit a long-lived HTTP `CONNECT` tunnel to the selected DERP host and port, normally TCP 443, plus the DERP HTTP upgrade that follows inside the tunnel. SOCKS, NTLM, PAC files, system keychains, and other proxy authentication mechanisms are not supported.
+
+Basic proxy authentication works only when the proxy URL contains both an explicit username and password. Percent-encode credentials as URL userinfo requires. Remember that proxy URLs stored in environment variables may be visible through local process inspection.
+
+Proxy selection is authoritative. Unsupported proxy schemes, malformed credentials, a failed proxy connection, or a rejected `CONNECT` fail closed. Once the standard resolver selects a proxy, the clients do not fall back to a direct DERP TCP connection. Use `NO_PROXY` for DERP hosts that should be reached directly.
+
+A proxy changes only the DERP TCP path. It does not imply `--force-relay`, proxy UDP, or force all traffic through DERP. Direct UDP discovery and promotion still run unless you select `--force-relay`. On a locked-down network those attempts may fail, in which case the session simply remains on DERP.
+
+The proxy can observe the DERP destination, connection timing, and byte volume. For an `https://` DERP endpoint, DERP TLS remains inside the `CONNECT` tunnel. An `http://` DERP endpoint has no inner DERP TLS. Peer payload encryption remains separate in either case. Verbose diagnostics report only the sanitized proxy scheme and address plus the DERP target; URL credentials are never included.
+
 ## Transport Establishment
 
 The transport implementation is in `tailscale/derp/derphttp/derphttp_client.go`.

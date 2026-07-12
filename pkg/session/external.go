@@ -66,6 +66,19 @@ var listenExternalViaV2Fn = listenExternalViaV2
 var offerExternalViaV2Fn = offerExternalViaV2
 var receiveExternalOfferViaV2Fn = receiveExternalOfferViaV2
 
+func emitDERPProxyDebug(emitter *telemetry.Emitter, client *derpbind.Client) {
+	if emitter == nil || client == nil {
+		return
+	}
+	info, ok := client.ProxyInfo()
+	if !ok {
+		return
+	}
+	if msg := info.DebugString(); msg != "" {
+		emitter.Debug(msg)
+	}
+}
+
 type publicPortmap interface {
 	transport.Portmap
 	SetLocalPort(uint16)

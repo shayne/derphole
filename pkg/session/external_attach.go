@@ -16,6 +16,7 @@ import (
 	"github.com/shayne/derphole/pkg/derpbind"
 	"github.com/shayne/derphole/pkg/quicpath"
 	"github.com/shayne/derphole/pkg/rendezvous"
+	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/token"
 	"github.com/shayne/derphole/pkg/transport"
 	"go4.org/mem"
@@ -74,7 +75,7 @@ func (c *externalAttachConn) Close() error {
 	return c.Conn.Close()
 }
 
-func issuePublicQUICSession(ctx context.Context, capabilities uint32) (string, *relaySession, error) {
+func issuePublicQUICSession(ctx context.Context, capabilities uint32, emitter *telemetry.Emitter) (string, *relaySession, error) {
 	dm, err := derpbind.FetchMap(ctx, publicDERPMapURL())
 	if err != nil {
 		return "", nil, err
@@ -88,6 +89,7 @@ func issuePublicQUICSession(ctx context.Context, capabilities uint32) (string, *
 	if err != nil {
 		return "", nil, err
 	}
+	emitDERPProxyDebug(emitter, derpClient)
 
 	var sessionID [16]byte
 	if _, err := rand.Read(sessionID[:]); err != nil {
@@ -139,12 +141,12 @@ func issuePublicQUICSession(ctx context.Context, capabilities uint32) (string, *
 	return tok, session, nil
 }
 
-func issuePublicAttachSession(ctx context.Context) (string, *relaySession, error) {
-	return issuePublicQUICSession(ctx, token.CapabilityAttach)
+func issuePublicAttachSession(ctx context.Context, emitter *telemetry.Emitter) (string, *relaySession, error) {
+	return issuePublicQUICSession(ctx, token.CapabilityAttach, emitter)
 }
 
 func listenAttachExternal(ctx context.Context, cfg AttachListenConfig) (*AttachListener, error) {
-	tok, session, err := issuePublicAttachSession(ctx)
+	tok, session, err := issuePublicAttachSession(ctx, cfg.Emitter)
 	if err != nil {
 		return nil, err
 	}
@@ -446,7 +448,7 @@ func newAttachDialRuntime(ctx context.Context, cfg AttachDialConfig, tok token.T
 	if listenerDERP.IsZero() {
 		return nil, ErrUnknownSession
 	}
-	dm, derpClient, err := openDerptunDialDERP(ctx, tok)
+	dm, derpClient, err := openDerptunDialDERP(ctx, tok, cfg.Emitter)
 	if err != nil {
 		return nil, err
 	}

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"sync"
 	"time"
 
@@ -27,11 +28,12 @@ type Packet struct {
 }
 
 type Client struct {
-	pub      key.NodePublic
-	dc       derpClientConn
-	packetCh chan Packet
-	stopCh   chan struct{}
-	doneCh   chan struct{}
+	pub       key.NodePublic
+	dc        derpClientConn
+	packetCh  chan Packet
+	stopCh    chan struct{}
+	doneCh    chan struct{}
+	proxyInfo *proxyInfoRecorder
 
 	subMu       sync.RWMutex
 	subscribers map[uint64]*packetSubscriber
@@ -93,6 +95,10 @@ func newClientWithPrivateKey(ctx context.Context, node *tailcfg.DERPNode, server
 	if node == nil {
 		return nil, errors.New("nil DERP node")
 	}
+	derpURL, err := url.Parse(serverURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse DERP URL: %w", err)
+	}
 
 	logf := logger.Logf(func(string, ...any) {})
 	netMon := netmon.NewStatic()
@@ -100,7 +106,8 @@ func newClientWithPrivateKey(ctx context.Context, node *tailcfg.DERPNode, server
 	if err != nil {
 		return nil, err
 	}
-	dc.SetURLDialer(newDERPNodeDialer(node, logf, netMon))
+	proxyInfo := &proxyInfoRecorder{}
+	dc.SetURLDialer(newDERPNodeDialer(node, derpURL, proxyInfo, logf, netMon))
 	dc.SetCanAckPings(true)
 	if err := dc.Connect(ctx); err != nil {
 		_ = dc.Close()
@@ -113,6 +120,7 @@ func newClientWithPrivateKey(ctx context.Context, node *tailcfg.DERPNode, server
 		packetCh:    make(chan Packet, 16),
 		stopCh:      make(chan struct{}),
 		doneCh:      make(chan struct{}),
+		proxyInfo:   proxyInfo,
 		subscribers: make(map[uint64]*packetSubscriber),
 	}
 	go c.recvLoop()
@@ -130,7 +138,24 @@ type derpDialResult struct {
 	err    error
 }
 
-func newDERPNodeDialer(node *tailcfg.DERPNode, logf logger.Logf, netMon *netmon.Monitor) func(context.Context, string, string) (net.Conn, error) {
+type proxyInfoRecorder struct {
+	mu   sync.RWMutex
+	info ProxyInfo
+}
+
+func (r *proxyInfoRecorder) Store(info ProxyInfo) {
+	r.mu.Lock()
+	r.info = info
+	r.mu.Unlock()
+}
+
+func (r *proxyInfoRecorder) Load() (ProxyInfo, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.info, r.info.Scheme != ""
+}
+
+func newDERPNodeDialer(node *tailcfg.DERPNode, derpURL *url.URL, proxyInfo *proxyInfoRecorder, logf logger.Logf, netMon *netmon.Monitor) func(context.Context, string, string) (net.Conn, error) {
 	if node == nil {
 		return nil
 	}
@@ -138,22 +163,66 @@ func newDERPNodeDialer(node *tailcfg.DERPNode, logf logger.Logf, netMon *netmon.
 		panic("nil netMon")
 	}
 	return func(ctx context.Context, _ string, addr string) (net.Conn, error) {
-		host, port, err := net.SplitHostPort(addr)
+		selectedProxy, err := derpProxyForURL(derpURL)
 		if err != nil {
 			return nil, err
 		}
-		targets, explicitDisable := derpDialTargets(node, host, port)
-		if explicitDisable && len(targets) == 0 {
-			return nil, errors.New("both IPv4 and IPv6 are explicitly disabled for node")
+		if selectedProxy != nil {
+			target, err := canonicalDERPTarget(derpURL)
+			if err != nil {
+				return nil, err
+			}
+			conn, info, err := dialDERPThroughProxy(ctx, selectedProxy, target, logf, netMon)
+			if err != nil {
+				return nil, err
+			}
+			proxyInfo.Store(info)
+			return conn, nil
 		}
-		if len(targets) == 0 {
-			targets = append(targets, derpDialTarget{
-				network: "tcp",
-				addr:    net.JoinHostPort(host, port),
-			})
-		}
-		return raceDERPDial(ctx, logf, netMon, targets)
+		return dialDERPDirect(ctx, node, logf, netMon, addr)
 	}
+}
+
+func canonicalDERPTarget(derpURL *url.URL) (string, error) {
+	if derpURL == nil {
+		return "", errors.New("nil DERP URL")
+	}
+	host := derpURL.Hostname()
+	if host == "" {
+		return "", errors.New("DERP URL has no hostname")
+	}
+	defaultPort := ""
+	switch derpURL.Scheme {
+	case "https":
+		defaultPort = "443"
+	case "http":
+		defaultPort = "80"
+	default:
+		return "", fmt.Errorf("unsupported DERP URL scheme %q", derpURL.Scheme)
+	}
+	port := derpURL.Port()
+	if port == "" {
+		port = defaultPort
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
+func dialDERPDirect(ctx context.Context, node *tailcfg.DERPNode, logf logger.Logf, netMon *netmon.Monitor, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	targets, explicitDisable := derpDialTargets(node, host, port)
+	if explicitDisable && len(targets) == 0 {
+		return nil, errors.New("both IPv4 and IPv6 are explicitly disabled for node")
+	}
+	if len(targets) == 0 {
+		targets = append(targets, derpDialTarget{
+			network: "tcp",
+			addr:    net.JoinHostPort(host, port),
+		})
+	}
+	return raceDERPDial(ctx, logf, netMon, targets)
 }
 
 func derpDialTargets(node *tailcfg.DERPNode, host, port string) ([]derpDialTarget, bool) {
@@ -301,6 +370,13 @@ func derpDialContextWithTimeout(ctx context.Context) (context.Context, context.C
 }
 
 func (c *Client) PublicKey() key.NodePublic { return c.pub }
+
+func (c *Client) ProxyInfo() (ProxyInfo, bool) {
+	if c == nil || c.proxyInfo == nil {
+		return ProxyInfo{}, false
+	}
+	return c.proxyInfo.Load()
+}
 
 func (c *Client) Close() error {
 	if c == nil || c.dc == nil {

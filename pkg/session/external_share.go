@@ -25,8 +25,7 @@ import (
 )
 
 func issuePublicShareSession(ctx context.Context, cfg ShareConfig) (string, *relaySession, error) {
-	_ = cfg
-	return issuePublicQUICSession(ctx, token.CapabilityShare)
+	return issuePublicQUICSession(ctx, token.CapabilityShare, cfg.Emitter)
 }
 
 func shareExternal(ctx context.Context, cfg ShareConfig) (string, error) {
@@ -196,7 +195,7 @@ func newOpenExternalRuntime(ctx context.Context, cfg OpenConfig, tok token.Token
 	if listenerDERP.IsZero() {
 		return nil, ErrUnknownSession
 	}
-	dm, derpClient, err := openDerptunDialDERP(ctx, tok)
+	dm, derpClient, err := openDerptunDialDERP(ctx, tok, cfg.Emitter)
 	if err != nil {
 		return nil, err
 	}
