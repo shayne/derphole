@@ -238,8 +238,52 @@ exec shasum -a 256 "$@"
 /usr/bin/wc "$@" | tr -d '[:space:]'
 printf '\n'
 `)
-	writeExecutable(t, filepath.Join(fakeBin, "ssh"), `#!/bin/sh
-exec /bin/bash -se
+	writeExecutable(t, filepath.Join(fakeBin, "ssh"), `#!/usr/bin/env bash
+set -euo pipefail
+script="$(mktemp)"
+hidden_status=""
+restore_status() {
+  if [[ -n "${hidden_status}" && -f "${hidden_status}.visibility-delayed" ]]; then
+    mv "${hidden_status}.visibility-delayed" "${hidden_status}"
+  fi
+  rm -f "${script}"
+}
+trap restore_status EXIT
+cat >"${script}"
+
+if [[ "${FAKE_STATUS_VISIBILITY_DELAY_POLLS:-0}" =~ ^[1-9][0-9]*$ ]] &&
+  grep -Fq "status-missing" "${script}"; then
+  completed_status=""
+  for _ in $(seq 1 200); do
+    for status_path in "${DERPHOLE_BENCH_REMOTE_OUTPUT_ROOT}"/derphole-promotion-*/run.status; do
+      [[ -f "${status_path}" ]] || continue
+      pid_path="${status_path%.status}.pid"
+      wrapper_pid="$(cat "${pid_path}")"
+      if ! kill -0 "${wrapper_pid}" 2>/dev/null; then
+        completed_status="${status_path}"
+        break
+      fi
+    done
+    [[ -n "${completed_status}" ]] && break
+    sleep 0.01
+  done
+
+  if [[ -n "${completed_status}" ]]; then
+    count_path="${FAKE_DERPHOLE_STATE}/status-visibility-polls"
+    visibility_polls=0
+    if [[ -f "${count_path}" ]]; then
+      visibility_polls="$(cat "${count_path}")"
+    fi
+    if ((visibility_polls < FAKE_STATUS_VISIBILITY_DELAY_POLLS)); then
+      visibility_polls=$((visibility_polls + 1))
+      printf '%s\n' "${visibility_polls}" >"${count_path}"
+      mv "${completed_status}" "${completed_status}.visibility-delayed"
+      hidden_status="${completed_status}"
+    fi
+  fi
+fi
+
+/bin/bash -e "${script}"
 `)
 	writeExecutable(t, filepath.Join(fakeBin, "scp"), `#!/bin/sh
 set -eu
@@ -320,6 +364,54 @@ func TestPromotionBenchmarkReverseRejectsRemoteSenderFailure(t *testing.T) {
 	}
 	if !strings.Contains(string(output), "remote derphole process exited with status 23") {
 		t.Fatalf("reverse sender failure output missing exit status:\n%s", output)
+	}
+	harness.assertCleaned(t, "reverse")
+}
+
+func TestPromotionBenchmarkReverseWaitsForDelayedRemoteStatusVisibility(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+	cmd := harness.command("reverse", map[string]string{
+		"FAKE_SEND_STATUS":                   "23",
+		"FAKE_STATUS_VISIBILITY_DELAY_POLLS": "2",
+	})
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("reverse benchmark accepted remote sender failure:\n%s", output)
+	}
+	if !strings.Contains(string(output), "remote derphole process exited with status 23") {
+		t.Fatalf("reverse sender failure output missing delayed exit status:\n%s", output)
+	}
+
+	polls, readErr := os.ReadFile(filepath.Join(harness.stateDir, "status-visibility-polls"))
+	if readErr != nil {
+		t.Fatalf("read delayed status visibility polls: %v\n%s", readErr, output)
+	}
+	if got, want := strings.TrimSpace(string(polls)), "2"; got != want {
+		t.Fatalf("delayed status visibility polls = %q, want %q; output:\n%s", got, want, output)
+	}
+	harness.assertCleaned(t, "reverse")
+}
+
+func TestPromotionBenchmarkReverseBoundsMissingRemoteStatusGrace(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+	cmd := harness.command("reverse", map[string]string{
+		"FAKE_SEND_STATUS":                   "23",
+		"FAKE_STATUS_VISIBILITY_DELAY_POLLS": "1000",
+	})
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("reverse benchmark accepted permanently missing remote status:\n%s", output)
+	}
+	if !strings.Contains(string(output), "remote derphole process exited without a status") {
+		t.Fatalf("reverse sender failure output missing bounded status error:\n%s", output)
+	}
+
+	polls, readErr := os.ReadFile(filepath.Join(harness.stateDir, "status-visibility-polls"))
+	if readErr != nil {
+		t.Fatalf("read missing status visibility polls: %v\n%s", readErr, output)
+	}
+	if got, want := strings.TrimSpace(string(polls)), "5"; got != want {
+		t.Fatalf("missing status visibility polls = %q, want %q; output:\n%s", got, want, output)
 	}
 	harness.assertCleaned(t, "reverse")
 }

@@ -368,6 +368,10 @@ wait_remote_pid_exit() {
 wait_remote_pid_status() {
   local state
   local remote_status
+  local status_missing_polls=0
+  # Bound sidecar visibility lag to four normal polling intervals (one second).
+  local status_missing_grace_polls=4
+  local status_poll_interval_seconds=0.25
 
   for _ in $(seq 1 400); do
     if ! state="$(remote "if [[ -f '${remote_base}.status' ]]; then status=\$(cat '${remote_base}.status') || exit 1; if [[ ! \"\${status}\" =~ ^[0-9]+$ ]]; then exit 1; fi; pid=''; if [[ -f '${remote_base}.pid' ]]; then pid=\$(cat '${remote_base}.pid') || exit 1; fi; if [[ -n \"\${pid}\" && ! \"\${pid}\" =~ ^[0-9]+$ ]]; then exit 1; fi; if [[ -n \"\${pid}\" ]] && kill -0 \"\${pid}\" 2>/dev/null; then printf 'running\\n'; else printf 'exited:%s\\n' \"\${status}\"; fi; elif [[ ! -f '${remote_base}.pid' ]]; then printf 'status-missing\\n'; else pid=\$(cat '${remote_base}.pid') || exit 1; if [[ ! \"\${pid}\" =~ ^[0-9]+$ ]]; then exit 1; fi; if kill -0 \"\${pid}\" 2>/dev/null; then printf 'running\\n'; else printf 'status-missing\\n'; fi; fi")"; then
@@ -384,17 +388,21 @@ wait_remote_pid_status() {
         return 1
         ;;
       running)
+        status_missing_polls=0
         ;;
       status-missing)
-        echo "remote ${tool} process exited without a status on ${target}" >&2
-        return 1
+        status_missing_polls=$((status_missing_polls + 1))
+        if ((status_missing_polls > status_missing_grace_polls)); then
+          echo "remote ${tool} process exited without a status on ${target}" >&2
+          return 1
+        fi
         ;;
       *)
         echo "invalid remote ${tool} process status on ${target}: ${state:-empty}" >&2
         return 1
         ;;
     esac
-    sleep 0.25
+    sleep "${status_poll_interval_seconds}"
   done
   echo "timed out waiting for remote ${tool} process status on ${target}" >&2
   return 1
