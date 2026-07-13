@@ -11,6 +11,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -216,6 +218,66 @@ func TestExternalV2BlockTransferPolicyUsesFileReceiverInBothTopologies(t *testin
 			got := externalV2AcceptedBlockTransferPolicy(tt.claim, true, tt.acceptCandidates)
 			if got.Receiver != tt.wantReceiver || got.Mode != tt.wantMode {
 				t.Fatalf("policy = %#v, want receiver=%q mode=%q", got, tt.wantReceiver, tt.wantMode)
+			}
+		})
+	}
+}
+
+func TestExternalV2BlockTransferPolicyCanForceBulkPacketsForBenchmarking(t *testing.T) {
+	t.Setenv("DERPHOLE_TEST_FORCE_BULK_PACKET_TRANSFER", "1")
+
+	claim := externalV2Claim{
+		BlockCapable:       true,
+		BlockPacketCapable: true,
+	}
+	for port := 10000; port < 10013; port++ {
+		claim.Candidates = append(claim.Candidates, fmt.Sprintf("203.0.113.10:%d", port))
+	}
+
+	got := externalV2AcceptedBlockTransferPolicy(claim, true, nil)
+	if got.Mode != externalV2TransferModeBulkPackets {
+		t.Fatalf("policy mode = %q, want %q", got.Mode, externalV2TransferModeBulkPackets)
+	}
+	if !got.ForcedBulkPackets {
+		t.Fatal("policy ForcedBulkPackets = false, want true")
+	}
+
+	claim.Candidates = append(claim.Candidates, "not-an-addr-port")
+	got = externalV2AcceptedBlockTransferPolicy(claim, true, nil)
+	if got.Mode != externalV2TransferModeBlocks {
+		t.Fatalf("policy mode with invalid candidate = %q, want %q", got.Mode, externalV2TransferModeBlocks)
+	}
+}
+
+func TestExternalV2DirectTCPFileSelectionRequiresLargeQUICPolicyFileAndReachablePeer(t *testing.T) {
+	advertisement := &externalV2DirectTCPAdvertisement{
+		Candidates:        []string{"203.0.113.10:8123"},
+		FingerprintSHA256: strings.Repeat("a", 64),
+		TransferID:        strings.Repeat("b", 32),
+	}
+	tests := []struct {
+		name          string
+		policy        string
+		size          int64
+		claimCapable  bool
+		acceptCapable bool
+		claimAd       *externalV2DirectTCPAdvertisement
+		acceptAd      *externalV2DirectTCPAdvertisement
+		want          string
+	}{
+		{name: "receiver listener", policy: externalV2TransferModeBlocks, size: externalV2DirectTCPMinFileSize, claimCapable: true, acceptCapable: true, claimAd: advertisement, want: externalV2TransferModeDirectTCP},
+		{name: "sender listener", policy: externalV2TransferModeBlocks, size: externalV2DirectTCPMinFileSize, claimCapable: true, acceptCapable: true, acceptAd: advertisement, want: externalV2TransferModeDirectTCP},
+		{name: "bulk policy remains bulk", policy: externalV2TransferModeBulkPackets, size: 1 << 30, claimCapable: true, acceptCapable: true, claimAd: advertisement, want: externalV2TransferModeBulkPackets},
+		{name: "small file remains quic", policy: externalV2TransferModeBlocks, size: externalV2DirectTCPMinFileSize - 1, claimCapable: true, acceptCapable: true, claimAd: advertisement, want: externalV2TransferModeBlocks},
+		{name: "old claimant", policy: externalV2TransferModeBlocks, size: 1 << 30, acceptCapable: true, claimAd: advertisement, want: externalV2TransferModeBlocks},
+		{name: "old acceptor", policy: externalV2TransferModeBlocks, size: 1 << 30, claimCapable: true, claimAd: advertisement, want: externalV2TransferModeBlocks},
+		{name: "no reachable listener", policy: externalV2TransferModeBlocks, size: 1 << 30, claimCapable: true, acceptCapable: true, want: externalV2TransferModeBlocks},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := externalV2SelectFileTransferMode(tt.policy, tt.size, tt.claimCapable, tt.acceptCapable, tt.claimAd, tt.acceptAd)
+			if got != tt.want {
+				t.Fatalf("mode = %q, want %q", got, tt.want)
 			}
 		})
 	}

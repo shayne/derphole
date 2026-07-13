@@ -16,9 +16,10 @@ import (
 )
 
 type sendFlags struct {
-	ForceRelay   bool `flag:"force-relay" help:"Disable direct probing"`
-	HideProgress bool `flag:"hide-progress" help:"Suppress progress-bar display"`
-	QR           bool `flag:"qr" help:"Render a QR code for the receive token"`
+	ForceRelay    bool `flag:"force-relay" help:"Disable direct probing"`
+	HideProgress  bool `flag:"hide-progress" help:"Suppress progress-bar display"`
+	QR            bool `flag:"qr" help:"Render a QR code for the receive token"`
+	DirectTCPPort int  `flag:"direct-tcp-port" help:"Listen on an existing same-port TCP forward for large file transfers"`
 }
 
 type sendArgs struct {
@@ -85,6 +86,7 @@ func runSend(args []string, level telemetry.Level, stdin io.Reader, stdout, stde
 		QR:             parsed.SubCommandFlags.QR,
 		ParallelPolicy: session.DefaultParallelPolicy(),
 		Trace:          trace,
+		DirectTCPPort:  parsed.SubCommandFlags.DirectTCPPort,
 	}); err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1

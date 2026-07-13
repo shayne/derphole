@@ -75,6 +75,20 @@ func TestRunSendPassesQRFlag(t *testing.T) {
 	}
 }
 
+func TestRunSendPassesDirectTCPPort(t *testing.T) {
+	prev := runSendTransfer
+	t.Cleanup(func() { runSendTransfer = prev })
+	runSendTransfer = func(_ context.Context, cfg pkgderphole.SendConfig) error {
+		if cfg.DirectTCPPort != 8123 {
+			t.Fatalf("DirectTCPPort = %d, want 8123", cfg.DirectTCPPort)
+		}
+		return nil
+	}
+	if code := runSend([]string{"--direct-tcp-port", "8123", "hello"}, telemetry.LevelQuiet, strings.NewReader(""), io.Discard, io.Discard); code != 0 {
+		t.Fatalf("runSend() code = %d, want 0", code)
+	}
+}
+
 func TestRunSendPassesTransferTraceFromEnvironment(t *testing.T) {
 	t.Setenv("DERPHOLE_TRANSFER_TRACE_CSV", filepath.Join(t.TempDir(), "send.csv"))
 	prev := runSendTransfer

@@ -24,6 +24,24 @@ if [[ -n "${bulk_initial_rate}" ]]; then
     exit 2
   fi
 fi
+bulk_batched_io="${DERPHOLE_TEST_BULK_BATCHED_IO:-}"
+if [[ -n "${bulk_batched_io}" && "${bulk_batched_io}" != "1" ]]; then
+  echo "DERPHOLE_TEST_BULK_BATCHED_IO must be empty or 1" >&2
+  exit 2
+fi
+force_bulk_packets="${DERPHOLE_TEST_FORCE_BULK_PACKET_TRANSFER:-}"
+if [[ -n "${force_bulk_packets}" && "${force_bulk_packets}" != "1" ]]; then
+  echo "DERPHOLE_TEST_FORCE_BULK_PACKET_TRANSFER must be empty or 1" >&2
+  exit 2
+fi
+direct_tcp_port="${DERPHOLE_BENCH_DIRECT_TCP_PORT:-}"
+if [[ -n "${direct_tcp_port}" ]]; then
+  if [[ ! "${direct_tcp_port}" =~ ^[0-9]+$ ]] ||
+     ((direct_tcp_port < 1 || direct_tcp_port > 65535)); then
+    echo "DERPHOLE_BENCH_DIRECT_TCP_PORT must be an integer from 1 through 65535" >&2
+    exit 2
+  fi
+fi
 transfer_mode="unknown"
 
 local_override="${DERPHOLE_BENCH_LOCAL_BIN:-}"
@@ -83,6 +101,15 @@ remote_sender_resource_json="${remote_base}.sender.resource.json"
 remote_receiver_resource_json="${remote_base}.receiver.resource.json"
 receiver_out="${tmp}/receiver.out"
 payload="${tmp}/payload.bin"
+local_payload_override="${DERPHOLE_BENCH_LOCAL_PAYLOAD:-}"
+remote_payload_override="${DERPHOLE_BENCH_REMOTE_PAYLOAD:-}"
+remote_payload="${remote_base}.payload"
+if [[ -n "${local_payload_override}" ]]; then
+  payload="${local_payload_override}"
+fi
+if [[ -n "${remote_payload_override}" ]]; then
+  remote_payload="${remote_payload_override}"
+fi
 revision_label="${DERPHOLE_BENCH_REVISION_LABEL:-}"
 sender_user_cpu_seconds=""
 sender_system_cpu_seconds=""
@@ -99,10 +126,14 @@ listener_pid=""
 remote_env=()
 parallel_args=()
 parallel_args_remote=""
+direct_tcp_args=()
 
 if [[ "${DERPHOLE_BENCH_PARALLEL:-}" != "" ]]; then
   parallel_args=(--parallel "${DERPHOLE_BENCH_PARALLEL}")
   parallel_args_remote="${parallel_args[*]-}"
+fi
+if [[ -n "${direct_tcp_port}" ]]; then
+  direct_tcp_args=(--direct-tcp-port "${direct_tcp_port}")
 fi
 if [[ "${DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES:-}" == "1" ]]; then
   remote_env+=(DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1)
@@ -118,6 +149,12 @@ if [[ -n "${DERPHOLE_V2_MANAGER_QUIC_FANOUT:-}" ]]; then
 fi
 if [[ -n "${bulk_initial_rate}" ]]; then
   remote_env+=(DERPHOLE_TEST_BULK_INITIAL_WIRE_MBPS="${bulk_initial_rate}")
+fi
+if [[ "${bulk_batched_io}" == "1" ]]; then
+  remote_env+=(DERPHOLE_TEST_BULK_BATCHED_IO=1)
+fi
+if [[ "${force_bulk_packets}" == "1" ]]; then
+  remote_env+=(DERPHOLE_TEST_FORCE_BULK_PACKET_TRANSFER=1)
 fi
 remote() {
   ssh "${remote_target}" "${remote_env[@]}" 'bash -se' <<<"$1"
@@ -390,7 +427,7 @@ count_remote_tool_processes() {
 
 path_trace() {
   local file="$1"
-  grep -E 'connected-(relay|direct)|v2-data-plane=raw-direct|v2-raw-direct-active=[1-9][0-9]*' "${file}" 2>/dev/null || true
+  grep -E 'connected-(relay|direct)|v2-data-plane=(raw-direct|direct-tcp-files)|v2-raw-direct-active=[1-9][0-9]*|v2-direct-tcp-selected=true' "${file}" 2>/dev/null || true
 }
 
 path_changed_mid_run() {
@@ -399,7 +436,7 @@ path_changed_mid_run() {
 }
 
 has_direct_path_evidence() {
-  grep -Eq 'connected-direct|v2-data-plane=raw-direct|v2-raw-direct-active=[1-9][0-9]*'
+  grep -Eq 'connected-direct|v2-data-plane=(raw-direct|direct-tcp-files)|v2-raw-direct-active=[1-9][0-9]*|v2-direct-tcp-selected=true'
 }
 
 require_direct_evidence() {
@@ -872,9 +909,52 @@ build_and_install_remote_binary() {
   fi
 }
 
+validate_caller_owned_payloads() {
+  local actual_size
+  if [[ -n "${local_payload_override}" ]]; then
+    if [[ ! -f "${local_payload_override}" ]]; then
+      echo "local benchmark payload must be a regular file: ${local_payload_override}" >&2
+      exit 2
+    fi
+    actual_size="$(wc -c <"${local_payload_override}" | tr -d '[:space:]')"
+    if [[ "${actual_size}" != "${expected_size}" ]]; then
+      echo "local benchmark payload size ${actual_size}, want ${expected_size}" >&2
+      exit 2
+    fi
+  fi
+  if [[ -n "${remote_payload_override}" ]]; then
+    if ! remote "test -f '${remote_payload_override}'"; then
+      echo "remote benchmark payload must be a regular file: ${remote_payload_override}" >&2
+      exit 2
+    fi
+    actual_size="$(remote "wc -c < '${remote_payload_override}'" | tr -d '[:space:]')"
+    if [[ "${actual_size}" != "${expected_size}" ]]; then
+      echo "remote benchmark payload size ${actual_size}, want ${expected_size}" >&2
+      exit 2
+    fi
+  fi
+}
+
+prepare_local_payload() {
+  if [[ -z "${local_payload_override}" ]]; then
+    echo "generating ${size_mib} MiB random payload"
+    dd if=/dev/urandom of="${payload}" bs=1048576 count="${size_mib}" 2>/dev/null
+  else
+    echo "using caller-owned local payload ${payload}"
+  fi
+}
+
+prepare_remote_payload() {
+  if [[ -z "${remote_payload_override}" ]]; then
+    echo "generating ${size_mib} MiB random payload on ${target}"
+    remote "dd if=/dev/urandom of='${remote_payload}' bs=1048576 count='${size_mib}' 2>/dev/null"
+  else
+    echo "using caller-owned remote payload ${remote_payload}"
+  fi
+}
+
 run_forward_derphole_stream() {
-  echo "generating ${size_mib} MiB random payload"
-  dd if=/dev/urandom of="${payload}" bs=1048576 count="${size_mib}" 2>/dev/null
+  prepare_local_payload
   source_sha="$(shasum -a 256 "${payload}" | awk '{print $1}')"
 
   remote "rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_receiver_resource_json}'; nohup env DERPHOLE_TRANSFER_TRACE_CSV='${remote_base}.trace.csv' '${remote_runstats}' -out '${remote_receiver_resource_json}' -- '${remote_bin}' --verbose listen >'${remote_base}.out' 2>'${remote_base}.err' </dev/null & echo \$! > '${remote_base}.pid'"
@@ -909,14 +989,13 @@ run_forward_derphole_stream() {
 }
 
 run_forward_derphole_file() {
-  echo "generating ${size_mib} MiB random payload"
-  dd if=/dev/urandom of="${payload}" bs=1048576 count="${size_mib}" 2>/dev/null
+  prepare_local_payload
   source_sha="$(shasum -a 256 "${payload}" | awk '{print $1}')"
   rm -f "${sender_log}" "${sender_trace_csv}" "${sender_resource_json}"
   remote "rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_receiver_resource_json}'"
 
   start_ms="$(now_ms)"
-  DERPHOLE_TRANSFER_TRACE_CSV="${sender_trace_csv}" "${local_runstats}" -out "${sender_resource_json}" -- "${local_bin}" --verbose send "${payload}" >/dev/null 2>"${sender_log}" &
+  DERPHOLE_TRANSFER_TRACE_CSV="${sender_trace_csv}" "${local_runstats}" -out "${sender_resource_json}" -- "${local_bin}" --verbose send "${direct_tcp_args[@]}" "${payload}" >/dev/null 2>"${sender_log}" &
   send_pid="$!"
 
   token=""
@@ -941,9 +1020,8 @@ run_forward_derphole_file() {
 }
 
 run_reverse_derphole_stream() {
-  echo "generating ${size_mib} MiB random payload on ${target}"
-  remote "dd if=/dev/urandom of='${remote_base}.payload' bs=1048576 count='${size_mib}' 2>/dev/null"
-  source_sha="$(remote "sha256sum '${remote_base}.payload' | awk '{print \$1}'")"
+  prepare_remote_payload
+  source_sha="$(remote "sha256sum '${remote_payload}' | awk '{print \$1}'")"
 
   DERPHOLE_TRANSFER_TRACE_CSV="${receiver_trace_csv}" "${local_runstats}" -out "${receiver_resource_json}" -- "${local_bin}" --verbose listen >"${receiver_out}" 2>"${receiver_log}" &
   listener_pid="$!"
@@ -966,7 +1044,7 @@ run_reverse_derphole_stream() {
   if [[ -n "${parallel_args_remote}" ]]; then
     remote_send_cmd+=" ${parallel_args_remote}"
   fi
-  remote_send_cmd+=" '${token}' <'${remote_base}.payload' >/dev/null 2>'${remote_base}.err'"
+  remote_send_cmd+=" '${token}' <'${remote_payload}' >/dev/null 2>'${remote_base}.err'"
 
   start_ms="$(now_ms)"
   remote "${remote_send_cmd}"
@@ -982,10 +1060,9 @@ run_reverse_derphole_stream() {
 }
 
 run_reverse_derphole_file() {
-  echo "generating ${size_mib} MiB random payload on ${target}"
-  remote "dd if=/dev/urandom of='${remote_base}.payload' bs=1048576 count='${size_mib}' 2>/dev/null"
-  source_sha="$(remote "sha256sum '${remote_base}.payload' | awk '{print \$1}'")"
-  remote "rm -f '${remote_base}.pid' '${remote_base}.child.pid' '${remote_base}.child.pid.tmp' '${remote_base}.status' '${remote_base}.status.tmp' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_sender_resource_json}'; nohup sh -c 'set +e; child_pid=; forward_signal() { signal=\$1; if [ -n \"\${child_pid}\" ]; then kill -\"\${signal}\" \"\${child_pid}\" 2>/dev/null || true; fi; }; trap \"forward_signal TERM\" TERM; trap \"forward_signal INT\" INT; DERPHOLE_TRANSFER_TRACE_CSV=\"${remote_base}.trace.csv\" \"${remote_runstats}\" -out \"${remote_sender_resource_json}\" -- \"${remote_bin}\" --verbose send \"${remote_base}.payload\" >\"${remote_base}.out\" 2>\"${remote_base}.err\" & child_pid=\$!; printf \"%s\\n\" \"\${child_pid}\" >\"${remote_base}.child.pid.tmp\"; mv \"${remote_base}.child.pid.tmp\" \"${remote_base}.child.pid\"; wait \"\${child_pid}\"; status=\$?; printf \"%s\\n\" \"\${status}\" >\"${remote_base}.status.tmp\"; mv \"${remote_base}.status.tmp\" \"${remote_base}.status\"; exit \"\${status}\"' >/dev/null 2>&1 </dev/null & echo \$! >'${remote_base}.pid'"
+  prepare_remote_payload
+  source_sha="$(remote "sha256sum '${remote_payload}' | awk '{print \$1}'")"
+  remote "rm -f '${remote_base}.pid' '${remote_base}.child.pid' '${remote_base}.child.pid.tmp' '${remote_base}.status' '${remote_base}.status.tmp' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_sender_resource_json}'; nohup sh -c 'set +e; child_pid=; forward_signal() { signal=\$1; if [ -n \"\${child_pid}\" ]; then kill -\"\${signal}\" \"\${child_pid}\" 2>/dev/null || true; fi; }; trap \"forward_signal TERM\" TERM; trap \"forward_signal INT\" INT; DERPHOLE_TRANSFER_TRACE_CSV=\"${remote_base}.trace.csv\" \"${remote_runstats}\" -out \"${remote_sender_resource_json}\" -- \"${remote_bin}\" --verbose send \"${remote_payload}\" >\"${remote_base}.out\" 2>\"${remote_base}.err\" & child_pid=\$!; printf \"%s\\n\" \"\${child_pid}\" >\"${remote_base}.child.pid.tmp\"; mv \"${remote_base}.child.pid.tmp\" \"${remote_base}.child.pid\"; wait \"\${child_pid}\"; status=\$?; printf \"%s\\n\" \"\${status}\" >\"${remote_base}.status.tmp\"; mv \"${remote_base}.status.tmp\" \"${remote_base}.status\"; exit \"\${status}\"' >/dev/null 2>&1 </dev/null & echo \$! >'${remote_base}.pid'"
 
   token=""
   for _ in $(seq 1 200); do
@@ -996,7 +1073,7 @@ run_reverse_derphole_file() {
   [[ -n "${token}" ]] || { echo "failed to capture remote send token" >&2; exit 1; }
 
   start_ms="$(now_ms)"
-  DERPHOLE_TRANSFER_TRACE_CSV="${receiver_trace_csv}" "${local_runstats}" -out "${receiver_resource_json}" -- "${local_bin}" --verbose receive -o "${receiver_out}" "${token}" >/dev/null 2>"${receiver_log}"
+  DERPHOLE_TRANSFER_TRACE_CSV="${receiver_trace_csv}" "${local_runstats}" -out "${receiver_resource_json}" -- "${local_bin}" --verbose receive "${direct_tcp_args[@]}" -o "${receiver_out}" "${token}" >/dev/null 2>"${receiver_log}"
   wait_remote_pid_status
   command_end_ms="$(now_ms)"
 
@@ -1016,7 +1093,9 @@ finalize_run() {
   sender_trace="$(path_trace "${sender_log}")"
   receiver_trace="$(path_trace "${receiver_log}")"
 
-  if grep -Fq 'v2-block-transfer=bulk-packets' "${sender_log}" && grep -Fq 'v2-block-transfer=bulk-packets' "${receiver_log}"; then
+  if grep -Fq 'v2-block-transfer=direct-tcp-files' "${sender_log}" && grep -Fq 'v2-block-transfer=direct-tcp-files' "${receiver_log}"; then
+    transfer_mode="direct-tcp-files-v1"
+  elif grep -Fq 'v2-block-transfer=bulk-packets' "${sender_log}" && grep -Fq 'v2-block-transfer=bulk-packets' "${receiver_log}"; then
     transfer_mode="bulk-packets-v1"
   elif grep -Fq 'v2-block-policy=mode:blocks-v1' "${sender_log}" || grep -Fq 'v2-block-policy=mode:blocks-v1' "${receiver_log}"; then
     transfer_mode="blocks-v1"
@@ -1100,6 +1179,7 @@ finalize_run() {
 }
 
 build_and_install_remote_binary
+validate_caller_owned_payloads
 
 case "${tool}:${direction}:${workload}" in
   derphole:forward:file) run_forward_derphole_file ;;

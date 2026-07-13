@@ -25,6 +25,15 @@ import (
 	"github.com/shayne/derphole/pkg/token"
 )
 
+func TestFileTransferRejectsInvalidDirectTCPPort(t *testing.T) {
+	if err := Send(context.Background(), SendConfig{DirectTCPPort: 65536}); err == nil || !strings.Contains(err.Error(), "direct TCP port") {
+		t.Fatalf("Send() error = %v, want direct TCP port error", err)
+	}
+	if err := Receive(context.Background(), ReceiveConfig{DirectTCPPort: -1}); err == nil || !strings.Contains(err.Error(), "direct TCP port") {
+		t.Fatalf("Receive() error = %v, want direct TCP port error", err)
+	}
+}
+
 func TestSendTextIssuesTokenAndTransfersPayload(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

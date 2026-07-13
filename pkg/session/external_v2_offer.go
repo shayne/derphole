@@ -26,10 +26,11 @@ import (
 )
 
 type externalV2OfferRuntime struct {
-	cfg     OfferConfig
-	tok     string
-	auth    externalPeerControlAuth
-	session *relaySession
+	cfg       OfferConfig
+	tok       string
+	auth      externalPeerControlAuth
+	session   *relaySession
+	directTCP *externalV2DirectTCPListener
 
 	claimCh             <-chan derpbind.Packet
 	completeCh          <-chan derpbind.Packet
@@ -53,6 +54,7 @@ type externalV2OfferReceiveRuntime struct {
 	auth         externalPeerControlAuth
 	candidates   []string
 	countedDst   *byteCountingWriteCloser
+	directTCP    *externalV2DirectTCPListener
 
 	acceptCh          <-chan derpbind.Packet
 	abortCh           <-chan derpbind.Packet
@@ -117,6 +119,9 @@ func (rt *externalV2OfferRuntime) subscribe() {
 }
 
 func (rt *externalV2OfferRuntime) Close() {
+	if rt.directTCP != nil {
+		rt.directTCP.Close()
+	}
 	if rt.unsubscribeClaims != nil {
 		rt.unsubscribeClaims()
 	}
@@ -257,6 +262,14 @@ func (rt *externalV2OfferRuntime) send(ctx context.Context, accepted externalV2A
 
 	managerConnections := externalV2ManagerConnectionCount(accept, policy)
 	rawDirectBudget := externalV2AcceptedRawDirectStartupBudget(accept)
+	if externalV2UsesDirectTCPFileTransfer(accept.TransferMode) {
+		rt.cfg.BlockSource.ChunkSize = accept.BlockChunkSize
+		used, err := rt.sendDirectTCPBlock(ctx, transferCtx, accepted, tr, metrics, progressState, pathEmitter, abortErrCh)
+		if err != nil || used {
+			return err
+		}
+		accept.TransferMode = externalV2TransferModeBlocks
+	}
 	return rt.sendQUIC(ctx, transferCtx, accepted, accept, tr, policy, managerConnections, rawDirectBudget, countedSrc, metrics, progressState, pathEmitter, abortErrCh, setEndpoint)
 }
 
@@ -426,8 +439,20 @@ func (rt *externalV2OfferRuntime) sendAccept(ctx context.Context, peerDERP key.N
 	if claim.BlockCapable {
 		externalV2BlockSourceAccept(rt.cfg.BlockSource, &accept)
 		policy := externalV2AcceptedBlockTransferPolicy(claim, validExternalV2BlockSource(rt.cfg.BlockSource), candidates)
-		accept.TransferMode = policy.Mode
+		accept.DirectTCPFileCapable = validExternalV2BlockSource(rt.cfg.BlockSource) && !rt.cfg.ForceRelay
+		if policy.Mode == externalV2TransferModeBlocks && accept.BlockSize >= externalV2DirectTCPMinFileSize && claim.DirectTCPFileCapable && accept.DirectTCPFileCapable && !externalV2DirectTCPAdvertisementUsable(claim.DirectTCPFile) {
+			rt.directTCP = openConfiguredExternalV2DirectTCPListener(rt.cfg.DirectTCPPort, candidates, rt.cfg.Emitter)
+			if rt.directTCP != nil {
+				ad := rt.directTCP.ad
+				accept.DirectTCPFile = &ad
+			}
+		}
+		accept.TransferMode = externalV2SelectFileTransferMode(policy.Mode, accept.BlockSize, claim.DirectTCPFileCapable, accept.DirectTCPFileCapable, claim.DirectTCPFile, accept.DirectTCPFile)
+		if externalV2UsesDirectTCPFileTransfer(accept.TransferMode) {
+			accept.BlockChunkSize = externalV2DirectTCPChunkSize
+		}
 		emitExternalV2BlockTransferPolicy(rt.cfg.Emitter, policy)
+		emitExternalV2Debug(rt.cfg.Emitter, fmt.Sprintf("v2-file-transfer-selection=policy:%s size:%d claim_tcp:%t accept_tcp:%t claim_listener:%t accept_listener:%t selected:%s", policy.Mode, accept.BlockSize, claim.DirectTCPFileCapable, accept.DirectTCPFileCapable, externalV2DirectTCPAdvertisementUsable(claim.DirectTCPFile), externalV2DirectTCPAdvertisementUsable(accept.DirectTCPFile), accept.TransferMode))
 	}
 	err := sendAuthenticatedEnvelope(ctx, rt.session.derp, peerDERP, envelope{
 		Type:     envelopeV2Accept,
@@ -627,6 +652,9 @@ func (rt *externalV2OfferReceiveRuntime) subscribe() {
 }
 
 func (rt *externalV2OfferReceiveRuntime) Close() {
+	if rt.directTCP != nil {
+		rt.directTCP.Close()
+	}
 	if rt.unsubscribeAccept != nil {
 		rt.unsubscribeAccept()
 	}
@@ -661,24 +689,25 @@ func (rt *externalV2OfferReceiveRuntime) run(ctx context.Context) (retErr error)
 	if err := rt.sendClaim(ctx); err != nil {
 		return err
 	}
-	var tr externalV2ListenTransport
-	trOpen := false
+	tr, accept, err := rt.acceptAndStartTransport(ctx, pathEmitter, metrics)
+	if err != nil {
+		rt.notifyAbort(err)
+		drainExternalV2AbortSignal()
+		return err
+	}
 	defer func() {
 		if retErr != nil {
 			rt.notifyAbort(retErr)
 			drainExternalV2AbortSignal()
 		}
-		if trOpen {
-			tr.Close()
-		}
+		tr.Close()
 	}()
-	tr, accept, err := rt.acceptAndStartTransport(ctx, pathEmitter, metrics)
-	if err != nil {
-		return err
-	}
-	trOpen = true
 	metrics.SetTransportManager(tr.manager)
 	metrics.SetPhase(transfertrace.PhaseRelay, string(StateRelay))
+	if !externalV2UsesDirectTCPFileTransfer(accept.TransferMode) && rt.directTCP != nil {
+		rt.directTCP.Close()
+		rt.directTCP = nil
+	}
 
 	sink, err := rt.openAcceptedReceiveSink(ctx, accept, metrics)
 	if err != nil {
@@ -692,7 +721,22 @@ func (rt *externalV2OfferReceiveRuntime) run(ctx context.Context) (retErr error)
 	policy := externalV2ParallelPolicy(accept)
 	managerConnections := externalV2ManagerConnectionCount(accept, policy)
 	rawDirectBudget := externalV2AcceptedRawDirectStartupBudget(accept)
+	if handled, err := rt.receiveSelectedDirectTCP(ctx, accept, tr, &sink, progressSender, metrics, pathEmitter); err != nil || handled {
+		return err
+	}
 	return rt.receiveAcceptedQUIC(ctx, tr, policy, managerConnections, rawDirectBudget, sink, progressSender, metrics, pathEmitter)
+}
+
+func (rt *externalV2OfferReceiveRuntime) receiveSelectedDirectTCP(ctx context.Context, accept externalV2Accept, tr externalV2ListenTransport, sink *externalV2OfferReceiveSink, progressSender *externalV2PeerProgressSender, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter) (bool, error) {
+	if sink == nil || !sink.useBlock || !externalV2UsesDirectTCPFileTransfer(sink.transferMode) {
+		return false, nil
+	}
+	used, err := rt.receiveDirectTCPBlock(ctx, accept, tr, sink.block, sink.blockCfg, progressSender, metrics, pathEmitter)
+	if err != nil || used {
+		return true, err
+	}
+	sink.transferMode = externalV2TransferModeBlocks
+	return false, nil
 }
 
 type externalV2OfferReceiveSink struct {
@@ -822,12 +866,20 @@ func (rt *externalV2OfferReceiveRuntime) sendClaim(ctx context.Context) error {
 	rt.candidates = externalV2ProbeCandidates(ctx, rt.cfg.ForceRelay, rt.probeConn, rt.dm, rt.pm)
 	emitExternalV2Debug(rt.cfg.Emitter, fmt.Sprintf("v2-claim-candidates=%d", len(rt.candidates)))
 	claim := externalV2Claim{
-		Protocol:           externalV2Protocol,
-		QUICPublic:         rt.identity.Public,
-		Candidates:         rt.candidates,
-		RelayCapable:       !rt.cfg.ForceRelay,
-		BlockCapable:       rt.cfg.BlockReceiver != nil,
-		BlockPacketCapable: rt.cfg.BlockReceiver != nil,
+		Protocol:             externalV2Protocol,
+		QUICPublic:           rt.identity.Public,
+		Candidates:           rt.candidates,
+		RelayCapable:         !rt.cfg.ForceRelay,
+		BlockCapable:         rt.cfg.BlockReceiver != nil,
+		BlockPacketCapable:   rt.cfg.BlockReceiver != nil,
+		DirectTCPFileCapable: rt.cfg.BlockReceiver != nil && !rt.cfg.ForceRelay,
+	}
+	if claim.DirectTCPFileCapable {
+		rt.directTCP = openConfiguredExternalV2DirectTCPListener(rt.cfg.DirectTCPPort, rt.candidates, rt.cfg.Emitter)
+		if rt.directTCP != nil {
+			ad := rt.directTCP.ad
+			claim.DirectTCPFile = &ad
+		}
 	}
 	claim.ParallelMode, claim.ParallelInitial, claim.ParallelCap = externalV2SetParallelPolicy(DefaultParallelPolicy())
 	return sendAuthenticatedEnvelope(ctx, rt.derp, rt.listenerDERP, envelope{

@@ -153,9 +153,9 @@ func TestRunPrintsRepairEfficiencySummary(t *testing.T) {
 
 func TestRunChecksPeerTraceSuccess(t *testing.T) {
 	sendPath := writeTrace(t, transfertrace.HeaderLine+"\n"+
-		"1000,0,send,complete,1024,0,1024,1024,0.00,1024,1024,,500,false,,,,,,,,,,,,stream-complete,\n")
+		padLegacyTraceRow("1000,0,send,complete,1024,0,1024,1024,0.00,1024,1024,,500,false,,,,,,,,,,,,stream-complete,"))
 	receivePath := writeTrace(t, transfertrace.HeaderLine+"\n"+
-		"1000,0,receive,complete,1024,0,1024,1024,0.00,0,0,,500,false,,,,,,,,,,,,stream-complete,\n")
+		padLegacyTraceRow("1000,0,receive,complete,1024,0,1024,1024,0.00,0,0,,500,false,,,,,,,,,,,,stream-complete,"))
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"-role", "send", "-expected-bytes", "1024", "-progress-lead-tolerance", "0", "-peer-trace", receivePath, sendPath}, &stdout, &stderr)
 	if code != 0 {
@@ -168,9 +168,9 @@ func TestRunChecksPeerTraceSuccess(t *testing.T) {
 
 func TestRunChecksPeerTraceFailure(t *testing.T) {
 	sendPath := writeTrace(t, transfertrace.HeaderLine+"\n"+
-		"1000,0,send,complete,2048,0,2048,2048,0.00,2048,2048,,500,false,,,,,,,,,,,,stream-complete,\n")
+		padLegacyTraceRow("1000,0,send,complete,2048,0,2048,2048,0.00,2048,2048,,500,false,,,,,,,,,,,,stream-complete,"))
 	receivePath := writeTrace(t, transfertrace.HeaderLine+"\n"+
-		"1000,0,receive,complete,1024,0,1024,1024,0.00,0,0,,500,false,,,,,,,,,,,,stream-complete,\n")
+		padLegacyTraceRow("1000,0,receive,complete,1024,0,1024,1024,0.00,0,0,,500,false,,,,,,,,,,,,stream-complete,"))
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"-role", "send", "-expected-bytes", "2048", "-peer-trace", receivePath, sendPath}, &stdout, &stderr)
 	if code != 1 {
@@ -405,7 +405,7 @@ func TestRunStandaloneFailureReportsObservedFlatline(t *testing.T) {
 
 func TestRunReturnsFailureForCheckError(t *testing.T) {
 	path := writeTrace(t, transfertrace.HeaderLine+"\n"+
-		"1000,0,receive,error,0,0,0,0,0.00,0,0,,,false,,,,,,,,,,,,connected-direct,message too long\n")
+		padLegacyTraceRow("1000,0,receive,error,0,0,0,0,0.00,0,0,,,false,,,,,,,,,,,,connected-direct,message too long"))
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"-role", "receive", path}, &stdout, &stderr)
 	if code != 1 {
@@ -506,5 +506,14 @@ func traceCSVRow(t *testing.T, values map[string]string) string {
 		}
 		fields[index] = value
 	}
+	return strings.Join(fields, ",") + "\n"
+}
+
+func padLegacyTraceRow(row string) string {
+	fields := strings.Split(row, ",")
+	if len(fields) > len(transfertrace.Header) {
+		panic("legacy trace row has more fields than current header")
+	}
+	fields = append(fields, make([]string, len(transfertrace.Header)-len(fields))...)
 	return strings.Join(fields, ",") + "\n"
 }

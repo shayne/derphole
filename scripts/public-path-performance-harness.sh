@@ -11,12 +11,23 @@ runs="${DERPHOLE_PUBLIC_PATH_RUNS:-3}"
 initial_rates_raw="${DERPHOLE_PUBLIC_PATH_INITIAL_RATES:-}"
 initial_rates=()
 iperf_port="${DERPHOLE_PUBLIC_IPERF_PORT:-8123}"
+iperf_streams="${DERPHOLE_PUBLIC_IPERF_STREAMS:-4}"
 direction="${DERPHOLE_PUBLIC_PATH_DIRECTION:-forward}"
 iperf_server_host="${DERPHOLE_PUBLIC_IPERF_SERVER_HOST:-}"
 log_dir="${DERPHOLE_BENCH_LOG_DIR:-.tmp/public-path-performance}"
 remote_output_root="${DERPHOLE_BENCH_REMOTE_OUTPUT_ROOT:-derphole-bench/public-path}"
 summary_csv="${log_dir}/summary.csv"
 remote_user="${DERPHOLE_REMOTE_USER:-ubuntu}"
+bulk_batched_io="${DERPHOLE_TEST_BULK_BATCHED_IO:-}"
+
+if [[ ! "${iperf_streams}" =~ ^[0-9]+$ ]] || ((iperf_streams < 1 || iperf_streams > 64)); then
+  echo "DERPHOLE_PUBLIC_IPERF_STREAMS must be an integer from 1 through 64" >&2
+  exit 2
+fi
+if [[ -n "${bulk_batched_io}" && "${bulk_batched_io}" != "1" ]]; then
+  echo "DERPHOLE_TEST_BULK_BATCHED_IO must be empty or 1" >&2
+  exit 2
+fi
 
 if [[ "${1:-}" != "" ]]; then
   hosts_raw="$1"
@@ -95,7 +106,7 @@ run_iperf_sample() {
   if [[ -n "${iperf_reverse_flag}" ]]; then
     remote_cmd+=("${iperf_reverse_flag}")
   fi
-  remote_cmd+=(-c "${iperf_server_host}" -p "${iperf_port}" -t 20 -P 4)
+  remote_cmd+=(-c "${iperf_server_host}" -p "${iperf_port}" -t 20 -P "${iperf_streams}")
   printf -v remote_cmd_quoted '%q ' "${remote_cmd[@]}"
   ssh -n -o BatchMode=yes "${remote}" "${remote_cmd_quoted}" >"${out}"
   wait "${server_pid}" || true
@@ -125,11 +136,15 @@ run_derphole_sample() {
   if [[ -n "${initial_rate}" ]]; then
     experiment_env+=(DERPHOLE_TEST_BULK_INITIAL_WIRE_MBPS="${initial_rate}")
   fi
+  if [[ "${bulk_batched_io}" == "1" ]]; then
+    experiment_env+=(DERPHOLE_TEST_BULK_BATCHED_IO=1)
+  fi
   env \
     -u DERPHOLE_V2_RAW_DIRECT \
     -u DERPHOLE_V2_RAW_DIRECT_BUDGET_MS \
     -u DERPHOLE_V2_MANAGER_QUIC_FANOUT \
     -u DERPHOLE_TEST_BULK_INITIAL_WIRE_MBPS \
+    -u DERPHOLE_TEST_BULK_BATCHED_IO \
     "${experiment_env[@]}" \
     DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 \
     DERPHOLE_BENCH_WORKLOAD=file \

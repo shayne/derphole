@@ -664,6 +664,20 @@ func TestExternalTransferMetricsDirectPathReceiveProgressWritesCommittedBytes(t 
 	}
 }
 
+func TestExternalTransferMetricsDirectStreamTransportCanIdentifyTCP(t *testing.T) {
+	start := time.Unix(1700000000, 0)
+	metrics := newExternalTransferMetrics(start)
+	metrics.SetDirectStreamTransport("tls-tcp")
+	metrics.RecordDirectPathSend(1024, start.Add(time.Millisecond))
+
+	metrics.mu.Lock()
+	got := metrics.directTransport
+	metrics.mu.Unlock()
+	if got != "tls-tcp" {
+		t.Fatalf("direct transport = %q, want tls-tcp", got)
+	}
+}
+
 func TestExternalTransferMetricsSetDirectStatsWithoutByteProgressWritesDiagnosticsOnly(t *testing.T) {
 	var out bytes.Buffer
 	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, time.Unix(35, 0))
@@ -1031,6 +1045,52 @@ func TestListenConfigTraceUpdatesReceiveRelayPrefixTrace(t *testing.T) {
 	body := out.String()
 	if !strings.Contains(body, ",receive,relay,2048,0,2048,2048,") {
 		t.Fatalf("trace body missing receive relay progress:\n%s", body)
+	}
+}
+
+func TestExternalTransferMetricsBulkBatchDiagnosticsAreMonotonic(t *testing.T) {
+	metrics := newExternalTransferMetrics(time.Now())
+	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
+		BulkBatchPresent:     true,
+		BulkBatchBackend:     "linux-sendmmsg",
+		BulkGSOAttempted:     true,
+		BulkGSOActive:        false,
+		BulkGSOSegments:      0,
+		BulkSendCalls:        10,
+		BulkSendDatagrams:    640,
+		BulkReceiveCalls:     8,
+		BulkReceiveDatagrams: 512,
+		BulkMaxSendBatch:     64,
+		BulkMaxReceiveBatch:  64,
+		BulkCryptoQueuePeak:  4,
+		BulkWriterQueuePeak:  3,
+	}, time.Now())
+	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
+		BulkBatchPresent:     true,
+		BulkBatchBackend:     "linux-gso",
+		BulkGSOAttempted:     true,
+		BulkGSOActive:        true,
+		BulkGSOSegments:      64,
+		BulkSendCalls:        9,
+		BulkSendDatagrams:    600,
+		BulkReceiveCalls:     7,
+		BulkReceiveDatagrams: 500,
+		BulkMaxSendBatch:     32,
+		BulkMaxReceiveBatch:  32,
+		BulkCryptoQueuePeak:  2,
+		BulkWriterQueuePeak:  2,
+	}, time.Now())
+
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	if !metrics.bulkBatchPresent || metrics.bulkBatchBackend != "linux-gso" || !metrics.bulkGSOAttempted || !metrics.bulkGSOActive {
+		t.Fatalf("batch identity = present %v backend %q attempted %v active %v", metrics.bulkBatchPresent, metrics.bulkBatchBackend, metrics.bulkGSOAttempted, metrics.bulkGSOActive)
+	}
+	if metrics.bulkGSOSegments != 64 || metrics.bulkSendCalls != 10 || metrics.bulkSendDatagrams != 640 || metrics.bulkReceiveCalls != 8 || metrics.bulkReceiveDatagrams != 512 {
+		t.Fatalf("batch counters regressed: gso=%d send=%d/%d receive=%d/%d", metrics.bulkGSOSegments, metrics.bulkSendCalls, metrics.bulkSendDatagrams, metrics.bulkReceiveCalls, metrics.bulkReceiveDatagrams)
+	}
+	if metrics.bulkMaxSendBatch != 64 || metrics.bulkMaxReceiveBatch != 64 || metrics.bulkCryptoQueuePeak != 4 || metrics.bulkWriterQueuePeak != 3 {
+		t.Fatalf("batch peaks regressed: send=%d receive=%d crypto=%d writer=%d", metrics.bulkMaxSendBatch, metrics.bulkMaxReceiveBatch, metrics.bulkCryptoQueuePeak, metrics.bulkWriterQueuePeak)
 	}
 }
 

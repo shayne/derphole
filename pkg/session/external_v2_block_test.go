@@ -9,6 +9,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -354,6 +355,106 @@ func TestExternalV2BlockTransferUsesBulkPacketsOnRawDirect(t *testing.T) {
 	}
 }
 
+func TestExternalV2ListenSendDirectTCPFileRoundTripReceiverListens(t *testing.T) {
+	testExternalV2ListenSendDirectTCPFileRoundTrip(t, false)
+}
+
+func TestExternalV2ListenSendDirectTCPFileRoundTripSenderListens(t *testing.T) {
+	testExternalV2ListenSendDirectTCPFileRoundTrip(t, true)
+}
+
+func testExternalV2ListenSendDirectTCPFileRoundTrip(t *testing.T, senderListens bool) {
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+
+	prevInterfaceAddrs := publicInterfaceAddrs
+	publicInterfaceAddrs = func() ([]net.Addr, error) {
+		result := make([]net.Addr, 0, 5)
+		for last := 1; last <= 5; last++ {
+			result = append(result, &net.IPNet{IP: net.IPv4(127, 0, 0, byte(last)), Mask: net.CIDRMask(8, 32)})
+		}
+		return result, nil
+	}
+	t.Cleanup(func() { publicInterfaceAddrs = prevInterfaceAddrs })
+
+	reserved, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, portText, err := net.SplitHostPort(reserved.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = reserved.Close()
+	senderPort, receiverPort := 0, port
+	if senderListens {
+		senderPort, receiverPort = port, 0
+	}
+
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	payload := bytes.Repeat([]byte{0x6b}, externalV2DirectTCPMinFileSize)
+	sink := newMemoryBlockSink(int64(len(payload)))
+	var listenerStatus, senderStatus syncBuffer
+	tokenSink := make(chan string, 1)
+	listenErr := make(chan error, 1)
+	go func() {
+		_, err := listenExternal(ctx, ListenConfig{
+			TokenSink:     tokenSink,
+			Emitter:       telemetry.New(&listenerStatus, telemetry.LevelVerbose),
+			UsePublicDERP: true,
+			DirectTCPPort: receiverPort,
+			BlockReceiver: func(context.Context, BlockReceiveRequest) (BlockReceiveSink, error) {
+				return sink, nil
+			},
+		})
+		listenErr <- err
+	}()
+
+	var raw string
+	select {
+	case raw = <-tokenSink:
+	case err := <-listenErr:
+		t.Fatalf("listenExternal() returned before token: %v", err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	err = sendExternal(ctx, SendConfig{
+		Token:         raw,
+		Emitter:       telemetry.New(&senderStatus, telemetry.LevelVerbose),
+		UsePublicDERP: true,
+		DirectTCPPort: senderPort,
+		BlockSource: &BlockSource{
+			Header:      []byte("direct-tcp"),
+			Payload:     bytes.NewReader(payload),
+			PayloadSize: int64(len(payload)),
+			ChunkSize:   1 << 20,
+		},
+	})
+	if err != nil {
+		t.Fatalf("sendExternal() error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+	}
+	if err := <-listenErr; err != nil {
+		t.Fatalf("listenExternal() error = %v listener=%q sender=%q", err, listenerStatus.String(), senderStatus.String())
+	}
+	if !bytes.Equal(sink.bytes(), payload) {
+		t.Fatal("direct TCP file payload mismatch")
+	}
+	for role, status := range map[string]string{"listener": listenerStatus.String(), "sender": senderStatus.String()} {
+		if !strings.Contains(status, "v2-block-transfer=direct-tcp-files") || !strings.Contains(status, "v2-data-plane=direct-tcp-files") {
+			t.Fatalf("%s status missing direct TCP markers: %q", role, status)
+		}
+	}
+}
+
 func TestExternalV2OfferReceiveRawDirectBulk(t *testing.T) {
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
@@ -541,6 +642,106 @@ func TestExternalV2OfferReceiveRawDirectBulk(t *testing.T) {
 	gotPayload := sink.bytes()
 	if !bytes.Equal(gotPayload, payload) {
 		t.Fatal("offer/receive block payload mismatch")
+	}
+}
+
+func TestExternalV2OfferReceiveDirectTCPFileRoundTripReceiverListens(t *testing.T) {
+	testExternalV2OfferReceiveDirectTCPFileRoundTrip(t, false)
+}
+
+func TestExternalV2OfferReceiveDirectTCPFileRoundTripSenderListens(t *testing.T) {
+	testExternalV2OfferReceiveDirectTCPFileRoundTrip(t, true)
+}
+
+func testExternalV2OfferReceiveDirectTCPFileRoundTrip(t *testing.T, senderListens bool) {
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+
+	prevInterfaceAddrs := publicInterfaceAddrs
+	publicInterfaceAddrs = func() ([]net.Addr, error) {
+		result := make([]net.Addr, 0, 5)
+		for last := 1; last <= 5; last++ {
+			result = append(result, &net.IPNet{IP: net.IPv4(127, 0, 0, byte(last)), Mask: net.CIDRMask(8, 32)})
+		}
+		return result, nil
+	}
+	t.Cleanup(func() { publicInterfaceAddrs = prevInterfaceAddrs })
+
+	reserved, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, portText, err := net.SplitHostPort(reserved.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = reserved.Close()
+	senderPort, receiverPort := 0, port
+	if senderListens {
+		senderPort, receiverPort = port, 0
+	}
+
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	payload := bytes.Repeat([]byte{0x5a}, externalV2DirectTCPMinFileSize)
+	sink := newMemoryBlockSink(int64(len(payload)))
+	var offerStatus, receiveStatus syncBuffer
+	tokenSink := make(chan string, 1)
+	offerErr := make(chan error, 1)
+	go func() {
+		_, err := Offer(ctx, OfferConfig{
+			TokenSink:     tokenSink,
+			Emitter:       telemetry.New(&offerStatus, telemetry.LevelVerbose),
+			UsePublicDERP: true,
+			DirectTCPPort: senderPort,
+			BlockSource: &BlockSource{
+				Header:      []byte("direct-tcp"),
+				Payload:     bytes.NewReader(payload),
+				PayloadSize: int64(len(payload)),
+				ChunkSize:   1 << 20,
+			},
+		})
+		offerErr <- err
+	}()
+
+	var raw string
+	select {
+	case raw = <-tokenSink:
+	case err := <-offerErr:
+		t.Fatalf("Offer() returned before token: %v", err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	err = Receive(ctx, ReceiveConfig{
+		Token:         raw,
+		Emitter:       telemetry.New(&receiveStatus, telemetry.LevelVerbose),
+		UsePublicDERP: true,
+		DirectTCPPort: receiverPort,
+		BlockReceiver: func(context.Context, BlockReceiveRequest) (BlockReceiveSink, error) {
+			return sink, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Receive() error = %v offer=%q receive=%q", err, offerStatus.String(), receiveStatus.String())
+	}
+	if err := <-offerErr; err != nil {
+		t.Fatalf("Offer() error = %v offer=%q receive=%q", err, offerStatus.String(), receiveStatus.String())
+	}
+	if !bytes.Equal(sink.bytes(), payload) {
+		t.Fatal("direct TCP file payload mismatch")
+	}
+	for role, status := range map[string]string{"offer": offerStatus.String(), "receive": receiveStatus.String()} {
+		if !strings.Contains(status, "v2-block-transfer=direct-tcp-files") || !strings.Contains(status, "v2-data-plane=direct-tcp-files") {
+			t.Fatalf("%s status missing direct TCP markers: %q", role, status)
+		}
 	}
 }
 

@@ -108,6 +108,18 @@ var header = [...]string{
 	"repair_request_batches",
 	"reorder_trail_packets",
 	"receive_packet_rate_pps",
+	"bulk_batch_backend",
+	"bulk_gso_attempted",
+	"bulk_gso_active",
+	"bulk_gso_segments",
+	"bulk_send_calls",
+	"bulk_send_datagrams",
+	"bulk_receive_calls",
+	"bulk_receive_datagrams",
+	"bulk_max_send_batch",
+	"bulk_max_receive_batch",
+	"bulk_crypto_queue_peak",
+	"bulk_writer_queue_peak",
 }
 
 var Header = append([]string(nil), header[:]...)
@@ -176,6 +188,19 @@ type Snapshot struct {
 	RepairRequestBatches    uint64
 	ReorderTrailPackets     uint32
 	ReceivePacketRatePPS    uint32
+	BulkBatchPresent        bool
+	BulkBatchBackend        string
+	BulkGSOAttempted        bool
+	BulkGSOActive           bool
+	BulkGSOSegments         uint64
+	BulkSendCalls           uint64
+	BulkSendDatagrams       uint64
+	BulkReceiveCalls        uint64
+	BulkReceiveDatagrams    uint64
+	BulkMaxSendBatch        uint32
+	BulkMaxReceiveBatch     uint32
+	BulkCryptoQueuePeak     uint32
+	BulkWriterQueuePeak     uint32
 	LastState               string
 	LastError               string
 }
@@ -385,7 +410,7 @@ func (r *Recorder) row(snap Snapshot, deltaBytes int64, deltaMS int64, localSent
 		receiverCommittedGoodput = formatMbps(peerReceivedDelta, deltaMS)
 	}
 
-	return []string{
+	row := []string{
 		strconv.FormatInt(snap.At.UnixMilli(), 10),
 		strconv.FormatInt(snap.At.Sub(r.start).Milliseconds(), 10),
 		string(r.role),
@@ -458,6 +483,27 @@ func (r *Recorder) row(snap Snapshot, deltaBytes int64, deltaMS int64, localSent
 		strconv.FormatUint(snap.RepairRequestBatches, 10),
 		strconv.FormatUint(uint64(snap.ReorderTrailPackets), 10),
 		strconv.FormatUint(uint64(snap.ReceivePacketRatePPS), 10),
+	}
+	return append(row, bulkBatchTraceColumns(snap)...)
+}
+
+func bulkBatchTraceColumns(snap Snapshot) []string {
+	if !snap.BulkBatchPresent {
+		return make([]string, 12)
+	}
+	return []string{
+		snap.BulkBatchBackend,
+		strconv.FormatBool(snap.BulkGSOAttempted),
+		strconv.FormatBool(snap.BulkGSOActive),
+		strconv.FormatUint(snap.BulkGSOSegments, 10),
+		strconv.FormatUint(snap.BulkSendCalls, 10),
+		strconv.FormatUint(snap.BulkSendDatagrams, 10),
+		strconv.FormatUint(snap.BulkReceiveCalls, 10),
+		strconv.FormatUint(snap.BulkReceiveDatagrams, 10),
+		strconv.FormatUint(uint64(snap.BulkMaxSendBatch), 10),
+		strconv.FormatUint(uint64(snap.BulkMaxReceiveBatch), 10),
+		strconv.FormatUint(uint64(snap.BulkCryptoQueuePeak), 10),
+		strconv.FormatUint(uint64(snap.BulkWriterQueuePeak), 10),
 	}
 }
 

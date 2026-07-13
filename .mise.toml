@@ -88,6 +88,7 @@ run = """
 set -euo pipefail
 mkdir -p dist
 go build -o dist/derphole ./cmd/derphole
+go build -o dist/derphole-transport-bench ./cmd/derphole-transport-bench
 go build -o dist/derptun ./cmd/derptun
 go build -o dist/derpssh ./cmd/derpssh
 """
@@ -242,9 +243,14 @@ run = """
 set -euo pipefail
 mkdir -p dist
 GOOS=linux GOARCH=amd64 go build -o dist/derphole-linux-amd64 ./cmd/derphole
+GOOS=linux GOARCH=amd64 go build -o dist/derphole-transport-bench-linux-amd64 ./cmd/derphole-transport-bench
 GOOS=linux GOARCH=amd64 go build -o dist/derptun-linux-amd64 ./cmd/derptun
 GOOS=linux GOARCH=amd64 go build -o dist/derpssh-linux-amd64 ./cmd/derpssh
 """
+
+[tasks."transport:feasibility"]
+description = "Run the encrypted file transport feasibility gate"
+run = "bash ./scripts/encrypted-transport-feasibility.sh"
 
 [tasks."release:build-vendor"]
 run = "bash ./tools/packaging/build-vendor.sh"

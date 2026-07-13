@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,9 +24,12 @@ import (
 const (
 	externalV2TransferModeBlocks       = "blocks-v1"
 	externalV2TransferModeBulkPackets  = "bulk-packets-v1"
+	externalV2TransferModeDirectTCP    = "direct-tcp-files-v1"
+	externalV2DirectTCPMinFileSize     = 64 << 20
 	externalV2BlockFrameSize           = 12
 	externalV2DefaultBlockChunkSize    = 256 << 10
 	externalV2BulkPacketCandidateLimit = 4
+	externalV2TestForceBulkPacketEnv   = "DERPHOLE_TEST_FORCE_BULK_PACKET_TRANSFER"
 )
 
 type externalV2BlockChunk struct {
@@ -83,7 +87,21 @@ func externalV2BlockSourceAccept(src *BlockSource, accept *externalV2Accept) {
 }
 
 func externalV2AcceptsBlockTransfer(accept externalV2Accept) bool {
-	return accept.TransferMode == externalV2TransferModeBlocks || accept.TransferMode == externalV2TransferModeBulkPackets
+	return accept.TransferMode == externalV2TransferModeBlocks || accept.TransferMode == externalV2TransferModeBulkPackets || accept.TransferMode == externalV2TransferModeDirectTCP
+}
+
+func externalV2SelectFileTransferMode(policy string, size int64, claimCapable, acceptCapable bool, claimAd, acceptAd *externalV2DirectTCPAdvertisement) string {
+	if policy != externalV2TransferModeBlocks || size < externalV2DirectTCPMinFileSize || !claimCapable || !acceptCapable {
+		return policy
+	}
+	if externalV2DirectTCPAdvertisementUsable(claimAd) || externalV2DirectTCPAdvertisementUsable(acceptAd) {
+		return externalV2TransferModeDirectTCP
+	}
+	return policy
+}
+
+func externalV2UsesDirectTCPFileTransfer(mode string) bool {
+	return mode == externalV2TransferModeDirectTCP
 }
 
 func externalV2AcceptCarriesBlockTransfer(accept externalV2Accept) bool {
@@ -101,6 +119,7 @@ type externalV2BlockTransferPolicy struct {
 	PolicyCandidates           int
 	IgnoredTailscaleCandidates int
 	InvalidCandidates          int
+	ForcedBulkPackets          bool
 }
 
 func externalV2AcceptedBlockTransferPolicy(claim externalV2Claim, blockTransfer bool, acceptCandidates []string) externalV2BlockTransferPolicy {
@@ -124,7 +143,8 @@ func externalV2AcceptedBlockTransferPolicy(claim externalV2Claim, blockTransfer 
 
 	policy.ReceiverCandidates = len(receiverCandidates)
 	policy.PolicyCandidates, policy.IgnoredTailscaleCandidates, policy.InvalidCandidates = externalV2BlockTransferCandidateCounts(receiverCandidates)
-	if claim.BlockPacketCapable && policy.InvalidCandidates == 0 && policy.PolicyCandidates <= externalV2BulkPacketCandidateLimit {
+	policy.ForcedBulkPackets = os.Getenv(externalV2TestForceBulkPacketEnv) == "1"
+	if claim.BlockPacketCapable && policy.InvalidCandidates == 0 && (policy.ForcedBulkPackets || policy.PolicyCandidates <= externalV2BulkPacketCandidateLimit) {
 		policy.Mode = externalV2TransferModeBulkPackets
 	}
 	return policy
@@ -150,13 +170,14 @@ func externalV2BlockTransferCandidateCounts(candidates []string) (policyCandidat
 
 func emitExternalV2BlockTransferPolicy(emitter *telemetry.Emitter, policy externalV2BlockTransferPolicy) {
 	emitExternalV2Debug(emitter, fmt.Sprintf(
-		"v2-block-policy=mode:%s receiver:%s candidates:%d policy_candidates:%d tailscale_ignored:%d invalid:%d",
+		"v2-block-policy=mode:%s receiver:%s candidates:%d policy_candidates:%d tailscale_ignored:%d invalid:%d forced_bulk:%t",
 		policy.Mode,
 		policy.Receiver,
 		policy.ReceiverCandidates,
 		policy.PolicyCandidates,
 		policy.IgnoredTailscaleCandidates,
 		policy.InvalidCandidates,
+		policy.ForcedBulkPackets,
 	))
 }
 

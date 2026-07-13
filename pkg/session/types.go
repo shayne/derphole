@@ -25,6 +25,7 @@ type ListenConfig struct {
 	ForceRelay    bool
 	UsePublicDERP bool
 	Trace         *transfertrace.Recorder
+	DirectTCPPort int
 }
 
 type AttachListenConfig struct {
@@ -44,6 +45,7 @@ type SendConfig struct {
 	ParallelPolicy     ParallelPolicy
 	Trace              *transfertrace.Recorder
 	Progress           func(bytesReceived int64, transferElapsedMS int64)
+	DirectTCPPort      int
 }
 
 type OfferConfig struct {
@@ -57,6 +59,7 @@ type OfferConfig struct {
 	ParallelPolicy     ParallelPolicy
 	Trace              *transfertrace.Recorder
 	Progress           func(bytesReceived int64, transferElapsedMS int64)
+	DirectTCPPort      int
 }
 
 type ReceiveConfig struct {
@@ -67,6 +70,7 @@ type ReceiveConfig struct {
 	ForceRelay    bool
 	UsePublicDERP bool
 	Trace         *transfertrace.Recorder
+	DirectTCPPort int
 }
 
 type BlockSource struct {

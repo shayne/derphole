@@ -71,6 +71,19 @@ type externalTransferMetrics struct {
 	repairRequestBatches   uint64
 	reorderTrailPackets    uint32
 	receivePacketRatePPS   uint32
+	bulkBatchPresent       bool
+	bulkBatchBackend       string
+	bulkGSOAttempted       bool
+	bulkGSOActive          bool
+	bulkGSOSegments        uint64
+	bulkSendCalls          uint64
+	bulkSendDatagrams      uint64
+	bulkReceiveCalls       uint64
+	bulkReceiveDatagrams   uint64
+	bulkMaxSendBatch       uint32
+	bulkMaxReceiveBatch    uint32
+	bulkCryptoQueuePeak    uint32
+	bulkWriterQueuePeak    uint32
 
 	localENOBUFSRetries        int64
 	localENOBUFSWaitUS         int64
@@ -80,6 +93,7 @@ type externalTransferMetrics struct {
 	directPacketBytes     int64
 	directCommittedBytes  int64
 	directTransport       string
+	directStreamTransport string
 	quicHandshakeMS       int64
 	quicFirstByteMS       int64
 	quicStreamBytesSent   int64
@@ -134,6 +148,19 @@ type externalDirectTransferDiagnostics struct {
 	RepairRequestBatches       uint64
 	ReorderTrailPackets        uint32
 	ReceivePacketRatePPS       uint32
+	BulkBatchPresent           bool
+	BulkBatchBackend           string
+	BulkGSOAttempted           bool
+	BulkGSOActive              bool
+	BulkGSOSegments            uint64
+	BulkSendCalls              uint64
+	BulkSendDatagrams          uint64
+	BulkReceiveCalls           uint64
+	BulkReceiveDatagrams       uint64
+	BulkMaxSendBatch           uint32
+	BulkMaxReceiveBatch        uint32
+	BulkCryptoQueuePeak        uint32
+	BulkWriterQueuePeak        uint32
 }
 
 type externalPeerProgressSnapshot struct {
@@ -298,6 +325,15 @@ func (m *externalTransferMetrics) RecordDirectPathSend(n int64, at time.Time) {
 
 func (m *externalTransferMetrics) RecordDirectPathReceive(n int64, at time.Time) {
 	m.recordDirectPathBytes(n, at, false, "quic")
+}
+
+func (m *externalTransferMetrics) SetDirectStreamTransport(transport string) {
+	if m == nil || transport == "" {
+		return
+	}
+	m.mu.Lock()
+	m.directStreamTransport = transport
+	m.mu.Unlock()
 }
 
 func (m *externalTransferMetrics) RecordDirectPacketSend(n int64, at time.Time) {
@@ -594,6 +630,9 @@ func (m *externalTransferMetrics) recordDirectPathBytes(n int64, at time.Time, s
 	}
 	at = nonZeroTime(at)
 	m.mu.Lock()
+	if transport == "quic" && m.directStreamTransport != "" {
+		transport = m.directStreamTransport
+	}
 	m.directTransport = transport
 	if !m.directValidated {
 		m.markDirectValidatedLocked()
@@ -687,6 +726,19 @@ func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrac
 		RepairRequestBatches:       m.repairRequestBatches,
 		ReorderTrailPackets:        m.reorderTrailPackets,
 		ReceivePacketRatePPS:       m.receivePacketRatePPS,
+		BulkBatchPresent:           m.bulkBatchPresent,
+		BulkBatchBackend:           m.bulkBatchBackend,
+		BulkGSOAttempted:           m.bulkGSOAttempted,
+		BulkGSOActive:              m.bulkGSOActive,
+		BulkGSOSegments:            m.bulkGSOSegments,
+		BulkSendCalls:              m.bulkSendCalls,
+		BulkSendDatagrams:          m.bulkSendDatagrams,
+		BulkReceiveCalls:           m.bulkReceiveCalls,
+		BulkReceiveDatagrams:       m.bulkReceiveDatagrams,
+		BulkMaxSendBatch:           m.bulkMaxSendBatch,
+		BulkMaxReceiveBatch:        m.bulkMaxReceiveBatch,
+		BulkCryptoQueuePeak:        m.bulkCryptoQueuePeak,
+		BulkWriterQueuePeak:        m.bulkWriterQueuePeak,
 		LocalENOBUFSRetries:        m.localENOBUFSRetries,
 		LocalENOBUFSWaitUS:         m.localENOBUFSWaitUS,
 		LocalENOBUFSMaxConsecutive: m.localENOBUFSMaxConsecutive,
@@ -763,6 +815,28 @@ func (m *externalTransferMetrics) setDirectDiagnosticsLocked(diagnostics externa
 	m.setDirectLaneDiagnosticsLocked(diagnostics)
 	m.setDirectControllerDiagnosticsLocked(diagnostics)
 	m.setDirectCounterDiagnosticsLocked(diagnostics)
+	m.setBulkBatchDiagnosticsLocked(diagnostics)
+}
+
+func (m *externalTransferMetrics) setBulkBatchDiagnosticsLocked(diagnostics externalDirectTransferDiagnostics) {
+	if !diagnostics.BulkBatchPresent {
+		return
+	}
+	m.bulkBatchPresent = true
+	if diagnostics.BulkBatchBackend != "" {
+		m.bulkBatchBackend = diagnostics.BulkBatchBackend
+	}
+	m.bulkGSOAttempted = m.bulkGSOAttempted || diagnostics.BulkGSOAttempted
+	m.bulkGSOActive = m.bulkGSOActive || diagnostics.BulkGSOActive
+	m.bulkGSOSegments = max(m.bulkGSOSegments, diagnostics.BulkGSOSegments)
+	m.bulkSendCalls = max(m.bulkSendCalls, diagnostics.BulkSendCalls)
+	m.bulkSendDatagrams = max(m.bulkSendDatagrams, diagnostics.BulkSendDatagrams)
+	m.bulkReceiveCalls = max(m.bulkReceiveCalls, diagnostics.BulkReceiveCalls)
+	m.bulkReceiveDatagrams = max(m.bulkReceiveDatagrams, diagnostics.BulkReceiveDatagrams)
+	m.bulkMaxSendBatch = max(m.bulkMaxSendBatch, diagnostics.BulkMaxSendBatch)
+	m.bulkMaxReceiveBatch = max(m.bulkMaxReceiveBatch, diagnostics.BulkMaxReceiveBatch)
+	m.bulkCryptoQueuePeak = max(m.bulkCryptoQueuePeak, diagnostics.BulkCryptoQueuePeak)
+	m.bulkWriterQueuePeak = max(m.bulkWriterQueuePeak, diagnostics.BulkWriterQueuePeak)
 }
 
 func (m *externalTransferMetrics) setDirectRateDiagnosticsLocked(diagnostics externalDirectTransferDiagnostics) {

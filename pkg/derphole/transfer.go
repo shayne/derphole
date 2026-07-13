@@ -43,6 +43,7 @@ type SendConfig struct {
 	QR             bool
 	ParallelPolicy session.ParallelPolicy
 	Trace          *transfertrace.Recorder
+	DirectTCPPort  int
 }
 
 type ReceiveConfig struct {
@@ -60,6 +61,7 @@ type ReceiveConfig struct {
 	ParallelPolicy session.ParallelPolicy
 	Progress       func(current, total int64)
 	Trace          *transfertrace.Recorder
+	DirectTCPPort  int
 }
 
 type directorySummary struct {
@@ -100,6 +102,9 @@ func normalizeParallelPolicy(policy session.ParallelPolicy) session.ParallelPoli
 }
 
 func Send(ctx context.Context, cfg SendConfig) error {
+	if err := validateDirectTCPPort(cfg.DirectTCPPort); err != nil {
+		return err
+	}
 	cfg.ParallelPolicy = normalizeParallelPolicy(cfg.ParallelPolicy)
 	if err := validateQRSendConfig(cfg); err != nil {
 		return err
@@ -173,6 +178,9 @@ func validateQRSendConfig(cfg SendConfig) error {
 }
 
 func Receive(ctx context.Context, cfg ReceiveConfig) error {
+	if err := validateDirectTCPPort(cfg.DirectTCPPort); err != nil {
+		return err
+	}
 	cfg.ParallelPolicy = normalizeParallelPolicy(cfg.ParallelPolicy)
 	if cfg.Allocate {
 		return receiveAllocated(ctx, cfg)
@@ -182,6 +190,13 @@ func Receive(ctx context.Context, cfg ReceiveConfig) error {
 		return err
 	}
 	return receiveWithToken(ctx, cfg, receiveToken)
+}
+
+func validateDirectTCPPort(port int) error {
+	if port < 0 || port > 65535 {
+		return fmt.Errorf("direct TCP port %d must be zero or within [1,65535]", port)
+	}
+	return nil
 }
 
 func receivePromptInput(r io.Reader) io.Reader {
@@ -214,6 +229,7 @@ func receiveAllocated(ctx context.Context, cfg ReceiveConfig) error {
 			UsePublicDERP: cfg.UsePublicDERP,
 			ForceRelay:    cfg.ForceRelay,
 			Trace:         cfg.Trace,
+			DirectTCPPort: cfg.DirectTCPPort,
 		})
 		if err != nil {
 			_ = pipeWriter.CloseWithError(err)
@@ -297,6 +313,7 @@ func receiveViaStdioOffer(ctx context.Context, cfg ReceiveConfig, receiveToken s
 			UsePublicDERP: cfg.UsePublicDERP,
 			ForceRelay:    cfg.ForceRelay,
 			Trace:         cfg.Trace,
+			DirectTCPPort: cfg.DirectTCPPort,
 		})
 		if err != nil {
 			_ = pipeWriter.CloseWithError(err)
@@ -649,6 +666,7 @@ func offerTransferStream(ctx context.Context, cfg SendConfig, tx sendTransfer) e
 			ForceRelay:         cfg.ForceRelay,
 			ParallelPolicy:     cfg.ParallelPolicy,
 			Trace:              cfg.Trace,
+			DirectTCPPort:      cfg.DirectTCPPort,
 		})
 		offerErrCh <- err
 	}()
@@ -719,6 +737,7 @@ func offerTransferBlock(ctx context.Context, cfg SendConfig, tx sendTransfer) (b
 			ForceRelay:         cfg.ForceRelay,
 			ParallelPolicy:     cfg.ParallelPolicy,
 			Trace:              cfg.Trace,
+			DirectTCPPort:      cfg.DirectTCPPort,
 		})
 		offerErrCh <- err
 	}()
@@ -868,6 +887,7 @@ func sendViaSessionBlock(ctx context.Context, cfg SendConfig, tx sendTransfer) (
 		ForceRelay:         cfg.ForceRelay,
 		ParallelPolicy:     cfg.ParallelPolicy,
 		Trace:              cfg.Trace,
+		DirectTCPPort:      cfg.DirectTCPPort,
 	})
 	finishTransferProgress(progress, err)
 	return true, err

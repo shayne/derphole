@@ -101,7 +101,7 @@ func TestRecorderWritesRepairEfficiencyDiagnostics(t *testing.T) {
 	}
 
 	records, indexes := readTraceCSV(t, out.String())
-	assertHeaderSuffix(t, records[0], []string{
+	assertHeaderContainsSequence(t, records[0], []string{
 		"missing_scan_checks",
 		"pending_missing",
 		"pending_missing_peak",
@@ -118,6 +118,74 @@ func TestRecorderWritesRepairEfficiencyDiagnostics(t *testing.T) {
 	assertColumn(t, row, indexes, "repair_request_batches", "32")
 	assertColumn(t, row, indexes, "reorder_trail_packets", "22000")
 	assertColumn(t, row, indexes, "receive_packet_rate_pps", "88000")
+}
+
+func TestRecorderWritesBulkBatchDiagnosticsIncludingHealthyZeroes(t *testing.T) {
+	var out bytes.Buffer
+	recorder, err := NewRecorder(&out, RoleSend, time.Unix(260, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder.Observe(Snapshot{
+		At:                   time.Unix(261, 0),
+		Phase:                PhaseDirectExecute,
+		BulkBatchPresent:     true,
+		BulkBatchBackend:     "linux-sendmmsg",
+		BulkGSOAttempted:     true,
+		BulkGSOActive:        false,
+		BulkGSOSegments:      0,
+		BulkSendCalls:        10,
+		BulkSendDatagrams:    640,
+		BulkReceiveCalls:     0,
+		BulkReceiveDatagrams: 0,
+		BulkMaxSendBatch:     64,
+		BulkMaxReceiveBatch:  0,
+		BulkCryptoQueuePeak:  4,
+		BulkWriterQueuePeak:  0,
+	})
+	if err := recorder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	records, indexes := readTraceCSV(t, out.String())
+	assertHeaderSuffix(t, records[0], []string{
+		"bulk_batch_backend",
+		"bulk_gso_attempted",
+		"bulk_gso_active",
+		"bulk_gso_segments",
+		"bulk_send_calls",
+		"bulk_send_datagrams",
+		"bulk_receive_calls",
+		"bulk_receive_datagrams",
+		"bulk_max_send_batch",
+		"bulk_max_receive_batch",
+		"bulk_crypto_queue_peak",
+		"bulk_writer_queue_peak",
+	})
+	row := records[1]
+	assertColumn(t, row, indexes, "bulk_batch_backend", "linux-sendmmsg")
+	assertColumn(t, row, indexes, "bulk_gso_attempted", "true")
+	assertColumn(t, row, indexes, "bulk_gso_active", "false")
+	assertColumn(t, row, indexes, "bulk_gso_segments", "0")
+	assertColumn(t, row, indexes, "bulk_send_datagrams", "640")
+	assertColumn(t, row, indexes, "bulk_receive_calls", "0")
+	assertColumn(t, row, indexes, "bulk_max_receive_batch", "0")
+	assertColumn(t, row, indexes, "bulk_writer_queue_peak", "0")
+}
+
+func TestRecorderLeavesBulkBatchDiagnosticsEmptyWhenAbsent(t *testing.T) {
+	var out bytes.Buffer
+	recorder, err := NewRecorder(&out, RoleSend, time.Unix(270, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder.Observe(Snapshot{At: time.Unix(271, 0), Phase: PhaseDirectExecute})
+	if err := recorder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	records, indexes := readTraceCSV(t, out.String())
+	for _, column := range []string{"bulk_batch_backend", "bulk_gso_attempted", "bulk_send_calls", "bulk_writer_queue_peak"} {
+		assertColumn(t, records[1], indexes, column, "")
+	}
 }
 
 func TestRecorderErrorRowIsTerminal(t *testing.T) {
@@ -291,7 +359,7 @@ func TestRecorderWritesDirectPathDiagnosticFields(t *testing.T) {
 
 	sendRecords, sendIndexes := readTraceCSV(t, sendOut.String())
 	assertRecordCount(t, sendRecords, 3)
-	assertHeaderSuffix(t, sendRecords[0], directPathDiagnosticHeader())
+	assertHeaderContainsSequence(t, sendRecords[0], directPathDiagnosticHeader())
 	sendRow := sendRecords[2]
 	assertColumn(t, sendRow, sendIndexes, "rate_target_mbps", "263")
 	assertColumn(t, sendRow, sendIndexes, "rate_ceiling_mbps", "700")
@@ -347,7 +415,7 @@ func TestRecorderWritesDirectPathDiagnosticFields(t *testing.T) {
 
 	receiveRecords, receiveIndexes := readTraceCSV(t, receiveOut.String())
 	assertRecordCount(t, receiveRecords, 3)
-	assertHeaderSuffix(t, receiveRecords[0], directPathDiagnosticHeader())
+	assertHeaderContainsSequence(t, receiveRecords[0], directPathDiagnosticHeader())
 	receiveRow := receiveRecords[2]
 	assertColumn(t, receiveRow, receiveIndexes, "receive_goodput_mbps", "12.00")
 	assertColumn(t, receiveRow, receiveIndexes, "receiver_committed_mbps", "4.00")
@@ -594,6 +662,23 @@ func assertHeaderSuffix(t *testing.T, header []string, suffix []string) {
 			t.Fatalf("header suffix[%d] = %q, want %q; header = %v", i, got, want, header)
 		}
 	}
+}
+
+func assertHeaderContainsSequence(t *testing.T, header []string, sequence []string) {
+	t.Helper()
+	for start := 0; start+len(sequence) <= len(header); start++ {
+		matches := true
+		for index, want := range sequence {
+			if header[start+index] != want {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return
+		}
+	}
+	t.Fatalf("header does not contain sequence %v; header = %v", sequence, header)
 }
 
 func assertColumn(t *testing.T, row []string, indexes map[string]int, column string, want string) {

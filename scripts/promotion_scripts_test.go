@@ -120,7 +120,7 @@ func TestPromotionBenchmarkDefaultsToFileSendReceive(t *testing.T) {
 	body := readPromotionDriver(t)
 	for _, want := range []string{
 		`workload="${DERPHOLE_BENCH_WORKLOAD:-file}"`,
-		`--verbose send "${payload}"`,
+		`--verbose send "${direct_tcp_args[@]}" "${payload}"`,
 		`--verbose receive -o '${remote_base}.out'`,
 		`benchmark-workload=${workload}`,
 		`benchmark-transfer-mode=${transfer_mode}`,
@@ -135,6 +135,73 @@ func TestPromotionStreamWorkloadIsExplicit(t *testing.T) {
 	body := readPromotionDriver(t)
 	if !strings.Contains(body, `stream) run_forward_derphole_stream ;;`) {
 		t.Fatal("promotion driver does not isolate listen/pipe as stream workload")
+	}
+}
+
+func TestPromotionBenchmarkSupportsCallerOwnedPayloads(t *testing.T) {
+	body := readPromotionDriver(t)
+	for _, want := range []string{
+		`DERPHOLE_BENCH_LOCAL_PAYLOAD`,
+		`DERPHOLE_BENCH_REMOTE_PAYLOAD`,
+		`local benchmark payload must be a regular file`,
+		`remote benchmark payload must be a regular file`,
+		`local benchmark payload size`,
+		`remote benchmark payload size`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("promotion driver missing caller-owned payload support %q", want)
+		}
+	}
+}
+
+func TestPromotionBenchmarkPropagatesOnlyAllowlistedBatchGate(t *testing.T) {
+	body := readPromotionDriver(t)
+	for _, want := range []string{
+		`bulk_batched_io="${DERPHOLE_TEST_BULK_BATCHED_IO:-}"`,
+		`DERPHOLE_TEST_BULK_BATCHED_IO must be empty or 1`,
+		`remote_env+=(DERPHOLE_TEST_BULK_BATCHED_IO=1)`,
+		`force_bulk_packets="${DERPHOLE_TEST_FORCE_BULK_PACKET_TRANSFER:-}"`,
+		`DERPHOLE_TEST_FORCE_BULK_PACKET_TRANSFER must be empty or 1`,
+		`remote_env+=(DERPHOLE_TEST_FORCE_BULK_PACKET_TRANSFER=1)`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("promotion driver missing batch-gate handling %q", want)
+		}
+	}
+}
+
+func TestPromotionBenchmarkSupportsLocalDirectTCPFileListener(t *testing.T) {
+	body := readPromotionDriver(t)
+	for _, want := range []string{
+		`direct_tcp_port="${DERPHOLE_BENCH_DIRECT_TCP_PORT:-}"`,
+		`DERPHOLE_BENCH_DIRECT_TCP_PORT must be an integer from 1 through 65535`,
+		`direct_tcp_args=(--direct-tcp-port "${direct_tcp_port}")`,
+		`--verbose send "${direct_tcp_args[@]}" "${payload}"`,
+		`--verbose receive "${direct_tcp_args[@]}" -o "${receiver_out}"`,
+		`transfer_mode="direct-tcp-files-v1"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("promotion driver missing direct TCP handling %q", want)
+		}
+	}
+}
+
+func TestPublicPathHarnessValidatesIperfStreamsAndBatchGate(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(".", "public-path-performance-harness.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(data)
+	for _, want := range []string{
+		`iperf_streams="${DERPHOLE_PUBLIC_IPERF_STREAMS:-4}"`,
+		`DERPHOLE_PUBLIC_IPERF_STREAMS must be an integer`,
+		`-P "${iperf_streams}"`,
+		`bulk_batched_io="${DERPHOLE_TEST_BULK_BATCHED_IO:-}"`,
+		`DERPHOLE_TEST_BULK_BATCHED_IO must be empty or 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("public path harness missing %q", want)
+		}
 	}
 }
 
@@ -1050,7 +1117,7 @@ func TestPromotionDriverStopsCommandClockBeforePostflight(t *testing.T) {
 	forwardFile := scriptSection(t, body, "run_forward_derphole_file() {", "\nrun_reverse_derphole_stream() {")
 	assertScriptOrder(t, forwardFile,
 		`start_ms="$(now_ms)"`,
-		`--verbose send "${payload}"`,
+		`--verbose send "${direct_tcp_args[@]}" "${payload}"`,
 		`--verbose receive -o '${remote_base}.out'`,
 		`wait "${send_pid}"`,
 		`command_end_ms="$(now_ms)"`,
@@ -1068,7 +1135,7 @@ func TestPromotionDriverStopsCommandClockBeforePostflight(t *testing.T) {
 	reverseFile := scriptSection(t, body, "run_reverse_derphole_file() {", "\nfinalize_run() {")
 	assertScriptOrder(t, reverseFile,
 		`start_ms="$(now_ms)"`,
-		`--verbose receive -o "${receiver_out}"`,
+		`--verbose receive "${direct_tcp_args[@]}" -o "${receiver_out}"`,
 		"wait_remote_pid_status",
 		`command_end_ms="$(now_ms)"`,
 		`remote "cat '${remote_base}.err'"`,

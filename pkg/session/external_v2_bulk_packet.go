@@ -290,26 +290,28 @@ func wrapExternalV2BulkPacketCloseError(err error) error {
 }
 
 type externalV2BulkPacketSender struct {
-	ctx                 context.Context
-	src                 *BlockSource
-	path                externalV2BulkPacketPath
-	auth                externalV2BulkPacketAuth
-	metrics             *externalTransferMetrics
-	initialPaceMbps     int
-	runID               uint64
-	totalPackets        uint32
-	laneCount           int
-	pacer               *rate.Limiter
-	controller          *externalV2BulkPacketController
-	sentPackets         atomic.Uint64
-	sentPayload         atomic.Int64
-	primaryPayloadBytes atomic.Int64
-	primaryWireBytes    atomic.Int64
-	repairWireBytes     atomic.Int64
-	repairPackets       atomic.Int64
-	repairPayloadBytes  atomic.Int64
-	repairRequests      atomic.Int64
-	currentPaceMbps     atomic.Int64
+	ctx                  context.Context
+	src                  *BlockSource
+	path                 externalV2BulkPacketPath
+	batchConns           []externalV2BulkPacketBatchConn
+	auth                 externalV2BulkPacketAuth
+	metrics              *externalTransferMetrics
+	initialPaceMbps      int
+	runID                uint64
+	totalPackets         uint32
+	laneCount            int
+	pacer                *rate.Limiter
+	controller           *externalV2BulkPacketController
+	sentPackets          atomic.Uint64
+	sentPayload          atomic.Int64
+	primaryPayloadBytes  atomic.Int64
+	primaryWireBytes     atomic.Int64
+	repairWireBytes      atomic.Int64
+	repairPackets        atomic.Int64
+	repairPayloadBytes   atomic.Int64
+	repairRequests       atomic.Int64
+	currentPaceMbps      atomic.Int64
+	batchCryptoQueuePeak atomic.Uint32
 
 	localENOBUFSRetries        atomic.Int64
 	localENOBUFSWaitNanos      atomic.Int64
@@ -335,11 +337,20 @@ func newExternalV2BulkPacketSender(ctx context.Context, src *BlockSource, path e
 		),
 		controller: controller,
 	}
+	if externalV2BulkPacketBatchedIOEnabled() {
+		sender.batchConns = make([]externalV2BulkPacketBatchConn, sender.laneCount)
+		for lane := range sender.laneCount {
+			sender.batchConns[lane] = newExternalV2BulkPacketBatchConn(path.Conns[lane])
+		}
+	}
 	sender.currentPaceMbps.Store(int64(initialPaceMbps))
 	return sender
 }
 
 func (s *externalV2BulkPacketSender) sendInitialPackets() error {
+	if len(s.batchConns) == s.laneCount && s.laneCount > 0 {
+		return s.sendInitialPacketsBatched()
+	}
 	for index := uint32(0); index < s.totalPackets; index++ {
 		if err := s.ctx.Err(); err != nil {
 			return err
@@ -549,6 +560,7 @@ func (s *externalV2BulkPacketSender) stats(committed bool) externalDirectTransfe
 	stats.Diagnostics.LocalENOBUFSRetries = s.localENOBUFSRetries.Load()
 	stats.Diagnostics.LocalENOBUFSWaitUS = externalV2BulkPacketRoundedUpMicroseconds(s.localENOBUFSWaitNanos.Load())
 	stats.Diagnostics.LocalENOBUFSMaxConsecutive = s.localENOBUFSMaxConsecutive.Load()
+	mergeExternalV2BulkPacketBatchDiagnostics(&stats.Diagnostics, externalV2BulkPacketBatchDiagnostics(s.batchConns, s.batchCryptoQueuePeak.Load(), 0))
 	return stats
 }
 
@@ -599,7 +611,7 @@ func (s *externalV2BulkPacketSender) publishControllerDiagnostics(
 	if s.metrics == nil {
 		return
 	}
-	s.metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
+	diagnostics := externalDirectTransferDiagnostics{
 		RateSelectedMbps:           s.initialPaceMbps,
 		RateTargetMbps:             decision.TargetMbps,
 		RateCeilingMbps:            externalV2BulkPacketCeilingWireMbps,
@@ -613,7 +625,9 @@ func (s *externalV2BulkPacketSender) publishControllerDiagnostics(
 		LocalENOBUFSRetries:        s.localENOBUFSRetries.Load(),
 		LocalENOBUFSWaitUS:         externalV2BulkPacketRoundedUpMicroseconds(s.localENOBUFSWaitNanos.Load()),
 		LocalENOBUFSMaxConsecutive: s.localENOBUFSMaxConsecutive.Load(),
-	}, at)
+	}
+	mergeExternalV2BulkPacketBatchDiagnostics(&diagnostics, externalV2BulkPacketBatchDiagnostics(s.batchConns, s.batchCryptoQueuePeak.Load(), 0))
+	s.metrics.SetDirectDiagnostics(diagnostics, at)
 }
 
 func offerExternalV2BulkPacketRepairError(ch chan<- error, err error) {
@@ -640,7 +654,17 @@ func receiveExternalV2BulkBlockPackets(ctx context.Context, sink BlockReceiveSin
 
 	dataCh := make(chan externalV2BulkPacketReceiveResult, externalV2BulkPacketDataQueue)
 	errCh := make(chan error, len(path.Conns))
-	dataReadersDone := startExternalV2BulkPacketDataReaders(recvCtx, path, auth, dataCh, errCh)
+	var dataReadersDone <-chan struct{}
+	if externalV2BulkPacketBatchedIOEnabled() {
+		receiver.assembler = newExternalV2BulkPacketAsyncReceiveAssembler(recvCtx, sink, cfg, receiver.totalPackets, metrics)
+		receiver.batchConns = make([]externalV2BulkPacketBatchConn, len(path.Conns))
+		for lane, conn := range path.Conns {
+			receiver.batchConns[lane] = newExternalV2BulkPacketBatchConn(conn)
+		}
+		dataReadersDone = startExternalV2BulkPacketBatchedDataReaders(recvCtx, receiver.batchConns, auth, dataCh, errCh, &receiver.batchCryptoQueuePeak)
+	} else {
+		dataReadersDone = startExternalV2BulkPacketDataReaders(recvCtx, path, auth, dataCh, errCh)
+	}
 	receiver.stopHello = startExternalV2BulkPacketHelloLoop(recvCtx, path, auth, receiver.totalPackets)
 	defer receiver.stopHello()
 
@@ -678,23 +702,26 @@ func validateExternalV2BulkPacketReceiver(sink BlockReceiveSink, cfg externalV2B
 }
 
 type externalV2BulkPacketReceiver struct {
-	cfg                externalV2BlockReceiveConfig
-	path               externalV2BulkPacketPath
-	auth               externalV2BulkPacketAuth
-	metrics            *externalTransferMetrics
-	laneCount          int
-	totalPackets       uint32
-	seen               []bool
-	missing            *externalV2BulkPacketMissingTracker
-	receiveRate        externalV2BulkPacketReceiveRate
-	assembler          *externalV2BulkPacketReceiveAssembler
-	runID              uint64
-	receivedPackets    uint32
-	highestSeenPlusOne uint32
-	committedPayload   int64
-	repairRequests     int64
-	controlSeq         uint32
-	stopHello          func()
+	cfg                  externalV2BlockReceiveConfig
+	path                 externalV2BulkPacketPath
+	auth                 externalV2BulkPacketAuth
+	batchConns           []externalV2BulkPacketBatchConn
+	batchCryptoQueuePeak atomic.Uint32
+	metrics              *externalTransferMetrics
+	laneCount            int
+	totalPackets         uint32
+	seen                 []bool
+	missing              *externalV2BulkPacketMissingTracker
+	receiveRate          externalV2BulkPacketReceiveRate
+	assembler            *externalV2BulkPacketReceiveAssembler
+	runID                uint64
+	receivedPackets      uint32
+	highestSeenPlusOne   uint32
+	lastDataAt           time.Time
+	committedPayload     int64
+	repairRequests       int64
+	controlSeq           uint32
+	stopHello            func()
 }
 
 func newExternalV2BulkPacketReceiver(sink BlockReceiveSink, cfg externalV2BlockReceiveConfig, path externalV2BulkPacketPath, auth externalV2BulkPacketAuth, metrics *externalTransferMetrics) *externalV2BulkPacketReceiver {
@@ -714,25 +741,23 @@ func newExternalV2BulkPacketReceiver(sink BlockReceiveSink, cfg externalV2BlockR
 }
 
 func (r *externalV2BulkPacketReceiver) run(ctx context.Context, dataCh <-chan externalV2BulkPacketReceiveResult, errCh <-chan error) (int64, externalDirectTransferStats, error) {
+	repairTicker := time.NewTicker(externalV2BulkPacketReadIdle)
+	defer repairTicker.Stop()
 	for r.receivedPackets < r.totalPackets {
-		timer := time.NewTimer(externalV2BulkPacketReadIdle)
 		select {
 		case result := <-dataCh:
-			stopExternalV2BulkPacketTimer(timer)
 			err := r.handleDataResult(result)
 			result.release()
 			if err != nil {
 				return r.result(err)
 			}
 		case err := <-errCh:
-			stopExternalV2BulkPacketTimer(timer)
 			if err != nil {
 				return r.result(err)
 			}
-		case <-timer.C:
-			r.sendIdleMissing(time.Now())
+		case <-repairTicker.C:
+			r.repairTick(time.Now())
 		case <-ctx.Done():
-			stopExternalV2BulkPacketTimer(timer)
 			return r.result(ctx.Err())
 		}
 	}
@@ -756,6 +781,7 @@ func (r *externalV2BulkPacketReceiver) handleDataResult(result externalV2BulkPac
 		return err
 	}
 	now := time.Now()
+	r.lastDataAt = now
 	r.markHighestSeen(header.index)
 	n, err := r.assembler.add(header.index, result.data)
 	if n > 0 {
@@ -773,6 +799,14 @@ func (r *externalV2BulkPacketReceiver) handleDataResult(result externalV2BulkPac
 	r.receiveRate.observe(now)
 	r.sendActiveMissing(now)
 	return nil
+}
+
+func (r *externalV2BulkPacketReceiver) repairTick(now time.Time) {
+	if !r.lastDataAt.IsZero() && now.Sub(r.lastDataAt) < externalV2BulkPacketReadIdle {
+		r.sendActiveMissing(now)
+		return
+	}
+	r.sendIdleMissing(now)
 }
 
 func (r *externalV2BulkPacketReceiver) validateData(header externalV2BulkPacketHeader, data []byte) error {
@@ -850,18 +884,27 @@ func (r *externalV2BulkPacketReceiver) sendDoneRepeats() {
 }
 
 func (r *externalV2BulkPacketReceiver) result(err error) (int64, externalDirectTransferStats, error) {
+	if r.assembler != nil && r.assembler.isAsync() {
+		committed, writerErr := r.assembler.finish()
+		r.committedPayload = committed
+		err = errors.Join(err, writerErr)
+	}
 	repairStats := r.missing.stats()
-	return r.cfg.HeaderBytes + r.committedPayload,
-		externalV2BulkPacketReceiveStats(
-			r.cfg.PayloadSize,
-			r.committedPayload,
-			r.repairRequests,
-			r.laneCount,
-			repairStats,
-			r.receiveRate.trailPackets(),
-			r.receiveRate.packetsPerSecond(),
-		),
-		err
+	stats := externalV2BulkPacketReceiveStats(
+		r.cfg.PayloadSize,
+		r.committedPayload,
+		r.repairRequests,
+		r.laneCount,
+		repairStats,
+		r.receiveRate.trailPackets(),
+		r.receiveRate.packetsPerSecond(),
+	)
+	writerQueuePeak := uint32(0)
+	if r.assembler != nil {
+		writerQueuePeak = r.assembler.writerQueuePeak()
+	}
+	mergeExternalV2BulkPacketBatchDiagnostics(&stats.Diagnostics, externalV2BulkPacketBatchDiagnostics(r.batchConns, r.batchCryptoQueuePeak.Load(), writerQueuePeak))
+	return r.cfg.HeaderBytes + r.committedPayload, stats, err
 }
 
 type externalV2BulkPacketReceiveAssembler struct {
@@ -870,6 +913,10 @@ type externalV2BulkPacketReceiveAssembler struct {
 	totalPackets    uint32
 	packetsPerGroup uint32
 	groups          map[uint32]*externalV2BulkPacketReceiveGroup
+	asyncWriter     *externalV2BulkPacketAsyncWriter
+	finishOnce      sync.Once
+	finishCommitted int64
+	finishErr       error
 }
 
 type externalV2BulkPacketReceiveGroup struct {
@@ -881,6 +928,17 @@ type externalV2BulkPacketReceiveGroup struct {
 
 func newExternalV2BulkPacketReceiveAssembler(sink BlockReceiveSink, cfg externalV2BlockReceiveConfig, totalPackets uint32) *externalV2BulkPacketReceiveAssembler {
 	groupBytes := min(externalV2BlockChunkSize(cfg.ChunkSize), externalV2BulkPacketReceiveGroupBytes)
+	return newExternalV2BulkPacketReceiveAssemblerWithGroup(sink, cfg, totalPackets, groupBytes)
+}
+
+func newExternalV2BulkPacketAsyncReceiveAssembler(ctx context.Context, sink BlockReceiveSink, cfg externalV2BlockReceiveConfig, totalPackets uint32, metrics *externalTransferMetrics) *externalV2BulkPacketReceiveAssembler {
+	groupBytes := min(externalV2BlockChunkSize(cfg.ChunkSize), externalV2BulkPacketWriteGroup)
+	assembler := newExternalV2BulkPacketReceiveAssemblerWithGroup(sink, cfg, totalPackets, groupBytes)
+	assembler.asyncWriter = newExternalV2BulkPacketAsyncWriter(ctx, sink, externalV2BulkPacketWriterQueue, metrics)
+	return assembler
+}
+
+func newExternalV2BulkPacketReceiveAssemblerWithGroup(sink BlockReceiveSink, cfg externalV2BlockReceiveConfig, totalPackets uint32, groupBytes int) *externalV2BulkPacketReceiveAssembler {
 	packetsPerGroup := uint32(max(1, groupBytes/externalV2BulkPacketPayloadSize))
 	return &externalV2BulkPacketReceiveAssembler{
 		sink:            sink,
@@ -912,6 +970,16 @@ func (a *externalV2BulkPacketReceiveAssembler) add(index uint32, data []byte) (i
 	if group.received < uint32(len(group.seen)) {
 		return 0, nil
 	}
+	if a.asyncWriter != nil {
+		if err := a.asyncWriter.enqueue(externalV2BulkPacketWriteExtent{
+			Offset: int64(group.baseIndex) * externalV2BulkPacketPayloadSize,
+			Data:   group.data,
+		}); err != nil {
+			return 0, err
+		}
+		delete(a.groups, groupID)
+		return 0, nil
+	}
 	n, err := a.sink.WriteAt(group.data, int64(group.baseIndex)*externalV2BulkPacketPayloadSize)
 	if err != nil {
 		return n, err
@@ -921,6 +989,27 @@ func (a *externalV2BulkPacketReceiveAssembler) add(index uint32, data []byte) (i
 	}
 	delete(a.groups, groupID)
 	return n, nil
+}
+
+func (a *externalV2BulkPacketReceiveAssembler) isAsync() bool {
+	return a.asyncWriter != nil
+}
+
+func (a *externalV2BulkPacketReceiveAssembler) finish() (int64, error) {
+	if a.asyncWriter == nil {
+		return 0, nil
+	}
+	a.finishOnce.Do(func() {
+		a.finishCommitted, a.finishErr = a.asyncWriter.finish()
+	})
+	return a.finishCommitted, a.finishErr
+}
+
+func (a *externalV2BulkPacketReceiveAssembler) writerQueuePeak() uint32 {
+	if a.asyncWriter == nil {
+		return 0
+	}
+	return a.asyncWriter.peak.Load()
 }
 
 func (a *externalV2BulkPacketReceiveAssembler) newGroup(groupID uint32) *externalV2BulkPacketReceiveGroup {
@@ -1220,6 +1309,10 @@ func resetExternalV2BulkPacketTimer(timer *time.Timer, d time.Duration) {
 }
 
 func sealExternalV2BulkPacket(aead cipher.AEAD, header externalV2BulkPacketHeader, payload []byte) ([]byte, error) {
+	return sealExternalV2BulkPacketInto(aead, nil, header, payload)
+}
+
+func sealExternalV2BulkPacketInto(aead cipher.AEAD, dst []byte, header externalV2BulkPacketHeader, payload []byte) ([]byte, error) {
 	if aead == nil {
 		return nil, errors.New("nil bulk packet AEAD")
 	}
@@ -1227,7 +1320,14 @@ func sealExternalV2BulkPacket(aead cipher.AEAD, header externalV2BulkPacketHeade
 		return nil, fmt.Errorf("bulk packet payload too large: %d", len(payload))
 	}
 	header.length = uint16(len(payload))
-	out := make([]byte, externalV2BulkPacketHeaderSize, externalV2BulkPacketHeaderSize+len(payload)+aead.Overhead())
+	wantCapacity := externalV2BulkPacketHeaderSize + len(payload) + aead.Overhead()
+	if cap(dst) < wantCapacity {
+		dst = make([]byte, externalV2BulkPacketHeaderSize, wantCapacity)
+	} else {
+		dst = dst[:externalV2BulkPacketHeaderSize]
+		clear(dst)
+	}
+	out := dst
 	fillExternalV2BulkPacketHeader(out, header)
 	nonce := externalV2BulkPacketNonce(header)
 	out = aead.Seal(out, nonce[:], payload, out[:externalV2BulkPacketHeaderSize])

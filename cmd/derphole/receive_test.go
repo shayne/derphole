@@ -56,6 +56,20 @@ func TestRunReceivePassesTransferTraceFromEnvironment(t *testing.T) {
 	}
 }
 
+func TestRunReceivePassesDirectTCPPort(t *testing.T) {
+	prev := runReceiveTransfer
+	t.Cleanup(func() { runReceiveTransfer = prev })
+	runReceiveTransfer = func(_ context.Context, cfg pkgderphole.ReceiveConfig) error {
+		if cfg.DirectTCPPort != 8123 {
+			t.Fatalf("DirectTCPPort = %d, want 8123", cfg.DirectTCPPort)
+		}
+		return nil
+	}
+	if code := runReceive([]string{"--direct-tcp-port", "8123", "token"}, telemetry.LevelQuiet, strings.NewReader(""), io.Discard, io.Discard); code != 0 {
+		t.Fatalf("runReceive() code = %d, want 0", code)
+	}
+}
+
 func TestRunReceiveWithoutCodeAllocatesTransfer(t *testing.T) {
 	prev := runReceiveTransfer
 	t.Cleanup(func() {

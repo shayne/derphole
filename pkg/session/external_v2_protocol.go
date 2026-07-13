@@ -19,37 +19,41 @@ var (
 )
 
 type externalV2Claim struct {
-	Protocol           string   `json:"protocol"`
-	QUICPublic         [32]byte `json:"quic_public"`
-	Candidates         []string `json:"candidates,omitempty"`
-	RelayCapable       bool     `json:"relay_capable"`
-	ReceiverLimited    bool     `json:"receiver_limited,omitempty"`
-	ParallelMode       string   `json:"parallel_mode,omitempty"`
-	ParallelInitial    int      `json:"parallel_initial,omitempty"`
-	ParallelCap        int      `json:"parallel_cap,omitempty"`
-	TransferMode       string   `json:"transfer_mode,omitempty"`
-	BlockHeader        []byte   `json:"block_header,omitempty"`
-	BlockSize          int64    `json:"block_size,omitempty"`
-	BlockChunkSize     int      `json:"block_chunk_size,omitempty"`
-	BlockCapable       bool     `json:"block_capable,omitempty"`
-	BlockPacketCapable bool     `json:"block_packet_capable,omitempty"`
+	Protocol             string                            `json:"protocol"`
+	QUICPublic           [32]byte                          `json:"quic_public"`
+	Candidates           []string                          `json:"candidates,omitempty"`
+	RelayCapable         bool                              `json:"relay_capable"`
+	ReceiverLimited      bool                              `json:"receiver_limited,omitempty"`
+	ParallelMode         string                            `json:"parallel_mode,omitempty"`
+	ParallelInitial      int                               `json:"parallel_initial,omitempty"`
+	ParallelCap          int                               `json:"parallel_cap,omitempty"`
+	TransferMode         string                            `json:"transfer_mode,omitempty"`
+	BlockHeader          []byte                            `json:"block_header,omitempty"`
+	BlockSize            int64                             `json:"block_size,omitempty"`
+	BlockChunkSize       int                               `json:"block_chunk_size,omitempty"`
+	BlockCapable         bool                              `json:"block_capable,omitempty"`
+	BlockPacketCapable   bool                              `json:"block_packet_capable,omitempty"`
+	DirectTCPFileCapable bool                              `json:"direct_tcp_file_capable,omitempty"`
+	DirectTCPFile        *externalV2DirectTCPAdvertisement `json:"direct_tcp_file,omitempty"`
 }
 
 type externalV2Accept struct {
-	Protocol           string   `json:"protocol"`
-	Accepted           bool     `json:"accepted"`
-	Candidates         []string `json:"candidates,omitempty"`
-	RelayCapable       bool     `json:"relay_capable"`
-	Reason             string   `json:"reason,omitempty"`
-	ParallelMode       string   `json:"parallel_mode,omitempty"`
-	ParallelInitial    int      `json:"parallel_initial,omitempty"`
-	ParallelCap        int      `json:"parallel_cap,omitempty"`
-	ManagerConnections int      `json:"manager_connections,omitempty"`
-	RawDirectBudgetMS  int      `json:"raw_direct_budget_ms,omitempty"`
-	TransferMode       string   `json:"transfer_mode,omitempty"`
-	BlockHeader        []byte   `json:"block_header,omitempty"`
-	BlockSize          int64    `json:"block_size,omitempty"`
-	BlockChunkSize     int      `json:"block_chunk_size,omitempty"`
+	Protocol             string                            `json:"protocol"`
+	Accepted             bool                              `json:"accepted"`
+	Candidates           []string                          `json:"candidates,omitempty"`
+	RelayCapable         bool                              `json:"relay_capable"`
+	Reason               string                            `json:"reason,omitempty"`
+	ParallelMode         string                            `json:"parallel_mode,omitempty"`
+	ParallelInitial      int                               `json:"parallel_initial,omitempty"`
+	ParallelCap          int                               `json:"parallel_cap,omitempty"`
+	ManagerConnections   int                               `json:"manager_connections,omitempty"`
+	RawDirectBudgetMS    int                               `json:"raw_direct_budget_ms,omitempty"`
+	TransferMode         string                            `json:"transfer_mode,omitempty"`
+	BlockHeader          []byte                            `json:"block_header,omitempty"`
+	BlockSize            int64                             `json:"block_size,omitempty"`
+	BlockChunkSize       int                               `json:"block_chunk_size,omitempty"`
+	DirectTCPFileCapable bool                              `json:"direct_tcp_file_capable,omitempty"`
+	DirectTCPFile        *externalV2DirectTCPAdvertisement `json:"direct_tcp_file,omitempty"`
 }
 
 type externalV2Complete struct {

@@ -16,9 +16,10 @@ import (
 )
 
 type receiveFlags struct {
-	ForceRelay   bool   `flag:"force-relay" help:"Disable direct probing"`
-	HideProgress bool   `flag:"hide-progress" help:"Suppress progress-bar display"`
-	Output       string `flag:"output" short:"o" help:"Write a received file to this path or directory"`
+	ForceRelay    bool   `flag:"force-relay" help:"Disable direct probing"`
+	HideProgress  bool   `flag:"hide-progress" help:"Suppress progress-bar display"`
+	Output        string `flag:"output" short:"o" help:"Write a received file to this path or directory"`
+	DirectTCPPort int    `flag:"direct-tcp-port" help:"Listen on an existing same-port TCP forward for large file transfers"`
 }
 
 type receiveArgs struct {
@@ -87,6 +88,7 @@ func runReceive(args []string, level telemetry.Level, stdin io.Reader, stdout, s
 		ForceRelay:     parsed.SubCommandFlags.ForceRelay,
 		ParallelPolicy: session.DefaultParallelPolicy(),
 		Trace:          trace,
+		DirectTCPPort:  parsed.SubCommandFlags.DirectTCPPort,
 	}); err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1

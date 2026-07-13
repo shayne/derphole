@@ -2,6 +2,24 @@
 
 Use this runbook when comparing `derphole` throughput, relay-to-direct promotion latency, or baseline host-to-host performance. The goal is repeatable measurements without leaking UDP sockets, orphaning processes, or exhausting ephemeral ports on either host.
 
+## Encrypted transport feasibility gate
+
+Use the feasibility gate only for the Mac-to-exact-two-vCPU-Hetzner comparison. It builds both endpoints from the same revision, creates one ordinary 3 GiB random file, stages identical bytes on both hosts, and interleaves three file transfers in each direction for the batched bulk UDP and eight-lane TLS 1.3 candidates. Every transfer is paired with a same-direction 20-second, eight-flow iperf3 control.
+
+The TCP port must be reachable through the public internet in both directions. On a NATed local endpoint, forward that TCP port to the Mac before starting. The two address variables must be literal public IPv4 addresses; loopback, private, link-local, multicast, and Tailscale CGNAT addresses are rejected.
+
+```bash
+DERPHOLE_FEASIBILITY_REMOTE="${DERPHOLE_FEASIBILITY_REMOTE:?set SSH target}" \
+DERPHOLE_FEASIBILITY_REMOTE_PUBLIC_ADDR="${DERPHOLE_FEASIBILITY_REMOTE_PUBLIC_ADDR:?set remote public address}" \
+DERPHOLE_FEASIBILITY_LOCAL_PUBLIC_ADDR="${DERPHOLE_FEASIBILITY_LOCAL_PUBLIC_ADDR:?set local public address}" \
+DERPHOLE_FEASIBILITY_TCP_PORT="${DERPHOLE_FEASIBILITY_TCP_PORT:?set forwarded TCP port}" \
+mise run transport:feasibility
+```
+
+The gate does not install packages. `iperf3`, Python 3, SSH/SCP, and the repository's `mise` toolchain must already exist locally; `iperf3`, Python 3, and standard Linux inspection tools must exist remotely. The remote must report exactly two online CPUs and both endpoints must have at least 16 GiB free for the source and retained receiver outputs.
+
+Artifacts are kept under `.tmp/encrypted-transport-feasibility/<UTC timestamp>-<PID>/`. `results.jsonl` contains the normalized runs and `decision.json` contains the strict verdict. A sample is invalid and retried when the paired capacity control is below 2.05 Gbps. A candidate passes only when every valid 3 GiB run exceeds 2.0 Gbps receiver-anchored goodput, hashes match, payload progress never stalls for one second, the public route is proven, and resource/transport evidence is complete. Interruptions preserve local evidence and remove only the exact remote directory and recorded process IDs created by that invocation.
+
 ## Preferred Benchmark Paths
 
 Use the checked-in harnesses first:
@@ -62,6 +80,16 @@ DERPHOLE_PUBLIC_IPERF_PORT=8123 \
 The harness sets `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1` for derphole runs so the measurement stays on the public Internet path. This is a test-only guard; production defaults still allow Tailscale candidates.
 
 Normal public-path runs use the file workload and leave `DERPHOLE_BENCH_PARALLEL` unset. For an explicit stream diagnostic, set both controls, for example `DERPHOLE_BENCH_WORKLOAD=stream DERPHOLE_BENCH_PARALLEL=auto ./scripts/public-path-performance-harness.sh`.
+
+For a large-file direct-TCP acceptance run, set `DERPHOLE_BENCH_DIRECT_TCP_PORT` to an existing same-port TCP forward on the local endpoint. The driver passes `--direct-tcp-port` only to the local active file endpoint in each direction; the remote peer dials that advertisement. Keep `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1` for public-path evidence and set `DERPHOLE_BENCH_EXPECT_TRANSFER_MODE=direct-tcp-files-v1` when the run must reject fallback:
+
+```bash
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 \
+DERPHOLE_BENCH_DIRECT_TCP_PORT=8123 \
+DERPHOLE_BENCH_EXPECT_TRANSFER_MODE=direct-tcp-files-v1 \
+DERPHOLE_BENCH_WORKLOAD=file \
+./scripts/promotion-test.sh root@remote.example 3072
+```
 
 The July 2 baseline expected eric-nuc Mac -> remote derphole average within 10-15 percent of same-run `iperf3`, with zero steady direct-phase `transfertracecheck` stalls over 1s. Keep that result as historical context. Use the bulk-pacing decision gate below when selecting an initial rate; the old average is not the selection rule.
 

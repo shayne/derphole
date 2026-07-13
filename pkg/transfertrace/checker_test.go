@@ -14,9 +14,9 @@ import (
 
 func TestCheckPassesSmoothCompleteTransfer(t *testing.T) {
 	csvText := HeaderLine + "\n" +
-		"1000,0,receive,relay,1024,0,1024,1024,0.00,0,0,,,false,,,,,,,,,,,,connected-relay,\n" +
-		"1500,500,receive,overlap,2048,1024,2048,1024,16.38,0,0,,,true,,,,,,,,,,,,connected-direct,\n" +
-		"2000,1000,receive,complete,2048,4096,4096,2048,32.77,0,0,,,false,,,,,,,,,,,,stream-complete,\n"
+		padLegacyTraceRow("1000,0,receive,relay,1024,0,1024,1024,0.00,0,0,,,false,,,,,,,,,,,,connected-relay,") +
+		padLegacyTraceRow("1500,500,receive,overlap,2048,1024,2048,1024,16.38,0,0,,,true,,,,,,,,,,,,connected-direct,") +
+		padLegacyTraceRow("2000,1000,receive,complete,2048,4096,4096,2048,32.77,0,0,,,false,,,,,,,,,,,,stream-complete,")
 	result, err := Check(strings.NewReader(csvText), Options{Role: RoleReceive, StallWindow: time.Second, ExpectedBytes: 4096})
 	if err != nil {
 		t.Fatalf("Check() error = %v", err)
@@ -136,9 +136,9 @@ func TestCheckIgnoresInitialActiveSetupBeforeFirstAppByte(t *testing.T) {
 
 func TestCheckFailsApplicationFlatline(t *testing.T) {
 	csvText := HeaderLine + "\n" +
-		"1000,0,receive,relay,1024,0,1024,1024,0.00,0,0,,,false,,,,,,,,,,,,connected-relay,\n" +
-		"1500,500,receive,direct_probe,1024,0,1024,0,0.00,0,0,,,true,,,,,,,,,,,,connected-direct,\n" +
-		"2501,1501,receive,direct_probe,1024,0,1024,0,0.00,0,0,,,true,,,,,,,,,,,,connected-direct,\n"
+		padLegacyTraceRow("1000,0,receive,relay,1024,0,1024,1024,0.00,0,0,,,false,,,,,,,,,,,,connected-relay,") +
+		padLegacyTraceRow("1500,500,receive,direct_probe,1024,0,1024,0,0.00,0,0,,,true,,,,,,,,,,,,connected-direct,") +
+		padLegacyTraceRow("2501,1501,receive,direct_probe,1024,0,1024,0,0.00,0,0,,,true,,,,,,,,,,,,connected-direct,")
 	_, err := Check(strings.NewReader(csvText), Options{Role: RoleReceive, StallWindow: time.Second})
 	if err == nil || !strings.Contains(err.Error(), "app bytes stalled") || !strings.Contains(err.Error(), "row 4") {
 		t.Fatalf("Check() error = %v, want app bytes stalled at row 4", err)
@@ -174,7 +174,7 @@ func TestCheckFailsMissingTimestampHeaderWithAliases(t *testing.T) {
 
 func TestCheckFailsTerminalError(t *testing.T) {
 	csvText := HeaderLine + "\n" +
-		"1000,0,send,error,0,0,0,0,0.00,0,0,,,false,,,,,,,,,,,,connected-direct,message too long\n"
+		padLegacyTraceRow("1000,0,send,error,0,0,0,0,0.00,0,0,,,false,,,,,,,,,,,,connected-direct,message too long")
 	_, err := Check(strings.NewReader(csvText), Options{Role: RoleSend, StallWindow: time.Second})
 	if err == nil || !strings.Contains(err.Error(), "message too long") || !strings.Contains(err.Error(), "row 2") {
 		t.Fatalf("Check() error = %v, want terminal error at row 2", err)
@@ -993,7 +993,7 @@ func TestCheckFailsTargetRowWithExtraFields(t *testing.T) {
 
 func TestCheckFailsExpectedByteMismatch(t *testing.T) {
 	csvText := HeaderLine + "\n" +
-		"1000,0,receive,complete,0,0,1024,1024,0.00,0,0,,,false,,,,,,,,,,,,stream-complete,\n"
+		padLegacyTraceRow("1000,0,receive,complete,0,0,1024,1024,0.00,0,0,,,false,,,,,,,,,,,,stream-complete,")
 	_, err := Check(strings.NewReader(csvText), Options{Role: RoleReceive, StallWindow: time.Second, ExpectedBytes: 2048})
 	if err == nil || !strings.Contains(err.Error(), "final app bytes") {
 		t.Fatalf("Check() error = %v, want byte mismatch", err)
@@ -1060,6 +1060,15 @@ type testTraceRowConfig struct {
 	quicBytesSent                  int64
 	quicGoodputMbps                string
 	quicCloseReason                string
+}
+
+func padLegacyTraceRow(row string) string {
+	fields := strings.Split(row, ",")
+	if len(fields) > len(Header) {
+		panic("legacy trace row has more fields than current header")
+	}
+	fields = append(fields, make([]string, len(Header)-len(fields))...)
+	return strings.Join(fields, ",") + "\n"
 }
 
 func testTraceRow(cfg testTraceRowConfig) string {
