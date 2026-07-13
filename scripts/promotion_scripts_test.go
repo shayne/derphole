@@ -792,6 +792,65 @@ func TestPromotionBenchmarkReverseFailureTerminatesRemoteSenderChild(t *testing.
 	harness.assertCleaned(t, "reverse")
 }
 
+func TestPromotionBenchmarkInterruptTerminatesRemoteSenderChild(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+	cmd := harness.command("reverse", map[string]string{
+		"FAKE_SEND_STAY_RUNNING": "1",
+	})
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start reverse benchmark: %v", err)
+	}
+
+	childPath := filepath.Join(harness.stateDir, "remote-child-pid")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(childPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Fatalf("remote sender did not start before interrupt; output:\n%s", output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	childPID := readProcessID(t, childPath, nil)
+	t.Cleanup(func() {
+		_ = syscall.Kill(childPID, syscall.SIGKILL)
+	})
+	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatalf("interrupt reverse benchmark: %v", err)
+	}
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	select {
+	case err := <-waitDone:
+		if err == nil {
+			t.Fatalf("interrupted benchmark exited successfully; output:\n%s", output.String())
+		}
+	case <-time.After(8 * time.Second):
+		_ = cmd.Process.Kill()
+		<-waitDone
+		t.Fatalf("interrupted benchmark did not exit; output:\n%s", output.String())
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for processExists(childPID) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if processExists(childPID) {
+		t.Fatalf("remote sender child PID %d survived interrupt cleanup; output:\n%s", childPID, output.String())
+	}
+	if _, err := os.Stat(filepath.Join(harness.stateDir, "remote-child-term")); err != nil {
+		t.Fatalf("remote sender child PID %d did not receive TERM after interrupt: %v", childPID, err)
+	}
+	harness.assertCleaned(t, "reverse")
+}
+
 func TestPromotionBenchmarkFailureWaitsForLocalRunstatsAndChild(t *testing.T) {
 	harness := newPromotionDriverTest(t)
 	cmd := harness.command("forward", map[string]string{
@@ -1147,6 +1206,30 @@ func TestPromotionDriverStopsCommandClockBeforePostflight(t *testing.T) {
 		"assert_no_tool_leaks",
 		`end_ms="$(now_ms)"`,
 		`duration_ms="$((end_ms - start_ms))"`,
+	)
+}
+
+func TestPromotionLeakCheckIgnoresPreexistingToolProcesses(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(filepath.Join(".", "promotion-benchmark-driver.sh"))
+	if err != nil {
+		t.Fatalf("read promotion-benchmark-driver.sh: %v", err)
+	}
+	body := string(data)
+	for _, want := range []string{
+		`local_tool_pids_baseline="$(list_local_tool_pids)"`,
+		`remote_tool_pids_baseline="$(list_remote_tool_pids)"`,
+		`new_local_tool_pids`,
+		`new_remote_tool_pids`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("promotion-benchmark-driver.sh missing %q", want)
+		}
+	}
+	assertScriptOrder(t, body,
+		"snapshot_tool_processes",
+		"build_and_install_remote_binary",
 	)
 }
 
@@ -1711,6 +1794,7 @@ func TestPromotionBenchmarkDriverPropagatesTransportExperimentEnv(t *testing.T) 
 		"DERPHOLE_V2_RAW_DIRECT",
 		"DERPHOLE_V2_RAW_DIRECT_BUDGET_MS",
 		"DERPHOLE_V2_MANAGER_QUIC_FANOUT",
+		"DERPHOLE_TEST_CPU_PROFILE",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("promotion-benchmark-driver.sh missing remote env propagation for %s", want)

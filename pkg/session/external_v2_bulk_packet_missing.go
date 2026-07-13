@@ -6,17 +6,130 @@ package session
 
 import (
 	"math"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	externalV2BulkPacketActiveRequestInterval    = 100 * time.Millisecond
+	externalV2BulkPacketActiveRequestInterval    = 50 * time.Millisecond
 	externalV2BulkPacketRateSampleInterval       = 100 * time.Millisecond
-	externalV2BulkPacketReorderWindow            = 250 * time.Millisecond
+	externalV2BulkPacketReorderWindow            = 75 * time.Millisecond
 	externalV2BulkPacketMinimumActiveRepairTrail = uint32(8192)
-	externalV2BulkPacketMaximumActiveRepairTrail = uint32(65536)
+	externalV2BulkPacketMaximumActiveRepairTrail = uint32(16384)
 	externalV2BulkPacketReceiveRateAlpha         = 0.25
 )
+
+// externalV2BulkPacketArrivalTracker records authenticated packets as soon as
+// decryption finishes. Assembly and disk writes can lag behind the socket
+// readers, so using only the assembled bitmap would mistake queued packets for
+// loss and request needless repairs.
+type externalV2BulkPacketArrivalTracker struct {
+	total          uint32
+	words          []atomic.Uint64
+	claims         []atomic.Uint32
+	highestArrival atomic.Uint32
+	lastActivityNS atomic.Int64
+	payload        atomic.Int64
+}
+
+func newExternalV2BulkPacketArrivalTracker(total uint32) *externalV2BulkPacketArrivalTracker {
+	return &externalV2BulkPacketArrivalTracker{
+		total:  total,
+		words:  make([]atomic.Uint64, (uint64(total)+63)/64),
+		claims: make([]atomic.Uint32, total),
+	}
+}
+
+func (t *externalV2BulkPacketArrivalTracker) mark(index uint32) bool {
+	if t == nil || index >= t.total {
+		return false
+	}
+	mask := uint64(1) << (index % 64)
+	if t.words[index/64].Or(mask)&mask != 0 {
+		return false
+	}
+	externalV2BulkPacketAtomicMaxUint32(&t.highestArrival, index+1)
+	return true
+}
+
+func (t *externalV2BulkPacketArrivalTracker) markData(header externalV2BulkPacketHeader) {
+	if t == nil || header.total != t.total {
+		return
+	}
+	if t.mark(header.index) {
+		t.payload.Add(int64(header.length))
+	}
+	t.claims[header.index].Store(2)
+}
+
+func (t *externalV2BulkPacketArrivalTracker) tryClaim(index uint32) bool {
+	if t == nil || index >= t.total || t.contains(index) {
+		return false
+	}
+	return t.claims[index].CompareAndSwap(0, 1)
+}
+
+func (t *externalV2BulkPacketArrivalTracker) finishClaim(header externalV2BulkPacketHeader, authenticated bool) {
+	if t == nil || header.total != t.total || header.index >= t.total {
+		return
+	}
+	if !authenticated {
+		t.claims[header.index].CompareAndSwap(1, 0)
+		return
+	}
+	t.markData(header)
+}
+
+func (t *externalV2BulkPacketArrivalTracker) markGroupedFragment(header externalV2BulkPacketHeader) bool {
+	if t == nil || header.total != t.total || header.index >= t.total {
+		return false
+	}
+	return t.mark(header.index)
+}
+
+func (t *externalV2BulkPacketArrivalTracker) addAuthenticatedPayload(bytes int) {
+	if t != nil && bytes > 0 {
+		t.payload.Add(int64(bytes))
+	}
+}
+
+func (t *externalV2BulkPacketArrivalTracker) contains(index uint32) bool {
+	if t == nil || index >= t.total {
+		return false
+	}
+	return t.words[index/64].Load()&(uint64(1)<<(index%64)) != 0
+}
+
+func (t *externalV2BulkPacketArrivalTracker) highestPlusOne() uint32 {
+	if t == nil {
+		return 0
+	}
+	return t.highestArrival.Load()
+}
+
+func (t *externalV2BulkPacketArrivalTracker) observeActivity(at time.Time) {
+	if t != nil && !at.IsZero() {
+		t.lastActivityNS.Store(at.UnixNano())
+	}
+}
+
+func (t *externalV2BulkPacketArrivalTracker) lastActivity() time.Time {
+	if t == nil {
+		return time.Time{}
+	}
+	nanos := t.lastActivityNS.Load()
+	if nanos == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nanos)
+}
+
+func (t *externalV2BulkPacketArrivalTracker) payloadBytes() int64 {
+	if t == nil {
+		return 0
+	}
+	return t.payload.Load()
+}
 
 type externalV2BulkPacketReceiveRate struct {
 	sampleStarted time.Time
@@ -26,13 +139,17 @@ type externalV2BulkPacketReceiveRate struct {
 }
 
 func (r *externalV2BulkPacketReceiveRate) observe(at time.Time) {
-	if at.IsZero() {
+	r.observeN(at, 1)
+}
+
+func (r *externalV2BulkPacketReceiveRate) observeN(at time.Time, packets uint32) {
+	if at.IsZero() || packets == 0 {
 		return
 	}
 	if r.sampleStarted.IsZero() {
 		r.sampleStarted = at
 	}
-	r.samplePackets++
+	r.samplePackets += packets
 	elapsed := at.Sub(r.sampleStarted)
 	if elapsed < externalV2BulkPacketRateSampleInterval {
 		return
@@ -95,12 +212,17 @@ type externalV2BulkPacketMissingTracker struct {
 	pendingPeak      uint32
 	requestedPackets uint64
 	requestBatches   uint64
+	arrivals         *externalV2BulkPacketArrivalTracker
 }
 
-func newExternalV2BulkPacketMissingTracker(total uint32) *externalV2BulkPacketMissingTracker {
-	return &externalV2BulkPacketMissingTracker{
+func newExternalV2BulkPacketMissingTracker(total uint32, arrivals ...*externalV2BulkPacketArrivalTracker) *externalV2BulkPacketMissingTracker {
+	tracker := &externalV2BulkPacketMissingTracker{
 		pendingFlags: make([]bool, total),
 	}
+	if len(arrivals) > 0 {
+		tracker.arrivals = arrivals[0]
+	}
+	return tracker
 }
 
 func (t *externalV2BulkPacketMissingTracker) advance(seen []bool, limit uint32) {
@@ -113,7 +235,7 @@ func (t *externalV2BulkPacketMissingTracker) advance(seen []bool, limit uint32) 
 	}
 	for index := t.scanCursor; index < limit; index++ {
 		t.scanChecks++
-		if seen[index] || t.pendingFlags[index] {
+		if t.present(seen, index) || t.pendingFlags[index] {
 			continue
 		}
 		t.pendingFlags[index] = true
@@ -162,11 +284,11 @@ func (t *externalV2BulkPacketMissingTracker) compact(seen []bool) {
 		if !t.pendingFlags[index] {
 			continue
 		}
-		if index >= uint32(len(seen)) {
+		if index >= uint32(len(seen)) && !t.arrivals.contains(index) {
 			kept = append(kept, index)
 			continue
 		}
-		if seen[index] {
+		if t.present(seen, index) {
 			t.pendingFlags[index] = false
 			t.pendingCount--
 			continue
@@ -174,6 +296,10 @@ func (t *externalV2BulkPacketMissingTracker) compact(seen []bool) {
 		kept = append(kept, index)
 	}
 	t.pending = kept
+}
+
+func (t *externalV2BulkPacketMissingTracker) present(seen []bool, index uint32) bool {
+	return (index < uint32(len(seen)) && seen[index]) || t.arrivals.contains(index)
 }
 
 func (t *externalV2BulkPacketMissingTracker) stats() externalV2BulkPacketMissingStats {

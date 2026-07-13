@@ -272,9 +272,9 @@ func TestExternalV2BulkPacketControllerLowRepairInterruptsPressure(t *testing.T)
 
 	interrupted := series.observe(60_000_000, 0, 45_000_000, true)
 	if interrupted.Action != "hold" ||
-		interrupted.Reason != "receiver-limited" ||
+		interrupted.Reason != "receiver-limited-pending" ||
 		interrupted.TargetMbps != 1000 {
-		t.Fatalf("low-repair decision = %#v, want receiver-limited hold", interrupted)
+		t.Fatalf("low-repair decision = %#v, want pending receiver-limited hold", interrupted)
 	}
 
 	afterReset := series.observe(57_600_000, 2_400_000, 50_000_000, true)
@@ -341,6 +341,45 @@ func TestExternalV2BulkPacketControllerNoPeerProgressResetsPressure(t *testing.T
 		afterReset.Reason != "repair-pressure-pending" ||
 		afterReset.TargetMbps != 1000 {
 		t.Fatalf("second decision after peer reset = %#v, want fresh pending hold", afterReset)
+	}
+}
+
+func TestExternalV2BulkPacketControllerBacksOffSustainedReceiverLimitAcrossProgressGap(t *testing.T) {
+	series := newExternalV2BulkPacketControllerTestSeries(time.Unix(226, 0))
+	first := series.observe(135_000_000, 0, 25_000_000, true)
+	if first.Action != "hold" || first.Reason != "receiver-limited-pending" || first.TargetMbps != 1000 {
+		t.Fatalf("first receiver-limited decision = %#v", first)
+	}
+
+	series.sample.At = series.sample.At.Add(externalV2BulkPacketControllerInterval)
+	series.sample.PrimaryWireBytes += 135_000_000
+	gap := series.controller.Observe(series.sample)
+	if gap.Action != "hold" || gap.Reason != "awaiting-peer-progress" || gap.TargetMbps != 1000 {
+		t.Fatalf("progress-gap decision = %#v", gap)
+	}
+
+	confirmed := series.observe(135_000_000, 0, 25_000_000, true)
+	if confirmed.Action != "decrease" || confirmed.Reason != "receiver-limited" || confirmed.TargetMbps != 850 {
+		t.Fatalf("confirmed receiver-limited decision = %#v", confirmed)
+	}
+}
+
+func TestExternalV2BulkPacketControllerDoesNotBackOffReceiveWindowFlowControl(t *testing.T) {
+	controller := newExternalV2BulkPacketController(2160)
+	start := time.Unix(227, 0)
+	controller.Observe(externalV2BulkPacketControllerSample{At: start, PeerProgress: true})
+	for window := 1; window <= 3; window++ {
+		decision := controller.Observe(externalV2BulkPacketControllerSample{
+			At:                    start.Add(time.Duration(window) * externalV2BulkPacketControllerInterval),
+			PrimaryWireBytes:      int64(window) * 128_000_000,
+			PeerBytes:             int64(window) * 90_000_000,
+			PeerTransferElapsedMS: int64(window) * externalV2BulkPacketControllerInterval.Milliseconds(),
+			PeerProgress:          true,
+			ReceiveWindowBlocked:  true,
+		})
+		if decision.TargetMbps != 2160 || decision.Action != "hold" || decision.Reason != "receive-window" {
+			t.Fatalf("window %d decision = %#v, want receive-window hold at probe target", window, decision)
+		}
 	}
 }
 

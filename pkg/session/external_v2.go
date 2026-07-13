@@ -339,9 +339,25 @@ func (rt *externalV2SendRuntime) sendStream(ctx context.Context, accept external
 	}
 	if path.raw && externalV2UsesBulkPacketTransfer(accept.TransferMode) {
 		emitExternalV2Debug(rt.cfg.Emitter, "v2-block-transfer=bulk-packets")
+		batchNative := accept.BlockPacketBatchCapable && externalV2BulkPacketBatchCapability()
+		grouped := batchNative && externalV2GroupedBulk(accept.BlockPacketGroupCapable, externalV2BulkPacketGroupCapability())
+		emitExternalV2BulkPacketRecordMode(rt.cfg.Emitter, grouped)
 		abortErrCh, stopAbortWatch := rt.watchAbort(ctx, cancelStream)
-		defer stopAbortWatch()
-		return rt.sendBulkPacketBlock(streamCtx, ctx, path, metrics, abortErrCh, progress)
+		err := rt.sendBulkPacketBlock(
+			streamCtx,
+			ctx,
+			path,
+			batchNative,
+			grouped,
+			metrics,
+			abortErrCh,
+			progress,
+		)
+		stopAbortWatch()
+		if !errors.Is(err, errExternalV2BulkPacketProbeRejected) {
+			return err
+		}
+		emitExternalV2Debug(rt.cfg.Emitter, "v2-bulk-probe=fallback-before-payload")
 	}
 	client := rt.newExternalV2SendClient(tr.manager, path, managerConnections)
 	return rt.copySendStreamWithClient(streamCtx, ctx, accept, path.raw, streamCount, client, cancelStream, metrics, progress)
@@ -396,12 +412,13 @@ func (rt *externalV2SendRuntime) copySendStreamWithClient(streamCtx context.Cont
 	return nil
 }
 
-func (rt *externalV2SendRuntime) sendBulkPacketBlock(streamCtx context.Context, completeCtx context.Context, path externalV2DirectPacketPath, metrics *externalTransferMetrics, abortErrCh <-chan error, progress *externalV2PeerProgressState) error {
+func (rt *externalV2SendRuntime) sendBulkPacketBlock(streamCtx context.Context, completeCtx context.Context, path externalV2DirectPacketPath, batchNative, grouped bool, metrics *externalTransferMetrics, abortErrCh <-chan error, progress *externalV2PeerProgressState) error {
 	auth, err := externalV2BulkPacketAuthForToken(rt.tok, rt.derp.PublicKey(), rt.listenerDERP)
 	if err != nil {
 		return err
 	}
-	stats, err := sendExternalV2BulkBlockPackets(streamCtx, rt.cfg.BlockSource, externalV2BulkPacketPathFromRaw(path), auth, metrics)
+	auth = auth.withGrouped(grouped)
+	stats, err := sendExternalV2BulkBlockPacketsWithProbe(streamCtx, rt.cfg.BlockSource, externalV2BulkPacketPathFromRaw(path), auth, metrics, batchNative)
 	metrics.SetDirectStats(stats)
 	if err != nil {
 		return externalV2PreferPeerAbort(completeCtx, abortErrCh, err)
@@ -1016,7 +1033,10 @@ func (rt *externalV2ListenRuntime) sendAccept(ctx context.Context, peerDERP key.
 	accept.ManagerConnections = externalV2SetManagerConnectionCount(policy)
 	accept.RawDirectBudgetMS = externalV2SetRawDirectStartupBudgetMS()
 	if blockTransfer {
-		policy := externalV2AcceptedBlockTransferPolicy(claim, true, candidates)
+		batchCapable := externalV2BulkPacketBatchCapability()
+		accept.BlockPacketBatchCapable = batchCapable
+		accept.BlockPacketGroupCapable = batchCapable && externalV2BulkPacketGroupCapability()
+		policy := externalV2AcceptedBlockTransferPolicy(claim, true, accept.BlockPacketBatchCapable, candidates)
 		accept.DirectTCPFileCapable = !rt.cfg.ForceRelay
 		if policy.Mode == externalV2TransferModeBlocks && claim.BlockSize >= externalV2DirectTCPMinFileSize && claim.DirectTCPFileCapable && accept.DirectTCPFileCapable {
 			rt.directTCP = openConfiguredExternalV2DirectTCPListener(rt.cfg.DirectTCPPort, candidates, rt.cfg.Emitter)
@@ -1025,12 +1045,13 @@ func (rt *externalV2ListenRuntime) sendAccept(ctx context.Context, peerDERP key.
 				accept.DirectTCPFile = &ad
 			}
 		}
-		accept.TransferMode = externalV2SelectFileTransferMode(policy.Mode, claim.BlockSize, claim.DirectTCPFileCapable, accept.DirectTCPFileCapable, claim.DirectTCPFile, accept.DirectTCPFile)
+		accept.TransferMode = externalV2SelectOptimizedFileTransferMode(policy.Mode, claim.BlockSize, claim.BlockPacketBatchCapable, accept.BlockPacketBatchCapable)
+		accept.TransferMode = externalV2SelectFileTransferMode(accept.TransferMode, claim.BlockSize, claim.DirectTCPFileCapable, accept.DirectTCPFileCapable, claim.DirectTCPFile, accept.DirectTCPFile)
 		if externalV2UsesDirectTCPFileTransfer(accept.TransferMode) {
 			accept.BlockChunkSize = externalV2DirectTCPChunkSize
 		}
 		emitExternalV2BlockTransferPolicy(rt.cfg.Emitter, policy)
-		emitExternalV2Debug(rt.cfg.Emitter, fmt.Sprintf("v2-file-transfer-selection=policy:%s size:%d claim_tcp:%t accept_tcp:%t claim_listener:%t accept_listener:%t selected:%s", policy.Mode, claim.BlockSize, claim.DirectTCPFileCapable, accept.DirectTCPFileCapable, externalV2DirectTCPAdvertisementUsable(claim.DirectTCPFile), externalV2DirectTCPAdvertisementUsable(accept.DirectTCPFile), accept.TransferMode))
+		emitExternalV2Debug(rt.cfg.Emitter, fmt.Sprintf("v2-file-transfer-selection=policy:%s size:%d claim_batch:%t accept_batch:%t claim_tcp:%t accept_tcp:%t claim_listener:%t accept_listener:%t selected:%s", policy.Mode, claim.BlockSize, claim.BlockPacketBatchCapable, accept.BlockPacketBatchCapable, claim.DirectTCPFileCapable, accept.DirectTCPFileCapable, externalV2DirectTCPAdvertisementUsable(claim.DirectTCPFile), externalV2DirectTCPAdvertisementUsable(accept.DirectTCPFile), accept.TransferMode))
 	}
 	err := sendAuthenticatedEnvelope(ctx, rt.session.derp, peerDERP, envelope{
 		Type:     envelopeV2Accept,

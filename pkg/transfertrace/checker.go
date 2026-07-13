@@ -16,10 +16,12 @@ import (
 )
 
 type Options struct {
-	Role             Role
-	StallWindow      time.Duration
-	ExpectedBytes    int64
-	ExpectedBytesSet bool
+	Role                   Role
+	StallWindow            time.Duration
+	ExpectedBytes          int64
+	ExpectedBytesSet       bool
+	RequireDirectTransport string
+	ForbidRelayPayload     bool
 }
 
 type Result struct {
@@ -91,6 +93,7 @@ type checkerIndexes struct {
 	phase                int
 	elapsedMS            int
 	appBytes             int
+	relayBytes           int
 	appMbps              int
 	peerReceivedBytes    int
 	transferElapsedMS    int
@@ -112,6 +115,7 @@ type checkerRow struct {
 	elapsedMS          int64
 	phase              Phase
 	appBytes           int64
+	relayBytes         int64
 	peerReceivedBytes  int64
 	transferElapsedMS  int64
 	directValidated    bool
@@ -313,6 +317,7 @@ type checker struct {
 	active             bool
 	activeSince        time.Time
 	lastPhase          Phase
+	maxRelayBytes      int64
 }
 
 func Check(r io.Reader, opts Options) (Result, error) {
@@ -393,6 +398,7 @@ func (c *checker) consume(row checkerRow) error {
 	c.result.Rows++
 	c.result.FinalAppBytes = row.appBytes
 	c.result.FinalPhase = row.phase
+	c.maxRelayBytes = maxInt64(c.maxRelayBytes, row.relayBytes)
 	c.recordDiagnostics(row)
 	if row.lastError != "" {
 		return fmt.Errorf("row %d: terminal error: %s", row.rowNo, row.lastError)
@@ -567,6 +573,12 @@ func (c *checker) finish() (Result, error) {
 	}
 	if c.result.FinalPhase != PhaseComplete {
 		return c.result, fmt.Errorf("final phase = %s, want %s", c.result.FinalPhase, PhaseComplete)
+	}
+	if c.opts.ForbidRelayPayload && c.maxRelayBytes != 0 {
+		return c.result, fmt.Errorf("relay payload bytes = %d, want 0", c.maxRelayBytes)
+	}
+	if c.opts.RequireDirectTransport != "" && c.result.Diagnostics.DirectTransport != c.opts.RequireDirectTransport {
+		return c.result, fmt.Errorf("direct transport = %q, want %q", c.result.Diagnostics.DirectTransport, c.opts.RequireDirectTransport)
 	}
 	c.recordReceiverRateSummary()
 	return c.result, nil
@@ -870,6 +882,7 @@ func checkerHeaderIndexes(header []string) (checkerIndexes, error) {
 		timestampName:        timestampName,
 		role:                 role,
 		phase:                phase,
+		relayBytes:           optional("relay_bytes"),
 		elapsedMS:            optional("elapsed_ms"),
 		appBytes:             appBytes,
 		appMbps:              optional("app_mbps"),
@@ -948,32 +961,12 @@ func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int) (checke
 	if err := requireCheckerRowFields(record, indexes, rowNo); err != nil {
 		return checkerRow{}, err
 	}
-	timestampMS, err := parseIntField(record, indexes.timestamp, indexes.timestampName, rowNo)
-	if err != nil {
-		return checkerRow{}, err
-	}
-	elapsedMS, err := parseOptionalIntField(record, indexes.elapsedMS, "elapsed_ms", rowNo)
-	if err != nil {
-		return checkerRow{}, err
-	}
-	appBytes, err := parseIntField(record, indexes.appBytes, "app_bytes", rowNo)
+	fields, err := parseCheckerRowFields(record, indexes, rowNo)
 	if err != nil {
 		return checkerRow{}, err
 	}
 	role := Role(field(record, indexes.role))
 	phase := Phase(field(record, indexes.phase))
-	peerReceivedBytes, err := parseOptionalIntField(record, indexes.peerReceivedBytes, "peer_received_bytes", rowNo)
-	if err != nil {
-		return checkerRow{}, err
-	}
-	transferElapsedMS, err := parseOptionalIntField(record, indexes.transferElapsedMS, "transfer_elapsed_ms", rowNo)
-	if err != nil {
-		return checkerRow{}, err
-	}
-	directValidated, err := parseOptionalBoolField(record, indexes.directValidated, "direct_validated", rowNo)
-	if err != nil {
-		return checkerRow{}, err
-	}
 	diagnostics, err := parseCheckerRowDiagnostics(record, indexes, rowNo, role, phase)
 	if err != nil {
 		return checkerRow{}, err
@@ -981,19 +974,61 @@ func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int) (checke
 	return checkerRow{
 		rowNo:              rowNo,
 		role:               role,
-		timestamp:          time.UnixMilli(timestampMS),
-		elapsedMS:          elapsedMS,
+		timestamp:          time.UnixMilli(fields.timestampMS),
+		elapsedMS:          fields.elapsedMS,
 		phase:              phase,
-		appBytes:           appBytes,
-		peerReceivedBytes:  peerReceivedBytes,
-		transferElapsedMS:  transferElapsedMS,
-		directValidated:    directValidated,
+		appBytes:           fields.appBytes,
+		relayBytes:         fields.relayBytes,
+		peerReceivedBytes:  fields.peerReceivedBytes,
+		transferElapsedMS:  fields.transferElapsedMS,
+		directValidated:    fields.directValidated,
 		fallbackReason:     field(record, indexes.fallbackReason),
 		lastState:          field(record, indexes.lastState),
 		lastError:          field(record, indexes.lastError),
 		controllerDecision: field(record, indexes.controllerDecision),
 		diagnostics:        diagnostics,
 	}, nil
+}
+
+type checkerRowFields struct {
+	timestampMS       int64
+	elapsedMS         int64
+	appBytes          int64
+	relayBytes        int64
+	peerReceivedBytes int64
+	transferElapsedMS int64
+	directValidated   bool
+}
+
+func parseCheckerRowFields(record []string, indexes checkerIndexes, rowNo int) (checkerRowFields, error) {
+	var fields checkerRowFields
+	parsers := []struct {
+		value    *int64
+		index    int
+		name     string
+		required bool
+	}{
+		{&fields.timestampMS, indexes.timestamp, indexes.timestampName, true},
+		{&fields.elapsedMS, indexes.elapsedMS, "elapsed_ms", false},
+		{&fields.appBytes, indexes.appBytes, "app_bytes", true},
+		{&fields.relayBytes, indexes.relayBytes, "relay_bytes", false},
+		{&fields.peerReceivedBytes, indexes.peerReceivedBytes, "peer_received_bytes", false},
+		{&fields.transferElapsedMS, indexes.transferElapsedMS, "transfer_elapsed_ms", false},
+	}
+	for _, parser := range parsers {
+		var err error
+		if parser.required {
+			*parser.value, err = parseIntField(record, parser.index, parser.name, rowNo)
+		} else {
+			*parser.value, err = parseOptionalIntField(record, parser.index, parser.name, rowNo)
+		}
+		if err != nil {
+			return checkerRowFields{}, err
+		}
+	}
+	directValidated, err := parseOptionalBoolField(record, indexes.directValidated, "direct_validated", rowNo)
+	fields.directValidated = directValidated
+	return fields, err
 }
 
 func parseReceiverAppMbps(record []string, indexes checkerIndexes, rowNo int, role Role, phase Phase) (float64, bool, error) {

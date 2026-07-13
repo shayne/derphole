@@ -26,6 +26,8 @@ type options struct {
 	PeerTrace                  string
 	RateTolerance              float64
 	ProgressLeadToleranceBytes int64
+	RequireDirectTransport     string
+	ForbidRelayPayload         bool
 	Path                       string
 }
 
@@ -147,6 +149,8 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 	var peerTrace string
 	var rateTolerance float64
 	var progressLeadToleranceBytes int64
+	var requireDirectTransport string
+	var forbidRelayPayload bool
 	flags := flag.NewFlagSet("transfertracecheck", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.StringVar(&role, "role", "", "trace role to check")
@@ -155,6 +159,8 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 	flags.StringVar(&peerTrace, "peer-trace", "", "optional peer trace CSV for sender peer_received_bytes to receiver app_bytes comparison")
 	flags.Float64Var(&rateTolerance, "rate-tolerance", 0.10, "allowed sender/receiver transfer rate divergence")
 	flags.Int64Var(&progressLeadToleranceBytes, "progress-lead-tolerance", 0, "allowed sender peer progress lead over receiver app bytes")
+	flags.StringVar(&requireDirectTransport, "require-direct-transport", "", "require the final direct transport (for example, udp)")
+	flags.BoolVar(&forbidRelayPayload, "forbid-relay-payload", false, "reject any payload bytes carried by relay")
 	flags.Usage = func() {
 		_, _ = fmt.Fprintln(stderr, "usage: transfertracecheck -role receive [-expected-bytes N] [-peer-trace peer.csv] trace.csv")
 		flags.PrintDefaults()
@@ -195,6 +201,8 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 		PeerTrace:                  peerTrace,
 		RateTolerance:              rateTolerance,
 		ProgressLeadToleranceBytes: progressLeadToleranceBytes,
+		RequireDirectTransport:     requireDirectTransport,
+		ForbidRelayPayload:         forbidRelayPayload,
 		Path:                       flags.Arg(0),
 	}, nil
 }
@@ -211,10 +219,12 @@ func flagProvided(flags *flag.FlagSet, name string) bool {
 
 func checkPayloadPaths(opts options) (transfertrace.Result, string, error) {
 	checkOpts := transfertrace.Options{
-		Role:             transfertrace.Role(opts.Role),
-		ExpectedBytes:    opts.ExpectedBytes,
-		ExpectedBytesSet: opts.ExpectedBytesSet,
-		StallWindow:      opts.StallWindow,
+		Role:                   transfertrace.Role(opts.Role),
+		ExpectedBytes:          opts.ExpectedBytes,
+		ExpectedBytesSet:       opts.ExpectedBytesSet,
+		StallWindow:            opts.StallWindow,
+		RequireDirectTransport: opts.RequireDirectTransport,
+		ForbidRelayPayload:     opts.ForbidRelayPayload,
 	}
 	pairedSender := opts.Role == string(transfertrace.RoleSend) && opts.PeerTrace != ""
 	if pairedSender {
@@ -226,8 +236,10 @@ func checkPayloadPaths(opts options) (transfertrace.Result, string, error) {
 	}
 
 	peerResult, err := checkTracePath(opts.PeerTrace, transfertrace.Options{
-		Role:        transfertrace.RoleReceive,
-		StallWindow: opts.StallWindow,
+		Role:                   transfertrace.RoleReceive,
+		StallWindow:            opts.StallWindow,
+		RequireDirectTransport: opts.RequireDirectTransport,
+		ForbidRelayPayload:     opts.ForbidRelayPayload,
 	})
 	if err != nil {
 		return peerResult, "", err

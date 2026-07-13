@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	externalV2BulkPacketWriterQueue = 8
-	externalV2BulkPacketWriteGroup  = 256 << 10
+	externalV2BulkPacketWriterQueue = 64
+	externalV2BulkPacketWriteGroup  = 1 << 20
+	externalV2BulkPacketWriters     = 4
 )
 
 type externalV2BulkPacketWriteExtent struct {
@@ -30,6 +31,7 @@ type externalV2BulkPacketAsyncWriter struct {
 	queue     chan externalV2BulkPacketWriteExtent
 	done      chan struct{}
 	closeOnce sync.Once
+	workers   sync.WaitGroup
 	committed atomic.Int64
 	peak      atomic.Uint32
 	errMu     sync.Mutex
@@ -44,7 +46,18 @@ func newExternalV2BulkPacketAsyncWriter(ctx context.Context, sink BlockReceiveSi
 		queue:   make(chan externalV2BulkPacketWriteExtent, max(1, depth)),
 		done:    make(chan struct{}),
 	}
-	go writer.run()
+	workerCount := 1
+	if concurrent, ok := sink.(ConcurrentBlockReceiveSink); ok && concurrent.ConcurrentWriteAtSafe() {
+		workerCount = externalV2BulkPacketWriters
+	}
+	writer.workers.Add(workerCount)
+	for range workerCount {
+		go writer.run()
+	}
+	go func() {
+		writer.workers.Wait()
+		close(writer.done)
+	}()
 	return writer
 }
 
@@ -71,7 +84,7 @@ func (w *externalV2BulkPacketAsyncWriter) finish() (int64, error) {
 }
 
 func (w *externalV2BulkPacketAsyncWriter) run() {
-	defer close(w.done)
+	defer w.workers.Done()
 	for extent := range w.queue {
 		if w.loadError() != nil {
 			continue

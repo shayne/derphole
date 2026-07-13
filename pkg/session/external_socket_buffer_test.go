@@ -83,6 +83,17 @@ func TestTuneExternalPacketConnRequestsBothBuffers(t *testing.T) {
 	}
 }
 
+func TestTuneExternalPacketConnReceiveOnlyUsesBulkDataWindow(t *testing.T) {
+	conn := &externalSocketBufferTestConn{}
+	stats := tuneExternalPacketConnReceive(conn, externalV2BulkPacketReceiveSocketBufferBytes)
+	if conn.readRequested != externalV2BulkPacketReceiveSocketBufferBytes || conn.writeRequested != 0 {
+		t.Fatalf("requested read=%d write=%d, want receive-only %d", conn.readRequested, conn.writeRequested, externalV2BulkPacketReceiveSocketBufferBytes)
+	}
+	if stats.RequestedBytes != externalV2BulkPacketReceiveSocketBufferBytes {
+		t.Fatalf("stats requested bytes = %d", stats.RequestedBytes)
+	}
+}
+
 func TestOpenExternalV2DataPacketPathReportsSocketBuffersPerLane(t *testing.T) {
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
 

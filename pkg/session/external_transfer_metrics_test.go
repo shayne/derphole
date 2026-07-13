@@ -1051,34 +1051,56 @@ func TestListenConfigTraceUpdatesReceiveRelayPrefixTrace(t *testing.T) {
 func TestExternalTransferMetricsBulkBatchDiagnosticsAreMonotonic(t *testing.T) {
 	metrics := newExternalTransferMetrics(time.Now())
 	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
-		BulkBatchPresent:     true,
-		BulkBatchBackend:     "linux-sendmmsg",
-		BulkGSOAttempted:     true,
-		BulkGSOActive:        false,
-		BulkGSOSegments:      0,
-		BulkSendCalls:        10,
-		BulkSendDatagrams:    640,
-		BulkReceiveCalls:     8,
-		BulkReceiveDatagrams: 512,
-		BulkMaxSendBatch:     64,
-		BulkMaxReceiveBatch:  64,
-		BulkCryptoQueuePeak:  4,
-		BulkWriterQueuePeak:  3,
+		BulkBatchPresent:           true,
+		BulkBatchBackend:           "linux-sendmmsg",
+		BulkGSOAttempted:           true,
+		BulkGSOActive:              false,
+		BulkGSOSegments:            0,
+		BulkSendCalls:              10,
+		BulkSendDatagrams:          640,
+		BulkReceiveCalls:           8,
+		BulkReceiveDatagrams:       512,
+		BulkMaxSendBatch:           64,
+		BulkMaxReceiveBatch:        64,
+		BulkCryptoQueuePeak:        4,
+		BulkLaneQueuePeak:          2,
+		BulkReceiveQueuePeak:       5,
+		BulkWriterQueuePeak:        3,
+		BulkDecryptBatches:         100,
+		BulkDecryptDatagrams:       6400,
+		BulkProbeSelectedMbps:      2160,
+		BulkProbeDurationMS:        250,
+		BulkProbeTrains:            5,
+		BulkProbeSentDatagrams:     30000,
+		BulkProbeReceivedDatagrams: 29800,
+		BulkProbeLossPPM:           6666,
+		BulkProbePressure:          false,
 	}, time.Now())
 	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
-		BulkBatchPresent:     true,
-		BulkBatchBackend:     "linux-gso",
-		BulkGSOAttempted:     true,
-		BulkGSOActive:        true,
-		BulkGSOSegments:      64,
-		BulkSendCalls:        9,
-		BulkSendDatagrams:    600,
-		BulkReceiveCalls:     7,
-		BulkReceiveDatagrams: 500,
-		BulkMaxSendBatch:     32,
-		BulkMaxReceiveBatch:  32,
-		BulkCryptoQueuePeak:  2,
-		BulkWriterQueuePeak:  2,
+		BulkBatchPresent:           true,
+		BulkBatchBackend:           "linux-gso",
+		BulkGSOAttempted:           true,
+		BulkGSOActive:              true,
+		BulkGSOSegments:            64,
+		BulkSendCalls:              9,
+		BulkSendDatagrams:          600,
+		BulkReceiveCalls:           7,
+		BulkReceiveDatagrams:       500,
+		BulkMaxSendBatch:           32,
+		BulkMaxReceiveBatch:        32,
+		BulkCryptoQueuePeak:        2,
+		BulkLaneQueuePeak:          1,
+		BulkReceiveQueuePeak:       2,
+		BulkWriterQueuePeak:        2,
+		BulkDecryptBatches:         90,
+		BulkDecryptDatagrams:       6000,
+		BulkProbeSelectedMbps:      1800,
+		BulkProbeDurationMS:        200,
+		BulkProbeTrains:            4,
+		BulkProbeSentDatagrams:     25000,
+		BulkProbeReceivedDatagrams: 24000,
+		BulkProbeLossPPM:           40000,
+		BulkProbePressure:          true,
 	}, time.Now())
 
 	metrics.mu.Lock()
@@ -1089,8 +1111,14 @@ func TestExternalTransferMetricsBulkBatchDiagnosticsAreMonotonic(t *testing.T) {
 	if metrics.bulkGSOSegments != 64 || metrics.bulkSendCalls != 10 || metrics.bulkSendDatagrams != 640 || metrics.bulkReceiveCalls != 8 || metrics.bulkReceiveDatagrams != 512 {
 		t.Fatalf("batch counters regressed: gso=%d send=%d/%d receive=%d/%d", metrics.bulkGSOSegments, metrics.bulkSendCalls, metrics.bulkSendDatagrams, metrics.bulkReceiveCalls, metrics.bulkReceiveDatagrams)
 	}
-	if metrics.bulkMaxSendBatch != 64 || metrics.bulkMaxReceiveBatch != 64 || metrics.bulkCryptoQueuePeak != 4 || metrics.bulkWriterQueuePeak != 3 {
-		t.Fatalf("batch peaks regressed: send=%d receive=%d crypto=%d writer=%d", metrics.bulkMaxSendBatch, metrics.bulkMaxReceiveBatch, metrics.bulkCryptoQueuePeak, metrics.bulkWriterQueuePeak)
+	if metrics.bulkMaxSendBatch != 64 || metrics.bulkMaxReceiveBatch != 64 || metrics.bulkCryptoQueuePeak != 4 || metrics.bulkLaneQueuePeak != 2 || metrics.bulkWriterQueuePeak != 3 {
+		t.Fatalf("batch peaks regressed: send=%d receive=%d crypto=%d lane=%d writer=%d", metrics.bulkMaxSendBatch, metrics.bulkMaxReceiveBatch, metrics.bulkCryptoQueuePeak, metrics.bulkLaneQueuePeak, metrics.bulkWriterQueuePeak)
+	}
+	if metrics.bulkReceiveQueuePeak != 5 || metrics.bulkDecryptBatches != 100 || metrics.bulkDecryptDatagrams != 6400 {
+		t.Fatalf("receive pipeline diagnostics regressed: queue=%d batches=%d datagrams=%d", metrics.bulkReceiveQueuePeak, metrics.bulkDecryptBatches, metrics.bulkDecryptDatagrams)
+	}
+	if metrics.bulkProbeSelectedMbps != 1800 || metrics.bulkProbeDurationMS != 200 || metrics.bulkProbeTrains != 5 || metrics.bulkProbeSentDatagrams != 30000 || metrics.bulkProbeReceivedDatagrams != 29800 || metrics.bulkProbeLossPPM != 40000 || !metrics.bulkProbePressure {
+		t.Fatalf("probe diagnostics = selected:%d duration:%d trains:%d sent:%d received:%d loss_ppm:%d pressure:%t", metrics.bulkProbeSelectedMbps, metrics.bulkProbeDurationMS, metrics.bulkProbeTrains, metrics.bulkProbeSentDatagrams, metrics.bulkProbeReceivedDatagrams, metrics.bulkProbeLossPPM, metrics.bulkProbePressure)
 	}
 }
 

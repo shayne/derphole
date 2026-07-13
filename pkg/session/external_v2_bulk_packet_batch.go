@@ -8,22 +8,40 @@ import (
 	"context"
 	"errors"
 	"net"
-	"os"
 	"sync/atomic"
 	"time"
 )
 
-const externalV2BulkPacketMaxBatch = 64
+const externalV2BulkPacketMaxBatch = 192
 
 var errExternalV2BulkPacketBatchNoProgress = errors.New("bulk packet batch write made no progress")
 
+func externalV2BulkPacketFlattenMessage(buffers [][]byte) ([]byte, error) {
+	if len(buffers) == 0 {
+		return nil, errors.New("bulk packet batch message has no buffers")
+	}
+	if len(buffers) == 1 {
+		return buffers[0], nil
+	}
+	total := 0
+	for _, buffer := range buffers {
+		total += len(buffer)
+	}
+	payload := make([]byte, 0, total)
+	for _, buffer := range buffers {
+		payload = append(payload, buffer...)
+	}
+	return payload, nil
+}
+
 type externalV2BulkPacketBatchMessage struct {
-	Buffers [][]byte
-	Addr    net.Addr
-	OOB     []byte
-	N       int
-	NN      int
-	Flags   int
+	Buffers      [][]byte
+	Addr         net.Addr
+	OOB          []byte
+	PayloadBytes int
+	N            int
+	NN           int
+	Flags        int
 }
 
 type externalV2BulkPacketBatchStats struct {
@@ -45,6 +63,18 @@ type externalV2BulkPacketBatchConn interface {
 	WriteBatch(context.Context, []externalV2BulkPacketBatchMessage) (int, error)
 	ReadBatch(context.Context, []externalV2BulkPacketBatchMessage) (int, error)
 	Stats() externalV2BulkPacketBatchStats
+}
+
+func enableExternalV2BulkPacketFixedPeerConnect(conn externalV2BulkPacketBatchConn) {
+	if connector, ok := conn.(interface{ enableFixedPeerConnect() }); ok {
+		connector.enableFixedPeerConnect()
+	}
+}
+
+func enableExternalV2BulkPacketReceiveCoalescing(conn externalV2BulkPacketBatchConn) {
+	if coalescer, ok := conn.(interface{ enableReceiveCoalescing() }); ok {
+		coalescer.enableReceiveCoalescing()
+	}
 }
 
 type externalV2BulkPacketAtomicBatchStats struct {
@@ -121,10 +151,6 @@ func externalV2BulkPacketAtomicMaxUint32(counter *atomic.Uint32, candidate uint3
 	}
 }
 
-func externalV2BulkPacketBatchedIOEnabled() bool {
-	return os.Getenv("DERPHOLE_TEST_BULK_BATCHED_IO") == "1"
-}
-
 func externalV2BulkPacketMessageLength(buffers [][]byte) int {
 	total := 0
 	for _, buffer := range buffers {
@@ -139,6 +165,25 @@ func externalV2BulkPacketBatchDeadline(ctx context.Context, now time.Time) time.
 		return contextDeadline
 	}
 	return deadline
+}
+
+func externalV2BulkPacketArmWriteDeadline(ctx context.Context, conn net.PacketConn) error {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return nil
+	}
+	return conn.SetWriteDeadline(deadline)
+}
+
+func externalV2BulkPacketRetryReadError(ctx context.Context, err error) (bool, error) {
+	networkError, ok := err.(net.Error)
+	if !ok || !networkError.Timeout() {
+		return false, err
+	}
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	return true, nil
 }
 
 func writeExternalV2BulkPacketBatchAll(ctx context.Context, conn externalV2BulkPacketBatchConn, messages []externalV2BulkPacketBatchMessage) error {
@@ -161,11 +206,12 @@ func writeExternalV2BulkPacketBatchAll(ctx context.Context, conn externalV2BulkP
 	return nil
 }
 
-func externalV2BulkPacketBatchDiagnostics(conns []externalV2BulkPacketBatchConn, cryptoQueuePeak, writerQueuePeak uint32) externalDirectTransferDiagnostics {
+func externalV2BulkPacketBatchDiagnostics(conns []externalV2BulkPacketBatchConn, cryptoQueuePeak, writerQueuePeak, laneQueuePeak uint32) externalDirectTransferDiagnostics {
 	diagnostics := externalDirectTransferDiagnostics{
 		BulkBatchPresent:    len(conns) > 0,
 		BulkCryptoQueuePeak: cryptoQueuePeak,
 		BulkWriterQueuePeak: writerQueuePeak,
+		BulkLaneQueuePeak:   laneQueuePeak,
 	}
 	for _, conn := range conns {
 		if conn == nil {
@@ -206,5 +252,6 @@ func mergeExternalV2BulkPacketBatchDiagnostics(target *externalDirectTransferDia
 	target.BulkMaxSendBatch = batch.BulkMaxSendBatch
 	target.BulkMaxReceiveBatch = batch.BulkMaxReceiveBatch
 	target.BulkCryptoQueuePeak = batch.BulkCryptoQueuePeak
+	target.BulkLaneQueuePeak = batch.BulkLaneQueuePeak
 	target.BulkWriterQueuePeak = batch.BulkWriterQueuePeak
 }

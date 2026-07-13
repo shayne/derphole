@@ -5,72 +5,11 @@
 package session
 
 import (
-	"context"
-	"errors"
-	"net"
 	"testing"
 	"time"
-
-	"tailscale.com/types/key"
 )
 
-func TestExternalV2BulkPacketRepairCadenceContinuesUnderContinuousData(t *testing.T) {
-	auth, err := externalV2BulkPacketAuthForToken(testExternalV2BulkPacketToken(), key.NewNode().Public(), key.NewNode().Public())
-	if err != nil {
-		t.Fatal(err)
-	}
-	conn := &captureControlExternalV2BulkPacketConn{writes: make(chan []byte, 1)}
-	receiver := newExternalV2BulkPacketReceiver(nil, externalV2BlockReceiveConfig{
-		PayloadSize: 2 * externalV2BulkPacketPayloadSize,
-	}, externalV2BulkPacketPath{
-		Conns: []net.PacketConn{conn},
-		Addrs: []net.Addr{dummyExternalV2BulkPacketAddr("peer")},
-	}, auth, nil)
-	receiver.runID = 7
-	receiver.seen[0] = true
-	receiver.receivedPackets = 1
-	receiver.highestSeenPlusOne = 1
-	receiver.stopHello = func() {}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-	dataCh := make(chan externalV2BulkPacketReceiveResult, 4096)
-	duplicate := externalV2BulkPacketReceiveResult{header: externalV2BulkPacketHeader{kind: externalV2BulkPacketData, runID: 7, index: 0, total: 2}}
-	go func() {
-		for {
-			select {
-			case dataCh <- duplicate:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-	runDone := make(chan error, 1)
-	go func() {
-		_, _, err := receiver.run(ctx, dataCh, make(chan error))
-		runDone <- err
-	}()
-
-	select {
-	case packet := <-conn.writes:
-		header, payload, ok := openExternalV2BulkPacket(auth.control, packet)
-		if !ok || header.kind != externalV2BulkPacketMiss {
-			t.Fatalf("control packet = header %+v ok %v", header, ok)
-		}
-		missing := decodeExternalV2BulkPacketMissing(payload)
-		if len(missing) != 1 || missing[0] != 1 {
-			t.Fatalf("missing = %v, want [1]", missing)
-		}
-	case <-time.After(250 * time.Millisecond):
-		t.Fatal("repair cadence was starved by continuous data")
-	}
-	cancel()
-	if err := <-runDone; !errors.Is(err, context.Canceled) {
-		t.Fatalf("receiver error = %v, want context.Canceled", err)
-	}
-}
-
-func TestExternalV2BulkPacketRepairTickDoesNotRequestUnsentLookaheadDuringActiveProgress(t *testing.T) {
+func TestExternalV2BulkPacketRepairTickRequestsOnlyOldGapsDuringActiveProgress(t *testing.T) {
 	receiver := newExternalV2BulkPacketReceiver(nil, externalV2BlockReceiveConfig{
 		PayloadSize: 20_000 * externalV2BulkPacketPayloadSize,
 	}, externalV2BulkPacketPath{}, externalV2BulkPacketAuth{}, nil)
@@ -80,12 +19,17 @@ func TestExternalV2BulkPacketRepairTickDoesNotRequestUnsentLookaheadDuringActive
 	for index := range uint32(10_000) {
 		receiver.seen[index] = true
 	}
+	receiver.seen[0] = false
+	receiver.receivedPackets--
 	now := time.Unix(100, 0)
 	receiver.lastDataAt = now
 
 	receiver.repairTick(now.Add(externalV2BulkPacketReadIdle / 2))
-	if receiver.repairRequests != 0 {
-		t.Fatalf("active repair requests = %d, want 0 for unsent lookahead", receiver.repairRequests)
+	if receiver.repairRequests != 1 {
+		t.Fatalf("active repair requests = %d, want one old-gap request", receiver.repairRequests)
+	}
+	if checks := receiver.missing.stats().ScanChecks; checks != uint64(10_000-externalV2BulkPacketMinimumActiveRepairTrail) {
+		t.Fatalf("active scan checks = %d, want old high-water range without unsent lookahead", checks)
 	}
 
 	receiver.repairTick(now.Add(externalV2BulkPacketReadIdle))
@@ -94,31 +38,64 @@ func TestExternalV2BulkPacketRepairTickDoesNotRequestUnsentLookaheadDuringActive
 	}
 }
 
-type captureControlExternalV2BulkPacketConn struct {
-	writes chan []byte
-}
-
-func (c *captureControlExternalV2BulkPacketConn) WriteTo(payload []byte, _ net.Addr) (int, error) {
-	packet := append([]byte(nil), payload...)
-	select {
-	case c.writes <- packet:
-	default:
+func TestExternalV2BulkPacketRepairTickUsesArrivalBitmapWhileAuthenticationLags(t *testing.T) {
+	receiver := newExternalV2BulkPacketReceiver(nil, externalV2BlockReceiveConfig{
+		PayloadSize: 20_000 * externalV2BulkPacketPayloadSize,
+	}, externalV2BulkPacketPath{}, externalV2BulkPacketAuth{}, nil)
+	receiver.runID = 7
+	receiver.highestSeenPlusOne = 10_000
+	receiver.receivedPackets = 10_000
+	for index := range uint32(10_000) {
+		receiver.seen[index] = true
 	}
-	return len(payload), nil
+	receiver.seen[0] = false
+	receiver.receivedPackets--
+	now := time.Unix(100, 0)
+	receiver.lastDataAt = now.Add(-time.Second)
+	receiver.arrivals.observeActivity(now)
+
+	receiver.repairTick(now.Add(externalV2BulkPacketReadIdle / 2))
+	if receiver.repairRequests != 1 {
+		t.Fatalf("active repair requests = %d, want one genuinely absent old-gap request", receiver.repairRequests)
+	}
+
+	receiver.repairTick(now.Add(externalV2BulkPacketReadIdle))
+	if receiver.repairRequests == 0 {
+		t.Fatal("idle repair requests = 0, want repair after accepted socket traffic stops")
+	}
 }
 
-func (*captureControlExternalV2BulkPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
-	return 0, nil, errors.New("unexpected read")
-}
-func (*captureControlExternalV2BulkPacketConn) Close() error { return nil }
-func (*captureControlExternalV2BulkPacketConn) LocalAddr() net.Addr {
-	return dummyExternalV2BulkPacketAddr("local")
-}
-func (*captureControlExternalV2BulkPacketConn) SetDeadline(time.Time) error      { return nil }
-func (*captureControlExternalV2BulkPacketConn) SetReadDeadline(time.Time) error  { return nil }
-func (*captureControlExternalV2BulkPacketConn) SetWriteDeadline(time.Time) error { return nil }
+func TestExternalV2BulkPacketPrimaryCompleteForcesTailRepair(t *testing.T) {
+	receiver := newExternalV2BulkPacketReceiver(nil, externalV2BlockReceiveConfig{
+		PayloadSize: 10 * externalV2BulkPacketPayloadSize,
+	}, externalV2BulkPacketPath{}, externalV2BulkPacketAuth{}, nil)
+	receiver.runID = 7
+	receiver.highestSeenPlusOne = receiver.totalPackets
+	receiver.receivedPackets = receiver.totalPackets - 1
+	for index := range receiver.totalPackets {
+		receiver.seen[index] = true
+	}
+	receiver.seen[3] = false
+	receiver.lastDataAt = time.Unix(200, 0)
 
-type dummyExternalV2BulkPacketAddr string
-
-func (a dummyExternalV2BulkPacketAddr) Network() string { return "udp" }
-func (a dummyExternalV2BulkPacketAddr) String() string  { return string(a) }
+	if err := receiver.handleDataBatch(externalV2BulkPacketReceiveBatch{results: []externalV2BulkPacketReceiveResult{{
+		header: externalV2BulkPacketHeader{
+			kind:  externalV2BulkPacketPrimaryComplete,
+			runID: receiver.runID,
+			total: receiver.totalPackets,
+		},
+		primaryComplete: true,
+	}}}, receiver.lastDataAt); err != nil {
+		t.Fatal(err)
+	}
+	if !receiver.primaryComplete {
+		t.Fatal("authenticated primary-complete marker did not arm fast repair")
+	}
+	receiver.sendPrimaryCompleteRepair(receiver.lastDataAt.Add(time.Millisecond))
+	if receiver.repairRequests == 0 {
+		t.Fatal("primary-complete repair waited for the normal idle interval")
+	}
+	if receiver.primaryComplete {
+		t.Fatal("primary-complete repair remained armed after firing")
+	}
+}

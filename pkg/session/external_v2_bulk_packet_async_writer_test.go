@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -74,6 +75,34 @@ func TestExternalV2BulkPacketAsyncWriterQueueHonorsCancellation(t *testing.T) {
 	_, _ = writer.finish()
 }
 
+func TestExternalV2BulkPacketAsyncWriterUsesConcurrentSafeSink(t *testing.T) {
+	sink := &concurrentSafeAsyncBulkPacketSink{
+		started: make(chan struct{}, 4),
+		release: make(chan struct{}),
+	}
+	writer := newExternalV2BulkPacketAsyncWriter(context.Background(), sink, 4, nil)
+	for index := range 4 {
+		if err := writer.enqueue(externalV2BulkPacketWriteExtent{Offset: int64(index), Data: []byte{byte(index)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 4 {
+		select {
+		case <-sink.started:
+		case <-time.After(250 * time.Millisecond):
+			close(sink.release)
+			t.Fatal("concurrent-safe sink did not start four writes")
+		}
+	}
+	close(sink.release)
+	if _, err := writer.finish(); err != nil {
+		t.Fatal(err)
+	}
+	if sink.maximum.Load() < 4 {
+		t.Fatalf("maximum concurrent writes = %d, want 4", sink.maximum.Load())
+	}
+}
+
 type shortAsyncBulkPacketSink struct{}
 
 func (shortAsyncBulkPacketSink) WriteAt(payload []byte, _ int64) (int, error) {
@@ -87,6 +116,27 @@ type blockingAsyncBulkPacketSink struct {
 	release chan struct{}
 	once    sync.Once
 }
+
+type concurrentSafeAsyncBulkPacketSink struct {
+	started chan struct{}
+	release chan struct{}
+	active  atomic.Int32
+	maximum atomic.Int32
+}
+
+func (*concurrentSafeAsyncBulkPacketSink) ConcurrentWriteAtSafe() bool { return true }
+
+func (s *concurrentSafeAsyncBulkPacketSink) WriteAt(payload []byte, _ int64) (int, error) {
+	active := s.active.Add(1)
+	for current := s.maximum.Load(); active > current && !s.maximum.CompareAndSwap(current, active); current = s.maximum.Load() {
+	}
+	s.started <- struct{}{}
+	<-s.release
+	s.active.Add(-1)
+	return len(payload), nil
+}
+
+func (*concurrentSafeAsyncBulkPacketSink) Close() error { return nil }
 
 func (s *blockingAsyncBulkPacketSink) WriteAt(payload []byte, _ int64) (int, error) {
 	s.once.Do(func() { close(s.started) })

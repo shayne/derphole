@@ -6,7 +6,10 @@ package session
 
 import "net"
 
-const externalPacketConnSocketBufferBytes = 8 << 20
+// Two MiB per lane gives an eight-lane path 16 MiB of requested receive and
+// send buffering. Linux reports doubled kernel accounting, so this bounds the
+// effective eight-lane receive and send buffers to 32 MiB each on small hosts.
+const externalPacketConnSocketBufferBytes = 2 << 20
 
 type externalPacketConnSocketBufferStats struct {
 	RequestedBytes int
@@ -29,5 +32,14 @@ func tuneExternalPacketConn(conn net.PacketConn) externalPacketConnSocketBufferS
 	}
 	stats.ReadBytes, stats.WriteBytes, stats.InspectError =
 		readExternalPacketConnSocketBuffers(conn)
+	return stats
+}
+
+func tuneExternalPacketConnReceive(conn net.PacketConn, requestedBytes int) externalPacketConnSocketBufferStats {
+	stats := externalPacketConnSocketBufferStats{RequestedBytes: requestedBytes}
+	if setter, ok := conn.(interface{ SetReadBuffer(int) error }); ok {
+		stats.ReadSetError = setter.SetReadBuffer(requestedBytes)
+	}
+	stats.ReadBytes, stats.WriteBytes, stats.InspectError = readExternalPacketConnSocketBuffers(conn)
 	return stats
 }

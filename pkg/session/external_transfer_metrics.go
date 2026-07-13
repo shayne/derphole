@@ -16,74 +16,85 @@ import (
 )
 
 type externalTransferMetrics struct {
-	mu                     sync.Mutex
-	startedAt              time.Time
-	completedAt            time.Time
-	firstByteAt            time.Time
-	relayBytes             int64
-	directBytes            int64
-	localSentBytes         int64
-	peerReceivedBytes      int64
-	peerProgressSet        bool
-	transferStartedAt      time.Time
-	receiverTransferMS     int64
-	directValidated        bool
-	fallbackReason         string
-	transportPath          transport.Path
-	transportSelectedAddr  string
-	transportPreviousAddr  string
-	transportReason        string
-	transportSource        string
-	transportRTTMS         int64
-	directAppProgressBase  int64
-	directAppProgressSet   bool
-	trace                  *transfertrace.Recorder
-	role                   transfertrace.Role
-	phase                  transfertrace.Phase
-	lastState              string
-	lastError              string
-	deferSendComplete      bool
-	directRateSelectedMbps int
-	directRateSelectedPlan bool
-	directRateActiveMbps   int
-	directLanesActive      int
-	directLanesAvailable   int
-	rateTargetMbps         int
-	rateTargetFromDirect   bool
-	rateCeilingMbps        int
-	rateExplorationCeiling int
-	laneMin                int
-	laneCap                int
-	controllerDecision     string
-	controllerReason       string
-	directProbeState       string
-	directProbeSummary     string
-	replayWindowBytes      uint64
-	replayBytes            uint64
-	repairQueueBytes       uint64
-	retransmitCount        int64
-	repairRequests         int64
-	repairBytes            int64
-	missingScanChecks      uint64
-	pendingMissing         uint32
-	pendingMissingPeak     uint32
-	repairRequestedPackets uint64
-	repairRequestBatches   uint64
-	reorderTrailPackets    uint32
-	receivePacketRatePPS   uint32
-	bulkBatchPresent       bool
-	bulkBatchBackend       string
-	bulkGSOAttempted       bool
-	bulkGSOActive          bool
-	bulkGSOSegments        uint64
-	bulkSendCalls          uint64
-	bulkSendDatagrams      uint64
-	bulkReceiveCalls       uint64
-	bulkReceiveDatagrams   uint64
-	bulkMaxSendBatch       uint32
-	bulkMaxReceiveBatch    uint32
-	bulkCryptoQueuePeak    uint32
-	bulkWriterQueuePeak    uint32
+	mu                         sync.Mutex
+	startedAt                  time.Time
+	completedAt                time.Time
+	firstByteAt                time.Time
+	relayBytes                 int64
+	directBytes                int64
+	localSentBytes             int64
+	peerReceivedBytes          int64
+	peerProgressSet            bool
+	transferStartedAt          time.Time
+	receiverTransferMS         int64
+	directValidated            bool
+	fallbackReason             string
+	transportPath              transport.Path
+	transportSelectedAddr      string
+	transportPreviousAddr      string
+	transportReason            string
+	transportSource            string
+	transportRTTMS             int64
+	directAppProgressBase      int64
+	directAppProgressSet       bool
+	trace                      *transfertrace.Recorder
+	role                       transfertrace.Role
+	phase                      transfertrace.Phase
+	lastState                  string
+	lastError                  string
+	deferSendComplete          bool
+	directRateSelectedMbps     int
+	directRateSelectedPlan     bool
+	directRateActiveMbps       int
+	directLanesActive          int
+	directLanesAvailable       int
+	rateTargetMbps             int
+	rateTargetFromDirect       bool
+	rateCeilingMbps            int
+	rateExplorationCeiling     int
+	laneMin                    int
+	laneCap                    int
+	controllerDecision         string
+	controllerReason           string
+	directProbeState           string
+	directProbeSummary         string
+	replayWindowBytes          uint64
+	replayBytes                uint64
+	repairQueueBytes           uint64
+	retransmitCount            int64
+	repairRequests             int64
+	repairBytes                int64
+	missingScanChecks          uint64
+	pendingMissing             uint32
+	pendingMissingPeak         uint32
+	repairRequestedPackets     uint64
+	repairRequestBatches       uint64
+	reorderTrailPackets        uint32
+	receivePacketRatePPS       uint32
+	bulkBatchPresent           bool
+	bulkBatchBackend           string
+	bulkGSOAttempted           bool
+	bulkGSOActive              bool
+	bulkGSOSegments            uint64
+	bulkSendCalls              uint64
+	bulkSendDatagrams          uint64
+	bulkReceiveCalls           uint64
+	bulkReceiveDatagrams       uint64
+	bulkMaxSendBatch           uint32
+	bulkMaxReceiveBatch        uint32
+	bulkCryptoQueuePeak        uint32
+	bulkLaneQueuePeak          uint32
+	bulkReceiveQueuePeak       uint32
+	bulkWriterQueuePeak        uint32
+	bulkDecryptBatches         uint64
+	bulkDecryptDatagrams       uint64
+	bulkProbeSelectedMbps      int
+	bulkProbeDurationMS        int64
+	bulkProbeTrains            uint32
+	bulkProbeSentDatagrams     uint64
+	bulkProbeReceivedDatagrams uint64
+	bulkProbeLossPPM           uint64
+	bulkProbePressure          bool
 
 	localENOBUFSRetries        int64
 	localENOBUFSWaitUS         int64
@@ -160,7 +171,18 @@ type externalDirectTransferDiagnostics struct {
 	BulkMaxSendBatch           uint32
 	BulkMaxReceiveBatch        uint32
 	BulkCryptoQueuePeak        uint32
+	BulkLaneQueuePeak          uint32
+	BulkReceiveQueuePeak       uint32
 	BulkWriterQueuePeak        uint32
+	BulkDecryptBatches         uint64
+	BulkDecryptDatagrams       uint64
+	BulkProbeSelectedMbps      int
+	BulkProbeDurationMS        int64
+	BulkProbeTrains            uint32
+	BulkProbeSentDatagrams     uint64
+	BulkProbeReceivedDatagrams uint64
+	BulkProbeLossPPM           uint64
+	BulkProbePressure          bool
 }
 
 type externalPeerProgressSnapshot struct {
@@ -738,7 +760,18 @@ func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrac
 		BulkMaxSendBatch:           m.bulkMaxSendBatch,
 		BulkMaxReceiveBatch:        m.bulkMaxReceiveBatch,
 		BulkCryptoQueuePeak:        m.bulkCryptoQueuePeak,
+		BulkLaneQueuePeak:          m.bulkLaneQueuePeak,
+		BulkReceiveQueuePeak:       m.bulkReceiveQueuePeak,
 		BulkWriterQueuePeak:        m.bulkWriterQueuePeak,
+		BulkDecryptBatches:         m.bulkDecryptBatches,
+		BulkDecryptDatagrams:       m.bulkDecryptDatagrams,
+		BulkProbeSelectedMbps:      m.bulkProbeSelectedMbps,
+		BulkProbeDurationMS:        m.bulkProbeDurationMS,
+		BulkProbeTrains:            m.bulkProbeTrains,
+		BulkProbeSentDatagrams:     m.bulkProbeSentDatagrams,
+		BulkProbeReceivedDatagrams: m.bulkProbeReceivedDatagrams,
+		BulkProbeLossPPM:           m.bulkProbeLossPPM,
+		BulkProbePressure:          m.bulkProbePressure,
 		LocalENOBUFSRetries:        m.localENOBUFSRetries,
 		LocalENOBUFSWaitUS:         m.localENOBUFSWaitUS,
 		LocalENOBUFSMaxConsecutive: m.localENOBUFSMaxConsecutive,
@@ -836,7 +869,22 @@ func (m *externalTransferMetrics) setBulkBatchDiagnosticsLocked(diagnostics exte
 	m.bulkMaxSendBatch = max(m.bulkMaxSendBatch, diagnostics.BulkMaxSendBatch)
 	m.bulkMaxReceiveBatch = max(m.bulkMaxReceiveBatch, diagnostics.BulkMaxReceiveBatch)
 	m.bulkCryptoQueuePeak = max(m.bulkCryptoQueuePeak, diagnostics.BulkCryptoQueuePeak)
+	m.bulkLaneQueuePeak = max(m.bulkLaneQueuePeak, diagnostics.BulkLaneQueuePeak)
+	m.bulkReceiveQueuePeak = max(m.bulkReceiveQueuePeak, diagnostics.BulkReceiveQueuePeak)
 	m.bulkWriterQueuePeak = max(m.bulkWriterQueuePeak, diagnostics.BulkWriterQueuePeak)
+	m.bulkDecryptBatches = max(m.bulkDecryptBatches, diagnostics.BulkDecryptBatches)
+	m.bulkDecryptDatagrams = max(m.bulkDecryptDatagrams, diagnostics.BulkDecryptDatagrams)
+	if diagnostics.BulkProbeSelectedMbps > 0 {
+		m.bulkProbeSelectedMbps = diagnostics.BulkProbeSelectedMbps
+	}
+	if diagnostics.BulkProbeDurationMS > 0 {
+		m.bulkProbeDurationMS = diagnostics.BulkProbeDurationMS
+	}
+	m.bulkProbeTrains = max(m.bulkProbeTrains, diagnostics.BulkProbeTrains)
+	m.bulkProbeSentDatagrams = max(m.bulkProbeSentDatagrams, diagnostics.BulkProbeSentDatagrams)
+	m.bulkProbeReceivedDatagrams = max(m.bulkProbeReceivedDatagrams, diagnostics.BulkProbeReceivedDatagrams)
+	m.bulkProbeLossPPM = max(m.bulkProbeLossPPM, diagnostics.BulkProbeLossPPM)
+	m.bulkProbePressure = m.bulkProbePressure || diagnostics.BulkProbePressure
 }
 
 func (m *externalTransferMetrics) setDirectRateDiagnosticsLocked(diagnostics externalDirectTransferDiagnostics) {

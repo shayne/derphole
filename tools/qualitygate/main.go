@@ -179,7 +179,7 @@ func parseGolangCIJSON(report []byte) ([]hotspot, error) {
 	out := make([]hotspot, 0, len(parsed.Issues))
 	functions := map[string][]funcRange{}
 	for _, issue := range parsed.Issues {
-		file := issue.Pos.Filename
+		file := normalizeReportFilename(issue.Pos.Filename)
 		if file == "" {
 			file = "unknown"
 		}
@@ -205,6 +205,30 @@ func parseGolangCIJSON(report []byte) ([]hotspot, error) {
 	}
 	sortHotspots(out)
 	return out, nil
+}
+
+func normalizeReportFilename(path string) string {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if path == "." {
+		return ""
+	}
+	path = filepath.ToSlash(path)
+	if !filepath.IsAbs(filepath.FromSlash(path)) && !strings.HasPrefix(path, "../") {
+		return path
+	}
+
+	parts := strings.Split(path, "/")
+	for index, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			continue
+		}
+		candidate := strings.Join(parts[index:], "/")
+		info, err := os.Stat(filepath.FromSlash(candidate))
+		if err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return path
 }
 
 func issueFunction(text string) string {

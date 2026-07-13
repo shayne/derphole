@@ -92,6 +92,24 @@ func TestExternalV2BlockSourceAcceptSnapshotsHeaderFunc(t *testing.T) {
 	}
 }
 
+func TestExternalV2GroupedBulkRequiresBothPeerCapabilities(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		claim, accept bool
+		want          bool
+	}{
+		{name: "both", claim: true, accept: true, want: true},
+		{name: "old claimant", claim: false, accept: true},
+		{name: "old acceptor", claim: true, accept: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := externalV2GroupedBulk(tt.claim, tt.accept); got != tt.want {
+				t.Fatalf("externalV2GroupedBulk(%t, %t) = %t, want %t", tt.claim, tt.accept, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestExternalV2BlockReceiveWritesOutOfOrderChunksByOffset(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -364,6 +382,7 @@ func TestExternalV2ListenSendDirectTCPFileRoundTripSenderListens(t *testing.T) {
 }
 
 func testExternalV2ListenSendDirectTCPFileRoundTrip(t *testing.T, senderListens bool) {
+	disableExternalV2BulkPacketBatchCapability(t)
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
 
@@ -645,6 +664,69 @@ func TestExternalV2OfferReceiveRawDirectBulk(t *testing.T) {
 	}
 }
 
+func TestExternalV2ProbeFallbackCompletesThroughQUICBeforePayload(t *testing.T) {
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+	previousSelector := externalV2BulkPacketProbeSelector
+	externalV2BulkPacketProbeSelector = func(trains []externalV2BulkPacketProbeTrainResult) (externalV2BulkPacketProbeResult, error) {
+		return externalV2BulkPacketProbeResult{Trains: append([]externalV2BulkPacketProbeTrainResult(nil), trains...)}, errExternalV2BulkPacketProbeRejected
+	}
+	t.Cleanup(func() { externalV2BulkPacketProbeSelector = previousSelector })
+
+	previousInterfaceAddrs := publicInterfaceAddrs
+	publicInterfaceAddrs = func() ([]net.Addr, error) {
+		return []net.Addr{&net.IPNet{IP: net.IPv4(127, 0, 0, 1), Mask: net.CIDRMask(8, 32)}}, nil
+	}
+	t.Cleanup(func() { publicInterfaceAddrs = previousInterfaceAddrs })
+
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	header := []byte("probe-fallback")
+	payload := bytes.Repeat([]byte("quic-after-rejected-udp-probe"), 16<<10)
+	sink := newMemoryBlockSink(int64(len(payload)))
+	var offerStatus, receiveStatus syncBuffer
+	tokenSink := make(chan string, 1)
+	offerErr := make(chan error, 1)
+	go func() {
+		_, err := Offer(ctx, OfferConfig{
+			TokenSink: tokenSink, Emitter: telemetry.New(&offerStatus, telemetry.LevelVerbose), UsePublicDERP: true,
+			BlockSource: &BlockSource{Header: header, Payload: bytes.NewReader(payload), PayloadSize: int64(len(payload))},
+		})
+		offerErr <- err
+	}()
+
+	var raw string
+	select {
+	case raw = <-tokenSink:
+	case err := <-offerErr:
+		t.Fatalf("Offer() returned before token: %v", err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	receiveErr := Receive(ctx, ReceiveConfig{
+		Token: raw, Emitter: telemetry.New(&receiveStatus, telemetry.LevelVerbose), UsePublicDERP: true,
+		BlockReceiver: func(context.Context, BlockReceiveRequest) (BlockReceiveSink, error) { return sink, nil },
+	})
+	if receiveErr != nil {
+		t.Fatalf("Receive() error = %v offer=%q receive=%q", receiveErr, offerStatus.String(), receiveStatus.String())
+	}
+	if err := <-offerErr; err != nil {
+		t.Fatalf("Offer() error = %v offer=%q receive=%q", err, offerStatus.String(), receiveStatus.String())
+	}
+	if !bytes.Equal(sink.bytes(), payload) {
+		t.Fatal("QUIC fallback payload mismatch")
+	}
+	for role, status := range map[string]string{"offer": offerStatus.String(), "receive": receiveStatus.String()} {
+		if !strings.Contains(status, "v2-bulk-probe=fallback-before-payload") {
+			t.Fatalf("%s status missing pre-payload fallback marker: %q", role, status)
+		}
+	}
+}
+
 func TestExternalV2OfferReceiveDirectTCPFileRoundTripReceiverListens(t *testing.T) {
 	testExternalV2OfferReceiveDirectTCPFileRoundTrip(t, false)
 }
@@ -654,6 +736,7 @@ func TestExternalV2OfferReceiveDirectTCPFileRoundTripSenderListens(t *testing.T)
 }
 
 func testExternalV2OfferReceiveDirectTCPFileRoundTrip(t *testing.T, senderListens bool) {
+	disableExternalV2BulkPacketBatchCapability(t)
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
 
@@ -743,6 +826,13 @@ func testExternalV2OfferReceiveDirectTCPFileRoundTrip(t *testing.T, senderListen
 			t.Fatalf("%s status missing direct TCP markers: %q", role, status)
 		}
 	}
+}
+
+func disableExternalV2BulkPacketBatchCapability(t *testing.T) {
+	t.Helper()
+	previous := externalV2BulkPacketBatchCapability
+	externalV2BulkPacketBatchCapability = func() bool { return false }
+	t.Cleanup(func() { externalV2BulkPacketBatchCapability = previous })
 }
 
 func TestExternalV2OfferReceiveRelayBlockRoundTrip(t *testing.T) {

@@ -120,6 +120,17 @@ var header = [...]string{
 	"bulk_max_receive_batch",
 	"bulk_crypto_queue_peak",
 	"bulk_writer_queue_peak",
+	"bulk_lane_queue_peak",
+	"bulk_receive_queue_peak",
+	"bulk_decrypt_batches",
+	"bulk_decrypt_datagrams",
+	"bulk_probe_selected_mbps",
+	"bulk_probe_duration_ms",
+	"bulk_probe_trains",
+	"bulk_probe_sent_datagrams",
+	"bulk_probe_received_datagrams",
+	"bulk_probe_loss_ppm",
+	"bulk_probe_pressure",
 }
 
 var Header = append([]string(nil), header[:]...)
@@ -170,39 +181,50 @@ type Snapshot struct {
 	StripedReceivePendingBytes     int64
 	StripedReceivePendingBytesMax  int64
 
-	DirectPacketBytes       int64
-	DirectCommittedBytes    int64
-	DirectTransport         string
-	QUICHandshakeMS         int64
-	QUICFirstByteMS         int64
-	QUICStreamBytesSent     int64
-	QUICStreamBytesReceived int64
-	QUICStreamGoodputMbps   string
-	QUICSmoothedRTTMS       string
-	QUICLossEvents          int64
-	QUICCloseReason         string
-	MissingScanChecks       uint64
-	PendingMissing          uint32
-	PendingMissingPeak      uint32
-	RepairRequestedPackets  uint64
-	RepairRequestBatches    uint64
-	ReorderTrailPackets     uint32
-	ReceivePacketRatePPS    uint32
-	BulkBatchPresent        bool
-	BulkBatchBackend        string
-	BulkGSOAttempted        bool
-	BulkGSOActive           bool
-	BulkGSOSegments         uint64
-	BulkSendCalls           uint64
-	BulkSendDatagrams       uint64
-	BulkReceiveCalls        uint64
-	BulkReceiveDatagrams    uint64
-	BulkMaxSendBatch        uint32
-	BulkMaxReceiveBatch     uint32
-	BulkCryptoQueuePeak     uint32
-	BulkWriterQueuePeak     uint32
-	LastState               string
-	LastError               string
+	DirectPacketBytes          int64
+	DirectCommittedBytes       int64
+	DirectTransport            string
+	QUICHandshakeMS            int64
+	QUICFirstByteMS            int64
+	QUICStreamBytesSent        int64
+	QUICStreamBytesReceived    int64
+	QUICStreamGoodputMbps      string
+	QUICSmoothedRTTMS          string
+	QUICLossEvents             int64
+	QUICCloseReason            string
+	MissingScanChecks          uint64
+	PendingMissing             uint32
+	PendingMissingPeak         uint32
+	RepairRequestedPackets     uint64
+	RepairRequestBatches       uint64
+	ReorderTrailPackets        uint32
+	ReceivePacketRatePPS       uint32
+	BulkBatchPresent           bool
+	BulkBatchBackend           string
+	BulkGSOAttempted           bool
+	BulkGSOActive              bool
+	BulkGSOSegments            uint64
+	BulkSendCalls              uint64
+	BulkSendDatagrams          uint64
+	BulkReceiveCalls           uint64
+	BulkReceiveDatagrams       uint64
+	BulkMaxSendBatch           uint32
+	BulkMaxReceiveBatch        uint32
+	BulkCryptoQueuePeak        uint32
+	BulkWriterQueuePeak        uint32
+	BulkLaneQueuePeak          uint32
+	BulkReceiveQueuePeak       uint32
+	BulkDecryptBatches         uint64
+	BulkDecryptDatagrams       uint64
+	BulkProbeSelectedMbps      int
+	BulkProbeDurationMS        int64
+	BulkProbeTrains            uint32
+	BulkProbeSentDatagrams     uint64
+	BulkProbeReceivedDatagrams uint64
+	BulkProbeLossPPM           uint64
+	BulkProbePressure          bool
+	LastState                  string
+	LastError                  string
 }
 
 type Recorder struct {
@@ -489,7 +511,7 @@ func (r *Recorder) row(snap Snapshot, deltaBytes int64, deltaMS int64, localSent
 
 func bulkBatchTraceColumns(snap Snapshot) []string {
 	if !snap.BulkBatchPresent {
-		return make([]string, 12)
+		return make([]string, 23)
 	}
 	return []string{
 		snap.BulkBatchBackend,
@@ -504,6 +526,17 @@ func bulkBatchTraceColumns(snap Snapshot) []string {
 		strconv.FormatUint(uint64(snap.BulkMaxReceiveBatch), 10),
 		strconv.FormatUint(uint64(snap.BulkCryptoQueuePeak), 10),
 		strconv.FormatUint(uint64(snap.BulkWriterQueuePeak), 10),
+		strconv.FormatUint(uint64(snap.BulkLaneQueuePeak), 10),
+		strconv.FormatUint(uint64(snap.BulkReceiveQueuePeak), 10),
+		strconv.FormatUint(snap.BulkDecryptBatches, 10),
+		strconv.FormatUint(snap.BulkDecryptDatagrams, 10),
+		strconv.Itoa(snap.BulkProbeSelectedMbps),
+		strconv.FormatInt(snap.BulkProbeDurationMS, 10),
+		strconv.FormatUint(uint64(snap.BulkProbeTrains), 10),
+		strconv.FormatUint(snap.BulkProbeSentDatagrams, 10),
+		strconv.FormatUint(snap.BulkProbeReceivedDatagrams, 10),
+		strconv.FormatUint(snap.BulkProbeLossPPM, 10),
+		strconv.FormatBool(snap.BulkProbePressure),
 	}
 }
 

@@ -42,6 +42,11 @@ if [[ -n "${direct_tcp_port}" ]]; then
     exit 2
   fi
 fi
+test_cpu_profile="${DERPHOLE_TEST_CPU_PROFILE:-}"
+if [[ "${test_cpu_profile}" == *$'\n'* || "${test_cpu_profile}" == *$'\r'* ]]; then
+  echo "DERPHOLE_TEST_CPU_PROFILE must be one path" >&2
+  exit 2
+fi
 transfer_mode="unknown"
 
 local_override="${DERPHOLE_BENCH_LOCAL_BIN:-}"
@@ -123,6 +128,8 @@ receiver_resource_stats_available="false"
 receiver_resource_exit_code=""
 send_pid=""
 listener_pid=""
+local_tool_pids_baseline=""
+remote_tool_pids_baseline=""
 remote_env=()
 parallel_args=()
 parallel_args_remote=""
@@ -155,6 +162,9 @@ if [[ "${bulk_batched_io}" == "1" ]]; then
 fi
 if [[ "${force_bulk_packets}" == "1" ]]; then
   remote_env+=(DERPHOLE_TEST_FORCE_BULK_PACKET_TRANSFER=1)
+fi
+if [[ -n "${test_cpu_profile}" ]]; then
+  remote_env+=(DERPHOLE_TEST_CPU_PROFILE="${test_cpu_profile}")
 fi
 remote() {
   ssh "${remote_target}" "${remote_env[@]}" 'bash -se' <<<"$1"
@@ -403,9 +413,45 @@ require_resource_stats() {
   esac
 }
 
+list_local_tool_pids() {
+  pgrep -x "${tool}" | sort -n | paste -sd, - || true
+}
+
+list_remote_tool_pids() {
+  remote "pgrep -x '${tool}' | sort -n | paste -sd, - || true"
+}
+
+exclude_tool_pid_baseline() {
+  local current="$1"
+  local baseline="$2"
+  local pid
+  local new_pids=()
+
+  while IFS= read -r pid; do
+    [[ -n "${pid}" ]] || continue
+    if [[ ",${baseline}," != *",${pid},"* ]]; then
+      new_pids+=("${pid}")
+    fi
+  done < <(tr ',' '\n' <<<"${current}")
+  (IFS=,; echo "${new_pids[*]-}")
+}
+
+new_local_tool_pids() {
+  exclude_tool_pid_baseline "$(list_local_tool_pids)" "${local_tool_pids_baseline}"
+}
+
+new_remote_tool_pids() {
+  exclude_tool_pid_baseline "$(list_remote_tool_pids)" "${remote_tool_pids_baseline}"
+}
+
+snapshot_tool_processes() {
+  local_tool_pids_baseline="$(list_local_tool_pids)"
+  remote_tool_pids_baseline="$(list_remote_tool_pids)"
+}
+
 count_local_udp_sockets() {
   local pids
-  pids="$(pgrep -x "${tool}" | paste -sd, - || true)"
+  pids="$(new_local_tool_pids)"
   if [[ -z "${pids}" ]]; then
     echo 0
     return 0
@@ -413,16 +459,27 @@ count_local_udp_sockets() {
   lsof -nP -a -p "${pids}" -iUDP 2>/dev/null | awk 'NR > 1 { count++ } END { print count + 0 }' || true
 }
 
+count_pid_list() {
+  local pids="$1"
+  if [[ -z "${pids}" ]]; then
+    echo 0
+    return 0
+  fi
+  awk -F, '{ print NF }' <<<"${pids}"
+}
+
 count_local_tool_processes() {
-  pgrep -x "${tool}" | awk '{ count++ } END { print count + 0 }' || true
+  count_pid_list "$(new_local_tool_pids)"
 }
 
 count_remote_udp_sockets() {
-  remote "pids=\$(pgrep -x '${tool}' | paste -sd, - || true); if [[ -z \"\${pids}\" ]]; then echo 0; else lsof -nP -a -p \"\${pids}\" -iUDP 2>/dev/null | awk 'NR > 1 { count++ } END { print count + 0 }' || true; fi"
+  local pids
+  pids="$(new_remote_tool_pids)"
+  remote "pids='${pids}'; if [[ -z \"\${pids}\" ]]; then echo 0; else lsof -nP -a -p \"\${pids}\" -iUDP 2>/dev/null | awk 'NR > 1 { count++ } END { print count + 0 }' || true; fi"
 }
 
 count_remote_tool_processes() {
-  remote "pgrep -x '${tool}' | awk '{ count++ } END { print count + 0 }' || true"
+  count_pid_list "$(new_remote_tool_pids)"
 }
 
 path_trace() {
@@ -892,6 +949,8 @@ handle_exit() {
 }
 
 trap 'handle_exit "$?"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 build_and_install_remote_binary() {
   if [[ -z "${local_override}" ]]; then
@@ -1178,6 +1237,7 @@ finalize_run() {
   cat "${receiver_trace_csv}"
 }
 
+snapshot_tool_processes
 build_and_install_remote_binary
 validate_caller_owned_payloads
 

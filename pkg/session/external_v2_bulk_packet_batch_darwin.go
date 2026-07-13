@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -19,8 +20,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-//lint:ignore SA1019 x/sys has no recvmsg_x wrapper; Darwin batching requires this stable XNU syscall.
-const externalV2BulkPacketDarwinRecvmsgX = unix.SYS_RECVMSG_X //nolint:staticcheck // See the lint:ignore rationale above.
+const (
+	//lint:ignore SA1019 x/sys has no recvmsg_x wrapper; Darwin batching requires this stable XNU syscall.
+	externalV2BulkPacketDarwinRecvmsgX = unix.SYS_RECVMSG_X //nolint:staticcheck // See the lint:ignore rationale above.
+	//lint:ignore SA1019 x/sys has no sendmsg_x wrapper; Darwin batching requires this stable XNU syscall.
+	externalV2BulkPacketDarwinSendmsgX = unix.SYS_SENDMSG_X //nolint:staticcheck // See the lint:ignore rationale above.
+
+	externalV2BulkPacketDarwinReceiveCoalesceDelay = time.Millisecond
+)
 
 type externalV2BulkPacketDarwinMsgHdr struct {
 	Name       *byte
@@ -33,12 +40,25 @@ type externalV2BulkPacketDarwinMsgHdr struct {
 	DataLen    uint64
 }
 
+type externalV2BulkPacketDarwinSockaddr struct {
+	storage unix.RawSockaddrInet6
+}
+
 type externalV2BulkPacketDarwinBatchConn struct {
 	conn    net.PacketConn
 	raw     syscall.RawConn
 	stats   *externalV2BulkPacketAtomicBatchStats
-	headers [externalV2BulkPacketMaxBatch]externalV2BulkPacketDarwinMsgHdr
-	iovs    [externalV2BulkPacketMaxBatch]unix.Iovec
+	writeMu sync.Mutex
+
+	connectAttempted     bool
+	connectEnabled       bool
+	connected            bool
+	connectedAddr        string
+	receiveCoalescing    bool
+	receiveCoalesceDelay time.Duration
+	headers              [externalV2BulkPacketMaxBatch]externalV2BulkPacketDarwinMsgHdr
+	iovs                 [externalV2BulkPacketMaxBatch]unix.Iovec
+	addrs                [externalV2BulkPacketMaxBatch]externalV2BulkPacketDarwinSockaddr
 }
 
 func newExternalV2BulkPacketBatchConn(conn net.PacketConn) externalV2BulkPacketBatchConn {
@@ -53,6 +73,62 @@ func newExternalV2BulkPacketBatchConn(conn net.PacketConn) externalV2BulkPacketB
 }
 
 func (c *externalV2BulkPacketDarwinBatchConn) WriteBatch(ctx context.Context, messages []externalV2BulkPacketBatchMessage) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if len(messages) == 0 {
+		return 0, nil
+	}
+	if c.raw == nil {
+		return c.writePortable(ctx, messages)
+	}
+	if len(messages) > externalV2BulkPacketMaxBatch {
+		messages = messages[:externalV2BulkPacketMaxBatch]
+	}
+	return c.writeSendmsgX(ctx, messages)
+}
+
+func (c *externalV2BulkPacketDarwinBatchConn) enableFixedPeerConnect() {
+	c.connectEnabled = true
+}
+
+func (c *externalV2BulkPacketDarwinBatchConn) enableReceiveCoalescing() {
+	if c.raw == nil {
+		return
+	}
+	c.receiveCoalescing = true
+	c.receiveCoalesceDelay = externalV2BulkPacketDarwinReceiveCoalesceDelay
+}
+
+func (c *externalV2BulkPacketDarwinBatchConn) writeSendmsgX(ctx context.Context, messages []externalV2BulkPacketBatchMessage) (int, error) {
+	prepared, err := c.prepareSendmsgX(messages)
+	if err != nil {
+		return 0, err
+	}
+	if !prepared {
+		return c.writePortable(ctx, messages)
+	}
+	if err := externalV2BulkPacketArmWriteDeadline(ctx, c.conn); err != nil {
+		return 0, err
+	}
+	written, err := c.sendmsgX(messages)
+	if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EOPNOTSUPP) {
+		return c.writePortable(ctx, messages)
+	}
+	if written > 0 {
+		c.stats.setBackend("darwin-sendmsg-x")
+		c.stats.observeSend(written)
+		for index := 0; index < written; index++ {
+			messages[index].N = len(messages[index].Buffers[0])
+		}
+	}
+	return written, err
+}
+
+func (c *externalV2BulkPacketDarwinBatchConn) writePortable(ctx context.Context, messages []externalV2BulkPacketBatchMessage) (int, error) {
 	written := 0
 	for index := range messages {
 		if err := ctx.Err(); err != nil {
@@ -62,7 +138,7 @@ func (c *externalV2BulkPacketDarwinBatchConn) WriteBatch(ctx context.Context, me
 		if err != nil {
 			return written, err
 		}
-		if err := c.conn.SetWriteDeadline(externalV2BulkPacketBatchDeadline(ctx, time.Now())); err != nil {
+		if err := externalV2BulkPacketArmWriteDeadline(ctx, c.conn); err != nil {
 			return written, err
 		}
 		n, err := c.conn.WriteTo(payload, messages[index].Addr)
@@ -77,6 +153,178 @@ func (c *externalV2BulkPacketDarwinBatchConn) WriteBatch(ctx context.Context, me
 		}
 		messages[index].N = n
 		written++
+	}
+	return written, nil
+}
+
+func (c *externalV2BulkPacketDarwinBatchConn) prepareSendmsgX(messages []externalV2BulkPacketBatchMessage) (bool, error) {
+	connected := c.connectFixedPeer(messages)
+	for index := range messages {
+		if len(messages[index].Buffers) != 1 || len(messages[index].Buffers[0]) == 0 || len(messages[index].OOB) != 0 {
+			return false, nil
+		}
+		var name *byte
+		var nameLen uint32
+		if !connected {
+			var supported bool
+			var err error
+			name, nameLen, supported, err = c.addrs[index].set(messages[index].Addr)
+			if err != nil {
+				return false, err
+			}
+			if !supported {
+				return false, nil
+			}
+		}
+		buffer := messages[index].Buffers[0]
+		c.iovs[index] = unix.Iovec{Base: &buffer[0], Len: uint64(len(buffer))}
+		c.headers[index] = externalV2BulkPacketDarwinMsgHdr{
+			Name:    name,
+			NameLen: nameLen,
+			Iov:     &c.iovs[index],
+			IovLen:  1,
+		}
+	}
+	return true, nil
+}
+
+func (c *externalV2BulkPacketDarwinBatchConn) connectFixedPeer(messages []externalV2BulkPacketBatchMessage) bool {
+	if !c.connectEnabled || c.raw == nil || len(messages) == 0 || messages[0].Addr == nil {
+		return false
+	}
+	peer := messages[0].Addr.String()
+	for index := 1; index < len(messages); index++ {
+		if messages[index].Addr == nil || messages[index].Addr.String() != peer {
+			return false
+		}
+	}
+	if c.connected {
+		return c.connectedAddr == peer
+	}
+	if c.connectAttempted {
+		return false
+	}
+	c.connectAttempted = true
+	sockaddr, ok := externalV2BulkPacketDarwinConnectSockaddr(messages[0].Addr)
+	if !ok {
+		return false
+	}
+	var connectErr error
+	if err := c.raw.Control(func(fd uintptr) {
+		connectErr = unix.Connect(int(fd), sockaddr)
+	}); err != nil {
+		return false
+	}
+	if connectErr != nil && !errors.Is(connectErr, unix.EISCONN) {
+		return false
+	}
+	c.connected = true
+	c.connectedAddr = peer
+	return true
+}
+
+func externalV2BulkPacketDarwinConnectSockaddr(addr net.Addr) (unix.Sockaddr, bool) {
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok || udpAddr == nil || udpAddr.Port < 0 || udpAddr.Port > 1<<16-1 {
+		return nil, false
+	}
+	if ip4 := udpAddr.IP.To4(); ip4 != nil {
+		sockaddr := &unix.SockaddrInet4{Port: udpAddr.Port}
+		copy(sockaddr.Addr[:], ip4)
+		return sockaddr, true
+	}
+	ip6 := udpAddr.IP.To16()
+	if ip6 == nil {
+		return nil, false
+	}
+	sockaddr := &unix.SockaddrInet6{Port: udpAddr.Port}
+	copy(sockaddr.Addr[:], ip6)
+	if udpAddr.Zone != "" {
+		iface, err := net.InterfaceByName(udpAddr.Zone)
+		if err != nil {
+			return nil, false
+		}
+		sockaddr.ZoneId = uint32(iface.Index)
+	}
+	return sockaddr, true
+}
+
+func (a *externalV2BulkPacketDarwinSockaddr) set(addr net.Addr) (*byte, uint32, bool, error) {
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok || udpAddr == nil {
+		return nil, 0, false, nil
+	}
+	if udpAddr.Port < 0 || udpAddr.Port > 1<<16-1 {
+		return nil, 0, false, unix.EINVAL
+	}
+	if ip4 := udpAddr.IP.To4(); ip4 != nil {
+		raw := (*unix.RawSockaddrInet4)(unsafe.Pointer(&a.storage))
+		*raw = unix.RawSockaddrInet4{Len: unix.SizeofSockaddrInet4, Family: unix.AF_INET}
+		externalV2BulkPacketDarwinSetPort(&raw.Port, udpAddr.Port)
+		copy(raw.Addr[:], ip4)
+		return (*byte)(unsafe.Pointer(raw)), uint32(raw.Len), true, nil
+	}
+	ip6 := udpAddr.IP.To16()
+	if ip6 == nil {
+		return nil, 0, false, unix.EINVAL
+	}
+	raw := &a.storage
+	*raw = unix.RawSockaddrInet6{Len: unix.SizeofSockaddrInet6, Family: unix.AF_INET6}
+	externalV2BulkPacketDarwinSetPort(&raw.Port, udpAddr.Port)
+	copy(raw.Addr[:], ip6)
+	if udpAddr.Zone != "" {
+		iface, err := net.InterfaceByName(udpAddr.Zone)
+		if err != nil {
+			return nil, 0, false, err
+		}
+		raw.Scope_id = uint32(iface.Index)
+	}
+	return (*byte)(unsafe.Pointer(raw)), uint32(raw.Len), true, nil
+}
+
+func externalV2BulkPacketDarwinSetPort(port *uint16, value int) {
+	bytes := (*[2]byte)(unsafe.Pointer(port))
+	bytes[0] = byte(value >> 8)
+	bytes[1] = byte(value)
+}
+
+func (c *externalV2BulkPacketDarwinBatchConn) sendmsgX(messages []externalV2BulkPacketBatchMessage) (int, error) {
+	written := 0
+	var syscallErr error
+	err := c.raw.Write(func(fd uintptr) bool {
+		for {
+			count, _, errno := unix.Syscall6(
+				externalV2BulkPacketDarwinSendmsgX,
+				fd,
+				uintptr(unsafe.Pointer(&c.headers[0])),
+				uintptr(len(messages)),
+				uintptr(unix.MSG_DONTWAIT),
+				0,
+				0,
+			)
+			switch errno {
+			case 0:
+				written = int(count)
+				return true
+			case unix.EINTR:
+				continue
+			case unix.EAGAIN:
+				return false
+			default:
+				syscallErr = errno
+				return true
+			}
+		}
+	})
+	runtime.KeepAlive(messages)
+	runtime.KeepAlive(c.headers)
+	runtime.KeepAlive(c.iovs)
+	runtime.KeepAlive(c.addrs)
+	if err != nil {
+		return 0, err
+	}
+	if syscallErr != nil {
+		return 0, syscallErr
 	}
 	return written, nil
 }
@@ -107,9 +355,7 @@ func (c *externalV2BulkPacketDarwinBatchConn) readRecvmsgXLoop(ctx context.Conte
 		}
 		count, err := c.recvmsgX(messages)
 		if err == nil {
-			c.stats.setBackend("darwin-recvmsg-x")
-			c.stats.observeReceive(count)
-			return count, nil
+			return c.observeRecvmsgX(count), nil
 		}
 		if ctx.Err() != nil {
 			return 0, ctx.Err()
@@ -120,6 +366,12 @@ func (c *externalV2BulkPacketDarwinBatchConn) readRecvmsgXLoop(ctx context.Conte
 		}
 		return 0, err
 	}
+}
+
+func (c *externalV2BulkPacketDarwinBatchConn) observeRecvmsgX(count int) int {
+	c.stats.setBackend("darwin-recvmsg-x")
+	c.stats.observeReceive(count)
+	return count
 }
 
 func (c *externalV2BulkPacketDarwinBatchConn) prepareRecvmsgX(messages []externalV2BulkPacketBatchMessage) error {
@@ -140,39 +392,48 @@ func (c *externalV2BulkPacketDarwinBatchConn) prepareRecvmsgX(messages []externa
 func (c *externalV2BulkPacketDarwinBatchConn) recvmsgX(messages []externalV2BulkPacketBatchMessage) (int, error) {
 	count := 0
 	var syscallErr error
+	delayed := false
 	err := c.raw.Read(func(fd uintptr) bool {
-		for {
-			received, _, errno := unix.Syscall6(
-				externalV2BulkPacketDarwinRecvmsgX,
-				fd,
-				uintptr(unsafe.Pointer(&c.headers[0])),
-				uintptr(len(messages)),
-				uintptr(unix.MSG_DONTWAIT),
-				0,
-				0,
-			)
-			switch errno {
-			case 0:
-				count = int(received)
-				return true
-			case unix.EINTR:
-				continue
-			case unix.EAGAIN:
-				return false
-			default:
-				syscallErr = errno
-				return true
-			}
+		if c.receiveCoalescing && !delayed {
+			// Darwin wakes the socket at the first datagram even when recvmsg_x can
+			// drain a full vector. Give the kernel one bounded scheduling interval
+			// to fill that vector; this is enabled only for bulk file receivers.
+			delayed = true
+			time.Sleep(c.receiveCoalesceDelay)
 		}
+		count, syscallErr = c.recvmsgXFD(fd, messages)
+		return !errors.Is(syscallErr, unix.EAGAIN)
 	})
+	return c.finishRecvmsgX(messages, count, errors.Join(err, syscallErr))
+}
+
+func (c *externalV2BulkPacketDarwinBatchConn) recvmsgXFD(fd uintptr, messages []externalV2BulkPacketBatchMessage) (int, error) {
+	for {
+		received, _, errno := unix.Syscall6(
+			externalV2BulkPacketDarwinRecvmsgX,
+			fd,
+			uintptr(unsafe.Pointer(&c.headers[0])),
+			uintptr(len(messages)),
+			uintptr(unix.MSG_DONTWAIT),
+			0,
+			0,
+		)
+		if errno == unix.EINTR {
+			continue
+		}
+		if errno != 0 {
+			return 0, errno
+		}
+		return int(received), nil
+	}
+}
+
+func (c *externalV2BulkPacketDarwinBatchConn) finishRecvmsgX(messages []externalV2BulkPacketBatchMessage, count int, err error) (int, error) {
 	runtime.KeepAlive(messages)
 	runtime.KeepAlive(c.headers)
 	runtime.KeepAlive(c.iovs)
 	if err != nil {
 		return 0, err
-	}
-	if syscallErr != nil {
-		return 0, syscallErr
 	}
 	for index := 0; index < count; index++ {
 		messages[index].N = int(c.headers[index].DataLen)
@@ -188,17 +449,23 @@ func (c *externalV2BulkPacketDarwinBatchConn) readPortable(ctx context.Context, 
 	if len(buffer) != 1 || len(buffer[0]) == 0 {
 		return 0, errors.New("portable bulk packet receive requires one non-empty buffer")
 	}
-	if err := c.conn.SetReadDeadline(externalV2BulkPacketBatchDeadline(ctx, time.Now())); err != nil {
-		return 0, err
+	for {
+		if err := c.conn.SetReadDeadline(externalV2BulkPacketBatchDeadline(ctx, time.Now())); err != nil {
+			return 0, err
+		}
+		n, addr, err := c.conn.ReadFrom(buffer[0])
+		if err != nil {
+			retry, readErr := externalV2BulkPacketRetryReadError(ctx, err)
+			if retry {
+				continue
+			}
+			return 0, readErr
+		}
+		messages[0].N = n
+		messages[0].Addr = addr
+		c.stats.observeReceive(1)
+		return 1, nil
 	}
-	n, addr, err := c.conn.ReadFrom(buffer[0])
-	if err != nil {
-		return 0, err
-	}
-	messages[0].N = n
-	messages[0].Addr = addr
-	c.stats.observeReceive(1)
-	return 1, nil
 }
 
 func (c *externalV2BulkPacketDarwinBatchConn) Stats() externalV2BulkPacketBatchStats {

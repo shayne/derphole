@@ -252,6 +252,10 @@ GOOS=linux GOARCH=amd64 go build -o dist/derpssh-linux-amd64 ./cmd/derpssh
 description = "Run the encrypted file transport feasibility gate"
 run = "bash ./scripts/encrypted-transport-feasibility.sh"
 
+[tasks."udp:file-acceptance"]
+description = "Run the strict 2 Gbps public-UDP file acceptance gate"
+run = "bash ./scripts/udp-file-acceptance.sh"
+
 [tasks."release:build-vendor"]
 run = "bash ./tools/packaging/build-vendor.sh"
 

@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !linux && !darwin
+//go:build !darwin
 
 package session
 
@@ -19,7 +19,7 @@ type externalV2BulkPacketPortableBatchConn struct {
 	stats *externalV2BulkPacketAtomicBatchStats
 }
 
-func newExternalV2BulkPacketBatchConn(conn net.PacketConn) externalV2BulkPacketBatchConn {
+func newExternalV2BulkPacketPortableBatchConn(conn net.PacketConn) externalV2BulkPacketBatchConn {
 	return &externalV2BulkPacketPortableBatchConn{
 		conn:  conn,
 		stats: newExternalV2BulkPacketAtomicBatchStats("portable-single"),
@@ -95,19 +95,8 @@ func (c *externalV2BulkPacketPortableBatchConn) readOne(ctx context.Context, buf
 	if err == nil {
 		return n, addr, false, nil
 	}
-	retry, err := externalV2BulkPacketPortableReadError(ctx, err)
+	retry, err := externalV2BulkPacketRetryReadError(ctx, err)
 	return 0, nil, retry, err
-}
-
-func externalV2BulkPacketPortableReadError(ctx context.Context, err error) (bool, error) {
-	networkError, ok := err.(net.Error)
-	if !ok || !networkError.Timeout() {
-		return false, err
-	}
-	if ctx.Err() != nil {
-		return false, ctx.Err()
-	}
-	return true, nil
 }
 
 func externalV2BulkPacketCommitPortableRead(message *externalV2BulkPacketBatchMessage, n int, addr net.Addr) {
@@ -126,5 +115,5 @@ func (c *externalV2BulkPacketPortableBatchConn) armReadDeadline(ctx context.Cont
 }
 
 func (c *externalV2BulkPacketPortableBatchConn) armWriteDeadline(ctx context.Context) error {
-	return c.conn.SetWriteDeadline(externalV2BulkPacketBatchDeadline(ctx, time.Now()))
+	return externalV2BulkPacketArmWriteDeadline(ctx, c.conn)
 }

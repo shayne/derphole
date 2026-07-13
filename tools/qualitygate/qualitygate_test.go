@@ -77,6 +77,11 @@ func Call() {
       "Text": "SA1019: deprecated. ",
       "Pos": {"Filename": "pkg/session/client.go", "Line": 4},
       "SourceLines": ["\tdefer resp.Body.Close()"]
+    },
+    {
+      "FromLinter": "cyclop",
+      "Text": "calculated cyclomatic complexity for function Call is 12, max is 10",
+      "Pos": {"Filename": "../workspaces/stale/pkg/session/client.go", "Line": 3}
     }
   ]
 }`
@@ -88,6 +93,7 @@ func Call() {
 
 	want := []hotspot{
 		{Key: "cyclop|cmd/derphole/root.go|main", Detail: "cmd/derphole/root.go main (cyclop)"},
+		{Key: "cyclop|pkg/session/client.go|Call", Detail: "pkg/session/client.go Call (cyclop)"},
 		{Key: "errcheck|pkg/session/client.go|Call|source:defer resp.Body.Close()|Error return value of `resp.Body.Close` is not checked", Detail: "pkg/session/client.go:4 Error return value of `resp.Body.Close` is not checked (errcheck)"},
 		{Key: "gocognit|pkg/derphole/transfer.go|HandleTransfer", Detail: "pkg/derphole/transfer.go HandleTransfer (gocognit)"},
 		{Key: "staticcheck|pkg/session/client.go|Call|source:defer resp.Body.Close()|SA1019: deprecated.", Detail: "pkg/session/client.go:4 SA1019: deprecated. (staticcheck)"},

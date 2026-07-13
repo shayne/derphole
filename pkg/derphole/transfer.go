@@ -389,14 +389,15 @@ func newSessionBlockReceiver(cfg ReceiveConfig, token func() string, handled fun
 		if header.Size == 0 {
 			progress.Finish()
 		}
+		sink, err := newReceiveBlockFileSink(f, header.Size, progress)
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
 		if handled != nil {
 			handled()
 		}
-		return &receiveBlockFileSink{
-			file:     f,
-			progress: progress,
-			size:     header.Size,
-		}, nil
+		return sink, nil
 	}
 }
 
@@ -996,6 +997,64 @@ type receiveBlockFileSink struct {
 	progress *ProgressReporter
 	size     int64
 	current  atomic.Int64
+	direct   []byte
+	prepared int64
+	whole    bool
+	window   *receiveBlockFileWindow
+}
+
+const (
+	receiveBlockFilePrepareAhead     = int64(96 << 20)
+	receiveBlockFilePrepareInitial   = int64(96 << 20)
+	receiveBlockFilePrepareThreshold = int64(48 << 20)
+	receiveBlockFileReleaseBehind    = int64(64 << 20)
+	receiveBlockFileReleaseStep      = int64(16 << 20)
+	receiveBlockFilePrepareWholeMax  = int64(96 << 20)
+	receiveBlockFilePageSize         = int64(4096)
+)
+
+func newReceiveBlockFileSink(file *os.File, size int64, progress *ProgressReporter) (*receiveBlockFileSink, error) {
+	if file == nil {
+		return nil, errors.New("file sink is not open")
+	}
+	if size < 0 {
+		return nil, fmt.Errorf("negative file sink size %d", size)
+	}
+	if err := file.Truncate(size); err != nil {
+		return nil, err
+	}
+	if _, err := allocateReceiveBlockFile(file, size); err != nil {
+		return nil, err
+	}
+	direct, _ := mapReceiveBlockFile(file, size)
+	sink := &receiveBlockFileSink{
+		file:     file,
+		progress: progress,
+		size:     size,
+		direct:   direct,
+	}
+	if len(direct) > 0 {
+		initial := min(size, receiveBlockFilePrepareInitial)
+		if size <= receiveBlockFilePrepareWholeMax {
+			initial = size
+			sink.whole = true
+		}
+		if err := prepareReceiveBlockFile(direct, 0, initial); err != nil {
+			_ = unmapReceiveBlockFile(direct)
+			sink.direct = nil
+		} else {
+			sink.prepared = initial
+			if !sink.whole {
+				sink.window = newReceiveBlockFileWindow(
+					size,
+					initial,
+					func(start, end int64) error { return prepareReceiveBlockFileWindow(direct, start, end) },
+					func(start, end int64) error { return releaseReceiveBlockFile(direct, start, end) },
+				)
+			}
+		}
+	}
+	return sink, nil
 }
 
 func (s *receiveBlockFileSink) WriteAt(p []byte, off int64) (int, error) {
@@ -1004,10 +1063,7 @@ func (s *receiveBlockFileSink) WriteAt(p []byte, off int64) (int, error) {
 	}
 	n, err := s.file.WriteAt(p, off)
 	if n > 0 {
-		s.progress.Add(n)
-		if s.current.Add(int64(n)) >= s.size {
-			s.progress.Finish()
-		}
+		err = errors.Join(err, s.commit(n, off+int64(n)))
 	}
 	if err != nil {
 		return n, err
@@ -1018,6 +1074,44 @@ func (s *receiveBlockFileSink) WriteAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
+func (*receiveBlockFileSink) ConcurrentWriteAtSafe() bool { return true }
+
+func (s *receiveBlockFileSink) DirectWriteBuffer() []byte { return s.direct }
+
+func (s *receiveBlockFileSink) CommitDirectWrite(n int, highestEnd int64) error {
+	return s.commit(n, highestEnd)
+}
+
+func (s *receiveBlockFileSink) commit(n int, highestEnd int64) error {
+	if n <= 0 {
+		return nil
+	}
+	s.progress.Add(n)
+	if s.current.Add(int64(n)) >= s.size {
+		s.progress.Finish()
+	}
+	return s.advanceDirectWindow(highestEnd)
+}
+
+func (s *receiveBlockFileSink) advanceDirectWindow(highestEnd int64) error {
+	if len(s.direct) == 0 || highestEnd <= 0 || s.whole {
+		return nil
+	}
+	if err := s.window.err(); err != nil {
+		return err
+	}
+	s.window.request(highestEnd)
+	return s.window.err()
+}
+
+func receiveBlockFileAlignUp(value int64) int64 {
+	return (value + receiveBlockFilePageSize - 1) &^ (receiveBlockFilePageSize - 1)
+}
+
+func receiveBlockFileAlignDownTo(value, alignment int64) int64 {
+	return value &^ (alignment - 1)
+}
+
 func (s *receiveBlockFileSink) Close() error {
 	if s.file == nil {
 		return nil
@@ -1025,9 +1119,13 @@ func (s *receiveBlockFileSink) Close() error {
 	if s.current.Load() < s.size {
 		s.progress.Abort()
 	}
+	windowErr := s.window.close()
+	s.window = nil
+	unmapErr := unmapReceiveBlockFile(s.direct)
+	s.direct = nil
 	err := s.file.Close()
 	s.file = nil
-	return err
+	return errors.Join(windowErr, unmapErr, err)
 }
 
 func newNativeWebFileSink(outputPath string, stderr, progressOut io.Writer, progress func(current, total int64)) *nativeWebFileSink {

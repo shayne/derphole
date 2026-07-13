@@ -47,6 +47,36 @@ func TestRunPrintsSuccess(t *testing.T) {
 	}
 }
 
+func TestRunEnforcesUDPOnlyPayload(t *testing.T) {
+	path := writeTrace(t, transfertrace.HeaderLine+"\n"+
+		traceCSVRow(t, map[string]string{
+			"timestamp_unix_ms": "1000",
+			"role":              "receive",
+			"phase":             "complete",
+			"relay_bytes":       "1",
+			"app_bytes":         "4096",
+			"delta_app_bytes":   "4096",
+			"direct_transport":  "tcp",
+		}))
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"-role", "receive",
+		"-expected-bytes", "4096",
+		"-require-direct-transport", "udp",
+		"-forbid-relay-payload",
+		path,
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run() exit = %d, want 1", code)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if got := stderr.String(); !strings.Contains(got, "relay payload bytes") && !strings.Contains(got, "direct transport") {
+		t.Fatalf("stderr = %q, want UDP-only rejection", got)
+	}
+}
+
 func TestRunPrintsDiagnosticSummary(t *testing.T) {
 	path := writeTrace(t, transfertrace.HeaderLine+"\n"+
 		traceCSVRow(t, map[string]string{

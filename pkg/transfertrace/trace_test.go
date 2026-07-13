@@ -127,21 +127,32 @@ func TestRecorderWritesBulkBatchDiagnosticsIncludingHealthyZeroes(t *testing.T) 
 		t.Fatal(err)
 	}
 	recorder.Observe(Snapshot{
-		At:                   time.Unix(261, 0),
-		Phase:                PhaseDirectExecute,
-		BulkBatchPresent:     true,
-		BulkBatchBackend:     "linux-sendmmsg",
-		BulkGSOAttempted:     true,
-		BulkGSOActive:        false,
-		BulkGSOSegments:      0,
-		BulkSendCalls:        10,
-		BulkSendDatagrams:    640,
-		BulkReceiveCalls:     0,
-		BulkReceiveDatagrams: 0,
-		BulkMaxSendBatch:     64,
-		BulkMaxReceiveBatch:  0,
-		BulkCryptoQueuePeak:  4,
-		BulkWriterQueuePeak:  0,
+		At:                         time.Unix(261, 0),
+		Phase:                      PhaseDirectExecute,
+		BulkBatchPresent:           true,
+		BulkBatchBackend:           "linux-sendmmsg",
+		BulkGSOAttempted:           true,
+		BulkGSOActive:              false,
+		BulkGSOSegments:            0,
+		BulkSendCalls:              10,
+		BulkSendDatagrams:          640,
+		BulkReceiveCalls:           0,
+		BulkReceiveDatagrams:       0,
+		BulkMaxSendBatch:           64,
+		BulkMaxReceiveBatch:        0,
+		BulkCryptoQueuePeak:        4,
+		BulkWriterQueuePeak:        0,
+		BulkLaneQueuePeak:          2,
+		BulkReceiveQueuePeak:       3,
+		BulkDecryptBatches:         100,
+		BulkDecryptDatagrams:       6400,
+		BulkProbeSelectedMbps:      2160,
+		BulkProbeDurationMS:        250,
+		BulkProbeTrains:            5,
+		BulkProbeSentDatagrams:     30000,
+		BulkProbeReceivedDatagrams: 29800,
+		BulkProbeLossPPM:           6666,
+		BulkProbePressure:          false,
 	})
 	if err := recorder.Close(); err != nil {
 		t.Fatal(err)
@@ -160,6 +171,17 @@ func TestRecorderWritesBulkBatchDiagnosticsIncludingHealthyZeroes(t *testing.T) 
 		"bulk_max_receive_batch",
 		"bulk_crypto_queue_peak",
 		"bulk_writer_queue_peak",
+		"bulk_lane_queue_peak",
+		"bulk_receive_queue_peak",
+		"bulk_decrypt_batches",
+		"bulk_decrypt_datagrams",
+		"bulk_probe_selected_mbps",
+		"bulk_probe_duration_ms",
+		"bulk_probe_trains",
+		"bulk_probe_sent_datagrams",
+		"bulk_probe_received_datagrams",
+		"bulk_probe_loss_ppm",
+		"bulk_probe_pressure",
 	})
 	row := records[1]
 	assertColumn(t, row, indexes, "bulk_batch_backend", "linux-sendmmsg")
@@ -170,6 +192,17 @@ func TestRecorderWritesBulkBatchDiagnosticsIncludingHealthyZeroes(t *testing.T) 
 	assertColumn(t, row, indexes, "bulk_receive_calls", "0")
 	assertColumn(t, row, indexes, "bulk_max_receive_batch", "0")
 	assertColumn(t, row, indexes, "bulk_writer_queue_peak", "0")
+	assertColumn(t, row, indexes, "bulk_lane_queue_peak", "2")
+	assertColumn(t, row, indexes, "bulk_receive_queue_peak", "3")
+	assertColumn(t, row, indexes, "bulk_decrypt_batches", "100")
+	assertColumn(t, row, indexes, "bulk_decrypt_datagrams", "6400")
+	assertColumn(t, row, indexes, "bulk_probe_selected_mbps", "2160")
+	assertColumn(t, row, indexes, "bulk_probe_duration_ms", "250")
+	assertColumn(t, row, indexes, "bulk_probe_trains", "5")
+	assertColumn(t, row, indexes, "bulk_probe_sent_datagrams", "30000")
+	assertColumn(t, row, indexes, "bulk_probe_received_datagrams", "29800")
+	assertColumn(t, row, indexes, "bulk_probe_loss_ppm", "6666")
+	assertColumn(t, row, indexes, "bulk_probe_pressure", "false")
 }
 
 func TestRecorderLeavesBulkBatchDiagnosticsEmptyWhenAbsent(t *testing.T) {
@@ -183,7 +216,7 @@ func TestRecorderLeavesBulkBatchDiagnosticsEmptyWhenAbsent(t *testing.T) {
 		t.Fatal(err)
 	}
 	records, indexes := readTraceCSV(t, out.String())
-	for _, column := range []string{"bulk_batch_backend", "bulk_gso_attempted", "bulk_send_calls", "bulk_writer_queue_peak"} {
+	for _, column := range []string{"bulk_batch_backend", "bulk_gso_attempted", "bulk_send_calls", "bulk_writer_queue_peak", "bulk_lane_queue_peak", "bulk_decrypt_datagrams", "bulk_probe_selected_mbps", "bulk_probe_pressure"} {
 		assertColumn(t, records[1], indexes, column, "")
 	}
 }

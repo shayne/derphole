@@ -5,6 +5,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"os"
 )
@@ -14,5 +15,15 @@ func main() {
 }
 
 func runMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	return run(args, stdin, stdout, stderr)
+	stopProfile, err := startDerpholeTestCPUProfile(os.Getenv(derpholeTestCPUProfileEnv))
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "derphole: start test CPU profile: %v\n", err)
+		return 1
+	}
+	code := run(args, stdin, stdout, stderr)
+	if err := stopProfile(); err != nil {
+		_, _ = fmt.Fprintf(stderr, "derphole: close test CPU profile: %v\n", err)
+		return 1
+	}
+	return code
 }

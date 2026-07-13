@@ -215,9 +215,46 @@ func TestExternalV2BlockTransferPolicyUsesFileReceiverInBothTopologies(t *testin
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := externalV2AcceptedBlockTransferPolicy(tt.claim, true, tt.acceptCandidates)
+			got := externalV2AcceptedBlockTransferPolicy(tt.claim, true, true, tt.acceptCandidates)
 			if got.Receiver != tt.wantReceiver || got.Mode != tt.wantMode {
 				t.Fatalf("policy = %#v, want receiver=%q mode=%q", got, tt.wantReceiver, tt.wantMode)
+			}
+		})
+	}
+}
+
+func TestExternalV2BatchNativePeersPreferBulkForLargeFiles(t *testing.T) {
+	claim := externalV2Claim{
+		BlockCapable:            true,
+		BlockPacketCapable:      true,
+		BlockPacketBatchCapable: true,
+		BlockPacketGroupCapable: true,
+		BlockSize:               3 << 30,
+	}
+	for port := 10000; port < 10008; port++ {
+		claim.Candidates = append(claim.Candidates, fmt.Sprintf("203.0.113.10:%d", port))
+	}
+
+	policy := externalV2AcceptedBlockTransferPolicy(claim, true, true, nil)
+	if policy.Mode != externalV2TransferModeBulkPackets || !policy.BatchNative {
+		t.Fatalf("policy = %#v, want batch-native bulk", policy)
+	}
+}
+
+func TestExternalV2BatchNativeSelectionRequiresBothPeers(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		claim, accept bool
+		want          string
+	}{
+		{name: "both", claim: true, accept: true, want: externalV2TransferModeBulkPackets},
+		{name: "old claimant", claim: false, accept: true, want: externalV2TransferModeBlocks},
+		{name: "old acceptor", claim: true, accept: false, want: externalV2TransferModeBlocks},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := externalV2SelectOptimizedFileTransferMode(externalV2TransferModeBlocks, 3<<30, tt.claim, tt.accept)
+			if got != tt.want {
+				t.Fatalf("mode = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -234,7 +271,7 @@ func TestExternalV2BlockTransferPolicyCanForceBulkPacketsForBenchmarking(t *test
 		claim.Candidates = append(claim.Candidates, fmt.Sprintf("203.0.113.10:%d", port))
 	}
 
-	got := externalV2AcceptedBlockTransferPolicy(claim, true, nil)
+	got := externalV2AcceptedBlockTransferPolicy(claim, true, true, nil)
 	if got.Mode != externalV2TransferModeBulkPackets {
 		t.Fatalf("policy mode = %q, want %q", got.Mode, externalV2TransferModeBulkPackets)
 	}
@@ -243,7 +280,7 @@ func TestExternalV2BlockTransferPolicyCanForceBulkPacketsForBenchmarking(t *test
 	}
 
 	claim.Candidates = append(claim.Candidates, "not-an-addr-port")
-	got = externalV2AcceptedBlockTransferPolicy(claim, true, nil)
+	got = externalV2AcceptedBlockTransferPolicy(claim, true, true, nil)
 	if got.Mode != externalV2TransferModeBlocks {
 		t.Fatalf("policy mode with invalid candidate = %q, want %q", got.Mode, externalV2TransferModeBlocks)
 	}

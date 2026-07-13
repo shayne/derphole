@@ -6,6 +6,8 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -89,6 +91,23 @@ func TestRunMainRoutesVersion(t *testing.T) {
 	}
 	if got := stderr.String(); got != "" {
 		t.Fatalf("stderr = %q, want empty", got)
+	}
+}
+
+func TestRunMainWritesTestCPUProfile(t *testing.T) {
+	profilePath := filepath.Join(t.TempDir(), "derphole.pprof")
+	t.Setenv(derpholeTestCPUProfileEnv, profilePath)
+	var stdout, stderr bytes.Buffer
+	code := runMain([]string{"version"}, strings.NewReader("ignored"), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("runMain() = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	info, err := os.Stat(profilePath)
+	if err != nil {
+		t.Fatalf("Stat(%q) error = %v", profilePath, err)
+	}
+	if info.Size() == 0 {
+		t.Fatalf("profile %q is empty", profilePath)
 	}
 }
 

@@ -550,6 +550,45 @@ func TestCheckReportsQUICDiagnosticsSummary(t *testing.T) {
 	}
 }
 
+func TestCheckRequiresUDPDirectTransport(t *testing.T) {
+	csvText := HeaderLine + "\n" + testTraceRow(testTraceRowConfig{
+		timestampMS:     1000,
+		role:            RoleSend,
+		phase:           PhaseComplete,
+		appBytes:        1024,
+		deltaAppBytes:   1024,
+		directValidated: true,
+		directTransport: "tcp",
+	})
+	_, err := Check(strings.NewReader(csvText), Options{
+		Role: RoleSend, ExpectedBytes: 1024, ExpectedBytesSet: true,
+		RequireDirectTransport: "udp",
+	})
+	if err == nil || !strings.Contains(err.Error(), `direct transport = "tcp", want "udp"`) {
+		t.Fatalf("Check() error = %v, want UDP transport mismatch", err)
+	}
+}
+
+func TestCheckForbidsRelayPayload(t *testing.T) {
+	csvText := HeaderLine + "\n" + testTraceRow(testTraceRowConfig{
+		timestampMS:     1000,
+		role:            RoleReceive,
+		phase:           PhaseComplete,
+		relayBytes:      1,
+		appBytes:        1024,
+		deltaAppBytes:   1024,
+		directValidated: true,
+		directTransport: "udp",
+	})
+	_, err := Check(strings.NewReader(csvText), Options{
+		Role: RoleReceive, ExpectedBytes: 1024, ExpectedBytesSet: true,
+		RequireDirectTransport: "udp", ForbidRelayPayload: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "relay payload bytes = 1, want 0") {
+		t.Fatalf("Check() error = %v, want relay payload rejection", err)
+	}
+}
+
 func TestCheckReportsRepairEfficiencyDiagnostics(t *testing.T) {
 	csvText := "timestamp_unix_ms,role,phase,app_bytes,last_error,missing_scan_checks,pending_missing,pending_missing_peak,repair_requested_packets,repair_request_batches,reorder_trail_packets,receive_packet_rate_pps\n" +
 		"1000,receive,direct_execute,1024,,790545,1234,1234,4567,32,22000,88000\n" +

@@ -2,6 +2,26 @@
 
 Use this runbook when comparing `derphole` throughput, relay-to-direct promotion latency, or baseline host-to-host performance. The goal is repeatable measurements without leaking UDP sockets, orphaning processes, or exhausting ephemeral ports on either host.
 
+## Public UDP file acceptance gate
+
+Use the UDP file gate for the final Mac-to-exact-two-vCPU-Hetzner acceptance test. It builds both peers from the current revision, verifies the uploaded Linux binary, creates and stages one ordinary 3 GiB random file, and runs three normal `send FILE` / `receive TOKEN` transfers in each direction. A 20-second, eight-flow iperf3 control must show at least 2.05 Gbps in the same direction before each transfer.
+
+The TCP port is used only by iperf3 as the independent WAN-capacity control. Forward it through the router to the Mac. The Mac runs the iperf3 server for both directions; the Hetzner client uses reverse mode for the Mac-to-Hetzner control. Hetzner does not need an inbound TCP port. Derphole still uses its normal UDP hole-punched file path. The gate gives the benchmark driver a clean environment, enables only the public-path Tailscale-candidate guard, and rejects TCP, TLS, relay payload, or any transfer mode other than `bulk-packets-v1`.
+
+```bash
+HETZNER_PUBLIC_IPV4="$(ssh -o BatchMode=yes root@hetz 'curl -4fsS https://api.ipify.org')"
+MAC_PUBLIC_IPV4="$(curl -4fsS https://api.ipify.org)"
+DERPHOLE_UDP_ACCEPT_REMOTE=root@hetz \
+DERPHOLE_UDP_ACCEPT_REMOTE_PUBLIC_ADDR="${HETZNER_PUBLIC_IPV4}" \
+DERPHOLE_UDP_ACCEPT_LOCAL_PUBLIC_ADDR="${MAC_PUBLIC_IPV4}" \
+DERPHOLE_UDP_ACCEPT_TCP_PORT=8123 \
+mise run udp:file-acceptance
+```
+
+Every accepted run must exceed 2.0 Gbps receiver-anchored verified-file goodput. Each direction must have a coefficient of variation at or below 0.10. The gate also requires exact size and SHA-256, zero relay payload, UDP transport accounting for the file, no one-second payload flatline, repair below 2 percent, incremental missing-scan work below 2.0 checks per packet, no OOM increment, exactly two remote CPUs, and remote-role CPU below 8.0 seconds per GiB.
+
+Artifacts remain under `.tmp/udp-file-2gbps/<UTC timestamp>-<PID>/`. `results.csv` contains the six normalized samples and batch/probe/queue/resource evidence. `decision.json` is written atomically and contains the final rates, population standard deviations, coefficients of variation, and failure reasons. Cleanup targets only recorded PIDs and the unique remote directory created by that invocation.
+
 ## Encrypted transport feasibility gate
 
 Use the feasibility gate only for the Mac-to-exact-two-vCPU-Hetzner comparison. It builds both endpoints from the same revision, creates one ordinary 3 GiB random file, stages identical bytes on both hosts, and interleaves three file transfers in each direction for the batched bulk UDP and eight-lane TLS 1.3 candidates. Every transfer is paired with a same-direction 20-second, eight-flow iperf3 control.
@@ -113,13 +133,13 @@ The controller samples every 500 ms. An accepted primary sample contains at leas
 
 The pending-pressure count clears after a counter reset, after an accepted sample without usable peer progress, after an accepted peer-ready sample with repair below 2 percent or delivery at least 90 percent of the target, and after a decrease. An `insufficient-wire-sample` observation neither advances nor clears the count; its primary traffic continues accumulating toward the next accepted sample.
 
-A decrease loads a four-window cooldown. Repair of at least 2 percent with healthy delivery always holds as `repair-hold`, consuming one cooldown window when one remains. With repair below 2 percent, an active cooldown holds as `backoff-cooldown` and consumes one window. A pending pressure sample does not consume cooldown, and a second consecutive pressure sample may decrease the target again before cooldown expires. Once cooldown is clear, clean delivery below 2 percent repair increases the target by 64 Mbps up to the ceiling; low-repair delivery below 90 percent holds as `receiver-limited`.
+A decrease loads a four-window cooldown. Repair of at least 2 percent with healthy delivery always holds as `repair-hold`, consuming one cooldown window when one remains. With repair below 2 percent, an active cooldown holds as `backoff-cooldown` and consumes one window. A pending pressure sample does not consume cooldown, and a second consecutive pressure sample may decrease the target again before cooldown expires. Once cooldown is clear, clean delivery below 2 percent repair increases the target by 64 Mbps up to the ceiling. Low-repair delivery below 90 percent first holds as `receiver-limited-pending`, then decreases as `receiver-limited` after a second confirmed sample. A stale peer-progress interval does not erase that pending evidence.
 
 The controller also uses the exact guard reasons `initial-target`, `counter-reset`, `insufficient-wire-sample`, `awaiting-peer-progress`, `ceiling`, and `minimum`. Repair percentage is repair IPv4-wire bytes divided by primary plus repair IPv4-wire bytes for the accepted sample.
 
 Use the cumulative `retransmits`, `repair_requests`, and `repair_bytes` counters with the target and reason. Do not infer a decision from the final trace row alone; controller state must be present in non-terminal rows.
 
-Verbose `v2-raw-direct-socket-buffer` lines report the 8 MiB request and, for each opened lane, the raw receive and write values returned by `getsockopt(SO_RCVBUF)` and `getsockopt(SO_SNDBUF)`. The line also reports whether either set operation or the inspection failed. Linux may report a doubled kernel accounting value; preserve the returned number when comparing hosts.
+Verbose `v2-raw-direct-socket-buffer` lines report the 2 MiB per-lane request and, for each opened lane, the raw receive and write values returned by `getsockopt(SO_RCVBUF)` and `getsockopt(SO_SNDBUF)`. The line also reports whether either set operation or the inspection failed. Linux may report a doubled kernel accounting value; preserve the returned number when comparing hosts.
 
 ### Bulk repair efficiency
 

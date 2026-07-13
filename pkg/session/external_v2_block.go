@@ -32,6 +32,9 @@ const (
 	externalV2TestForceBulkPacketEnv   = "DERPHOLE_TEST_FORCE_BULK_PACKET_TRANSFER"
 )
 
+var externalV2BulkPacketBatchCapability = func() bool { return true }
+var externalV2BulkPacketGroupCapability = func() bool { return true }
+
 type externalV2BlockChunk struct {
 	offset int64
 	data   []byte
@@ -74,6 +77,9 @@ func externalV2BlockSourceClaim(src *BlockSource, claim *externalV2Claim) {
 	claim.BlockSize = src.PayloadSize
 	claim.BlockChunkSize = externalV2BlockChunkSize(src.ChunkSize)
 	claim.BlockPacketCapable = true
+	batchCapable := externalV2BulkPacketBatchCapability()
+	claim.BlockPacketBatchCapable = batchCapable
+	claim.BlockPacketGroupCapable = batchCapable && externalV2BulkPacketGroupCapability()
 }
 
 func externalV2BlockSourceAccept(src *BlockSource, accept *externalV2Accept) {
@@ -84,6 +90,9 @@ func externalV2BlockSourceAccept(src *BlockSource, accept *externalV2Accept) {
 	accept.BlockHeader = externalV2BlockSourceHeader(src)
 	accept.BlockSize = src.PayloadSize
 	accept.BlockChunkSize = externalV2BlockChunkSize(src.ChunkSize)
+	batchCapable := externalV2BulkPacketBatchCapability()
+	accept.BlockPacketBatchCapable = batchCapable
+	accept.BlockPacketGroupCapable = batchCapable && externalV2BulkPacketGroupCapability()
 }
 
 func externalV2AcceptsBlockTransfer(accept externalV2Accept) bool {
@@ -96,6 +105,29 @@ func externalV2SelectFileTransferMode(policy string, size int64, claimCapable, a
 	}
 	if externalV2DirectTCPAdvertisementUsable(claimAd) || externalV2DirectTCPAdvertisementUsable(acceptAd) {
 		return externalV2TransferModeDirectTCP
+	}
+	return policy
+}
+
+func externalV2BatchNativeBulk(claimCapable, acceptCapable bool) bool {
+	return claimCapable && acceptCapable
+}
+
+func externalV2GroupedBulk(claimCapable, acceptCapable bool) bool {
+	return claimCapable && acceptCapable
+}
+
+func emitExternalV2BulkPacketRecordMode(emitter *telemetry.Emitter, grouped bool) {
+	mode := "packets-v1"
+	if grouped {
+		mode = "grouped-v1 aead:aes-128-gcm"
+	}
+	emitExternalV2Debug(emitter, "v2-bulk-records="+mode)
+}
+
+func externalV2SelectOptimizedFileTransferMode(policy string, size int64, claimBatch, acceptBatch bool) string {
+	if policy == externalV2TransferModeBlocks && size >= externalV2DirectTCPMinFileSize && externalV2BatchNativeBulk(claimBatch, acceptBatch) {
+		return externalV2TransferModeBulkPackets
 	}
 	return policy
 }
@@ -120,9 +152,10 @@ type externalV2BlockTransferPolicy struct {
 	IgnoredTailscaleCandidates int
 	InvalidCandidates          int
 	ForcedBulkPackets          bool
+	BatchNative                bool
 }
 
-func externalV2AcceptedBlockTransferPolicy(claim externalV2Claim, blockTransfer bool, acceptCandidates []string) externalV2BlockTransferPolicy {
+func externalV2AcceptedBlockTransferPolicy(claim externalV2Claim, blockTransfer bool, acceptBatchCapable bool, acceptCandidates []string) externalV2BlockTransferPolicy {
 	policy := externalV2BlockTransferPolicy{Mode: externalV2TransferModeBlocks, Receiver: "unknown"}
 	if !blockTransfer {
 		policy.Mode = ""
@@ -144,7 +177,8 @@ func externalV2AcceptedBlockTransferPolicy(claim externalV2Claim, blockTransfer 
 	policy.ReceiverCandidates = len(receiverCandidates)
 	policy.PolicyCandidates, policy.IgnoredTailscaleCandidates, policy.InvalidCandidates = externalV2BlockTransferCandidateCounts(receiverCandidates)
 	policy.ForcedBulkPackets = os.Getenv(externalV2TestForceBulkPacketEnv) == "1"
-	if claim.BlockPacketCapable && policy.InvalidCandidates == 0 && (policy.ForcedBulkPackets || policy.PolicyCandidates <= externalV2BulkPacketCandidateLimit) {
+	policy.BatchNative = externalV2BatchNativeBulk(claim.BlockPacketBatchCapable, acceptBatchCapable)
+	if claim.BlockPacketCapable && (policy.BatchNative || policy.InvalidCandidates == 0 && (policy.ForcedBulkPackets || policy.PolicyCandidates <= externalV2BulkPacketCandidateLimit)) {
 		policy.Mode = externalV2TransferModeBulkPackets
 	}
 	return policy
@@ -170,7 +204,7 @@ func externalV2BlockTransferCandidateCounts(candidates []string) (policyCandidat
 
 func emitExternalV2BlockTransferPolicy(emitter *telemetry.Emitter, policy externalV2BlockTransferPolicy) {
 	emitExternalV2Debug(emitter, fmt.Sprintf(
-		"v2-block-policy=mode:%s receiver:%s candidates:%d policy_candidates:%d tailscale_ignored:%d invalid:%d forced_bulk:%t",
+		"v2-block-policy=mode:%s receiver:%s candidates:%d policy_candidates:%d tailscale_ignored:%d invalid:%d forced_bulk:%t batch_native:%t",
 		policy.Mode,
 		policy.Receiver,
 		policy.ReceiverCandidates,
@@ -178,6 +212,7 @@ func emitExternalV2BlockTransferPolicy(emitter *telemetry.Emitter, policy extern
 		policy.IgnoredTailscaleCandidates,
 		policy.InvalidCandidates,
 		policy.ForcedBulkPackets,
+		policy.BatchNative,
 	))
 }
 
@@ -248,11 +283,9 @@ func (rt *externalV2ListenRuntime) receiveQUICBlock(ctx context.Context, accepte
 	defer rawPath.Close()
 	if rawPath.raw {
 		tr.ActivateRawDirect()
-		if externalV2UsesBulkPacketTransfer(transferMode) {
-			emitExternalV2Debug(rt.cfg.Emitter, "v2-block-transfer=bulk-packets")
-			abortErrCh, stopAbortWatch := rt.watchAbort(ctx, accepted.peerDERP, cancelStream)
-			defer stopAbortWatch()
-			return rt.receiveBulkPacketBlock(streamCtx, ctx, accepted, rawPath, sink, blockCfg, progressSender, metrics, pathEmitter, tr.manager, abortErrCh)
+		handled, err := rt.tryReceiveBulkPacketBlock(streamCtx, ctx, cancelStream, accepted, transferMode, tr, rawPath, sink, blockCfg, progressSender, metrics, pathEmitter)
+		if handled {
+			return err
 		}
 		server = dataplane.NewQUICServerOnPacketConns(rawPath.conns, rt.session.quicIdentity, accepted.claim.QUICPublic)
 		server.SetManagerConnectionCount(managerConnections)
@@ -294,12 +327,58 @@ func (rt *externalV2ListenRuntime) receiveQUICBlock(ctx context.Context, accepte
 	return nil
 }
 
-func (rt *externalV2ListenRuntime) receiveBulkPacketBlock(streamCtx context.Context, completeCtx context.Context, accepted externalV2AcceptedClaim, path externalV2DirectPacketPath, sink *countingBlockReceiveSink, blockCfg externalV2BlockReceiveConfig, progressSender *externalV2PeerProgressSender, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter, manager *transport.Manager, abortErrCh <-chan error) error {
+func (rt *externalV2ListenRuntime) tryReceiveBulkPacketBlock(
+	streamCtx context.Context,
+	completeCtx context.Context,
+	cancelStream context.CancelFunc,
+	accepted externalV2AcceptedClaim,
+	transferMode string,
+	tr externalV2ListenTransport,
+	rawPath externalV2DirectPacketPath,
+	sink *countingBlockReceiveSink,
+	blockCfg externalV2BlockReceiveConfig,
+	progressSender *externalV2PeerProgressSender,
+	metrics *externalTransferMetrics,
+	pathEmitter *transportPathEmitter,
+) (bool, error) {
+	if !externalV2UsesBulkPacketTransfer(transferMode) {
+		return false, nil
+	}
+	emitExternalV2Debug(rt.cfg.Emitter, "v2-block-transfer=bulk-packets")
+	batchNative := accepted.claim.BlockPacketBatchCapable && externalV2BulkPacketBatchCapability()
+	grouped := batchNative && externalV2GroupedBulk(accepted.claim.BlockPacketGroupCapable, externalV2BulkPacketGroupCapability())
+	emitExternalV2BulkPacketRecordMode(rt.cfg.Emitter, grouped)
+	abortErrCh, stopAbortWatch := rt.watchAbort(completeCtx, accepted.peerDERP, cancelStream)
+	err := rt.receiveBulkPacketBlock(
+		streamCtx,
+		completeCtx,
+		accepted,
+		rawPath,
+		batchNative,
+		grouped,
+		sink,
+		blockCfg,
+		progressSender,
+		metrics,
+		pathEmitter,
+		tr.manager,
+		abortErrCh,
+	)
+	stopAbortWatch()
+	if !errors.Is(err, errExternalV2BulkPacketProbeRejected) {
+		return true, err
+	}
+	emitExternalV2Debug(rt.cfg.Emitter, "v2-bulk-probe=fallback-before-payload")
+	return false, nil
+}
+
+func (rt *externalV2ListenRuntime) receiveBulkPacketBlock(streamCtx context.Context, completeCtx context.Context, accepted externalV2AcceptedClaim, path externalV2DirectPacketPath, batchNative, grouped bool, sink *countingBlockReceiveSink, blockCfg externalV2BlockReceiveConfig, progressSender *externalV2PeerProgressSender, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter, manager *transport.Manager, abortErrCh <-chan error) error {
 	auth, err := externalV2BulkPacketAuthForToken(rt.session.token, accepted.peerDERP, rt.session.derp.PublicKey())
 	if err != nil {
 		return err
 	}
-	bytesReceived, stats, err := receiveExternalV2BulkBlockPackets(streamCtx, sink, blockCfg, externalV2BulkPacketPathFromRaw(path), auth, metrics)
+	auth = auth.withGrouped(grouped)
+	bytesReceived, stats, err := receiveExternalV2BulkBlockPacketsWithProbe(streamCtx, sink, blockCfg, externalV2BulkPacketPathFromRaw(path), auth, metrics, batchNative)
 	metrics.SetDirectStats(stats)
 	if err != nil {
 		return externalV2PreferPeerAbort(completeCtx, abortErrCh, err)
@@ -312,17 +391,45 @@ func (rt *externalV2ListenRuntime) receiveBulkPacketBlock(streamCtx context.Cont
 	return nil
 }
 
-func (rt *externalV2OfferReceiveRuntime) receiveQUICBlock(ctx context.Context, tr externalV2ListenTransport, policy ParallelPolicy, managerConnections int, rawDirectBudget time.Duration, transferMode string, sink *countingBlockReceiveSink, blockCfg externalV2BlockReceiveConfig, progressSender *externalV2PeerProgressSender, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter) error {
-	if externalV2UsesBulkPacketTransfer(transferMode) {
-		if ok, err := rt.receiveBulkPacketBlock(ctx, tr, policy, rawDirectBudget, sink, blockCfg, progressSender, metrics, pathEmitter); ok || err != nil {
-			return err
-		}
-	}
-	endpoint, streams, rawPath, err := rt.acceptReceiveStreams(tr, externalV2StreamCount(policy), managerConnections, rawDirectBudget)
+func (rt *externalV2OfferReceiveRuntime) receiveQUICBlock(ctx context.Context, tr externalV2ListenTransport, policy ParallelPolicy, managerConnections int, rawDirectBudget time.Duration, transferMode string, batchNative, grouped bool, sink *countingBlockReceiveSink, blockCfg externalV2BlockReceiveConfig, progressSender *externalV2PeerProgressSender, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter) error {
+	streamCount := externalV2StreamCount(policy)
+	rawPath, err := negotiateExternalV2DirectPacketPath(tr.ctx, rt.derp, rt.listenerDERP, tr.manager, rt.dm, rt.auth, rt.cfg.Emitter, streamCount, 0, rawDirectBudget, tr.relayOnly)
 	if err != nil {
 		return err
 	}
 	defer rawPath.Close()
+	var endpoint externalV2QUICEndpoint
+	var streams []io.ReadCloser
+	if rawPath.raw {
+		tr.ActivateRawDirect()
+		if externalV2UsesBulkPacketTransfer(transferMode) {
+			emitExternalV2Debug(rt.cfg.Emitter, "v2-block-transfer=bulk-packets")
+			grouped = grouped && batchNative
+			emitExternalV2BulkPacketRecordMode(rt.cfg.Emitter, grouped)
+			err := rt.receiveBulkPacketBlock(ctx, rawPath, batchNative, grouped, sink, blockCfg, progressSender, metrics, pathEmitter, tr.manager)
+			if !errors.Is(err, errExternalV2BulkPacketProbeRejected) {
+				return err
+			}
+			emitExternalV2Debug(rt.cfg.Emitter, "v2-bulk-probe=fallback-before-payload")
+		}
+		server := dataplane.NewQUICServerOnPacketConns(rawPath.conns, rt.identity, rt.tok.QUICPublic)
+		server.SetManagerConnectionCount(managerConnections)
+		endpoint = server
+		openCtx, cancelOpen := context.WithTimeout(ctx, externalV2StreamOpenWait)
+		streams, err = server.AcceptStreamsWithReady(openCtx, streamCount, nil)
+		cancelOpen()
+		if err != nil {
+			return externalV2StreamOpenFailure(err)
+		}
+	} else {
+		client := dataplane.NewQUICClient(tr.manager, rt.identity, rt.tok.QUICPublic)
+		client.SetManagerConnectionCount(managerConnections)
+		endpoint = client
+		streams, err = client.AcceptStreams(ctx, streamCount)
+		if err != nil {
+			return err
+		}
+	}
 	bytesReceived, err := receiveExternalV2BlockStreams(ctx, sink, blockCfg, streams, metrics)
 	if err != nil {
 		return rt.receiveStreamError(endpoint, err)
@@ -335,33 +442,23 @@ func (rt *externalV2OfferReceiveRuntime) receiveQUICBlock(ctx context.Context, t
 	return nil
 }
 
-func (rt *externalV2OfferReceiveRuntime) receiveBulkPacketBlock(ctx context.Context, tr externalV2ListenTransport, policy ParallelPolicy, rawDirectBudget time.Duration, sink *countingBlockReceiveSink, blockCfg externalV2BlockReceiveConfig, progressSender *externalV2PeerProgressSender, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter) (bool, error) {
-	streamCount := externalV2StreamCount(policy)
-	rawPath, err := negotiateExternalV2DirectPacketPath(tr.ctx, rt.derp, rt.listenerDERP, tr.manager, rt.dm, rt.auth, rt.cfg.Emitter, streamCount, 0, rawDirectBudget, tr.relayOnly)
-	if err != nil {
-		return true, err
-	}
-	defer rawPath.Close()
-	if !rawPath.raw {
-		return false, nil
-	}
-	tr.ActivateRawDirect()
-	emitExternalV2Debug(rt.cfg.Emitter, "v2-block-transfer=bulk-packets")
+func (rt *externalV2OfferReceiveRuntime) receiveBulkPacketBlock(ctx context.Context, rawPath externalV2DirectPacketPath, batchNative, grouped bool, sink *countingBlockReceiveSink, blockCfg externalV2BlockReceiveConfig, progressSender *externalV2PeerProgressSender, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter, manager *transport.Manager) error {
 	auth, err := externalV2BulkPacketAuthForToken(rt.tok, rt.listenerDERP, rt.derp.PublicKey())
 	if err != nil {
-		return true, err
+		return err
 	}
-	bytesReceived, stats, err := receiveExternalV2BulkBlockPackets(ctx, sink, blockCfg, externalV2BulkPacketPathFromRaw(rawPath), auth, metrics)
+	auth = auth.withGrouped(grouped)
+	bytesReceived, stats, err := receiveExternalV2BulkBlockPacketsWithProbe(ctx, sink, blockCfg, externalV2BulkPacketPathFromRaw(rawPath), auth, metrics, batchNative)
 	metrics.SetDirectStats(stats)
 	if err != nil {
-		return true, err
+		return err
 	}
 	if err := rt.sendComplete(ctx, bytesReceived, progressSender); err != nil {
-		return true, err
+		return err
 	}
 	metrics.Complete(time.Now())
-	pathEmitter.Complete(tr.manager)
-	return true, nil
+	pathEmitter.Complete(manager)
+	return nil
 }
 
 func writeExternalV2BlockFrame(w io.Writer, offset int64, data []byte) error {
@@ -751,6 +848,35 @@ func (s *countingBlockReceiveSink) WriteAt(p []byte, off int64) (int, error) {
 		s.firstByteUnixNano.CompareAndSwap(0, time.Now().UnixNano())
 	}
 	return n, err
+}
+
+func (s *countingBlockReceiveSink) ConcurrentWriteAtSafe() bool {
+	concurrent, ok := s.sink.(ConcurrentBlockReceiveSink)
+	return ok && concurrent.ConcurrentWriteAtSafe()
+}
+
+func (s *countingBlockReceiveSink) DirectWriteBuffer() []byte {
+	direct, ok := s.sink.(DirectBlockReceiveSink)
+	if !ok {
+		return nil
+	}
+	return direct.DirectWriteBuffer()
+}
+
+func (s *countingBlockReceiveSink) CommitDirectWrite(n int, highestEnd int64) error {
+	if n <= 0 {
+		return nil
+	}
+	direct, ok := s.sink.(DirectBlockReceiveSink)
+	if !ok {
+		return errors.New("block sink does not support direct write commits")
+	}
+	if err := direct.CommitDirectWrite(n, highestEnd); err != nil {
+		return err
+	}
+	s.payloadBytes.Add(int64(n))
+	s.firstByteUnixNano.CompareAndSwap(0, time.Now().UnixNano())
+	return nil
 }
 
 func (s *countingBlockReceiveSink) Close() error {

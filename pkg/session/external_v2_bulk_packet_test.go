@@ -405,13 +405,13 @@ func TestExternalV2BulkPacketTopLevelClearsReadAndWriteDeadlines(t *testing.T) {
 
 	resultCh := make(chan error, 1)
 	go func() {
-		_, err := sendExternalV2BulkBlockPackets(ctx, &BlockSource{
+		_, err := sendExternalV2BulkBlockPacketsWithProbe(ctx, &BlockSource{
 			Payload:     bytes.NewReader(payload),
 			PayloadSize: int64(len(payload)),
 		}, externalV2BulkPacketPath{
 			Conns: []net.PacketConn{conn},
 			Addrs: externalV2BulkPacketTestAddrs(receivers),
-		}, auth, nil)
+		}, auth, nil, false)
 		resultCh <- err
 	}()
 
@@ -461,7 +461,9 @@ func TestExternalV2BulkPacketControlReaderReusesDeadlineAcrossSuccessfulReads(t 
 		make(chan []uint32, 1),
 		make(chan struct{}, 1),
 		make(chan struct{}, 2),
+		nil,
 		make(chan error, 1),
+		nil,
 		nil,
 	)
 
@@ -495,7 +497,9 @@ func TestExternalV2BulkPacketControlReaderRefreshesDeadlineAfterTimeout(t *testi
 		make(chan []uint32, 1),
 		make(chan struct{}, 1),
 		make(chan struct{}, 1),
+		nil,
 		make(chan error, 1),
+		nil,
 		nil,
 	)
 
@@ -578,10 +582,12 @@ func TestExternalV2BulkPacketDataReadRecyclesPayloadAllocation(t *testing.T) {
 	if !ok {
 		t.Fatal("parseExternalV2BulkPacketHeader() failed")
 	}
-	nonce := externalV2BulkPacketNonce(header)
+	var nonceScratch [externalV2BulkPacketMaximumNonceSize]byte
+	nonce := nonceScratch[:auth.data.NonceSize()]
+	fillExternalV2BulkPacketNonce(nonce, header)
 	openBuf := make([]byte, 0, externalV2BulkPacketPayloadSize)
 	directOpenAllocs := testing.AllocsPerRun(1000, func() {
-		openedPayload, err := auth.data.Open(openBuf[:0], nonce[:], header.payload, packet[:externalV2BulkPacketHeaderSize])
+		openedPayload, err := auth.data.Open(openBuf[:0], nonce, header.payload, packet[:externalV2BulkPacketHeaderSize])
 		if err != nil || len(openedPayload) != len(payload) {
 			t.Fatalf("AEAD.Open() = len %d, error %v", len(openedPayload), err)
 		}
@@ -755,6 +761,23 @@ func TestExternalV2BulkPacketNonceAndWireVector(t *testing.T) {
 	openedHeader, openedPayload, ok := openExternalV2BulkPacket(aead, packet)
 	if !ok || openedHeader.kind != header.kind || openedHeader.runID != header.runID || openedHeader.index != header.index || openedHeader.total != header.total || openedHeader.length != header.length || !bytes.Equal(openedPayload, []byte{0x11, 0x22, 0x33}) {
 		t.Fatalf("open vector = header %+v payload %x ok %v", openedHeader, openedPayload, ok)
+	}
+}
+
+func TestExternalV2BulkPacketSessionAuthUsesAESGCMNonce(t *testing.T) {
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auth.data.NonceSize() != 12 || auth.control.NonceSize() != 12 || auth.grouped.NonceSize() != 12 {
+		t.Fatalf("nonce sizes data/control/grouped = %d/%d/%d, want AES-GCM 12-byte nonces", auth.data.NonceSize(), auth.control.NonceSize(), auth.grouped.NonceSize())
+	}
+	if auth.grouped.Overhead() != 16 {
+		t.Fatalf("grouped AES-GCM overhead = %d, want 16", auth.grouped.Overhead())
 	}
 }
 
@@ -1022,6 +1045,79 @@ func TestExternalV2BulkPacketManualReceiveResultReleaseIsNoOp(t *testing.T) {
 	}
 }
 
+func TestExternalV2BulkPacketReceiveAckIsMonotonic(t *testing.T) {
+	var ack externalV2BulkPacketReceiveAck
+	ack.record(1024, 64<<20)
+	ack.record(512, 64<<20)
+	bytes, window, set := ack.snapshot()
+	if !set || bytes != 1024 || window != 64<<20 {
+		t.Fatalf("receive ack = %d window %d/%t", bytes, window, set)
+	}
+}
+
+func TestExternalV2BulkPacketReceiverAcknowledgesUniqueAuthenticatedArrivals(t *testing.T) {
+	arrivals := newExternalV2BulkPacketArrivalTracker(4)
+	arrivals.markData(externalV2BulkPacketHeader{index: 0, total: 4, length: externalV2BulkPacketPayloadSize})
+	arrivals.markData(externalV2BulkPacketHeader{index: 1, total: 4, length: externalV2BulkPacketPayloadSize})
+	arrivals.markData(externalV2BulkPacketHeader{index: 3, total: 4, length: externalV2BulkPacketPayloadSize})
+	receiver := &externalV2BulkPacketReceiver{
+		seen:         make([]bool, 4),
+		arrivals:     arrivals,
+		totalPackets: 4,
+		cfg:          externalV2BlockReceiveConfig{PayloadSize: 4 * externalV2BulkPacketPayloadSize},
+	}
+	if got := receiver.authenticatedPayloadCredit(); got != 3*externalV2BulkPacketPayloadSize {
+		t.Fatalf("out-of-order authenticated credit = %d", got)
+	}
+	arrivals.markData(externalV2BulkPacketHeader{index: 2, total: 4, length: externalV2BulkPacketPayloadSize})
+	if got := receiver.authenticatedPayloadCredit(); got != 4*externalV2BulkPacketPayloadSize {
+		t.Fatalf("complete authenticated credit = %d", got)
+	}
+}
+
+func TestExternalV2BulkPacketAckPayloadRoundTrip(t *testing.T) {
+	encoded := encodeExternalV2BulkPacketAck(987654321, 64<<20)
+	decoded, window, ok := decodeExternalV2BulkPacketAck(encoded)
+	if !ok || decoded != 987654321 || window != 64<<20 {
+		t.Fatalf("ack round trip = %d window %d/%t", decoded, window, ok)
+	}
+	if _, _, ok := decodeExternalV2BulkPacketAck(encoded[:7]); ok {
+		t.Fatal("short ack payload was accepted")
+	}
+	if decoded, window, ok := decodeExternalV2BulkPacketAck(encoded[:8]); !ok || decoded != 987654321 || window != externalV2BulkPacketBufferedReceiveWindow {
+		t.Fatalf("legacy ack = %d window %d/%t", decoded, window, ok)
+	}
+}
+
+func TestExternalV2BulkPacketControlAcceptsAckForCurrentTransfer(t *testing.T) {
+	const (
+		runID        = 17
+		totalPackets = 23
+	)
+	var ack externalV2BulkPacketReceiveAck
+	valid := externalV2BulkPacketHeader{
+		kind:  externalV2BulkPacketAck,
+		runID: runID,
+		total: totalPackets,
+	}
+	if stop := handleExternalV2BulkPacketControl(valid, encodeExternalV2BulkPacketAck(4096, 64<<20), runID, totalPackets, nil, nil, nil, nil, nil, &ack); stop {
+		t.Fatal("ACK stopped the control reader")
+	}
+	if got, window, set := ack.snapshot(); !set || got != 4096 || window != 64<<20 {
+		t.Fatalf("accepted ACK = %d window %d/%t", got, window, set)
+	}
+
+	wrongRun := valid
+	wrongRun.runID++
+	handleExternalV2BulkPacketControl(wrongRun, encodeExternalV2BulkPacketAck(8192, 64<<20), runID, totalPackets, nil, nil, nil, nil, nil, &ack)
+	wrongTotal := valid
+	wrongTotal.total++
+	handleExternalV2BulkPacketControl(wrongTotal, encodeExternalV2BulkPacketAck(8192, 64<<20), runID, totalPackets, nil, nil, nil, nil, nil, &ack)
+	if got, _, _ := ack.snapshot(); got != 4096 {
+		t.Fatalf("mismatched ACK advanced frontier to %d", got)
+	}
+}
+
 func TestExternalV2BulkPacketReceiverShutdownReturnsQueuedPayloads(t *testing.T) {
 	for _, tt := range []struct {
 		name        string
@@ -1075,7 +1171,8 @@ func TestExternalV2BulkPacketReceiverShutdownReturnsQueuedPayloads(t *testing.T)
 					kind: externalV2BulkPacketData, runID: 7, index: 1, total: 2,
 				}, []byte{0x99}),
 			}
-			dataCh := make(chan externalV2BulkPacketReceiveResult, len(results))
+			dataCh := make(chan externalV2BulkPacketReceiveBatch, 1)
+			batch := externalV2BulkPacketReceiveBatch{results: results}
 			readersDone := make(chan struct{})
 			ctx, cancel := context.WithCancel(context.Background())
 			if tt.cancelFirst {
@@ -1084,15 +1181,11 @@ func TestExternalV2BulkPacketReceiverShutdownReturnsQueuedPayloads(t *testing.T)
 				cancel = func() { close(readersCancel) }
 				go func() {
 					<-readersCancel
-					for _, result := range results {
-						dataCh <- result
-					}
+					dataCh <- batch
 					close(readersDone)
 				}()
 			} else {
-				for _, result := range results {
-					dataCh <- result
-				}
+				dataCh <- batch
 				close(readersDone)
 			}
 			_, _, err := runExternalV2BulkPacketReceiver(
@@ -1139,13 +1232,13 @@ func TestExternalV2BulkPacketTopLevelStopsWhenReadDeadlineCannotBeSet(t *testing
 
 	resultCh := make(chan error, 1)
 	go func() {
-		_, err := sendExternalV2BulkBlockPackets(ctx, &BlockSource{
+		_, err := sendExternalV2BulkBlockPacketsWithProbe(ctx, &BlockSource{
 			Payload:     bytes.NewReader([]byte{0x5a}),
 			PayloadSize: 1,
 		}, externalV2BulkPacketPath{
 			Conns: []net.PacketConn{conn},
 			Addrs: externalV2BulkPacketTestAddrs(receivers),
-		}, auth, nil)
+		}, auth, nil, false)
 		resultCh <- err
 	}()
 
@@ -1187,13 +1280,13 @@ func TestExternalV2BulkPacketTopLevelClosesBlockedWriteWhenDeadlinesFail(t *test
 
 	resultCh := make(chan error, 1)
 	go func() {
-		_, err := sendExternalV2BulkBlockPackets(ctx, &BlockSource{
+		_, err := sendExternalV2BulkBlockPacketsWithProbe(ctx, &BlockSource{
 			Payload:     bytes.NewReader(payload),
 			PayloadSize: int64(len(payload)),
 		}, externalV2BulkPacketPath{
 			Conns: []net.PacketConn{conn},
 			Addrs: externalV2BulkPacketTestAddrs(receivers),
-		}, auth, nil)
+		}, auth, nil, false)
 		resultCh <- err
 	}()
 
@@ -1246,13 +1339,13 @@ func TestExternalV2BulkPacketTopLevelInterruptsInitialSendOnPostHelloWorkerError
 
 	resultCh := make(chan error, 1)
 	go func() {
-		_, err := sendExternalV2BulkBlockPackets(ctx, &BlockSource{
+		_, err := sendExternalV2BulkBlockPacketsWithProbe(ctx, &BlockSource{
 			Payload:     bytes.NewReader(payload),
 			PayloadSize: int64(len(payload)),
 		}, externalV2BulkPacketPath{
 			Conns: []net.PacketConn{conn},
 			Addrs: externalV2BulkPacketTestAddrs(receivers),
-		}, auth, nil)
+		}, auth, nil, false)
 		resultCh <- err
 	}()
 
@@ -1369,7 +1462,7 @@ func TestExternalV2BulkPacketReceiverResultReportsRepairEfficiency(t *testing.T)
 		diagnostics.PendingMissingPeak != 1234 ||
 		diagnostics.RepairRequestedPackets != 4567 ||
 		diagnostics.RepairRequestBatches != 32 ||
-		diagnostics.ReorderTrailPackets != 22_000 ||
+		diagnostics.ReorderTrailPackets != externalV2BulkPacketMaximumActiveRepairTrail ||
 		diagnostics.ReceivePacketRatePPS != 88_000 {
 		t.Fatalf("repair efficiency diagnostics = %#v", diagnostics)
 	}
@@ -1940,6 +2033,35 @@ func TestExternalV2BulkPacketRepairLaneRotatesAwayFromPrimary(t *testing.T) {
 	}
 	if lane := externalV2BulkPacketRepairLane(6, 1, 0); lane != 0 {
 		t.Fatalf("single-lane repair lane = %d, want 0", lane)
+	}
+}
+
+func TestExternalV2BulkPacketPrimaryCompleteIsAuthenticated(t *testing.T) {
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(),
+		key.NewNode().Public(),
+		key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, err := sealExternalV2BulkPacket(auth.data, externalV2BulkPacketHeader{
+		kind:  externalV2BulkPacketPrimaryComplete,
+		runID: 91,
+		index: 2,
+		total: 700,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nonce [externalV2BulkPacketMaximumNonceSize]byte
+	header, ok := openExternalV2BulkPacketPrimaryComplete(auth.data, packet, &nonce)
+	if !ok || header.runID != 91 || header.total != 700 {
+		t.Fatalf("primary-complete open = %#v, %t", header, ok)
+	}
+	packet[len(packet)-1] ^= 0x80
+	if _, ok := openExternalV2BulkPacketPrimaryComplete(auth.data, packet, &nonce); ok {
+		t.Fatal("forged primary-complete marker authenticated")
 	}
 }
 

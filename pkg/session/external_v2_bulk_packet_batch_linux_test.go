@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -50,6 +51,9 @@ func TestExternalV2BulkPacketLinuxBatchRoundTrip(t *testing.T) {
 			t.Fatal(err)
 		}
 		for index := 0; index < count; index++ {
+			if readMessages[index].Addr != nil || readMessages[index].NN != 0 {
+				t.Fatalf("connected receive unpacked unused source metadata: addr=%v oob=%d", readMessages[index].Addr, readMessages[index].NN)
+			}
 			payload := string(readMessages[index].Buffers[0][:readMessages[index].N])
 			if _, ok := want[payload]; !ok {
 				t.Fatalf("unexpected or duplicate payload %q", payload)
@@ -116,6 +120,45 @@ func TestExternalV2BulkPacketLinuxBatchReadHonorsCancellation(t *testing.T) {
 	}
 }
 
+func TestExternalV2BulkPacketLinuxPrepareReadReusesScratch(t *testing.T) {
+	messages := make([]externalV2BulkPacketBatchMessage, externalV2BulkPacketMaxBatch)
+	for index := range messages {
+		messages[index].Buffers = [][]byte{make([]byte, externalV2BulkPacketMaxSize)}
+	}
+	var headers [externalV2BulkPacketMaxBatch]externalV2BulkPacketMMsgHdr
+	var iovecs [externalV2BulkPacketMaxBatch]unix.Iovec
+	allocations := testing.AllocsPerRun(100, func() {
+		prepared, preparedHeaders, err := externalV2BulkPacketPrepareRead(messages, headers[:], iovecs[:])
+		if err != nil || len(prepared) != len(messages) || len(preparedHeaders) != len(messages) {
+			t.Fatalf("prepare read = %d/%d, error %v", len(prepared), len(preparedHeaders), err)
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("prepare-read allocations = %f, want 0", allocations)
+	}
+}
+
+func TestExternalV2BulkPacketLinuxBatchReusesReadDeadlineAcrossSuccess(t *testing.T) {
+	receiverUDP := listenExternalV2BulkPacketLinuxUDP(t)
+	receiverConn := &readDeadlineRecordingLinuxUDPConn{UDPConn: receiverUDP}
+	defer receiverConn.Close()
+	senderConn := listenExternalV2BulkPacketLinuxUDP(t)
+	defer senderConn.Close()
+	receiver := newExternalV2BulkPacketBatchConn(receiverConn)
+	message := []externalV2BulkPacketBatchMessage{{Buffers: [][]byte{make([]byte, externalV2BulkPacketMaxSize)}}}
+	for index := range 3 {
+		if _, err := senderConn.WriteToUDP([]byte{byte(index)}, receiverUDP.LocalAddr().(*net.UDPAddr)); err != nil {
+			t.Fatal(err)
+		}
+		if count, err := receiver.ReadBatch(context.Background(), message); err != nil || count != 1 {
+			t.Fatalf("read %d = %d, error %v", index, count, err)
+		}
+	}
+	if got := receiverConn.nonzeroReadDeadlines.Load(); got != 1 {
+		t.Fatalf("nonzero read deadlines = %d, want 1", got)
+	}
+}
+
 func TestExternalV2BulkPacketLinuxGSOControlMessage(t *testing.T) {
 	control := make([]byte, 0, unix.CmsgSpace(2))
 	externalV2BulkPacketSetGSOSize(&control, 1400)
@@ -131,6 +174,57 @@ func TestExternalV2BulkPacketLinuxGSOControlMessage(t *testing.T) {
 	}
 }
 
+func TestExternalV2BulkPacketLinuxGSOLimitsQdiscDropAmplification(t *testing.T) {
+	addr := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 10), Port: 8123}
+	messages := make([]externalV2BulkPacketBatchMessage, 45)
+	for index := range messages {
+		messages[index] = externalV2BulkPacketBatchMessage{
+			Buffers: [][]byte{make([]byte, 1400)},
+			Addr:    addr,
+		}
+	}
+	var scratch externalV2BulkPacketLinuxGSOScratch
+	groups, groupEnds := externalV2BulkPacketPrepareLinuxGSOGroups(messages, &scratch)
+	if got, want := len(groups), 15; got != want {
+		t.Fatalf("GSO groups = %d, want %d", got, want)
+	}
+	for index := range groups {
+		if got, want := len(groups[index].Buffers), 3; got != want {
+			t.Fatalf("GSO group %d segments = %d, want %d", index, got, want)
+		}
+		if groups[index].Addr.String() != addr.String() {
+			t.Fatalf("GSO group %d addr = %v, want %v", index, groups[index].Addr, addr)
+		}
+		control, err := unix.ParseSocketControlMessage(groups[index].OOB)
+		if err != nil || len(control) != 1 {
+			t.Fatalf("GSO group %d control = %+v, error %v", index, control, err)
+		}
+		if got := binary.NativeEndian.Uint16(control[0].Data); got != 1400 {
+			t.Fatalf("GSO group %d size = %d, want 1400", index, got)
+		}
+		if got, want := groupEnds[index], (index+1)*3; got != want {
+			t.Fatalf("GSO group %d logical end = %d, want %d", index, got, want)
+		}
+	}
+}
+
+func TestExternalV2BulkPacketLinuxGSOWrittenMapsPartialGroups(t *testing.T) {
+	groupEnds := []int{12, 24, 36, 45}
+	for _, test := range []struct {
+		groups int
+		want   int
+	}{
+		{groups: 0, want: 0},
+		{groups: 1, want: 12},
+		{groups: 2, want: 24},
+		{groups: 4, want: 45},
+	} {
+		if got := externalV2BulkPacketLinuxGSOWritten(test.groups, groupEnds); got != test.want {
+			t.Fatalf("%d written GSO groups = %d logical packets, want %d", test.groups, got, test.want)
+		}
+	}
+}
+
 func listenExternalV2BulkPacketLinuxUDP(t *testing.T) *net.UDPConn {
 	t.Helper()
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -138,6 +232,18 @@ func listenExternalV2BulkPacketLinuxUDP(t *testing.T) *net.UDPConn {
 		t.Fatal(err)
 	}
 	return conn
+}
+
+type readDeadlineRecordingLinuxUDPConn struct {
+	*net.UDPConn
+	nonzeroReadDeadlines atomic.Int32
+}
+
+func (c *readDeadlineRecordingLinuxUDPConn) SetReadDeadline(deadline time.Time) error {
+	if !deadline.IsZero() {
+		c.nonzeroReadDeadlines.Add(1)
+	}
+	return c.UDPConn.SetReadDeadline(deadline)
 }
 
 var _ syscall.Conn = (*net.UDPConn)(nil)

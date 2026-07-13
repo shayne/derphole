@@ -15,9 +15,9 @@ func TestExternalV2BulkPacketReceiveRateUsesTimeBasedTrail(t *testing.T) {
 		pps  uint32
 		want uint32
 	}{
-		{name: "500 Mbps class", pps: 44_000, want: 11_000},
-		{name: "1 Gbps class", pps: 88_000, want: 22_000},
-		{name: "2.4 Gbps ceiling", pps: 210_000, want: 52_500},
+		{name: "500 Mbps class", pps: 44_000, want: 8_192},
+		{name: "1 Gbps class", pps: 88_000, want: 8_192},
+		{name: "2.4 Gbps ceiling", pps: 210_000, want: 15_750},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -27,6 +27,13 @@ func TestExternalV2BulkPacketReceiveRateUsesTimeBasedTrail(t *testing.T) {
 				t.Fatalf("trail packets = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestExternalV2BulkPacketActiveRepairTrailFitsInsideDirectWindow(t *testing.T) {
+	trailBytes := int64(externalV2BulkPacketMaximumActiveRepairTrail) * externalV2BulkPacketPayloadSize
+	if trailBytes >= externalV2BulkPacketDirectReceiveWindow {
+		t.Fatalf("maximum repair trail = %d bytes, must fit inside direct receive window %d", trailBytes, externalV2BulkPacketDirectReceiveWindow)
 	}
 }
 
@@ -72,6 +79,20 @@ func TestExternalV2BulkPacketReceiveRateObservesElapsedArrivalTime(t *testing.T)
 	}
 }
 
+func TestExternalV2BulkPacketReceiveRateObserveNMatchesIndividualPackets(t *testing.T) {
+	started := time.Unix(70, 0)
+	var individual, batched externalV2BulkPacketReceiveRate
+	individual.observe(started)
+	individual.observe(started.Add(50 * time.Millisecond))
+	individual.observe(started.Add(100 * time.Millisecond))
+	batched.observeN(started, 1)
+	batched.observeN(started.Add(50*time.Millisecond), 1)
+	batched.observeN(started.Add(100*time.Millisecond), 1)
+	if individual.packetsPerSecond() != batched.packetsPerSecond() || individual.trailPackets() != batched.trailPackets() {
+		t.Fatalf("individual pps/trail=%d/%d batch=%d/%d", individual.packetsPerSecond(), individual.trailPackets(), batched.packetsPerSecond(), batched.trailPackets())
+	}
+}
+
 func TestExternalV2BulkPacketMissingTrackerScansEachIndexOnce(t *testing.T) {
 	seen := []bool{true, false, true, true, false, true, true, true}
 	tracker := newExternalV2BulkPacketMissingTracker(uint32(len(seen)))
@@ -108,6 +129,55 @@ func TestExternalV2BulkPacketMissingTrackerResolvesLateOriginal(t *testing.T) {
 	}
 }
 
+func TestExternalV2BulkPacketMissingTrackerIgnoresAuthenticatedArrivalsWaitingForAssembly(t *testing.T) {
+	seen := []bool{false, false, false}
+	arrivals := newExternalV2BulkPacketArrivalTracker(uint32(len(seen)))
+	arrivals.mark(1)
+	tracker := newExternalV2BulkPacketMissingTracker(uint32(len(seen)), arrivals)
+
+	tracker.advance(seen, uint32(len(seen)))
+	got := tracker.batches(seen, time.Unix(15, 0), true)
+	if len(got) != 1 || len(got[0]) != 2 || got[0][0] != 0 || got[0][1] != 2 {
+		t.Fatalf("repair batches = %v, want only packets not seen or waiting for assembly", got)
+	}
+	if arrivals.highestPlusOne() != 2 {
+		t.Fatalf("highest authenticated arrival = %d, want 2", arrivals.highestPlusOne())
+	}
+}
+
+func TestExternalV2BulkPacketArrivalCreditCountsUniqueAuthenticatedPayload(t *testing.T) {
+	arrivals := newExternalV2BulkPacketArrivalTracker(3)
+	arrivals.markData(externalV2BulkPacketHeader{index: 2, total: 3, length: 100})
+	arrivals.markData(externalV2BulkPacketHeader{index: 2, total: 3, length: 100})
+	arrivals.markData(externalV2BulkPacketHeader{index: 0, total: 3, length: 200})
+	arrivals.markData(externalV2BulkPacketHeader{index: 1, total: 4, length: 250})
+
+	if got := arrivals.payloadBytes(); got != 300 {
+		t.Fatalf("authenticated arrival credit = %d, want 300 unique bytes", got)
+	}
+}
+
+func TestExternalV2BulkPacketArrivalTrackerSerializesDirectDecryptClaims(t *testing.T) {
+	tracker := newExternalV2BulkPacketArrivalTracker(2)
+	if !tracker.tryClaim(1) {
+		t.Fatal("first direct decrypt claim was rejected")
+	}
+	if tracker.tryClaim(1) {
+		t.Fatal("concurrent direct decrypt claim was accepted")
+	}
+	tracker.finishClaim(externalV2BulkPacketHeader{index: 1, total: 2, length: 17}, false)
+	if !tracker.tryClaim(1) {
+		t.Fatal("failed authentication did not release direct decrypt claim")
+	}
+	tracker.finishClaim(externalV2BulkPacketHeader{index: 1, total: 2, length: 17}, true)
+	if !tracker.contains(1) || tracker.payloadBytes() != 17 {
+		t.Fatalf("successful claim was not recorded: present=%t payload=%d", tracker.contains(1), tracker.payloadBytes())
+	}
+	if tracker.tryClaim(1) {
+		t.Fatal("authenticated packet accepted another direct decrypt claim")
+	}
+}
+
 func TestExternalV2BulkPacketMissingTrackerPreservesActiveRepairCadenceAndBatchLimit(t *testing.T) {
 	seen := make([]bool, 605)
 	tracker := newExternalV2BulkPacketMissingTracker(uint32(len(seen)))
@@ -118,10 +188,10 @@ func TestExternalV2BulkPacketMissingTrackerPreservesActiveRepairCadenceAndBatchL
 	if len(first) != 3 || len(first[0]) != 300 || len(first[1]) != 300 || len(first[2]) != 5 {
 		t.Fatalf("first batches = lens %v, want 300,300,5", externalV2BulkPacketBatchLengths(first))
 	}
-	if got := tracker.batches(seen, start.Add(99*time.Millisecond), false); len(got) != 0 {
+	if got := tracker.batches(seen, start.Add(externalV2BulkPacketActiveRequestInterval-time.Millisecond), false); len(got) != 0 {
 		t.Fatalf("early repeat batches = %v, want none", got)
 	}
-	if got := tracker.batches(seen, start.Add(100*time.Millisecond), false); len(got) != 3 {
+	if got := tracker.batches(seen, start.Add(externalV2BulkPacketActiveRequestInterval), false); len(got) != 3 {
 		t.Fatalf("due repeat batch count = %d, want 3", len(got))
 	}
 	stats := tracker.stats()

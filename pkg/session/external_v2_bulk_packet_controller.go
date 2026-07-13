@@ -42,6 +42,7 @@ type externalV2BulkPacketControllerSample struct {
 	PeerBytes             int64
 	PeerTransferElapsedMS int64
 	PeerProgress          bool
+	ReceiveWindowBlocked  bool
 }
 
 type externalV2BulkPacketControllerDecision struct {
@@ -53,12 +54,13 @@ type externalV2BulkPacketControllerDecision struct {
 }
 
 type externalV2BulkPacketController struct {
-	targetMbps      int
-	cooldown        int
-	previous        externalV2BulkPacketControllerSample
-	lastObserved    externalV2BulkPacketControllerSample
-	haveSample      bool
-	pressureWindows int
+	targetMbps             int
+	cooldown               int
+	previous               externalV2BulkPacketControllerSample
+	lastObserved           externalV2BulkPacketControllerSample
+	haveSample             bool
+	pressureWindows        int
+	receiverLimitedWindows int
 }
 
 func externalV2BulkPacketInitialWireMbps() int {
@@ -99,6 +101,7 @@ func (c *externalV2BulkPacketController) Observe(
 		c.previous = sample
 		c.lastObserved = sample
 		c.pressureWindows = 0
+		c.receiverLimitedWindows = 0
 		return c.decision("hold", "counter-reset", 0, 0)
 	}
 	c.lastObserved = sample
@@ -111,7 +114,7 @@ func (c *externalV2BulkPacketController) Observe(
 	}
 	c.previous = sample
 
-	return c.decideSample(primaryDelta, repairDelta, deliveredWireMbps, peerReady)
+	return c.decideSample(primaryDelta, repairDelta, deliveredWireMbps, peerReady, sample.ReceiveWindowBlocked)
 }
 
 func (c *externalV2BulkPacketController) hasCounterReset(
@@ -148,6 +151,7 @@ func (c *externalV2BulkPacketController) decideSample(
 	repairDelta int64,
 	deliveredWireMbps int,
 	peerReady bool,
+	receiveWindowBlocked bool,
 ) externalV2BulkPacketControllerDecision {
 	totalDelta := primaryDelta + repairDelta
 	repairPPM := externalV2BulkPacketRepairPPM(repairDelta, totalDelta)
@@ -155,32 +159,48 @@ func (c *externalV2BulkPacketController) decideSample(
 		c.pressureWindows = 0
 		return c.decision("hold", "awaiting-peer-progress", 0, repairPPM)
 	}
-	return c.decideWithPeerProgress(deliveredWireMbps, repairPPM)
+	return c.decideWithPeerProgress(deliveredWireMbps, repairPPM, receiveWindowBlocked)
 }
 
 func (c *externalV2BulkPacketController) decideWithPeerProgress(
 	deliveredWireMbps int,
 	repairPPM int64,
+	receiveWindowBlocked bool,
 ) externalV2BulkPacketControllerDecision {
 	healthyDelivery := int64(deliveredWireMbps)*1_000_000 >=
 		int64(c.targetMbps)*externalV2BulkPacketHealthyPPM
 	if repairPPM >= externalV2BulkPacketSoftRepairPPM && !healthyDelivery {
+		c.receiverLimitedWindows = 0
 		return c.confirmRepairPressure(deliveredWireMbps, repairPPM)
 	}
 	c.pressureWindows = 0
 	if repairPPM >= externalV2BulkPacketSoftRepairPPM {
+		c.receiverLimitedWindows = 0
 		if c.cooldown > 0 {
 			c.cooldown--
 		}
 		return c.decision("hold", "repair-hold", deliveredWireMbps, repairPPM)
 	}
+	if receiveWindowBlocked {
+		c.receiverLimitedWindows = 0
+		if c.cooldown > 0 {
+			c.cooldown--
+		}
+		return c.decision("hold", "receive-window", deliveredWireMbps, repairPPM)
+	}
 	if c.cooldown > 0 {
+		c.receiverLimitedWindows = 0
 		c.cooldown--
 		return c.decision("hold", "backoff-cooldown", deliveredWireMbps, repairPPM)
 	}
 	if !healthyDelivery {
-		return c.decision("hold", "receiver-limited", deliveredWireMbps, repairPPM)
+		c.receiverLimitedWindows++
+		if c.receiverLimitedWindows < externalV2BulkPacketPressureWindows {
+			return c.decision("hold", "receiver-limited-pending", deliveredWireMbps, repairPPM)
+		}
+		return c.decrease("receiver-limited", deliveredWireMbps, repairPPM)
 	}
+	c.receiverLimitedWindows = 0
 	if c.targetMbps >= externalV2BulkPacketCeilingWireMbps {
 		return c.decision("hold", "ceiling", deliveredWireMbps, repairPPM)
 	}
@@ -212,6 +232,7 @@ func (c *externalV2BulkPacketController) decrease(
 	repairPPM int64,
 ) externalV2BulkPacketControllerDecision {
 	c.pressureWindows = 0
+	c.receiverLimitedWindows = 0
 	next := c.targetMbps *
 		externalV2BulkPacketBackoffNumerator /
 		externalV2BulkPacketBackoffDenominator

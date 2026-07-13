@@ -5,26 +5,30 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"tailscale.com/types/key"
 )
 
-func TestExternalV2BulkPacketBatchedIODisabledByDefault(t *testing.T) {
+func TestExternalV2BulkPacketBatchBackendConfiguredByDefault(t *testing.T) {
 	t.Setenv("DERPHOLE_TEST_BULK_BATCHED_IO", "")
-	if externalV2BulkPacketBatchedIOEnabled() {
-		t.Fatal("batched I/O enabled without the test gate")
+	senders, receivers := listenExternalV2BulkPacketTestConns(t, 2)
+	auth, err := externalV2BulkPacketAuthForToken(testExternalV2BulkPacketToken(), key.NewNode().Public(), key.NewNode().Public())
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Setenv("DERPHOLE_TEST_BULK_BATCHED_IO", "true")
-	if externalV2BulkPacketBatchedIOEnabled() {
-		t.Fatal("batched I/O enabled for a non-canonical gate value")
-	}
-	t.Setenv("DERPHOLE_TEST_BULK_BATCHED_IO", "1")
-	if !externalV2BulkPacketBatchedIOEnabled() {
-		t.Fatal("batched I/O disabled for gate value 1")
+	sender := newExternalV2BulkPacketSender(context.Background(), &BlockSource{
+		Payload: bytes.NewReader([]byte("batch by default")), PayloadSize: int64(len("batch by default")),
+	}, externalV2BulkPacketPath{Conns: senders, Addrs: externalV2BulkPacketTestAddrs(receivers)}, auth, nil)
+	if len(sender.batchConns) != 2 {
+		t.Fatalf("batch backends = %d, want 2 without an environment gate", len(sender.batchConns))
 	}
 }
 
@@ -54,6 +58,34 @@ func TestExternalV2BulkPacketBatchWriteAllRejectsNoProgress(t *testing.T) {
 	err := writeExternalV2BulkPacketBatchAll(context.Background(), batch, []externalV2BulkPacketBatchMessage{{Buffers: [][]byte{{1}}}})
 	if !errors.Is(err, errExternalV2BulkPacketBatchNoProgress) {
 		t.Fatalf("error = %v, want no progress", err)
+	}
+}
+
+func TestExternalV2BulkPacketBatchWriteDoesNotLeaveArtificialDeadline(t *testing.T) {
+	receiverConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiverConn.Close()
+	senderConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer senderConn.Close()
+	recording := &writeDeadlineRecordingPacketConn{UDPConn: senderConn.(*net.UDPConn)}
+	batch := newExternalV2BulkPacketBatchConn(recording)
+
+	written, err := batch.WriteBatch(context.Background(), []externalV2BulkPacketBatchMessage{{
+		Buffers: [][]byte{[]byte("payload")}, Addr: receiverConn.LocalAddr(),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written != 1 {
+		t.Fatalf("written = %d, want 1", written)
+	}
+	if got := recording.nonzero.Load(); got != 0 {
+		t.Fatalf("non-zero write deadlines = %d, want none without a context deadline", got)
 	}
 }
 
@@ -99,6 +131,7 @@ func TestExternalV2BulkPacketPortableBatchRoundTrip(t *testing.T) {
 		wantSendBackend = "linux-sendmmsg"
 		wantReceiveBackend = "linux-recvmmsg"
 	} else if runtime.GOOS == "darwin" {
+		wantSendBackend = "darwin-sendmsg-x"
 		wantReceiveBackend = "darwin-recvmsg-x"
 	}
 	if sendStats.Backend != wantSendBackend || sendStats.SendCalls < 1 || sendStats.SendDatagrams != 2 || sendStats.MaxSendBatch < 1 {
@@ -128,6 +161,27 @@ func TestExternalV2BulkPacketPortableBatchReadHonorsCancellation(t *testing.T) {
 	}
 }
 
+func TestExternalV2BulkPacketPortableBatchReadRetriesIdleTimeouts(t *testing.T) {
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	wrapped := &writeDeadlineRecordingPacketConn{UDPConn: conn.(*net.UDPConn)}
+	batch := newExternalV2BulkPacketBatchConn(wrapped)
+	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err = batch.ReadBatch(ctx, []externalV2BulkPacketBatchMessage{{Buffers: [][]byte{make([]byte, externalV2BulkPacketMaxSize)}}})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		networkError, ok := err.(net.Error)
+		t.Fatalf("error = %T %v net_error=%t timeout=%t, want context deadline after retrying idle socket timeouts", err, err, ok, ok && networkError.Timeout())
+	}
+	if elapsed := time.Since(started); elapsed < 300*time.Millisecond {
+		t.Fatalf("read returned after %s, want retries until context deadline", elapsed)
+	}
+}
+
 func TestExternalV2BulkPacketBatchDiagnosticsAggregateLanes(t *testing.T) {
 	conns := []externalV2BulkPacketBatchConn{
 		staticExternalV2BulkPacketBatchConn{stats: externalV2BulkPacketBatchStats{
@@ -138,14 +192,14 @@ func TestExternalV2BulkPacketBatchDiagnosticsAggregateLanes(t *testing.T) {
 			ReceiveCalls: 4, ReceiveDatagrams: 128, MaxSendBatch: 64, MaxReceiveBatch: 32,
 		}},
 	}
-	diagnostics := externalV2BulkPacketBatchDiagnostics(conns, 4, 3)
+	diagnostics := externalV2BulkPacketBatchDiagnostics(conns, 4, 3, 2)
 	if !diagnostics.BulkBatchPresent || diagnostics.BulkBatchBackend != "linux-gso" || !diagnostics.BulkGSOAttempted || !diagnostics.BulkGSOActive {
 		t.Fatalf("identity = %+v", diagnostics)
 	}
 	if diagnostics.BulkGSOSegments != 64 || diagnostics.BulkSendCalls != 5 || diagnostics.BulkSendDatagrams != 164 || diagnostics.BulkReceiveCalls != 4 || diagnostics.BulkReceiveDatagrams != 128 {
 		t.Fatalf("counters = %+v", diagnostics)
 	}
-	if diagnostics.BulkMaxSendBatch != 64 || diagnostics.BulkMaxReceiveBatch != 32 || diagnostics.BulkCryptoQueuePeak != 4 || diagnostics.BulkWriterQueuePeak != 3 {
+	if diagnostics.BulkMaxSendBatch != 64 || diagnostics.BulkMaxReceiveBatch != 32 || diagnostics.BulkCryptoQueuePeak != 4 || diagnostics.BulkWriterQueuePeak != 3 || diagnostics.BulkLaneQueuePeak != 2 {
 		t.Fatalf("peaks = %+v", diagnostics)
 	}
 }
@@ -157,6 +211,18 @@ type scriptedExternalV2BulkPacketBatchConn struct {
 
 type staticExternalV2BulkPacketBatchConn struct {
 	stats externalV2BulkPacketBatchStats
+}
+
+type writeDeadlineRecordingPacketConn struct {
+	*net.UDPConn
+	nonzero atomic.Int64
+}
+
+func (c *writeDeadlineRecordingPacketConn) SetWriteDeadline(deadline time.Time) error {
+	if !deadline.IsZero() {
+		c.nonzero.Add(1)
+	}
+	return c.UDPConn.SetWriteDeadline(deadline)
 }
 
 func (staticExternalV2BulkPacketBatchConn) WriteBatch(context.Context, []externalV2BulkPacketBatchMessage) (int, error) {

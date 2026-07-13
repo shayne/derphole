@@ -93,6 +93,23 @@ type BlockReceiveSink interface {
 	Close() error
 }
 
+// ConcurrentBlockReceiveSink is an optional capability for sinks whose
+// WriteAt implementation permits calls from multiple goroutines. Block sinks
+// without this capability remain serialized.
+type ConcurrentBlockReceiveSink interface {
+	BlockReceiveSink
+	ConcurrentWriteAtSafe() bool
+}
+
+// DirectBlockReceiveSink is an optional capability for file-backed sinks that
+// expose the destination's page-cache mapping. Bulk packet receivers copy only
+// authenticated payload into the buffer and report committed bytes in batches.
+type DirectBlockReceiveSink interface {
+	BlockReceiveSink
+	DirectWriteBuffer() []byte
+	CommitDirectWrite(bytes int, highestEnd int64) error
+}
+
 type BlockReceiver func(context.Context, BlockReceiveRequest) (BlockReceiveSink, error)
 
 type AttachDialConfig struct {
