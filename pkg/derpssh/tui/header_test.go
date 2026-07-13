@@ -18,7 +18,7 @@ func TestHeaderPeerChipClickOpensPeerDialogForPeerID(t *testing.T) {
 	_ = appContent(app)
 
 	peer := topBarPeerRect(t, app, "guest-2")
-	dispatchViewMouse(t, app, leftClick(peer.X+peer.W/2, peer.Y))
+	dispatchMouse(t, app, leftClick(peer.X+peer.W/2, peer.Y))
 
 	if !app.peerDialogOpen {
 		t.Fatal("peer dialog did not open")

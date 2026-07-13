@@ -47,15 +47,6 @@ func (s Scene) TargetAt(x int, y int) layerTarget {
 	return layerTarget(hit.ID())
 }
 
-func (s Scene) PointerCmd(capture layerTarget, msg tea.MouseMsg) tea.Cmd {
-	target := capture
-	if target == "" {
-		mouse := msg.Mouse()
-		target = s.TargetAt(mouse.X, mouse.Y)
-	}
-	return func() tea.Msg { return newPointerMsg(target, msg) }
-}
-
 func sceneLayer(id layerTarget, rect Rect, z int, content string) *lipgloss.Layer {
 	return lipgloss.NewLayer(fitSceneContent(content, rect.W, rect.H)).
 		ID(string(id)).

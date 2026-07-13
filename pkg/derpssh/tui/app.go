@@ -235,7 +235,7 @@ func (a *App) handleInteractiveMessage(msg tea.Msg) (tea.Cmd, bool) {
 	case pointerMsg:
 		return HandleMouse(a, msg), true
 	case tea.MouseMsg:
-		return nil, true
+		return a.handleMouseMessage(msg), true
 	default:
 		return nil, false
 	}
@@ -362,11 +362,7 @@ func (a *App) buildScene() Scene {
 func (a *App) configureView(view tea.View, scene Scene) tea.View {
 	view.AltScreen = true
 	view.MouseMode = tea.MouseModeCellMotion
-	if a.modalActive() {
-		a.clearPointerCapture()
-	}
 	if a.copyMode || a.inviteOpen {
-		a.clearPointerCapture()
 		view.MouseMode = tea.MouseModeNone
 	}
 	view.Cursor = scene.Cursor
@@ -374,10 +370,6 @@ func (a *App) configureView(view tea.View, scene Scene) tea.View {
 		ReportAlternateKeys:        true,
 		ReportAllKeysAsEscapeCodes: true,
 		ReportAssociatedText:       true,
-	}
-	capture := a.pointerCapture
-	view.OnMouse = func(msg tea.MouseMsg) tea.Cmd {
-		return scene.PointerCmd(capture, msg)
 	}
 	return view
 }
