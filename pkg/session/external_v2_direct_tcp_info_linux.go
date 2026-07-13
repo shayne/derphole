@@ -22,26 +22,30 @@ func externalV2DirectTCPRetransmits(path *externalV2DirectTCPPath) (int64, bool)
 		if conn == nil {
 			return 0, false
 		}
-		var rawConn net.Conn = conn
-		if unwrapper, ok := rawConn.(interface{ NetConn() net.Conn }); ok {
-			rawConn = unwrapper.NetConn()
-		}
-		syscallConn, ok := rawConn.(syscall.Conn)
+		retransmits, ok := externalV2DirectTCPConnRetransmits(conn.NetConn())
 		if !ok {
 			return 0, false
 		}
-		raw, err := syscallConn.SyscallConn()
-		if err != nil {
-			return 0, false
-		}
-		var info *unix.TCPInfo
-		var socketErr error
-		if err := raw.Control(func(fd uintptr) {
-			info, socketErr = unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO)
-		}); err != nil || socketErr != nil || info == nil {
-			return 0, false
-		}
-		total += int64(info.Total_retrans)
+		total += retransmits
 	}
 	return total, true
+}
+
+func externalV2DirectTCPConnRetransmits(conn net.Conn) (int64, bool) {
+	syscallConn, ok := conn.(syscall.Conn)
+	if !ok {
+		return 0, false
+	}
+	raw, err := syscallConn.SyscallConn()
+	if err != nil {
+		return 0, false
+	}
+	var info *unix.TCPInfo
+	var socketErr error
+	if err := raw.Control(func(fd uintptr) {
+		info, socketErr = unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO)
+	}); err != nil || socketErr != nil || info == nil {
+		return 0, false
+	}
+	return int64(info.Total_retrans), true
 }
