@@ -133,24 +133,6 @@ func externalV2BulkPacketMessageLength(buffers [][]byte) int {
 	return total
 }
 
-func externalV2BulkPacketFlattenMessage(buffers [][]byte) ([]byte, error) {
-	if len(buffers) == 0 {
-		return nil, errors.New("bulk packet batch message has no buffers")
-	}
-	if len(buffers) == 1 {
-		return buffers[0], nil
-	}
-	total := 0
-	for _, buffer := range buffers {
-		total += len(buffer)
-	}
-	payload := make([]byte, 0, total)
-	for _, buffer := range buffers {
-		payload = append(payload, buffer...)
-	}
-	return payload, nil
-}
-
 func externalV2BulkPacketBatchDeadline(ctx context.Context, now time.Time) time.Time {
 	deadline := now.Add(externalV2BulkPacketReadIdle)
 	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
