@@ -62,14 +62,14 @@ func TestPointerDispatchUsesPeerIDTarget(t *testing.T) {
 	}
 }
 
-func TestRawMouseMessageDoesNotDispatchPointerAction(t *testing.T) {
+func TestRawMouseMessageDispatchesHeaderAction(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
 	chat := topBarActionIDRect(t, app, ActionToggleChat)
 
 	app.Update(clickAt(chat.X, chat.Y, tea.MouseLeft))
 
-	if app.sidebarOpen {
-		t.Fatal("raw Bubble Tea mouse message dispatched a second action")
+	if !app.sidebarOpen {
+		t.Fatal("sidebarOpen = false, want true after raw toggle-chat click")
 	}
 }

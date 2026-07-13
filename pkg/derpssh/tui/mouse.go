@@ -31,6 +31,15 @@ func newPointerMsg(target layerTarget, msg tea.MouseMsg) pointerMsg {
 	return pointerMsg{Target: target, Event: msg, Mouse: msg.Mouse()}
 }
 
+func (a *App) handleMouseMessage(msg tea.MouseMsg) tea.Cmd {
+	target := a.pointerCapture
+	if target == "" {
+		mouse := msg.Mouse()
+		target = a.buildScene().TargetAt(mouse.X, mouse.Y)
+	}
+	return HandleMouse(a, newPointerMsg(target, msg))
+}
+
 type pointerAction int
 
 const (
