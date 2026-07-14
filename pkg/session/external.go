@@ -143,7 +143,15 @@ func derpPublicKeyRaw32(pub key.NodePublic) [32]byte {
 }
 
 func issuePublicSessionWithCapabilities(ctx context.Context, capabilities uint32) (string, *relaySession, error) {
-	dm, node, derpClient, err := openPublicSessionDERPClient(ctx)
+	route, err := derpbind.RouteFromEnvironment()
+	if err != nil {
+		return "", nil, err
+	}
+	bootstrap, err := resolveDERPBootstrap(ctx, route, 0, "no DERP node available")
+	if err != nil {
+		return "", nil, err
+	}
+	derpClient, err := openSessionDERPClient(ctx, bootstrap, nil)
 	if err != nil {
 		return "", nil, err
 	}
@@ -159,14 +167,15 @@ func issuePublicSessionWithCapabilities(ctx context.Context, capabilities uint32
 		return "", nil, err
 	}
 	tokValue := token.Token{
-		Version:         token.SupportedVersion,
+		Version:         token.VersionForRoute(route),
 		SessionID:       sessionID,
 		ExpiresUnix:     time.Now().Add(time.Hour).Unix(),
-		BootstrapRegion: uint16(node.RegionID),
+		BootstrapRegion: uint16(bootstrap.node.RegionID),
 		DERPPublic:      derpPublicKeyRaw32(derpClient.PublicKey()),
 		QUICPublic:      quicIdentity.Public,
 		BearerSecret:    bearerSecret,
 		Capabilities:    capabilities,
+		DERPRoute:       route,
 	}
 	tok, err := token.Encode(tokValue)
 	if err != nil {
@@ -186,29 +195,12 @@ func issuePublicSessionWithCapabilities(ctx context.Context, capabilities uint32
 		derp:         derpClient,
 		token:        tokValue,
 		gate:         rendezvous.NewGate(tokValue),
-		derpMap:      dm,
+		derpMap:      bootstrap.dm,
 		quicIdentity: quicIdentity,
 	}
 	attachPublicPortmap(session, newBoundPublicPortmap(probeConn, nil))
 	return tok, session, nil
 }
-
-func openPublicSessionDERPClient(ctx context.Context) (*tailcfg.DERPMap, *tailcfg.DERPNode, *derpbind.Client, error) {
-	dm, err := derpbind.FetchMap(ctx, publicDERPMapURL())
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	node := firstDERPNode(dm, 0)
-	if node == nil {
-		return nil, nil, nil, errors.New("no DERP node available")
-	}
-	derpClient, err := derpbind.NewClient(ctx, node, publicDERPServerURL(node))
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return dm, node, derpClient, nil
-}
-
 func newPublicSessionSecrets() ([16]byte, [32]byte, error) {
 	var sessionID [16]byte
 	if _, err := rand.Read(sessionID[:]); err != nil {

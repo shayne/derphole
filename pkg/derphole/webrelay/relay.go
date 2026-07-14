@@ -71,13 +71,31 @@ type DirectSignalPeer interface {
 	Signals() <-chan webproto.Frame
 }
 
+type DirectConfig struct {
+	STUNURLs []string
+}
+
 type DirectTransport interface {
-	Start(context.Context, DirectRole, DirectSignalPeer) error
+	Start(context.Context, DirectRole, DirectSignalPeer, DirectConfig) error
 	Ready() <-chan struct{}
 	Failed() <-chan error
 	SendFrame(context.Context, []byte) error
 	ReceiveFrames() <-chan []byte
 	Close() error
+}
+
+func directConfigForRoute(route derpbind.Route) DirectConfig {
+	if route.IsCustom() {
+		authority := route.STUNAuthority()
+		if authority == "" {
+			return DirectConfig{}
+		}
+		return DirectConfig{STUNURLs: []string{"stun:" + authority}}
+	}
+	return DirectConfig{STUNURLs: []string{
+		"stun:stun.l.google.com:19302",
+		"stun:stun.cloudflare.com:3478",
+	}}
 }
 
 type TransferOptions struct {
@@ -252,15 +270,19 @@ func unmarshalFramePayload(frame webproto.Frame, dst any) error {
 }
 
 func NewOffer(ctx context.Context) (*Offer, string, error) {
-	node, err := fetchWebRelayDERPNode(ctx, 0, "no DERP node available")
+	route, err := derpbind.RouteFromEnvironment()
 	if err != nil {
 		return nil, "", err
 	}
-	client, err := derpbind.NewClient(ctx, node, publicDERPServerURL(node))
+	node, serverURL, err := resolveWebRelayDERP(ctx, route, 0, "no DERP node available")
 	if err != nil {
 		return nil, "", err
 	}
-	tokValue, encoded, err := newEncodedOfferToken(client, node)
+	client, err := derpbind.NewClient(ctx, node, serverURL)
+	if err != nil {
+		return nil, "", derpbind.WrapCustomDERPConnectError(route, serverURL, err)
+	}
+	tokValue, encoded, err := newEncodedOfferToken(client, node, route)
 	if err != nil {
 		_ = client.Close()
 		return nil, "", err
@@ -272,8 +294,10 @@ func NewOffer(ctx context.Context) (*Offer, string, error) {
 	}, encoded, nil
 }
 
+var fetchWebRelayDERPMap = derpbind.FetchMap
+
 func fetchWebRelayDERPNode(ctx context.Context, regionID int, missingErr string) (*tailcfg.DERPNode, error) {
-	dm, err := derpbind.FetchMap(ctx, publicDERPMapURL())
+	dm, err := fetchWebRelayDERPMap(ctx, publicDERPMapURL())
 	if err != nil {
 		return nil, err
 	}
@@ -284,8 +308,30 @@ func fetchWebRelayDERPNode(ctx context.Context, regionID int, missingErr string)
 	return node, nil
 }
 
-func newEncodedOfferToken(client derpClient, node *tailcfg.DERPNode) (token.Token, string, error) {
-	tokValue, err := newToken(client.PublicKey(), node.RegionID)
+func resolveWebRelayDERP(ctx context.Context, route derpbind.Route, regionID int, missingErr string) (*tailcfg.DERPNode, string, error) {
+	if !route.IsCustom() {
+		node, err := fetchWebRelayDERPNode(ctx, regionID, missingErr)
+		if err != nil {
+			return nil, "", err
+		}
+		return node, publicDERPServerURL(node), nil
+	}
+	if err := route.Validate(); err != nil {
+		return nil, "", err
+	}
+	node := firstDERPNode(route.DERPMap(), derpbind.CustomDERPRegionID)
+	if node == nil {
+		return nil, "", errors.New(missingErr)
+	}
+	serverURL := route.ServerURL()
+	if override := os.Getenv("DERPHOLE_TEST_DERP_SERVER_URL"); override != "" {
+		serverURL = override
+	}
+	return node, serverURL, nil
+}
+
+func newEncodedOfferToken(client derpClient, node *tailcfg.DERPNode, route derpbind.Route) (token.Token, string, error) {
+	tokValue, err := newToken(client.PublicKey(), node.RegionID, route)
 	if err != nil {
 		return token.Token{}, "", err
 	}
@@ -377,7 +423,7 @@ func (o *Offer) startSendDirectPath(ctx context.Context, peerDERP key.NodePublic
 		signalPeer.close()
 		_ = transport.Close()
 	}
-	if err := transport.Start(ctx, DirectRoleSender, signalPeer); err != nil {
+	if err := transport.Start(ctx, DirectRoleSender, signalPeer, directConfigForRoute(o.token.DERPRoute)); err != nil {
 		direct.noteFailureBeforeSwitch(err)
 		return nil, direct, stop
 	}
@@ -673,13 +719,13 @@ func receive(ctx context.Context, encodedToken string, sink FileSink, cb Callbac
 	if err != nil {
 		return err
 	}
-	node, err := fetchWebRelayDERPNode(ctx, int(tok.BootstrapRegion), "no bootstrap DERP node available")
+	node, serverURL, err := resolveWebRelayDERP(ctx, tok.DERPRoute, int(tok.BootstrapRegion), "no bootstrap DERP node available")
 	if err != nil {
 		return err
 	}
-	client, err := derpbind.NewClient(ctx, node, publicDERPServerURL(node))
+	client, err := derpbind.NewClient(ctx, node, serverURL)
 	if err != nil {
-		return err
+		return derpbind.WrapCustomDERPConnectError(tok.DERPRoute, serverURL, err)
 	}
 	defer func() { _ = client.Close() }()
 	return receiveWithClient(ctx, tok, client, sink, cb, opts)
@@ -722,7 +768,7 @@ func receiveWithClient(ctx context.Context, tok token.Token, client derpClient, 
 	}
 
 	if directTransport != nil {
-		if err := directTransport.Start(ctx, DirectRoleReceiver, signalPeer); err != nil {
+		if err := directTransport.Start(ctx, DirectRoleReceiver, signalPeer, directConfigForRoute(tok.DERPRoute)); err != nil {
 			directTransport = nil
 		} else {
 			cb.status(statusProbing)
@@ -1819,7 +1865,7 @@ func sendMergedFrame(ctx context.Context, out chan<- []byte, raw []byte) bool {
 	}
 }
 
-func newToken(pub key.NodePublic, regionID int) (token.Token, error) {
+func newToken(pub key.NodePublic, regionID int, route derpbind.Route) (token.Token, error) {
 	var sessionID [16]byte
 	if _, err := rand.Read(sessionID[:]); err != nil {
 		return token.Token{}, err
@@ -1833,7 +1879,7 @@ func newToken(pub key.NodePublic, regionID int) (token.Token, error) {
 		return token.Token{}, err
 	}
 	return token.Token{
-		Version:         token.SupportedVersion,
+		Version:         token.VersionForRoute(route),
 		SessionID:       sessionID,
 		ExpiresUnix:     time.Now().Add(offerTokenTTL).Unix(),
 		BootstrapRegion: uint16(regionID),
@@ -1841,6 +1887,7 @@ func newToken(pub key.NodePublic, regionID int) (token.Token, error) {
 		QUICPublic:      quicPublic,
 		BearerSecret:    bearerSecret,
 		Capabilities:    token.CapabilityWebFile,
+		DERPRoute:       route,
 	}, nil
 }
 

@@ -7,7 +7,6 @@ package session
 import (
 	"context"
 	"crypto/rand"
-	"errors"
 	"net"
 	"sync"
 	"time"
@@ -76,20 +75,18 @@ func (c *externalAttachConn) Close() error {
 }
 
 func issuePublicQUICSession(ctx context.Context, capabilities uint32, emitter *telemetry.Emitter) (string, *relaySession, error) {
-	dm, err := derpbind.FetchMap(ctx, publicDERPMapURL())
+	route, err := derpbind.RouteFromEnvironment()
 	if err != nil {
 		return "", nil, err
 	}
-	node := firstDERPNode(dm, 0)
-	if node == nil {
-		return "", nil, errors.New("no DERP node available")
-	}
-
-	derpClient, err := derpbind.NewClient(ctx, node, publicDERPServerURL(node))
+	bootstrap, err := resolveDERPBootstrap(ctx, route, 0, "no DERP node available")
 	if err != nil {
 		return "", nil, err
 	}
-	emitDERPProxyDebug(emitter, derpClient)
+	derpClient, err := openSessionDERPClient(ctx, bootstrap, emitter)
+	if err != nil {
+		return "", nil, err
+	}
 
 	var sessionID [16]byte
 	if _, err := rand.Read(sessionID[:]); err != nil {
@@ -108,14 +105,15 @@ func issuePublicQUICSession(ctx context.Context, capabilities uint32, emitter *t
 	}
 
 	tokValue := token.Token{
-		Version:         token.SupportedVersion,
+		Version:         token.VersionForRoute(route),
 		SessionID:       sessionID,
 		ExpiresUnix:     time.Now().Add(time.Hour).Unix(),
-		BootstrapRegion: uint16(node.RegionID),
+		BootstrapRegion: uint16(bootstrap.node.RegionID),
 		DERPPublic:      derpPublicKeyRaw32(derpClient.PublicKey()),
 		QUICPublic:      quicIdentity.Public,
 		BearerSecret:    bearerSecret,
 		Capabilities:    capabilities,
+		DERPRoute:       route,
 	}
 	tok, err := token.Encode(tokValue)
 	if err != nil {
@@ -134,7 +132,7 @@ func issuePublicQUICSession(ctx context.Context, capabilities uint32, emitter *t
 		derp:         derpClient,
 		token:        tokValue,
 		gate:         rendezvous.NewGate(tokValue),
-		derpMap:      dm,
+		derpMap:      bootstrap.dm,
 		quicIdentity: quicIdentity,
 	}
 	attachPublicPortmap(session, newBoundPublicPortmap(probeConn, nil))

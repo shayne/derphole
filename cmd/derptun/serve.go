@@ -142,7 +142,7 @@ func resolveServeServerToken(flags serveFlags, stdin io.Reader, stderr io.Writer
 		return "", 2, true
 	}
 
-	token, err = derptunpkg.GenerateServerToken(derptunpkg.ServerTokenOptions{})
+	token, err = derptunpkg.GenerateServerTokenFromEnvironment(derptunpkg.ServerTokenOptions{})
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return "", 1, true

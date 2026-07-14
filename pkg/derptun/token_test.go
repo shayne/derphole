@@ -12,8 +12,187 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shayne/derphole/pkg/derpbind"
 	sessiontoken "github.com/shayne/derphole/pkg/token"
 )
+
+const publicServerGolden = "dts1_eyJ2ZXJzaW9uIjoxLCJzZXNzaW9uX2lkIjpbMSwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMF0sImV4cGlyZXNfdW5peCI6MTcwMDAwMDAwMCwiZGVycF9wcml2YXRlIjoicHJpdmtleTpnb2xkZW4iLCJxdWljX3ByaXZhdGUiOiJBZ009Iiwic2lnbmluZ19zZWNyZXQiOls0LDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDAsMCwwLDBdfQ"
+
+func TestPublicServerCredentialGolden(t *testing.T) {
+	cred := ServerCredential{
+		Version:       TokenVersion,
+		ExpiresUnix:   1_700_000_000,
+		DERPPrivate:   "privkey:golden",
+		QUICPrivate:   []byte{2, 3},
+		SigningSecret: [32]byte{4},
+	}
+	cred.SessionID[0] = 1
+
+	got, err := encodeJSONToken(ServerTokenPrefix, cred)
+	if err != nil {
+		t.Fatalf("encodeJSONToken() error = %v", err)
+	}
+	if got != publicServerGolden {
+		t.Fatalf("encodeJSONToken() = %q, want literal public golden %q", got, publicServerGolden)
+	}
+}
+
+func TestCustomDERPCredentialFlowIgnoresDerivationEnvironment(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	route, err := derpbind.NewCustomRoute("derp.example.com", 8443, 3478)
+	if err != nil {
+		t.Fatalf("NewCustomRoute() error = %v", err)
+	}
+	serverToken, err := GenerateServerToken(ServerTokenOptions{Now: now, Days: 30, DERPRoute: route})
+	if err != nil {
+		t.Fatalf("GenerateServerToken(custom) error = %v", err)
+	}
+	if !strings.HasPrefix(serverToken, CustomServerTokenPrefix) {
+		t.Fatalf("server token = %q, want %s prefix", serverToken, CustomServerTokenPrefix)
+	}
+	server, err := DecodeServerToken(serverToken, now)
+	if err != nil {
+		t.Fatalf("DecodeServerToken(custom) error = %v", err)
+	}
+	if server.Version != CustomTokenVersion || server.DERPRoute == nil || *server.DERPRoute != route {
+		t.Fatalf("server credential = %+v, want version %d route %+v", server, CustomTokenVersion, route)
+	}
+
+	t.Setenv(derpbind.CustomDERPServerEnv, "https://conflict.invalid")
+	clientToken, err := GenerateClientToken(ClientTokenOptions{Now: now, ServerToken: serverToken, Days: 7})
+	if err != nil {
+		t.Fatalf("GenerateClientToken(custom) error = %v", err)
+	}
+	if !strings.HasPrefix(clientToken, CustomClientTokenPrefix) {
+		t.Fatalf("client token = %q, want %s prefix", clientToken, CustomClientTokenPrefix)
+	}
+	client, err := DecodeClientToken(clientToken, now)
+	if err != nil {
+		t.Fatalf("DecodeClientToken(custom) error = %v", err)
+	}
+	if client.Version != CustomTokenVersion || client.DERPRoute == nil || *client.DERPRoute != route {
+		t.Fatalf("client credential = %+v, want version %d route %+v", client, CustomTokenVersion, route)
+	}
+
+	serverSession, err := server.SessionToken()
+	if err != nil {
+		t.Fatalf("server SessionToken() error = %v", err)
+	}
+	clientSession, err := client.SessionToken()
+	if err != nil {
+		t.Fatalf("client SessionToken() error = %v", err)
+	}
+	for name, tok := range map[string]sessiontoken.Token{"server": serverSession, "client": clientSession} {
+		if tok.Version != sessiontoken.CustomDERPVersion || tok.DERPRoute != route {
+			t.Fatalf("%s session token = %+v, want version %d route %+v", name, tok, sessiontoken.CustomDERPVersion, route)
+		}
+	}
+
+	publicServerToken, err := GenerateServerToken(ServerTokenOptions{Now: now, Days: 30})
+	if err != nil {
+		t.Fatalf("GenerateServerToken(public) error = %v", err)
+	}
+	publicServer, err := DecodeServerToken(publicServerToken, now)
+	if err != nil {
+		t.Fatalf("DecodeServerToken(public) error = %v", err)
+	}
+	publicClientToken, err := GenerateClientToken(ClientTokenOptions{Now: now, ServerToken: publicServerToken, Days: 7})
+	if err != nil {
+		t.Fatalf("GenerateClientToken(public) error = %v", err)
+	}
+	publicClient, err := DecodeClientToken(publicClientToken, now)
+	if err != nil {
+		t.Fatalf("DecodeClientToken(public) error = %v", err)
+	}
+	publicServerSession, err := publicServer.SessionToken()
+	if err != nil {
+		t.Fatalf("public server SessionToken() error = %v", err)
+	}
+	publicClientSession, err := publicClient.SessionToken()
+	if err != nil {
+		t.Fatalf("public client SessionToken() error = %v", err)
+	}
+	if publicServerSession.Version != sessiontoken.SupportedVersion || publicClientSession.Version != sessiontoken.SupportedVersion {
+		t.Fatalf("public session versions = %d/%d, want %d", publicServerSession.Version, publicClientSession.Version, sessiontoken.SupportedVersion)
+	}
+	if publicServerSession.DERPRoute.IsCustom() || publicClientSession.DERPRoute.IsCustom() {
+		t.Fatalf("public session routes = %+v/%+v, want public", publicServerSession.DERPRoute, publicClientSession.DERPRoute)
+	}
+}
+
+func TestGenerateServerTokenFromEnvironment(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	t.Setenv(derpbind.CustomDERPServerEnv, "https://derp.example.com:8443/derp")
+	token, err := GenerateServerTokenFromEnvironment(ServerTokenOptions{Now: now, Days: 7})
+	if err != nil {
+		t.Fatalf("GenerateServerTokenFromEnvironment() error = %v", err)
+	}
+	cred, err := DecodeServerToken(token, now)
+	if err != nil {
+		t.Fatalf("DecodeServerToken() error = %v", err)
+	}
+	if cred.DERPRoute == nil || cred.DERPRoute.Host != "derp.example.com" || cred.DERPRoute.DERPPort != 8443 {
+		t.Fatalf("DERPRoute = %+v, want environment route", cred.DERPRoute)
+	}
+}
+
+func TestDecodeServerTokenRequiresMatchingPrefixVersionAndRoute(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	publicToken, err := GenerateServerToken(ServerTokenOptions{Now: now, Days: 7})
+	if err != nil {
+		t.Fatalf("GenerateServerToken(public) error = %v", err)
+	}
+	publicPayload := decodeTokenPayload(t, ServerTokenPrefix, publicToken)
+
+	v2WithPublicPrefix := cloneTokenPayload(publicPayload)
+	v2WithPublicPrefix["version"] = float64(CustomTokenVersion)
+	v2WithPublicPrefix["derp_route"] = map[string]any{"host": "derp.example.com", "derp_port": float64(8443), "stun_port": float64(3478)}
+
+	v1WithCustomPrefix := cloneTokenPayload(publicPayload)
+
+	for name, token := range map[string]string{
+		"dts1 with v2 route":  encodeTokenPayload(t, ServerTokenPrefix, v2WithPublicPrefix),
+		"dts2 with v1 public": encodeTokenPayload(t, CustomServerTokenPrefix, v1WithCustomPrefix),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeServerToken(token, now); !errors.Is(err, ErrInvalidToken) {
+				t.Fatalf("DecodeServerToken() error = %v, want ErrInvalidToken", err)
+			}
+		})
+	}
+}
+
+func TestCredentialPrefixRecognitionIsExact(t *testing.T) {
+	for _, tt := range []struct {
+		value  string
+		server bool
+		client bool
+	}{
+		{value: ServerTokenPrefix + "payload", server: true},
+		{value: CustomServerTokenPrefix + "payload", server: true},
+		{value: ClientTokenPrefix + "payload", client: true},
+		{value: CustomClientTokenPrefix + "payload", client: true},
+		{value: "dts3_payload"},
+		{value: "DT3payload"},
+		{value: "prefix" + ServerTokenPrefix},
+		{value: "prefix" + ClientTokenPrefix},
+	} {
+		if got := HasServerTokenPrefix(tt.value); got != tt.server {
+			t.Errorf("HasServerTokenPrefix(%q) = %t, want %t", tt.value, got, tt.server)
+		}
+		if got := HasClientTokenPrefix(tt.value); got != tt.client {
+			t.Errorf("HasClientTokenPrefix(%q) = %t, want %t", tt.value, got, tt.client)
+		}
+	}
+}
+
+func cloneTokenPayload(payload map[string]any) map[string]any {
+	clone := make(map[string]any, len(payload))
+	for key, value := range payload {
+		clone[key] = value
+	}
+	return clone
+}
 
 func TestGenerateServerTokenDefaultsToSixMonths(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()

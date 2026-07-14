@@ -17,6 +17,7 @@ import (
 	"time"
 
 	creackpty "github.com/creack/pty"
+	"github.com/shayne/derphole/pkg/derpbind"
 	"github.com/shayne/derphole/pkg/derpssh/protocol"
 	"github.com/shayne/derphole/pkg/derpssh/pty"
 	"github.com/shayne/derphole/pkg/derptun"
@@ -38,6 +39,40 @@ func TestInviteRoundTrip(t *testing.T) {
 	}
 	if decoded.ClientToken != clientToken {
 		t.Fatalf("ClientToken = %q, want %q", decoded.ClientToken, clientToken)
+	}
+}
+
+func TestShareInviteCustomDERPCredentialsDelegateTransportToDerptunAppMux(t *testing.T) {
+	t.Setenv(derpbind.CustomDERPServerEnv, "https://derp.example.com:8443/derp")
+	serverToken, command, err := newShareInviteCommand()
+	if err != nil {
+		t.Fatalf("newShareInviteCommand() error = %v", err)
+	}
+	if !strings.HasPrefix(serverToken, derptun.CustomServerTokenPrefix) {
+		t.Fatalf("server token = %q, want %s prefix", serverToken, derptun.CustomServerTokenPrefix)
+	}
+	t.Setenv(derpbind.CustomDERPServerEnv, "")
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		t.Fatalf("command = %q, want invite", command)
+	}
+	inv, err := DecodeInvite(fields[len(fields)-1])
+	if err != nil {
+		t.Fatalf("DecodeInvite() error = %v", err)
+	}
+	client, err := derptun.DecodeClientToken(inv.ClientToken, time.Now())
+	if err != nil {
+		t.Fatalf("DecodeClientToken() error = %v", err)
+	}
+	server, err := derptun.DecodeServerToken(serverToken, time.Now())
+	if err != nil {
+		t.Fatalf("DecodeServerToken() error = %v", err)
+	}
+	if server.DERPRoute == nil || client.DERPRoute == nil || *server.DERPRoute != *client.DERPRoute {
+		t.Fatalf("credential DERP routes = server %+v client %+v, want identical embedded routes", server.DERPRoute, client.DERPRoute)
+	}
+	if client.DERPRoute.Host != "derp.example.com" || client.DERPRoute.DERPPort != 8443 {
+		t.Fatalf("client DERPRoute = %+v, want creator environment route", client.DERPRoute)
 	}
 }
 

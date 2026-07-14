@@ -96,7 +96,7 @@ func (p *ParsedPayload) Path() string {
 
 func ParsePayload(payload string) (*ParsedPayload, error) {
 	payload = strings.TrimSpace(payload)
-	if strings.HasPrefix(payload, derptun.ClientTokenPrefix) {
+	if derptun.HasClientTokenPrefix(payload) {
 		if _, err := derptun.DecodeClientToken(payload, time.Now()); err != nil {
 			return nil, err
 		}

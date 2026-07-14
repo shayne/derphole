@@ -13,8 +13,54 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shayne/derphole/pkg/derpbind"
 	"github.com/shayne/derphole/pkg/token"
+	"tailscale.com/tailcfg"
 )
+
+func TestDerptunDurableCustomDERPDelegatesAttachAndOpenRuntimes(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv(derpbind.CustomDERPServerEnv, "https://consumer.invalid:9443/derp")
+	clearDERPProxyEnvironment(t)
+	route, err := derpbind.NewCustomRoute("127.0.0.1", 8443, derpbind.DefaultSTUNPort)
+	if err != nil {
+		t.Fatalf("NewCustomRoute() error = %v", err)
+	}
+	tok := token.Token{
+		Version:         token.CustomDERPVersion,
+		BootstrapRegion: derpbind.CustomDERPRegionID,
+		DERPPublic:      [32]byte{1},
+		DERPRoute:       route,
+	}
+
+	oldFetch := fetchSessionDERPMap
+	t.Cleanup(func() { fetchSessionDERPMap = oldFetch })
+	fetchCalls := 0
+	fetchSessionDERPMap = func(context.Context, string) (*tailcfg.DERPMap, error) {
+		fetchCalls++
+		return nil, errors.New("unexpected public DERP map fetch")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	attachRuntime, err := newAttachDialRuntime(ctx, AttachDialConfig{ForceRelay: true}, tok)
+	if err != nil {
+		t.Fatalf("newAttachDialRuntime() error = %v", err)
+	}
+	assertCustomDERPMap(t, attachRuntime.dm, route)
+	attachRuntime.close()
+
+	openRuntime, err := newOpenExternalRuntime(ctx, OpenConfig{ForceRelay: true}, tok)
+	if err != nil {
+		t.Fatalf("newOpenExternalRuntime() error = %v", err)
+	}
+	assertCustomDERPMap(t, openRuntime.dm, route)
+	openRuntime.close()
+	if fetchCalls != 0 {
+		t.Fatalf("public DERP map fetch calls = %d, want 0 for embedded custom route", fetchCalls)
+	}
+}
 
 func TestListenAttachAndDialAttachExternalRoundTrip(t *testing.T) {
 	srv := newSessionTestDERPServer(t)

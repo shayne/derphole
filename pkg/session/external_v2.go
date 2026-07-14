@@ -141,20 +141,15 @@ func newExternalV2SendRuntime(ctx context.Context, cfg SendConfig) (*externalV2S
 }
 
 func (rt *externalV2SendRuntime) openDERP(ctx context.Context) error {
-	dm, err := derpbind.FetchMap(ctx, publicDERPMapURL())
+	bootstrap, err := resolveDERPBootstrap(ctx, rt.tok.DERPRoute, int(rt.tok.BootstrapRegion), "no bootstrap DERP node available")
 	if err != nil {
 		return err
 	}
-	node := firstDERPNode(dm, int(rt.tok.BootstrapRegion))
-	if node == nil {
-		return errors.New("no bootstrap DERP node available")
-	}
-	client, err := derpbind.NewClient(ctx, node, publicDERPServerURL(node))
+	client, err := openSessionDERPClient(ctx, bootstrap, rt.cfg.Emitter)
 	if err != nil {
 		return err
 	}
-	emitDERPProxyDebug(rt.cfg.Emitter, client)
-	rt.dm = dm
+	rt.dm = bootstrap.dm
 	rt.derp = client
 	return nil
 }

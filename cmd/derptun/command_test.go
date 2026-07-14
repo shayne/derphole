@@ -15,10 +15,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shayne/derphole/pkg/derpbind"
 	"github.com/shayne/derphole/pkg/derptun"
 	"github.com/shayne/derphole/pkg/endpointlookup"
 	"github.com/shayne/derphole/pkg/session"
 )
+
+func TestMain(m *testing.M) {
+	value, hadValue := os.LookupEnv(derpbind.CustomDERPServerEnv)
+	_ = os.Unsetenv(derpbind.CustomDERPServerEnv)
+	code := m.Run()
+	if hadValue {
+		_ = os.Setenv(derpbind.CustomDERPServerEnv, value)
+	} else {
+		_ = os.Unsetenv(derpbind.CustomDERPServerEnv)
+	}
+	os.Exit(code)
+}
 
 func TestRunServePassesServerTokenAndTCP(t *testing.T) {
 	serverToken := newDerptunServerToken(t)
@@ -48,6 +61,7 @@ func TestRunServePassesServerTokenAndTCP(t *testing.T) {
 }
 
 func TestRunServeWithoutTokenGeneratesEphemeralServerTokenAndPrintsOpenCommand(t *testing.T) {
+	t.Setenv(derpbind.CustomDERPServerEnv, "")
 	oldServe := derptunServe
 	defer func() { derptunServe = oldServe }()
 	derptunServe = func(ctx context.Context, cfg session.DerptunServeConfig) error {
@@ -68,6 +82,52 @@ func TestRunServeWithoutTokenGeneratesEphemeralServerTokenAndPrintsOpenCommand(t
 	clientToken := extractDerptunOpenCommandToken(t, stderr.String())
 	if _, err := derptun.DecodeClientToken(clientToken, time.Now()); err != nil {
 		t.Fatalf("DecodeClientToken() error = %v", err)
+	}
+}
+
+func TestRunServeWithoutTokenUsesCustomDERPEnvironment(t *testing.T) {
+	t.Setenv(derpbind.CustomDERPServerEnv, "https://derp.example.com:8443/derp")
+	oldServe := derptunServe
+	defer func() { derptunServe = oldServe }()
+	derptunServe = func(ctx context.Context, cfg session.DerptunServeConfig) error {
+		if !strings.HasPrefix(cfg.ServerToken, derptun.CustomServerTokenPrefix) {
+			t.Fatalf("ServerToken = %q, want %s prefix", cfg.ServerToken, derptun.CustomServerTokenPrefix)
+		}
+		return nil
+	}
+
+	var stderr bytes.Buffer
+	code := run([]string{"serve", "--tcp", "127.0.0.1:8080"}, strings.NewReader(""), &bytes.Buffer{}, &stderr)
+	if code != 0 {
+		t.Fatalf("code = %d stderr=%s", code, stderr.String())
+	}
+	clientToken := extractDerptunOpenCommandToken(t, stderr.String())
+	if !strings.HasPrefix(clientToken, derptun.CustomClientTokenPrefix) {
+		t.Fatalf("client token = %q, want %s prefix", clientToken, derptun.CustomClientTokenPrefix)
+	}
+}
+
+func TestRunTokenServerRejectsInvalidCustomDERPEnvironment(t *testing.T) {
+	t.Setenv(derpbind.CustomDERPServerEnv, "http://insecure.invalid")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"token", "server", "--days", "7"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1; stderr=%s", code, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want no token", stdout.String())
+	}
+}
+
+func TestRunTokenServerUsesCustomDERPEnvironment(t *testing.T) {
+	t.Setenv(derpbind.CustomDERPServerEnv, "https://derp.example.com:8443/derp")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"token", "server", "--days", "7"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("code = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if token := strings.TrimSpace(stdout.String()); !strings.HasPrefix(token, derptun.CustomServerTokenPrefix) {
+		t.Fatalf("token = %q, want %s prefix", token, derptun.CustomServerTokenPrefix)
 	}
 }
 
@@ -209,6 +269,25 @@ func TestRunOpenReadsClientTokenFromStdin(t *testing.T) {
 
 func TestRunOpenRejectsServerTokenWithRoleError(t *testing.T) {
 	serverToken := newDerptunServerToken(t)
+	var stderr bytes.Buffer
+	code := run([]string{"open", "--token", serverToken}, strings.NewReader(""), &bytes.Buffer{}, &stderr)
+	if code != 2 {
+		t.Fatalf("code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "server tokens are for derptun serve") {
+		t.Fatalf("stderr = %q, want server-token role error", stderr.String())
+	}
+}
+
+func TestRunOpenRejectsCustomServerTokenWithRoleError(t *testing.T) {
+	route, err := derpbind.NewCustomRoute("derp.example.com", 8443, 3478)
+	if err != nil {
+		t.Fatalf("NewCustomRoute() error = %v", err)
+	}
+	serverToken, err := derptun.GenerateServerToken(derptun.ServerTokenOptions{Days: 7, DERPRoute: route})
+	if err != nil {
+		t.Fatalf("GenerateServerToken() error = %v", err)
+	}
 	var stderr bytes.Buffer
 	code := run([]string{"open", "--token", serverToken}, strings.NewReader(""), &bytes.Buffer{}, &stderr)
 	if code != 2 {
@@ -483,7 +562,7 @@ func extractDerptunOpenCommandToken(t *testing.T, output string) string {
 	t.Helper()
 	fields := strings.Fields(output)
 	for i := 0; i+1 < len(fields); i++ {
-		if fields[i] == "--token" && strings.HasPrefix(fields[i+1], derptun.ClientTokenPrefix) {
+		if fields[i] == "--token" && derptun.HasClientTokenPrefix(fields[i+1]) {
 			return fields[i+1]
 		}
 	}

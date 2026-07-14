@@ -83,7 +83,9 @@ func runTokenServer(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprint(stderr, tokenHelpText())
 		return 2
 	}
-	tokenValue, err := derptun.GenerateServerToken(derptun.ServerTokenOptions{Days: parsed.SubCommandFlags.Days, Expires: expires})
+	tokenValue, err := derptun.GenerateServerTokenFromEnvironment(
+		derptun.ServerTokenOptions{Days: parsed.SubCommandFlags.Days, Expires: expires},
+	)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1

@@ -6,12 +6,44 @@ package webrtcdirect
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/shayne/derphole/pkg/derphole/webproto"
 	"github.com/shayne/derphole/pkg/derphole/webrelay"
 )
+
+func TestPeerConnectionConfigUsesOnlyProvidedSTUNURLs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		urls []string
+	}{
+		{
+			name: "public",
+			urls: []string{
+				"stun:stun.l.google.com:19302",
+				"stun:stun.cloudflare.com:3478",
+			},
+		},
+		{
+			name: "custom",
+			urls: []string{"stun:[2001:db8::7]:5349"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := peerConnectionConfig(webrelay.DirectConfig{STUNURLs: tc.urls})
+			if len(got.ICEServers) != len(tc.urls) {
+				t.Fatalf("ICE server count = %d, want %d", len(got.ICEServers), len(tc.urls))
+			}
+			for i, server := range got.ICEServers {
+				if !slices.Equal(server.URLs, []string{tc.urls[i]}) {
+					t.Fatalf("ICE server %d URLs = %q, want only %q", i, server.URLs, tc.urls[i])
+				}
+			}
+		})
+	}
+}
 
 type memoryPeer struct {
 	in  chan webproto.Frame
@@ -43,10 +75,11 @@ func TestTransportLoopbackSendsFrame(t *testing.T) {
 	defer sender.Close()
 	defer receiver.Close()
 
-	if err := receiver.Start(ctx, webrelay.DirectRoleReceiver, receiverPeer); err != nil {
+	config := webrelay.DirectConfig{STUNURLs: []string{"stun:127.0.0.1:3478"}}
+	if err := receiver.Start(ctx, webrelay.DirectRoleReceiver, receiverPeer, config); err != nil {
 		t.Fatalf("receiver Start() error = %v", err)
 	}
-	if err := sender.Start(ctx, webrelay.DirectRoleSender, senderPeer); err != nil {
+	if err := sender.Start(ctx, webrelay.DirectRoleSender, senderPeer, config); err != nil {
 		t.Fatalf("sender Start() error = %v", err)
 	}
 
@@ -97,10 +130,11 @@ func TestTransportLoopbackOpensStripedChannels(t *testing.T) {
 	defer sender.Close()
 	defer receiver.Close()
 
-	if err := receiver.Start(ctx, webrelay.DirectRoleReceiver, receiverPeer); err != nil {
+	config := webrelay.DirectConfig{STUNURLs: []string{"stun:127.0.0.1:3478"}}
+	if err := receiver.Start(ctx, webrelay.DirectRoleReceiver, receiverPeer, config); err != nil {
 		t.Fatalf("receiver Start() error = %v", err)
 	}
-	if err := sender.Start(ctx, webrelay.DirectRoleSender, senderPeer); err != nil {
+	if err := sender.Start(ctx, webrelay.DirectRoleSender, senderPeer, config); err != nil {
 		t.Fatalf("sender Start() error = %v", err)
 	}
 

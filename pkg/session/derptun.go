@@ -183,24 +183,21 @@ func loadDerptunServeIdentity(serverToken string) (derptun.ServerCredential, ses
 }
 
 func openDerptunServeDERP(ctx context.Context, tok sessiontoken.Token, cred derptun.ServerCredential, emitter *telemetry.Emitter) (*tailcfg.DERPMap, *derpbind.Client, error) {
+	bootstrap, err := resolveDERPBootstrap(ctx, tok.DERPRoute, int(tok.BootstrapRegion), "no bootstrap DERP node available")
+	if err != nil {
+		return nil, nil, err
+	}
 	derpPriv, err := cred.DERPKey()
 	if err != nil {
 		return nil, nil, err
 	}
-	dm, err := derpbind.FetchMap(ctx, publicDERPMapURL())
+	emitDERPRouteDebug(emitter, bootstrap.route)
+	derpClient, err := derpbind.NewClientWithPrivateKey(ctx, bootstrap.node, bootstrap.serverURL, derpPriv)
 	if err != nil {
-		return nil, nil, err
-	}
-	node := firstDERPNode(dm, int(tok.BootstrapRegion))
-	if node == nil {
-		return nil, nil, errors.New("no bootstrap DERP node available")
-	}
-	derpClient, err := derpbind.NewClientWithPrivateKey(ctx, node, publicDERPServerURL(node), derpPriv)
-	if err != nil {
-		return nil, nil, err
+		return nil, nil, derpbind.WrapCustomDERPConnectError(bootstrap.route, bootstrap.serverURL, err)
 	}
 	emitDERPProxyDebug(emitter, derpClient)
-	return dm, derpClient, nil
+	return bootstrap.dm, derpClient, nil
 }
 
 func openDerptunServeProbe(emitter *telemetry.Emitter) (net.PacketConn, publicPortmap, error) {
@@ -430,13 +427,14 @@ func derptunServerTokenForClaim(server derptun.ServerCredential, claim rendezvou
 		return sessiontoken.Token{}, rendezvous.Decision{Accepted: false, Reject: &rendezvous.RejectInfo{Code: rendezvous.RejectClaimMalformed, Reason: "client proof missing"}}, rendezvous.ErrDenied
 	}
 	client := derptun.ClientCredential{
-		Version:     derptun.TokenVersion,
+		Version:     server.Version,
 		SessionID:   claim.SessionID,
 		ClientID:    claim.Client.ClientID,
 		TokenID:     claim.Client.TokenID,
 		ClientName:  claim.Client.ClientName,
 		ExpiresUnix: claim.Client.ExpiresUnix,
 		ProofMAC:    claim.Client.ProofMAC,
+		DERPRoute:   server.DERPRoute,
 	}
 	if client.ExpiresUnix > server.ExpiresUnix {
 		return sessiontoken.Token{}, rendezvous.Decision{Accepted: false, Reject: &rendezvous.RejectInfo{Code: rendezvous.RejectExpired, Reason: "client expiry exceeds server expiry"}}, derptun.ErrExpired
@@ -1814,20 +1812,15 @@ func loadDerptunDialToken(clientToken string) (derptun.ClientCredential, session
 }
 
 func openDerptunDialDERP(ctx context.Context, tok sessiontoken.Token, emitter *telemetry.Emitter) (*tailcfg.DERPMap, *derpbind.Client, error) {
-	dm, err := derpbind.FetchMap(ctx, publicDERPMapURL())
+	bootstrap, err := resolveDERPBootstrap(ctx, tok.DERPRoute, int(tok.BootstrapRegion), "no bootstrap DERP node available")
 	if err != nil {
 		return nil, nil, err
 	}
-	node := firstDERPNode(dm, int(tok.BootstrapRegion))
-	if node == nil {
-		return nil, nil, errors.New("no bootstrap DERP node available")
-	}
-	derpClient, err := derpbind.NewClient(ctx, node, publicDERPServerURL(node))
+	derpClient, err := openSessionDERPClient(ctx, bootstrap, emitter)
 	if err != nil {
 		return nil, nil, err
 	}
-	emitDERPProxyDebug(emitter, derpClient)
-	return dm, derpClient, nil
+	return bootstrap.dm, derpClient, nil
 }
 
 func (r *derptunDialRuntime) openProbe(ctx context.Context, emitter *telemetry.Emitter, forceRelay bool) error {

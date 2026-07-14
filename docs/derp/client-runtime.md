@@ -14,6 +14,8 @@ This split is important because "DERP client behavior" is not just a socket dial
 
 derphole, derptun, and derpssh do not add proxy flags. Set the standard proxy environment variables before starting the process. Public `https://` DERP endpoints use `HTTPS_PROXY`; `HTTP_PROXY` applies to `http://` DERP endpoints. The lowercase forms and `NO_PROXY`/`no_proxy` follow Go's standard proxy resolver semantics.
 
+Self-hosted routes use the same proxy machinery. See [Custom DERP Servers](./custom-server.md) for the embedded-route contract, relay and STUN behavior, and its trust boundary.
+
 ```sh
 export HTTPS_PROXY=http://proxy.example:3128
 export NO_PROXY=localhost,127.0.0.1

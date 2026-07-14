@@ -64,7 +64,7 @@ func resolveClientTokenSource(ctx context.Context, stdin io.Reader, source token
 
 func validateClientTokenForCLI(token string) error {
 	token = strings.TrimSpace(token)
-	if strings.HasPrefix(token, derptunpkg.ServerTokenPrefix) {
+	if derptunpkg.HasServerTokenPrefix(token) {
 		return errServerTokenForClient
 	}
 	if _, err := derptunpkg.DecodeClientToken(token, time.Now()); err != nil {

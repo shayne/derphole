@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -25,6 +26,7 @@ import (
 	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/token"
 	"go4.org/mem"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
 
@@ -44,6 +46,181 @@ func derptunServerAndClientTokens(t *testing.T) (string, string) {
 		t.Fatalf("GenerateClientToken() error = %v", err)
 	}
 	return server, client
+}
+
+func TestDerptunDurableCustomDERPRouteIgnoresConsumerEnvironment(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+	clearDERPProxyEnvironment(t)
+
+	t.Setenv(derpbind.CustomDERPServerEnv, "https://Creator.Invalid.:8443/derp")
+	serverToken, err := derptun.GenerateServerTokenFromEnvironment(derptun.ServerTokenOptions{Now: time.Now(), Days: 1})
+	if err != nil {
+		t.Fatalf("GenerateServerTokenFromEnvironment() error = %v", err)
+	}
+	if !strings.HasPrefix(serverToken, derptun.CustomServerTokenPrefix) {
+		t.Fatalf("server token prefix = %q, want %q", serverToken[:len(derptun.CustomServerTokenPrefix)], derptun.CustomServerTokenPrefix)
+	}
+
+	t.Setenv(derpbind.CustomDERPServerEnv, "https://consumer.invalid:9443/derp")
+	clientToken, err := derptun.GenerateClientToken(derptun.ClientTokenOptions{Now: time.Now(), ServerToken: serverToken, Days: 1})
+	if err != nil {
+		t.Fatalf("GenerateClientToken() error = %v", err)
+	}
+	if !strings.HasPrefix(clientToken, derptun.CustomClientTokenPrefix) {
+		t.Fatalf("client token prefix = %q, want %q", clientToken[:len(derptun.CustomClientTokenPrefix)], derptun.CustomClientTokenPrefix)
+	}
+
+	serverCred, serverSession, _, err := loadDerptunServeIdentity(serverToken)
+	if err != nil {
+		t.Fatalf("loadDerptunServeIdentity() error = %v", err)
+	}
+	clientCred, clientSession, _, err := loadDerptunDialToken(clientToken)
+	if err != nil {
+		t.Fatalf("loadDerptunDialToken() error = %v", err)
+	}
+	wantRoute, err := derpbind.NewCustomRoute("creator.invalid", 8443, derpbind.DefaultSTUNPort)
+	if err != nil {
+		t.Fatalf("NewCustomRoute() error = %v", err)
+	}
+	for name, tok := range map[string]token.Token{"server": serverSession, "client": clientSession} {
+		if tok.Version != token.CustomDERPVersion || tok.DERPRoute != wantRoute {
+			t.Fatalf("%s session token = %+v, want version %d route %+v", name, tok, token.CustomDERPVersion, wantRoute)
+		}
+	}
+	if serverCred.DERPRoute == nil || clientCred.DERPRoute == nil || *serverCred.DERPRoute != wantRoute || *clientCred.DERPRoute != wantRoute {
+		t.Fatalf("credential routes = server %+v client %+v, want %+v", serverCred.DERPRoute, clientCred.DERPRoute, wantRoute)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	serverMap, serverDERP, err := openDerptunServeDERP(ctx, serverSession, serverCred, nil)
+	if err != nil {
+		t.Fatalf("openDerptunServeDERP() error = %v", err)
+	}
+	defer serverDERP.Close()
+	clientMap, clientDERP, err := openDerptunDialDERP(ctx, clientSession, nil)
+	if err != nil {
+		t.Fatalf("openDerptunDialDERP() error = %v", err)
+	}
+	defer clientDERP.Close()
+	assertCustomDERPMap(t, serverMap, wantRoute)
+	assertCustomDERPMap(t, clientMap, wantRoute)
+	serverDERPKey, err := serverCred.DERPKey()
+	if err != nil {
+		t.Fatalf("server DERPKey() error = %v", err)
+	}
+	if serverDERP.PublicKey() != serverDERPKey.Public() {
+		t.Fatalf("server DERP public key = %v, want credential key %v", serverDERP.PublicKey(), serverDERPKey.Public())
+	}
+	if clientDERP.PublicKey().IsZero() || clientDERP.PublicKey() == serverDERP.PublicKey() {
+		t.Fatalf("client DERP public key = %v, want non-zero ephemeral key distinct from server %v", clientDERP.PublicKey(), serverDERP.PublicKey())
+	}
+}
+
+func TestDerptunPublicCredentialsUsePublicDERPMap(t *testing.T) {
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+	t.Setenv(derpbind.CustomDERPServerEnv, "https://consumer.invalid:9443/derp")
+	clearDERPProxyEnvironment(t)
+
+	serverToken, clientToken := derptunServerAndClientTokens(t)
+	if !strings.HasPrefix(serverToken, derptun.ServerTokenPrefix) || !strings.HasPrefix(clientToken, derptun.ClientTokenPrefix) {
+		t.Fatalf("public credential prefixes = %q/%q, want %q/%q", serverToken[:len(derptun.ServerTokenPrefix)], clientToken[:len(derptun.ClientTokenPrefix)], derptun.ServerTokenPrefix, derptun.ClientTokenPrefix)
+	}
+	serverCred, serverSession, _, err := loadDerptunServeIdentity(serverToken)
+	if err != nil {
+		t.Fatalf("loadDerptunServeIdentity() error = %v", err)
+	}
+	_, clientSession, _, err := loadDerptunDialToken(clientToken)
+	if err != nil {
+		t.Fatalf("loadDerptunDialToken() error = %v", err)
+	}
+	if serverSession.Version != token.SupportedVersion || clientSession.Version != token.SupportedVersion || serverSession.DERPRoute.IsCustom() || clientSession.DERPRoute.IsCustom() {
+		t.Fatalf("public session tokens = server %+v client %+v, want version %d public routes", serverSession, clientSession, token.SupportedVersion)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	serverMap, serverDERP, err := openDerptunServeDERP(ctx, serverSession, serverCred, nil)
+	if err != nil {
+		t.Fatalf("openDerptunServeDERP() error = %v", err)
+	}
+	defer serverDERP.Close()
+	clientMap, clientDERP, err := openDerptunDialDERP(ctx, clientSession, nil)
+	if err != nil {
+		t.Fatalf("openDerptunDialDERP() error = %v", err)
+	}
+	defer clientDERP.Close()
+	for name, dm := range map[string]*tailcfg.DERPMap{"server": serverMap, "client": clientMap} {
+		if dm == nil || dm.OmitDefaultRegions || dm.Regions[1] == nil {
+			t.Fatalf("%s DERP map = %+v, want public provider region 1", name, dm)
+		}
+		if dm.Regions[derpbind.CustomDERPRegionID] != nil {
+			t.Fatalf("%s DERP map = %+v, want no custom region", name, dm)
+		}
+	}
+}
+
+func TestDerptunMalformedCustomDERPCredentialsFailBeforeBootstrap(t *testing.T) {
+	route, err := derpbind.NewCustomRoute("creator.invalid", 8443, derpbind.DefaultSTUNPort)
+	if err != nil {
+		t.Fatalf("NewCustomRoute() error = %v", err)
+	}
+	serverToken, err := derptun.GenerateServerToken(derptun.ServerTokenOptions{Now: time.Now(), Days: 1, DERPRoute: route})
+	if err != nil {
+		t.Fatalf("GenerateServerToken() error = %v", err)
+	}
+	clientToken, err := derptun.GenerateClientToken(derptun.ClientTokenOptions{Now: time.Now(), ServerToken: serverToken, Days: 1})
+	if err != nil {
+		t.Fatalf("GenerateClientToken() error = %v", err)
+	}
+
+	serverCred, err := derptun.DecodeServerToken(serverToken, time.Now())
+	if err != nil {
+		t.Fatalf("DecodeServerToken() error = %v", err)
+	}
+	serverCred.DERPRoute = &derpbind.Route{Host: "Creator.Invalid", DERPPort: 8443, STUNPort: derpbind.DefaultSTUNPort}
+	payload, err := json.Marshal(serverCred)
+	if err != nil {
+		t.Fatalf("json.Marshal(server credential) error = %v", err)
+	}
+	malformedServer := derptun.CustomServerTokenPrefix + base64.RawURLEncoding.EncodeToString(payload)
+	malformedClient := clientToken[:len(clientToken)-3]
+
+	oldFetch := fetchSessionDERPMap
+	t.Cleanup(func() { fetchSessionDERPMap = oldFetch })
+	fetchCalls := 0
+	fetchSessionDERPMap = func(context.Context, string) (*tailcfg.DERPMap, error) {
+		fetchCalls++
+		return nil, errors.New("unexpected DERP map fetch")
+	}
+	if _, _, _, err := loadDerptunServeIdentity(malformedServer); !errors.Is(err, derptun.ErrInvalidToken) {
+		t.Fatalf("loadDerptunServeIdentity(malformed route) error = %v, want ErrInvalidToken", err)
+	}
+	if _, _, _, err := loadDerptunDialToken(malformedClient); !errors.Is(err, derptun.ErrInvalidToken) {
+		t.Fatalf("loadDerptunDialToken(truncated route) error = %v, want ErrInvalidToken", err)
+	}
+	if fetchCalls != 0 {
+		t.Fatalf("DERP map fetch calls = %d, want 0 before credential decoding succeeds", fetchCalls)
+	}
+}
+
+func assertCustomDERPMap(t *testing.T, dm *tailcfg.DERPMap, route derpbind.Route) {
+	t.Helper()
+	if dm == nil || !dm.OmitDefaultRegions || len(dm.Regions) != 1 {
+		t.Fatalf("DERP map = %+v, want exactly one custom-only region", dm)
+	}
+	region := dm.Regions[derpbind.CustomDERPRegionID]
+	if region == nil || len(region.Nodes) != 1 {
+		t.Fatalf("custom DERP region = %+v, want exactly one node", region)
+	}
+	node := region.Nodes[0]
+	if node == nil || node.HostName != route.Host || node.DERPPort != int(route.DERPPort) || node.STUNPort != int(route.STUNPort) {
+		t.Fatalf("custom DERP node = %+v, want host %q DERP %d STUN %d", node, route.Host, route.DERPPort, route.STUNPort)
+	}
 }
 
 func TestDerptunOpenForwardsTCPToServedTarget(t *testing.T) {

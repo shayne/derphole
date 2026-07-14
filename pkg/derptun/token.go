@@ -14,20 +14,25 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/shayne/derphole/pkg/derpbind"
 	sessiontoken "github.com/shayne/derphole/pkg/token"
 	"tailscale.com/types/key"
 )
 
 const (
-	ServerTokenPrefix = "dts1_"
-	ClientTokenPrefix = "DT1"
-	TokenVersion      = 1
-	DefaultServerDays = 180
-	DefaultClientDays = 90
-	ProtocolTCP       = "tcp"
-	ProtocolUDP       = "udp"
+	ServerTokenPrefix       = "dts1_"
+	CustomServerTokenPrefix = "dts2_"
+	ClientTokenPrefix       = "DT1"
+	CustomClientTokenPrefix = "DT2"
+	TokenVersion            = 1
+	CustomTokenVersion      = 2
+	DefaultServerDays       = 180
+	DefaultClientDays       = 90
+	ProtocolTCP             = "tcp"
+	ProtocolUDP             = "udp"
 )
 
 var (
@@ -36,9 +41,10 @@ var (
 )
 
 type ServerTokenOptions struct {
-	Now     time.Time
-	Days    int
-	Expires time.Time
+	Now       time.Time
+	Days      int
+	Expires   time.Time
+	DERPRoute derpbind.Route
 }
 
 type ClientTokenOptions struct {
@@ -56,13 +62,14 @@ type ForwardSpec struct {
 }
 
 type ServerCredential struct {
-	Version       int           `json:"version"`
-	SessionID     [16]byte      `json:"session_id"`
-	ExpiresUnix   int64         `json:"expires_unix"`
-	DERPPrivate   string        `json:"derp_private"`
-	QUICPrivate   []byte        `json:"quic_private"`
-	SigningSecret [32]byte      `json:"signing_secret"`
-	Forwards      []ForwardSpec `json:"forwards,omitempty"`
+	Version       int             `json:"version"`
+	SessionID     [16]byte        `json:"session_id"`
+	ExpiresUnix   int64           `json:"expires_unix"`
+	DERPPrivate   string          `json:"derp_private"`
+	QUICPrivate   []byte          `json:"quic_private"`
+	SigningSecret [32]byte        `json:"signing_secret"`
+	Forwards      []ForwardSpec   `json:"forwards,omitempty"`
+	DERPRoute     *derpbind.Route `json:"derp_route,omitempty"`
 }
 
 type ClientCredential struct {
@@ -76,17 +83,23 @@ type ClientCredential struct {
 	QUICPublic   [32]byte `json:"quic_public"`
 	BearerSecret [32]byte `json:"bearer_secret"`
 	ProofMAC     string   `json:"proof_mac"`
+	DERPRoute    *derpbind.Route
 }
 
 func GenerateServerToken(opts ServerTokenOptions) (string, error) {
+	if err := opts.DERPRoute.Validate(); err != nil {
+		return "", err
+	}
 	now := normalizedNow(opts.Now)
 	expires, err := resolveExpiry(now, opts.Days, opts.Expires, DefaultServerDays)
 	if err != nil {
 		return "", err
 	}
+	version, prefix := serverCredentialEncoding(opts.DERPRoute)
 	cred := ServerCredential{
-		Version:     TokenVersion,
+		Version:     version,
 		ExpiresUnix: expires.Unix(),
+		DERPRoute:   cloneCustomRoute(opts.DERPRoute),
 	}
 	if _, err := rand.Read(cred.SessionID[:]); err != nil {
 		return "", err
@@ -105,7 +118,16 @@ func GenerateServerToken(opts ServerTokenOptions) (string, error) {
 		return "", err
 	}
 	cred.QUICPrivate = append([]byte(nil), quicPrivate...)
-	return encodeJSONToken(ServerTokenPrefix, cred)
+	return encodeJSONToken(prefix, cred)
+}
+
+func GenerateServerTokenFromEnvironment(opts ServerTokenOptions) (string, error) {
+	route, err := derpbind.RouteFromEnvironment()
+	if err != nil {
+		return "", err
+	}
+	opts.DERPRoute = route
+	return GenerateServerToken(opts)
 }
 
 func GenerateClientToken(opts ClientTokenOptions) (string, error) {
@@ -122,9 +144,10 @@ func GenerateClientToken(opts ClientTokenOptions) (string, error) {
 		return "", fmt.Errorf("client expiry exceeds server expiry")
 	}
 	client := ClientCredential{
-		Version:     TokenVersion,
+		Version:     server.Version,
 		SessionID:   server.SessionID,
 		ExpiresUnix: expires.Unix(),
+		DERPRoute:   cloneRoutePointer(server.DERPRoute),
 	}
 	if _, err := rand.Read(client.ClientID[:]); err != nil {
 		return "", err
@@ -140,7 +163,10 @@ func GenerateClientToken(opts ClientTokenOptions) (string, error) {
 	client.DERPPublic = serverTok.DERPPublic
 	client.QUICPublic = serverTok.QUICPublic
 	client.BearerSecret = deriveClientBearerSecret(server.SigningSecret, client.ClientID)
-	client.ProofMAC = computeClientProofMAC(server.SigningSecret, client)
+	client.ProofMAC, err = computeClientProofMAC(server.SigningSecret, client)
+	if err != nil {
+		return "", err
+	}
 	return EncodeClientCredential(client)
 }
 
@@ -152,11 +178,15 @@ func EncodeClientCredential(cred ClientCredential) (string, error) {
 }
 
 func DecodeServerToken(encoded string, now time.Time) (ServerCredential, error) {
-	var cred ServerCredential
-	if err := decodeJSONToken(encoded, ServerTokenPrefix, &cred); err != nil {
+	prefix, version, err := serverCredentialPrefix(encoded)
+	if err != nil {
 		return ServerCredential{}, err
 	}
-	if cred.Version != TokenVersion ||
+	var cred ServerCredential
+	if err := decodeJSONToken(encoded, prefix, &cred); err != nil {
+		return ServerCredential{}, err
+	}
+	if !validServerCredentialRoute(cred, version) ||
 		cred.SessionID == ([16]byte{}) ||
 		cred.DERPPrivate == "" ||
 		len(cred.QUICPrivate) != ed25519.PrivateKeySize ||
@@ -177,7 +207,7 @@ func DecodeClientToken(encoded string, now time.Time) (ClientCredential, error) 
 }
 
 func validClientCredential(cred ClientCredential) bool {
-	return cred.Version == TokenVersion &&
+	return validClientCredentialRoute(cred) &&
 		cred.SessionID != ([16]byte{}) &&
 		cred.ClientID != ([16]byte{}) &&
 		cred.TokenID != ([16]byte{}) &&
@@ -186,6 +216,31 @@ func validClientCredential(cred ClientCredential) bool {
 		cred.QUICPublic != ([32]byte{}) &&
 		cred.BearerSecret != ([32]byte{}) &&
 		validProofMACHex(cred.ProofMAC)
+}
+
+func validServerCredentialRoute(cred ServerCredential, version int) bool {
+	if cred.Version != version {
+		return false
+	}
+	switch version {
+	case TokenVersion:
+		return cred.DERPRoute == nil
+	case CustomTokenVersion:
+		return cred.DERPRoute != nil && cred.DERPRoute.IsCustom() && cred.DERPRoute.Validate() == nil
+	default:
+		return false
+	}
+}
+
+func validClientCredentialRoute(cred ClientCredential) bool {
+	switch cred.Version {
+	case TokenVersion:
+		return cred.DERPRoute == nil
+	case CustomTokenVersion:
+		return cred.DERPRoute != nil && cred.DERPRoute.IsCustom() && cred.DERPRoute.Validate() == nil
+	default:
+		return false
+	}
 }
 
 func (cred ServerCredential) DERPKey() (key.NodePrivate, error) {
@@ -216,26 +271,30 @@ func (cred ServerCredential) SessionToken() (sessiontoken.Token, error) {
 	copy(quicPublic[:], quicPrivate.Public().(ed25519.PublicKey))
 	var derpPublic [32]byte
 	copy(derpPublic[:], derpKey.Public().AppendTo(nil))
+	route := routeValue(cred.DERPRoute)
 	return sessiontoken.Token{
-		Version:      sessiontoken.SupportedVersion,
+		Version:      sessiontoken.VersionForRoute(route),
 		SessionID:    cred.SessionID,
 		ExpiresUnix:  cred.ExpiresUnix,
 		DERPPublic:   derpPublic,
 		QUICPublic:   quicPublic,
 		BearerSecret: deriveClientBearerSecret(cred.SigningSecret, [16]byte{}),
 		Capabilities: sessiontoken.CapabilityDerptunTCP,
+		DERPRoute:    route,
 	}, nil
 }
 
 func (cred ClientCredential) SessionToken() (sessiontoken.Token, error) {
+	route := routeValue(cred.DERPRoute)
 	return sessiontoken.Token{
-		Version:      sessiontoken.SupportedVersion,
+		Version:      sessiontoken.VersionForRoute(route),
 		SessionID:    cred.SessionID,
 		ExpiresUnix:  cred.ExpiresUnix,
 		DERPPublic:   cred.DERPPublic,
 		QUICPublic:   cred.QUICPublic,
 		BearerSecret: cred.BearerSecret,
 		Capabilities: sessiontoken.CapabilityDerptunTCP,
+		DERPRoute:    route,
 	}, nil
 }
 
@@ -300,7 +359,11 @@ func validClientProofMAC(secret [32]byte, client ClientCredential) bool {
 	if err != nil {
 		return false
 	}
-	want, err := hex.DecodeString(computeClientProofMAC(secret, client))
+	wantHex, err := computeClientProofMAC(secret, client)
+	if err != nil {
+		return false
+	}
+	want, err := hex.DecodeString(wantHex)
 	if err != nil {
 		return false
 	}
@@ -339,9 +402,16 @@ func deriveClientBearerSecret(secret [32]byte, clientID [16]byte) [32]byte {
 	return out
 }
 
-func computeClientProofMAC(secret [32]byte, client ClientCredential) string {
+func computeClientProofMAC(secret [32]byte, client ClientCredential) (string, error) {
 	mac := hmac.New(sha256.New, secret[:])
-	mac.Write([]byte("derptun-client-proof-v1"))
+	switch client.Version {
+	case TokenVersion:
+		mac.Write([]byte("derptun-client-proof-v1"))
+	case CustomTokenVersion:
+		mac.Write([]byte("derptun-client-proof-v2"))
+	default:
+		return "", ErrInvalidToken
+	}
 	mac.Write(client.SessionID[:])
 	mac.Write(client.ClientID[:])
 	mac.Write(client.TokenID[:])
@@ -350,5 +420,64 @@ func computeClientProofMAC(secret [32]byte, client ClientCredential) string {
 	mac.Write(client.QUICPublic[:])
 	mac.Write(client.BearerSecret[:])
 	_, _ = fmt.Fprintf(mac, "%d", client.ExpiresUnix)
-	return hex.EncodeToString(mac.Sum(nil))
+	if client.Version == CustomTokenVersion {
+		if client.DERPRoute == nil {
+			return "", ErrInvalidToken
+		}
+		routeWire, err := client.DERPRoute.AppendWire(nil)
+		if err != nil {
+			return "", err
+		}
+		mac.Write(routeWire)
+	}
+	return hex.EncodeToString(mac.Sum(nil)), nil
+}
+
+func serverCredentialEncoding(route derpbind.Route) (int, string) {
+	if route.IsCustom() {
+		return CustomTokenVersion, CustomServerTokenPrefix
+	}
+	return TokenVersion, ServerTokenPrefix
+}
+
+func serverCredentialPrefix(encoded string) (string, int, error) {
+	switch {
+	case strings.HasPrefix(encoded, ServerTokenPrefix):
+		return ServerTokenPrefix, TokenVersion, nil
+	case strings.HasPrefix(encoded, CustomServerTokenPrefix):
+		return CustomServerTokenPrefix, CustomTokenVersion, nil
+	default:
+		return "", 0, ErrInvalidToken
+	}
+}
+
+func HasServerTokenPrefix(value string) bool {
+	return strings.HasPrefix(value, ServerTokenPrefix) || strings.HasPrefix(value, CustomServerTokenPrefix)
+}
+
+func HasClientTokenPrefix(value string) bool {
+	return strings.HasPrefix(value, ClientTokenPrefix) || strings.HasPrefix(value, CustomClientTokenPrefix)
+}
+
+func cloneCustomRoute(route derpbind.Route) *derpbind.Route {
+	if !route.IsCustom() {
+		return nil
+	}
+	clone := route
+	return &clone
+}
+
+func cloneRoutePointer(route *derpbind.Route) *derpbind.Route {
+	if route == nil {
+		return nil
+	}
+	clone := *route
+	return &clone
+}
+
+func routeValue(route *derpbind.Route) derpbind.Route {
+	if route == nil {
+		return derpbind.Route{}
+	}
+	return *route
 }

@@ -25,6 +25,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/shayne/derphole/pkg/derpbind"
 	"github.com/shayne/derphole/pkg/portmap"
 	"github.com/shayne/derphole/pkg/rendezvous"
 	"github.com/shayne/derphole/pkg/telemetry"
@@ -794,6 +795,61 @@ func TestShareOpenExternalCanUpgradeAfterRelayStartAndServeConnections(t *testin
 			t.Fatalf("upgrade reply for %q = %q, want %q", payload, got, payload)
 		}
 	}
+}
+
+func TestCustomDERPShareOpenExternalPromotesRelayToDirect(t *testing.T) {
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv(derpbind.CustomDERPServerEnv, "https://127.0.0.1:8443/derp")
+	route, err := derpbind.NewCustomRoute("127.0.0.1", 8443, derpbind.DefaultSTUNPort)
+	if err != nil {
+		t.Fatalf("NewCustomRoute() error = %v", err)
+	}
+
+	prevInterfaceAddrs := publicInterfaceAddrs
+	var candidateCalls atomic.Int32
+	publicInterfaceAddrs = func() ([]net.Addr, error) {
+		candidateCalls.Add(1)
+		return prevInterfaceAddrs()
+	}
+	t.Cleanup(func() { publicInterfaceAddrs = prevInterfaceAddrs })
+
+	result := runExternalShareOpenSession(t, shareOpenRoundTripConfig{
+		relayPayload:    "custom-relay-first",
+		upgradePayloads: []string{"custom-direct"},
+	})
+	if got := result.RelayReply; got != "custom-relay-first" {
+		t.Fatalf("relay reply = %q, want %q", got, "custom-relay-first")
+	}
+	if got := result.UpgradeReplies["custom-direct"]; got != "custom-direct" {
+		t.Fatalf("direct reply = %q, want %q", got, "custom-direct")
+	}
+	for name, status := range map[string]string{"share": result.ShareStatus, "open": result.OpenStatus} {
+		lines := sessionStatusLines(status)
+		relayAt, directAt := -1, -1
+		for i, line := range lines {
+			if line == string(StateRelay) && relayAt == -1 {
+				relayAt = i
+			}
+			if line == string(StateDirect) && directAt == -1 {
+				directAt = i
+			}
+		}
+		if relayAt == -1 || directAt <= relayAt {
+			t.Fatalf("%s status lines = %v, want connected-relay before connected-direct", name, lines)
+		}
+	}
+
+	if candidateCalls.Load() == 0 {
+		t.Fatal("fake direct candidate calls = 0, want successful candidate refresh after relay start")
+	}
+	tok, err := token.Decode(result.Token, time.Now())
+	if err != nil {
+		t.Fatalf("token.Decode(custom direct session) error = %v", err)
+	}
+	if tok.DERPRoute != route {
+		t.Fatalf("custom direct token route = %+v, want %+v", tok.DERPRoute, route)
+	}
+	assertCustomDERPMap(t, tok.DERPRoute.DERPMap(), route)
 }
 
 func TestShareOpenExternalUsesV2RawDirectDataPlane(t *testing.T) {
@@ -2009,6 +2065,7 @@ type shareOpenRoundTripConfig struct {
 }
 
 type shareOpenRoundTripResult struct {
+	Token          string
 	RelayReply     string
 	UpgradeReplies map[string]string
 	ShareStatus    string
@@ -2131,6 +2188,7 @@ func runExternalShareOpenSession(t *testing.T, cfg shareOpenRoundTripConfig) sha
 	shareStatuses := shareStatus.String()
 	openStatuses := openStatus.String()
 	return shareOpenRoundTripResult{
+		Token:          tok,
 		RelayReply:     relayReply,
 		UpgradeReplies: replies,
 		ShareStatus:    shareStatuses,

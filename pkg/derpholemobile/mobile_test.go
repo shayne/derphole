@@ -9,9 +9,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/shayne/derphole/pkg/derpbind"
 	"github.com/shayne/derphole/pkg/derphole"
 	"github.com/shayne/derphole/pkg/derphole/qrpayload"
 	"github.com/shayne/derphole/pkg/derptun"
@@ -94,6 +96,54 @@ func TestParsePayloadClassifiesClientTokenAsTCP(t *testing.T) {
 	}
 	if parsed.Token() != client {
 		t.Fatalf("Token() = %q, want original client token", parsed.Token())
+	}
+}
+
+func TestParsePayloadRecognizesOnlySupportedClientTokenPrefixes(t *testing.T) {
+	now := time.Now()
+	publicServer, err := derptun.GenerateServerToken(derptun.ServerTokenOptions{Now: now, Days: 7})
+	if err != nil {
+		t.Fatalf("GenerateServerToken(public) error = %v", err)
+	}
+	publicClient, err := derptun.GenerateClientToken(derptun.ClientTokenOptions{Now: now, ServerToken: publicServer, Days: 3})
+	if err != nil {
+		t.Fatalf("GenerateClientToken(public) error = %v", err)
+	}
+	route, err := derpbind.NewCustomRoute("derp.example.com", 8443, 3478)
+	if err != nil {
+		t.Fatalf("NewCustomRoute() error = %v", err)
+	}
+	customServer, err := derptun.GenerateServerToken(derptun.ServerTokenOptions{Now: now, Days: 7, DERPRoute: route})
+	if err != nil {
+		t.Fatalf("GenerateServerToken(custom) error = %v", err)
+	}
+	customClient, err := derptun.GenerateClientToken(derptun.ClientTokenOptions{Now: now, ServerToken: customServer, Days: 3})
+	if err != nil {
+		t.Fatalf("GenerateClientToken(custom) error = %v", err)
+	}
+
+	for name, token := range map[string]string{"DT1": publicClient, "DT2": customClient} {
+		t.Run(name, func(t *testing.T) {
+			parsed, err := ParsePayload(token)
+			if err != nil {
+				t.Fatalf("ParsePayload() error = %v", err)
+			}
+			if parsed.Kind() != "tcp" || parsed.Token() != token {
+				t.Fatalf("parsed = %+v, want original tcp token", parsed)
+			}
+		})
+	}
+
+	if _, err := ParsePayload(derptun.CustomClientTokenPrefix + "malformed"); !errors.Is(err, derptun.ErrInvalidToken) {
+		t.Fatalf("ParsePayload(malformed DT2) error = %v, want ErrInvalidToken", err)
+	}
+	nonToken := "DT3" + strings.Repeat("0", 20)
+	parsed, err := ParsePayload(nonToken)
+	if err != nil {
+		t.Fatalf("ParsePayload(non-token QR payload) error = %v", err)
+	}
+	if parsed.Kind() != "file" || parsed.Token() != nonToken {
+		t.Fatalf("ParsePayload(non-token QR payload) = %+v, want file payload", parsed)
 	}
 }
 

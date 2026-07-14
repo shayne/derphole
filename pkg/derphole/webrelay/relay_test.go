@@ -11,7 +11,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -21,6 +24,7 @@ import (
 	"github.com/shayne/derphole/pkg/derphole/webproto"
 	"github.com/shayne/derphole/pkg/rendezvous"
 	"github.com/shayne/derphole/pkg/token"
+	"tailscale.com/derp/derpserver"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -31,7 +35,7 @@ type fakeDirect struct {
 	failCh    chan error
 	recvCh    chan []byte
 	sendHook  func([]byte) error
-	startHook func(context.Context, DirectRole, DirectSignalPeer) error
+	startHook func(context.Context, DirectRole, DirectSignalPeer, DirectConfig) error
 
 	sentMu sync.Mutex
 	sent   [][]byte
@@ -72,9 +76,9 @@ func newFakeDirect() *fakeDirect {
 	}
 }
 
-func (d *fakeDirect) Start(ctx context.Context, role DirectRole, peer DirectSignalPeer) error {
+func (d *fakeDirect) Start(ctx context.Context, role DirectRole, peer DirectSignalPeer, config DirectConfig) error {
 	if d.startHook != nil {
-		return d.startHook(ctx, role, peer)
+		return d.startHook(ctx, role, peer, config)
 	}
 	return nil
 }
@@ -150,6 +154,49 @@ type fakeSubscriber struct {
 	ch     chan derpbind.Packet
 	mu     sync.Mutex
 	closed bool
+}
+
+type webRelayTestDERPServer struct {
+	MapURL     string
+	DERPURL    string
+	mapFetches atomic.Int64
+}
+
+func newWebRelayTestDERPServer(t *testing.T) *webRelayTestDERPServer {
+	t.Helper()
+
+	server := derpserver.New(key.NewNode(), t.Logf)
+	t.Cleanup(func() { _ = server.Close() })
+
+	derpHTTP := httptest.NewServer(derpserver.Handler(server))
+	t.Cleanup(derpHTTP.Close)
+
+	dm := &tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{
+		1: {
+			RegionID:   1,
+			RegionCode: "test",
+			RegionName: "Web Relay Test",
+			Nodes: []*tailcfg.DERPNode{{
+				Name:     "web-relay-test-1",
+				RegionID: 1,
+				HostName: "127.0.0.1",
+				IPv4:     "127.0.0.1",
+				STUNPort: -1,
+			}},
+		},
+	}}
+	fixture := &webRelayTestDERPServer{DERPURL: derpHTTP.URL + "/derp"}
+	mapHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fixture.mapFetches.Add(1)
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(dm)
+	}))
+	t.Cleanup(mapHTTP.Close)
+	fixture.MapURL = mapHTTP.URL
+	return fixture
 }
 
 func newFakeDERPClient() *fakeDERPClient {
@@ -299,7 +346,7 @@ func TestWebRelaySmallHelpers(t *testing.T) {
 func TestWebRelayTokenAndDERPHelpers(t *testing.T) {
 	client := newFakeDERPClient()
 	node := &tailcfg.DERPNode{RegionID: 7, HostName: "derp.example.com", DERPPort: 8443}
-	tokValue, encoded, err := newEncodedOfferToken(client, node)
+	tokValue, encoded, err := newEncodedOfferToken(client, node, derpbind.Route{})
 	if err != nil {
 		t.Fatalf("newEncodedOfferToken() error = %v", err)
 	}
@@ -332,6 +379,155 @@ func TestWebRelayTokenAndDERPHelpers(t *testing.T) {
 	}
 	if got := publicDERPServerURL(nil); got != "" {
 		t.Fatalf("publicDERPServerURL(nil) = %q, want empty", got)
+	}
+}
+
+func TestWebRelayNewOfferPublicRouteKeepsV5Token(t *testing.T) {
+	srv := newWebRelayTestDERPServer(t)
+	t.Setenv(derpbind.CustomDERPServerEnv, "")
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+
+	offer, encoded, err := NewOffer(context.Background())
+	if err != nil {
+		t.Fatalf("NewOffer() error = %v", err)
+	}
+	defer func() { _ = offer.Close() }()
+	tok, err := decodeWebFileToken(encoded)
+	if err != nil {
+		t.Fatalf("decodeWebFileToken() error = %v", err)
+	}
+	if tok.Version != token.SupportedVersion || tok.DERPRoute.IsCustom() {
+		t.Fatalf("public token version/route = %d/%+v, want public v%d", tok.Version, tok.DERPRoute, token.SupportedVersion)
+	}
+	if got := srv.mapFetches.Load(); got != 1 {
+		t.Fatalf("public map fetches = %d, want 1", got)
+	}
+}
+
+func TestWebRelayCustomRouteRoundTripIgnoresConsumerEnvironment(t *testing.T) {
+	srv := newWebRelayTestDERPServer(t)
+	t.Setenv(derpbind.CustomDERPServerEnv, "https://Creator.Invalid.:8443/derp")
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+	oldFetch := fetchWebRelayDERPMap
+	var publicFetches atomic.Int64
+	fetchWebRelayDERPMap = func(context.Context, string) (*tailcfg.DERPMap, error) {
+		publicFetches.Add(1)
+		return nil, errors.New("unexpected public DERP map fetch")
+	}
+	t.Cleanup(func() { fetchWebRelayDERPMap = oldFetch })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	offer, encoded, err := NewOffer(ctx)
+	if err != nil {
+		t.Fatalf("NewOffer() error = %v", err)
+	}
+	defer func() { _ = offer.Close() }()
+	tok, err := decodeWebFileToken(encoded)
+	if err != nil {
+		t.Fatalf("decodeWebFileToken() error = %v", err)
+	}
+	wantRoute := derpbind.Route{Host: "creator.invalid", DERPPort: 8443, STUNPort: derpbind.DefaultSTUNPort}
+	if tok.Version != token.CustomDERPVersion || tok.DERPRoute != wantRoute {
+		t.Fatalf("custom token version/route = %d/%+v, want v%d %+v", tok.Version, tok.DERPRoute, token.CustomDERPVersion, wantRoute)
+	}
+	if got := publicFetches.Load(); got != 0 {
+		t.Fatalf("public map fetches after custom NewOffer = %d, want 0", got)
+	}
+
+	t.Setenv(derpbind.CustomDERPServerEnv, "https://consumer-conflict.invalid:9443/derp")
+	sendErr := make(chan error, 1)
+	go func() {
+		sendErr <- offer.Send(ctx, newFakeSource("route.txt", []byte("custom web relay")), Callbacks{})
+	}()
+	sink := &fakeSink{}
+	if err := Receive(ctx, encoded, sink, Callbacks{}); err != nil {
+		t.Fatalf("Receive() error = %v", err)
+	}
+	if err := <-sendErr; err != nil {
+		t.Fatalf("Offer.Send() error = %v", err)
+	}
+	if got := sink.buf.String(); got != "custom web relay" {
+		t.Fatalf("received payload = %q, want custom web relay", got)
+	}
+	if got := publicFetches.Load(); got != 0 {
+		t.Fatalf("public map fetches after custom Receive = %d, want 0", got)
+	}
+}
+
+func TestWebRelayCustomConnectFailuresAreSanitized(t *testing.T) {
+	clearWebRelayProxyEnvironment(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", "")
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", "")
+	oldFetch := fetchWebRelayDERPMap
+	var publicFetches atomic.Int64
+	fetchWebRelayDERPMap = func(context.Context, string) (*tailcfg.DERPMap, error) {
+		publicFetches.Add(1)
+		return nil, errors.New("unexpected public DERP map fetch")
+	}
+	t.Cleanup(func() { fetchWebRelayDERPMap = oldFetch })
+
+	t.Run("creator", func(t *testing.T) {
+		t.Setenv(derpbind.CustomDERPServerEnv, "https://unresolvable.webrelay.test.invalid/derp")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _, err := NewOffer(ctx)
+		if err == nil {
+			t.Fatal("NewOffer() error = nil, want custom destination failure")
+		}
+		assertSanitizedWebRelayConnectError(t, err, "unresolvable.webrelay.test.invalid:443")
+	})
+
+	t.Run("receiver", func(t *testing.T) {
+		t.Setenv(derpbind.CustomDERPServerEnv, "https://consumer-secret.invalid:9443/derp")
+		route, err := derpbind.NewCustomRoute("unresolvable.webrelay.test.invalid", derpbind.DefaultDERPPort, derpbind.DefaultSTUNPort)
+		if err != nil {
+			t.Fatalf("NewCustomRoute() error = %v", err)
+		}
+		tok, err := newToken(key.NewNode().Public(), derpbind.CustomDERPRegionID, route)
+		if err != nil {
+			t.Fatalf("newToken() error = %v", err)
+		}
+		encoded, err := token.Encode(tok)
+		if err != nil {
+			t.Fatalf("token.Encode() error = %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err = Receive(ctx, encoded, &fakeSink{}, Callbacks{})
+		if err == nil {
+			t.Fatal("Receive() error = nil, want custom destination failure")
+		}
+		assertSanitizedWebRelayConnectError(t, err, "unresolvable.webrelay.test.invalid:443")
+	})
+
+	if got := publicFetches.Load(); got != 0 {
+		t.Fatalf("public DERP map fetches = %d, want 0", got)
+	}
+}
+
+func clearWebRelayProxyEnvironment(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy", "REQUEST_METHOD"} {
+		t.Setenv(name, "")
+	}
+}
+
+func assertSanitizedWebRelayConnectError(t *testing.T, err error, authority string) {
+	t.Helper()
+	got := err.Error()
+	if !strings.Contains(got, "connect custom DERP "+authority) {
+		t.Fatalf("custom connect error = %q, want sanitized authority %q", got, authority)
+	}
+	if !strings.Contains(got, "dial") && !strings.Contains(got, "lookup") && !strings.Contains(got, "timeout") {
+		t.Fatalf("custom connect error = %q, want useful connection-stage detail", got)
+	}
+	for _, forbidden := range []string{"consumer-secret", "https://", "http://", "/derp"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("custom connect error exposes destination detail %q: %q", forbidden, got)
+		}
 	}
 }
 
@@ -815,6 +1011,51 @@ func TestFrameRetryDelayKeepsDirectHandoffResponsive(t *testing.T) {
 	}
 }
 
+func TestDirectConfigForRoutePreservesPublicSTUNServers(t *testing.T) {
+	got := directConfigForRoute(derpbind.Route{})
+	want := []string{
+		"stun:stun.l.google.com:19302",
+		"stun:stun.cloudflare.com:3478",
+	}
+	if !slices.Equal(got.STUNURLs, want) {
+		t.Fatalf("public STUN URLs = %q, want %q", got.STUNURLs, want)
+	}
+}
+
+func TestOfferPassesCustomRouteOnlyToSenderDirectTransport(t *testing.T) {
+	route, err := derpbind.NewCustomRoute("2001:db8::7", 8443, 5349)
+	if err != nil {
+		t.Fatalf("NewCustomRoute() error = %v", err)
+	}
+
+	direct := newFakeDirect()
+	direct.startHook = func(_ context.Context, role DirectRole, _ DirectSignalPeer, config DirectConfig) error {
+		if role != DirectRoleSender {
+			t.Fatalf("direct role = %q, want %q", role, DirectRoleSender)
+		}
+		want := []string{"stun:[2001:db8::7]:5349"}
+		if !slices.Equal(config.STUNURLs, want) {
+			t.Fatalf("custom STUN URLs = %q, want %q", config.STUNURLs, want)
+		}
+		return nil
+	}
+
+	offer := &Offer{
+		client: newFakeDERPClient(),
+		token:  token.Token{DERPRoute: route},
+	}
+	transport, _, stop := offer.startSendDirectPath(
+		context.Background(),
+		key.NewNode().Public(),
+		Callbacks{},
+		direct,
+	)
+	defer stop()
+	if transport == nil {
+		t.Fatal("custom sender direct transport was not started")
+	}
+}
+
 func TestSendWrappersPreserveNilOfferError(t *testing.T) {
 	ctx := context.Background()
 	var offer *Offer
@@ -851,14 +1092,14 @@ func TestReceiveWithClientBuffersDirectSignalSentImmediatelyAfterDecision(t *tes
 
 	client := newFakeDERPClient()
 	peerDERP := key.NewNode().Public()
-	tok, err := newToken(peerDERP, 1)
+	tok, err := newToken(peerDERP, 1, derpbind.Route{})
 	if err != nil {
 		t.Fatalf("newToken() error = %v", err)
 	}
 
 	offerSeen := make(chan struct{})
 	direct := newFakeDirect()
-	direct.startHook = func(ctx context.Context, role DirectRole, peer DirectSignalPeer) error {
+	direct.startHook = func(ctx context.Context, role DirectRole, peer DirectSignalPeer, _ DirectConfig) error {
 		if role != DirectRoleReceiver {
 			t.Fatalf("direct role = %q, want %q", role, DirectRoleReceiver)
 		}
@@ -911,13 +1152,66 @@ func TestReceiveWithClientBuffersDirectSignalSentImmediatelyAfterDecision(t *tes
 	<-errCh
 }
 
+func TestReceiveWithClientPassesCustomRouteOnlyToReceiverDirectTransport(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client := newFakeDERPClient()
+	peerDERP := key.NewNode().Public()
+	route, err := derpbind.NewCustomRoute("custom.example", 443, 3479)
+	if err != nil {
+		t.Fatalf("NewCustomRoute() error = %v", err)
+	}
+	tok, err := newToken(peerDERP, derpbind.CustomDERPRegionID, route)
+	if err != nil {
+		t.Fatalf("newToken() error = %v", err)
+	}
+
+	started := make(chan struct{})
+	direct := newFakeDirect()
+	direct.startHook = func(_ context.Context, role DirectRole, _ DirectSignalPeer, config DirectConfig) error {
+		if role != DirectRoleReceiver {
+			t.Fatalf("direct role = %q, want %q", role, DirectRoleReceiver)
+		}
+		want := []string{"stun:custom.example:3479"}
+		if !slices.Equal(config.STUNURLs, want) {
+			t.Fatalf("custom STUN URLs = %q, want %q", config.STUNURLs, want)
+		}
+		close(started)
+		return nil
+	}
+
+	client.sendHook = func(_ key.NodePublic, payload []byte) {
+		frame, err := webproto.Parse(payload)
+		if err != nil {
+			t.Fatalf("Parse(sent frame) error = %v", err)
+		}
+		if frame.Kind == webproto.FrameClaim {
+			client.emit(peerDERP, mustMarshalFrame(t, webproto.FrameDecision, 0, rendezvous.Decision{Accepted: true}))
+		}
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- receiveWithClient(ctx, tok, client, &fakeSink{}, Callbacks{}, TransferOptions{Direct: direct})
+	}()
+
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for custom receiver direct transport")
+	}
+	cancel()
+	<-errCh
+}
+
 func TestSendWithOptionsDirectFailureBeforeHandoffKeepsRelay(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	client := newFakeDERPClient()
 	peerDERP := key.NewNode().Public()
-	tok, err := newToken(client.PublicKey(), 1)
+	tok, err := newToken(client.PublicKey(), 1, derpbind.Route{})
 	if err != nil {
 		t.Fatalf("newToken() error = %v", err)
 	}
@@ -982,7 +1276,7 @@ func TestSendWithOptionsPipelinesRelayDataBeforeAck(t *testing.T) {
 
 	client := newFakeDERPClient()
 	peerDERP := key.NewNode().Public()
-	tok, err := newToken(client.PublicKey(), 1)
+	tok, err := newToken(client.PublicKey(), 1, derpbind.Route{})
 	if err != nil {
 		t.Fatalf("newToken() error = %v", err)
 	}
@@ -1054,7 +1348,7 @@ func TestSendWithOptionsRetransmitsOldestFrameOnDuplicateAck(t *testing.T) {
 
 	client := newFakeDERPClient()
 	peerDERP := key.NewNode().Public()
-	tok, err := newToken(client.PublicKey(), 1)
+	tok, err := newToken(client.PublicKey(), 1, derpbind.Route{})
 	if err != nil {
 		t.Fatalf("newToken() error = %v", err)
 	}
@@ -1350,7 +1644,7 @@ func TestSendWithOptionsSwitchesToDirectAfterHandoff(t *testing.T) {
 
 	client := newFakeDERPClient()
 	peerDERP := key.NewNode().Public()
-	tok, err := newToken(client.PublicKey(), 1)
+	tok, err := newToken(client.PublicKey(), 1, derpbind.Route{})
 	if err != nil {
 		t.Fatalf("newToken() error = %v", err)
 	}
@@ -1481,7 +1775,7 @@ func TestSendWithOptionsDirectProgressWaitsForDirectAck(t *testing.T) {
 
 	client := newFakeDERPClient()
 	peerDERP := key.NewNode().Public()
-	tok, err := newToken(client.PublicKey(), 1)
+	tok, err := newToken(client.PublicKey(), 1, derpbind.Route{})
 	if err != nil {
 		t.Fatalf("newToken() error = %v", err)
 	}
@@ -1596,7 +1890,7 @@ func TestSendWithOptionsUsesDirectChunkSizeAfterHandoff(t *testing.T) {
 
 	client := newFakeDERPClient()
 	peerDERP := key.NewNode().Public()
-	tok, err := newToken(client.PublicKey(), 1)
+	tok, err := newToken(client.PublicKey(), 1, derpbind.Route{})
 	if err != nil {
 		t.Fatalf("newToken() error = %v", err)
 	}
@@ -1713,7 +2007,7 @@ func TestSendWithOptionsActiveDirectFailureDoesNotResumeRelay(t *testing.T) {
 
 	client := newFakeDERPClient()
 	peerDERP := key.NewNode().Public()
-	tok, err := newToken(client.PublicKey(), 1)
+	tok, err := newToken(client.PublicKey(), 1, derpbind.Route{})
 	if err != nil {
 		t.Fatalf("newToken() error = %v", err)
 	}
@@ -2025,7 +2319,7 @@ func TestSendContextCancelNotifiesReceiverAbort(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	client := newFakeDERPClient()
 	peerDERP := key.NewNode().Public()
-	tok, err := newToken(client.PublicKey(), 1)
+	tok, err := newToken(client.PublicKey(), 1, derpbind.Route{})
 	if err != nil {
 		t.Fatalf("newToken() error = %v", err)
 	}
@@ -2170,7 +2464,7 @@ func TestSendWithOptionsDirectDoneWaitIgnoresDirectCloseAfterFinalAck(t *testing
 
 	client := newFakeDERPClient()
 	peerDERP := key.NewNode().Public()
-	tok, err := newToken(client.PublicKey(), 1)
+	tok, err := newToken(client.PublicKey(), 1, derpbind.Route{})
 	if err != nil {
 		t.Fatalf("newToken() error = %v", err)
 	}

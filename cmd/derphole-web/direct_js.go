@@ -44,7 +44,7 @@ func newJSDirectTransport(v js.Value) webrelay.DirectTransport {
 	}
 }
 
-func (d *jsDirectTransport) Start(ctx context.Context, role webrelay.DirectRole, peer webrelay.DirectSignalPeer) error {
+func (d *jsDirectTransport) Start(ctx context.Context, role webrelay.DirectRole, peer webrelay.DirectSignalPeer, config webrelay.DirectConfig) error {
 	if d == nil {
 		return errors.New("nil direct transport")
 	}
@@ -55,11 +55,19 @@ func (d *jsDirectTransport) Start(ctx context.Context, role webrelay.DirectRole,
 	d.installFrameHandler()
 	signalSink := d.installSignalSink(ctx, peer)
 	d.startWatchers(ctx, peer)
-	if _, err := await(ctx, d.api.Call("start", string(role), signalSink)); err != nil {
+	if _, err := await(ctx, d.api.Call("start", string(role), signalSink, stringsToJS(config.STUNURLs))); err != nil {
 		d.fail(err)
 		return err
 	}
 	return nil
+}
+
+func stringsToJS(values []string) js.Value {
+	array := js.Global().Get("Array").New(len(values))
+	for i, value := range values {
+		array.SetIndex(i, value)
+	}
+	return array
 }
 
 func (d *jsDirectTransport) validateAPI() error {

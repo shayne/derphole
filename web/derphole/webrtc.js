@@ -37,14 +37,11 @@
       failedReject = reject;
     });
 
-    const lanes = Array.from({ length: dataChannelCount }, (_, index) => createLane(index));
+    let lanes = [];
 
-    function createLane(index) {
+    function createLane(index, iceServers) {
       const pc = new PeerConnection({
-        iceServers: [
-          { urls: "stun:stun.l.google.com:19302" },
-          { urls: "stun:stun.cloudflare.com:3478" },
-        ],
+        iceServers,
       });
       const lane = {
         index,
@@ -167,7 +164,15 @@
       };
     }
 
-    async function start(role, nextSignalSink) {
+    async function start(role, nextSignalSink, stunURLs) {
+      if (!Array.isArray(stunURLs)) {
+        throw new Error("webrtc STUN URLs are required");
+      }
+      if (lanes.length !== 0) {
+        throw new Error("webrtc transport already started");
+      }
+      const iceServers = stunURLs.map((url) => ({ urls: url }));
+      lanes = Array.from({ length: dataChannelCount }, (_, index) => createLane(index, iceServers));
       signalSink = nextSignalSink;
       status("probing-direct");
       status(`webrtc-role-${role}`);

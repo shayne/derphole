@@ -12,6 +12,8 @@ import (
 	"hash/crc32"
 	"io"
 	"time"
+
+	"github.com/shayne/derphole/pkg/derpbind"
 )
 
 const (
@@ -34,6 +36,7 @@ type Token struct {
 	QUICPublic      [32]byte
 	BearerSecret    [32]byte
 	Capabilities    uint32
+	DERPRoute       derpbind.Route
 }
 
 var (
@@ -44,7 +47,8 @@ var (
 )
 
 const (
-	SupportedVersion uint8 = 5
+	SupportedVersion  uint8 = 5
+	CustomDERPVersion uint8 = 6
 )
 
 const (
@@ -53,7 +57,7 @@ const (
 
 func Encode(tok Token) (string, error) {
 	var err error
-	tok.Version, err = encodeVersion(tok.Version)
+	tok.Version, err = encodeVersion(tok.Version, tok.DERPRoute)
 	if err != nil {
 		return "", ErrUnsupportedVersion
 	}
@@ -70,11 +74,23 @@ func Encode(tok Token) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(payload.Bytes()), nil
 }
 
-func encodeVersion(version uint8) (uint8, error) {
-	if version == 0 {
-		return SupportedVersion, nil
+func VersionForRoute(route derpbind.Route) uint8 {
+	if route.IsCustom() {
+		return CustomDERPVersion
 	}
-	if version != SupportedVersion {
+	return SupportedVersion
+}
+
+func IsSupportedVersion(version uint8) bool {
+	return version == SupportedVersion || version == CustomDERPVersion
+}
+
+func encodeVersion(version uint8, route derpbind.Route) (uint8, error) {
+	want := VersionForRoute(route)
+	if version == 0 {
+		return want, nil
+	}
+	if !IsSupportedVersion(version) || version != want {
 		return 0, ErrUnsupportedVersion
 	}
 	return version, nil
@@ -88,6 +104,16 @@ type payloadWriter struct {
 func encodePayload(tok Token) (bytes.Buffer, error) {
 	var payload payloadWriter
 	writeTokenFixedPayload(&payload, tok)
+	if payload.err != nil {
+		return payload.Buffer, payload.err
+	}
+	if tok.Version == CustomDERPVersion {
+		routeWire, err := tok.DERPRoute.AppendWire(nil)
+		if err != nil {
+			return payload.Buffer, err
+		}
+		payload.writeBytes(routeWire)
+	}
 	return payload.Buffer, payload.err
 }
 
@@ -141,11 +167,11 @@ func decodeEnvelope(encoded string) (Token, []byte, error) {
 		return tok, nil, ErrInvalidLength
 	}
 	tok.Version = raw[0]
-	wantLen, ok := tokenWireSize(tok.Version)
-	if !ok {
-		return tok, nil, ErrUnsupportedVersion
+	wantLen, err := tokenWireSize(raw)
+	if err != nil {
+		return tok, nil, err
 	}
-	if len(raw) < wantLen {
+	if len(raw) != wantLen {
 		return tok, nil, ErrInvalidLength
 	}
 	payload := raw[:len(raw)-4]
@@ -156,11 +182,20 @@ func decodeEnvelope(encoded string) (Token, []byte, error) {
 	return tok, payload, nil
 }
 
-func tokenWireSize(version uint8) (int, bool) {
-	if version != SupportedVersion {
-		return 0, false
+func tokenWireSize(raw []byte) (int, error) {
+	version := raw[0]
+	if !IsSupportedVersion(version) {
+		return 0, ErrUnsupportedVersion
 	}
-	return fixedPayloadSize + 4, true
+	if version == SupportedVersion {
+		return fixedPayloadSize + 4, nil
+	}
+	const minimumCustomWireSize = fixedPayloadSize + 1 + 4 + 4
+	if len(raw) < minimumCustomWireSize {
+		return 0, ErrInvalidLength
+	}
+	hostLen := int(raw[fixedPayloadSize])
+	return fixedPayloadSize + 1 + hostLen + 4 + 4, nil
 }
 
 type payloadReader struct {
@@ -169,9 +204,25 @@ type payloadReader struct {
 }
 
 func decodePayload(tok *Token, payload []byte) error {
-	reader := payloadReader{Reader: bytes.NewReader(payload[1:])}
+	reader := payloadReader{Reader: bytes.NewReader(payload[1:fixedPayloadSize])}
 	readTokenFixedPayload(&reader, tok)
-	return reader.result()
+	if err := reader.result(); err != nil {
+		return err
+	}
+	if tok.Version == SupportedVersion {
+		return nil
+	}
+
+	extension := payload[fixedPayloadSize:]
+	route, consumed, err := derpbind.ParseRouteWire(extension)
+	if err != nil {
+		return err
+	}
+	if consumed != len(extension) {
+		return ErrInvalidLength
+	}
+	tok.DERPRoute = route
+	return nil
 }
 
 func readTokenFixedPayload(reader *payloadReader, tok *Token) {

@@ -586,7 +586,7 @@ type fakeWebDirect struct{}
 
 func newFakeDirect() webrelay.DirectTransport { return fakeWebDirect{} }
 
-func (fakeWebDirect) Start(context.Context, webrelay.DirectRole, webrelay.DirectSignalPeer) error {
+func (fakeWebDirect) Start(context.Context, webrelay.DirectRole, webrelay.DirectSignalPeer, webrelay.DirectConfig) error {
 	return nil
 }
 func (fakeWebDirect) Ready() <-chan struct{} { return make(chan struct{}) }

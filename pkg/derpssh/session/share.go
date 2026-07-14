@@ -34,7 +34,7 @@ type ShareConfig struct {
 	Emitter    *telemetry.Emitter
 }
 
-var generateServerToken = derptun.GenerateServerToken
+var generateServerToken = derptun.GenerateServerTokenFromEnvironment
 var generateClientToken = derptun.GenerateClientToken
 var serveAppMux = appsession.DerptunAppServe
 var startPTY = pty.Start

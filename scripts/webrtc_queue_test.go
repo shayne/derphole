@@ -52,7 +52,8 @@ class FakeDataChannel {
 }
 
 class FakeRTCPeerConnection {
-  constructor() {
+  constructor(config) {
+	this.config = config;
     this.connectionState = "new";
     this.iceConnectionState = "new";
     createdPeerConnections.push(this);
@@ -87,7 +88,11 @@ vm.runInContext(source, context);
 
 (async () => {
   const transport = context.window.createDerpholeWebRTCTransport();
-  await transport.start("sender", (signal) => emittedSignals.push(signal));
+  const publicSTUNURLs = [
+	"stun:stun.l.google.com:19302",
+	"stun:stun.cloudflare.com:3478",
+  ];
+  await transport.start("sender", (signal) => emittedSignals.push(signal), publicSTUNURLs);
   await Promise.race([
     transport.ready(),
     new Promise((_, reject) => setTimeout(() => reject(new Error("timed out waiting for WebRTC ready")), 100)),
@@ -95,6 +100,12 @@ vm.runInContext(source, context);
 
   if (createdPeerConnections.length !== 2) {
     throw new Error("expected 2 independent PeerConnections, got " + createdPeerConnections.length);
+  }
+  for (const pc of createdPeerConnections) {
+	const got = pc.config.iceServers.map((server) => server.urls);
+	if (got.join(",") !== publicSTUNURLs.join(",")) {
+	  throw new Error("public ICE servers changed: " + got.join(","));
+	}
   }
   const offerLanes = emittedSignals.filter((signal) => signal.kind === "offer").map((signal) => signal.lane).sort();
   if (offerLanes.join(",") !== "0,1") {
@@ -167,5 +178,62 @@ vm.runInContext(source, context);
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("node regression failed: %v\n%s", err, out)
+	}
+}
+
+func TestWebRTCTransportUsesOnlyConfiguredCustomSTUNServer(t *testing.T) {
+	t.Parallel()
+
+	script := `
+const fs = require("fs");
+const vm = require("vm");
+
+const source = fs.readFileSync(process.argv[1], "utf8");
+const configs = [];
+class FakeRTCPeerConnection {
+  constructor(config) {
+	configs.push(config);
+	this.connectionState = "new";
+	this.iceConnectionState = "new";
+  }
+  close() {}
+}
+const context = {
+  window: { RTCPeerConnection: FakeRTCPeerConnection },
+  ArrayBuffer,
+  Error,
+  performance: { now: () => Date.now() },
+  Promise,
+  Uint8Array,
+  clearTimeout,
+  queueMicrotask,
+  setTimeout,
+};
+vm.createContext(context);
+vm.runInContext(source, context);
+
+(async () => {
+  const transport = context.window.createDerpholeWebRTCTransport();
+  const custom = "stun:[2001:db8::7]:5349";
+  await transport.start("receiver", () => {}, [custom]);
+  if (configs.length !== 2) {
+	throw new Error("expected 2 PeerConnections, got " + configs.length);
+  }
+  for (const config of configs) {
+	const got = config.iceServers.map((server) => server.urls);
+	if (got.length !== 1 || got[0] !== custom) {
+	  throw new Error("custom ICE servers leaked public fallback: " + got.join(","));
+	}
+  }
+})().catch((err) => {
+  console.error(err.stack || err.message);
+  process.exit(1);
+});
+`
+
+	cmd := exec.Command("node", "-e", script, filepath.Join("..", "web", "derphole", "webrtc.js"))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("node custom STUN regression failed: %v\n%s", err, out)
 	}
 }

@@ -48,11 +48,8 @@ func New() *Transport {
 	}
 }
 
-func (t *Transport) Start(ctx context.Context, role webrelay.DirectRole, peer webrelay.DirectSignalPeer) error {
-	config := webrtc.Configuration{ICEServers: []webrtc.ICEServer{
-		{URLs: []string{"stun:stun.l.google.com:19302"}},
-		{URLs: []string{"stun:stun.cloudflare.com:3478"}},
-	}}
+func (t *Transport) Start(ctx context.Context, role webrelay.DirectRole, peer webrelay.DirectSignalPeer, directConfig webrelay.DirectConfig) error {
+	config := peerConnectionConfig(directConfig)
 	pcs := make([]*webrtc.PeerConnection, 0, dataChannelCount)
 	for lane := 0; lane < dataChannelCount; lane++ {
 		pc, err := newPeerConnection(config)
@@ -92,6 +89,14 @@ func (t *Transport) Start(ctx context.Context, role webrelay.DirectRole, peer we
 		}
 	}
 	return nil
+}
+
+func peerConnectionConfig(config webrelay.DirectConfig) webrtc.Configuration {
+	iceServers := make([]webrtc.ICEServer, 0, len(config.STUNURLs))
+	for _, stunURL := range config.STUNURLs {
+		iceServers = append(iceServers, webrtc.ICEServer{URLs: []string{stunURL}})
+	}
+	return webrtc.Configuration{ICEServers: iceServers}
 }
 
 func (t *Transport) configurePeerConnection(ctx context.Context, peer webrelay.DirectSignalPeer, lane int, pc *webrtc.PeerConnection) {
