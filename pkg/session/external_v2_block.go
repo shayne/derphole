@@ -18,6 +18,7 @@ import (
 
 	"github.com/shayne/derphole/pkg/dataplane"
 	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/transfertrace"
 	"github.com/shayne/derphole/pkg/transport"
 )
 
@@ -100,6 +101,9 @@ func externalV2AcceptsBlockTransfer(accept externalV2Accept) bool {
 }
 
 func externalV2SelectFileTransferMode(policy string, size int64, claimCapable, acceptCapable bool, claimAd, acceptAd *externalV2DirectTCPAdvertisement) string {
+	if selected, fixed := externalV2BulkPacketCandidateSelectedMode(policy); fixed {
+		return selected
+	}
 	if policy != externalV2TransferModeBlocks || size < externalV2DirectTCPMinFileSize || !claimCapable || !acceptCapable {
 		return policy
 	}
@@ -126,6 +130,9 @@ func emitExternalV2BulkPacketRecordMode(emitter *telemetry.Emitter, grouped bool
 }
 
 func externalV2SelectOptimizedFileTransferMode(policy string, size int64, claimBatch, acceptBatch bool) string {
+	if selected, fixed := externalV2BulkPacketCandidateSelectedMode(policy); fixed {
+		return selected
+	}
 	if policy == externalV2TransferModeBlocks && size >= externalV2DirectTCPMinFileSize && externalV2BatchNativeBulk(claimBatch, acceptBatch) {
 		return externalV2TransferModeBulkPackets
 	}
@@ -283,6 +290,9 @@ func (rt *externalV2ListenRuntime) receiveQUICBlock(ctx context.Context, accepte
 	defer rawPath.Close()
 	if rawPath.raw {
 		tr.ActivateRawDirect()
+		if err := metrics.SetFilePayloadLaneAddrs(rawPath.addrs, time.Now()); err != nil {
+			return err
+		}
 		handled, err := rt.tryReceiveBulkPacketBlock(streamCtx, ctx, cancelStream, accepted, transferMode, tr, rawPath, sink, blockCfg, progressSender, metrics, pathEmitter)
 		if handled {
 			return err
@@ -292,34 +302,28 @@ func (rt *externalV2ListenRuntime) receiveQUICBlock(ctx context.Context, accepte
 	}
 	abortErrCh, stopAbortWatch := rt.watchAbort(ctx, accepted.peerDERP, func() {
 		cancelStream()
-		_ = server.CloseWithError(1, "peer aborted transfer")
+		_ = closeExternalV2QUICEndpoint(server, metrics, streamCount, rawPath.raw, 1, "peer aborted transfer")
 	})
 	defer stopAbortWatch()
-	openCtx := streamCtx
-	cancelOpen := func() {}
-	boundedOpen := rawPath.raw
-	if rawPath.raw {
-		openCtx, cancelOpen = context.WithTimeout(streamCtx, externalV2StreamOpenWait)
-	}
-	streams, err := server.AcceptStreamsWithReady(openCtx, streamCount, nil)
-	cancelOpen()
+	streams, err := acceptExternalV2ListenQUICStreams(streamCtx, ctx, abortErrCh, server, streamCount, rawPath.raw)
 	if err != nil {
-		err = externalV2PreferPeerAbort(ctx, abortErrCh, err)
-		if boundedOpen {
-			err = externalV2StreamOpenFailure(err)
-		}
+		_ = closeExternalV2QUICEndpoint(server, metrics, streamCount, rawPath.raw, 1, err.Error())
 		return err
 	}
+	return rt.finishQUICBlockReceive(streamCtx, ctx, accepted, tr, rawPath, server, streamCount, streams, sink, blockCfg, progressSender, metrics, pathEmitter, abortErrCh)
+}
+
+func (rt *externalV2ListenRuntime) finishQUICBlockReceive(streamCtx, completeCtx context.Context, accepted externalV2AcceptedClaim, tr externalV2ListenTransport, rawPath externalV2DirectPacketPath, server *dataplane.QUICServer, streamCount int, streams []io.ReadCloser, sink *countingBlockReceiveSink, blockCfg externalV2BlockReceiveConfig, progressSender *externalV2PeerProgressSender, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter, abortErrCh <-chan error) error {
 	bytesReceived, err := receiveExternalV2BlockStreams(streamCtx, sink, blockCfg, streams, metrics)
 	if err != nil {
-		_ = server.CloseWithError(1, err.Error())
-		return externalV2PreferPeerAbort(ctx, abortErrCh, err)
+		_ = closeExternalV2QUICEndpoint(server, metrics, streamCount, rawPath.raw, 1, err.Error())
+		return externalV2PreferPeerAbort(completeCtx, abortErrCh, err)
 	}
-	if err := rt.sendComplete(ctx, accepted.peerDERP, bytesReceived, progressSender); err != nil {
-		_ = server.CloseWithError(1, err.Error())
+	if err := rt.sendComplete(completeCtx, accepted.peerDERP, bytesReceived, progressSender); err != nil {
+		_ = closeExternalV2QUICEndpoint(server, metrics, streamCount, rawPath.raw, 1, err.Error())
 		return err
 	}
-	if err := server.CloseWithError(0, "complete"); err != nil {
+	if err := closeExternalV2QUICEndpoint(server, metrics, streamCount, rawPath.raw, 0, "complete"); err != nil {
 		return err
 	}
 	metrics.Complete(time.Now())
@@ -398,48 +402,68 @@ func (rt *externalV2OfferReceiveRuntime) receiveQUICBlock(ctx context.Context, t
 		return err
 	}
 	defer rawPath.Close()
-	var endpoint externalV2QUICEndpoint
-	var streams []io.ReadCloser
 	if rawPath.raw {
 		tr.ActivateRawDirect()
-		if externalV2UsesBulkPacketTransfer(transferMode) {
-			emitExternalV2Debug(rt.cfg.Emitter, "v2-block-transfer=bulk-packets")
-			grouped = grouped && batchNative
-			emitExternalV2BulkPacketRecordMode(rt.cfg.Emitter, grouped)
-			err := rt.receiveBulkPacketBlock(ctx, rawPath, batchNative, grouped, sink, blockCfg, progressSender, metrics, pathEmitter, tr.manager)
-			if !errors.Is(err, errExternalV2BulkPacketProbeRejected) {
-				return err
-			}
-			emitExternalV2Debug(rt.cfg.Emitter, "v2-bulk-probe=fallback-before-payload")
+		if err := metrics.SetFilePayloadLaneAddrs(rawPath.addrs, time.Now()); err != nil {
+			return err
 		}
-		server := dataplane.NewQUICServerOnPacketConns(rawPath.conns, rt.identity, rt.tok.QUICPublic)
-		server.SetManagerConnectionCount(managerConnections)
-		endpoint = server
-		openCtx, cancelOpen := context.WithTimeout(ctx, externalV2StreamOpenWait)
-		streams, err = server.AcceptStreamsWithReady(openCtx, streamCount, nil)
-		cancelOpen()
-		if err != nil {
-			return externalV2StreamOpenFailure(err)
-		}
-	} else {
-		client := dataplane.NewQUICClient(tr.manager, rt.identity, rt.tok.QUICPublic)
-		client.SetManagerConnectionCount(managerConnections)
-		endpoint = client
-		streams, err = client.AcceptStreams(ctx, streamCount)
-		if err != nil {
+		handled, err := rt.tryOfferReceiveBulkPacketBlock(ctx, transferMode, rawPath, batchNative, grouped, sink, blockCfg, progressSender, metrics, pathEmitter, tr.manager)
+		if handled {
 			return err
 		}
 	}
+	endpoint, streams, err := rt.openOfferReceiveQUICBlockStreams(ctx, tr, rawPath, managerConnections, streamCount, metrics)
+	if err != nil {
+		return err
+	}
 	bytesReceived, err := receiveExternalV2BlockStreams(ctx, sink, blockCfg, streams, metrics)
 	if err != nil {
-		return rt.receiveStreamError(endpoint, err)
+		return rt.receiveStreamError(endpoint, metrics, err)
 	}
-	if err := rt.finishReceiveStream(ctx, endpoint, bytesReceived, progressSender); err != nil {
+	if err := rt.finishReceiveStream(ctx, endpoint, bytesReceived, progressSender, metrics); err != nil {
 		return err
 	}
 	metrics.Complete(time.Now())
 	pathEmitter.Complete(tr.manager)
 	return nil
+}
+
+func (rt *externalV2OfferReceiveRuntime) tryOfferReceiveBulkPacketBlock(ctx context.Context, transferMode string, rawPath externalV2DirectPacketPath, batchNative, grouped bool, sink *countingBlockReceiveSink, blockCfg externalV2BlockReceiveConfig, progressSender *externalV2PeerProgressSender, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter, manager *transport.Manager) (bool, error) {
+	if !externalV2UsesBulkPacketTransfer(transferMode) {
+		return false, nil
+	}
+	emitExternalV2Debug(rt.cfg.Emitter, "v2-block-transfer=bulk-packets")
+	grouped = grouped && batchNative
+	emitExternalV2BulkPacketRecordMode(rt.cfg.Emitter, grouped)
+	err := rt.receiveBulkPacketBlock(ctx, rawPath, batchNative, grouped, sink, blockCfg, progressSender, metrics, pathEmitter, manager)
+	if !errors.Is(err, errExternalV2BulkPacketProbeRejected) {
+		return true, err
+	}
+	emitExternalV2Debug(rt.cfg.Emitter, "v2-bulk-probe=fallback-before-payload")
+	return false, nil
+}
+
+func (rt *externalV2OfferReceiveRuntime) openOfferReceiveQUICBlockStreams(ctx context.Context, tr externalV2ListenTransport, rawPath externalV2DirectPacketPath, managerConnections, streamCount int, metrics *externalTransferMetrics) (externalV2QUICEndpoint, []io.ReadCloser, error) {
+	if rawPath.raw {
+		server := dataplane.NewQUICServerOnPacketConns(rawPath.conns, rt.identity, rt.tok.QUICPublic)
+		server.SetManagerConnectionCount(managerConnections)
+		openCtx, cancelOpen := context.WithTimeout(ctx, externalV2StreamOpenWait)
+		streams, err := server.AcceptStreamsWithReady(openCtx, streamCount, nil)
+		cancelOpen()
+		if err != nil {
+			_ = closeExternalV2QUICEndpoint(server, metrics, streamCount, true, 1, err.Error())
+			return nil, nil, externalV2StreamOpenFailure(err)
+		}
+		return server, streams, nil
+	}
+	client := dataplane.NewQUICClient(tr.manager, rt.identity, rt.tok.QUICPublic)
+	client.SetManagerConnectionCount(managerConnections)
+	streams, err := client.AcceptStreams(ctx, streamCount)
+	if err != nil {
+		_ = closeExternalV2QUICEndpoint(client, metrics, streamCount, false, 1, err.Error())
+		return nil, nil, err
+	}
+	return client, streams, nil
 }
 
 func (rt *externalV2OfferReceiveRuntime) receiveBulkPacketBlock(ctx context.Context, rawPath externalV2DirectPacketPath, batchNative, grouped bool, sink *countingBlockReceiveSink, blockCfg externalV2BlockReceiveConfig, progressSender *externalV2PeerProgressSender, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter, manager *transport.Manager) error {
@@ -524,6 +548,7 @@ func copyExternalV2SendBlockStreams(ctx context.Context, src *BlockSource, strea
 	if len(streams) == 0 {
 		return errors.New("no block streams")
 	}
+	metrics.SelectFilePayloadEngine(transfertrace.FilePayloadEngineQUIC, time.Now())
 	defer closeExternalV2BlockWriters(streams)
 
 	chunkSize := externalV2BlockChunkSize(src.ChunkSize)
@@ -623,6 +648,7 @@ func receiveExternalV2BlockStreams(ctx context.Context, sink BlockReceiveSink, c
 	if err != nil {
 		return 0, err
 	}
+	metrics.SelectFilePayloadEngine(transfertrace.FilePayloadEngineQUIC, time.Now())
 
 	receiveCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -772,6 +798,7 @@ func (t *externalV2BlockReceiveTracker) writeChunk(sink BlockReceiveSink, chunk 
 	if n != len(chunk.data) {
 		return io.ErrShortWrite
 	}
+	metrics.RecordFilePayloadCommit(transfertrace.FilePayloadEngineQUIC, int64(n), time.Now())
 	return nil
 }
 

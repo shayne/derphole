@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/csv"
 	"os"
 	"path/filepath"
 	"strings"
@@ -211,6 +212,74 @@ func TestRunChecksPeerTraceFailure(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "sender peer_received_bytes") {
 		t.Fatalf("stderr = %q, want peer progress error", stderr.String())
+	}
+}
+
+func TestRunPairedSenderAppliesExpectedPayloadToReceiver(t *testing.T) {
+	sendPath := writeTrace(t, transfertrace.HeaderLine+"\n"+
+		pairedEngineTraceCSVRow(t, "4096", map[string]string{
+			"timestamp_unix_ms": "1000", "role": "send", "phase": "complete", "app_bytes": "4096",
+			"peer_received_bytes": "4096", "transfer_elapsed_ms": "500", "last_state": "stream-complete",
+			"file_payload_engine": "bulk-packets-v1", "file_payload_bytes_committed": "0",
+			"file_payload_bytes_bulk": "0", "file_payload_bytes_quic": "0",
+			"file_payload_lane_addrs": `["203.0.113.10:41000"]`,
+		}))
+	receivePath := writeTrace(t, transfertrace.HeaderLine+"\n"+
+		pairedEngineTraceCSVRow(t, "4096", map[string]string{
+			"timestamp_unix_ms": "1000", "role": "receive", "phase": "complete", "app_bytes": "4096",
+			"transfer_elapsed_ms": "500", "last_state": "stream-complete",
+			"file_payload_engine": "bulk-packets-v1", "file_payload_bytes_committed": "4095",
+			"file_payload_bytes_bulk": "4095", "file_payload_bytes_quic": "0",
+			"file_payload_lane_addrs": `["198.51.100.20:42000"]`,
+		}))
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"-role", "send",
+		"-expected-bytes", "4096",
+		"-expected-payload-bytes", "4096",
+		"-require-file-payload-engine", "bulk-packets-v1",
+		"-require-engine-telemetry",
+		"-expected-selected-public-ipv4", "203.0.113.10",
+		"-peer-expected-selected-public-ipv4", "198.51.100.20",
+		"-peer-trace", receivePath,
+		sendPath,
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run() exit = %d, want receiver payload failure; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "file payload") {
+		t.Fatalf("stderr = %q, want receiver file payload mismatch", stderr.String())
+	}
+}
+
+func TestRunPairedSenderUsesPeerSpecificSelectedPublicIPv4(t *testing.T) {
+	sendPath := writeTrace(t, transfertrace.HeaderLine+"\n"+pairedEngineTraceCSVRow(t, "4096", map[string]string{
+		"timestamp_unix_ms": "1000", "role": "send", "phase": "complete", "app_bytes": "4096",
+		"peer_received_bytes": "4096", "transfer_elapsed_ms": "500", "last_state": "stream-complete",
+		"file_payload_engine": "bulk-packets-v1", "file_payload_bytes_committed": "0",
+		"file_payload_bytes_bulk": "0", "file_payload_bytes_quic": "0",
+		"file_payload_lane_addrs": `["203.0.113.10:41000"]`,
+	}))
+	receivePath := writeTrace(t, transfertrace.HeaderLine+"\n"+pairedEngineTraceCSVRow(t, "4096", map[string]string{
+		"timestamp_unix_ms": "1000", "role": "receive", "phase": "complete", "app_bytes": "4096",
+		"transfer_elapsed_ms": "500", "last_state": "stream-complete",
+		"file_payload_engine": "bulk-packets-v1", "file_payload_bytes_committed": "4096",
+		"file_payload_bytes_bulk": "4096", "file_payload_bytes_quic": "0",
+		"file_payload_lane_addrs": `["198.51.100.20:42000"]`,
+	}))
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"-role", "send", "-expected-bytes", "4096", "-expected-payload-bytes", "4096",
+		"-require-file-payload-engine", "bulk-packets-v1", "-require-engine-telemetry",
+		"-expected-selected-public-ipv4", "203.0.113.10",
+		"-peer-expected-selected-public-ipv4", "198.51.100.20",
+		"-peer-trace", receivePath, sendPath,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() exit = %d, stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "final_file_payload_bytes=4096") {
+		t.Fatalf("stdout = %q, want receiver-owned final payload bytes", stdout.String())
 	}
 }
 
@@ -529,6 +598,11 @@ func traceCSVRow(t *testing.T, values map[string]string) string {
 	for i, name := range transfertrace.Header {
 		positions[name] = i
 	}
+	fields[positions["file_payload_engine"]] = "bulk-packets-v1"
+	fields[positions["file_payload_bytes_committed"]] = "0"
+	fields[positions["file_payload_bytes_bulk"]] = "0"
+	fields[positions["file_payload_bytes_quic"]] = "0"
+	fields[positions["file_payload_lane_addrs"]] = "[]"
 	for name, value := range values {
 		index, ok := positions[name]
 		if !ok {
@@ -536,7 +610,68 @@ func traceCSVRow(t *testing.T, values map[string]string) string {
 		}
 		fields[index] = value
 	}
-	return strings.Join(fields, ",") + "\n"
+	var row bytes.Buffer
+	w := csv.NewWriter(&row)
+	if err := w.Write(fields); err != nil {
+		t.Fatal(err)
+	}
+	w.Flush()
+	if err := w.Error(); err != nil {
+		t.Fatal(err)
+	}
+	return row.String()
+}
+
+func pairedEngineTraceCSVRow(t *testing.T, expectedPayloadBytes string, values map[string]string) string {
+	t.Helper()
+	withSourceReads := healthyBulkEngineTraceValues(expectedPayloadBytes)
+	for name, value := range values {
+		withSourceReads[name] = value
+	}
+	if withSourceReads["role"] == string(transfertrace.RoleSend) {
+		withSourceReads["file_source_read_calls"] = "1"
+		withSourceReads["file_source_read_bytes"] = expectedPayloadBytes
+	} else {
+		withSourceReads["file_source_read_calls"] = "0"
+		withSourceReads["file_source_read_bytes"] = "0"
+		for _, name := range []string{
+			"bulk_native_send_attempts", "bulk_native_send_syscalls", "bulk_gso_messages",
+			"bulk_logical_datagrams", "bulk_accepted_payload_bytes", "bulk_gso_segments_per_message",
+			"bulk_gso_segments", "bulk_send_calls", "bulk_send_datagrams", "bulk_max_send_batch",
+		} {
+			withSourceReads[name] = "0"
+		}
+		withSourceReads["bulk_batch_backend"] = "linux-recvmmsg"
+		withSourceReads["bulk_gso_attempted"] = "false"
+		withSourceReads["bulk_gso_active"] = "false"
+		withSourceReads["bulk_receive_calls"] = "2"
+		withSourceReads["bulk_receive_datagrams"] = "8"
+		withSourceReads["bulk_max_receive_batch"] = "4"
+		withSourceReads["bulk_decrypt_batches"] = "2"
+		withSourceReads["bulk_decrypt_datagrams"] = "8"
+	}
+	return traceCSVRow(t, withSourceReads)
+}
+
+func healthyBulkEngineTraceValues(expectedPayloadBytes string) map[string]string {
+	return map[string]string{
+		"bulk_candidate_id": "combined-gso3", "bulk_native_send_attempts": "2",
+		"bulk_native_send_syscalls": "2", "bulk_gso_messages": "1", "bulk_logical_datagrams": "8",
+		"bulk_accepted_payload_bytes": expectedPayloadBytes, "bulk_gso_segments_per_message": "3",
+		"bulk_batch_backend": "linux-gso", "bulk_gso_attempted": "true", "bulk_gso_active": "true",
+		"bulk_gso_segments": "8", "bulk_send_calls": "2", "bulk_send_datagrams": "8",
+		"bulk_receive_calls": "0", "bulk_receive_datagrams": "0", "bulk_max_send_batch": "4",
+		"bulk_max_receive_batch": "0", "bulk_crypto_queue_peak": "0", "bulk_writer_queue_peak": "0",
+		"bulk_lane_queue_peak": "0", "bulk_receive_queue_peak": "0", "bulk_decrypt_batches": "0",
+		"bulk_decrypt_datagrams": "0", "bulk_probe_selected_mbps": "2160", "bulk_probe_duration_ms": "250",
+		"bulk_probe_trains": "5", "bulk_probe_sent_datagrams": "100", "bulk_probe_received_datagrams": "99",
+		"bulk_probe_loss_ppm": "10000", "bulk_probe_pressure": "false", "repair_queue_bytes": "0",
+		"local_enobufs_retries": "0", "local_enobufs_wait_us": "0", "local_enobufs_max_consecutive": "0",
+		"peer_recv_queue_depth": "0", "peer_recv_queue_depth_max": "0", "retransmits": "0",
+		"repair_requests": "0", "repair_bytes": "0", "missing_scan_checks": "0", "pending_missing": "0",
+		"pending_missing_peak": "0", "repair_requested_packets": "0", "repair_request_batches": "0",
+		"reorder_trail_packets": "0", "receive_packet_rate_pps": "100",
+	}
 }
 
 func padLegacyTraceRow(row string) string {
@@ -545,5 +680,15 @@ func padLegacyTraceRow(row string) string {
 		panic("legacy trace row has more fields than current header")
 	}
 	fields = append(fields, make([]string, len(transfertrace.Header)-len(fields))...)
+	for i, name := range transfertrace.Header {
+		switch name {
+		case "file_payload_engine":
+			fields[i] = "bulk-packets-v1"
+		case "file_payload_bytes_committed", "file_payload_bytes_bulk", "file_payload_bytes_quic":
+			fields[i] = "0"
+		case "file_payload_lane_addrs":
+			fields[i] = "[]"
+		}
+	}
 	return strings.Join(fields, ",") + "\n"
 }

@@ -194,7 +194,7 @@ func TestEndpointTransfersMultipleUnidirectionalStreams(t *testing.T) {
 	}
 }
 
-func TestEndpointTransfersMultipleConnections(t *testing.T) {
+func TestEndpointStatsAggregateMultipleConnections(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -293,6 +293,27 @@ func TestEndpointTransfersMultipleConnections(t *testing.T) {
 		if !seen[byte('A'+i)] {
 			t.Fatalf("missing payload %q from receive streams", byte('A'+i))
 		}
+	}
+
+	clientStats := client.Stats()
+	if !clientStats.TelemetryPresent {
+		t.Fatalf("client mechanism evidence is absent: %+v", clientStats)
+	}
+	if clientStats.Connections != connCount || clientStats.Streams != connCount {
+		t.Fatalf("client mechanism counts = connections:%d streams:%d, want %d/%d", clientStats.Connections, clientStats.Streams, connCount, connCount)
+	}
+	if clientStats.PacketsSent == 0 || clientStats.WireBytesSent == 0 || clientStats.Version == "" {
+		t.Fatalf("client mechanism stats are incomplete: %+v", clientStats)
+	}
+	if clientStats.RawSocketBackend == "" || clientStats.NativeSendBackend == "" || clientStats.NativeReceiveBackend == "" || clientStats.NativeGSO == "" || clientStats.NativeReceiveBatch == "" {
+		t.Fatalf("client backend identity is incomplete: %+v", clientStats)
+	}
+	serverStats := server.Stats()
+	if !serverStats.TelemetryPresent {
+		t.Fatalf("server mechanism evidence is absent: %+v", serverStats)
+	}
+	if serverStats.Connections != connCount || serverStats.Streams != connCount || serverStats.PacketsReceived == 0 {
+		t.Fatalf("server mechanism stats are incomplete: %+v", serverStats)
 	}
 }
 

@@ -45,13 +45,15 @@ type externalV2BulkPacketDarwinSockaddr struct {
 }
 
 type externalV2BulkPacketDarwinBatchConn struct {
-	conn    net.PacketConn
-	raw     syscall.RawConn
-	stats   *externalV2BulkPacketAtomicBatchStats
-	writeMu sync.Mutex
+	conn         net.PacketConn
+	raw          syscall.RawConn
+	stats        *externalV2BulkPacketAtomicBatchStats
+	candidateErr error
+	writeMu      sync.Mutex
 
 	connectAttempted     bool
 	connectEnabled       bool
+	fixedPeer            net.Addr
 	connected            bool
 	connectedAddr        string
 	receiveCoalescing    bool
@@ -62,9 +64,14 @@ type externalV2BulkPacketDarwinBatchConn struct {
 }
 
 func newExternalV2BulkPacketBatchConn(conn net.PacketConn) externalV2BulkPacketBatchConn {
+	candidate, candidateErr := externalV2BulkPacketConfiguredCandidate()
 	batch := &externalV2BulkPacketDarwinBatchConn{
-		conn:  conn,
-		stats: newExternalV2BulkPacketAtomicBatchStats("portable-single"),
+		conn:         conn,
+		stats:        newExternalV2BulkPacketAtomicBatchStats("portable-single"),
+		candidateErr: candidateErr,
+	}
+	if candidateErr == nil {
+		batch.stats.setCandidateID(candidate.ID)
 	}
 	if syscallConn, ok := conn.(syscall.Conn); ok {
 		batch.raw, _ = syscallConn.SyscallConn()
@@ -76,6 +83,9 @@ func (c *externalV2BulkPacketDarwinBatchConn) WriteBatch(ctx context.Context, me
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
+	if c.candidateErr != nil {
+		return 0, c.candidateErr
+	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -91,8 +101,13 @@ func (c *externalV2BulkPacketDarwinBatchConn) WriteBatch(ctx context.Context, me
 	return c.writeSendmsgX(ctx, messages)
 }
 
-func (c *externalV2BulkPacketDarwinBatchConn) enableFixedPeerConnect() {
+func (c *externalV2BulkPacketDarwinBatchConn) enableFixedPeerConnect(peer net.Addr) error {
+	if peer == nil {
+		return errors.New("bulk packet fixed peer is nil")
+	}
 	c.connectEnabled = true
+	c.fixedPeer = peer
+	return nil
 }
 
 func (c *externalV2BulkPacketDarwinBatchConn) enableReceiveCoalescing() {
@@ -119,6 +134,7 @@ func (c *externalV2BulkPacketDarwinBatchConn) writeSendmsgX(ctx context.Context,
 		return c.writePortable(ctx, messages)
 	}
 	if written > 0 {
+		c.stats.observeNativeAccepted(messages, written, 0, 0)
 		c.stats.setBackend("darwin-sendmsg-x")
 		c.stats.observeSend(written)
 		for index := 0; index < written; index++ {
@@ -141,8 +157,12 @@ func (c *externalV2BulkPacketDarwinBatchConn) writePortable(ctx context.Context,
 		if err := externalV2BulkPacketArmWriteDeadline(ctx, c.conn); err != nil {
 			return written, err
 		}
+		c.stats.observeNativeAttempt()
 		n, err := c.conn.WriteTo(payload, messages[index].Addr)
-		if n > 0 {
+		c.stats.observeNativeSyscall()
+		if n == len(payload) {
+			c.stats.observeNativeAccepted(messages[index:index+1], 1, 0, 0)
+			c.stats.setBackend("portable-single")
 			c.stats.observeSend(1)
 		}
 		if err != nil {
@@ -189,11 +209,11 @@ func (c *externalV2BulkPacketDarwinBatchConn) prepareSendmsgX(messages []externa
 }
 
 func (c *externalV2BulkPacketDarwinBatchConn) connectFixedPeer(messages []externalV2BulkPacketBatchMessage) bool {
-	if !c.connectEnabled || c.raw == nil || len(messages) == 0 || messages[0].Addr == nil {
+	if !c.connectEnabled || c.raw == nil || c.fixedPeer == nil || len(messages) == 0 {
 		return false
 	}
-	peer := messages[0].Addr.String()
-	for index := 1; index < len(messages); index++ {
+	peer := c.fixedPeer.String()
+	for index := range messages {
 		if messages[index].Addr == nil || messages[index].Addr.String() != peer {
 			return false
 		}
@@ -205,7 +225,7 @@ func (c *externalV2BulkPacketDarwinBatchConn) connectFixedPeer(messages []extern
 		return false
 	}
 	c.connectAttempted = true
-	sockaddr, ok := externalV2BulkPacketDarwinConnectSockaddr(messages[0].Addr)
+	sockaddr, ok := externalV2BulkPacketDarwinConnectSockaddr(c.fixedPeer)
 	if !ok {
 		return false
 	}
@@ -293,6 +313,7 @@ func (c *externalV2BulkPacketDarwinBatchConn) sendmsgX(messages []externalV2Bulk
 	var syscallErr error
 	err := c.raw.Write(func(fd uintptr) bool {
 		for {
+			c.stats.observeNativeAttempt()
 			count, _, errno := unix.Syscall6(
 				externalV2BulkPacketDarwinSendmsgX,
 				fd,
@@ -302,6 +323,7 @@ func (c *externalV2BulkPacketDarwinBatchConn) sendmsgX(messages []externalV2Bulk
 				0,
 				0,
 			)
+			c.stats.observeNativeSyscall()
 			switch errno {
 			case 0:
 				written = int(count)
@@ -330,6 +352,9 @@ func (c *externalV2BulkPacketDarwinBatchConn) sendmsgX(messages []externalV2Bulk
 }
 
 func (c *externalV2BulkPacketDarwinBatchConn) ReadBatch(ctx context.Context, messages []externalV2BulkPacketBatchMessage) (int, error) {
+	if c.candidateErr != nil {
+		return 0, c.candidateErr
+	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}

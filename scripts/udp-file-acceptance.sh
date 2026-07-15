@@ -377,11 +377,17 @@ analyze_transfer() {
     return 1
   fi
 
-  "${local_tracecheck}" -role send -expected-bytes "${size_bytes}" -stall-window 999ms -require-direct-transport udp -forbid-relay-payload -peer-trace "${receiver_trace}" "${sender_trace}" >"${case_dir}/sender-trace-check.txt"
-  "${local_tracecheck}" -role receive -expected-bytes "${size_bytes}" -stall-window 999ms -require-direct-transport udp -forbid-relay-payload "${receiver_trace}" >"${case_dir}/receiver-trace-check.txt"
+  local sender_peer="${remote_public}"
+  local receiver_peer="${local_public}"
+  if [[ "${direction}" == "remote-to-local" ]]; then
+    sender_peer="${local_public}"
+    receiver_peer="${remote_public}"
+  fi
 
-  local expected_public="${remote_public}"
-  [[ "${direction}" == "remote-to-local" ]] && expected_public="${local_public}"
+  "${local_tracecheck}" -role send -stall-window 999ms -expected-payload-bytes "${size_bytes}" -require-direct-transport udp -require-file-payload-engine bulk-packets-v1 -require-engine-telemetry -expected-selected-public-ipv4 "${sender_peer}" -peer-expected-selected-public-ipv4 "${receiver_peer}" -forbid-relay-payload -peer-trace "${receiver_trace}" "${sender_trace}" >"${case_dir}/sender-trace-check.txt"
+  "${local_tracecheck}" -role receive -stall-window 999ms -expected-payload-bytes "${size_bytes}" -require-direct-transport udp -require-file-payload-engine bulk-packets-v1 -require-engine-telemetry -expected-selected-public-ipv4 "${receiver_peer}" -forbid-relay-payload "${receiver_trace}" >"${case_dir}/receiver-trace-check.txt"
+
+  local expected_public="${sender_peer}"
   if ! grep -F "${expected_public}:" "${sender_log}" "${receiver_log}" >/dev/null; then
     fail "transfer logs do not prove expected public route ${expected_public}"
     return 1
@@ -451,8 +457,6 @@ def max_flatline_ms(rows):
                 maximum_gap = max(maximum_gap, at - last_progress_at)
             last_value = value
             last_progress_at = at
-    if last_value != size:
-        raise SystemExit(f"receiver trace has {last_value} bytes, want {size}")
     return maximum_gap
 
 f = footer(promotion)

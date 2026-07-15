@@ -218,3 +218,21 @@ func tracerFromEnv() func(context.Context, bool, quic.ConnectionID) qlogwriter.T
 	}
 	return qlogTracerFromEnv()
 }
+
+// TracerWithMechanism keeps the always-on in-process trace and forwards the
+// same events to the configured qlog or metrics file trace when enabled.
+func TracerWithMechanism(mechanism *MechanismTrace) func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace {
+	if mechanism == nil {
+		mechanism = NewMechanismTrace()
+	}
+	optional := tracerFromEnv()
+	return func(ctx context.Context, isClient bool, connID quic.ConnectionID) qlogwriter.Trace {
+		traces := []qlogwriter.Trace{mechanism}
+		if optional != nil {
+			if trace := optional(ctx, isClient, connID); trace != nil {
+				traces = append(traces, trace)
+			}
+		}
+		return &multiplexTrace{traces: traces}
+	}
+}

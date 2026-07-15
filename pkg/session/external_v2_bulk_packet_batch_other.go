@@ -15,18 +15,28 @@ import (
 )
 
 type externalV2BulkPacketPortableBatchConn struct {
-	conn  net.PacketConn
-	stats *externalV2BulkPacketAtomicBatchStats
+	conn         net.PacketConn
+	stats        *externalV2BulkPacketAtomicBatchStats
+	candidateErr error
 }
 
 func newExternalV2BulkPacketPortableBatchConn(conn net.PacketConn) externalV2BulkPacketBatchConn {
-	return &externalV2BulkPacketPortableBatchConn{
-		conn:  conn,
-		stats: newExternalV2BulkPacketAtomicBatchStats("portable-single"),
+	candidate, candidateErr := externalV2BulkPacketConfiguredCandidate()
+	batch := &externalV2BulkPacketPortableBatchConn{
+		conn:         conn,
+		stats:        newExternalV2BulkPacketAtomicBatchStats("portable-single"),
+		candidateErr: candidateErr,
 	}
+	if candidateErr == nil {
+		batch.stats.setCandidateID(candidate.ID)
+	}
+	return batch
 }
 
 func (c *externalV2BulkPacketPortableBatchConn) WriteBatch(ctx context.Context, messages []externalV2BulkPacketBatchMessage) (int, error) {
+	if c.candidateErr != nil {
+		return 0, c.candidateErr
+	}
 	written := 0
 	for index := range messages {
 		if err := ctx.Err(); err != nil {
@@ -39,8 +49,11 @@ func (c *externalV2BulkPacketPortableBatchConn) WriteBatch(ctx context.Context, 
 		if err := c.armWriteDeadline(ctx); err != nil {
 			return written, err
 		}
+		c.stats.observeNativeAttempt()
 		n, err := c.conn.WriteTo(payload, messages[index].Addr)
-		if n > 0 {
+		c.stats.observeNativeSyscall()
+		if n == len(payload) {
+			c.stats.observeNativeAccepted(messages[index:index+1], 1, 0, 0)
 			c.stats.observeSend(1)
 		}
 		if err != nil {
@@ -56,6 +69,9 @@ func (c *externalV2BulkPacketPortableBatchConn) WriteBatch(ctx context.Context, 
 }
 
 func (c *externalV2BulkPacketPortableBatchConn) ReadBatch(ctx context.Context, messages []externalV2BulkPacketBatchMessage) (int, error) {
+	if c.candidateErr != nil {
+		return 0, c.candidateErr
+	}
 	buffer, empty, err := externalV2BulkPacketPortableReadBuffer(messages)
 	if err != nil || empty {
 		return 0, err

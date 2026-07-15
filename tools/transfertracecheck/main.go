@@ -19,16 +19,22 @@ import (
 var errUsage = errors.New("usage")
 
 type options struct {
-	Role                       string
-	ExpectedBytes              int64
-	ExpectedBytesSet           bool
-	StallWindow                time.Duration
-	PeerTrace                  string
-	RateTolerance              float64
-	ProgressLeadToleranceBytes int64
-	RequireDirectTransport     string
-	ForbidRelayPayload         bool
-	Path                       string
+	Role                           string
+	ExpectedBytes                  int64
+	ExpectedBytesSet               bool
+	ExpectedPayloadBytes           int64
+	ExpectedPayloadBytesSet        bool
+	StallWindow                    time.Duration
+	PeerTrace                      string
+	RateTolerance                  float64
+	ProgressLeadToleranceBytes     int64
+	RequireDirectTransport         string
+	RequireFilePayloadEngine       transfertrace.FilePayloadEngine
+	RequireEngineTelemetry         bool
+	ExpectedSelectedPublicIPv4     string
+	PeerExpectedSelectedPublicIPv4 string
+	ForbidRelayPayload             bool
+	Path                           string
 }
 
 func main() {
@@ -62,7 +68,7 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 	}
 
 	diagnosticSummary := formatDiagnosticsSummary(result.Diagnostics)
-	_, _ = fmt.Fprintf(stdout, "trace-ok rows=%d final_app_bytes=%d max_flatline=%s%s%s%s\n", result.Rows, result.FinalAppBytes, result.MaxFlatline, pairSummary, senderACKSummary, diagnosticSummary)
+	_, _ = fmt.Fprintf(stdout, "trace-ok rows=%d final_app_bytes=%d final_file_payload_bytes=%d max_flatline=%s%s%s%s\n", result.Rows, result.FinalAppBytes, result.FinalFilePayloadBytes, result.MaxFlatline, pairSummary, senderACKSummary, diagnosticSummary)
 	return 0
 }
 
@@ -145,21 +151,31 @@ func formatReceiverRepairSummary(d transfertrace.DiagnosticsSummary) string {
 func parseOptions(args []string, stderr io.Writer) (options, error) {
 	var role string
 	var expectedBytes int64
+	var expectedPayloadBytes int64
 	var stallWindow time.Duration
 	var peerTrace string
 	var rateTolerance float64
 	var progressLeadToleranceBytes int64
 	var requireDirectTransport string
+	var requireFilePayloadEngine string
+	var requireEngineTelemetry bool
+	var expectedSelectedPublicIPv4 string
+	var peerExpectedSelectedPublicIPv4 string
 	var forbidRelayPayload bool
 	flags := flag.NewFlagSet("transfertracecheck", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.StringVar(&role, "role", "", "trace role to check")
 	flags.Int64Var(&expectedBytes, "expected-bytes", 0, "expected final app byte count")
+	flags.Int64Var(&expectedPayloadBytes, "expected-payload-bytes", 0, "expected receiver-committed file payload byte count")
 	flags.DurationVar(&stallWindow, "stall-window", time.Second, "maximum active-phase app byte stall")
 	flags.StringVar(&peerTrace, "peer-trace", "", "optional peer trace CSV for sender peer_received_bytes to receiver app_bytes comparison")
 	flags.Float64Var(&rateTolerance, "rate-tolerance", 0.10, "allowed sender/receiver transfer rate divergence")
 	flags.Int64Var(&progressLeadToleranceBytes, "progress-lead-tolerance", 0, "allowed sender peer progress lead over receiver app bytes")
 	flags.StringVar(&requireDirectTransport, "require-direct-transport", "", "require the final direct transport (for example, udp)")
+	flags.StringVar(&requireFilePayloadEngine, "require-file-payload-engine", "", "require file payload engine (bulk-packets-v1 or quic-blocks-v1)")
+	flags.BoolVar(&requireEngineTelemetry, "require-engine-telemetry", false, "require observed file payload engine telemetry")
+	flags.StringVar(&expectedSelectedPublicIPv4, "expected-selected-public-ipv4", "", "require every selected file payload lane to use this public IPv4")
+	flags.StringVar(&peerExpectedSelectedPublicIPv4, "peer-expected-selected-public-ipv4", "", "require every peer selected file payload lane to use this public IPv4")
 	flags.BoolVar(&forbidRelayPayload, "forbid-relay-payload", false, "reject any payload bytes carried by relay")
 	flags.Usage = func() {
 		_, _ = fmt.Fprintln(stderr, "usage: transfertracecheck -role receive [-expected-bytes N] [-peer-trace peer.csv] trace.csv")
@@ -168,43 +184,87 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 	if err := flags.Parse(args); err != nil {
 		return options{}, errUsage
 	}
-	if role == "" || flags.NArg() != 1 {
-		flags.Usage()
-		return options{}, errUsage
-	}
-	if role != string(transfertrace.RoleSend) && role != string(transfertrace.RoleReceive) {
-		_, _ = fmt.Fprintln(stderr, "role must be send or receive")
-		flags.Usage()
-		return options{}, errUsage
+	if err := validateRoleOption(role, flags, stderr); err != nil {
+		return options{}, err
 	}
 	expectedBytesSet := flagProvided(flags, "expected-bytes")
-	if expectedBytes < 0 {
-		_, _ = fmt.Fprintln(stderr, "expected-bytes must be non-negative")
-		flags.Usage()
-		return options{}, errUsage
+	expectedPayloadBytesSet := flagProvided(flags, "expected-payload-bytes")
+	if err := validateExpectedByteOptions(expectedBytes, expectedPayloadBytes, flags, stderr); err != nil {
+		return options{}, err
 	}
-	if rateTolerance < 0 {
-		_, _ = fmt.Fprintln(stderr, "rate-tolerance must be non-negative")
-		flags.Usage()
-		return options{}, errUsage
+	filePayloadEngine, err := parseRequiredFilePayloadEngine(requireFilePayloadEngine, flags, stderr)
+	if err != nil {
+		return options{}, err
 	}
-	if progressLeadToleranceBytes < 0 {
-		_, _ = fmt.Fprintln(stderr, "progress-lead-tolerance must be non-negative")
-		flags.Usage()
-		return options{}, errUsage
+	if err := validateToleranceOptions(rateTolerance, progressLeadToleranceBytes, flags, stderr); err != nil {
+		return options{}, err
 	}
 	return options{
-		Role:                       role,
-		ExpectedBytes:              expectedBytes,
-		ExpectedBytesSet:           expectedBytesSet,
-		StallWindow:                stallWindow,
-		PeerTrace:                  peerTrace,
-		RateTolerance:              rateTolerance,
-		ProgressLeadToleranceBytes: progressLeadToleranceBytes,
-		RequireDirectTransport:     requireDirectTransport,
-		ForbidRelayPayload:         forbidRelayPayload,
-		Path:                       flags.Arg(0),
+		Role:                           role,
+		ExpectedBytes:                  expectedBytes,
+		ExpectedBytesSet:               expectedBytesSet,
+		ExpectedPayloadBytes:           expectedPayloadBytes,
+		ExpectedPayloadBytesSet:        expectedPayloadBytesSet,
+		StallWindow:                    stallWindow,
+		PeerTrace:                      peerTrace,
+		RateTolerance:                  rateTolerance,
+		ProgressLeadToleranceBytes:     progressLeadToleranceBytes,
+		RequireDirectTransport:         requireDirectTransport,
+		RequireFilePayloadEngine:       filePayloadEngine,
+		RequireEngineTelemetry:         requireEngineTelemetry,
+		ExpectedSelectedPublicIPv4:     expectedSelectedPublicIPv4,
+		PeerExpectedSelectedPublicIPv4: peerExpectedSelectedPublicIPv4,
+		ForbidRelayPayload:             forbidRelayPayload,
+		Path:                           flags.Arg(0),
 	}, nil
+}
+
+func validateRoleOption(role string, flags *flag.FlagSet, stderr io.Writer) error {
+	if role == "" || flags.NArg() != 1 {
+		flags.Usage()
+		return errUsage
+	}
+	if role != string(transfertrace.RoleSend) && role != string(transfertrace.RoleReceive) {
+		return optionUsageError(stderr, flags, "role must be send or receive")
+	}
+	return nil
+}
+
+func validateExpectedByteOptions(expectedBytes, expectedPayloadBytes int64, flags *flag.FlagSet, stderr io.Writer) error {
+	if expectedBytes < 0 {
+		return optionUsageError(stderr, flags, "expected-bytes must be non-negative")
+	}
+	if expectedPayloadBytes < 0 {
+		return optionUsageError(stderr, flags, "expected-payload-bytes must be non-negative")
+	}
+	return nil
+}
+
+func parseRequiredFilePayloadEngine(value string, flags *flag.FlagSet, stderr io.Writer) (transfertrace.FilePayloadEngine, error) {
+	if value == "" {
+		return "", nil
+	}
+	engine, err := transfertrace.ParseFilePayloadEngine(value)
+	if err != nil {
+		return "", optionUsageError(stderr, flags, err)
+	}
+	return engine, nil
+}
+
+func validateToleranceOptions(rateTolerance float64, progressLeadToleranceBytes int64, flags *flag.FlagSet, stderr io.Writer) error {
+	if rateTolerance < 0 {
+		return optionUsageError(stderr, flags, "rate-tolerance must be non-negative")
+	}
+	if progressLeadToleranceBytes < 0 {
+		return optionUsageError(stderr, flags, "progress-lead-tolerance must be non-negative")
+	}
+	return nil
+}
+
+func optionUsageError(stderr io.Writer, flags *flag.FlagSet, message any) error {
+	_, _ = fmt.Fprintln(stderr, message)
+	flags.Usage()
+	return errUsage
 }
 
 func flagProvided(flags *flag.FlagSet, name string) bool {
@@ -219,12 +279,17 @@ func flagProvided(flags *flag.FlagSet, name string) bool {
 
 func checkPayloadPaths(opts options) (transfertrace.Result, string, error) {
 	checkOpts := transfertrace.Options{
-		Role:                   transfertrace.Role(opts.Role),
-		ExpectedBytes:          opts.ExpectedBytes,
-		ExpectedBytesSet:       opts.ExpectedBytesSet,
-		StallWindow:            opts.StallWindow,
-		RequireDirectTransport: opts.RequireDirectTransport,
-		ForbidRelayPayload:     opts.ForbidRelayPayload,
+		Role:                       transfertrace.Role(opts.Role),
+		ExpectedBytes:              opts.ExpectedBytes,
+		ExpectedBytesSet:           opts.ExpectedBytesSet,
+		ExpectedPayloadBytes:       opts.ExpectedPayloadBytes,
+		ExpectedPayloadBytesSet:    opts.ExpectedPayloadBytesSet,
+		StallWindow:                opts.StallWindow,
+		RequireDirectTransport:     opts.RequireDirectTransport,
+		RequireFilePayloadEngine:   opts.RequireFilePayloadEngine,
+		RequireEngineTelemetry:     opts.RequireEngineTelemetry,
+		ExpectedSelectedPublicIPv4: opts.ExpectedSelectedPublicIPv4,
+		ForbidRelayPayload:         opts.ForbidRelayPayload,
 	}
 	pairedSender := opts.Role == string(transfertrace.RoleSend) && opts.PeerTrace != ""
 	if pairedSender {
@@ -236,16 +301,26 @@ func checkPayloadPaths(opts options) (transfertrace.Result, string, error) {
 	}
 
 	peerResult, err := checkTracePath(opts.PeerTrace, transfertrace.Options{
-		Role:                   transfertrace.RoleReceive,
-		StallWindow:            opts.StallWindow,
-		RequireDirectTransport: opts.RequireDirectTransport,
-		ForbidRelayPayload:     opts.ForbidRelayPayload,
+		Role:                       transfertrace.RoleReceive,
+		StallWindow:                opts.StallWindow,
+		ExpectedPayloadBytes:       opts.ExpectedPayloadBytes,
+		ExpectedPayloadBytesSet:    opts.ExpectedPayloadBytesSet,
+		RequireDirectTransport:     opts.RequireDirectTransport,
+		RequireFilePayloadEngine:   opts.RequireFilePayloadEngine,
+		RequireEngineTelemetry:     opts.RequireEngineTelemetry,
+		ExpectedSelectedPublicIPv4: opts.PeerExpectedSelectedPublicIPv4,
+		ForbidRelayPayload:         opts.ForbidRelayPayload,
 	})
 	if err != nil {
 		return peerResult, "", err
 	}
 	senderACKSummary := fmt.Sprintf(" sender_ack_max_flatline=%s", result.MaxFlatline)
 	result.MaxFlatline = peerResult.MaxFlatline
+	result.FinalFilePayloadBytes = peerResult.FinalFilePayloadBytes
+	result.FinalFilePayloadEngine = peerResult.FinalFilePayloadEngine
+	result.FinalFilePayloadBytesBulk = peerResult.FinalFilePayloadBytesBulk
+	result.FinalFilePayloadBytesQUIC = peerResult.FinalFilePayloadBytesQUIC
+	result.FinalFilePayloadLaneAddresses = append([]string(nil), peerResult.FinalFilePayloadLaneAddresses...)
 	return result, senderACKSummary, nil
 }
 

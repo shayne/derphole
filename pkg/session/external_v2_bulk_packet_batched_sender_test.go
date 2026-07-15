@@ -97,6 +97,15 @@ func TestExternalV2BulkPacketBatchedSenderMatchesLegacyPackets(t *testing.T) {
 	if got := sender.primaryPayloadBytes.Load(); got != int64(len(payload)) {
 		t.Fatalf("primary payload = %d, want %d", got, len(payload))
 	}
+	var acceptedPayloadBytes int
+	for _, capture := range captures {
+		for _, n := range capture.payloadBytes {
+			acceptedPayloadBytes += n
+		}
+	}
+	if acceptedPayloadBytes != len(payload) {
+		t.Fatalf("batch message payload bytes = %d, want %d", acceptedPayloadBytes, len(payload))
+	}
 }
 
 func TestExternalV2BulkPacketRepairUsesBatchesAndPreservesLaneRotation(t *testing.T) {
@@ -185,6 +194,15 @@ func TestExternalV2BulkPacketRepairUsesBatchesAndPreservesLaneRotation(t *testin
 	}
 	if got := sender.sentPayload.Load(); got != wantPayload {
 		t.Fatalf("sent payload = %d, want %d", got, wantPayload)
+	}
+	var acceptedRepairPayload int64
+	for _, capture := range captures {
+		for _, n := range capture.payloadBytes {
+			acceptedRepairPayload += int64(n)
+		}
+	}
+	if acceptedRepairPayload != wantPayload {
+		t.Fatalf("repair batch message payload bytes = %d, want %d", acceptedRepairPayload, wantPayload)
 	}
 	if got := repairAttempt[4]; got != 2 {
 		t.Fatalf("packet 4 repair attempt = %d, want 2", got)
@@ -280,7 +298,7 @@ func TestExternalV2BulkPacketSenderFallsBackWhenPeerDoesNotAck(t *testing.T) {
 
 func TestExternalV2BulkPacketBatchedSenderRetriesENOBUFSFromFirstUnsent(t *testing.T) {
 	sender := &externalV2BulkPacketSender{ctx: context.Background()}
-	batch := &enobufsExternalV2BulkPacketBatchConn{remaining: 3}
+	batch := &enobufsExternalV2BulkPacketBatchConn{remaining: 3, partialFirst: true}
 	sender.batchConns = []externalV2BulkPacketBatchConn{batch}
 	messages := make([]externalV2BulkPacketBatchMessage, 4)
 	for index := range messages {
@@ -292,6 +310,9 @@ func TestExternalV2BulkPacketBatchedSenderRetriesENOBUFSFromFirstUnsent(t *testi
 	}
 	if batch.attempts != 4 {
 		t.Fatalf("attempts = %d, want 4", batch.attempts)
+	}
+	if !bytes.Equal(batch.starts, []byte{0, 1, 1, 1}) {
+		t.Fatalf("retry starts = %v, want [0 1 1 1]", batch.starts)
 	}
 	if sender.localENOBUFSRetries.Load() != 3 || sender.localENOBUFSMaxConsecutive.Load() != 3 {
 		t.Fatalf("ENOBUFS counters = retries %d max %d", sender.localENOBUFSRetries.Load(), sender.localENOBUFSMaxConsecutive.Load())
@@ -411,9 +432,10 @@ func TestExternalV2BulkPacketLaneWritersCancelAndReleaseEverySlab(t *testing.T) 
 }
 
 type captureExternalV2BulkPacketBatchConn struct {
-	mu       sync.Mutex
-	packets  [][]byte
-	maxBatch int
+	mu           sync.Mutex
+	packets      [][]byte
+	payloadBytes []int
+	maxBatch     int
 }
 
 func (c *captureExternalV2BulkPacketBatchConn) WriteBatch(_ context.Context, messages []externalV2BulkPacketBatchMessage) (int, error) {
@@ -423,6 +445,7 @@ func (c *captureExternalV2BulkPacketBatchConn) WriteBatch(_ context.Context, mes
 	for _, message := range messages {
 		packet := append([]byte(nil), message.Buffers[0]...)
 		c.packets = append(c.packets, packet)
+		c.payloadBytes = append(c.payloadBytes, message.PayloadBytes)
 	}
 	return len(messages), nil
 }
@@ -438,14 +461,20 @@ func (c *captureExternalV2BulkPacketBatchConn) Stats() externalV2BulkPacketBatch
 }
 
 type enobufsExternalV2BulkPacketBatchConn struct {
-	remaining int
-	attempts  int
+	remaining    int
+	attempts     int
+	partialFirst bool
+	starts       []byte
 }
 
 func (c *enobufsExternalV2BulkPacketBatchConn) WriteBatch(_ context.Context, messages []externalV2BulkPacketBatchMessage) (int, error) {
 	c.attempts++
+	c.starts = append(c.starts, messages[0].Buffers[0][0])
 	if c.remaining > 0 {
 		c.remaining--
+		if c.partialFirst && c.attempts == 1 {
+			return 1, syscall.ENOBUFS
+		}
 		return 0, syscall.ENOBUFS
 	}
 	return len(messages), nil

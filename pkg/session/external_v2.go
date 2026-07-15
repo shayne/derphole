@@ -208,6 +208,7 @@ func (rt *externalV2SendRuntime) Close() {
 
 func (rt *externalV2SendRuntime) run(ctx context.Context) (retErr error) {
 	metrics := newExternalTransferMetricsWithTrace(time.Now(), rt.cfg.Trace, transfertrace.RoleSend)
+	rt.cfg.BlockSource = withExternalV2FileSourceReadMetrics(rt.cfg.BlockSource, metrics)
 	defer func() {
 		if retErr != nil {
 			metrics.SetError(retErr)
@@ -334,6 +335,9 @@ func (rt *externalV2SendRuntime) sendStream(ctx context.Context, accept external
 	defer path.Close()
 	if path.raw {
 		tr.ActivateRawDirect()
+		if err := metrics.SetFilePayloadLaneAddrs(path.addrs, time.Now()); err != nil {
+			return err
+		}
 	}
 	if path.raw && externalV2UsesBulkPacketTransfer(accept.TransferMode) {
 		emitExternalV2Debug(rt.cfg.Emitter, "v2-block-transfer=bulk-packets")
@@ -375,7 +379,7 @@ func (rt *externalV2SendRuntime) newExternalV2SendClient(manager *transport.Mana
 func (rt *externalV2SendRuntime) copySendStreamWithClient(streamCtx context.Context, ctx context.Context, accept externalV2Accept, boundedOpen bool, streamCount int, client *dataplane.QUICClient, cancelStream context.CancelFunc, metrics *externalTransferMetrics, progress *externalV2PeerProgressState) error {
 	abortErrCh, stopAbortWatch := rt.watchAbort(ctx, func() {
 		cancelStream()
-		_ = client.CloseWithError(1, "peer aborted transfer")
+		_ = closeExternalV2QUICEndpoint(client, metrics, streamCount, boundedOpen, 1, "peer aborted transfer")
 	})
 	defer stopAbortWatch()
 	openCtx := streamCtx
@@ -390,21 +394,22 @@ func (rt *externalV2SendRuntime) copySendStreamWithClient(streamCtx context.Cont
 		if boundedOpen {
 			err = externalV2StreamOpenFailure(err)
 		}
+		_ = closeExternalV2QUICEndpoint(client, metrics, streamCount, boundedOpen, 1, err.Error())
 		return err
 	}
 	if err := rt.copyAcceptedSendStreams(streamCtx, ctx, accept, streams, metrics); err != nil {
-		return externalV2SendQUICStreamError(ctx, client, abortErrCh, err)
+		return externalV2SendQUICStreamError(ctx, client, abortErrCh, metrics, streamCount, boundedOpen, err)
 	}
 	complete, err := rt.receiveComplete(ctx, abortErrCh, rt.cfg.StdioExpectedBytes, progress)
 	if err != nil {
-		_ = client.CloseWithError(1, err.Error())
+		_ = closeExternalV2QUICEndpoint(client, metrics, streamCount, boundedOpen, 1, err.Error())
 		return err
 	}
 	if err := recordExternalV2Completion(ctx, complete, metrics, progress, rt.cfg.Progress, peerProgressFinalTimeout); err != nil {
-		_ = client.CloseWithError(1, err.Error())
+		_ = closeExternalV2QUICEndpoint(client, metrics, streamCount, boundedOpen, 1, err.Error())
 		return err
 	}
-	if err := client.CloseWithError(0, "complete"); err != nil {
+	if err := closeExternalV2QUICEndpoint(client, metrics, streamCount, boundedOpen, 0, "complete"); err != nil {
 		return err
 	}
 	return nil
@@ -440,8 +445,8 @@ func (rt *externalV2SendRuntime) copyAcceptedSendStreams(streamCtx context.Conte
 	return copyExternalV2SendStreams(streamCtx, src, streams, metrics)
 }
 
-func externalV2SendQUICStreamError(ctx context.Context, client *dataplane.QUICClient, abortErrCh <-chan error, err error) error {
-	_ = client.CloseWithError(1, err.Error())
+func externalV2SendQUICStreamError(ctx context.Context, client *dataplane.QUICClient, abortErrCh <-chan error, metrics *externalTransferMetrics, streamCount int, rawDirect bool, err error) error {
+	_ = closeExternalV2QUICEndpoint(client, metrics, streamCount, rawDirect, 1, err.Error())
 	return externalV2PreferPeerAbort(ctx, abortErrCh, err)
 }
 
@@ -867,43 +872,65 @@ func (rt *externalV2ListenRuntime) receiveQUIC(ctx context.Context, accepted ext
 		return err
 	}
 	defer rawPath.Close()
-	if rawPath.raw {
-		tr.ActivateRawDirect()
-	}
-	if rawPath.raw {
-		server = dataplane.NewQUICServerOnPacketConns(rawPath.conns, rt.session.quicIdentity, accepted.claim.QUICPublic)
-		server.SetManagerConnectionCount(managerConnections)
+	server, err = rt.listenQUICServer(tr, rawPath, server, accepted.claim.QUICPublic, managerConnections, metrics)
+	if err != nil {
+		return err
 	}
 	abortErrCh, stopAbortWatch := rt.watchAbort(ctx, accepted.peerDERP, func() {
 		cancelStream()
-		_ = server.CloseWithError(1, "peer aborted transfer")
+		_ = closeExternalV2QUICEndpoint(server, metrics, streamCount, rawPath.raw, 1, "peer aborted transfer")
 	})
 	defer stopAbortWatch()
+	streams, err := acceptExternalV2ListenQUICStreams(streamCtx, ctx, abortErrCh, server, streamCount, rawPath.raw)
+	if err != nil {
+		_ = closeExternalV2QUICEndpoint(server, metrics, streamCount, rawPath.raw, 1, err.Error())
+		return err
+	}
+	return rt.finishQUICReceive(streamCtx, ctx, accepted, tr, rawPath, server, streamCount, streams, dst, progressSender, metrics, pathEmitter, abortErrCh)
+}
+
+func (rt *externalV2ListenRuntime) listenQUICServer(tr externalV2ListenTransport, rawPath externalV2DirectPacketPath, server *dataplane.QUICServer, peer [32]byte, managerConnections int, metrics *externalTransferMetrics) (*dataplane.QUICServer, error) {
+	if !rawPath.raw {
+		return server, nil
+	}
+	tr.ActivateRawDirect()
+	if err := metrics.SetFilePayloadLaneAddrs(rawPath.addrs, time.Now()); err != nil {
+		return nil, err
+	}
+	server = dataplane.NewQUICServerOnPacketConns(rawPath.conns, rt.session.quicIdentity, peer)
+	server.SetManagerConnectionCount(managerConnections)
+	return server, nil
+}
+
+func acceptExternalV2ListenQUICStreams(streamCtx, preferenceCtx context.Context, abortErrCh <-chan error, server *dataplane.QUICServer, streamCount int, bounded bool) ([]io.ReadCloser, error) {
 	openCtx := streamCtx
 	cancelOpen := func() {}
-	boundedOpen := rawPath.raw
-	if rawPath.raw {
+	if bounded {
 		openCtx, cancelOpen = context.WithTimeout(streamCtx, externalV2StreamOpenWait)
 	}
 	streams, err := server.AcceptStreamsWithReady(openCtx, streamCount, nil)
 	cancelOpen()
-	if err != nil {
-		err = externalV2PreferPeerAbort(ctx, abortErrCh, err)
-		if boundedOpen {
-			err = externalV2StreamOpenFailure(err)
-		}
-		return err
+	if err == nil {
+		return streams, nil
 	}
+	err = externalV2PreferPeerAbort(preferenceCtx, abortErrCh, err)
+	if bounded {
+		err = externalV2StreamOpenFailure(err)
+	}
+	return nil, err
+}
+
+func (rt *externalV2ListenRuntime) finishQUICReceive(streamCtx, completeCtx context.Context, accepted externalV2AcceptedClaim, tr externalV2ListenTransport, rawPath externalV2DirectPacketPath, server *dataplane.QUICServer, streamCount int, streams []io.ReadCloser, dst *byteCountingWriteCloser, progressSender *externalV2PeerProgressSender, metrics *externalTransferMetrics, pathEmitter *transportPathEmitter, abortErrCh <-chan error) error {
 	bytesReceived, err := copyExternalV2ReceiveStreams(streamCtx, dst, streams, metrics)
 	if err != nil {
-		_ = server.CloseWithError(1, err.Error())
-		return externalV2PreferPeerAbort(ctx, abortErrCh, err)
+		_ = closeExternalV2QUICEndpoint(server, metrics, streamCount, rawPath.raw, 1, err.Error())
+		return externalV2PreferPeerAbort(completeCtx, abortErrCh, err)
 	}
-	if err := rt.sendComplete(ctx, accepted.peerDERP, bytesReceived, progressSender); err != nil {
-		_ = server.CloseWithError(1, err.Error())
+	if err := rt.sendComplete(completeCtx, accepted.peerDERP, bytesReceived, progressSender); err != nil {
+		_ = closeExternalV2QUICEndpoint(server, metrics, streamCount, rawPath.raw, 1, err.Error())
 		return err
 	}
-	if err := server.CloseWithError(0, "complete"); err != nil {
+	if err := closeExternalV2QUICEndpoint(server, metrics, streamCount, rawPath.raw, 0, "complete"); err != nil {
 		return err
 	}
 	metrics.Complete(time.Now())

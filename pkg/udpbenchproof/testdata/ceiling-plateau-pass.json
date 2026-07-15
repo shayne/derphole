@@ -1,0 +1,1 @@
+{"offered_gbps":[1.2,1.5,1.8,2.1,2.4],"delivered_gbps":[1.15,1.38,1.42,1.44,1.44],"loss_ratio":[0.01,0.04,0.18,0.31,0.4],"expected_passed":true,"expected_start_gbps":1.5,"expected_end_gbps":1.8}

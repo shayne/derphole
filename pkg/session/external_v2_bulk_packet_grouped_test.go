@@ -7,13 +7,291 @@ package session
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
+	"net"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/shayne/derphole/pkg/transfertrace"
 	"golang.org/x/time/rate"
 	"tailscale.com/types/key"
 )
+
+type recordingReaderAt struct {
+	io.ReaderAt
+	reads []recordedReaderAtRead
+}
+
+type recordedReaderAtRead struct {
+	offset int64
+	length int
+}
+
+func useExternalV2BulkPacketCandidate(t *testing.T, candidate string) {
+	t.Helper()
+	previous := externalV2BulkPacketBenchmarkCandidate
+	externalV2BulkPacketBenchmarkCandidate = candidate
+	t.Cleanup(func() { externalV2BulkPacketBenchmarkCandidate = previous })
+}
+
+func (r *recordingReaderAt) ReadAt(payload []byte, offset int64) (int, error) {
+	r.reads = append(r.reads, recordedReaderAtRead{offset: offset, length: len(payload)})
+	return r.ReaderAt.ReadAt(payload, offset)
+}
+
+func TestExternalV2BulkPacketGroupedPrepareSlabReadsFullRangeOnce(t *testing.T) {
+	useExternalV2BulkPacketCandidate(t, "coalesced-gso3")
+
+	payload := make([]byte, externalV2BulkPacketGroupedPlaintextBytes*16)
+	reader := &recordingReaderAt{ReaderAt: bytes.NewReader(payload)}
+	sender := newGroupedSlabTestSender(t, reader, int64(len(payload)))
+	result := sender.prepareGroupedPacketSlab(
+		context.Background(),
+		externalV2BulkPacketPrepareJob{start: 0, count: 16},
+		newExternalV2BulkPacketSlab(),
+	)
+	if result.err != nil || len(reader.reads) != 1 || reader.reads[0].offset != 0 || reader.reads[0].length != 989024 {
+		t.Fatalf("result=%v reads=%+v", result.err, reader.reads)
+	}
+}
+
+func TestExternalV2BulkPacketCandidateControlsGroupedSourceReads(t *testing.T) {
+	for _, test := range []struct {
+		candidate string
+		wantReads int
+	}{
+		{candidate: "baseline-gso3", wantReads: 16},
+		{candidate: "coalesced-gso3", wantReads: 1},
+		{candidate: "connected-gso3", wantReads: 16},
+		{candidate: "combined-gso3", wantReads: 1},
+	} {
+		t.Run(test.candidate, func(t *testing.T) {
+			useExternalV2BulkPacketCandidate(t, test.candidate)
+
+			payload := make([]byte, externalV2BulkPacketGroupedPlaintextBytes*16)
+			reader := &recordingReaderAt{ReaderAt: bytes.NewReader(payload)}
+			sender := newGroupedSlabTestSender(t, reader, int64(len(payload)))
+			result := sender.prepareGroupedPacketSlab(
+				context.Background(),
+				externalV2BulkPacketPrepareJob{start: 0, count: 16},
+				newExternalV2BulkPacketSlab(),
+			)
+			if result.err != nil || len(reader.reads) != test.wantReads {
+				t.Fatalf("candidate %q result=%v reads=%+v, want %d reads", test.candidate, result.err, reader.reads, test.wantReads)
+			}
+		})
+	}
+}
+
+func TestExternalV2BulkPacketCandidateInvalidValueStopsGroupedSourceReads(t *testing.T) {
+	previous := externalV2BulkPacketBenchmarkCandidate
+	externalV2BulkPacketBenchmarkCandidate = "combined-gso5"
+	t.Cleanup(func() { externalV2BulkPacketBenchmarkCandidate = previous })
+
+	payload := make([]byte, externalV2BulkPacketGroupedPlaintextBytes*16)
+	reader := &recordingReaderAt{ReaderAt: bytes.NewReader(payload)}
+	sender := newGroupedSlabTestSender(t, reader, int64(len(payload)))
+	result := sender.prepareGroupedPacketSlab(
+		context.Background(),
+		externalV2BulkPacketPrepareJob{start: 0, count: 16},
+		newExternalV2BulkPacketSlab(),
+	)
+	if result.err == nil || len(reader.reads) != 0 {
+		t.Fatalf("invalid candidate result=%v reads=%+v", result.err, reader.reads)
+	}
+}
+
+func TestExternalV2BulkPacketGroupedPrepareSlabReadsPartialFinalRangeOnce(t *testing.T) {
+	useExternalV2BulkPacketCandidate(t, "coalesced-gso3")
+
+	const finalBytes = 731
+	payload := make([]byte, externalV2BulkPacketGroupedPlaintextBytes*15+finalBytes)
+	reader := &recordingReaderAt{ReaderAt: bytes.NewReader(payload)}
+	sender := newGroupedSlabTestSender(t, reader, int64(len(payload)))
+	result := sender.prepareGroupedPacketSlab(
+		context.Background(),
+		externalV2BulkPacketPrepareJob{start: 0, count: 16},
+		newExternalV2BulkPacketSlab(),
+	)
+	wantLength := externalV2BulkPacketGroupedPlaintextBytes*15 + finalBytes
+	if result.err != nil || len(reader.reads) != 1 || reader.reads[0].offset != 0 || reader.reads[0].length != wantLength {
+		t.Fatalf("result=%v reads=%+v wantLength=%d", result.err, reader.reads, wantLength)
+	}
+}
+
+func TestExternalV2BulkPacketGroupedPrepareSlabReadsNonzeroRangeOnce(t *testing.T) {
+	useExternalV2BulkPacketCandidate(t, "coalesced-gso3")
+
+	const startGroup = 4
+	payload := make([]byte, externalV2BulkPacketGroupedPlaintextBytes*20)
+	reader := &recordingReaderAt{ReaderAt: bytes.NewReader(payload)}
+	sender := newGroupedSlabTestSender(t, reader, int64(len(payload)))
+	result := sender.prepareGroupedPacketSlab(
+		context.Background(),
+		externalV2BulkPacketPrepareJob{start: startGroup, count: 16},
+		newExternalV2BulkPacketSlab(),
+	)
+	wantOffset := int64(startGroup * externalV2BulkPacketGroupedPlaintextBytes)
+	if result.err != nil || len(reader.reads) != 1 || reader.reads[0].offset != wantOffset || reader.reads[0].length != 989024 {
+		t.Fatalf("result=%v reads=%+v wantOffset=%d", result.err, reader.reads, wantOffset)
+	}
+}
+
+func TestExternalV2BulkPacketGroupedPrepareSlabRejectsShortRead(t *testing.T) {
+	useExternalV2BulkPacketCandidate(t, "coalesced-gso3")
+
+	payloadSize := int64(externalV2BulkPacketGroupedPlaintextBytes * 16)
+	reader := &recordingReaderAt{ReaderAt: bytes.NewReader(make([]byte, payloadSize-1))}
+	sender := newGroupedSlabTestSender(t, reader, payloadSize)
+	result := sender.prepareGroupedPacketSlab(
+		context.Background(),
+		externalV2BulkPacketPrepareJob{start: 0, count: 16},
+		newExternalV2BulkPacketSlab(),
+	)
+	if !errors.Is(result.err, io.EOF) || len(reader.reads) != 1 || reader.reads[0].offset != 0 || reader.reads[0].length != 989024 {
+		t.Fatalf("result=%v reads=%+v", result.err, reader.reads)
+	}
+}
+
+func TestExternalV2BulkPacketGroupedPrepareSlabSkipsReadWhenContextCanceled(t *testing.T) {
+	payload := make([]byte, externalV2BulkPacketGroupedPlaintextBytes*16)
+	reader := &recordingReaderAt{ReaderAt: bytes.NewReader(payload)}
+	sender := newGroupedSlabTestSender(t, reader, int64(len(payload)))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result := sender.prepareGroupedPacketSlab(
+		ctx,
+		externalV2BulkPacketPrepareJob{start: 0, count: 16},
+		newExternalV2BulkPacketSlab(),
+	)
+	if !errors.Is(result.err, context.Canceled) || len(reader.reads) != 0 {
+		t.Fatalf("result=%v reads=%+v", result.err, reader.reads)
+	}
+}
+
+func TestExternalV2BulkPacketGroupedPrepareSlabRejectsZeroGroupCountBeforeRead(t *testing.T) {
+	payload := make([]byte, externalV2BulkPacketGroupedPlaintextBytes*16)
+	reader := &recordingReaderAt{ReaderAt: bytes.NewReader(payload)}
+	sender := newGroupedSlabTestSender(t, reader, int64(len(payload)))
+	result := sender.prepareGroupedPacketSlab(
+		context.Background(),
+		externalV2BulkPacketPrepareJob{start: 0, count: 0},
+		newExternalV2BulkPacketSlab(),
+	)
+	if result.err == nil || len(reader.reads) != 0 {
+		t.Fatalf("result=%v reads=%+v", result.err, reader.reads)
+	}
+}
+
+func TestExternalV2BulkPacketGroupedPrepareSlabRejectsOutOfRangeBeforeRead(t *testing.T) {
+	payload := make([]byte, externalV2BulkPacketGroupedPlaintextBytes*16)
+	reader := &recordingReaderAt{ReaderAt: bytes.NewReader(payload)}
+	sender := newGroupedSlabTestSender(t, reader, int64(len(payload)))
+	result := sender.prepareGroupedPacketSlab(
+		context.Background(),
+		externalV2BulkPacketPrepareJob{start: 16, count: 1},
+		newExternalV2BulkPacketSlab(),
+	)
+	if result.err == nil || len(reader.reads) != 0 {
+		t.Fatalf("result=%v reads=%+v", result.err, reader.reads)
+	}
+}
+
+func TestExternalV2BulkPacketGroupedPrepareSlabRejectsOversizedRangeBeforeRead(t *testing.T) {
+	payload := make([]byte, externalV2BulkPacketGroupedPlaintextBytes*(externalV2BulkPacketGroupedGroupsPerSlab+1))
+	reader := &recordingReaderAt{ReaderAt: bytes.NewReader(payload)}
+	sender := newGroupedSlabTestSender(t, reader, int64(len(payload)))
+	var result externalV2BulkPacketPreparedSlab
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("prepare panicked: %v", recovered)
+			}
+		}()
+		result = sender.prepareGroupedPacketSlab(
+			context.Background(),
+			externalV2BulkPacketPrepareJob{start: 0, count: externalV2BulkPacketGroupedGroupsPerSlab + 1},
+			newExternalV2BulkPacketSlab(),
+		)
+	}()
+	if result.err == nil || len(reader.reads) != 0 {
+		t.Fatalf("result=%v reads=%+v", result.err, reader.reads)
+	}
+}
+
+func TestExternalV2BulkPacketGroupedPrepareSlabRejectsOneByteSeventeenthGroupBeforeRead(t *testing.T) {
+	payload := make([]byte, externalV2BulkPacketGroupedPlaintextBytes*externalV2BulkPacketGroupedGroupsPerSlab+1)
+	reader := &recordingReaderAt{ReaderAt: bytes.NewReader(payload)}
+	sender := newGroupedSlabTestSender(t, reader, int64(len(payload)))
+	var result externalV2BulkPacketPreparedSlab
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("prepare panicked: %v", recovered)
+			}
+		}()
+		result = sender.prepareGroupedPacketSlab(
+			context.Background(),
+			externalV2BulkPacketPrepareJob{start: 0, count: externalV2BulkPacketGroupedGroupsPerSlab + 1},
+			newExternalV2BulkPacketSlab(),
+		)
+	}()
+	if result.err == nil || len(reader.reads) != 0 {
+		t.Fatalf("result=%v reads=%+v", result.err, reader.reads)
+	}
+}
+
+func TestExternalV2BulkPacketGroupedSlabRangeRejectsWrappedGroupRange(t *testing.T) {
+	payloadSize := (int64(^uint32(0)) + 2) * int64(externalV2BulkPacketGroupedPlaintextBytes)
+	start, length := externalV2BulkPacketGroupedSlabRange(^uint32(0), 2, payloadSize)
+	if length != 0 {
+		t.Fatalf("range start=%d length=%d, want empty", start, length)
+	}
+}
+
+func TestExternalV2BulkPacketGroupedPrepareSlabRejectsWrappedGroupRangeBeforeRead(t *testing.T) {
+	payload := make([]byte, externalV2BulkPacketGroupedPlaintextBytes)
+	reader := &recordingReaderAt{ReaderAt: bytes.NewReader(payload)}
+	sender := newGroupedSlabTestSender(t, reader, int64(len(payload)))
+	var result externalV2BulkPacketPreparedSlab
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("prepare panicked: %v", recovered)
+			}
+		}()
+		result = sender.prepareGroupedPacketSlab(
+			context.Background(),
+			externalV2BulkPacketPrepareJob{start: ^uint32(0), count: 2},
+			newExternalV2BulkPacketSlab(),
+		)
+	}()
+	if result.err == nil || len(reader.reads) != 0 {
+		t.Fatalf("result=%v reads=%+v", result.err, reader.reads)
+	}
+}
+
+func newGroupedSlabTestSender(t *testing.T, reader io.ReaderAt, payloadSize int64) *externalV2BulkPacketSender {
+	t.Helper()
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(), key.NewNode().Public(), key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupCount, totalPackets := externalV2BulkPacketGroupedLayout(payloadSize, auth.grouped.Overhead())
+	return &externalV2BulkPacketSender{
+		src:          &BlockSource{Payload: reader, PayloadSize: payloadSize},
+		path:         externalV2BulkPacketPath{Addrs: []net.Addr{&net.UDPAddr{}}},
+		auth:         auth,
+		runID:        1,
+		totalPackets: totalPackets,
+		groupCount:   groupCount,
+		laneCount:    1,
+	}
+}
 
 func TestExternalV2BulkPacketGroupedRecordRoundTrip(t *testing.T) {
 	auth, err := externalV2BulkPacketAuthForToken(
@@ -630,10 +908,11 @@ func TestExternalV2BulkPacketGroupedReceiverCommitsWithoutLegacyAssembler(t *tes
 	}
 	const payloadSize = externalV2BulkPacketGroupedMinimumFileBytes
 	sink := &groupedCaptureSink{}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(200, 0), nil, transfertrace.RoleReceive)
 	receiver := newExternalV2BulkPacketReceiver(sink, externalV2BlockReceiveConfig{
 		PayloadSize: payloadSize,
 		HeaderBytes: 17,
-	}, externalV2BulkPacketPath{}, auth, nil)
+	}, externalV2BulkPacketPath{}, auth, metrics)
 	receiver.stopHello = func() {}
 	if !receiver.grouped || receiver.groupAssembler == nil {
 		t.Fatal("large authenticated receive did not select grouped mode")
@@ -664,6 +943,11 @@ func TestExternalV2BulkPacketGroupedReceiverCommitsWithoutLegacyAssembler(t *tes
 	}
 	if sink.offset != plainStart || !bytes.Equal(sink.data, data) {
 		t.Fatal("grouped receiver did not write the authenticated group once at its file offset")
+	}
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	if metrics.filePayloadEngine != transfertrace.FilePayloadEngineBulk || metrics.filePayloadBytesCommitted != int64(plainBytes) || metrics.filePayloadBytesBulk != int64(plainBytes) {
+		t.Fatalf("grouped file payload engine=%q committed=%d bulk=%d", metrics.filePayloadEngine, metrics.filePayloadBytesCommitted, metrics.filePayloadBytesBulk)
 	}
 }
 

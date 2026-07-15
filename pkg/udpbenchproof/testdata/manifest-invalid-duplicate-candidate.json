@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "manifest_input": {
+    "kind": "experiment",
+    "parent_manifest": null,
+    "parent_decision_refs": null,
+    "local_public_ipv4": "1.1.1.1",
+    "remote_public_ipv4": "8.8.8.8",
+    "remote_kernel": "6.8.0-test",
+    "remote_arch": "x86_64",
+    "remote_boot_id": "11111111-2222-3333-4444-555555555555",
+    "remote_online_cpus": 2,
+    "payload": {"bytes": 1073741824, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    "candidates": [
+      {
+        "id": "control",
+        "commit": "1111111111111111111111111111111111111111",
+        "darwin": {"platform": "darwin-arm64", "sha256": "2222222222222222222222222222222222222222222222222222222222222222", "vcs_revision": "1111111111111111111111111111111111111111"},
+        "linux": {"platform": "linux-amd64", "sha256": "3333333333333333333333333333333333333333333333333333333333333333", "vcs_revision": "1111111111111111111111111111111111111111"},
+        "config": {"candidate": "control"}
+      },
+      {
+        "id": "control",
+        "commit": "4444444444444444444444444444444444444444",
+        "darwin": {"platform": "darwin-arm64", "sha256": "5555555555555555555555555555555555555555555555555555555555555555", "vcs_revision": "4444444444444444444444444444444444444444"},
+        "linux": {"platform": "linux-amd64", "sha256": "6666666666666666666666666666666666666666666666666666666666666666", "vcs_revision": "4444444444444444444444444444444444444444"},
+        "config": {"candidate": "challenger"}
+      }
+    ],
+    "schedules": [
+      {"stage": "screening", "run_ids": ["screen-1", "screen-2"], "candidate_order": ["control", "control"], "direction_order": ["hetz-to-mac", "hetz-to-mac"], "offered_load_mbps": null, "repetitions": 1},
+      {"stage": "finalist", "run_ids": ["final-h2m-control-1", "final-h2m-control-copy-1", "final-h2m-control-2", "final-h2m-control-copy-2", "final-h2m-control-3", "final-h2m-control-copy-3", "final-m2h-control-1", "final-m2h-control-copy-1", "final-m2h-control-2", "final-m2h-control-copy-2", "final-m2h-control-3", "final-m2h-control-copy-3"], "candidate_order": ["control", "control", "control", "control", "control", "control", "control", "control", "control", "control", "control", "control"], "direction_order": ["hetz-to-mac", "hetz-to-mac", "hetz-to-mac", "hetz-to-mac", "hetz-to-mac", "hetz-to-mac", "mac-to-hetz", "mac-to-hetz", "mac-to-hetz", "mac-to-hetz", "mac-to-hetz", "mac-to-hetz"], "offered_load_mbps": null, "repetitions": 3}
+    ],
+    "rules": {
+      "capacity_minimum_mbps": 2050,
+      "file_minimum_mbps": 2000,
+      "max_cv": 0.1,
+      "material_delta": 0.03,
+      "screen_dominance": 0.1,
+      "finalist_delta": 0.05,
+      "max_recovery": 0.02,
+      "max_scan_per_packet": 2,
+      "max_cpu_seconds_per_gib": 8,
+      "min_ceiling_cpu_saturation": 0.9,
+      "min_ceiling_kernel_saturation": 0.9,
+      "required_profile_agreement": 1,
+      "capacity_attempts": 3,
+      "min_repeated_ceiling_profiles": 2
+    },
+    "production_environment": {"DERPHOLE_TRANSFER_TRACE_CSV": "trace.csv"},
+    "fleet_inventory": [
+      {"id": "primary", "ssh": "benchmark@primary", "public_ipv4": "8.8.8.8", "role": "primary", "eric_watchdog": false},
+      {"id": "fleet-a", "ssh": "benchmark@fleet-a", "public_ipv4": "4.2.2.2", "role": "fleet", "eric_watchdog": false},
+      {"id": "fleet-b", "ssh": "benchmark@fleet-b", "public_ipv4": "8.8.4.4", "role": "fleet", "eric_watchdog": false},
+      {"id": "sentinel", "ssh": "benchmark@sentinel", "public_ipv4": "9.9.9.9", "role": "watchdog", "eric_watchdog": true}
+    ],
+    "baseline_health_identity": {
+      "artifact": {"role": "baseline-experiment", "path": "baselines/experiment.json", "sha256": "a00df906f1be83bfb8e3a0abd030924d6dfc2c979ec8d7ba123763683a9e5799"},
+      "captured_at_utc": "2026-07-16T00:00:00Z",
+      "sequence": 1,
+      "host_id": "primary",
+      "boot_id": "11111111-2222-3333-4444-555555555555"
+    },
+    "baseline_health_counters": {"uptime_seconds": 3600, "online_cpus": 2, "global_oom_kills": 0, "cgroup_oom_kills": 0, "available_memory_bytes": 1073741824, "swap_used_bytes": 0, "disk_free_bytes": 10737418240, "kernel_error_count": 0, "interface_drops": 0, "udp_errors": 0, "softnet_drops": 0, "process_count": 70, "socket_count": 20},
+    "capacity_tcp_port": 8123
+  }
+}

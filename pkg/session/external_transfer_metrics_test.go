@@ -8,11 +8,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/csv"
+	"errors"
 	"net"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/shayne/derphole/pkg/dataplane"
 	"github.com/shayne/derphole/pkg/transfertrace"
 	"github.com/shayne/derphole/pkg/transport"
 )
@@ -664,6 +666,269 @@ func TestExternalTransferMetricsDirectPathReceiveProgressWritesCommittedBytes(t 
 	}
 }
 
+func TestExternalTransferMetricsRecordsReceiverOwnedBulkPayload(t *testing.T) {
+	var out bytes.Buffer
+	start := time.Unix(182, 0)
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleReceive, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(start, rec, transfertrace.RoleReceive)
+	if err := metrics.SetFilePayloadLaneAddrs([]net.Addr{
+		&net.UDPAddr{IP: net.IPv4(203, 0, 113, 10), Port: 41000},
+	}, start.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	metrics.SelectFilePayloadEngine(transfertrace.FilePayloadEngineBulk, start.Add(2*time.Millisecond))
+	metrics.RecordFilePayloadCommit(transfertrace.FilePayloadEngineBulk, 4096, start.Add(3*time.Millisecond))
+	metrics.Tick(start.Add(4 * time.Millisecond))
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+	row := readTransferTraceRows(t, out.String())[len(readTransferTraceRows(t, out.String()))-1]
+	if row["file_payload_engine"] != "bulk-packets-v1" ||
+		row["file_payload_bytes_committed"] != "4096" || row["file_payload_bytes_bulk"] != "4096" ||
+		row["file_payload_bytes_quic"] != "0" || row["file_payload_lane_addrs"] != `["203.0.113.10:41000"]` {
+		t.Fatalf("trace row = %#v", row)
+	}
+}
+
+func TestExternalTransferMetricsRecordsReceiverOwnedQUICPayload(t *testing.T) {
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(183, 0), nil, transfertrace.RoleReceive)
+	metrics.SelectFilePayloadEngine(transfertrace.FilePayloadEngineQUIC, time.Unix(183, 1))
+	metrics.RecordFilePayloadCommit(transfertrace.FilePayloadEngineQUIC, 8192, time.Unix(183, 2))
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	if metrics.filePayloadBytesCommitted != 8192 || metrics.filePayloadBytesQUIC != 8192 || metrics.filePayloadBytesBulk != 0 {
+		t.Fatalf("committed=%d bulk=%d quic=%d", metrics.filePayloadBytesCommitted, metrics.filePayloadBytesBulk, metrics.filePayloadBytesQUIC)
+	}
+}
+
+func TestExternalTransferMetricsRecordsCompleteQUICEvidence(t *testing.T) {
+	var out bytes.Buffer
+	start := time.Unix(183, 0)
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(start, rec, transfertrace.RoleSend)
+	metrics.SelectFilePayloadEngine(transfertrace.FilePayloadEngineQUIC, start.Add(time.Millisecond))
+	metrics.RecordFileSourceRead(1024, start.Add(2*time.Millisecond))
+	metrics.RecordQUICEvidence(dataplane.Stats{
+		TelemetryPresent:     true,
+		Connections:          2,
+		Streams:              4,
+		PacketsSent:          10,
+		PacketsReceived:      8,
+		PacketsLost:          0,
+		WireBytesSent:        12_000,
+		RecoveryWireBytes:    0,
+		SmoothedRTT:          3 * time.Millisecond,
+		HandshakeMS:          4,
+		FirstByteMS:          5,
+		StreamBytesSent:      1024,
+		StreamBytesReceived:  0,
+		Version:              "v1",
+		RawSocketBackend:     "quic-go-oob",
+		NativeSendBackend:    "udp-gso-or-sendmsg",
+		NativeReceiveBackend: "udp-recvmmsg",
+		CloseReason:          "complete",
+		NativeGSO:            "false",
+		NativeReceiveBatch:   "true",
+	}, 4, true, start.Add(3*time.Millisecond))
+	metrics.Tick(start.Add(4 * time.Millisecond))
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rows := readTransferTraceRows(t, out.String())
+	row := rows[len(rows)-1]
+	want := map[string]string{
+		"quic_connections": "2", "quic_streams": "4", "quic_telemetry_present": "true", "quic_version": "v1",
+		"quic_raw_socket_backend": "quic-go-oob", "quic_native_send_backend": "udp-gso-or-sendmsg", "quic_native_receive_backend": "udp-recvmmsg",
+		"quic_handshake_ms": "4", "quic_first_byte_ms": "5", "quic_smoothed_rtt_ms": "3", "quic_packets_sent": "10", "quic_packets_received": "8",
+		"quic_packets_lost": "0", "quic_wire_bytes_sent": "12000", "quic_recovery_wire_bytes": "0", "quic_recovery_ratio": "0",
+		"quic_stream_bytes_sent": "1024", "quic_stream_bytes_received": "0", "quic_close_reason": "complete", "quic_native_gso": "false",
+		"quic_native_receive_batch": "true", "file_source_read_calls": "1", "file_source_read_bytes": "1024",
+	}
+	for column, value := range want {
+		if row[column] != value {
+			t.Fatalf("%s = %q, want %q; row=%#v", column, row[column], value, row)
+		}
+	}
+}
+
+func TestExternalTransferMetricsDoesNotPresentMissingQUICEvidence(t *testing.T) {
+	var out bytes.Buffer
+	start := time.Unix(183, 0)
+	rec, err := transfertrace.NewRecorder(&out, transfertrace.RoleSend, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(start, rec, transfertrace.RoleSend)
+	metrics.SelectFilePayloadEngine(transfertrace.FilePayloadEngineQUIC, start.Add(time.Millisecond))
+	metrics.RecordQUICEvidence(dataplane.Stats{
+		StreamBytesSent: 1024,
+		CloseReason:     "complete",
+	}, 4, true, start.Add(2*time.Millisecond))
+	metrics.mu.Lock()
+	present, streams := metrics.quicTelemetryPresent, metrics.quicStreams
+	raw, gso, batch := metrics.quicRawSocketBackend, metrics.quicNativeGSO, metrics.quicNativeReceiveBatch
+	metrics.mu.Unlock()
+	if present || streams != 0 || raw != "" || gso != "" || batch != "" {
+		t.Fatalf("missing endpoint evidence was synthesized: present=%t streams=%d raw=%q gso=%q batch=%q",
+			present, streams, raw, gso, batch)
+	}
+	metrics.Tick(start.Add(3 * time.Millisecond))
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rows := readTransferTraceRows(t, out.String())
+	row := rows[len(rows)-1]
+	for _, column := range []string{
+		"quic_telemetry_present", "quic_connections", "quic_streams",
+		"quic_raw_socket_backend", "quic_stream_bytes_sent", "quic_close_reason",
+		"quic_native_gso", "quic_native_receive_batch",
+	} {
+		if row[column] != "" {
+			t.Fatalf("%s = %q, want absent; row=%#v", column, row[column], row)
+		}
+	}
+}
+
+func TestExternalV2FileSourceReadMetricsWrapsAllReaderAtCalls(t *testing.T) {
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(184, 0), nil, transfertrace.RoleSend)
+	original := &BlockSource{Payload: bytes.NewReader([]byte("abcdefgh")), PayloadSize: 8}
+	wrapped := withExternalV2FileSourceReadMetrics(original, metrics)
+	if wrapped == original || wrapped.Payload == original.Payload {
+		t.Fatal("source metrics wrapper mutated or reused the original source")
+	}
+	buf := make([]byte, 4)
+	if n, err := wrapped.Payload.ReadAt(buf, 0); n != 4 || err != nil {
+		t.Fatalf("first ReadAt = %d, %v", n, err)
+	}
+	if n, err := wrapped.Payload.ReadAt(buf, 4); n != 4 || err != nil {
+		t.Fatalf("second ReadAt = %d, %v", n, err)
+	}
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	if metrics.fileSourceReadCalls != 2 || metrics.fileSourceReadBytes != 8 {
+		t.Fatalf("source reads = calls:%d bytes:%d, want 2/8", metrics.fileSourceReadCalls, metrics.fileSourceReadBytes)
+	}
+}
+
+type quicEvidenceEndpoint struct {
+	stats                  dataplane.Stats
+	metrics                *externalTransferMetrics
+	evidencePresentAtClose bool
+	closeCode              uint64
+	closeReason            string
+	closeErr               error
+}
+
+func (e *quicEvidenceEndpoint) Stats() dataplane.Stats { return e.stats }
+
+func (e *quicEvidenceEndpoint) CloseWithError(code uint64, reason string) error {
+	e.closeCode = code
+	e.closeReason = reason
+	e.metrics.mu.Lock()
+	e.evidencePresentAtClose = e.metrics.quicTelemetryPresent && e.metrics.quicCloseReason == reason
+	e.metrics.mu.Unlock()
+	return e.closeErr
+}
+
+func TestExternalV2QUICCloseRecordsNormalAndErrorEvidenceBeforeClose(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		code   uint64
+		reason string
+	}{
+		{name: "normal", code: 0, reason: "complete"},
+		{name: "error", code: 1, reason: "disk read failed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			metrics := newExternalTransferMetricsWithTrace(time.Unix(185, 0), nil, transfertrace.RoleSend)
+			endpoint := &quicEvidenceEndpoint{
+				metrics: metrics,
+				stats: dataplane.Stats{
+					TelemetryPresent: true,
+					Connections:      1, Streams: 1, Version: "v1", RawSocketBackend: "packet-conn",
+					NativeSendBackend: "packetconn-writeto", NativeReceiveBackend: "packetconn-readfrom",
+					NativeGSO: "false", NativeReceiveBatch: "false",
+				},
+			}
+			if err := closeExternalV2QUICEndpoint(endpoint, metrics, 1, false, test.code, test.reason); err != nil {
+				t.Fatal(err)
+			}
+			if !endpoint.evidencePresentAtClose || endpoint.closeCode != test.code || endpoint.closeReason != test.reason {
+				t.Fatalf("close = code:%d reason:%q evidence_before_close:%t", endpoint.closeCode, endpoint.closeReason, endpoint.evidencePresentAtClose)
+			}
+		})
+	}
+}
+
+func TestRecordExternalV2OpenQUICPayloadLanesClosesEndpointOnDuplicateLane(t *testing.T) {
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(186, 0), nil, transfertrace.RoleReceive)
+	closeFailure := errors.New("close failed")
+	endpoint := &quicEvidenceEndpoint{
+		metrics:  metrics,
+		closeErr: closeFailure,
+		stats: dataplane.Stats{
+			TelemetryPresent:  true,
+			Connections:       1,
+			Streams:           1,
+			PacketsReceived:   2,
+			SmoothedRTT:       time.Millisecond,
+			HandshakeMS:       1,
+			FirstByteMS:       1,
+			Version:           "v1",
+			RawSocketBackend:  "quic-go-oob",
+			NativeSendBackend: "udp-gso-or-sendmsg", NativeReceiveBackend: "udp-recvmmsg",
+			NativeGSO: "false", NativeReceiveBatch: "true",
+		},
+	}
+	lane := &net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 41000}
+	err := recordExternalV2OpenQUICPayloadLanes(endpoint, metrics, 1, []net.Addr{lane, lane}, time.Unix(186, 1))
+	if err == nil || !strings.Contains(err.Error(), "duplicate file payload lane address") {
+		t.Fatalf("lane error = %v, want duplicate-lane failure", err)
+	}
+	if !errors.Is(err, closeFailure) {
+		t.Fatalf("lane error = %v, want joined close failure", err)
+	}
+	if !endpoint.evidencePresentAtClose || endpoint.closeCode != 1 || !strings.Contains(endpoint.closeReason, "duplicate file payload lane address") {
+		t.Fatalf("close = code:%d reason:%q evidence_before_close:%t", endpoint.closeCode, endpoint.closeReason, endpoint.evidencePresentAtClose)
+	}
+}
+
+func TestExternalTransferMetricsSenderDoesNotSynthesizeCommittedPayload(t *testing.T) {
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(184, 0), nil, transfertrace.RoleSend)
+	metrics.SelectFilePayloadEngine(transfertrace.FilePayloadEngineBulk, time.Unix(184, 1))
+	metrics.RecordFilePayloadCommit(transfertrace.FilePayloadEngineBulk, 4096, time.Unix(184, 2))
+	metrics.SetDirectStats(externalDirectTransferStats{BytesSent: 4096, BytesReceived: 4096})
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	if metrics.filePayloadBytesCommitted != 0 || metrics.filePayloadBytesBulk != 0 || metrics.filePayloadBytesQUIC != 0 {
+		t.Fatalf("sender synthesized committed payload: committed=%d bulk=%d quic=%d", metrics.filePayloadBytesCommitted, metrics.filePayloadBytesBulk, metrics.filePayloadBytesQUIC)
+	}
+}
+
+func TestExternalTransferMetricsReceiverStatsDoNotSynthesizeFilePayload(t *testing.T) {
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(185, 0), nil, transfertrace.RoleReceive)
+	metrics.SelectFilePayloadEngine(transfertrace.FilePayloadEngineBulk, time.Unix(185, 1))
+	metrics.SetDirectStats(externalDirectTransferStats{BytesReceived: 4096})
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	if metrics.filePayloadBytesCommitted != 0 || metrics.filePayloadBytesBulk != 0 || metrics.filePayloadBytesQUIC != 0 {
+		t.Fatalf("direct stats synthesized file payload: committed=%d bulk=%d quic=%d", metrics.filePayloadBytesCommitted, metrics.filePayloadBytesBulk, metrics.filePayloadBytesQUIC)
+	}
+}
+
+func TestExternalTransferMetricsRejectsInvalidPayloadLaneAddress(t *testing.T) {
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(186, 0), nil, transfertrace.RoleReceive)
+	if err := metrics.SetFilePayloadLaneAddrs([]net.Addr{nil}, time.Unix(186, 1)); err == nil {
+		t.Fatal("nil payload lane accepted")
+	}
+}
+
 func TestExternalTransferMetricsDirectStreamTransportCanIdentifyTCP(t *testing.T) {
 	start := time.Unix(1700000000, 0)
 	metrics := newExternalTransferMetrics(start)
@@ -1051,56 +1316,70 @@ func TestListenConfigTraceUpdatesReceiveRelayPrefixTrace(t *testing.T) {
 func TestExternalTransferMetricsBulkBatchDiagnosticsAreMonotonic(t *testing.T) {
 	metrics := newExternalTransferMetrics(time.Now())
 	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
-		BulkBatchPresent:           true,
-		BulkBatchBackend:           "linux-sendmmsg",
-		BulkGSOAttempted:           true,
-		BulkGSOActive:              false,
-		BulkGSOSegments:            0,
-		BulkSendCalls:              10,
-		BulkSendDatagrams:          640,
-		BulkReceiveCalls:           8,
-		BulkReceiveDatagrams:       512,
-		BulkMaxSendBatch:           64,
-		BulkMaxReceiveBatch:        64,
-		BulkCryptoQueuePeak:        4,
-		BulkLaneQueuePeak:          2,
-		BulkReceiveQueuePeak:       5,
-		BulkWriterQueuePeak:        3,
-		BulkDecryptBatches:         100,
-		BulkDecryptDatagrams:       6400,
-		BulkProbeSelectedMbps:      2160,
-		BulkProbeDurationMS:        250,
-		BulkProbeTrains:            5,
-		BulkProbeSentDatagrams:     30000,
-		BulkProbeReceivedDatagrams: 29800,
-		BulkProbeLossPPM:           6666,
-		BulkProbePressure:          false,
+		BulkBatchPresent:               true,
+		BulkBatchBackend:               "linux-sendmmsg",
+		BulkCandidateID:                "combined-gso3",
+		BulkNativeSendAttempts:         12,
+		BulkNativeSendSyscalls:         11,
+		BulkNativeGSOMessages:          0,
+		BulkLogicalDatagrams:           640,
+		BulkNativeAcceptedPayloadBytes: 896_000,
+		BulkGSOSegmentsPerMessage:      0,
+		BulkGSOAttempted:               true,
+		BulkGSOActive:                  false,
+		BulkGSOSegments:                0,
+		BulkSendCalls:                  10,
+		BulkSendDatagrams:              640,
+		BulkReceiveCalls:               8,
+		BulkReceiveDatagrams:           512,
+		BulkMaxSendBatch:               64,
+		BulkMaxReceiveBatch:            64,
+		BulkCryptoQueuePeak:            4,
+		BulkLaneQueuePeak:              2,
+		BulkReceiveQueuePeak:           5,
+		BulkWriterQueuePeak:            3,
+		BulkDecryptBatches:             100,
+		BulkDecryptDatagrams:           6400,
+		BulkProbeSelectedMbps:          2160,
+		BulkProbeDurationMS:            250,
+		BulkProbeTrains:                5,
+		BulkProbeSentDatagrams:         30000,
+		BulkProbeReceivedDatagrams:     29800,
+		BulkProbeLossPPM:               6666,
+		BulkProbePressure:              false,
 	}, time.Now())
 	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
-		BulkBatchPresent:           true,
-		BulkBatchBackend:           "linux-gso",
-		BulkGSOAttempted:           true,
-		BulkGSOActive:              true,
-		BulkGSOSegments:            64,
-		BulkSendCalls:              9,
-		BulkSendDatagrams:          600,
-		BulkReceiveCalls:           7,
-		BulkReceiveDatagrams:       500,
-		BulkMaxSendBatch:           32,
-		BulkMaxReceiveBatch:        32,
-		BulkCryptoQueuePeak:        2,
-		BulkLaneQueuePeak:          1,
-		BulkReceiveQueuePeak:       2,
-		BulkWriterQueuePeak:        2,
-		BulkDecryptBatches:         90,
-		BulkDecryptDatagrams:       6000,
-		BulkProbeSelectedMbps:      1800,
-		BulkProbeDurationMS:        200,
-		BulkProbeTrains:            4,
-		BulkProbeSentDatagrams:     25000,
-		BulkProbeReceivedDatagrams: 24000,
-		BulkProbeLossPPM:           40000,
-		BulkProbePressure:          true,
+		BulkBatchPresent:               true,
+		BulkBatchBackend:               "linux-gso",
+		BulkCandidateID:                "combined-gso3",
+		BulkNativeSendAttempts:         11,
+		BulkNativeSendSyscalls:         10,
+		BulkNativeGSOMessages:          200,
+		BulkLogicalDatagrams:           600,
+		BulkNativeAcceptedPayloadBytes: 840_000,
+		BulkGSOSegmentsPerMessage:      3,
+		BulkGSOAttempted:               true,
+		BulkGSOActive:                  true,
+		BulkGSOSegments:                64,
+		BulkSendCalls:                  9,
+		BulkSendDatagrams:              600,
+		BulkReceiveCalls:               7,
+		BulkReceiveDatagrams:           500,
+		BulkMaxSendBatch:               32,
+		BulkMaxReceiveBatch:            32,
+		BulkCryptoQueuePeak:            2,
+		BulkLaneQueuePeak:              1,
+		BulkReceiveQueuePeak:           2,
+		BulkWriterQueuePeak:            2,
+		BulkDecryptBatches:             90,
+		BulkDecryptDatagrams:           6000,
+		BulkProbeSelectedMbps:          1800,
+		BulkProbeDurationMS:            200,
+		BulkProbeTrains:                4,
+		BulkProbeSentDatagrams:         25000,
+		BulkProbeReceivedDatagrams:     24000,
+		BulkProbeLossPPM:               40000,
+		BulkProbePressure:              true,
 	}, time.Now())
 
 	metrics.mu.Lock()
@@ -1111,6 +1390,9 @@ func TestExternalTransferMetricsBulkBatchDiagnosticsAreMonotonic(t *testing.T) {
 	if metrics.bulkGSOSegments != 64 || metrics.bulkSendCalls != 10 || metrics.bulkSendDatagrams != 640 || metrics.bulkReceiveCalls != 8 || metrics.bulkReceiveDatagrams != 512 {
 		t.Fatalf("batch counters regressed: gso=%d send=%d/%d receive=%d/%d", metrics.bulkGSOSegments, metrics.bulkSendCalls, metrics.bulkSendDatagrams, metrics.bulkReceiveCalls, metrics.bulkReceiveDatagrams)
 	}
+	if metrics.bulkCandidateID != "combined-gso3" || metrics.bulkNativeSendAttempts != 12 || metrics.bulkNativeSendSyscalls != 11 || metrics.bulkNativeGSOMessages != 200 || metrics.bulkLogicalDatagrams != 640 || metrics.bulkNativeAcceptedPayloadBytes != 896_000 || metrics.bulkGSOSegmentsPerMessage != 3 {
+		t.Fatalf("native telemetry regressed: candidate=%q attempts=%d syscalls=%d gso_messages=%d datagrams=%d payload=%d segments=%d", metrics.bulkCandidateID, metrics.bulkNativeSendAttempts, metrics.bulkNativeSendSyscalls, metrics.bulkNativeGSOMessages, metrics.bulkLogicalDatagrams, metrics.bulkNativeAcceptedPayloadBytes, metrics.bulkGSOSegmentsPerMessage)
+	}
 	if metrics.bulkMaxSendBatch != 64 || metrics.bulkMaxReceiveBatch != 64 || metrics.bulkCryptoQueuePeak != 4 || metrics.bulkLaneQueuePeak != 2 || metrics.bulkWriterQueuePeak != 3 {
 		t.Fatalf("batch peaks regressed: send=%d receive=%d crypto=%d lane=%d writer=%d", metrics.bulkMaxSendBatch, metrics.bulkMaxReceiveBatch, metrics.bulkCryptoQueuePeak, metrics.bulkLaneQueuePeak, metrics.bulkWriterQueuePeak)
 	}
@@ -1119,6 +1401,24 @@ func TestExternalTransferMetricsBulkBatchDiagnosticsAreMonotonic(t *testing.T) {
 	}
 	if metrics.bulkProbeSelectedMbps != 1800 || metrics.bulkProbeDurationMS != 200 || metrics.bulkProbeTrains != 5 || metrics.bulkProbeSentDatagrams != 30000 || metrics.bulkProbeReceivedDatagrams != 29800 || metrics.bulkProbeLossPPM != 40000 || !metrics.bulkProbePressure {
 		t.Fatalf("probe diagnostics = selected:%d duration:%d trains:%d sent:%d received:%d loss_ppm:%d pressure:%t", metrics.bulkProbeSelectedMbps, metrics.bulkProbeDurationMS, metrics.bulkProbeTrains, metrics.bulkProbeSentDatagrams, metrics.bulkProbeReceivedDatagrams, metrics.bulkProbeLossPPM, metrics.bulkProbePressure)
+	}
+}
+
+func TestExternalTransferMetricsBulkCandidateMismatchClearsPriorIdentity(t *testing.T) {
+	metrics := newExternalTransferMetrics(time.Now())
+	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
+		BulkBatchPresent: true,
+		BulkCandidateID:  "combined-gso3",
+	}, time.Now())
+	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
+		BulkBatchPresent: true,
+		BulkCandidateID:  "",
+	}, time.Now())
+
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	if metrics.bulkCandidateID != "" {
+		t.Fatalf("bulk candidate = %q, want mismatch to clear prior identity", metrics.bulkCandidateID)
 	}
 }
 

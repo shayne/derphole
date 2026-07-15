@@ -7,9 +7,11 @@ package quicpath
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -17,6 +19,285 @@ import (
 	"github.com/quic-go/quic-go/qlog"
 	"github.com/quic-go/quic-go/qlogwriter"
 )
+
+// MechanismSnapshot is the in-process transport evidence accumulated for a
+// set of QUIC connections.
+type MechanismSnapshot struct {
+	TelemetryPresent     bool
+	Connections          uint32
+	Streams              uint32
+	PacketsSent          uint64
+	PacketsReceived      uint64
+	PacketsLost          uint64
+	WireBytesSent        uint64
+	RecoveryWireBytes    uint64
+	SmoothedRTT          time.Duration
+	HandshakeDuration    time.Duration
+	FirstByteDuration    time.Duration
+	StreamBytesSent      uint64
+	StreamBytesReceived  uint64
+	Version              string
+	RawSocketBackend     string
+	NativeSendBackend    string
+	NativeReceiveBackend string
+	CloseReason          string
+	NativeGSO            string
+	NativeReceiveBatch   string
+}
+
+type mechanismStreamKey struct {
+	connection uint64
+	streamID   qlog.StreamID
+}
+
+type mechanismInterval struct {
+	start int64
+	end   int64
+}
+
+// MechanismTrace is shared by every connection owned by one direct QUIC
+// endpoint. Each qlog producer receives an independent connection identity so
+// equal stream IDs on different connections never share recovery state.
+type MechanismTrace struct {
+	mu             sync.Mutex
+	nextConnection uint64
+	snapshot       MechanismSnapshot
+	streamRanges   map[mechanismStreamKey][]mechanismInterval
+	seenStreams    map[mechanismStreamKey]struct{}
+}
+
+type mechanismRecorder struct {
+	trace      *MechanismTrace
+	connection uint64
+}
+
+func newQUICMechanismTrace() *MechanismTrace {
+	return NewMechanismTrace()
+}
+
+func NewMechanismTrace() *MechanismTrace {
+	return &MechanismTrace{
+		streamRanges: make(map[mechanismStreamKey][]mechanismInterval),
+		seenStreams:  make(map[mechanismStreamKey]struct{}),
+	}
+}
+
+func (t *MechanismTrace) AddProducer() qlogwriter.Recorder {
+	t.mu.Lock()
+	connection := t.nextConnection
+	t.nextConnection++
+	t.snapshot.Connections++
+	t.mu.Unlock()
+	return &mechanismRecorder{trace: t, connection: connection}
+}
+
+func (*MechanismTrace) SupportsSchemas(schema string) bool {
+	return schema == qlog.EventSchema
+}
+
+func (t *MechanismTrace) Snapshot() MechanismSnapshot {
+	if t == nil {
+		return MechanismSnapshot{}
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.snapshot
+}
+
+func (r *mechanismRecorder) RecordEvent(event qlogwriter.Event) {
+	if r == nil || r.trace == nil {
+		return
+	}
+	r.trace.recordMechanismEvent(r.connection, event)
+}
+
+func (*mechanismRecorder) Close() error { return nil }
+
+func (t *MechanismTrace) recordMechanismEvent(connection uint64, event qlogwriter.Event) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.snapshot.TelemetryPresent = true
+	event = mechanismEventValue(event)
+	switch event := event.(type) {
+	case qlog.PacketSent:
+		t.recordPacketSentLocked(connection, event)
+	case qlog.PacketReceived:
+		t.snapshot.PacketsReceived++
+		t.recordStreamsLocked(connection, event.Frames)
+	case qlog.PacketLost:
+		t.snapshot.PacketsLost++
+	case qlog.MetricsUpdated:
+		t.recordSmoothedRTTLocked(event.SmoothedRTT)
+	}
+}
+
+func mechanismEventValue(event qlogwriter.Event) qlogwriter.Event {
+	switch event := event.(type) {
+	case *qlog.PacketSent:
+		if event != nil {
+			return *event
+		}
+	case *qlog.PacketReceived:
+		if event != nil {
+			return *event
+		}
+	case *qlog.PacketLost:
+		if event != nil {
+			return *event
+		}
+	case *qlog.MetricsUpdated:
+		if event != nil {
+			return *event
+		}
+	}
+	return event
+}
+
+func (t *MechanismTrace) recordPacketSentLocked(connection uint64, event qlog.PacketSent) {
+	t.snapshot.PacketsSent++
+	if event.Raw.Length > 0 {
+		t.snapshot.WireBytesSent += uint64(event.Raw.Length)
+	}
+	recovery := t.packetContainsRecoveryLocked(connection, event.Frames)
+	if recovery && event.Raw.Length > 0 {
+		t.snapshot.RecoveryWireBytes += uint64(event.Raw.Length)
+	}
+	t.recordStreamsLocked(connection, event.Frames)
+	t.mergePacketStreamRangesLocked(connection, event.Frames)
+}
+
+func (t *MechanismTrace) packetContainsRecoveryLocked(connection uint64, frames []qlog.Frame) bool {
+	for _, frame := range frames {
+		stream, ok := mechanismStreamFrame(frame)
+		if !ok || stream.Length <= 0 {
+			continue
+		}
+		key := mechanismStreamKey{connection: connection, streamID: stream.StreamID}
+		if mechanismRangeOverlaps(t.streamRanges[key], stream.Offset, stream.Offset+stream.Length) {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *MechanismTrace) mergePacketStreamRangesLocked(connection uint64, frames []qlog.Frame) {
+	for _, frame := range frames {
+		stream, ok := mechanismStreamFrame(frame)
+		if !ok || stream.Length <= 0 {
+			continue
+		}
+		key := mechanismStreamKey{connection: connection, streamID: stream.StreamID}
+		t.streamRanges[key] = mergeMechanismInterval(t.streamRanges[key], mechanismInterval{start: stream.Offset, end: stream.Offset + stream.Length})
+	}
+}
+
+func (t *MechanismTrace) recordStreamsLocked(connection uint64, frames []qlog.Frame) {
+	for _, frame := range frames {
+		stream, ok := mechanismStreamFrame(frame)
+		if !ok {
+			continue
+		}
+		key := mechanismStreamKey{connection: connection, streamID: stream.StreamID}
+		if _, seen := t.seenStreams[key]; seen {
+			continue
+		}
+		t.seenStreams[key] = struct{}{}
+		t.snapshot.Streams++
+	}
+}
+
+func (t *MechanismTrace) recordSmoothedRTTLocked(rtt time.Duration) {
+	if rtt > t.snapshot.SmoothedRTT {
+		t.snapshot.SmoothedRTT = rtt
+	}
+}
+
+func mechanismStreamFrame(frame qlog.Frame) (qlog.StreamFrame, bool) {
+	switch stream := frame.Frame.(type) {
+	case qlog.StreamFrame:
+		return stream, true
+	case *qlog.StreamFrame:
+		if stream != nil {
+			return *stream, true
+		}
+	}
+	return qlog.StreamFrame{}, false
+}
+
+func mechanismRangeOverlaps(intervals []mechanismInterval, start, end int64) bool {
+	if end <= start {
+		return false
+	}
+	for _, interval := range intervals {
+		if start < interval.end && end > interval.start {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeMechanismInterval(intervals []mechanismInterval, next mechanismInterval) []mechanismInterval {
+	if next.end <= next.start {
+		return intervals
+	}
+	intervals = append(intervals, next)
+	sort.Slice(intervals, func(i, j int) bool { return intervals[i].start < intervals[j].start })
+	merged := intervals[:0]
+	for _, interval := range intervals {
+		last := len(merged) - 1
+		if last < 0 || interval.start > merged[last].end {
+			merged = append(merged, interval)
+			continue
+		}
+		if interval.end > merged[last].end {
+			merged[last].end = interval.end
+		}
+	}
+	return merged
+}
+
+type multiplexTrace struct {
+	traces []qlogwriter.Trace
+}
+
+type multiplexRecorder struct {
+	recorders []qlogwriter.Recorder
+}
+
+func (t *multiplexTrace) AddProducer() qlogwriter.Recorder {
+	recorders := make([]qlogwriter.Recorder, 0, len(t.traces))
+	for _, trace := range t.traces {
+		if trace != nil {
+			recorders = append(recorders, trace.AddProducer())
+		}
+	}
+	return &multiplexRecorder{recorders: recorders}
+}
+
+func (t *multiplexTrace) SupportsSchemas(schema string) bool {
+	for _, trace := range t.traces {
+		if trace != nil && !trace.SupportsSchemas(schema) {
+			return false
+		}
+	}
+	return len(t.traces) > 0
+}
+
+func (r *multiplexRecorder) RecordEvent(event qlogwriter.Event) {
+	for _, recorder := range r.recorders {
+		recorder.RecordEvent(event)
+	}
+}
+
+func (r *multiplexRecorder) Close() error {
+	var errs []error
+	for _, recorder := range r.recorders {
+		if err := recorder.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
 
 type quicMetricsSummary struct {
 	Events                    uint64  `json:"events"`

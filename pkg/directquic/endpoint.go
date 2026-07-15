@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"time"
 
@@ -36,21 +37,42 @@ type DialConfig struct {
 }
 
 type Stats struct {
-	BytesSent     int64
-	BytesReceived int64
-	HandshakeMS   int64
-	FirstByteMS   int64
-	OpenedAt      time.Time
-	HandshakeAt   time.Time
-	FirstByteAt   time.Time
-	ClosedAt      time.Time
-	CloseReason   string
+	BytesSent            int64
+	BytesReceived        int64
+	TelemetryPresent     bool
+	Connections          uint32
+	Streams              uint32
+	PacketsSent          uint64
+	PacketsReceived      uint64
+	PacketsLost          uint64
+	WireBytesSent        uint64
+	RecoveryWireBytes    uint64
+	SmoothedRTT          time.Duration
+	HandshakeDuration    time.Duration
+	FirstByteDuration    time.Duration
+	StreamBytesSent      uint64
+	StreamBytesReceived  uint64
+	Version              string
+	RawSocketBackend     string
+	NativeSendBackend    string
+	NativeReceiveBackend string
+	NativeGSO            string
+	NativeReceiveBatch   string
+	HandshakeMS          int64
+	FirstByteMS          int64
+	OpenedAt             time.Time
+	HandshakeAt          time.Time
+	FirstByteAt          time.Time
+	ClosedAt             time.Time
+	CloseReason          string
 }
 
 type Endpoint struct {
 	conns     []*quic.Conn
 	listener  *quic.Listener
 	transport *quic.Transport
+	mechanism *quicpath.MechanismTrace
+	backend   endpointBackend
 
 	mu           sync.Mutex
 	stats        Stats
@@ -77,8 +99,9 @@ func ListenConnectionsWithReady(ctx context.Context, cfg ListenConfig, count int
 		return listenSingleWithReady(ctx, cfg, ready)
 	}
 	openedAt := time.Now()
+	mechanism := quicpath.NewMechanismTrace()
 	transport := &quic.Transport{Conn: cfg.PacketConn}
-	listener, err := transport.Listen(quicpath.ServerTLSConfig(cfg.Identity, cfg.PeerPublic), endpointQUICConfig())
+	listener, err := transport.Listen(quicpath.ServerTLSConfig(cfg.Identity, cfg.PeerPublic), endpointQUICConfig(mechanism))
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +123,7 @@ func ListenConnectionsWithReady(ctx context.Context, cfg ListenConfig, count int
 		}
 		conns = append(conns, conn)
 	}
-	return newEndpoint(conns, listener, transport, openedAt), nil
+	return newEndpoint(conns, listener, transport, openedAt, mechanism, classifyEndpointBackend(cfg.PacketConn)), nil
 }
 
 func Dial(ctx context.Context, cfg DialConfig) (*Endpoint, error) {
@@ -121,10 +144,11 @@ func DialConnections(ctx context.Context, cfg DialConfig, count int) (*Endpoint,
 		return dialSingle(ctx, cfg)
 	}
 	openedAt := time.Now()
+	mechanism := quicpath.NewMechanismTrace()
 	transport := &quic.Transport{Conn: cfg.PacketConn}
 	conns := make([]*quic.Conn, 0, count)
 	for len(conns) < count {
-		conn, err := transport.Dial(ctx, cfg.RemoteAddr, quicpath.ClientTLSConfig(cfg.Identity, cfg.PeerPublic), endpointQUICConfig())
+		conn, err := transport.Dial(ctx, cfg.RemoteAddr, quicpath.ClientTLSConfig(cfg.Identity, cfg.PeerPublic), endpointQUICConfig(mechanism))
 		if err != nil {
 			closeQUICConns(conns, 1, "dial failed")
 			_ = transport.Close()
@@ -132,12 +156,13 @@ func DialConnections(ctx context.Context, cfg DialConfig, count int) (*Endpoint,
 		}
 		conns = append(conns, conn)
 	}
-	return newEndpoint(conns, nil, transport, openedAt), nil
+	return newEndpoint(conns, nil, transport, openedAt, mechanism, classifyEndpointBackend(cfg.PacketConn)), nil
 }
 
 func listenSingleWithReady(ctx context.Context, cfg ListenConfig, ready func() error) (*Endpoint, error) {
 	openedAt := time.Now()
-	listener, err := quic.Listen(cfg.PacketConn, quicpath.ServerTLSConfig(cfg.Identity, cfg.PeerPublic), endpointQUICConfig())
+	mechanism := quicpath.NewMechanismTrace()
+	listener, err := quic.Listen(cfg.PacketConn, quicpath.ServerTLSConfig(cfg.Identity, cfg.PeerPublic), endpointQUICConfig(mechanism))
 	if err != nil {
 		return nil, err
 	}
@@ -152,16 +177,17 @@ func listenSingleWithReady(ctx context.Context, cfg ListenConfig, ready func() e
 		_ = listener.Close()
 		return nil, err
 	}
-	return newEndpoint([]*quic.Conn{conn}, listener, nil, openedAt), nil
+	return newEndpoint([]*quic.Conn{conn}, listener, nil, openedAt, mechanism, classifyEndpointBackend(cfg.PacketConn)), nil
 }
 
 func dialSingle(ctx context.Context, cfg DialConfig) (*Endpoint, error) {
 	openedAt := time.Now()
-	conn, err := quic.Dial(ctx, cfg.PacketConn, cfg.RemoteAddr, quicpath.ClientTLSConfig(cfg.Identity, cfg.PeerPublic), endpointQUICConfig())
+	mechanism := quicpath.NewMechanismTrace()
+	conn, err := quic.Dial(ctx, cfg.PacketConn, cfg.RemoteAddr, quicpath.ClientTLSConfig(cfg.Identity, cfg.PeerPublic), endpointQUICConfig(mechanism))
 	if err != nil {
 		return nil, err
 	}
-	return newEndpoint([]*quic.Conn{conn}, nil, nil, openedAt), nil
+	return newEndpoint([]*quic.Conn{conn}, nil, nil, openedAt, mechanism, classifyEndpointBackend(cfg.PacketConn)), nil
 }
 
 func validateConnectionCount(count int) error {
@@ -171,16 +197,20 @@ func validateConnectionCount(count int) error {
 	return nil
 }
 
-func newEndpoint(conns []*quic.Conn, listener *quic.Listener, transport *quic.Transport, openedAt time.Time) *Endpoint {
+func newEndpoint(conns []*quic.Conn, listener *quic.Listener, transport *quic.Transport, openedAt time.Time, mechanism *quicpath.MechanismTrace, backend endpointBackend) *Endpoint {
 	handshakeAt := time.Now()
+	handshakeDuration := handshakeAt.Sub(openedAt)
 	return &Endpoint{
 		conns:     conns,
 		listener:  listener,
 		transport: transport,
+		mechanism: mechanism,
+		backend:   backend,
 		stats: Stats{
-			OpenedAt:    openedAt,
-			HandshakeAt: handshakeAt,
-			HandshakeMS: handshakeAt.Sub(openedAt).Milliseconds(),
+			OpenedAt:          openedAt,
+			HandshakeAt:       handshakeAt,
+			HandshakeMS:       handshakeDuration.Milliseconds(),
+			HandshakeDuration: handshakeDuration,
 		},
 	}
 }
@@ -197,6 +227,7 @@ func (e *Endpoint) openSendStream(ctx context.Context, conn *quic.Conn) (io.Writ
 	if err != nil {
 		return nil, err
 	}
+	e.addStream()
 	return sendStreamStatsWriter{stream: stream, endpoint: e}, nil
 }
 
@@ -233,6 +264,7 @@ func (e *Endpoint) acceptReceiveStream(ctx context.Context, conn *quic.Conn) (io
 	if err != nil {
 		return nil, err
 	}
+	e.addStream()
 	return receiveStreamCloser{stream: stream, endpoint: e}, nil
 }
 
@@ -325,8 +357,86 @@ func (e *Endpoint) Stats() Stats {
 		return Stats{}
 	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.stats
+	stats := e.stats
+	conns := append([]*quic.Conn(nil), e.conns...)
+	mechanism := e.mechanism
+	backend := e.backend
+	e.mu.Unlock()
+
+	stats = applyMechanismSnapshot(stats, mechanism.Snapshot())
+	stats = applyConnectionSnapshots(stats, conns, backend)
+	return stats
+}
+
+func applyMechanismSnapshot(stats Stats, snapshot quicpath.MechanismSnapshot) Stats {
+	stats.TelemetryPresent = snapshot.TelemetryPresent
+	stats.Connections = snapshot.Connections
+	stats.Streams = max(stats.Streams, snapshot.Streams)
+	stats.PacketsSent = snapshot.PacketsSent
+	stats.PacketsReceived = snapshot.PacketsReceived
+	stats.PacketsLost = snapshot.PacketsLost
+	stats.WireBytesSent = snapshot.WireBytesSent
+	stats.RecoveryWireBytes = snapshot.RecoveryWireBytes
+	stats.SmoothedRTT = snapshot.SmoothedRTT
+	return stats
+}
+
+func applyConnectionSnapshots(stats Stats, conns []*quic.Conn, backend endpointBackend) Stats {
+	if len(conns) > 0 {
+		stats.Connections = uint32(len(conns))
+		stats.RawSocketBackend = backend.rawSocket
+		stats.NativeSendBackend = backend.send
+		stats.NativeReceiveBackend = backend.receive
+		stats.NativeReceiveBatch = backend.receiveBatch
+	}
+	stats.NativeGSO = ""
+
+	var connectionPacketsSent uint64
+	var connectionPacketsReceived uint64
+	var connectionPacketsLost uint64
+	for _, conn := range conns {
+		if conn == nil {
+			continue
+		}
+		connectionPacketsSent, connectionPacketsReceived, connectionPacketsLost = mergeConnectionSnapshot(
+			&stats, conn, connectionPacketsSent, connectionPacketsReceived, connectionPacketsLost,
+		)
+	}
+	stats.PacketsSent = max(stats.PacketsSent, connectionPacketsSent)
+	stats.PacketsReceived = max(stats.PacketsReceived, connectionPacketsReceived)
+	stats.PacketsLost = max(stats.PacketsLost, connectionPacketsLost)
+	return stats
+}
+
+func mergeConnectionSnapshot(stats *Stats, conn *quic.Conn, sent, received, lost uint64) (uint64, uint64, uint64) {
+	connectionStats := conn.ConnectionStats()
+	sent += connectionStats.PacketsSent
+	received += connectionStats.PacketsReceived
+	lost += connectionStats.PacketsLost
+	stats.SmoothedRTT = max(stats.SmoothedRTT, connectionStats.SmoothedRTT)
+	state := conn.ConnectionState()
+	if stats.NativeGSO == "" {
+		stats.NativeGSO = "false"
+	}
+	version := state.Version.String()
+	if stats.Version == "" {
+		stats.Version = version
+	} else if version != stats.Version {
+		stats.Version = "mixed"
+	}
+	if state.GSO {
+		stats.NativeGSO = "true"
+	}
+	return sent, received, lost
+}
+
+func (e *Endpoint) addStream() {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	e.stats.Streams++
+	e.mu.Unlock()
 }
 
 func (e *Endpoint) addBytesSent(n int) {
@@ -335,6 +445,7 @@ func (e *Endpoint) addBytesSent(n int) {
 	}
 	e.mu.Lock()
 	e.stats.BytesSent += int64(n)
+	e.stats.StreamBytesSent += uint64(n)
 	e.recordFirstByteLocked(time.Now())
 	e.mu.Unlock()
 }
@@ -353,6 +464,7 @@ func (e *Endpoint) addBytesReceived(n int) {
 	}
 	e.mu.Lock()
 	e.stats.BytesReceived += int64(n)
+	e.stats.StreamBytesReceived += uint64(n)
 	e.recordFirstByteLocked(time.Now())
 	e.mu.Unlock()
 }
@@ -363,7 +475,8 @@ func (e *Endpoint) recordFirstByteLocked(at time.Time) {
 	}
 	e.firstByteSet = true
 	e.stats.FirstByteAt = at
-	e.stats.FirstByteMS = at.Sub(e.stats.OpenedAt).Milliseconds()
+	e.stats.FirstByteDuration = at.Sub(e.stats.OpenedAt)
+	e.stats.FirstByteMS = e.stats.FirstByteDuration.Milliseconds()
 }
 
 func validateCommon(packetConn net.PacketConn, peerPublic [32]byte) error {
@@ -376,10 +489,48 @@ func validateCommon(packetConn net.PacketConn, peerPublic [32]byte) error {
 	return nil
 }
 
-func endpointQUICConfig() *quic.Config {
+func endpointQUICConfig(mechanism *quicpath.MechanismTrace) *quic.Config {
 	cfg := quicpath.DefaultQUICConfig()
 	cfg.MaxIncomingUniStreams = quicpath.MaxIncomingStreams
+	cfg.Tracer = quicpath.TracerWithMechanism(mechanism)
 	return cfg
+}
+
+type endpointBackend struct {
+	rawSocket    string
+	send         string
+	receive      string
+	receiveBatch string
+}
+
+func classifyEndpointBackend(conn net.PacketConn) endpointBackend {
+	if _, ok := conn.(quic.OOBCapablePacketConn); !ok {
+		return endpointBackend{
+			rawSocket:    "packet-conn",
+			send:         "packetconn-writeto",
+			receive:      "packetconn-readfrom",
+			receiveBatch: "false",
+		}
+	}
+	backend := endpointBackend{
+		rawSocket: "quic-go-oob",
+		send:      "udp-sendmsg",
+		receive:   "udp-recvmsg",
+	}
+	switch runtime.GOOS {
+	case "linux":
+		backend.send = "udp-gso-or-sendmsg"
+		backend.receive = "udp-recvmmsg"
+		backend.receiveBatch = "true"
+	case "freebsd":
+		backend.receive = "udp-recvmmsg"
+		backend.receiveBatch = "true"
+	case "darwin", "windows":
+		backend.receiveBatch = "false"
+	default:
+		backend.receiveBatch = "unsupported"
+	}
+	return backend
 }
 
 type sendStreamStatsWriter struct {

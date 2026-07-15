@@ -6,30 +6,42 @@ package transfertrace
 
 import (
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"net/netip"
 	"slices"
 	"strconv"
 	"time"
 )
 
 type Options struct {
-	Role                   Role
-	StallWindow            time.Duration
-	ExpectedBytes          int64
-	ExpectedBytesSet       bool
-	RequireDirectTransport string
-	ForbidRelayPayload     bool
+	Role                       Role
+	StallWindow                time.Duration
+	ExpectedBytes              int64
+	ExpectedBytesSet           bool
+	ExpectedPayloadBytes       int64
+	ExpectedPayloadBytesSet    bool
+	RequireDirectTransport     string
+	RequireFilePayloadEngine   FilePayloadEngine
+	RequireEngineTelemetry     bool
+	ExpectedSelectedPublicIPv4 string
+	ForbidRelayPayload         bool
 }
 
 type Result struct {
-	Rows          int
-	FinalAppBytes int64
-	FinalPhase    Phase
-	MaxFlatline   time.Duration
-	Diagnostics   DiagnosticsSummary
+	Rows                          int
+	FinalAppBytes                 int64
+	FinalFilePayloadBytes         int64
+	FinalFilePayloadEngine        FilePayloadEngine
+	FinalFilePayloadBytesBulk     int64
+	FinalFilePayloadBytesQUIC     int64
+	FinalFilePayloadLaneAddresses []string
+	FinalPhase                    Phase
+	MaxFlatline                   time.Duration
+	Diagnostics                   DiagnosticsSummary
 }
 
 type DiagnosticsSummary struct {
@@ -103,9 +115,16 @@ type checkerIndexes struct {
 	lastError            int
 	controllerDecision   int
 	directTransport      int
+	filePayloadEngine    int
+	filePayloadCommitted int
+	filePayloadBulk      int
+	filePayloadQUIC      int
+	filePayloadLaneAddrs int
 	senderHealthSchema   bool
 	receiverRepairSchema bool
 	numericDiagnostics   []checkerNumericDiagnostic
+	quicEvidence         map[string]int
+	bulkEvidence         map[string]int
 }
 
 type checkerRow struct {
@@ -123,17 +142,66 @@ type checkerRow struct {
 	lastState          string
 	lastError          string
 	controllerDecision string
+	filePayload        checkerRowFilePayload
+	quicEvidence       checkerRowQUICEvidence
+	bulkEvidence       checkerRowBulkEvidence
 	diagnostics        checkerRowDiagnostics
 }
 
+type checkerRowQUICEvidence struct {
+	observed             map[string]bool
+	telemetryPresent     bool
+	connections          uint64
+	streams              uint64
+	version              string
+	rawSocketBackend     string
+	nativeSendBackend    string
+	nativeReceiveBackend string
+	handshakeMS          int64
+	firstByteMS          int64
+	smoothedRTTMS        float64
+	packetsSent          uint64
+	packetsReceived      uint64
+	packetsLost          uint64
+	wireBytesSent        uint64
+	recoveryWireBytes    uint64
+	recoveryRatio        float64
+	streamBytesSent      int64
+	streamBytesReceived  int64
+	closeReason          string
+	nativeGSO            string
+	nativeReceiveBatch   string
+	fileSourceReadCalls  uint64
+	fileSourceReadBytes  uint64
+}
+
+type checkerRowFilePayload struct {
+	engine        FilePayloadEngine
+	committed     int64
+	bulk          int64
+	quic          int64
+	laneAddresses []string
+	observed      map[string]bool
+}
+
+type checkerRowBulkEvidence struct {
+	observed map[string]bool
+	strings  map[string]string
+	uints    map[string]uint64
+	bools    map[string]bool
+}
+
 type checkerRowDiagnostics struct {
+	observed                       map[string]bool
 	rateTargetMbps                 int
 	appMbps                        float64
 	appMbpsObserved                bool
 	receiverCommittedMbps          float64
 	receiverCommittedMbpsObserved  bool
 	replayBytes                    uint64
+	repairQueueBytes               uint64
 	retransmits                    int64
+	repairRequests                 int64
 	repairBytes                    int64
 	localENOBUFSRetries            int64
 	localENOBUFSWaitUS             int64
@@ -167,8 +235,14 @@ var checkerRowDiagnosticRecorders = map[string]func(*checkerRowDiagnostics, chec
 	"replay_bytes": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
 		d.replayBytes = value.uint64Value
 	},
+	"repair_queue_bytes": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.repairQueueBytes = value.uint64Value
+	},
 	"retransmits": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
 		d.retransmits = value.int64Value
+	},
+	"repair_requests": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
+		d.repairRequests = value.int64Value
 	},
 	"repair_bytes": func(d *checkerRowDiagnostics, value checkerNumericDiagnosticValue) {
 		d.repairBytes = value.int64Value
@@ -268,6 +342,7 @@ var checkerNumericDiagnosticColumns = []checkerNumericDiagnosticColumn{
 	{name: "receive_goodput_mbps", kind: checkerNumericDiagnosticFloat},
 	{name: "receiver_committed_mbps", kind: checkerNumericDiagnosticFloat},
 	{name: "replay_bytes", kind: checkerNumericDiagnosticUint64},
+	{name: "repair_queue_bytes", kind: checkerNumericDiagnosticUint64},
 	{name: "retransmits", kind: checkerNumericDiagnosticInt64},
 	{name: "repair_requests", kind: checkerNumericDiagnosticInt64},
 	{name: "repair_bytes", kind: checkerNumericDiagnosticInt64},
@@ -308,16 +383,79 @@ var receiverRepairDiagnosticColumns = [...]string{
 	"receive_packet_rate_pps",
 }
 
+var checkerQUICEvidenceColumns = [...]string{
+	"quic_connections",
+	"quic_streams",
+	"quic_telemetry_present",
+	"quic_version",
+	"quic_raw_socket_backend",
+	"quic_native_send_backend",
+	"quic_native_receive_backend",
+	"quic_handshake_ms",
+	"quic_first_byte_ms",
+	"quic_smoothed_rtt_ms",
+	"quic_packets_sent",
+	"quic_packets_received",
+	"quic_packets_lost",
+	"quic_wire_bytes_sent",
+	"quic_recovery_wire_bytes",
+	"quic_recovery_ratio",
+	"quic_stream_bytes_sent",
+	"quic_stream_bytes_received",
+	"quic_close_reason",
+	"quic_native_gso",
+	"quic_native_receive_batch",
+	"file_source_read_calls",
+	"file_source_read_bytes",
+}
+
+var checkerBulkEvidenceColumns = [...]string{
+	"bulk_candidate_id",
+	"bulk_native_send_attempts",
+	"bulk_native_send_syscalls",
+	"bulk_gso_messages",
+	"bulk_logical_datagrams",
+	"bulk_accepted_payload_bytes",
+	"bulk_gso_segments_per_message",
+	"bulk_batch_backend",
+	"bulk_gso_attempted",
+	"bulk_gso_active",
+	"bulk_gso_segments",
+	"bulk_send_calls",
+	"bulk_send_datagrams",
+	"bulk_receive_calls",
+	"bulk_receive_datagrams",
+	"bulk_max_send_batch",
+	"bulk_max_receive_batch",
+	"bulk_crypto_queue_peak",
+	"bulk_writer_queue_peak",
+	"bulk_lane_queue_peak",
+	"bulk_receive_queue_peak",
+	"bulk_decrypt_batches",
+	"bulk_decrypt_datagrams",
+	"bulk_probe_selected_mbps",
+	"bulk_probe_duration_ms",
+	"bulk_probe_trains",
+	"bulk_probe_sent_datagrams",
+	"bulk_probe_received_datagrams",
+	"bulk_probe_loss_ppm",
+	"bulk_probe_pressure",
+}
+
 type checker struct {
-	opts               Options
-	result             Result
-	lastAppBytes       int64
-	lastRateTargetMbps int
-	receiverRates      []float64
-	active             bool
-	activeSince        time.Time
-	lastPhase          Phase
-	maxRelayBytes      int64
+	opts                Options
+	result              Result
+	lastAppBytes        int64
+	lastRateTargetMbps  int
+	receiverRates       []float64
+	active              bool
+	activeSince         time.Time
+	lastPhase           Phase
+	maxRelayBytes       int64
+	filePayloadObserved map[string]bool
+	finalQUICEvidence   checkerRowQUICEvidence
+	finalBulkEvidence   checkerRowBulkEvidence
+	finalRowDiagnostics checkerRowDiagnostics
 }
 
 func Check(r io.Reader, opts Options) (Result, error) {
@@ -397,6 +535,15 @@ func (c *checker) scanRows(cr *csv.Reader, indexes checkerIndexes) error {
 func (c *checker) consume(row checkerRow) error {
 	c.result.Rows++
 	c.result.FinalAppBytes = row.appBytes
+	c.result.FinalFilePayloadBytes = row.filePayload.committed
+	c.result.FinalFilePayloadEngine = row.filePayload.engine
+	c.result.FinalFilePayloadBytesBulk = row.filePayload.bulk
+	c.result.FinalFilePayloadBytesQUIC = row.filePayload.quic
+	c.result.FinalFilePayloadLaneAddresses = append(c.result.FinalFilePayloadLaneAddresses[:0], row.filePayload.laneAddresses...)
+	c.filePayloadObserved = row.filePayload.observed
+	c.finalQUICEvidence = row.quicEvidence
+	c.finalBulkEvidence = row.bulkEvidence
+	c.finalRowDiagnostics = row.diagnostics
 	c.result.FinalPhase = row.phase
 	c.maxRelayBytes = maxInt64(c.maxRelayBytes, row.relayBytes)
 	c.recordDiagnostics(row)
@@ -580,8 +727,548 @@ func (c *checker) finish() (Result, error) {
 	if c.opts.RequireDirectTransport != "" && c.result.Diagnostics.DirectTransport != c.opts.RequireDirectTransport {
 		return c.result, fmt.Errorf("direct transport = %q, want %q", c.result.Diagnostics.DirectTransport, c.opts.RequireDirectTransport)
 	}
+	if err := c.validateFilePayloadEvidence(); err != nil {
+		return c.result, err
+	}
 	c.recordReceiverRateSummary()
 	return c.result, nil
+}
+
+func (c *checker) validateFilePayloadEvidence() error {
+	requireEngine := c.opts.RequireEngineTelemetry || c.opts.RequireFilePayloadEngine != "" ||
+		c.expectedPayloadBytesSet() || c.opts.ExpectedSelectedPublicIPv4 != ""
+	if err := c.validateRequiredFilePayloadEngine(requireEngine); err != nil {
+		return err
+	}
+	if c.opts.RequireEngineTelemetry {
+		if err := c.validateSelectedEngineTelemetry(); err != nil {
+			return err
+		}
+	}
+	if requireEngine {
+		if err := c.validateFilePayloadCounters(); err != nil {
+			return err
+		}
+	}
+	return c.validateSelectedPayloadLanes()
+}
+
+func (c *checker) validateRequiredFilePayloadEngine(required bool) error {
+	if required && (!c.filePayloadObserved["file_payload_engine"] || !c.result.FinalFilePayloadEngine.Valid()) {
+		return fmt.Errorf("file payload engine = %q, want valid engine telemetry", c.result.FinalFilePayloadEngine)
+	}
+	if c.opts.RequireFilePayloadEngine == "" {
+		return nil
+	}
+	if !c.opts.RequireFilePayloadEngine.Valid() {
+		return fmt.Errorf("required file payload engine %q is invalid", c.opts.RequireFilePayloadEngine)
+	}
+	if c.result.FinalFilePayloadEngine != c.opts.RequireFilePayloadEngine {
+		return fmt.Errorf("file payload engine = %q, want %q", c.result.FinalFilePayloadEngine, c.opts.RequireFilePayloadEngine)
+	}
+	return nil
+}
+
+func (c *checker) validateSelectedEngineTelemetry() error {
+	if err := validateObservedTelemetry(c.filePayloadObserved, []string{
+		"file_payload_engine", "file_payload_bytes_committed", "file_payload_bytes_bulk",
+		"file_payload_bytes_quic", "file_payload_lane_addrs",
+	}); err != nil {
+		return err
+	}
+	if err := c.validateFileSourceReads(); err != nil {
+		return err
+	}
+	switch c.result.FinalFilePayloadEngine {
+	case FilePayloadEngineBulk:
+		return c.validateBulkEngineTelemetry()
+	case FilePayloadEngineQUIC:
+		return c.validateQUICEngineTelemetry()
+	default:
+		return fmt.Errorf("file payload engine = %q, want selected engine telemetry", c.result.FinalFilePayloadEngine)
+	}
+}
+
+func (c *checker) validateFilePayloadCounters() error {
+	if err := validateObservedTelemetry(c.filePayloadObserved, []string{
+		"file_payload_bytes_committed", "file_payload_bytes_bulk", "file_payload_bytes_quic",
+	}); err != nil {
+		return err
+	}
+	if c.opts.Role == RoleReceive {
+		return c.validateReceiverFilePayloadCounters()
+	}
+	if c.opts.Role == RoleSend {
+		return c.validateSenderFilePayloadCounters()
+	}
+	return nil
+}
+
+func (c *checker) validateReceiverFilePayloadCounters() error {
+	if c.result.FinalFilePayloadBytesBulk+c.result.FinalFilePayloadBytesQUIC != c.result.FinalFilePayloadBytes {
+		return fmt.Errorf("file payload engine bytes = %d, committed = %d", c.result.FinalFilePayloadBytesBulk+c.result.FinalFilePayloadBytesQUIC, c.result.FinalFilePayloadBytes)
+	}
+	if c.expectedPayloadBytesSet() && c.result.FinalFilePayloadBytes != c.opts.ExpectedPayloadBytes {
+		return fmt.Errorf("final file payload bytes = %d, want %d", c.result.FinalFilePayloadBytes, c.opts.ExpectedPayloadBytes)
+	}
+	selected, other := c.selectedAndOtherFilePayloadBytes()
+	if other != 0 {
+		return fmt.Errorf("file payload engine %q other engine bytes = %d, want 0", c.result.FinalFilePayloadEngine, other)
+	}
+	if c.expectedPayloadBytesSet() && selected != c.opts.ExpectedPayloadBytes {
+		return fmt.Errorf("file payload engine %q bytes = %d, other engine bytes = %d, want %d and 0", c.result.FinalFilePayloadEngine, selected, other, c.opts.ExpectedPayloadBytes)
+	}
+	return nil
+}
+
+func (c *checker) selectedAndOtherFilePayloadBytes() (int64, int64) {
+	if c.result.FinalFilePayloadEngine == FilePayloadEngineQUIC {
+		return c.result.FinalFilePayloadBytesQUIC, c.result.FinalFilePayloadBytesBulk
+	}
+	return c.result.FinalFilePayloadBytesBulk, c.result.FinalFilePayloadBytesQUIC
+}
+
+func (c *checker) validateSenderFilePayloadCounters() error {
+	if c.result.FinalFilePayloadBytes == 0 && c.result.FinalFilePayloadBytesBulk == 0 && c.result.FinalFilePayloadBytesQUIC == 0 {
+		return nil
+	}
+	return fmt.Errorf("sender file payload counters = committed:%d bulk:%d quic:%d, want receiver-owned zeroes", c.result.FinalFilePayloadBytes, c.result.FinalFilePayloadBytesBulk, c.result.FinalFilePayloadBytesQUIC)
+}
+
+func (c *checker) validateSelectedPayloadLanes() error {
+	if !c.opts.RequireEngineTelemetry && c.opts.ExpectedSelectedPublicIPv4 == "" {
+		return nil
+	}
+	return validateFilePayloadLanes(c.result.FinalFilePayloadLaneAddresses, c.opts.ExpectedSelectedPublicIPv4)
+}
+
+func validateObservedTelemetry(observed map[string]bool, columns []string) error {
+	for _, column := range columns {
+		if !observed[column] {
+			return fmt.Errorf("missing observed %s telemetry", column)
+		}
+	}
+	return nil
+}
+
+func (c *checker) validateFileSourceReads() error {
+	evidence := c.finalQUICEvidence
+	for _, name := range []string{"file_source_read_calls", "file_source_read_bytes"} {
+		if !evidence.observed[name] {
+			return fmt.Errorf("missing observed %s telemetry", name)
+		}
+	}
+	if c.opts.Role == RoleSend {
+		if evidence.fileSourceReadCalls == 0 {
+			return fmt.Errorf("file_source_read_calls = 0, want positive sender source reads")
+		}
+		if c.expectedPayloadBytesSet() && evidence.fileSourceReadBytes < uint64(c.opts.ExpectedPayloadBytes) {
+			return fmt.Errorf("file_source_read_bytes = %d, want at least %d", evidence.fileSourceReadBytes, c.opts.ExpectedPayloadBytes)
+		}
+	}
+	return nil
+}
+
+var checkerBulkCommonRequiredColumns = []string{
+	"bulk_candidate_id",
+	"bulk_native_send_attempts",
+	"bulk_native_send_syscalls",
+	"bulk_gso_messages",
+	"bulk_logical_datagrams",
+	"bulk_accepted_payload_bytes",
+	"bulk_gso_segments_per_message",
+	"bulk_batch_backend",
+	"bulk_gso_attempted",
+	"bulk_gso_active",
+	"bulk_gso_segments",
+	"bulk_probe_selected_mbps",
+	"bulk_probe_duration_ms",
+	"bulk_probe_trains",
+	"bulk_probe_sent_datagrams",
+	"bulk_probe_received_datagrams",
+	"bulk_probe_loss_ppm",
+	"bulk_probe_pressure",
+}
+
+var checkerBulkSenderRequiredColumns = []string{
+	"bulk_send_calls",
+	"bulk_send_datagrams",
+	"bulk_max_send_batch",
+	"bulk_crypto_queue_peak",
+	"bulk_lane_queue_peak",
+}
+
+var checkerBulkSenderDiagnosticColumns = []string{
+	"repair_queue_bytes",
+	"local_enobufs_retries",
+	"local_enobufs_wait_us",
+	"local_enobufs_max_consecutive",
+	"peer_recv_queue_depth",
+	"peer_recv_queue_depth_max",
+	"retransmits",
+	"repair_requests",
+	"repair_bytes",
+}
+
+var checkerBulkReceiverRequiredColumns = []string{
+	"bulk_receive_calls",
+	"bulk_receive_datagrams",
+	"bulk_max_receive_batch",
+	"bulk_crypto_queue_peak",
+	"bulk_writer_queue_peak",
+	"bulk_receive_queue_peak",
+	"bulk_decrypt_batches",
+	"bulk_decrypt_datagrams",
+}
+
+var checkerBulkReceiverDiagnosticColumns = []string{
+	"repair_requests",
+	"missing_scan_checks",
+	"pending_missing",
+	"pending_missing_peak",
+	"repair_requested_packets",
+	"repair_request_batches",
+	"reorder_trail_packets",
+	"receive_packet_rate_pps",
+}
+
+func (c *checker) validateBulkEngineTelemetry() error {
+	evidence := c.finalBulkEvidence
+	if err := validateObservedTelemetry(evidence.observed, checkerBulkCommonRequiredColumns); err != nil {
+		return err
+	}
+	if evidence.strings["bulk_candidate_id"] == "" || evidence.strings["bulk_batch_backend"] == "" {
+		return errors.New("bulk candidate and batch backend must be non-empty")
+	}
+	if err := validateBulkProbeRelations(evidence); err != nil {
+		return err
+	}
+	switch c.opts.Role {
+	case RoleSend:
+		return c.validateBulkSenderTelemetry(evidence)
+	case RoleReceive:
+		return c.validateBulkReceiverTelemetry(evidence)
+	default:
+		return fmt.Errorf("bulk telemetry role = %q, want send or receive", c.opts.Role)
+	}
+}
+
+func validateBulkProbeRelations(evidence checkerRowBulkEvidence) error {
+	sent := evidence.uints["bulk_probe_sent_datagrams"]
+	received := evidence.uints["bulk_probe_received_datagrams"]
+	if received > sent {
+		return fmt.Errorf("bulk_probe_received_datagrams = %d, exceeds bulk_probe_sent_datagrams = %d", received, sent)
+	}
+	if evidence.uints["bulk_probe_loss_ppm"] > 1_000_000 {
+		return fmt.Errorf("bulk_probe_loss_ppm = %d, want at most 1000000", evidence.uints["bulk_probe_loss_ppm"])
+	}
+	return nil
+}
+
+func (c *checker) validateBulkSenderTelemetry(evidence checkerRowBulkEvidence) error {
+	if err := validateObservedTelemetry(evidence.observed, checkerBulkSenderRequiredColumns); err != nil {
+		return err
+	}
+	if err := validateObservedTelemetry(c.finalDiagnostics().observed, checkerBulkSenderDiagnosticColumns); err != nil {
+		return err
+	}
+	if err := c.validateBulkNativeSenderRelations(evidence); err != nil {
+		return err
+	}
+	return validateBulkSenderQueueAndRepairRelations(c.finalDiagnostics())
+}
+
+func (c *checker) validateBulkNativeSenderRelations(evidence checkerRowBulkEvidence) error {
+	attempts := evidence.uints["bulk_native_send_attempts"]
+	syscalls := evidence.uints["bulk_native_send_syscalls"]
+	successfulCalls := evidence.uints["bulk_send_calls"]
+	logicalDatagrams := evidence.uints["bulk_logical_datagrams"]
+	acceptedPayload := evidence.uints["bulk_accepted_payload_bytes"]
+	if attempts == 0 || attempts < syscalls {
+		return fmt.Errorf("bulk_native_send_attempts = %d, want positive and at least bulk_native_send_syscalls = %d", attempts, syscalls)
+	}
+	if syscalls == 0 || syscalls < successfulCalls {
+		return fmt.Errorf("bulk_native_send_syscalls = %d, want positive and at least bulk_send_calls = %d", syscalls, successfulCalls)
+	}
+	if successfulCalls == 0 || logicalDatagrams < successfulCalls {
+		return fmt.Errorf("bulk_logical_datagrams = %d, want at least positive bulk_send_calls = %d", logicalDatagrams, successfulCalls)
+	}
+	if c.expectedPayloadBytesSet() && acceptedPayload < uint64(c.opts.ExpectedPayloadBytes) {
+		return fmt.Errorf("bulk_accepted_payload_bytes = %d, want at least %d", acceptedPayload, c.opts.ExpectedPayloadBytes)
+	}
+	return validateBulkGSOActiveRelations(evidence)
+}
+
+func validateBulkGSOActiveRelations(evidence checkerRowBulkEvidence) error {
+	if !evidence.bools["bulk_gso_active"] {
+		return nil
+	}
+	if !evidence.bools["bulk_gso_attempted"] {
+		return errors.New("bulk_gso_active = true, want bulk_gso_attempted = true")
+	}
+	if evidence.uints["bulk_gso_messages"] == 0 {
+		return errors.New("bulk_gso_messages = 0, want positive while GSO is active")
+	}
+	if evidence.uints["bulk_gso_segments"] == 0 {
+		return errors.New("bulk_gso_segments = 0, want positive while GSO is active")
+	}
+	if evidence.uints["bulk_gso_segments_per_message"] == 0 {
+		return errors.New("bulk_gso_segments_per_message = 0, want positive while GSO is active")
+	}
+	return nil
+}
+
+func validateBulkSenderQueueAndRepairRelations(diagnostics checkerRowDiagnostics) error {
+	if err := validateBulkPeerQueueRelations(diagnostics); err != nil {
+		return err
+	}
+	if err := validateBulkENOBUFSRelations(diagnostics); err != nil {
+		return err
+	}
+	return validateBulkRepairRelations(diagnostics)
+}
+
+func validateBulkPeerQueueRelations(diagnostics checkerRowDiagnostics) error {
+	if diagnostics.peerRecvQueueDepth < 0 || diagnostics.peerRecvQueueDepthMax < 0 || diagnostics.peerRecvQueueDepth > diagnostics.peerRecvQueueDepthMax {
+		return fmt.Errorf("peer_recv_queue_depth = %d, want non-negative and at most peer_recv_queue_depth_max = %d", diagnostics.peerRecvQueueDepth, diagnostics.peerRecvQueueDepthMax)
+	}
+	return nil
+}
+
+func validateBulkENOBUFSRelations(diagnostics checkerRowDiagnostics) error {
+	if diagnostics.localENOBUFSRetries < 0 || diagnostics.localENOBUFSWaitUS < 0 || diagnostics.localENOBUFSMaxConsecutive < 0 {
+		return errors.New("local ENOBUFS telemetry must be non-negative")
+	}
+	if diagnostics.localENOBUFSMaxConsecutive > diagnostics.localENOBUFSRetries {
+		return fmt.Errorf("local_enobufs_max_consecutive = %d, exceeds local_enobufs_retries = %d", diagnostics.localENOBUFSMaxConsecutive, diagnostics.localENOBUFSRetries)
+	}
+	return nil
+}
+
+func validateBulkRepairRelations(diagnostics checkerRowDiagnostics) error {
+	if diagnostics.retransmits < 0 || diagnostics.repairRequests < 0 || diagnostics.repairBytes < 0 {
+		return errors.New("bulk repair telemetry must be non-negative")
+	}
+	return nil
+}
+
+func (c *checker) validateBulkReceiverTelemetry(evidence checkerRowBulkEvidence) error {
+	if err := validateObservedTelemetry(evidence.observed, checkerBulkReceiverRequiredColumns); err != nil {
+		return err
+	}
+	if err := validateObservedTelemetry(c.finalDiagnostics().observed, checkerBulkReceiverDiagnosticColumns); err != nil {
+		return err
+	}
+	if err := validateBulkReceiverNativeZeroes(evidence); err != nil {
+		return err
+	}
+	if err := validateBulkReceiverBatchRelations(evidence); err != nil {
+		return err
+	}
+	return validateBulkReceiverRepairRelations(c.finalDiagnostics())
+}
+
+func validateBulkReceiverNativeZeroes(evidence checkerRowBulkEvidence) error {
+	for _, name := range []string{
+		"bulk_native_send_attempts", "bulk_native_send_syscalls", "bulk_gso_messages",
+		"bulk_logical_datagrams", "bulk_accepted_payload_bytes", "bulk_gso_segments_per_message",
+		"bulk_gso_segments", "bulk_send_calls", "bulk_send_datagrams", "bulk_max_send_batch",
+	} {
+		if evidence.uints[name] != 0 {
+			return fmt.Errorf("receiver bulk native send counters must be zero: %s = %d", name, evidence.uints[name])
+		}
+	}
+	if evidence.bools["bulk_gso_attempted"] || evidence.bools["bulk_gso_active"] {
+		return errors.New("receiver bulk native send counters must be zero: GSO state is true")
+	}
+	return nil
+}
+
+func validateBulkReceiverBatchRelations(evidence checkerRowBulkEvidence) error {
+	receiveCalls := evidence.uints["bulk_receive_calls"]
+	receiveDatagrams := evidence.uints["bulk_receive_datagrams"]
+	if receiveCalls == 0 || receiveDatagrams < receiveCalls {
+		return fmt.Errorf("bulk_receive_datagrams = %d, want at least positive bulk_receive_calls = %d", receiveDatagrams, receiveCalls)
+	}
+	if evidence.uints["bulk_max_receive_batch"] == 0 {
+		return errors.New("bulk_max_receive_batch = 0, want positive")
+	}
+	if evidence.uints["bulk_decrypt_datagrams"] < evidence.uints["bulk_decrypt_batches"] {
+		return fmt.Errorf("bulk_decrypt_datagrams = %d, want at least bulk_decrypt_batches = %d", evidence.uints["bulk_decrypt_datagrams"], evidence.uints["bulk_decrypt_batches"])
+	}
+	return nil
+}
+
+func validateBulkReceiverRepairRelations(diagnostics checkerRowDiagnostics) error {
+	if diagnostics.repairRequests < 0 {
+		return errors.New("bulk repair telemetry must be non-negative")
+	}
+	if diagnostics.pendingMissing > diagnostics.pendingMissingPeak {
+		return fmt.Errorf("pending_missing = %d, exceeds pending_missing_peak = %d", diagnostics.pendingMissing, diagnostics.pendingMissingPeak)
+	}
+	if diagnostics.repairRequestBatches > diagnostics.repairRequestedPackets {
+		return fmt.Errorf("repair_request_batches = %d, exceeds repair_requested_packets = %d", diagnostics.repairRequestBatches, diagnostics.repairRequestedPackets)
+	}
+	return nil
+}
+
+func (c *checker) finalDiagnostics() checkerRowDiagnostics {
+	return c.finalRowDiagnostics
+}
+
+func (c *checker) validateQUICEngineTelemetry() error {
+	evidence := c.finalQUICEvidence
+	if err := validateQUICObservedTelemetry(evidence); err != nil {
+		return err
+	}
+	if err := validateQUICIdentityAndTiming(evidence); err != nil {
+		return err
+	}
+	if err := validateQUICPacketRelations(evidence, c.opts.Role); err != nil {
+		return err
+	}
+	if err := c.validateQUICPayloadAndClose(evidence); err != nil {
+		return err
+	}
+	return validateQUICNativeStates(evidence)
+}
+
+func validateQUICObservedTelemetry(evidence checkerRowQUICEvidence) error {
+	for _, name := range checkerQUICEvidenceColumns {
+		if name != "file_source_read_calls" && name != "file_source_read_bytes" && !evidence.observed[name] {
+			return fmt.Errorf("missing observed %s telemetry", name)
+		}
+	}
+	return nil
+}
+
+func validateQUICIdentityAndTiming(evidence checkerRowQUICEvidence) error {
+	if !evidence.telemetryPresent {
+		return fmt.Errorf("quic_telemetry_present = false, want true")
+	}
+	if evidence.connections == 0 {
+		return fmt.Errorf("quic_connections = 0, want positive")
+	}
+	if evidence.streams == 0 {
+		return fmt.Errorf("quic_streams = 0, want positive")
+	}
+	if evidence.handshakeMS <= 0 {
+		return fmt.Errorf("quic_handshake_ms = %d, want positive", evidence.handshakeMS)
+	}
+	if evidence.firstByteMS <= 0 {
+		return fmt.Errorf("quic_first_byte_ms = %d, want positive", evidence.firstByteMS)
+	}
+	if evidence.smoothedRTTMS <= 0 {
+		return fmt.Errorf("quic_smoothed_rtt_ms = %g, want positive", evidence.smoothedRTTMS)
+	}
+	return nil
+}
+
+func validateQUICPacketRelations(evidence checkerRowQUICEvidence, role Role) error {
+	if role == RoleSend {
+		if evidence.packetsSent == 0 {
+			return fmt.Errorf("quic_packets_sent = 0, want positive sender packet evidence")
+		}
+		if evidence.wireBytesSent == 0 {
+			return fmt.Errorf("quic_wire_bytes_sent = 0, want positive sender wire evidence")
+		}
+	}
+	if role == RoleReceive && evidence.packetsReceived == 0 {
+		return fmt.Errorf("quic_packets_received = 0, want positive receiver packet evidence")
+	}
+	if evidence.packetsLost > evidence.packetsSent {
+		return fmt.Errorf("quic_packets_lost = %d, exceeds quic_packets_sent = %d", evidence.packetsLost, evidence.packetsSent)
+	}
+	if evidence.recoveryWireBytes > evidence.wireBytesSent {
+		return fmt.Errorf("quic_recovery_wire_bytes = %d, exceeds quic_wire_bytes_sent = %d", evidence.recoveryWireBytes, evidence.wireBytesSent)
+	}
+	initialWireBytes := evidence.wireBytesSent - evidence.recoveryWireBytes
+	wantRecoveryRatio := float64(evidence.recoveryWireBytes) / float64(max(uint64(1), initialWireBytes))
+	if math.Abs(evidence.recoveryRatio-wantRecoveryRatio) > 0.000001 {
+		return fmt.Errorf("quic_recovery_ratio = %g, want %g", evidence.recoveryRatio, wantRecoveryRatio)
+	}
+	return nil
+}
+
+func (c *checker) validateQUICPayloadAndClose(evidence checkerRowQUICEvidence) error {
+	if c.expectedPayloadBytesSet() {
+		if c.opts.Role == RoleSend && evidence.streamBytesSent < c.opts.ExpectedPayloadBytes {
+			return fmt.Errorf("quic_stream_bytes_sent = %d, want at least %d", evidence.streamBytesSent, c.opts.ExpectedPayloadBytes)
+		}
+		if c.opts.Role == RoleReceive && evidence.streamBytesReceived < c.opts.ExpectedPayloadBytes {
+			return fmt.Errorf("quic_stream_bytes_received = %d, want at least %d", evidence.streamBytesReceived, c.opts.ExpectedPayloadBytes)
+		}
+	}
+	if evidence.closeReason != "complete" && evidence.closeReason != "normal" {
+		return fmt.Errorf("quic_close_reason = %q, want normal completion", evidence.closeReason)
+	}
+	return nil
+}
+
+func validateQUICNativeStates(evidence checkerRowQUICEvidence) error {
+	for name, state := range map[string]string{
+		"quic_native_gso":           evidence.nativeGSO,
+		"quic_native_receive_batch": evidence.nativeReceiveBatch,
+	} {
+		if state != "true" && state != "false" && state != "unsupported" {
+			return fmt.Errorf("%s = %q, want true, false, or unsupported", name, state)
+		}
+	}
+	return nil
+}
+
+func validateFilePayloadLanes(lanes []string, expectedIPv4 string) error {
+	if len(lanes) == 0 {
+		return errors.New("file payload lane addresses are empty")
+	}
+	expected, err := parseExpectedFilePayloadIPv4(expectedIPv4)
+	if err != nil {
+		return err
+	}
+	seen := make(map[netip.AddrPort]struct{}, len(lanes))
+	for _, lane := range lanes {
+		if err := validateFilePayloadLane(lane, expected, seen); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func parseExpectedFilePayloadIPv4(value string) (netip.Addr, error) {
+	if value == "" {
+		return netip.Addr{}, nil
+	}
+	expected, err := netip.ParseAddr(value)
+	if err != nil || !expected.Is4() || !publicFilePayloadAddr(expected) {
+		return netip.Addr{}, fmt.Errorf("expected selected public IPv4 %q is invalid", value)
+	}
+	return expected, nil
+}
+
+func validateFilePayloadLane(lane string, expected netip.Addr, seen map[netip.AddrPort]struct{}) error {
+	addrPort, err := netip.ParseAddrPort(lane)
+	if err != nil {
+		return fmt.Errorf("parse file payload lane address %q: %w", lane, err)
+	}
+	addrPort = netip.AddrPortFrom(addrPort.Addr().Unmap(), addrPort.Port())
+	if _, duplicate := seen[addrPort]; duplicate {
+		return fmt.Errorf("duplicate file payload lane address %q", lane)
+	}
+	seen[addrPort] = struct{}{}
+	if !publicFilePayloadAddr(addrPort.Addr()) {
+		return fmt.Errorf("file payload lane address %q is not public", lane)
+	}
+	if expected.IsValid() && addrPort.Addr() != expected {
+		return fmt.Errorf("file payload lane IP = %s, want %s", addrPort.Addr(), expected)
+	}
+	return nil
+}
+
+func publicFilePayloadAddr(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	cgnat := netip.MustParsePrefix("100.64.0.0/10")
+	return addr.IsGlobalUnicast() && !addr.IsPrivate() && !addr.IsLoopback() &&
+		!addr.IsLinkLocalUnicast() && !addr.IsMulticast() && !addr.IsUnspecified() && !cgnat.Contains(addr)
 }
 
 func (c *checker) recordReceiverRateSummary() {
@@ -686,6 +1373,12 @@ func compareCheckerPair(primaryRows []checkerRow, peerRows []checkerRow, opts Pa
 	senderRows, receiverRows := senderReceiverRows(primaryRows, peerRows, opts.Role)
 	senderFinal := senderRows[len(senderRows)-1]
 	receiverFinal := receiverRows[len(receiverRows)-1]
+	if !senderFinal.filePayload.engine.Valid() || !receiverFinal.filePayload.engine.Valid() {
+		return PairResult{PrimaryRows: len(primaryRows), PeerRows: len(peerRows)}, fmt.Errorf("sender/receiver file payload engines must both be valid: sender=%q receiver=%q", senderFinal.filePayload.engine, receiverFinal.filePayload.engine)
+	}
+	if senderFinal.filePayload.engine != receiverFinal.filePayload.engine {
+		return PairResult{PrimaryRows: len(primaryRows), PeerRows: len(peerRows)}, fmt.Errorf("sender file payload engine = %q, receiver = %q", senderFinal.filePayload.engine, receiverFinal.filePayload.engine)
+	}
 	if senderFinal.phase != PhaseComplete {
 		return PairResult{PrimaryRows: len(primaryRows), PeerRows: len(peerRows)}, fmt.Errorf("sender final phase = %s, want %s", senderFinal.phase, PhaseComplete)
 	}
@@ -829,6 +1522,10 @@ func (c *checker) expectedBytesSet() bool {
 	return c.opts.ExpectedBytesSet || c.opts.ExpectedBytes > 0
 }
 
+func (c *checker) expectedPayloadBytesSet() bool {
+	return c.opts.ExpectedPayloadBytesSet || c.opts.ExpectedPayloadBytes > 0
+}
+
 func (c *checker) noRowsError() error {
 	if c.opts.Role != "" {
 		return fmt.Errorf("no rows matched role %q", c.opts.Role)
@@ -894,10 +1591,41 @@ func checkerHeaderIndexes(header []string) (checkerIndexes, error) {
 		lastError:            lastError,
 		controllerDecision:   optional("controller_decision"),
 		directTransport:      optional("direct_transport"),
+		filePayloadEngine:    optional("file_payload_engine"),
+		filePayloadCommitted: optional("file_payload_bytes_committed"),
+		filePayloadBulk:      optional("file_payload_bytes_bulk"),
+		filePayloadQUIC:      optional("file_payload_bytes_quic"),
+		filePayloadLaneAddrs: optional("file_payload_lane_addrs"),
 		senderHealthSchema:   checkerSenderHealthSchema(positions),
 		receiverRepairSchema: checkerReceiverRepairSchema(positions),
 		numericDiagnostics:   checkerNumericDiagnostics(positions),
+		quicEvidence:         checkerEvidenceIndexes(positions),
+		bulkEvidence:         checkerBulkEvidenceIndexes(positions),
 	}, nil
+}
+
+func checkerEvidenceIndexes(positions map[string]int) map[string]int {
+	indexes := make(map[string]int, len(checkerQUICEvidenceColumns))
+	for _, name := range checkerQUICEvidenceColumns {
+		if index, ok := positions[name]; ok {
+			indexes[name] = index
+		} else {
+			indexes[name] = -1
+		}
+	}
+	return indexes
+}
+
+func checkerBulkEvidenceIndexes(positions map[string]int) map[string]int {
+	indexes := make(map[string]int, len(checkerBulkEvidenceColumns))
+	for _, name := range checkerBulkEvidenceColumns {
+		if index, ok := positions[name]; ok {
+			indexes[name] = index
+		} else {
+			indexes[name] = -1
+		}
+	}
+	return indexes
 }
 
 func checkerReceiverRepairSchema(positions map[string]int) bool {
@@ -971,6 +1699,18 @@ func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int) (checke
 	if err != nil {
 		return checkerRow{}, err
 	}
+	filePayload, err := parseCheckerRowFilePayload(record, indexes, rowNo)
+	if err != nil {
+		return checkerRow{}, err
+	}
+	quicEvidence, err := parseCheckerRowQUICEvidence(record, indexes, rowNo)
+	if err != nil {
+		return checkerRow{}, err
+	}
+	bulkEvidence, err := parseCheckerRowBulkEvidence(record, indexes, rowNo)
+	if err != nil {
+		return checkerRow{}, err
+	}
 	return checkerRow{
 		rowNo:              rowNo,
 		role:               role,
@@ -986,8 +1726,251 @@ func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int) (checke
 		lastState:          field(record, indexes.lastState),
 		lastError:          field(record, indexes.lastError),
 		controllerDecision: field(record, indexes.controllerDecision),
+		filePayload:        filePayload,
+		quicEvidence:       quicEvidence,
+		bulkEvidence:       bulkEvidence,
 		diagnostics:        diagnostics,
 	}, nil
+}
+
+func parseCheckerRowFilePayload(record []string, indexes checkerIndexes, rowNo int) (checkerRowFilePayload, error) {
+	payload := checkerRowFilePayload{observed: make(map[string]bool)}
+	engineValue := field(record, indexes.filePayloadEngine)
+	if engineValue != "" {
+		engine, err := ParseFilePayloadEngine(engineValue)
+		if err != nil {
+			return checkerRowFilePayload{}, fmt.Errorf("row %d: %w", rowNo, err)
+		}
+		payload.engine = engine
+		payload.observed["file_payload_engine"] = true
+	}
+	for _, counter := range []struct {
+		name  string
+		index int
+		value *int64
+	}{
+		{name: "file_payload_bytes_committed", index: indexes.filePayloadCommitted, value: &payload.committed},
+		{name: "file_payload_bytes_bulk", index: indexes.filePayloadBulk, value: &payload.bulk},
+		{name: "file_payload_bytes_quic", index: indexes.filePayloadQUIC, value: &payload.quic},
+	} {
+		value := field(record, counter.index)
+		if value == "" {
+			continue
+		}
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || parsed < 0 {
+			return checkerRowFilePayload{}, fmt.Errorf("row %d: parse %s %q as non-negative decimal", rowNo, counter.name, value)
+		}
+		*counter.value = parsed
+		payload.observed[counter.name] = true
+	}
+	laneValue := field(record, indexes.filePayloadLaneAddrs)
+	if laneValue != "" {
+		if err := json.Unmarshal([]byte(laneValue), &payload.laneAddresses); err != nil {
+			return checkerRowFilePayload{}, fmt.Errorf("row %d: parse file_payload_lane_addrs as JSON array: %w", rowNo, err)
+		}
+		if payload.laneAddresses == nil {
+			payload.laneAddresses = []string{}
+		}
+		payload.observed["file_payload_lane_addrs"] = true
+	}
+	return payload, nil
+}
+
+func parseCheckerRowQUICEvidence(record []string, indexes checkerIndexes, rowNo int) (checkerRowQUICEvidence, error) {
+	evidence := checkerRowQUICEvidence{observed: make(map[string]bool)}
+	parseCheckerQUICStrings(record, indexes, &evidence)
+	if err := parseCheckerQUICTelemetryPresent(record, indexes, rowNo, &evidence); err != nil {
+		return checkerRowQUICEvidence{}, err
+	}
+	if err := parseCheckerQUICUintCounters(record, indexes, rowNo, &evidence); err != nil {
+		return checkerRowQUICEvidence{}, err
+	}
+	if err := parseCheckerQUICIntCounters(record, indexes, rowNo, &evidence); err != nil {
+		return checkerRowQUICEvidence{}, err
+	}
+	if err := parseCheckerQUICFloatCounters(record, indexes, rowNo, &evidence); err != nil {
+		return checkerRowQUICEvidence{}, err
+	}
+	return evidence, nil
+}
+
+func checkerEvidenceValue(record []string, indexes map[string]int, name string) string {
+	index, ok := indexes[name]
+	if !ok {
+		return ""
+	}
+	return field(record, index)
+}
+
+func parseCheckerQUICStrings(record []string, indexes checkerIndexes, evidence *checkerRowQUICEvidence) {
+	for _, item := range []struct {
+		name string
+		dst  *string
+	}{
+		{"quic_version", &evidence.version},
+		{"quic_raw_socket_backend", &evidence.rawSocketBackend},
+		{"quic_native_send_backend", &evidence.nativeSendBackend},
+		{"quic_native_receive_backend", &evidence.nativeReceiveBackend},
+		{"quic_close_reason", &evidence.closeReason},
+		{"quic_native_gso", &evidence.nativeGSO},
+		{"quic_native_receive_batch", &evidence.nativeReceiveBatch},
+	} {
+		if raw := checkerEvidenceValue(record, indexes.quicEvidence, item.name); raw != "" {
+			*item.dst = raw
+			evidence.observed[item.name] = true
+		}
+	}
+}
+
+func parseCheckerQUICTelemetryPresent(record []string, indexes checkerIndexes, rowNo int, evidence *checkerRowQUICEvidence) error {
+	raw := checkerEvidenceValue(record, indexes.quicEvidence, "quic_telemetry_present")
+	if raw == "" {
+		return nil
+	}
+	parsed, err := strconv.ParseBool(raw)
+	if err != nil {
+		return fmt.Errorf("row %d: parse quic_telemetry_present %q as boolean", rowNo, raw)
+	}
+	evidence.telemetryPresent = parsed
+	evidence.observed["quic_telemetry_present"] = true
+	return nil
+}
+
+func parseCheckerQUICUintCounters(record []string, indexes checkerIndexes, rowNo int, evidence *checkerRowQUICEvidence) error {
+	for _, counter := range []struct {
+		name string
+		dst  *uint64
+	}{
+		{"quic_connections", &evidence.connections},
+		{"quic_streams", &evidence.streams},
+		{"quic_packets_sent", &evidence.packetsSent},
+		{"quic_packets_received", &evidence.packetsReceived},
+		{"quic_packets_lost", &evidence.packetsLost},
+		{"quic_wire_bytes_sent", &evidence.wireBytesSent},
+		{"quic_recovery_wire_bytes", &evidence.recoveryWireBytes},
+		{"file_source_read_calls", &evidence.fileSourceReadCalls},
+		{"file_source_read_bytes", &evidence.fileSourceReadBytes},
+	} {
+		raw := checkerEvidenceValue(record, indexes.quicEvidence, counter.name)
+		if raw == "" {
+			continue
+		}
+		parsed, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			return fmt.Errorf("row %d: parse %s %q as non-negative decimal", rowNo, counter.name, raw)
+		}
+		*counter.dst = parsed
+		evidence.observed[counter.name] = true
+	}
+	return nil
+}
+
+func parseCheckerQUICIntCounters(record []string, indexes checkerIndexes, rowNo int, evidence *checkerRowQUICEvidence) error {
+	for _, counter := range []struct {
+		name string
+		dst  *int64
+	}{
+		{"quic_handshake_ms", &evidence.handshakeMS},
+		{"quic_first_byte_ms", &evidence.firstByteMS},
+		{"quic_stream_bytes_sent", &evidence.streamBytesSent},
+		{"quic_stream_bytes_received", &evidence.streamBytesReceived},
+	} {
+		raw := checkerEvidenceValue(record, indexes.quicEvidence, counter.name)
+		if raw == "" {
+			continue
+		}
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed < 0 {
+			return fmt.Errorf("row %d: parse %s %q as non-negative decimal", rowNo, counter.name, raw)
+		}
+		*counter.dst = parsed
+		evidence.observed[counter.name] = true
+	}
+	return nil
+}
+
+func parseCheckerQUICFloatCounters(record []string, indexes checkerIndexes, rowNo int, evidence *checkerRowQUICEvidence) error {
+	for _, counter := range []struct {
+		name string
+		dst  *float64
+	}{
+		{"quic_smoothed_rtt_ms", &evidence.smoothedRTTMS},
+		{"quic_recovery_ratio", &evidence.recoveryRatio},
+	} {
+		raw := checkerEvidenceValue(record, indexes.quicEvidence, counter.name)
+		if raw == "" {
+			continue
+		}
+		parsed, err := strconv.ParseFloat(raw, 64)
+		if err != nil || parsed < 0 || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+			return fmt.Errorf("row %d: parse %s %q as non-negative decimal", rowNo, counter.name, raw)
+		}
+		*counter.dst = parsed
+		evidence.observed[counter.name] = true
+	}
+	return nil
+}
+
+func parseCheckerRowBulkEvidence(record []string, indexes checkerIndexes, rowNo int) (checkerRowBulkEvidence, error) {
+	evidence := checkerRowBulkEvidence{
+		observed: make(map[string]bool),
+		strings:  make(map[string]string),
+		uints:    make(map[string]uint64),
+		bools:    make(map[string]bool),
+	}
+	parseCheckerBulkStrings(record, indexes, &evidence)
+	if err := parseCheckerBulkBools(record, indexes, rowNo, &evidence); err != nil {
+		return checkerRowBulkEvidence{}, err
+	}
+	if err := parseCheckerBulkUints(record, indexes, rowNo, &evidence); err != nil {
+		return checkerRowBulkEvidence{}, err
+	}
+	return evidence, nil
+}
+
+func parseCheckerBulkStrings(record []string, indexes checkerIndexes, evidence *checkerRowBulkEvidence) {
+	for _, name := range []string{"bulk_candidate_id", "bulk_batch_backend"} {
+		if raw := checkerEvidenceValue(record, indexes.bulkEvidence, name); raw != "" {
+			evidence.strings[name] = raw
+			evidence.observed[name] = true
+		}
+	}
+}
+
+func parseCheckerBulkBools(record []string, indexes checkerIndexes, rowNo int, evidence *checkerRowBulkEvidence) error {
+	for _, name := range []string{"bulk_gso_attempted", "bulk_gso_active", "bulk_probe_pressure"} {
+		raw := checkerEvidenceValue(record, indexes.bulkEvidence, name)
+		if raw == "" {
+			continue
+		}
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			return fmt.Errorf("row %d: parse %s %q as boolean", rowNo, name, raw)
+		}
+		evidence.bools[name] = parsed
+		evidence.observed[name] = true
+	}
+	return nil
+}
+
+func parseCheckerBulkUints(record []string, indexes checkerIndexes, rowNo int, evidence *checkerRowBulkEvidence) error {
+	for _, name := range checkerBulkEvidenceColumns {
+		if evidence.observed[name] || name == "bulk_candidate_id" || name == "bulk_batch_backend" {
+			continue
+		}
+		raw := checkerEvidenceValue(record, indexes.bulkEvidence, name)
+		if raw == "" {
+			continue
+		}
+		parsed, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			return fmt.Errorf("row %d: parse %s %q as non-negative decimal", rowNo, name, raw)
+		}
+		evidence.uints[name] = parsed
+		evidence.observed[name] = true
+	}
+	return nil
 }
 
 type checkerRowFields struct {
@@ -1047,7 +2030,7 @@ func parseReceiverAppMbps(record []string, indexes checkerIndexes, rowNo int, ro
 }
 
 func parseCheckerRowDiagnostics(record []string, indexes checkerIndexes, rowNo int, role Role, phase Phase) (checkerRowDiagnostics, error) {
-	var diagnostics checkerRowDiagnostics
+	diagnostics := checkerRowDiagnostics{observed: make(map[string]bool)}
 	diagnostics.receiverRepairObserved = checkerReceiverRepairObserved(record, indexes)
 	for _, column := range indexes.numericDiagnostics {
 		value, observed, err := parseCheckerNumericDiagnostic(record, column, rowNo)
@@ -1055,6 +2038,7 @@ func parseCheckerRowDiagnostics(record []string, indexes checkerIndexes, rowNo i
 			return checkerRowDiagnostics{}, err
 		}
 		if observed {
+			diagnostics.observed[column.name] = true
 			diagnostics.record(column.name, value)
 		}
 	}
@@ -1156,21 +2140,43 @@ func isOptionalTrailingDiagnosticColumn(name string) bool {
 		"direct_packet_bytes",
 		"direct_committed_bytes",
 		"direct_transport",
+		"quic_connections",
+		"quic_streams",
+		"quic_telemetry_present",
+		"quic_version",
+		"quic_raw_socket_backend",
+		"quic_native_send_backend",
+		"quic_native_receive_backend",
 		"quic_handshake_ms",
 		"quic_first_byte_ms",
+		"quic_packets_sent",
+		"quic_packets_received",
+		"quic_packets_lost",
+		"quic_wire_bytes_sent",
+		"quic_recovery_wire_bytes",
+		"quic_recovery_ratio",
 		"quic_stream_bytes_sent",
 		"quic_stream_bytes_received",
 		"quic_stream_goodput_mbps",
 		"quic_smoothed_rtt_ms",
 		"quic_loss_events",
 		"quic_close_reason",
+		"quic_native_gso",
+		"quic_native_receive_batch",
+		"file_source_read_calls",
+		"file_source_read_bytes",
 		"missing_scan_checks",
 		"pending_missing",
 		"pending_missing_peak",
 		"repair_requested_packets",
 		"repair_request_batches",
 		"reorder_trail_packets",
-		"receive_packet_rate_pps":
+		"receive_packet_rate_pps",
+		"file_payload_engine",
+		"file_payload_bytes_committed",
+		"file_payload_bytes_bulk",
+		"file_payload_bytes_quic",
+		"file_payload_lane_addrs":
 		return true
 	default:
 		return false

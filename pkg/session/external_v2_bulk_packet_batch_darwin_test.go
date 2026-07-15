@@ -155,7 +155,16 @@ func TestExternalV2BulkPacketDarwinSendmsgXWritesBatch(t *testing.T) {
 		}
 	}
 	sender := newExternalV2BulkPacketBatchConn(senderConn)
-	enableExternalV2BulkPacketFixedPeerConnect(sender)
+	if err := enableExternalV2BulkPacketFixedPeerConnect(sender, receiverConn.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	darwinSender, ok := sender.(*externalV2BulkPacketDarwinBatchConn)
+	if !ok || darwinSender.fixedPeer == nil || darwinSender.fixedPeer.String() != receiverConn.LocalAddr().String() {
+		t.Fatalf("Darwin fixed peer = %v, want %v", darwinSender.fixedPeer, receiverConn.LocalAddr())
+	}
+	if darwinSender.connectAttempted || darwinSender.connected {
+		t.Fatal("Darwin fixed peer connected before the first batch write")
+	}
 	written, err := sender.WriteBatch(context.Background(), messages)
 	if err != nil {
 		t.Fatal(err)
@@ -163,7 +172,6 @@ func TestExternalV2BulkPacketDarwinSendmsgXWritesBatch(t *testing.T) {
 	if written != len(messages) {
 		t.Fatalf("written = %d, want %d", written, len(messages))
 	}
-	darwinSender, ok := sender.(*externalV2BulkPacketDarwinBatchConn)
 	if !ok || !darwinSender.connected {
 		t.Fatal("Darwin batch sender did not connect its fixed-peer UDP socket")
 	}

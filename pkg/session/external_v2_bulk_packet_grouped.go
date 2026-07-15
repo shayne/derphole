@@ -104,60 +104,122 @@ func (s *externalV2BulkPacketSender) prepareGroupedPacketSlab(
 		byLane:   make([][]externalV2BulkPacketBatchMessage, s.laneCount),
 		slab:     slab,
 	}
+	if err := ctx.Err(); err != nil {
+		result.err = err
+		return result
+	}
+	candidate, err := externalV2BulkPacketConfiguredCandidate()
+	if err != nil {
+		result.err = err
+		return result
+	}
+	plainStart, plainLength, err := s.validateGroupedPacketSlabRange(job, slab)
+	if err != nil {
+		result.err = err
+		return result
+	}
+	input := slab.input[:plainLength]
+	if err := s.readGroupedPacketSlabInput(ctx, job, candidate, input, plainStart); err != nil {
+		result.err = err
+		return result
+	}
+	if err := s.prepareGroupedPacketSlabMessages(ctx, job, slab, input, result.byLane); err != nil {
+		result.err = err
+	}
+	return result
+}
+
+func (s *externalV2BulkPacketSender) validateGroupedPacketSlabRange(job externalV2BulkPacketPrepareJob, slab *externalV2BulkPacketSlab) (int64, int, error) {
+	if job.count > externalV2BulkPacketGroupedGroupsPerSlab {
+		return 0, 0, fmt.Errorf("bulk packet grouped slab contains %d groups, maximum %d", job.count, externalV2BulkPacketGroupedGroupsPerSlab)
+	}
+	if job.count == 0 || job.start >= s.groupCount || job.count > s.groupCount-job.start {
+		return 0, 0, fmt.Errorf("bulk packet grouped slab range start=%d count=%d exceeds source group count %d", job.start, job.count, s.groupCount)
+	}
+	plainStart, plainLength := externalV2BulkPacketGroupedSlabRange(job.start, job.count, s.src.PayloadSize)
+	if plainLength <= 0 {
+		return 0, 0, fmt.Errorf("bulk packet grouped slab range start=%d count=%d is outside source", job.start, job.count)
+	}
+	if plainLength > len(slab.input) {
+		return 0, 0, fmt.Errorf("bulk packet grouped slab range contains %d bytes, maximum %d", plainLength, len(slab.input))
+	}
+	return plainStart, plainLength, nil
+}
+
+func (s *externalV2BulkPacketSender) readGroupedPacketSlabInput(ctx context.Context, job externalV2BulkPacketPrepareJob, candidate externalV2BulkPacketCandidateConfig, input []byte, plainStart int64) error {
+	if candidate.CoalescedReads {
+		n, readErr := s.src.Payload.ReadAt(input, plainStart)
+		return externalV2BlockReadError(readErr, n, len(input), plainStart+int64(n), s.src.PayloadSize)
+	}
+	for localGroup := uint32(0); localGroup < job.count; localGroup++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		groupID := job.start + localGroup
+		groupStart, groupBytes := externalV2BulkPacketGroupedPlaintextRange(groupID, s.src.PayloadSize)
+		plainOffset := int(localGroup) * externalV2BulkPacketGroupedPlaintextBytes
+		plaintext := input[plainOffset : plainOffset+groupBytes]
+		n, readErr := s.src.Payload.ReadAt(plaintext, groupStart)
+		if err := externalV2BlockReadError(readErr, n, groupBytes, groupStart+int64(n), s.src.PayloadSize); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *externalV2BulkPacketSender) prepareGroupedPacketSlabMessages(ctx context.Context, job externalV2BulkPacketPrepareJob, slab *externalV2BulkPacketSlab, input []byte, byLane [][]externalV2BulkPacketBatchMessage) error {
 	packetSlot := 0
 	for localGroup := uint32(0); localGroup < job.count; localGroup++ {
 		if err := ctx.Err(); err != nil {
-			result.err = err
-			return result
+			return err
 		}
-		groupID := job.start + localGroup
-		plainStart, plainBytes := externalV2BulkPacketGroupedPlaintextRange(groupID, s.src.PayloadSize)
-		plainOffset := int(localGroup) * externalV2BulkPacketGroupedPlaintextBytes
-		plaintext := slab.input[plainOffset : plainOffset+plainBytes]
-		n, readErr := s.src.Payload.ReadAt(plaintext, plainStart)
-		if err := externalV2BlockReadError(readErr, n, plainBytes, plainStart+int64(n), s.src.PayloadSize); err != nil {
-			result.err = err
-			return result
-		}
-		cipherOffset := int(localGroup) * (externalV2BulkPacketGroupedPlaintextBytes + s.auth.grouped.Overhead())
-		ciphertext, err := sealExternalV2BulkPacketGroup(
-			s.auth.grouped,
-			slab.ciphertext[cipherOffset:cipherOffset:cipherOffset+plainBytes+s.auth.grouped.Overhead()],
-			s.runID,
-			groupID,
-			s.groupCount,
-			plaintext[:n],
-		)
-		if err != nil {
-			result.err = err
-			return result
-		}
-		firstFragment, fragments := externalV2BulkPacketGroupedFragmentRange(groupID, s.src.PayloadSize, s.auth.grouped.Overhead())
-		for localFragment := uint32(0); localFragment < fragments; localFragment++ {
-			fragmentIndex := firstFragment + localFragment
-			cipherStart, cipherEnd := externalV2BulkPacketGroupedFragmentCiphertextRange(fragmentIndex, len(ciphertext))
-			packetStart := packetSlot * externalV2BulkPacketMaxSize
-			packet, err := encodeExternalV2BulkPacketGroupedFragment(
-				slab.sealed[packetStart:packetStart:packetStart+externalV2BulkPacketMaxSize],
-				s.runID,
-				fragmentIndex,
-				s.totalPackets,
-				ciphertext[cipherStart:cipherEnd],
-			)
-			if err != nil {
-				result.err = err
-				return result
-			}
-			lane := externalV2BulkPacketPrimaryLane(fragmentIndex, s.laneCount)
-			result.byLane[lane] = append(result.byLane[lane], externalV2BulkPacketBatchMessage{
-				Buffers:      [][]byte{packet},
-				Addr:         s.path.Addrs[lane],
-				PayloadBytes: externalV2BulkPacketGroupedFragmentPlaintextBytes(fragmentIndex, len(ciphertext), s.auth.grouped.Overhead()),
-			})
-			packetSlot++
+		if err := s.prepareGroupedPacketGroup(job.start+localGroup, localGroup, slab, input, byLane, &packetSlot); err != nil {
+			return err
 		}
 	}
-	return result
+	return nil
+}
+
+func (s *externalV2BulkPacketSender) prepareGroupedPacketGroup(groupID, localGroup uint32, slab *externalV2BulkPacketSlab, input []byte, byLane [][]externalV2BulkPacketBatchMessage, packetSlot *int) error {
+	_, plainBytes := externalV2BulkPacketGroupedPlaintextRange(groupID, s.src.PayloadSize)
+	plainOffset := int(localGroup) * externalV2BulkPacketGroupedPlaintextBytes
+	plaintext := input[plainOffset : plainOffset+plainBytes]
+	cipherOffset := int(localGroup) * (externalV2BulkPacketGroupedPlaintextBytes + s.auth.grouped.Overhead())
+	ciphertext, err := sealExternalV2BulkPacketGroup(
+		s.auth.grouped,
+		slab.ciphertext[cipherOffset:cipherOffset:cipherOffset+plainBytes+s.auth.grouped.Overhead()],
+		s.runID,
+		groupID,
+		s.groupCount,
+		plaintext,
+	)
+	if err != nil {
+		return err
+	}
+	firstFragment, fragments := externalV2BulkPacketGroupedFragmentRange(groupID, s.src.PayloadSize, s.auth.grouped.Overhead())
+	for localFragment := uint32(0); localFragment < fragments; localFragment++ {
+		fragmentIndex := firstFragment + localFragment
+		cipherStart, cipherEnd := externalV2BulkPacketGroupedFragmentCiphertextRange(fragmentIndex, len(ciphertext))
+		packetStart := *packetSlot * externalV2BulkPacketMaxSize
+		packet, err := encodeExternalV2BulkPacketGroupedFragment(
+			slab.sealed[packetStart:packetStart:packetStart+externalV2BulkPacketMaxSize],
+			s.runID,
+			fragmentIndex,
+			s.totalPackets,
+			ciphertext[cipherStart:cipherEnd],
+		)
+		if err != nil {
+			return err
+		}
+		lane := externalV2BulkPacketPrimaryLane(fragmentIndex, s.laneCount)
+		byLane[lane] = append(byLane[lane], externalV2BulkPacketBatchMessage{
+			Buffers:      [][]byte{packet},
+			Addr:         s.path.Addrs[lane],
+			PayloadBytes: externalV2BulkPacketGroupedFragmentPlaintextBytes(fragmentIndex, len(ciphertext), s.auth.grouped.Overhead()),
+		})
+		*packetSlot++
+	}
+	return nil
 }
 
 func externalV2BulkPacketGroupedFragmentPlaintextBytes(fragmentIndex uint32, ciphertextBytes int, overhead int) int {
@@ -441,6 +503,25 @@ func externalV2BulkPacketGroupedPlaintextRange(groupID uint32, payloadSize int64
 		return start, 0
 	}
 	return start, int(min(int64(externalV2BulkPacketGroupedPlaintextBytes), payloadSize-start))
+}
+
+func externalV2BulkPacketGroupedSlabRange(startGroup, groupCount uint32, payloadSize int64) (int64, int) {
+	if groupCount == 0 || payloadSize <= 0 {
+		return 0, 0
+	}
+	start, startLength := externalV2BulkPacketGroupedPlaintextRange(startGroup, payloadSize)
+	if startLength == 0 {
+		return start, 0
+	}
+	lastGroup := uint64(startGroup) + uint64(groupCount) - 1
+	if lastGroup > uint64(^uint32(0)) {
+		return start, 0
+	}
+	lastStart, lastLength := externalV2BulkPacketGroupedPlaintextRange(uint32(lastGroup), payloadSize)
+	if lastLength == 0 {
+		return start, 0
+	}
+	return start, int(lastStart + int64(lastLength) - start)
 }
 
 func externalV2BulkPacketGroupedFragmentRange(groupID uint32, payloadSize int64, overhead int) (uint32, uint32) {

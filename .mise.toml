@@ -256,6 +256,14 @@ run = "bash ./scripts/encrypted-transport-feasibility.sh"
 description = "Run the strict 2 Gbps public-UDP file acceptance gate"
 run = "bash ./scripts/udp-file-acceptance.sh"
 
+[tasks."udp:peak-candidates"]
+description = "Build immutable public-UDP benchmark candidate pairs"
+run = "bash ./scripts/udp-peak-candidates.sh"
+
+[tasks."udp:peak"]
+description = "Run the focused public-UDP preliminary comparison"
+run = "bash ./scripts/udp-peak-performance.sh"
+
 [tasks."release:build-vendor"]
 run = "bash ./tools/packaging/build-vendor.sh"
 

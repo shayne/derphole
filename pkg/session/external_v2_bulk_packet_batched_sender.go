@@ -389,8 +389,9 @@ func (s *externalV2BulkPacketSender) preparePacketSlab(ctx context.Context, job 
 		}
 		lane := externalV2BulkPacketPrimaryLane(index, s.laneCount)
 		result.byLane[lane] = append(result.byLane[lane], externalV2BulkPacketBatchMessage{
-			Buffers: [][]byte{packet},
-			Addr:    s.path.Addrs[lane],
+			Buffers:      [][]byte{packet},
+			Addr:         s.path.Addrs[lane],
+			PayloadBytes: payloadEnd - payloadStart,
 		})
 	}
 	return result
@@ -457,8 +458,9 @@ func (s *externalV2BulkPacketSender) prepareRepairPacketSlab(
 			return nil, err
 		}
 		byLane[repair.lane] = append(byLane[repair.lane], externalV2BulkPacketBatchMessage{
-			Buffers: [][]byte{packet},
-			Addr:    s.path.Addrs[repair.lane],
+			Buffers:      [][]byte{packet},
+			Addr:         s.path.Addrs[repair.lane],
+			PayloadBytes: n,
 		})
 	}
 	return byLane, nil

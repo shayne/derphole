@@ -1,0 +1,1 @@
+{"candidate":"challenger","challenger":{"raw_mbps":900,"normalized":0.4,"cpu_efficiency":100},"competitor":{"raw_mbps":1010,"normalized":0.46,"cpu_efficiency":115},"control_before_mbps":1000,"control_after_mbps":1040,"expected_eliminated":false}

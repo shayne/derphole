@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/shayne/derphole/pkg/transfertrace"
 )
 
 const (
@@ -100,6 +102,7 @@ func (w *externalV2BulkPacketAsyncWriter) run() {
 		w.committed.Add(int64(n))
 		if w.metrics != nil {
 			w.metrics.RecordDirectPacketReceive(int64(n), time.Now())
+			w.metrics.RecordFilePayloadCommit(transfertrace.FilePayloadEngineBulk, int64(n), time.Now())
 		}
 	}
 }

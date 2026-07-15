@@ -1,0 +1,1 @@
+{"candidates":[{"id":"alpha","local_to_remote_mbps":1000,"remote_to_local_mbps":1000},{"id":"beta","local_to_remote_mbps":949,"remote_to_local_mbps":949},{"id":"gamma","local_to_remote_mbps":800,"remote_to_local_mbps":1100}],"expected_advanced":["alpha","gamma"]}

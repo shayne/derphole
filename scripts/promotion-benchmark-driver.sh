@@ -47,15 +47,62 @@ if [[ "${test_cpu_profile}" == *$'\n'* || "${test_cpu_profile}" == *$'\r'* ]]; t
   echo "DERPHOLE_TEST_CPU_PROFILE must be one path" >&2
   exit 2
 fi
+ready_file="${DERPHOLE_BENCH_READY_FILE:-}"
+start_file="${DERPHOLE_BENCH_START_FILE:-}"
+if [[ -n "${ready_file}" && -z "${start_file}" ]] || [[ -z "${ready_file}" && -n "${start_file}" ]]; then
+  echo "DERPHOLE_BENCH_READY_FILE and DERPHOLE_BENCH_START_FILE must be set together" >&2
+  exit 2
+fi
+for gate_file in "${ready_file}" "${start_file}"; do
+  if [[ -n "${gate_file}" && ( "${gate_file}" != /* || "${gate_file}" == *$'\n'* || "${gate_file}" == *$'\r'* ) ]]; then
+    echo "benchmark gate paths must be absolute single-line paths" >&2
+    exit 2
+  fi
+done
+process_identify_local="${DERPHOLE_BENCH_PROCESS_IDENTIFY_LOCAL:-}"
+process_identify_remote="${DERPHOLE_BENCH_PROCESS_IDENTIFY_REMOTE:-}"
+process_evidence_dir="${DERPHOLE_BENCH_PROCESS_EVIDENCE_DIR:-}"
+child_cleanup_out="${DERPHOLE_BENCH_CHILD_CLEANUP_OUT:-}"
+identity_evidence_enabled=false
+if [[ -n "${process_identify_local}${process_identify_remote}${process_evidence_dir}${child_cleanup_out}" ]]; then
+  if [[ -z "${process_identify_local}" || -z "${process_identify_remote}" || -z "${process_evidence_dir}" || -z "${child_cleanup_out}" ]]; then
+    echo "benchmark process identity evidence variables must be set together" >&2
+    exit 2
+  fi
+  for identity_path in "${process_identify_local}" "${process_identify_remote}" "${process_evidence_dir}" "${child_cleanup_out}"; do
+    if [[ "${identity_path}" != /* || "${identity_path}" == *$'\n'* || "${identity_path}" == *$'\r'* ]]; then
+      echo "benchmark process identity evidence paths must be absolute single-line paths" >&2
+      exit 2
+    fi
+  done
+  [[ -x "${process_identify_local}" ]] || { echo "local process identity helper is not executable" >&2; exit 2; }
+  [[ -d "$(dirname "${process_evidence_dir}")" && ! -L "$(dirname "${process_evidence_dir}")" ]] || { echo "process evidence parent is invalid" >&2; exit 2; }
+  [[ ! -e "${process_evidence_dir}" && ! -L "${process_evidence_dir}" && ! -e "${child_cleanup_out}" && ! -L "${child_cleanup_out}" ]] || { echo "process evidence output already exists" >&2; exit 2; }
+  mkdir -m 0700 "${process_evidence_dir}"
+  identity_evidence_enabled=true
+fi
 transfer_mode="unknown"
 
 local_override="${DERPHOLE_BENCH_LOCAL_BIN:-}"
 linux_override="${DERPHOLE_BENCH_LINUX_BIN:-}"
+local_expected_sha256="${DERPHOLE_BENCH_LOCAL_BIN_SHA256:-}"
+linux_expected_sha256="${DERPHOLE_BENCH_LINUX_BIN_SHA256:-}"
 if [[ -n "${local_override}" && -z "${linux_override}" ]] ||
    [[ -z "${local_override}" && -n "${linux_override}" ]]; then
   echo "DERPHOLE_BENCH_LOCAL_BIN and DERPHOLE_BENCH_LINUX_BIN must be set together" >&2
   exit 2
 fi
+if [[ -n "${local_expected_sha256}" && -z "${linux_expected_sha256}" ]] ||
+   [[ -z "${local_expected_sha256}" && -n "${linux_expected_sha256}" ]]; then
+  echo "DERPHOLE_BENCH_LOCAL_BIN_SHA256 and DERPHOLE_BENCH_LINUX_BIN_SHA256 must be set together" >&2
+  exit 2
+fi
+for expected_sha256 in "${local_expected_sha256}" "${linux_expected_sha256}"; do
+  if [[ -n "${expected_sha256}" && ! "${expected_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "benchmark binary SHA-256 values must be lowercase hexadecimal" >&2
+    exit 2
+  fi
+done
 
 target="${1:?usage: $0 <target> [size-mib]}"
 size_mib="${2:-1024}"
@@ -127,9 +174,22 @@ receiver_max_rss_bytes=""
 receiver_resource_stats_available="false"
 receiver_resource_exit_code=""
 send_pid=""
+send_ref=""
+send_child_ref=""
 listener_pid=""
+listener_ref=""
+listener_child_ref=""
 local_tool_pids_baseline=""
 remote_tool_pids_baseline=""
+source_sha=""
+sink_sha=""
+sink_size=""
+remote_linux_bin_sha256=""
+benchmark_cleanup_success="false"
+benchmark_child_cleanup_success="false"
+benchmark_child_cleanup_sha256=""
+process_recheck_sequence=0
+transfer_children_waited=false
 remote_env=()
 parallel_args=()
 parallel_args_remote=""
@@ -167,7 +227,13 @@ if [[ -n "${test_cpu_profile}" ]]; then
   remote_env+=(DERPHOLE_TEST_CPU_PROFILE="${test_cpu_profile}")
 fi
 remote() {
-  ssh "${remote_target}" "${remote_env[@]}" 'bash -se' <<<"$1"
+  local remote_command='env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}"'
+  local assignment quoted
+  for assignment in "${remote_env[@]}"; do
+    printf -v quoted '%q' "${assignment}"
+    remote_command+=" ${quoted}"
+  done
+  ssh "${remote_target}" "${remote_command} bash -se" <<<"$1"
 }
 
 install_remote_bin() {
@@ -301,6 +367,13 @@ emit_benchmark_footer() {
     echo "benchmark-receiver-max-rss-bytes=${receiver_max_rss_bytes}"
     echo "benchmark-receiver-resource-stats-available=${receiver_resource_stats_available}"
     echo "benchmark-revision-label=${revision_label}"
+    echo "benchmark-source-sha256=${source_sha}"
+    echo "benchmark-sink-sha256=${sink_sha}"
+    echo "benchmark-sink-size-bytes=${sink_size}"
+    echo "benchmark-remote-linux-bin-sha256=${remote_linux_bin_sha256}"
+    echo "benchmark-cleanup-success=${benchmark_cleanup_success}"
+    echo "benchmark-child-cleanup-success=${benchmark_child_cleanup_success}"
+    echo "benchmark-child-cleanup-sha256=${benchmark_child_cleanup_sha256}"
     echo "benchmark-success=${success}"
     if [[ -n "${error_text}" ]]; then
       echo "benchmark-error=${error_text}"
@@ -781,7 +854,127 @@ dump_failure() {
   fi
 }
 
+process_ref_field() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    print(json.load(source)[sys.argv[2]])
+PY
+}
+
+identify_local_owned_process() {
+  local role="$1" name="$2" pid="$3" output="${process_evidence_dir}/$1.ref.json"
+  [[ "${identity_evidence_enabled}" == true ]] || return 0
+  "${process_identify_local}" process-identify -name "${name}" -pid "${pid}" -timeout 5s -out "${output}" >"${output}.sha256"
+  printf '%s\n' "${output}"
+}
+
+identify_local_owned_child() {
+  local role="$1" parent_pid="$2" name="$3" child_pid=""
+  [[ "${identity_evidence_enabled}" == true ]] || return 0
+  for _ in $(seq 1 100); do
+    child_pid="$(pgrep -P "${parent_pid}" -x "${name}" 2>/dev/null | head -n 1 || true)"
+    [[ "${child_pid}" =~ ^[1-9][0-9]*$ ]] && break
+    sleep 0.02
+  done
+  [[ "${child_pid}" =~ ^[1-9][0-9]*$ ]] || { echo "failed to identify local ${role} child" >&2; return 1; }
+  identify_local_owned_process "${role}" "${name}" "${child_pid}"
+}
+
+record_remote_process_identity() {
+  local role="$1" name="$2" pid_file="$3" remote_ref="${remote_base}.$1.ref.json"
+  [[ "${identity_evidence_enabled}" == true ]] || return 0
+  remote "pid=\$(cat '${pid_file}') || exit 1; [[ \"\${pid}\" =~ ^[1-9][0-9]*$ ]] || exit 1; '${process_identify_remote}' process-identify -name '${name}' -pid \"\${pid}\" -timeout 5s -out '${remote_ref}' >'${remote_ref}.sha256'"
+  scp "${remote_target}:${remote_ref}" "${process_evidence_dir}/${role}.ref.json" >/dev/null
+  scp "${remote_target}:${remote_ref}.sha256" "${process_evidence_dir}/${role}.ref.json.sha256" >/dev/null
+}
+
+copy_remote_process_identity() {
+  local role="$1" remote_ref="${remote_base}.$1.ref.json"
+  [[ "${identity_evidence_enabled}" == true ]] || return 0
+  scp "${remote_target}:${remote_ref}" "${process_evidence_dir}/${role}.ref.json" >/dev/null
+  scp "${remote_target}:${remote_ref}.sha256" "${process_evidence_dir}/${role}.ref.json.sha256" >/dev/null
+}
+
+record_remote_child_identity() {
+  local role="$1" parent_pid_file="$2" name="$3" pid_file="${remote_base}.$1.pid"
+  [[ "${identity_evidence_enabled}" == true ]] || return 0
+  remote "parent=\$(cat '${parent_pid_file}') || exit 1; child=''; for _ in \$(seq 1 100); do child=\$(pgrep -P \"\${parent}\" -x '${name}' | head -n 1 || true); [[ \"\${child}\" =~ ^[1-9][0-9]*$ ]] && break; sleep 0.02; done; [[ \"\${child}\" =~ ^[1-9][0-9]*$ ]] || exit 1; printf '%s\n' \"\${child}\" >'${pid_file}'"
+  record_remote_process_identity "${role}" "${name}" "${pid_file}"
+}
+
+same_local_process() {
+  local reference="$1" name pid fresh
+  name="$(process_ref_field "${reference}" name)" || return 2
+  pid="$(process_ref_field "${reference}" pid)" || return 2
+  process_recheck_sequence=$((process_recheck_sequence + 1))
+  fresh="${process_evidence_dir}/recheck-${process_recheck_sequence}.ref.json"
+  if "${process_identify_local}" process-identify -name "${name}" -pid "${pid}" -timeout 5s -out "${fresh}" >"${fresh}.sha256" 2>"${fresh}.err"; then
+    cmp -s -- "${reference}" "${fresh}" && return 0
+    return 1
+  fi
+  return 2
+}
+
+terminate_local_process_ref() {
+  local reference="$1" pid state
+  [[ -f "${reference}" && ! -L "${reference}" ]] || return 1
+  pid="$(process_ref_field "${reference}" pid)" || return 1
+  if same_local_process "${reference}"; then
+    kill -TERM -- "${pid}" || return 1
+  else
+    state=$?
+    ((state == 1)) && return 0
+    return 1
+  fi
+  for _ in $(seq 1 40); do
+    if same_local_process "${reference}"; then :; else state=$?; ((state == 1)) && { wait "${pid}" 2>/dev/null || true; return 0; }; return 1; fi
+    sleep 0.05
+  done
+  if same_local_process "${reference}"; then
+    kill -KILL -- "${pid}" || return 1
+  else
+    state=$?
+    ((state == 1)) && return 0
+    return 1
+  fi
+  for _ in $(seq 1 40); do
+    if same_local_process "${reference}"; then :; else state=$?; ((state == 1)) && { wait "${pid}" 2>/dev/null || true; return 0; }; return 1; fi
+    sleep 0.05
+  done
+  return 1
+}
+
 terminate_remote_processes() {
+  if [[ "${identity_evidence_enabled}" == true ]]; then
+    remote "set +e
+helper='${process_identify_remote}'
+status=0
+sequence=0
+same_process() {
+  reference=\$1
+  name=\$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"name\"])' \"\${reference}\") || return 2
+  pid=\$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"pid\"])' \"\${reference}\") || return 2
+  sequence=\$((sequence + 1))
+  fresh=\"\${reference}.cleanup-recheck.\${sequence}\"
+  if \"\${helper}\" process-identify -name \"\${name}\" -pid \"\${pid}\" -timeout 5s -out \"\${fresh}\" >\"\${fresh}.sha256\" 2>\"\${fresh}.err\"; then cmp -s -- \"\${reference}\" \"\${fresh}\" && return 0; return 1; fi
+  return 2
+}
+terminate_exact() {
+  reference=\$1
+  [[ -f \"\${reference}\" && ! -L \"\${reference}\" ]] || return 0
+  pid=\$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"pid\"])' \"\${reference}\") || return 1
+  if same_process \"\${reference}\"; then kill -TERM -- \"\${pid}\" || return 1; else state=\$?; [[ \"\${state}\" == 1 ]] && return 0; return 1; fi
+  for _ in \$(seq 1 40); do if same_process \"\${reference}\"; then :; else state=\$?; [[ \"\${state}\" == 1 ]] && return 0; return 1; fi; sleep 0.05; done
+  if same_process \"\${reference}\"; then kill -KILL -- \"\${pid}\" || return 1; else state=\$?; [[ \"\${state}\" == 1 ]] && return 0; return 1; fi
+  for _ in \$(seq 1 40); do if same_process \"\${reference}\"; then :; else state=\$?; [[ \"\${state}\" == 1 ]] && return 0; return 1; fi; sleep 0.05; done
+  return 1
+}
+for role in derphole runstats wrapper; do terminate_exact '${remote_base}'.\${role}.ref.json || status=1; done
+exit \"\${status}\""
+    return
+  fi
   remote "set +e
 cleanup_status=0
 wrapper_pid=''
@@ -849,7 +1042,12 @@ local_process_running() {
 }
 
 terminate_local_process() {
-  local pid="$1"
+  local pid="$1" reference="${2:-}"
+  if [[ "${identity_evidence_enabled}" == true ]]; then
+    [[ -n "${reference}" ]] || return 1
+    terminate_local_process_ref "${reference}"
+    return
+  fi
   if [[ ! "${pid}" =~ ^[0-9]+$ ]]; then
     return 1
   fi
@@ -873,28 +1071,81 @@ terminate_local_process() {
   wait "${pid}" 2>/dev/null || true
 }
 
+write_child_cleanup_evidence() {
+  local cleanup_status="$1" count=0
+  [[ "${identity_evidence_enabled}" == true ]] || return 0
+  count="$(find "${process_evidence_dir}" -maxdepth 1 -type f -name '*.ref.json' ! -name 'recheck-*' | wc -l | tr -d '[:space:]')"
+  python3 - "${child_cleanup_out}" "${cleanup_status}" "${count}" "${process_evidence_dir}" <<'PY'
+import glob
+import hashlib
+import json
+import os
+import sys
+
+path, cleanup_status, count, evidence_dir = sys.argv[1:]
+references = []
+for reference_path in sorted(glob.glob(os.path.join(evidence_dir, "*.ref.json"))):
+    if os.path.basename(reference_path).startswith("recheck-"):
+        continue
+    with open(reference_path, "rb") as source:
+        digest = hashlib.sha256(source.read()).hexdigest()
+    references.append({"role": os.path.basename(reference_path)[:-9], "sha256": digest})
+expected_roles = {"local-runstats", "local-derphole", "wrapper", "runstats", "derphole"}
+success = cleanup_status == "0" and int(count) == 5 and {item["role"] for item in references} == expected_roles
+with open(path, "x", encoding="utf-8") as output:
+    json.dump({
+        "identity_cleanup_complete": cleanup_status == "0",
+        "references": references,
+        "schema_version": 1,
+        "success": success,
+    }, output, sort_keys=True, separators=(",", ":"))
+    output.write("\n")
+raise SystemExit(0 if success else 1)
+PY
+  local evidence_status=$?
+  benchmark_child_cleanup_sha256="$(shasum -a 256 "${child_cleanup_out}" | awk '{print $1}')"
+  chmod a-w "${child_cleanup_out}"
+  if ((evidence_status == 0)); then
+    benchmark_child_cleanup_success=true
+  fi
+  return "${evidence_status}"
+}
+
 cleanup() {
   local cleanup_status=0
   local remote_cleanup_status=0
 
-  if [[ -n "${send_pid}" ]]; then
-    if ! terminate_local_process "${send_pid}"; then
+  if [[ "${transfer_children_waited}" != true && -n "${send_pid}" ]]; then
+    if [[ -n "${send_child_ref}" ]] && ! terminate_local_process_ref "${send_child_ref}"; then
+      echo "local sender child cleanup incomplete" >&2
+      cleanup_status=1
+    fi
+    if ! terminate_local_process "${send_pid}" "${send_ref}"; then
       echo "local sender cleanup incomplete: ${send_pid}" >&2
       cleanup_status=1
     fi
     send_pid=""
   fi
-  if [[ -n "${listener_pid}" ]]; then
-    if ! terminate_local_process "${listener_pid}"; then
+  if [[ "${transfer_children_waited}" != true && -n "${listener_pid}" ]]; then
+    if [[ -n "${listener_child_ref}" ]] && ! terminate_local_process_ref "${listener_child_ref}"; then
+      echo "local receiver child cleanup incomplete" >&2
+      cleanup_status=1
+    fi
+    if ! terminate_local_process "${listener_pid}" "${listener_ref}"; then
       echo "local receiver cleanup incomplete: ${listener_pid}" >&2
       cleanup_status=1
     fi
     listener_pid=""
   fi
-  if ! terminate_remote_processes >/dev/null 2>&1; then
-    remote_cleanup_status=1
+  if [[ "${transfer_children_waited}" != true ]]; then
+    if ! terminate_remote_processes >/dev/null 2>&1; then
+      remote_cleanup_status=1
+    fi
   fi
-  if ! remote "rm -f '${remote_base}.pid' '${remote_base}.child.pid' '${remote_base}.child.pid.tmp' '${remote_base}.status' '${remote_base}.status.tmp' '${remote_base}.payload' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_sender_resource_json}' '${remote_receiver_resource_json}' '${remote_upload}' '${remote_runstats_upload}'; rm -f '${remote_bin}' '${remote_runstats}'; rmdir '${remote_bin_dir}' '${remote_run_dir}' 2>/dev/null || true; if [[ -e '${remote_base}.pid' || -e '${remote_base}.child.pid' || -e '${remote_base}.child.pid.tmp' || -e '${remote_base}.status' || -e '${remote_base}.status.tmp' || -e '${remote_sender_resource_json}' || -e '${remote_receiver_resource_json}' || -e '${remote_upload}' || -e '${remote_runstats_upload}' || -e '${remote_bin}' || -e '${remote_runstats}' || -e '${remote_bin_dir}' || -e '${remote_run_dir}' ]]; then exit 1; fi" >/dev/null 2>&1; then
+  if [[ "${identity_evidence_enabled}" == true ]] && ! write_child_cleanup_evidence "$((cleanup_status == 0 && remote_cleanup_status == 0 ? 0 : 1))"; then
+    cleanup_status=1
+  fi
+  if ! remote "rm -f '${remote_base}.pid' '${remote_base}.child.pid' '${remote_base}.child.pid.tmp' '${remote_base}.wrapper.pid' '${remote_base}.runstats.pid' '${remote_base}.derphole.pid' '${remote_base}.wrapper.ref.json' '${remote_base}.wrapper.ref.json.sha256' '${remote_base}.runstats.ref.json' '${remote_base}.runstats.ref.json.sha256' '${remote_base}.derphole.ref.json' '${remote_base}.derphole.ref.json.sha256' '${remote_base}.wrapper.ref.json.cleanup-recheck.'* '${remote_base}.runstats.ref.json.cleanup-recheck.'* '${remote_base}.derphole.ref.json.cleanup-recheck.'* '${remote_base}.status' '${remote_base}.status.tmp' '${remote_base}.payload' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_sender_resource_json}' '${remote_receiver_resource_json}' '${remote_upload}' '${remote_runstats_upload}'; rm -f '${remote_bin}' '${remote_runstats}'; rmdir '${remote_bin_dir}' '${remote_run_dir}' 2>/dev/null || true; if [[ -e '${remote_base}.pid' || -e '${remote_base}.child.pid' || -e '${remote_base}.status' || -e '${remote_sender_resource_json}' || -e '${remote_receiver_resource_json}' || -e '${remote_upload}' || -e '${remote_runstats_upload}' || -e '${remote_bin}' || -e '${remote_runstats}' || -e '${remote_bin_dir}' || -e '${remote_run_dir}' ]]; then exit 1; fi" >/dev/null 2>&1; then
     remote_cleanup_status=1
   fi
   if [[ "${remote_cleanup_status}" -ne 0 ]]; then
@@ -933,6 +1184,9 @@ handle_exit() {
   fi
   cleanup
   cleanup_status="$?"
+  if [[ "${cleanup_status}" -eq 0 ]]; then
+    benchmark_cleanup_success="true"
+  fi
   if [[ "${cleanup_status}" -ne 0 ]]; then
     echo "benchmark cleanup failed" >&2
   fi
@@ -952,18 +1206,57 @@ trap 'handle_exit "$?"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+wait_for_caller_start_gate() {
+  [[ -n "${ready_file}" ]] || return 0
+  [[ -d "$(dirname "${ready_file}")" && ! -L "$(dirname "${ready_file}")" ]] || { echo "benchmark ready-file parent is invalid" >&2; return 1; }
+  [[ -d "$(dirname "${start_file}")" && ! -L "$(dirname "${start_file}")" ]] || { echo "benchmark start-file parent is invalid" >&2; return 1; }
+  [[ ! -e "${ready_file}" && ! -L "${ready_file}" && ! -e "${start_file}" && ! -L "${start_file}" ]] || { echo "benchmark gate path already exists" >&2; return 1; }
+  (set -o noclobber; printf 'ready\n' >"${ready_file}") || return 1
+  for _ in $(seq 1 600); do
+    if [[ -f "${start_file}" && ! -L "${start_file}" ]]; then
+      return 0
+    fi
+    sleep 0.05
+  done
+  echo "timed out waiting for benchmark start gate" >&2
+  return 1
+}
+
 build_and_install_remote_binary() {
+  local actual_sha256 remote_upload_sha256
   if [[ -z "${local_override}" ]]; then
     mise run build
     mise run build-linux-amd64
+  fi
+  if [[ -n "${local_expected_sha256}" ]]; then
+    actual_sha256="$(shasum -a 256 "${local_bin}" | awk '{print $1}')"
+    if [[ "${actual_sha256}" != "${local_expected_sha256}" ]]; then
+      echo "local benchmark binary SHA-256 mismatch" >&2
+      exit 1
+    fi
+    actual_sha256="$(shasum -a 256 "${linux_bin}" | awk '{print $1}')"
+    if [[ "${actual_sha256}" != "${linux_expected_sha256}" ]]; then
+      echo "Linux benchmark binary SHA-256 mismatch" >&2
+      exit 1
+    fi
   fi
   mise exec -- go build -o "${local_runstats}" ./tools/runstats
   GOOS=linux GOARCH=amd64 mise exec -- go build -o "${linux_runstats}" ./tools/runstats
   remote "mkdir -p '${remote_run_dir}' '${remote_bin_dir}'"
   scp "${linux_bin}" "${remote_target}:${remote_upload}" >/dev/null
   scp "${linux_runstats}" "${remote_target}:${remote_runstats_upload}" >/dev/null
+  remote_upload_sha256="$(remote "sha256sum '${remote_upload}' | awk '{print \$1}'")"
+  if [[ -n "${linux_expected_sha256}" && "${remote_upload_sha256}" != "${linux_expected_sha256}" ]]; then
+    echo "remote Linux benchmark binary SHA-256 mismatch" >&2
+    exit 1
+  fi
   if ! install_remote_bin "${remote_bin_dir}"; then
     echo "remote benchmark directory is not writable and executable; set DERPHOLE_REMOTE_BIN_DIR to a writable executable root" >&2
+    exit 1
+  fi
+  remote_linux_bin_sha256="$(remote "sha256sum '${remote_bin}' | awk '{print \$1}'")"
+  if [[ -n "${linux_expected_sha256}" && "${remote_linux_bin_sha256}" != "${linux_expected_sha256}" ]]; then
+    echo "installed remote Linux benchmark binary SHA-256 mismatch" >&2
     exit 1
   fi
 }
@@ -1056,6 +1349,10 @@ run_forward_derphole_file() {
   start_ms="$(now_ms)"
   DERPHOLE_TRANSFER_TRACE_CSV="${sender_trace_csv}" "${local_runstats}" -out "${sender_resource_json}" -- "${local_bin}" --verbose send "${direct_tcp_args[@]}" "${payload}" >/dev/null 2>"${sender_log}" &
   send_pid="$!"
+  if [[ "${identity_evidence_enabled}" == true ]]; then
+    send_ref="$(identify_local_owned_process local-runstats runstats "${send_pid}")"
+    send_child_ref="$(identify_local_owned_child local-derphole "${send_pid}" "${tool}")"
+  fi
 
   token=""
   for _ in $(seq 1 200); do
@@ -1066,7 +1363,26 @@ run_forward_derphole_file() {
   done
   [[ -n "${token}" ]] || { echo "failed to capture send token" >&2; exit 1; }
 
-  remote "DERPHOLE_TRANSFER_TRACE_CSV='${remote_base}.trace.csv' '${remote_runstats}' -out '${remote_receiver_resource_json}' -- '${remote_bin}' --verbose receive -o '${remote_base}.out' '${token}' >/dev/null 2>'${remote_base}.err'"
+  if [[ "${identity_evidence_enabled}" == true ]]; then
+    remote "set +e
+printf '%s\n' \"\$\$\" >'${remote_base}.wrapper.pid'
+'${process_identify_remote}' process-identify -name bash -pid \"\$\$\" -timeout 5s -out '${remote_base}.wrapper.ref.json' >'${remote_base}.wrapper.ref.json.sha256' || exit 1
+DERPHOLE_TRANSFER_TRACE_CSV='${remote_base}.trace.csv' '${remote_runstats}' -out '${remote_receiver_resource_json}' -- '${remote_bin}' --verbose receive -o '${remote_base}.out' '${token}' >/dev/null 2>'${remote_base}.err' &
+child=\$!
+printf '%s\n' \"\${child}\" >'${remote_base}.runstats.pid'
+'${process_identify_remote}' process-identify -name runstats -pid \"\${child}\" -timeout 5s -out '${remote_base}.runstats.ref.json' >'${remote_base}.runstats.ref.json.sha256' || exit 1
+derphole_pid=''
+for _ in \$(seq 1 100); do derphole_pid=\$(pgrep -P \"\${child}\" -x '${tool}' | head -n 1 || true); [[ \"\${derphole_pid}\" =~ ^[1-9][0-9]*$ ]] && break; sleep 0.02; done
+[[ \"\${derphole_pid}\" =~ ^[1-9][0-9]*$ ]] || exit 1
+printf '%s\n' \"\${derphole_pid}\" >'${remote_base}.derphole.pid'
+'${process_identify_remote}' process-identify -name '${tool}' -pid \"\${derphole_pid}\" -timeout 5s -out '${remote_base}.derphole.ref.json' >'${remote_base}.derphole.ref.json.sha256' || exit 1
+wait \"\${child}\""
+    copy_remote_process_identity wrapper
+    copy_remote_process_identity runstats
+    copy_remote_process_identity derphole
+  else
+    remote "DERPHOLE_TRANSFER_TRACE_CSV='${remote_base}.trace.csv' '${remote_runstats}' -out '${remote_receiver_resource_json}' -- '${remote_bin}' --verbose receive -o '${remote_base}.out' '${token}' >/dev/null 2>'${remote_base}.err'"
+  fi
   wait "${send_pid}"
   send_pid=""
   command_end_ms="$(now_ms)"
@@ -1121,7 +1437,17 @@ run_reverse_derphole_stream() {
 run_reverse_derphole_file() {
   prepare_remote_payload
   source_sha="$(remote "sha256sum '${remote_payload}' | awk '{print \$1}'")"
-  remote "rm -f '${remote_base}.pid' '${remote_base}.child.pid' '${remote_base}.child.pid.tmp' '${remote_base}.status' '${remote_base}.status.tmp' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_sender_resource_json}'; nohup sh -c 'set +e; child_pid=; forward_signal() { signal=\$1; if [ -n \"\${child_pid}\" ]; then kill -\"\${signal}\" \"\${child_pid}\" 2>/dev/null || true; fi; }; trap \"forward_signal TERM\" TERM; trap \"forward_signal INT\" INT; DERPHOLE_TRANSFER_TRACE_CSV=\"${remote_base}.trace.csv\" \"${remote_runstats}\" -out \"${remote_sender_resource_json}\" -- \"${remote_bin}\" --verbose send \"${remote_payload}\" >\"${remote_base}.out\" 2>\"${remote_base}.err\" & child_pid=\$!; printf \"%s\\n\" \"\${child_pid}\" >\"${remote_base}.child.pid.tmp\"; mv \"${remote_base}.child.pid.tmp\" \"${remote_base}.child.pid\"; wait \"\${child_pid}\"; status=\$?; printf \"%s\\n\" \"\${status}\" >\"${remote_base}.status.tmp\"; mv \"${remote_base}.status.tmp\" \"${remote_base}.status\"; exit \"\${status}\"' >/dev/null 2>&1 </dev/null & echo \$! >'${remote_base}.pid'"
+  if [[ "${identity_evidence_enabled}" == true ]]; then
+    remote "rm -f '${remote_base}.pid' '${remote_base}.child.pid' '${remote_base}.child.pid.tmp' '${remote_base}.status' '${remote_base}.status.tmp' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_sender_resource_json}'; nohup sh -c 'set +e; DERPHOLE_TRANSFER_TRACE_CSV=\"${remote_base}.trace.csv\" \"${remote_runstats}\" -out \"${remote_sender_resource_json}\" -- \"${remote_bin}\" --verbose send \"${remote_payload}\" >\"${remote_base}.out\" 2>\"${remote_base}.err\" & child_pid=\$!; printf \"%s\\n\" \"\${child_pid}\" >\"${remote_base}.child.pid.tmp\"; mv \"${remote_base}.child.pid.tmp\" \"${remote_base}.child.pid\"; wait \"\${child_pid}\"; status=\$?; printf \"%s\\n\" \"\${status}\" >\"${remote_base}.status.tmp\"; mv \"${remote_base}.status.tmp\" \"${remote_base}.status\"; exit \"\${status}\"' >/dev/null 2>&1 </dev/null & echo \$! >'${remote_base}.pid'"
+  else
+    remote "rm -f '${remote_base}.pid' '${remote_base}.child.pid' '${remote_base}.child.pid.tmp' '${remote_base}.status' '${remote_base}.status.tmp' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_sender_resource_json}'; nohup sh -c 'set +e; child_pid=; forward_signal() { signal=\$1; if [ -n \"\${child_pid}\" ]; then kill -\"\${signal}\" \"\${child_pid}\" 2>/dev/null || true; fi; }; trap \"forward_signal TERM\" TERM; trap \"forward_signal INT\" INT; DERPHOLE_TRANSFER_TRACE_CSV=\"${remote_base}.trace.csv\" \"${remote_runstats}\" -out \"${remote_sender_resource_json}\" -- \"${remote_bin}\" --verbose send \"${remote_payload}\" >\"${remote_base}.out\" 2>\"${remote_base}.err\" & child_pid=\$!; printf \"%s\\n\" \"\${child_pid}\" >\"${remote_base}.child.pid.tmp\"; mv \"${remote_base}.child.pid.tmp\" \"${remote_base}.child.pid\"; wait \"\${child_pid}\"; status=\$?; printf \"%s\\n\" \"\${status}\" >\"${remote_base}.status.tmp\"; mv \"${remote_base}.status.tmp\" \"${remote_base}.status\"; exit \"\${status}\"' >/dev/null 2>&1 </dev/null & echo \$! >'${remote_base}.pid'"
+  fi
+  if [[ "${identity_evidence_enabled}" == true ]]; then
+    record_remote_process_identity wrapper sh "${remote_base}.pid"
+    for _ in $(seq 1 100); do remote "test -s '${remote_base}.child.pid'" 2>/dev/null && break; sleep 0.02; done
+    record_remote_process_identity runstats runstats "${remote_base}.child.pid"
+    record_remote_child_identity derphole "${remote_base}.child.pid" "${tool}"
+  fi
 
   token=""
   for _ in $(seq 1 200); do
@@ -1132,7 +1458,14 @@ run_reverse_derphole_file() {
   [[ -n "${token}" ]] || { echo "failed to capture remote send token" >&2; exit 1; }
 
   start_ms="$(now_ms)"
-  DERPHOLE_TRANSFER_TRACE_CSV="${receiver_trace_csv}" "${local_runstats}" -out "${receiver_resource_json}" -- "${local_bin}" --verbose receive "${direct_tcp_args[@]}" -o "${receiver_out}" "${token}" >/dev/null 2>"${receiver_log}"
+  DERPHOLE_TRANSFER_TRACE_CSV="${receiver_trace_csv}" "${local_runstats}" -out "${receiver_resource_json}" -- "${local_bin}" --verbose receive "${direct_tcp_args[@]}" -o "${receiver_out}" "${token}" >/dev/null 2>"${receiver_log}" &
+  listener_pid="$!"
+  if [[ "${identity_evidence_enabled}" == true ]]; then
+    listener_ref="$(identify_local_owned_process local-runstats runstats "${listener_pid}")"
+    listener_child_ref="$(identify_local_owned_child local-derphole "${listener_pid}" "${tool}")"
+  fi
+  wait "${listener_pid}"
+  listener_pid=""
   wait_remote_pid_status
   command_end_ms="$(now_ms)"
 
@@ -1237,6 +1570,7 @@ finalize_run() {
   cat "${receiver_trace_csv}"
 }
 
+wait_for_caller_start_gate
 snapshot_tool_processes
 build_and_install_remote_binary
 validate_caller_owned_payloads
@@ -1249,10 +1583,12 @@ case "${tool}:${direction}:${workload}" in
   *) echo "unsupported benchmark mode: ${tool}:${direction}:${workload}" >&2; exit 1 ;;
 esac
 
+transfer_children_waited=true
 finalize_run
 if ! cleanup; then
   echo "benchmark cleanup failed" >&2
   exit 1
 fi
+benchmark_cleanup_success="true"
 emit_benchmark_footer 1 true "" "${sender_goodput_mbps}" "${sender_peak_goodput_mbps}" "${sender_first_byte_ms}"
 trap - EXIT

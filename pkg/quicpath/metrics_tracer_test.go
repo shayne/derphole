@@ -152,3 +152,120 @@ func TestQUICMetricsTraceProducerLifecycleWritesSummary(t *testing.T) {
 		t.Fatalf("summary = %+v, want both loss events", summary)
 	}
 }
+
+func TestQUICMechanismTraceCountsRecoveryPackets(t *testing.T) {
+	trace := newQUICMechanismTrace()
+	recorder := trace.AddProducer()
+	t.Cleanup(func() { _ = recorder.Close() })
+
+	recorder.RecordEvent(qlog.PacketSent{
+		Raw: qlog.RawInfo{Length: 1200},
+		Frames: []qlog.Frame{{Frame: &qlog.StreamFrame{
+			StreamID: 1,
+			Offset:   0,
+			Length:   1000,
+		}}},
+	})
+	recorder.RecordEvent(qlog.PacketSent{
+		Raw: qlog.RawInfo{Length: 1200},
+		Frames: []qlog.Frame{{Frame: &qlog.StreamFrame{
+			StreamID: 1,
+			Offset:   0,
+			Length:   1000,
+		}}},
+	})
+
+	got := trace.Snapshot()
+	if got.Connections != 1 || got.PacketsSent != 2 || got.WireBytesSent != 2400 || got.RecoveryWireBytes != 1200 {
+		t.Fatalf("snapshot = %+v", got)
+	}
+}
+
+func TestQUICMechanismTracePresenceRequiresObservedEvent(t *testing.T) {
+	trace := newQUICMechanismTrace()
+	if got := trace.Snapshot(); got.TelemetryPresent {
+		t.Fatalf("empty snapshot = %+v, want telemetry absent", got)
+	}
+	recorder := trace.AddProducer()
+	t.Cleanup(func() { _ = recorder.Close() })
+	if got := trace.Snapshot(); got.TelemetryPresent {
+		t.Fatalf("producer-only snapshot = %+v, want telemetry absent", got)
+	}
+	recorder.RecordEvent(qlog.PacketSent{Raw: qlog.RawInfo{Length: 1200}})
+	if got := trace.Snapshot(); !got.TelemetryPresent {
+		t.Fatalf("event snapshot = %+v, want telemetry present", got)
+	}
+}
+
+func TestQUICMechanismTraceDoesNotConflateStreamIDsAcrossConnections(t *testing.T) {
+	trace := newQUICMechanismTrace()
+	first := trace.AddProducer()
+	second := trace.AddProducer()
+	t.Cleanup(func() {
+		_ = first.Close()
+		_ = second.Close()
+	})
+
+	packet := qlog.PacketSent{
+		Raw: qlog.RawInfo{Length: 1200},
+		Frames: []qlog.Frame{{Frame: &qlog.StreamFrame{
+			StreamID: 7,
+			Offset:   4096,
+			Length:   1024,
+		}}},
+	}
+	first.RecordEvent(packet)
+	second.RecordEvent(packet)
+
+	got := trace.Snapshot()
+	if got.Connections != 2 || got.PacketsSent != 2 || got.WireBytesSent != 2400 || got.RecoveryWireBytes != 0 {
+		t.Fatalf("snapshot = %+v", got)
+	}
+}
+
+func TestQUICMechanismTraceRecordsPacketAndRTTAggregates(t *testing.T) {
+	trace := newQUICMechanismTrace()
+	recorder := trace.AddProducer()
+	t.Cleanup(func() { _ = recorder.Close() })
+
+	recorder.RecordEvent(qlog.PacketReceived{Raw: qlog.RawInfo{Length: 1100}})
+	recorder.RecordEvent(qlog.PacketLost{})
+	recorder.RecordEvent(qlog.MetricsUpdated{SmoothedRTT: 7 * time.Millisecond})
+	recorder.RecordEvent(qlog.MetricsUpdated{SmoothedRTT: 3 * time.Millisecond})
+
+	got := trace.Snapshot()
+	if got.PacketsReceived != 1 || got.PacketsLost != 1 || got.SmoothedRTT != 7*time.Millisecond {
+		t.Fatalf("snapshot = %+v", got)
+	}
+}
+
+func TestQUICMechanismTraceHandlesPointerAndNilPointerEventForms(t *testing.T) {
+	trace := newQUICMechanismTrace()
+	recorder := trace.AddProducer()
+	t.Cleanup(func() { _ = recorder.Close() })
+
+	recorder.RecordEvent(&qlog.PacketSent{
+		Raw:    qlog.RawInfo{Length: 1200},
+		Frames: []qlog.Frame{{Frame: &qlog.StreamFrame{StreamID: 9, Offset: 0, Length: 1000}}},
+	})
+	recorder.RecordEvent(&qlog.PacketReceived{
+		Raw:    qlog.RawInfo{Length: 1100},
+		Frames: []qlog.Frame{{Frame: &qlog.StreamFrame{StreamID: 10, Offset: 0, Length: 900}}},
+	})
+	recorder.RecordEvent(&qlog.PacketLost{})
+	recorder.RecordEvent(&qlog.MetricsUpdated{SmoothedRTT: 7 * time.Millisecond})
+
+	var sent *qlog.PacketSent
+	var received *qlog.PacketReceived
+	var lost *qlog.PacketLost
+	var metrics *qlog.MetricsUpdated
+	recorder.RecordEvent(sent)
+	recorder.RecordEvent(received)
+	recorder.RecordEvent(lost)
+	recorder.RecordEvent(metrics)
+
+	got := trace.Snapshot()
+	if !got.TelemetryPresent || got.PacketsSent != 1 || got.PacketsReceived != 1 || got.PacketsLost != 1 || got.WireBytesSent != 1200 || got.SmoothedRTT != 7*time.Millisecond || got.Streams != 2 {
+		t.Fatalf("pointer-form snapshot = %+v", got)
+	}
+}

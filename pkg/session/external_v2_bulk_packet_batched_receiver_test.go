@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shayne/derphole/pkg/transfertrace"
 	"tailscale.com/types/key"
 )
 
@@ -333,6 +334,23 @@ func TestExternalV2BulkPacketReceiverCommitsDirectBatchesWithoutAssembler(t *tes
 	}
 	if receiver.committedPayload != payloadSize || receiver.receivedPackets != packetCount {
 		t.Fatalf("receiver committed=%d packets=%d", receiver.committedPayload, receiver.receivedPackets)
+	}
+}
+
+func TestExternalV2BulkPacketAsyncWriterDoesNotCountFailedWrite(t *testing.T) {
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(210, 0), nil, transfertrace.RoleReceive)
+	metrics.SelectFilePayloadEngine(transfertrace.FilePayloadEngineBulk, time.Unix(210, 1))
+	writer := newExternalV2BulkPacketAsyncWriter(context.Background(), errorBlockSink{}, 1, metrics)
+	if err := writer.enqueue(externalV2BulkPacketWriteExtent{Data: []byte("queued")}); err != nil {
+		t.Fatal(err)
+	}
+	if committed, err := writer.finish(); err == nil || committed != 0 {
+		t.Fatalf("finish() = %d, %v, want 0 and write error", committed, err)
+	}
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	if metrics.filePayloadBytesCommitted != 0 || metrics.filePayloadBytesBulk != 0 {
+		t.Fatalf("failed async write counted committed=%d bulk=%d", metrics.filePayloadBytesCommitted, metrics.filePayloadBytesBulk)
 	}
 }
 

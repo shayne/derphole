@@ -185,10 +185,14 @@ func TestExternalV2BulkPacketPortableBatchReadRetriesIdleTimeouts(t *testing.T) 
 func TestExternalV2BulkPacketBatchDiagnosticsAggregateLanes(t *testing.T) {
 	conns := []externalV2BulkPacketBatchConn{
 		staticExternalV2BulkPacketBatchConn{stats: externalV2BulkPacketBatchStats{
-			Backend: "linux-sendmmsg", GSOAttempted: true, SendCalls: 3, SendDatagrams: 100, MaxSendBatch: 40,
+			Backend: "linux-sendmmsg", CandidateID: "combined-gso3", GSOAttempted: true,
+			NativeSendAttempts: 4, NativeSendSyscalls: 3, LogicalDatagrams: 100, NativeAcceptedPayloadBytes: 140_000,
+			SendCalls: 3, SendDatagrams: 100, MaxSendBatch: 40,
 		}},
 		staticExternalV2BulkPacketBatchConn{stats: externalV2BulkPacketBatchStats{
-			Backend: "linux-gso", GSOAttempted: true, GSOActive: true, GSOSegments: 64, SendCalls: 2, SendDatagrams: 64,
+			Backend: "linux-gso", CandidateID: "combined-gso3", GSOAttempted: true, GSOActive: true, GSOSegments: 64,
+			NativeSendAttempts: 2, NativeSendSyscalls: 2, NativeGSOMessages: 22, LogicalDatagrams: 64,
+			NativeAcceptedPayloadBytes: 89_600, GSOSegmentsPerMessage: 3, SendCalls: 2, SendDatagrams: 64,
 			ReceiveCalls: 4, ReceiveDatagrams: 128, MaxSendBatch: 64, MaxReceiveBatch: 32,
 		}},
 	}
@@ -199,9 +203,102 @@ func TestExternalV2BulkPacketBatchDiagnosticsAggregateLanes(t *testing.T) {
 	if diagnostics.BulkGSOSegments != 64 || diagnostics.BulkSendCalls != 5 || diagnostics.BulkSendDatagrams != 164 || diagnostics.BulkReceiveCalls != 4 || diagnostics.BulkReceiveDatagrams != 128 {
 		t.Fatalf("counters = %+v", diagnostics)
 	}
+	if diagnostics.BulkCandidateID != "combined-gso3" || diagnostics.BulkNativeSendAttempts != 6 || diagnostics.BulkNativeSendSyscalls != 5 || diagnostics.BulkNativeGSOMessages != 22 || diagnostics.BulkLogicalDatagrams != 164 || diagnostics.BulkNativeAcceptedPayloadBytes != 229_600 || diagnostics.BulkGSOSegmentsPerMessage != 3 {
+		t.Fatalf("native counters = %+v", diagnostics)
+	}
 	if diagnostics.BulkMaxSendBatch != 64 || diagnostics.BulkMaxReceiveBatch != 32 || diagnostics.BulkCryptoQueuePeak != 4 || diagnostics.BulkWriterQueuePeak != 3 || diagnostics.BulkLaneQueuePeak != 2 {
 		t.Fatalf("peaks = %+v", diagnostics)
 	}
+}
+
+func TestExternalV2BulkPacketFixedPeersRequireSpareControlSocket(t *testing.T) {
+	path, batches := fixedPeerFixture(4)
+	if err := enableExternalV2BulkPacketFixedPeers(path, batches, 4); err != nil {
+		t.Fatal(err)
+	}
+	for lane, batch := range batches {
+		if batch.(*recordingFixedPeerBatch).peer != nil {
+			t.Fatalf("lane %d enabled a fixed peer without a spare control socket", lane)
+		}
+	}
+}
+
+func TestExternalV2BulkPacketFixedPeersUseFourDataSocketsAndPreserveFifthControlSocket(t *testing.T) {
+	path, batches := fixedPeerFixture(5)
+	if err := enableExternalV2BulkPacketFixedPeers(path, batches, 4); err != nil {
+		t.Fatal(err)
+	}
+	if len(batches) != 4 {
+		t.Fatalf("batch sockets = %d, want 4 data sockets", len(batches))
+	}
+	for lane, batch := range batches {
+		if got := batch.(*recordingFixedPeerBatch).peer; got != path.Addrs[lane] {
+			t.Fatalf("lane %d peer = %v, want %v", lane, got, path.Addrs[lane])
+		}
+	}
+}
+
+func TestExternalV2BulkPacketFixedPeersValidateBoundsBeforeActivation(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		laneCount  int
+		connCount  int
+		addrCount  int
+		batchCount int
+		wantErr    bool
+		wantPeers  bool
+	}{
+		{name: "negative lane count", laneCount: -1, connCount: 5, addrCount: 5, batchCount: 4, wantErr: true},
+		{name: "lane count exceeds maximum", laneCount: 5, connCount: 6, addrCount: 6, batchCount: 6, wantErr: true},
+		{name: "short batch conns", laneCount: 4, connCount: 5, addrCount: 5, batchCount: 3, wantErr: true},
+		{name: "short path conns", laneCount: 4, connCount: 3, addrCount: 5, batchCount: 4, wantErr: true},
+		{name: "short path addrs", laneCount: 4, connCount: 5, addrCount: 3, batchCount: 4, wantErr: true},
+		{name: "five conns four addrs has no paired spare", laneCount: 4, connCount: 5, addrCount: 4, batchCount: 4},
+		{name: "four conns five addrs has no paired spare", laneCount: 4, connCount: 4, addrCount: 5, batchCount: 4},
+		{name: "zero lanes", laneCount: 0},
+		{name: "paired fifth socket activates", laneCount: 4, connCount: 5, addrCount: 5, batchCount: 4, wantPeers: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path, batches := fixedPeerFixtureSizes(test.connCount, test.addrCount, test.batchCount)
+			var err error
+			var panicValue any
+			func() {
+				defer func() { panicValue = recover() }()
+				err = enableExternalV2BulkPacketFixedPeers(path, batches, test.laneCount)
+			}()
+			if panicValue != nil {
+				t.Fatalf("enable fixed peers panicked: %v", panicValue)
+			}
+			if (err != nil) != test.wantErr {
+				t.Fatalf("error = %v, want error %t", err, test.wantErr)
+			}
+			for lane, batch := range batches {
+				peerSet := batch.(*recordingFixedPeerBatch).peer != nil
+				if peerSet != test.wantPeers {
+					t.Fatalf("lane %d peer set = %t, want %t", lane, peerSet, test.wantPeers)
+				}
+			}
+		})
+	}
+}
+
+func fixedPeerFixture(socketCount int) (externalV2BulkPacketPath, []externalV2BulkPacketBatchConn) {
+	return fixedPeerFixtureSizes(socketCount, socketCount, min(socketCount, externalV2BulkPacketMaximumDataLanes))
+}
+
+func fixedPeerFixtureSizes(connCount, addrCount, batchCount int) (externalV2BulkPacketPath, []externalV2BulkPacketBatchConn) {
+	path := externalV2BulkPacketPath{
+		Conns: make([]net.PacketConn, connCount),
+		Addrs: make([]net.Addr, addrCount),
+	}
+	for lane := range addrCount {
+		path.Addrs[lane] = &net.UDPAddr{IP: net.IPv4(192, 0, 2, byte(lane+1)), Port: 8000 + lane}
+	}
+	batches := make([]externalV2BulkPacketBatchConn, batchCount)
+	for lane := range batches {
+		batches[lane] = &recordingFixedPeerBatch{}
+	}
+	return path, batches
 }
 
 type scriptedExternalV2BulkPacketBatchConn struct {
@@ -211,6 +308,10 @@ type scriptedExternalV2BulkPacketBatchConn struct {
 
 type staticExternalV2BulkPacketBatchConn struct {
 	stats externalV2BulkPacketBatchStats
+}
+
+type recordingFixedPeerBatch struct {
+	peer net.Addr
 }
 
 type writeDeadlineRecordingPacketConn struct {
@@ -232,6 +333,23 @@ func (staticExternalV2BulkPacketBatchConn) ReadBatch(context.Context, []external
 	return 0, errors.New("unexpected read")
 }
 func (c staticExternalV2BulkPacketBatchConn) Stats() externalV2BulkPacketBatchStats { return c.stats }
+
+func (*recordingFixedPeerBatch) WriteBatch(context.Context, []externalV2BulkPacketBatchMessage) (int, error) {
+	return 0, errors.New("unexpected write")
+}
+
+func (*recordingFixedPeerBatch) ReadBatch(context.Context, []externalV2BulkPacketBatchMessage) (int, error) {
+	return 0, errors.New("unexpected read")
+}
+
+func (*recordingFixedPeerBatch) Stats() externalV2BulkPacketBatchStats {
+	return externalV2BulkPacketBatchStats{Backend: "recording-fixed-peer"}
+}
+
+func (b *recordingFixedPeerBatch) enableFixedPeerConnect(peer net.Addr) error {
+	b.peer = peer
+	return nil
+}
 
 func (c *scriptedExternalV2BulkPacketBatchConn) WriteBatch(_ context.Context, messages []externalV2BulkPacketBatchMessage) (int, error) {
 	if len(messages) == 0 {

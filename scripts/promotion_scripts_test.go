@@ -6,7 +6,10 @@ package scripts
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/csv"
+	"encoding/hex"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -294,6 +297,7 @@ case "${command}" in
     payload="$(cat "${FAKE_DERPHOLE_STATE}/payload-path")"
     printf 'connected-relay\nconnected-direct\nv2-block-transfer=bulk-packets\nremote-receive-diagnostic\n' >&2
     printf 'app_bytes,transfer_elapsed_ms,send_goodput_mbps,quic_first_byte_ms,direct_bytes,direct_validated\n1048576,10,838.86,1,1048576,true\n' >"${trace}"
+    if [[ "${FAKE_RECEIVE_IDENTITY_DELAY:-0}" == "1" ]]; then sleep 0.25; fi
     if [[ "${FAKE_RECEIVE_STATUS:-0}" != "0" ]]; then
       if [[ "${FAKE_SIGNAL_SENDER_ON_RECEIVE_FAILURE:-0}" == "1" ]]; then
         touch "${FAKE_DERPHOLE_STATE}/received"
@@ -390,7 +394,36 @@ exit "${status}"
 RUNSTATS
 chmod 0755 "${out}"
 `)
-	writeExecutable(t, filepath.Join(fakeBin, "pgrep"), "#!/bin/sh\nexit 1\n")
+	writeExecutable(t, filepath.Join(fakeBin, "pgrep"), `#!/usr/bin/env bash
+set -euo pipefail
+parent=""
+while (( $# > 0 )); do
+  case "$1" in
+    -P) parent="$2"; shift 2 ;;
+    -x) shift 2 ;;
+    *) shift ;;
+  esac
+done
+[[ -n "${parent}" ]] || exit 1
+/usr/bin/pgrep -P "${parent}" | head -n 1
+`)
+	writeExecutable(t, filepath.Join(fakeBin, "udppeak"), `#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1" == process-identify ]]
+shift
+name=""; pid=""; out=""
+while (( $# > 0 )); do
+  case "$1" in
+    -name) name="$2"; shift 2 ;;
+    -pid) pid="$2"; shift 2 ;;
+    -out) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+kill -0 "${pid}" 2>/dev/null
+printf '{"executable_identity":"/fake/%s","name":"%s","pid":%s,"start_identity":"start-%s"}\n' "${name}" "${name}" "${pid}" "${pid}" >"${out}"
+shasum -a 256 "${out}" | awk '{print $1}'
+`)
 	writeExecutable(t, filepath.Join(fakeBin, "sha256sum"), `#!/bin/sh
 exec shasum -a 256 "$@"
 `)
@@ -447,7 +480,7 @@ fi
 `)
 	writeExecutable(t, filepath.Join(fakeBin, "scp"), `#!/bin/sh
 set -eu
-source=$1
+source=${1#*:}
 destination=${2#*:}
 mkdir -p "$(dirname "${destination}")"
 cp "${source}" "${destination}"
@@ -515,6 +548,121 @@ func TestPromotionBenchmarkDefaultExecutesSendBeforeReceive(t *testing.T) {
 		t.Fatalf("default file benchmark invoked stream command:\n%s", events)
 	}
 	harness.assertCleaned(t, "forward")
+}
+
+func TestPromotionBenchmarkIdentityBoundChildCleanupEvidence(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+	evidenceDir := filepath.Join(harness.root, "evidence", "refs")
+	if err := os.MkdirAll(filepath.Dir(evidenceDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cleanupPath := filepath.Join(harness.root, "evidence", "child-cleanup.json")
+	helper := filepath.Join(harness.fakeBin, "udppeak")
+	cmd := harness.command("forward", map[string]string{
+		"DERPHOLE_BENCH_PROCESS_IDENTIFY_LOCAL":  helper,
+		"DERPHOLE_BENCH_PROCESS_IDENTIFY_REMOTE": helper,
+		"DERPHOLE_BENCH_PROCESS_EVIDENCE_DIR":    evidenceDir,
+		"DERPHOLE_BENCH_CHILD_CLEANUP_OUT":       cleanupPath,
+		"FAKE_RECEIVE_IDENTITY_DELAY":            "1",
+	})
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("identity-bound benchmark failed: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "benchmark-child-cleanup-success=true") {
+		t.Fatalf("identity cleanup footer missing:\n%s", output)
+	}
+	data, err := os.ReadFile(cleanupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var evidence struct {
+		IdentityCleanupComplete bool  `json:"identity_cleanup_complete"`
+		References              []any `json:"references"`
+		Success                 bool  `json:"success"`
+	}
+	if err := json.Unmarshal(data, &evidence); err != nil {
+		t.Fatal(err)
+	}
+	if !evidence.Success || !evidence.IdentityCleanupComplete || len(evidence.References) != 5 {
+		t.Fatalf("child cleanup evidence = %#v", evidence)
+	}
+	harness.assertCleaned(t, "forward")
+}
+
+func TestPromotionIdentityMismatchNeverSignalsReusedPID(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(".", "promotion-benchmark-driver.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	definitions := scriptSection(t, string(data), "process_ref_field() {", "\nterminate_remote_processes() {")
+	root := t.TempDir()
+	helper := filepath.Join(root, "identify")
+	writeExecutable(t, helper, `#!/usr/bin/env bash
+set -euo pipefail
+name=""; pid=""; out=""
+while (( $# > 0 )); do
+  case "$1" in
+    -name) name="$2"; shift 2 ;;
+    -pid) pid="$2"; shift 2 ;;
+    -out) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+kill -0 "${pid}"
+printf '{"executable_identity":"/fake/bash","name":"%s","pid":%s,"start_identity":"reused"}\n' "${name}" "${pid}" >"${out}"
+shasum -a 256 "${out}" | awk '{print $1}'
+`)
+	probe := definitions + `
+process_identify_local=$1
+process_evidence_dir=$2
+process_recheck_sequence=0
+marker=$3
+bash -c 'trap "touch "$1"; exit 0" TERM; while :; do sleep 1; done' child "${marker}" &
+child=$!
+trap 'kill -KILL "${child}" 2>/dev/null || true; wait "${child}" 2>/dev/null || true' EXIT
+reference="${process_evidence_dir}/original.ref.json"
+printf '{"executable_identity":"/fake/bash","name":"bash","pid":%s,"start_identity":"original"}\n' "${child}" >"${reference}"
+terminate_local_process_ref "${reference}"
+kill -0 "${child}"
+[[ ! -e "${marker}" ]]
+`
+	cmd := exec.Command("bash", "-c", probe, "probe", helper, root, filepath.Join(root, "term-marker"))
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("PID-reuse probe failed: %v\n%s", err, output)
+	}
+}
+
+func TestPromotionIdentityHelperFailureIsIndeterminateAndNeverSignals(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(".", "promotion-benchmark-driver.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	definitions := scriptSection(t, string(data), "process_ref_field() {", "\nterminate_remote_processes() {")
+	root := t.TempDir()
+	helper := filepath.Join(root, "identify")
+	writeExecutable(t, helper, "#!/bin/sh\nexit 70\n")
+	probe := definitions + `
+process_identify_local=$1
+process_evidence_dir=$2
+process_recheck_sequence=0
+marker=$3
+bash -c 'trap "touch "$1"; exit 0" TERM; while :; do sleep 1; done' child "${marker}" &
+child=$!
+trap 'kill -KILL "${child}" 2>/dev/null || true; wait "${child}" 2>/dev/null || true' EXIT
+reference="${process_evidence_dir}/original.ref.json"
+printf '{"executable_identity":"/fake/bash","name":"bash","pid":%s,"start_identity":"original"}\n' "${child}" >"${reference}"
+if terminate_local_process_ref "${reference}"; then
+  echo "indeterminate identity unexpectedly succeeded" >&2
+  exit 90
+fi
+kill -0 "${child}"
+[[ ! -e "${marker}" ]]
+`
+	cmd := exec.Command("bash", "-c", probe, "probe", helper, root, filepath.Join(root, "term-marker"))
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("indeterminate identity probe failed: %v\n%s", err, output)
+	}
 }
 
 func TestPromotionBenchmarkBinaryOverridesStillBuildRunstats(t *testing.T) {
@@ -648,6 +796,106 @@ func TestPromotionBenchmarkRejectsPartialBinaryOverridePair(t *testing.T) {
 	if !strings.Contains(string(output), "DERPHOLE_BENCH_LOCAL_BIN and DERPHOLE_BENCH_LINUX_BIN") {
 		t.Fatalf("partial override output missing pair diagnostic:\n%s", output)
 	}
+}
+
+func TestPromotionBenchmarkBindsExactBinaryPairAndIndependentIntegrityFooters(t *testing.T) {
+	t.Parallel()
+
+	body := readPromotionDriver(t)
+	for _, want := range []string{
+		`DERPHOLE_BENCH_LOCAL_BIN_SHA256`,
+		`DERPHOLE_BENCH_LINUX_BIN_SHA256`,
+		`local benchmark binary SHA-256 mismatch`,
+		`Linux benchmark binary SHA-256 mismatch`,
+		`remote Linux benchmark binary SHA-256 mismatch`,
+		`installed remote Linux benchmark binary SHA-256 mismatch`,
+		`benchmark-source-sha256=${source_sha}`,
+		`benchmark-sink-sha256=${sink_sha}`,
+		`benchmark-sink-size-bytes=${sink_size}`,
+		`benchmark-remote-linux-bin-sha256=${remote_linux_bin_sha256}`,
+		`benchmark-cleanup-success=${benchmark_cleanup_success}`,
+		`env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("promotion benchmark driver missing %q", want)
+		}
+	}
+}
+
+func TestPromotionBenchmarkVerifiesExactBinaryHashesAndEmitsIntegrityOnce(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+	localPath := filepath.Join(harness.root, "dist", "derphole")
+	linuxPath := filepath.Join(harness.root, "dist", "derphole-linux-amd64")
+	localDigest := testFileSHA256(t, localPath)
+	linuxDigest := testFileSHA256(t, linuxPath)
+	command := harness.command("forward", map[string]string{
+		"DERPHOLE_BENCH_LOCAL_BIN_SHA256": localDigest,
+		"DERPHOLE_BENCH_LINUX_BIN_SHA256": linuxDigest,
+	})
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("exact binary benchmark failed: %v\n%s", err, output)
+	}
+	for field, want := range map[string]string{
+		"benchmark-source-sha256":           benchmarkOutputValue(string(output), "benchmark-sink-sha256"),
+		"benchmark-sink-size-bytes":         "1048576",
+		"benchmark-remote-linux-bin-sha256": linuxDigest,
+		"benchmark-cleanup-success":         "true",
+	} {
+		if got := benchmarkOutputValue(string(output), field); got != want || strings.Count(string(output), field+"=") != 1 {
+			t.Fatalf("%s = %q count=%d, want %q once; output:\n%s", field, got, strings.Count(string(output), field+"="), want, output)
+		}
+	}
+}
+
+func TestPromotionBenchmarkStartGateBlocksBeforeTransfer(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+	ready := filepath.Join(harness.root, "gate", "ready")
+	start := filepath.Join(harness.root, "gate", "start")
+	if err := os.MkdirAll(filepath.Dir(ready), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command := harness.command("forward", map[string]string{
+		"DERPHOLE_BENCH_READY_FILE": ready,
+		"DERPHOLE_BENCH_START_FILE": start,
+	})
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if command.Process != nil {
+			_ = command.Process.Kill()
+		}
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("driver did not publish start-gate readiness")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if events, err := os.ReadFile(filepath.Join(harness.stateDir, "events")); err == nil && len(events) != 0 {
+		t.Fatalf("driver transferred before start gate: %s", events)
+	}
+	if err := os.WriteFile(start, []byte("start\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testFileSHA256(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
 }
 
 func benchmarkOutputValue(output, field string) string {

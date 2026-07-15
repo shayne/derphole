@@ -6,114 +6,149 @@ package session
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net"
+	"net/netip"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/shayne/derphole/pkg/dataplane"
 	"github.com/shayne/derphole/pkg/transfertrace"
 	"github.com/shayne/derphole/pkg/transport"
 )
 
 type externalTransferMetrics struct {
-	mu                         sync.Mutex
-	startedAt                  time.Time
-	completedAt                time.Time
-	firstByteAt                time.Time
-	relayBytes                 int64
-	directBytes                int64
-	localSentBytes             int64
-	peerReceivedBytes          int64
-	peerProgressSet            bool
-	transferStartedAt          time.Time
-	receiverTransferMS         int64
-	directValidated            bool
-	fallbackReason             string
-	transportPath              transport.Path
-	transportSelectedAddr      string
-	transportPreviousAddr      string
-	transportReason            string
-	transportSource            string
-	transportRTTMS             int64
-	directAppProgressBase      int64
-	directAppProgressSet       bool
-	trace                      *transfertrace.Recorder
-	role                       transfertrace.Role
-	phase                      transfertrace.Phase
-	lastState                  string
-	lastError                  string
-	deferSendComplete          bool
-	directRateSelectedMbps     int
-	directRateSelectedPlan     bool
-	directRateActiveMbps       int
-	directLanesActive          int
-	directLanesAvailable       int
-	rateTargetMbps             int
-	rateTargetFromDirect       bool
-	rateCeilingMbps            int
-	rateExplorationCeiling     int
-	laneMin                    int
-	laneCap                    int
-	controllerDecision         string
-	controllerReason           string
-	directProbeState           string
-	directProbeSummary         string
-	replayWindowBytes          uint64
-	replayBytes                uint64
-	repairQueueBytes           uint64
-	retransmitCount            int64
-	repairRequests             int64
-	repairBytes                int64
-	missingScanChecks          uint64
-	pendingMissing             uint32
-	pendingMissingPeak         uint32
-	repairRequestedPackets     uint64
-	repairRequestBatches       uint64
-	reorderTrailPackets        uint32
-	receivePacketRatePPS       uint32
-	bulkBatchPresent           bool
-	bulkBatchBackend           string
-	bulkGSOAttempted           bool
-	bulkGSOActive              bool
-	bulkGSOSegments            uint64
-	bulkSendCalls              uint64
-	bulkSendDatagrams          uint64
-	bulkReceiveCalls           uint64
-	bulkReceiveDatagrams       uint64
-	bulkMaxSendBatch           uint32
-	bulkMaxReceiveBatch        uint32
-	bulkCryptoQueuePeak        uint32
-	bulkLaneQueuePeak          uint32
-	bulkReceiveQueuePeak       uint32
-	bulkWriterQueuePeak        uint32
-	bulkDecryptBatches         uint64
-	bulkDecryptDatagrams       uint64
-	bulkProbeSelectedMbps      int
-	bulkProbeDurationMS        int64
-	bulkProbeTrains            uint32
-	bulkProbeSentDatagrams     uint64
-	bulkProbeReceivedDatagrams uint64
-	bulkProbeLossPPM           uint64
-	bulkProbePressure          bool
+	mu                             sync.Mutex
+	startedAt                      time.Time
+	completedAt                    time.Time
+	firstByteAt                    time.Time
+	relayBytes                     int64
+	directBytes                    int64
+	localSentBytes                 int64
+	peerReceivedBytes              int64
+	peerProgressSet                bool
+	transferStartedAt              time.Time
+	receiverTransferMS             int64
+	directValidated                bool
+	fallbackReason                 string
+	transportPath                  transport.Path
+	transportSelectedAddr          string
+	transportPreviousAddr          string
+	transportReason                string
+	transportSource                string
+	transportRTTMS                 int64
+	directAppProgressBase          int64
+	directAppProgressSet           bool
+	trace                          *transfertrace.Recorder
+	role                           transfertrace.Role
+	phase                          transfertrace.Phase
+	lastState                      string
+	lastError                      string
+	deferSendComplete              bool
+	directRateSelectedMbps         int
+	directRateSelectedPlan         bool
+	directRateActiveMbps           int
+	directLanesActive              int
+	directLanesAvailable           int
+	rateTargetMbps                 int
+	rateTargetFromDirect           bool
+	rateCeilingMbps                int
+	rateExplorationCeiling         int
+	laneMin                        int
+	laneCap                        int
+	controllerDecision             string
+	controllerReason               string
+	directProbeState               string
+	directProbeSummary             string
+	replayWindowBytes              uint64
+	replayBytes                    uint64
+	repairQueueBytes               uint64
+	retransmitCount                int64
+	repairRequests                 int64
+	repairBytes                    int64
+	missingScanChecks              uint64
+	pendingMissing                 uint32
+	pendingMissingPeak             uint32
+	repairRequestedPackets         uint64
+	repairRequestBatches           uint64
+	reorderTrailPackets            uint32
+	receivePacketRatePPS           uint32
+	bulkBatchPresent               bool
+	bulkBatchBackend               string
+	bulkCandidateID                string
+	bulkNativeSendAttempts         uint64
+	bulkNativeSendSyscalls         uint64
+	bulkNativeGSOMessages          uint64
+	bulkLogicalDatagrams           uint64
+	bulkNativeAcceptedPayloadBytes uint64
+	bulkGSOSegmentsPerMessage      uint32
+	bulkGSOAttempted               bool
+	bulkGSOActive                  bool
+	bulkGSOSegments                uint64
+	bulkSendCalls                  uint64
+	bulkSendDatagrams              uint64
+	bulkReceiveCalls               uint64
+	bulkReceiveDatagrams           uint64
+	bulkMaxSendBatch               uint32
+	bulkMaxReceiveBatch            uint32
+	bulkCryptoQueuePeak            uint32
+	bulkLaneQueuePeak              uint32
+	bulkReceiveQueuePeak           uint32
+	bulkWriterQueuePeak            uint32
+	bulkDecryptBatches             uint64
+	bulkDecryptDatagrams           uint64
+	bulkProbeSelectedMbps          int
+	bulkProbeDurationMS            int64
+	bulkProbeTrains                uint32
+	bulkProbeSentDatagrams         uint64
+	bulkProbeReceivedDatagrams     uint64
+	bulkProbeLossPPM               uint64
+	bulkProbePressure              bool
+	filePayloadEngine              transfertrace.FilePayloadEngine
+	filePayloadBytesCommitted      int64
+	filePayloadBytesBulk           int64
+	filePayloadBytesQUIC           int64
+	filePayloadLaneAddresses       string
+	fileSourceReadCalls            uint64
+	fileSourceReadBytes            uint64
 
 	localENOBUFSRetries        int64
 	localENOBUFSWaitUS         int64
 	localENOBUFSMaxConsecutive int64
 
-	outOfOrderBytes       uint64
-	directPacketBytes     int64
-	directCommittedBytes  int64
-	directTransport       string
-	directStreamTransport string
-	quicHandshakeMS       int64
-	quicFirstByteMS       int64
-	quicStreamBytesSent   int64
-	quicStreamBytesRecv   int64
-	quicStreamGoodputMbps string
-	quicSmoothedRTTMS     string
-	quicLossEvents        int64
-	quicCloseReason       string
-	transportManager      *transport.Manager
+	outOfOrderBytes          uint64
+	directPacketBytes        int64
+	directCommittedBytes     int64
+	directTransport          string
+	directStreamTransport    string
+	quicTelemetryPresent     bool
+	quicConnections          uint32
+	quicStreams              uint32
+	quicVersion              string
+	quicRawSocketBackend     string
+	quicNativeSendBackend    string
+	quicNativeReceiveBackend string
+	quicHandshakeMS          int64
+	quicFirstByteMS          int64
+	quicSmoothedRTTMS        string
+	quicPacketsSent          uint64
+	quicPacketsReceived      uint64
+	quicPacketsLost          uint64
+	quicWireBytesSent        uint64
+	quicRecoveryWireBytes    uint64
+	quicRecoveryRatio        string
+	quicStreamBytesSent      int64
+	quicStreamBytesRecv      int64
+	quicStreamGoodputMbps    string
+	quicCloseReason          string
+	quicNativeGSO            string
+	quicNativeReceiveBatch   string
+	transportManager         *transport.Manager
 
 	stripedSendBlocked             time.Duration
 	stripedReceivePendingChunks    int
@@ -132,57 +167,64 @@ type externalDirectTransferStats struct {
 }
 
 type externalDirectTransferDiagnostics struct {
-	RateTargetMbps             int
-	RateCeilingMbps            int
-	RateExplorationCeilingMbps int
-	RateSelectedMbps           int
-	ActiveLanes                int
-	AvailableLanes             int
-	LaneMin                    int
-	LaneCap                    int
-	ControllerDecision         string
-	ControllerReason           string
-	ReplayBytes                uint64
-	Retransmits                int64
-	RepairRequests             int64
-	RepairBytes                int64
-	LocalENOBUFSRetries        int64
-	LocalENOBUFSWaitUS         int64
-	LocalENOBUFSMaxConsecutive int64
-	DirectPacketBytes          int64
-	DirectCommittedBytes       int64
-	ReceiverCommittedBytes     uint64
-	MissingScanChecks          uint64
-	PendingMissing             uint32
-	PendingMissingPeak         uint32
-	RepairRequestedPackets     uint64
-	RepairRequestBatches       uint64
-	ReorderTrailPackets        uint32
-	ReceivePacketRatePPS       uint32
-	BulkBatchPresent           bool
-	BulkBatchBackend           string
-	BulkGSOAttempted           bool
-	BulkGSOActive              bool
-	BulkGSOSegments            uint64
-	BulkSendCalls              uint64
-	BulkSendDatagrams          uint64
-	BulkReceiveCalls           uint64
-	BulkReceiveDatagrams       uint64
-	BulkMaxSendBatch           uint32
-	BulkMaxReceiveBatch        uint32
-	BulkCryptoQueuePeak        uint32
-	BulkLaneQueuePeak          uint32
-	BulkReceiveQueuePeak       uint32
-	BulkWriterQueuePeak        uint32
-	BulkDecryptBatches         uint64
-	BulkDecryptDatagrams       uint64
-	BulkProbeSelectedMbps      int
-	BulkProbeDurationMS        int64
-	BulkProbeTrains            uint32
-	BulkProbeSentDatagrams     uint64
-	BulkProbeReceivedDatagrams uint64
-	BulkProbeLossPPM           uint64
-	BulkProbePressure          bool
+	RateTargetMbps                 int
+	RateCeilingMbps                int
+	RateExplorationCeilingMbps     int
+	RateSelectedMbps               int
+	ActiveLanes                    int
+	AvailableLanes                 int
+	LaneMin                        int
+	LaneCap                        int
+	ControllerDecision             string
+	ControllerReason               string
+	ReplayBytes                    uint64
+	Retransmits                    int64
+	RepairRequests                 int64
+	RepairBytes                    int64
+	LocalENOBUFSRetries            int64
+	LocalENOBUFSWaitUS             int64
+	LocalENOBUFSMaxConsecutive     int64
+	DirectPacketBytes              int64
+	DirectCommittedBytes           int64
+	ReceiverCommittedBytes         uint64
+	MissingScanChecks              uint64
+	PendingMissing                 uint32
+	PendingMissingPeak             uint32
+	RepairRequestedPackets         uint64
+	RepairRequestBatches           uint64
+	ReorderTrailPackets            uint32
+	ReceivePacketRatePPS           uint32
+	BulkBatchPresent               bool
+	BulkBatchBackend               string
+	BulkCandidateID                string
+	BulkNativeSendAttempts         uint64
+	BulkNativeSendSyscalls         uint64
+	BulkNativeGSOMessages          uint64
+	BulkLogicalDatagrams           uint64
+	BulkNativeAcceptedPayloadBytes uint64
+	BulkGSOSegmentsPerMessage      uint32
+	BulkGSOAttempted               bool
+	BulkGSOActive                  bool
+	BulkGSOSegments                uint64
+	BulkSendCalls                  uint64
+	BulkSendDatagrams              uint64
+	BulkReceiveCalls               uint64
+	BulkReceiveDatagrams           uint64
+	BulkMaxSendBatch               uint32
+	BulkMaxReceiveBatch            uint32
+	BulkCryptoQueuePeak            uint32
+	BulkLaneQueuePeak              uint32
+	BulkReceiveQueuePeak           uint32
+	BulkWriterQueuePeak            uint32
+	BulkDecryptBatches             uint64
+	BulkDecryptDatagrams           uint64
+	BulkProbeSelectedMbps          int
+	BulkProbeDurationMS            int64
+	BulkProbeTrains                uint32
+	BulkProbeSentDatagrams         uint64
+	BulkProbeReceivedDatagrams     uint64
+	BulkProbeLossPPM               uint64
+	BulkProbePressure              bool
 }
 
 type externalPeerProgressSnapshot struct {
@@ -216,6 +258,206 @@ func (m *externalTransferMetrics) RecordDirectWrite(n int64, at time.Time) {
 		return
 	}
 	m.recordWrite(&m.directBytes, n, at)
+}
+
+func (m *externalTransferMetrics) SelectFilePayloadEngine(engine transfertrace.FilePayloadEngine, at time.Time) {
+	if m == nil || !engine.Valid() {
+		return
+	}
+	m.mu.Lock()
+	if m.filePayloadBytesCommitted == 0 || m.filePayloadEngine == engine {
+		m.filePayloadEngine = engine
+	}
+	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
+	m.mu.Unlock()
+	sampleExternalTransferTrace(trace, snap, ok)
+}
+
+func (m *externalTransferMetrics) SetFilePayloadLaneAddrs(addrs []net.Addr, at time.Time) error {
+	if m == nil {
+		return nil
+	}
+	if len(addrs) == 0 {
+		return fmt.Errorf("file payload lane addresses are empty")
+	}
+	lanes := make([]string, 0, len(addrs))
+	seen := make(map[netip.AddrPort]struct{}, len(addrs))
+	for _, addr := range addrs {
+		if addr == nil {
+			return fmt.Errorf("file payload lane address is nil")
+		}
+		lane, err := netip.ParseAddrPort(addr.String())
+		if err != nil {
+			return fmt.Errorf("parse file payload lane address %q: %w", addr.String(), err)
+		}
+		lane = netip.AddrPortFrom(lane.Addr().Unmap(), lane.Port())
+		if _, duplicate := seen[lane]; duplicate {
+			return fmt.Errorf("duplicate file payload lane address %q", addr.String())
+		}
+		seen[lane] = struct{}{}
+		lanes = append(lanes, lane.String())
+	}
+	encoded, err := json.Marshal(lanes)
+	if err != nil {
+		return fmt.Errorf("encode file payload lane addresses: %w", err)
+	}
+	m.mu.Lock()
+	m.filePayloadLaneAddresses = string(encoded)
+	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
+	m.mu.Unlock()
+	sampleExternalTransferTrace(trace, snap, ok)
+	return nil
+}
+
+func (m *externalTransferMetrics) RecordFilePayloadCommit(engine transfertrace.FilePayloadEngine, n int64, at time.Time) {
+	if m == nil || m.role != transfertrace.RoleReceive || !engine.Valid() || n <= 0 {
+		return
+	}
+	m.mu.Lock()
+	if m.filePayloadEngine != engine {
+		m.mu.Unlock()
+		return
+	}
+	m.filePayloadBytesCommitted += n
+	if engine == transfertrace.FilePayloadEngineBulk {
+		m.filePayloadBytesBulk += n
+	} else {
+		m.filePayloadBytesQUIC += n
+	}
+	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
+	m.mu.Unlock()
+	sampleExternalTransferTrace(trace, snap, ok)
+}
+
+func (m *externalTransferMetrics) RecordFileSourceRead(n int, at time.Time) {
+	if m == nil || n < 0 {
+		return
+	}
+	m.mu.Lock()
+	m.fileSourceReadCalls++
+	m.fileSourceReadBytes += uint64(n)
+	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
+	m.mu.Unlock()
+	sampleExternalTransferTrace(trace, snap, ok)
+}
+
+func (m *externalTransferMetrics) RecordQUICEvidence(stats dataplane.Stats, _ int, _ bool, at time.Time) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.directTransport = "quic"
+	if stats.TelemetryPresent {
+		m.quicTelemetryPresent = true
+	}
+	m.quicConnections = max(m.quicConnections, stats.Connections)
+	m.quicStreams = max(m.quicStreams, stats.Streams)
+	setNonEmptyString(&m.quicVersion, stats.Version)
+	setNonEmptyString(&m.quicRawSocketBackend, stats.RawSocketBackend)
+	setNonEmptyString(&m.quicNativeSendBackend, stats.NativeSendBackend)
+	setNonEmptyString(&m.quicNativeReceiveBackend, stats.NativeReceiveBackend)
+	m.quicHandshakeMS = max(m.quicHandshakeMS, max(stats.HandshakeMS, formatQUICDurationMS(stats.HandshakeDuration)))
+	m.quicFirstByteMS = max(m.quicFirstByteMS, max(stats.FirstByteMS, formatQUICDurationMS(stats.FirstByteDuration)))
+	if stats.SmoothedRTT > 0 {
+		m.quicSmoothedRTTMS = strings.TrimRight(strings.TrimRight(strconv.FormatFloat(float64(stats.SmoothedRTT)/float64(time.Millisecond), 'f', 3, 64), "0"), ".")
+	}
+	m.quicPacketsSent = max(m.quicPacketsSent, stats.PacketsSent)
+	m.quicPacketsReceived = max(m.quicPacketsReceived, stats.PacketsReceived)
+	m.quicPacketsLost = max(m.quicPacketsLost, stats.PacketsLost)
+	m.quicWireBytesSent = max(m.quicWireBytesSent, stats.WireBytesSent)
+	m.quicRecoveryWireBytes = max(m.quicRecoveryWireBytes, stats.RecoveryWireBytes)
+	m.quicRecoveryRatio = formatQUICRecoveryRatio(m.quicRecoveryWireBytes, m.quicWireBytesSent)
+	m.quicStreamBytesSent = max(m.quicStreamBytesSent, uint64ToInt64Saturating(stats.StreamBytesSent))
+	m.quicStreamBytesRecv = max(m.quicStreamBytesRecv, uint64ToInt64Saturating(stats.StreamBytesReceived))
+	setNonEmptyString(&m.quicCloseReason, stats.CloseReason)
+	setNonEmptyString(&m.quicNativeGSO, stats.NativeGSO)
+	setNonEmptyString(&m.quicNativeReceiveBatch, stats.NativeReceiveBatch)
+	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
+	m.mu.Unlock()
+	sampleExternalTransferTrace(trace, snap, ok)
+}
+
+type externalV2FileSourceReadMetrics struct {
+	reader  io.ReaderAt
+	metrics *externalTransferMetrics
+}
+
+func (r *externalV2FileSourceReadMetrics) ReadAt(p []byte, off int64) (int, error) {
+	n, err := r.reader.ReadAt(p, off)
+	r.metrics.RecordFileSourceRead(n, time.Now())
+	return n, err
+}
+
+func withExternalV2FileSourceReadMetrics(source *BlockSource, metrics *externalTransferMetrics) *BlockSource {
+	if source == nil || source.Payload == nil || metrics == nil {
+		return source
+	}
+	if wrapped, ok := source.Payload.(*externalV2FileSourceReadMetrics); ok && wrapped.metrics == metrics {
+		return source
+	}
+	wrapped := *source
+	wrapped.Payload = &externalV2FileSourceReadMetrics{reader: source.Payload, metrics: metrics}
+	return &wrapped
+}
+
+func closeExternalV2QUICEndpoint(endpoint externalV2QUICEndpoint, metrics *externalTransferMetrics, streamCount int, rawDirect bool, code uint64, reason string) error {
+	metrics.recordSelectedManagerFilePayloadLane(time.Now())
+	stats := endpoint.Stats()
+	if stats.CloseReason == "" {
+		stats.CloseReason = reason
+	}
+	metrics.RecordQUICEvidence(stats, streamCount, rawDirect, time.Now())
+	return endpoint.CloseWithError(code, reason)
+}
+
+func recordExternalV2OpenQUICPayloadLanes(endpoint externalV2QUICEndpoint, metrics *externalTransferMetrics, streamCount int, addrs []net.Addr, at time.Time) error {
+	laneErr := metrics.SetFilePayloadLaneAddrs(addrs, at)
+	if laneErr == nil {
+		return nil
+	}
+	closeErr := closeExternalV2QUICEndpoint(endpoint, metrics, streamCount, true, 1, laneErr.Error())
+	if closeErr == nil {
+		return laneErr
+	}
+	return errors.Join(laneErr, fmt.Errorf("close QUIC endpoint after lane telemetry failure: %w", closeErr))
+}
+
+func (m *externalTransferMetrics) recordSelectedManagerFilePayloadLane(at time.Time) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	manager := m.transportManager
+	hasLanes := m.filePayloadLaneAddresses != ""
+	m.mu.Unlock()
+	if hasLanes || manager == nil {
+		return
+	}
+	if selected := manager.PathSnapshot().SelectedAddr; selected != nil {
+		_ = m.SetFilePayloadLaneAddrs([]net.Addr{selected}, at)
+	}
+}
+
+func formatQUICDurationMS(duration time.Duration) int64 {
+	if duration <= 0 {
+		return 0
+	}
+	return max(int64(1), duration.Milliseconds())
+}
+
+func formatQUICRecoveryRatio(recoveryWireBytes, wireBytesSent uint64) string {
+	if recoveryWireBytes == 0 {
+		return "0"
+	}
+	originalWireBytes := wireBytesSent - min(wireBytesSent, recoveryWireBytes)
+	ratio := float64(recoveryWireBytes) / float64(max(uint64(1), originalWireBytes))
+	return strings.TrimRight(strings.TrimRight(strconv.FormatFloat(ratio, 'f', 6, 64), "0"), ".")
+}
+
+func setNonEmptyString(dst *string, value string) {
+	if value != "" {
+		*dst = value
+	}
 }
 
 func (m *externalTransferMetrics) RecordLocalSent(n int64, at time.Time) {
@@ -711,71 +953,85 @@ func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrac
 		peerRecvQueueDepthMax = m.transportManager.MaxPeerRecvQueueDepth()
 	}
 	return m.trace, transfertrace.Snapshot{
-		At:                         at,
-		Phase:                      m.phase,
-		RelayBytes:                 m.relayBytes,
-		DirectBytes:                m.directBytes,
-		AppBytes:                   m.appBytesLocked(),
-		LocalSentBytes:             m.localSentBytes,
-		PeerReceivedBytes:          m.peerReceivedBytes,
-		SetupElapsedMS:             setupMS,
-		TransferElapsedMS:          transferMS,
-		DirectValidated:            m.directValidated,
-		FallbackReason:             m.fallbackReason,
-		DirectRateSelectedMbps:     m.directRateSelectedMbps,
-		DirectRateActiveMbps:       m.directRateActiveMbps,
-		DirectLanesActive:          m.directLanesActive,
-		DirectLanesAvailable:       m.directLanesAvailable,
-		RateTargetMbps:             m.rateTargetMbps,
-		RateCeilingMbps:            m.rateCeilingMbps,
-		RateExplorationCeilingMbps: m.rateExplorationCeiling,
-		LaneMin:                    m.laneMin,
-		LaneCap:                    m.laneCap,
-		ControllerDecision:         m.controllerDecision,
-		ControllerReason:           m.controllerReason,
-		DirectProbeState:           m.directProbeState,
-		DirectProbeSummary:         m.directProbeSummary,
-		ReplayWindowBytes:          m.replayWindowBytes,
-		ReplayBytes:                m.replayBytes,
-		RepairQueueBytes:           m.repairQueueBytes,
-		RetransmitCount:            m.retransmitCount,
-		RepairRequests:             m.repairRequests,
-		RepairBytes:                m.repairBytes,
-		MissingScanChecks:          m.missingScanChecks,
-		PendingMissing:             m.pendingMissing,
-		PendingMissingPeak:         m.pendingMissingPeak,
-		RepairRequestedPackets:     m.repairRequestedPackets,
-		RepairRequestBatches:       m.repairRequestBatches,
-		ReorderTrailPackets:        m.reorderTrailPackets,
-		ReceivePacketRatePPS:       m.receivePacketRatePPS,
-		BulkBatchPresent:           m.bulkBatchPresent,
-		BulkBatchBackend:           m.bulkBatchBackend,
-		BulkGSOAttempted:           m.bulkGSOAttempted,
-		BulkGSOActive:              m.bulkGSOActive,
-		BulkGSOSegments:            m.bulkGSOSegments,
-		BulkSendCalls:              m.bulkSendCalls,
-		BulkSendDatagrams:          m.bulkSendDatagrams,
-		BulkReceiveCalls:           m.bulkReceiveCalls,
-		BulkReceiveDatagrams:       m.bulkReceiveDatagrams,
-		BulkMaxSendBatch:           m.bulkMaxSendBatch,
-		BulkMaxReceiveBatch:        m.bulkMaxReceiveBatch,
-		BulkCryptoQueuePeak:        m.bulkCryptoQueuePeak,
-		BulkLaneQueuePeak:          m.bulkLaneQueuePeak,
-		BulkReceiveQueuePeak:       m.bulkReceiveQueuePeak,
-		BulkWriterQueuePeak:        m.bulkWriterQueuePeak,
-		BulkDecryptBatches:         m.bulkDecryptBatches,
-		BulkDecryptDatagrams:       m.bulkDecryptDatagrams,
-		BulkProbeSelectedMbps:      m.bulkProbeSelectedMbps,
-		BulkProbeDurationMS:        m.bulkProbeDurationMS,
-		BulkProbeTrains:            m.bulkProbeTrains,
-		BulkProbeSentDatagrams:     m.bulkProbeSentDatagrams,
-		BulkProbeReceivedDatagrams: m.bulkProbeReceivedDatagrams,
-		BulkProbeLossPPM:           m.bulkProbeLossPPM,
-		BulkProbePressure:          m.bulkProbePressure,
-		LocalENOBUFSRetries:        m.localENOBUFSRetries,
-		LocalENOBUFSWaitUS:         m.localENOBUFSWaitUS,
-		LocalENOBUFSMaxConsecutive: m.localENOBUFSMaxConsecutive,
-		OutOfOrderBytes:            m.outOfOrderBytes,
+		At:                             at,
+		Phase:                          m.phase,
+		RelayBytes:                     m.relayBytes,
+		DirectBytes:                    m.directBytes,
+		AppBytes:                       m.appBytesLocked(),
+		LocalSentBytes:                 m.localSentBytes,
+		PeerReceivedBytes:              m.peerReceivedBytes,
+		SetupElapsedMS:                 setupMS,
+		TransferElapsedMS:              transferMS,
+		DirectValidated:                m.directValidated,
+		FallbackReason:                 m.fallbackReason,
+		DirectRateSelectedMbps:         m.directRateSelectedMbps,
+		DirectRateActiveMbps:           m.directRateActiveMbps,
+		DirectLanesActive:              m.directLanesActive,
+		DirectLanesAvailable:           m.directLanesAvailable,
+		RateTargetMbps:                 m.rateTargetMbps,
+		RateCeilingMbps:                m.rateCeilingMbps,
+		RateExplorationCeilingMbps:     m.rateExplorationCeiling,
+		LaneMin:                        m.laneMin,
+		LaneCap:                        m.laneCap,
+		ControllerDecision:             m.controllerDecision,
+		ControllerReason:               m.controllerReason,
+		DirectProbeState:               m.directProbeState,
+		DirectProbeSummary:             m.directProbeSummary,
+		ReplayWindowBytes:              m.replayWindowBytes,
+		ReplayBytes:                    m.replayBytes,
+		RepairQueueBytes:               m.repairQueueBytes,
+		RetransmitCount:                m.retransmitCount,
+		RepairRequests:                 m.repairRequests,
+		RepairBytes:                    m.repairBytes,
+		MissingScanChecks:              m.missingScanChecks,
+		PendingMissing:                 m.pendingMissing,
+		PendingMissingPeak:             m.pendingMissingPeak,
+		RepairRequestedPackets:         m.repairRequestedPackets,
+		RepairRequestBatches:           m.repairRequestBatches,
+		ReorderTrailPackets:            m.reorderTrailPackets,
+		ReceivePacketRatePPS:           m.receivePacketRatePPS,
+		FilePayloadEngine:              m.filePayloadEngine,
+		FilePayloadBytesCommitted:      m.filePayloadBytesCommitted,
+		FilePayloadBytesBulk:           m.filePayloadBytesBulk,
+		FilePayloadBytesQUIC:           m.filePayloadBytesQUIC,
+		FilePayloadLaneAddresses:       m.filePayloadLaneAddresses,
+		FileSourceReadCalls:            m.fileSourceReadCalls,
+		FileSourceReadBytes:            m.fileSourceReadBytes,
+		BulkBatchPresent:               m.bulkBatchPresent,
+		BulkBatchBackend:               m.bulkBatchBackend,
+		BulkCandidateID:                m.bulkCandidateID,
+		BulkNativeSendAttempts:         m.bulkNativeSendAttempts,
+		BulkNativeSendSyscalls:         m.bulkNativeSendSyscalls,
+		BulkNativeGSOMessages:          m.bulkNativeGSOMessages,
+		BulkLogicalDatagrams:           m.bulkLogicalDatagrams,
+		BulkNativeAcceptedPayloadBytes: m.bulkNativeAcceptedPayloadBytes,
+		BulkGSOSegmentsPerMessage:      m.bulkGSOSegmentsPerMessage,
+		BulkGSOAttempted:               m.bulkGSOAttempted,
+		BulkGSOActive:                  m.bulkGSOActive,
+		BulkGSOSegments:                m.bulkGSOSegments,
+		BulkSendCalls:                  m.bulkSendCalls,
+		BulkSendDatagrams:              m.bulkSendDatagrams,
+		BulkReceiveCalls:               m.bulkReceiveCalls,
+		BulkReceiveDatagrams:           m.bulkReceiveDatagrams,
+		BulkMaxSendBatch:               m.bulkMaxSendBatch,
+		BulkMaxReceiveBatch:            m.bulkMaxReceiveBatch,
+		BulkCryptoQueuePeak:            m.bulkCryptoQueuePeak,
+		BulkLaneQueuePeak:              m.bulkLaneQueuePeak,
+		BulkReceiveQueuePeak:           m.bulkReceiveQueuePeak,
+		BulkWriterQueuePeak:            m.bulkWriterQueuePeak,
+		BulkDecryptBatches:             m.bulkDecryptBatches,
+		BulkDecryptDatagrams:           m.bulkDecryptDatagrams,
+		BulkProbeSelectedMbps:          m.bulkProbeSelectedMbps,
+		BulkProbeDurationMS:            m.bulkProbeDurationMS,
+		BulkProbeTrains:                m.bulkProbeTrains,
+		BulkProbeSentDatagrams:         m.bulkProbeSentDatagrams,
+		BulkProbeReceivedDatagrams:     m.bulkProbeReceivedDatagrams,
+		BulkProbeLossPPM:               m.bulkProbeLossPPM,
+		BulkProbePressure:              m.bulkProbePressure,
+		LocalENOBUFSRetries:            m.localENOBUFSRetries,
+		LocalENOBUFSWaitUS:             m.localENOBUFSWaitUS,
+		LocalENOBUFSMaxConsecutive:     m.localENOBUFSMaxConsecutive,
+		OutOfOrderBytes:                m.outOfOrderBytes,
 
 		StripedSendBlockedMS:           roundedUpMilliseconds(m.stripedSendBlocked),
 		StripedReceivePendingChunks:    m.stripedReceivePendingChunks,
@@ -783,21 +1039,35 @@ func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrac
 		StripedReceivePendingBytes:     m.stripedReceivePendingBytes,
 		StripedReceivePendingBytesMax:  m.stripedReceivePendingBytesMax,
 
-		DirectPacketBytes:       m.directPacketBytes,
-		DirectCommittedBytes:    m.directCommittedBytes,
-		DirectTransport:         m.directTransport,
-		QUICHandshakeMS:         m.quicHandshakeMS,
-		QUICFirstByteMS:         m.quicFirstByteMS,
-		QUICStreamBytesSent:     m.quicStreamBytesSent,
-		QUICStreamBytesReceived: m.quicStreamBytesRecv,
-		QUICStreamGoodputMbps:   m.quicStreamGoodputMbps,
-		QUICSmoothedRTTMS:       m.quicSmoothedRTTMS,
-		QUICLossEvents:          m.quicLossEvents,
-		QUICCloseReason:         m.quicCloseReason,
-		PeerRecvQueueDepth:      peerRecvQueueDepth,
-		PeerRecvQueueDepthMax:   peerRecvQueueDepthMax,
-		LastState:               m.lastState,
-		LastError:               m.lastError,
+		DirectPacketBytes:        m.directPacketBytes,
+		DirectCommittedBytes:     m.directCommittedBytes,
+		DirectTransport:          m.directTransport,
+		QUICTelemetryPresent:     m.quicTelemetryPresent,
+		QUICConnections:          m.quicConnections,
+		QUICStreams:              m.quicStreams,
+		QUICVersion:              m.quicVersion,
+		QUICRawSocketBackend:     m.quicRawSocketBackend,
+		QUICNativeSendBackend:    m.quicNativeSendBackend,
+		QUICNativeReceiveBackend: m.quicNativeReceiveBackend,
+		QUICHandshakeMS:          m.quicHandshakeMS,
+		QUICFirstByteMS:          m.quicFirstByteMS,
+		QUICSmoothedRTTMS:        m.quicSmoothedRTTMS,
+		QUICPacketsSent:          m.quicPacketsSent,
+		QUICPacketsReceived:      m.quicPacketsReceived,
+		QUICPacketsLost:          m.quicPacketsLost,
+		QUICWireBytesSent:        m.quicWireBytesSent,
+		QUICRecoveryWireBytes:    m.quicRecoveryWireBytes,
+		QUICRecoveryRatio:        m.quicRecoveryRatio,
+		QUICStreamBytesSent:      m.quicStreamBytesSent,
+		QUICStreamBytesReceived:  m.quicStreamBytesRecv,
+		QUICStreamGoodputMbps:    m.quicStreamGoodputMbps,
+		QUICCloseReason:          m.quicCloseReason,
+		QUICNativeGSO:            m.quicNativeGSO,
+		QUICNativeReceiveBatch:   m.quicNativeReceiveBatch,
+		PeerRecvQueueDepth:       peerRecvQueueDepth,
+		PeerRecvQueueDepthMax:    peerRecvQueueDepthMax,
+		LastState:                m.lastState,
+		LastError:                m.lastError,
 	}, true
 }
 
@@ -859,6 +1129,13 @@ func (m *externalTransferMetrics) setBulkBatchDiagnosticsLocked(diagnostics exte
 	if diagnostics.BulkBatchBackend != "" {
 		m.bulkBatchBackend = diagnostics.BulkBatchBackend
 	}
+	m.bulkCandidateID = diagnostics.BulkCandidateID
+	m.bulkNativeSendAttempts = max(m.bulkNativeSendAttempts, diagnostics.BulkNativeSendAttempts)
+	m.bulkNativeSendSyscalls = max(m.bulkNativeSendSyscalls, diagnostics.BulkNativeSendSyscalls)
+	m.bulkNativeGSOMessages = max(m.bulkNativeGSOMessages, diagnostics.BulkNativeGSOMessages)
+	m.bulkLogicalDatagrams = max(m.bulkLogicalDatagrams, diagnostics.BulkLogicalDatagrams)
+	m.bulkNativeAcceptedPayloadBytes = max(m.bulkNativeAcceptedPayloadBytes, diagnostics.BulkNativeAcceptedPayloadBytes)
+	m.bulkGSOSegmentsPerMessage = max(m.bulkGSOSegmentsPerMessage, diagnostics.BulkGSOSegmentsPerMessage)
 	m.bulkGSOAttempted = m.bulkGSOAttempted || diagnostics.BulkGSOAttempted
 	m.bulkGSOActive = m.bulkGSOActive || diagnostics.BulkGSOActive
 	m.bulkGSOSegments = max(m.bulkGSOSegments, diagnostics.BulkGSOSegments)

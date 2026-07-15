@@ -984,6 +984,39 @@ func TestExternalV2BulkPacketReceiverReturnsPayloadAfterHandling(t *testing.T) {
 	}
 }
 
+func TestExternalV2BulkPacketReceiverCountsOnlyAuthenticatedCommittedPayload(t *testing.T) {
+	payload := []byte("authenticated-payload")
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(220, 0), nil, transfertrace.RoleReceive)
+	receiver := newExternalV2BulkPacketReceiver(
+		newMemoryBlockSink(int64(len(payload))),
+		externalV2BlockReceiveConfig{PayloadSize: int64(len(payload)), ChunkSize: len(payload)},
+		externalV2BulkPacketPath{}, externalV2BulkPacketAuth{}, metrics,
+	)
+	receiver.stopHello = func() {}
+	valid := externalV2BulkPacketReceiveResult{
+		header: externalV2BulkPacketHeader{kind: externalV2BulkPacketData, runID: 7, index: 0, total: 1},
+		data:   payload,
+	}
+	if err := receiver.handleDataResult(valid); err != nil {
+		t.Fatal(err)
+	}
+	if err := receiver.handleDataResult(valid); err != nil {
+		t.Fatal(err)
+	}
+	wrongRun := valid
+	wrongRun.header.runID = 8
+	if err := receiver.handleDataResult(wrongRun); err != nil {
+		t.Fatal(err)
+	}
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	if metrics.filePayloadEngine != transfertrace.FilePayloadEngineBulk ||
+		metrics.filePayloadBytesCommitted != int64(len(payload)) ||
+		metrics.filePayloadBytesBulk != int64(len(payload)) || metrics.filePayloadBytesQUIC != 0 {
+		t.Fatalf("engine=%q committed=%d bulk=%d quic=%d", metrics.filePayloadEngine, metrics.filePayloadBytesCommitted, metrics.filePayloadBytesBulk, metrics.filePayloadBytesQUIC)
+	}
+}
+
 func TestExternalV2BulkPacketAssemblerCopiesBeforePayloadRelease(t *testing.T) {
 	first := bytes.Repeat([]byte{0x11}, externalV2BulkPacketPayloadSize)
 	second := bytes.Repeat([]byte{0x22}, externalV2BulkPacketPayloadSize)
@@ -1628,6 +1661,83 @@ func TestExternalV2BulkPacketAuthMatchesTokenReceiverDERP(t *testing.T) {
 	}
 	if header, _, ok := openExternalV2BulkPacket(senderAuth.control, helloPacket); !ok || header.kind != externalV2BulkPacketHello {
 		t.Fatalf("sender failed to open receiver hello ok=%v header=%+v", ok, header)
+	}
+}
+
+func TestExternalV2BulkPacketNoProbeReceiverSelectsEngineAfterAuthenticatedPayload(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	senders, receiverConns := listenExternalV2BulkPacketTestConns(t, 1)
+	setupBlocked := make(chan struct{})
+	setupRelease := make(chan struct{})
+	receivers := []net.PacketConn{&blockingReadBufferBulkPacketConn{
+		PacketConn: receiverConns[0],
+		blocked:    setupBlocked,
+		release:    setupRelease,
+	}}
+	payload := bytes.Repeat([]byte{0x6b}, externalV2BulkPacketPayloadSize)
+	sink := newMemoryBlockSink(int64(len(payload)))
+	auth, err := externalV2BulkPacketAuthForToken(
+		testExternalV2BulkPacketToken(), key.NewNode().Public(), key.NewNode().Public(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(240, 0), nil, transfertrace.RoleReceive)
+	receiveErr := make(chan error, 1)
+	go func() {
+		_, _, err := receiveExternalV2BulkBlockPacketsWithProbe(
+			ctx,
+			sink,
+			externalV2BlockReceiveConfig{PayloadSize: int64(len(payload)), ChunkSize: len(payload)},
+			externalV2BulkPacketPath{Conns: receivers, Addrs: externalV2BulkPacketTestAddrs(senders)},
+			auth,
+			metrics,
+			false,
+		)
+		receiveErr <- err
+	}()
+
+	released := false
+	defer func() {
+		if !released {
+			close(setupRelease)
+		}
+	}()
+	select {
+	case <-setupBlocked:
+	case <-ctx.Done():
+		t.Fatalf("receiver did not reach no-probe payload setup: %v", ctx.Err())
+	}
+	metrics.mu.Lock()
+	engineBeforePayload := metrics.filePayloadEngine
+	metrics.mu.Unlock()
+	if engineBeforePayload != "" {
+		t.Fatalf("no-probe receiver selected engine before authenticated payload: %q", engineBeforePayload)
+	}
+
+	close(setupRelease)
+	released = true
+	_, err = sendExternalV2BulkBlockPacketsWithProbe(
+		ctx,
+		&BlockSource{Payload: bytes.NewReader(payload), PayloadSize: int64(len(payload)), ChunkSize: len(payload)},
+		externalV2BulkPacketPath{Conns: senders, Addrs: externalV2BulkPacketTestAddrs(receiverConns)},
+		auth,
+		nil,
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-receiveErr; err != nil {
+		t.Fatal(err)
+	}
+	metrics.mu.Lock()
+	engineAfterPayload := metrics.filePayloadEngine
+	metrics.mu.Unlock()
+	if engineAfterPayload != transfertrace.FilePayloadEngineBulk {
+		t.Fatalf("no-probe receiver engine after authenticated payload = %q, want %q", engineAfterPayload, transfertrace.FilePayloadEngineBulk)
 	}
 }
 
@@ -2557,6 +2667,22 @@ func (c *dropPrimaryBulkDataPacketConn) WriteTo(p []byte, addr net.Addr) (int, e
 type writeCountingBlockSink struct {
 	*memoryBlockSink
 	writes int
+}
+
+type blockingReadBufferBulkPacketConn struct {
+	net.PacketConn
+	blocked chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingReadBufferBulkPacketConn) SetReadBuffer(bytes int) error {
+	c.once.Do(func() { close(c.blocked) })
+	<-c.release
+	if setter, ok := c.PacketConn.(interface{ SetReadBuffer(int) error }); ok {
+		return setter.SetReadBuffer(bytes)
+	}
+	return nil
 }
 
 func (s *writeCountingBlockSink) WriteAt(p []byte, off int64) (int, error) {

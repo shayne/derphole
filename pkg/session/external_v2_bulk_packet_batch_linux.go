@@ -18,7 +18,6 @@ import (
 	"time"
 	"unsafe"
 
-	"golang.org/x/net/ipv4"
 	"golang.org/x/sys/unix"
 )
 
@@ -27,31 +26,30 @@ const (
 	// Keep each software-segmented skb to a few qdisc quanta so a single local
 	// queue drop cannot discard a large fraction of the sender window. All GSO
 	// messages still share one sendmmsg call per logical batch.
-	externalV2BulkPacketLinuxGSOSegmentsPerMessage     = 3
-	externalV2BulkPacketLinuxMaximumGSOMessagesPerCall = (externalV2BulkPacketMaxBatch + externalV2BulkPacketLinuxGSOSegmentsPerMessage - 1) / externalV2BulkPacketLinuxGSOSegmentsPerMessage
+	externalV2BulkPacketLinuxGSOSegmentsPerMessage = 3
 )
 
-type externalV2BulkPacketLinuxGSOScratch struct {
-	messages  [externalV2BulkPacketLinuxMaximumGSOMessagesPerCall]ipv4.Message
-	buffers   [externalV2BulkPacketMaxBatch][]byte
-	groupEnds [externalV2BulkPacketLinuxMaximumGSOMessagesPerCall]int
-	control   []byte
-}
-
-var externalV2BulkPacketLinuxGSOScratchPool = sync.Pool{New: func() any {
-	return &externalV2BulkPacketLinuxGSOScratch{control: make([]byte, 0, unix.CmsgSpace(2))}
-}}
-
 type externalV2BulkPacketLinuxBatchConn struct {
-	conn              net.PacketConn
-	packetConn        *ipv4.PacketConn
-	rawConn           syscall.RawConn
-	stats             *externalV2BulkPacketAtomicBatchStats
-	gsoCapable        atomic.Bool
-	readHeaders       [externalV2BulkPacketMaxBatch]externalV2BulkPacketMMsgHdr
-	readIovecs        [externalV2BulkPacketMaxBatch]unix.Iovec
-	readDeadline      time.Time
-	readDeadlineArmed bool
+	conn               net.PacketConn
+	rawConn            syscall.RawConn
+	stats              *externalV2BulkPacketAtomicBatchStats
+	gsoCapable         atomic.Bool
+	connected          bool
+	candidateConfig    externalV2BulkPacketCandidateConfig
+	candidateErr       error
+	sendMMsg           externalV2BulkPacketLinuxSendSyscall
+	sendScratch        *externalV2BulkPacketLinuxSendScratch
+	connectedWriteGate chan struct{}
+	connectedGateOnce  sync.Once
+	writeCancelMu      sync.Mutex
+	writeCancelSet     bool
+	writeCancelDone    <-chan struct{}
+	writeCancelStop    func() bool
+	writeCancelFinish  chan struct{}
+	readHeaders        [externalV2BulkPacketMaxBatch]externalV2BulkPacketMMsgHdr
+	readIovecs         [externalV2BulkPacketMaxBatch]unix.Iovec
+	readDeadline       time.Time
+	readDeadlineArmed  bool
 }
 
 type externalV2BulkPacketMMsgHdr struct {
@@ -60,6 +58,14 @@ type externalV2BulkPacketMMsgHdr struct {
 }
 
 func newExternalV2BulkPacketBatchConn(conn net.PacketConn) externalV2BulkPacketBatchConn {
+	candidateConfig, candidateErr := externalV2BulkPacketConfiguredCandidate()
+	if candidateErr != nil {
+		return &externalV2BulkPacketLinuxBatchConn{
+			conn:         conn,
+			stats:        newExternalV2BulkPacketAtomicBatchStats("linux-sendmmsg"),
+			candidateErr: candidateErr,
+		}
+	}
 	if _, ok := conn.(net.Conn); !ok {
 		return newExternalV2BulkPacketPortableBatchConn(conn)
 	}
@@ -72,27 +78,155 @@ func newExternalV2BulkPacketBatchConn(conn net.PacketConn) externalV2BulkPacketB
 		return newExternalV2BulkPacketPortableBatchConn(conn)
 	}
 	batch := &externalV2BulkPacketLinuxBatchConn{
-		conn:       conn,
-		packetConn: ipv4.NewPacketConn(conn),
-		rawConn:    rawConn,
-		stats:      newExternalV2BulkPacketAtomicBatchStats("linux-sendmmsg"),
+		conn:               conn,
+		rawConn:            rawConn,
+		stats:              newExternalV2BulkPacketAtomicBatchStats("linux-sendmmsg"),
+		candidateConfig:    candidateConfig,
+		candidateErr:       candidateErr,
+		sendMMsg:           externalV2BulkPacketLinuxSendMMsgSyscall,
+		sendScratch:        newExternalV2BulkPacketLinuxSendScratch(),
+		connectedWriteGate: newExternalV2BulkPacketConnectedWriteGate(),
 	}
+	batch.stats.setCandidateID(candidateConfig.ID)
 	batch.gsoCapable.Store(externalV2BulkPacketLinuxGSOCapable(conn))
 	return batch
 }
 
-func (c *externalV2BulkPacketLinuxBatchConn) WriteBatch(ctx context.Context, messages []externalV2BulkPacketBatchMessage) (int, error) {
-	empty, err := externalV2BulkPacketPrepareWrite(ctx, c.conn, len(messages))
-	if err != nil {
-		return 0, err
+func (c *externalV2BulkPacketLinuxBatchConn) enableFixedPeerConnect(peer net.Addr) error {
+	if c.candidateErr != nil {
+		return c.candidateErr
 	}
-	if empty {
+	if !c.candidateConfig.NativeConnectedSend {
+		return nil
+	}
+	if err := externalV2BulkPacketLinuxConnectFixedPeer(c.rawConn, peer); err != nil {
+		return err
+	}
+	c.connected = true
+	return nil
+}
+
+func (c *externalV2BulkPacketLinuxBatchConn) WriteBatch(ctx context.Context, messages []externalV2BulkPacketBatchMessage) (int, error) {
+	if c.candidateErr != nil {
+		return 0, c.candidateErr
+	}
+	if len(messages) == 0 {
 		return 0, nil
 	}
-	return c.writePreparedBatch(messages)
+	if err := c.acquireConnectedWriteGate(ctx); err != nil {
+		return 0, err
+	}
+	defer c.releaseConnectedWriteGate()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	c.armConnectedWriteCancellation(ctx)
+	if err := externalV2BulkPacketArmWriteDeadline(ctx, c.conn); err != nil {
+		return 0, err
+	}
+	written, err := c.writePreparedBatch(messages)
+	if err != nil && ctx.Err() != nil {
+		return written, ctx.Err()
+	}
+	return written, err
+}
+
+func newExternalV2BulkPacketConnectedWriteGate() chan struct{} {
+	gate := make(chan struct{}, 1)
+	gate <- struct{}{}
+	return gate
+}
+
+func (c *externalV2BulkPacketLinuxBatchConn) initializedConnectedWriteGate() chan struct{} {
+	c.connectedGateOnce.Do(func() {
+		if c.connectedWriteGate == nil {
+			c.connectedWriteGate = newExternalV2BulkPacketConnectedWriteGate()
+		}
+	})
+	return c.connectedWriteGate
+}
+
+func (c *externalV2BulkPacketLinuxBatchConn) acquireConnectedWriteGate(ctx context.Context) error {
+	gate := c.initializedConnectedWriteGate()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-gate:
+	}
+	if err := ctx.Err(); err != nil {
+		gate <- struct{}{}
+		return err
+	}
+	return nil
+}
+
+func (c *externalV2BulkPacketLinuxBatchConn) releaseConnectedWriteGate() {
+	c.initializedConnectedWriteGate() <- struct{}{}
+}
+
+func (c *externalV2BulkPacketLinuxBatchConn) armConnectedWriteCancellation(ctx context.Context) {
+	done := ctx.Done()
+	c.writeCancelMu.Lock()
+	defer c.writeCancelMu.Unlock()
+	if c.writeCancelSet && done == c.writeCancelDone {
+		return
+	}
+	if !c.writeCancelSet && done == nil {
+		return
+	}
+	if c.writeCancelSet {
+		c.stopConnectedWriteCancellationLocked()
+		if c.conn != nil {
+			_ = c.conn.SetWriteDeadline(time.Time{})
+		}
+	}
+	if done == nil || c.conn == nil {
+		return
+	}
+	finished := make(chan struct{})
+	conn := c.conn
+	c.writeCancelSet = true
+	c.writeCancelDone = done
+	c.writeCancelFinish = finished
+	c.writeCancelStop = context.AfterFunc(ctx, func() {
+		_ = conn.SetWriteDeadline(time.Now())
+		close(finished)
+	})
+}
+
+func (c *externalV2BulkPacketLinuxBatchConn) disarmWriteCancellation() {
+	gate := c.initializedConnectedWriteGate()
+	<-gate
+	defer func() { gate <- struct{}{} }()
+	c.writeCancelMu.Lock()
+	defer c.writeCancelMu.Unlock()
+	c.stopConnectedWriteCancellationLocked()
+}
+
+func (c *externalV2BulkPacketLinuxBatchConn) stopConnectedWriteCancellationLocked() {
+	if !c.writeCancelSet {
+		return
+	}
+	if !c.writeCancelStop() {
+		<-c.writeCancelFinish
+	}
+	c.writeCancelSet = false
+	c.writeCancelDone = nil
+	c.writeCancelStop = nil
+	c.writeCancelFinish = nil
 }
 
 func (c *externalV2BulkPacketLinuxBatchConn) writePreparedBatch(messages []externalV2BulkPacketBatchMessage) (int, error) {
+	if c.connected {
+		segments := c.candidateConfig.GSOSegments
+		if segments == 0 {
+			segments = 1
+		}
+		if segments > 1 && c.gsoCapable.Load() {
+			return c.writeConnectedGSO(messages, segments)
+		}
+		return c.writeConnectedSendMMsg(messages)
+	}
 	if !c.gsoCapable.Load() {
 		return c.writeSendMMsg(messages)
 	}
@@ -105,14 +239,75 @@ func (c *externalV2BulkPacketLinuxBatchConn) writePreparedBatch(messages []exter
 	return c.writeSendMMsg(messages)
 }
 
-func externalV2BulkPacketPrepareWrite(ctx context.Context, conn net.PacketConn, count int) (bool, error) {
-	if count == 0 {
-		return true, nil
+func (c *externalV2BulkPacketLinuxBatchConn) writeConnectedGSO(messages []externalV2BulkPacketBatchMessage, segments int) (int, error) {
+	if c.sendScratch == nil {
+		c.sendScratch = newExternalV2BulkPacketLinuxSendScratch()
 	}
-	if err := ctx.Err(); err != nil {
-		return false, err
+	headers, groupEnds, err := externalV2BulkPacketPrepareLinuxConnectedGSO(messages, segments, c.sendScratch)
+	if err != nil {
+		return 0, err
 	}
-	return false, externalV2BulkPacketArmWriteDeadline(ctx, conn)
+	preparedMessages := messages[:groupEnds[len(groupEnds)-1]]
+	c.stats.gsoAttempted.Store(true)
+	writtenGroups, sendErr := c.sendScratch.sendMMsg(c.rawConn, headers, c.sendMMsg, c.stats)
+	written := externalV2BulkPacketLinuxGSOWritten(writtenGroups, groupEnds)
+	c.stats.observeNativeAccepted(preparedMessages, written, writtenGroups, segments)
+	for index := range preparedMessages {
+		runtime.KeepAlive(preparedMessages[index].Buffers[0])
+	}
+	runtime.KeepAlive(messages)
+	runtime.KeepAlive(headers)
+	runtime.KeepAlive(&c.sendScratch.iovecs)
+	runtime.KeepAlive(c.sendScratch.control)
+	runtime.KeepAlive(c.sendScratch)
+	externalV2BulkPacketResetLinuxConnectedSendScratch(c.sendScratch)
+	if written > 0 {
+		c.observeGSOSuccess(written)
+		for index := range written {
+			messages[index].N = len(messages[index].Buffers[0])
+		}
+	}
+	if sendErr == nil {
+		return written, nil
+	}
+	if !externalV2BulkPacketShouldDisableGSO(sendErr) {
+		return written, sendErr
+	}
+	c.disableGSO()
+	if written >= len(preparedMessages) {
+		return written, nil
+	}
+	fallbackWritten, fallbackErr := c.writeConnectedSendMMsg(preparedMessages[written:])
+	return written + fallbackWritten, fallbackErr
+}
+
+func (c *externalV2BulkPacketLinuxBatchConn) writeConnectedSendMMsg(messages []externalV2BulkPacketBatchMessage) (int, error) {
+	if c.sendScratch == nil {
+		c.sendScratch = newExternalV2BulkPacketLinuxSendScratch()
+	}
+	headers, err := externalV2BulkPacketPrepareLinuxConnectedSend(messages, c.sendScratch)
+	if err != nil {
+		return 0, err
+	}
+	preparedMessages := messages[:len(headers)]
+	written, sendErr := c.sendScratch.sendMMsg(c.rawConn, headers, c.sendMMsg, c.stats)
+	c.stats.observeNativeAccepted(preparedMessages, written, 0, 0)
+	for index := range preparedMessages {
+		runtime.KeepAlive(preparedMessages[index].Buffers[0])
+	}
+	runtime.KeepAlive(messages)
+	runtime.KeepAlive(headers)
+	runtime.KeepAlive(&c.sendScratch.iovecs)
+	runtime.KeepAlive(c.sendScratch)
+	externalV2BulkPacketResetLinuxConnectedSendScratch(c.sendScratch)
+	if written > 0 {
+		c.stats.setBackend("linux-sendmmsg")
+		c.stats.observeSend(written)
+		for index := range written {
+			messages[index].N = len(messages[index].Buffers[0])
+		}
+	}
+	return written, sendErr
 }
 
 func (c *externalV2BulkPacketLinuxBatchConn) tryWriteGSO(messages []externalV2BulkPacketBatchMessage) (bool, int, error) {
@@ -146,25 +341,39 @@ func (c *externalV2BulkPacketLinuxBatchConn) disableGSO() {
 }
 
 func (c *externalV2BulkPacketLinuxBatchConn) writeSendMMsg(messages []externalV2BulkPacketBatchMessage) (int, error) {
-	xMessages := make([]ipv4.Message, len(messages))
-	for index := range messages {
-		xMessages[index] = ipv4.Message{
-			Buffers: messages[index].Buffers,
-			OOB:     messages[index].OOB,
-			Addr:    messages[index].Addr,
-		}
+	if c.sendScratch == nil {
+		c.sendScratch = newExternalV2BulkPacketLinuxSendScratch()
 	}
-	written, err := c.packetConn.WriteBatch(xMessages, 0)
+	headers, err := externalV2BulkPacketPrepareLinuxAddressedSend(messages, c.sendScratch)
+	if err != nil {
+		return 0, err
+	}
+	preparedMessages := messages[:len(headers)]
+	written, sendErr := c.sendScratch.sendMMsg(c.rawConn, headers, c.sendMMsg, c.stats)
+	c.stats.observeNativeAccepted(preparedMessages, written, 0, 0)
+	for index := range preparedMessages {
+		runtime.KeepAlive(preparedMessages[index].Buffers[0])
+	}
+	runtime.KeepAlive(messages)
+	runtime.KeepAlive(headers)
+	runtime.KeepAlive(&c.sendScratch.iovecs)
+	runtime.KeepAlive(&c.sendScratch.sockaddrs)
+	runtime.KeepAlive(c.sendScratch)
+	externalV2BulkPacketResetLinuxConnectedSendScratch(c.sendScratch)
 	if written > 0 {
+		c.stats.setBackend("linux-sendmmsg")
 		c.stats.observeSend(written)
 		for index := 0; index < written; index++ {
 			messages[index].N = externalV2BulkPacketMessageLength(messages[index].Buffers)
 		}
 	}
-	return written, err
+	return written, sendErr
 }
 
 func (c *externalV2BulkPacketLinuxBatchConn) ReadBatch(ctx context.Context, messages []externalV2BulkPacketBatchMessage) (int, error) {
+	if c.candidateErr != nil {
+		return 0, c.candidateErr
+	}
 	messages, headers, err := externalV2BulkPacketPrepareRead(messages, c.readHeaders[:], c.readIovecs[:])
 	if err != nil || len(messages) == 0 {
 		return 0, err
@@ -313,46 +522,31 @@ func (c *externalV2BulkPacketLinuxBatchConn) Stats() externalV2BulkPacketBatchSt
 }
 
 func (c *externalV2BulkPacketLinuxBatchConn) writeGSO(messages []externalV2BulkPacketBatchMessage) (int, error) {
-	scratch := externalV2BulkPacketLinuxGSOScratchPool.Get().(*externalV2BulkPacketLinuxGSOScratch)
-	groups, groupEnds := externalV2BulkPacketPrepareLinuxGSOGroups(messages, scratch)
-	defer func() {
-		for index := range len(groups) {
-			scratch.messages[index] = ipv4.Message{}
-			scratch.groupEnds[index] = 0
-		}
-		for index := range len(messages) {
-			scratch.buffers[index] = nil
-		}
-		externalV2BulkPacketLinuxGSOScratchPool.Put(scratch)
-	}()
-	writtenGroups, err := c.packetConn.WriteBatch(groups, 0)
+	if c.sendScratch == nil {
+		c.sendScratch = newExternalV2BulkPacketLinuxSendScratch()
+	}
+	headers, groupEnds, err := externalV2BulkPacketPrepareLinuxAddressedGSO(messages, externalV2BulkPacketLinuxGSOSegmentsPerMessage, c.sendScratch)
+	if err != nil {
+		return 0, err
+	}
+	preparedMessages := messages[:groupEnds[len(groupEnds)-1]]
+	writtenGroups, sendErr := c.sendScratch.sendMMsg(c.rawConn, headers, c.sendMMsg, c.stats)
 	written := externalV2BulkPacketLinuxGSOWritten(writtenGroups, groupEnds)
+	c.stats.observeNativeAccepted(preparedMessages, written, writtenGroups, externalV2BulkPacketLinuxGSOSegmentsPerMessage)
+	for index := range preparedMessages {
+		runtime.KeepAlive(preparedMessages[index].Buffers[0])
+	}
+	runtime.KeepAlive(messages)
+	runtime.KeepAlive(headers)
+	runtime.KeepAlive(&c.sendScratch.iovecs)
+	runtime.KeepAlive(&c.sendScratch.sockaddrs)
+	runtime.KeepAlive(c.sendScratch.control)
+	runtime.KeepAlive(c.sendScratch)
+	externalV2BulkPacketResetLinuxConnectedSendScratch(c.sendScratch)
 	for index := range written {
 		messages[index].N = externalV2BulkPacketMessageLength(messages[index].Buffers)
 	}
-	return written, err
-}
-
-func externalV2BulkPacketPrepareLinuxGSOGroups(messages []externalV2BulkPacketBatchMessage, scratch *externalV2BulkPacketLinuxGSOScratch) ([]ipv4.Message, []int) {
-	if scratch.control == nil {
-		scratch.control = make([]byte, 0, unix.CmsgSpace(2))
-	}
-	externalV2BulkPacketSetGSOSize(&scratch.control, uint16(externalV2BulkPacketMessageLength(messages[0].Buffers)))
-	groupCount := 0
-	for start := 0; start < len(messages); start += externalV2BulkPacketLinuxGSOSegmentsPerMessage {
-		end := min(start+externalV2BulkPacketLinuxGSOSegmentsPerMessage, len(messages))
-		for index := start; index < end; index++ {
-			scratch.buffers[index] = messages[index].Buffers[0]
-		}
-		scratch.messages[groupCount] = ipv4.Message{
-			Buffers: scratch.buffers[start:end],
-			OOB:     scratch.control,
-			Addr:    messages[start].Addr,
-		}
-		scratch.groupEnds[groupCount] = end
-		groupCount++
-	}
-	return scratch.messages[:groupCount], scratch.groupEnds[:groupCount]
+	return written, sendErr
 }
 
 func externalV2BulkPacketLinuxGSOWritten(writtenGroups int, groupEnds []int) int {

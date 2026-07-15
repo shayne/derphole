@@ -5,6 +5,8 @@
 package transfertrace
 
 import (
+	"bytes"
+	"encoding/csv"
 	"math"
 	"strconv"
 	"strings"
@@ -550,6 +552,316 @@ func TestCheckReportsQUICDiagnosticsSummary(t *testing.T) {
 	}
 }
 
+func TestCheckRequiresCompleteQUICEngineTelemetry(t *testing.T) {
+	required := []string{
+		"quic_connections",
+		"quic_streams",
+		"quic_telemetry_present",
+		"quic_version",
+		"quic_raw_socket_backend",
+		"quic_native_send_backend",
+		"quic_native_receive_backend",
+		"quic_handshake_ms",
+		"quic_first_byte_ms",
+		"quic_smoothed_rtt_ms",
+		"quic_packets_sent",
+		"quic_packets_received",
+		"quic_packets_lost",
+		"quic_wire_bytes_sent",
+		"quic_recovery_wire_bytes",
+		"quic_recovery_ratio",
+		"quic_stream_bytes_sent",
+		"quic_stream_bytes_received",
+		"quic_close_reason",
+		"quic_native_gso",
+		"quic_native_receive_batch",
+		"file_source_read_calls",
+		"file_source_read_bytes",
+	}
+	for _, column := range required {
+		t.Run(column, func(t *testing.T) {
+			trace := testQUICEngineTrace(t, RoleSend, map[string]string{column: ""})
+			_, err := Check(strings.NewReader(trace), Options{
+				Role: RoleSend, ExpectedBytes: 1024, ExpectedBytesSet: true,
+				ExpectedPayloadBytes: 1024, ExpectedPayloadBytesSet: true,
+				RequireDirectTransport: "quic", RequireFilePayloadEngine: FilePayloadEngineQUIC,
+				RequireEngineTelemetry: true,
+			})
+			if err == nil || !strings.Contains(err.Error(), column) {
+				t.Fatalf("Check() error = %v, want missing %s", err, column)
+			}
+		})
+	}
+}
+
+func TestCheckRejectsInvalidQUICEngineRelations(t *testing.T) {
+	tests := []struct {
+		name      string
+		overrides map[string]string
+		want      string
+	}{
+		{name: "lost exceeds sent", overrides: map[string]string{"quic_packets_sent": "4", "quic_packets_lost": "5"}, want: "quic_packets_lost"},
+		{name: "recovery exceeds wire", overrides: map[string]string{"quic_wire_bytes_sent": "100", "quic_recovery_wire_bytes": "101"}, want: "quic_recovery_wire_bytes"},
+		{name: "sender stream bytes short", overrides: map[string]string{"quic_stream_bytes_sent": "1023"}, want: "quic_stream_bytes_sent"},
+		{name: "invalid GSO state", overrides: map[string]string{"quic_native_gso": "maybe"}, want: "quic_native_gso"},
+		{name: "invalid receive batch state", overrides: map[string]string{"quic_native_receive_batch": "maybe"}, want: "quic_native_receive_batch"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			trace := testQUICEngineTrace(t, RoleSend, test.overrides)
+			_, err := Check(strings.NewReader(trace), Options{
+				Role: RoleSend, ExpectedBytes: 1024, ExpectedBytesSet: true,
+				ExpectedPayloadBytes: 1024, ExpectedPayloadBytesSet: true,
+				RequireDirectTransport: "quic", RequireFilePayloadEngine: FilePayloadEngineQUIC,
+				RequireEngineTelemetry: true,
+			})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Check() error = %v, want %s relation failure", err, test.want)
+			}
+		})
+	}
+}
+
+func TestCheckAcceptsHealthyZeroLossQUICEngineTelemetry(t *testing.T) {
+	trace := testQUICEngineTrace(t, RoleReceive, map[string]string{
+		"file_source_read_calls":       "0",
+		"file_source_read_bytes":       "0",
+		"quic_stream_bytes_sent":       "0",
+		"quic_stream_bytes_received":   "1024",
+		"file_payload_bytes_committed": "1024",
+		"file_payload_bytes_quic":      "1024",
+	})
+	_, err := Check(strings.NewReader(trace), Options{
+		Role: RoleReceive, ExpectedBytes: 1024, ExpectedBytesSet: true,
+		ExpectedPayloadBytes: 1024, ExpectedPayloadBytesSet: true,
+		RequireDirectTransport: "quic", RequireFilePayloadEngine: FilePayloadEngineQUIC,
+		RequireEngineTelemetry: true,
+	})
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+}
+
+func TestCheckRejectsQUICPayloadWithoutMechanismEvidence(t *testing.T) {
+	trace := testQUICEngineTrace(t, RoleSend, map[string]string{
+		"quic_handshake_ms":      "0",
+		"quic_first_byte_ms":     "0",
+		"quic_smoothed_rtt_ms":   "0",
+		"quic_packets_sent":      "0",
+		"quic_packets_received":  "0",
+		"quic_wire_bytes_sent":   "0",
+		"quic_stream_bytes_sent": "1024",
+		"file_source_read_calls": "1",
+		"file_source_read_bytes": "1024",
+	})
+	_, err := Check(strings.NewReader(trace), Options{
+		Role: RoleSend, ExpectedBytes: 1024, ExpectedBytesSet: true,
+		ExpectedPayloadBytes: 1024, ExpectedPayloadBytesSet: true,
+		RequireDirectTransport: "quic", RequireFilePayloadEngine: FilePayloadEngineQUIC,
+		RequireEngineTelemetry: true,
+	})
+	if err == nil {
+		t.Fatal("QUIC payload with no timing, packet, or wire evidence accepted")
+	}
+}
+
+func TestCheckRequiresCompleteBulkEngineTelemetry(t *testing.T) {
+	common := []string{
+		"file_source_read_calls", "file_source_read_bytes",
+		"bulk_candidate_id", "bulk_native_send_attempts", "bulk_native_send_syscalls",
+		"bulk_gso_messages", "bulk_logical_datagrams", "bulk_accepted_payload_bytes",
+		"bulk_gso_segments_per_message", "bulk_batch_backend", "bulk_gso_attempted",
+		"bulk_gso_active", "bulk_gso_segments", "bulk_probe_selected_mbps",
+		"bulk_probe_duration_ms", "bulk_probe_trains", "bulk_probe_sent_datagrams",
+		"bulk_probe_received_datagrams", "bulk_probe_loss_ppm", "bulk_probe_pressure",
+	}
+	required := map[Role][]string{
+		RoleSend: append(append([]string{}, common...),
+			"bulk_send_calls", "bulk_send_datagrams", "bulk_max_send_batch", "bulk_crypto_queue_peak",
+			"bulk_lane_queue_peak", "local_enobufs_retries", "local_enobufs_wait_us",
+			"local_enobufs_max_consecutive", "repair_queue_bytes", "peer_recv_queue_depth",
+			"peer_recv_queue_depth_max", "retransmits", "repair_requests", "repair_bytes"),
+		RoleReceive: append(append([]string{}, common...),
+			"bulk_receive_calls", "bulk_receive_datagrams", "bulk_max_receive_batch", "bulk_crypto_queue_peak",
+			"bulk_writer_queue_peak", "bulk_receive_queue_peak", "bulk_decrypt_batches", "bulk_decrypt_datagrams",
+			"repair_requests", "missing_scan_checks", "pending_missing", "pending_missing_peak",
+			"repair_requested_packets", "repair_request_batches", "reorder_trail_packets", "receive_packet_rate_pps"),
+	}
+	for role, columns := range required {
+		for _, column := range columns {
+			t.Run(string(role)+"/"+column, func(t *testing.T) {
+				trace := testBulkEngineTrace(t, role, map[string]string{column: ""})
+				_, err := Check(strings.NewReader(trace), testBulkEngineOptions(role))
+				if err == nil || !strings.Contains(err.Error(), column) {
+					t.Fatalf("Check() error = %v, want missing %s", err, column)
+				}
+			})
+		}
+	}
+}
+
+func TestCheckAcceptsHealthyZeroBulkReceiverTelemetry(t *testing.T) {
+	trace := testBulkEngineTrace(t, RoleReceive, nil)
+	if _, err := Check(strings.NewReader(trace), testBulkEngineOptions(RoleReceive)); err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+}
+
+func TestCheckRejectsInvalidBulkEngineRelations(t *testing.T) {
+	tests := []struct {
+		name      string
+		role      Role
+		overrides map[string]string
+		want      string
+	}{
+		{name: "attempts below syscalls", role: RoleSend, overrides: map[string]string{"bulk_native_send_attempts": "1", "bulk_native_send_syscalls": "2"}, want: "bulk_native_send_attempts"},
+		{name: "syscalls below successful calls", role: RoleSend, overrides: map[string]string{"bulk_native_send_syscalls": "1", "bulk_send_calls": "2"}, want: "bulk_native_send_syscalls"},
+		{name: "accepted payload short", role: RoleSend, overrides: map[string]string{"bulk_accepted_payload_bytes": "1023"}, want: "bulk_accepted_payload_bytes"},
+		{name: "logical datagrams below calls", role: RoleSend, overrides: map[string]string{"bulk_logical_datagrams": "1", "bulk_send_calls": "2"}, want: "bulk_logical_datagrams"},
+		{name: "active GSO without messages", role: RoleSend, overrides: map[string]string{"bulk_gso_messages": "0"}, want: "bulk_gso_messages"},
+		{name: "active GSO without accepted segments", role: RoleSend, overrides: map[string]string{"bulk_gso_segments": "0"}, want: "bulk_gso_segments"},
+		{name: "active GSO without segments", role: RoleSend, overrides: map[string]string{"bulk_gso_segments_per_message": "0"}, want: "bulk_gso_segments_per_message"},
+		{name: "probe receives more than sent", role: RoleSend, overrides: map[string]string{"bulk_probe_sent_datagrams": "9", "bulk_probe_received_datagrams": "10"}, want: "bulk_probe_received_datagrams"},
+		{name: "sender repair requests negative", role: RoleSend, overrides: map[string]string{"repair_requests": "-1"}, want: "repair"},
+		{name: "receiver repair requests negative", role: RoleReceive, overrides: map[string]string{"repair_requests": "-1"}, want: "repair"},
+		{name: "pending missing exceeds peak", role: RoleReceive, overrides: map[string]string{"pending_missing": "2", "pending_missing_peak": "1"}, want: "pending_missing"},
+		{name: "receiver invents attempts", role: RoleReceive, overrides: map[string]string{"bulk_native_send_attempts": "1"}, want: "receiver bulk native send counters"},
+		{name: "receiver invents accepted payload", role: RoleReceive, overrides: map[string]string{"bulk_accepted_payload_bytes": "1"}, want: "receiver bulk native send counters"},
+		{name: "receiver invents GSO segments", role: RoleReceive, overrides: map[string]string{"bulk_gso_segments": "1"}, want: "receiver bulk native send counters"},
+		{name: "receiver invents successful sends", role: RoleReceive, overrides: map[string]string{"bulk_send_calls": "1"}, want: "receiver bulk native send counters"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			trace := testBulkEngineTrace(t, test.role, test.overrides)
+			_, err := Check(strings.NewReader(trace), testBulkEngineOptions(test.role))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Check() error = %v, want %s relation failure", err, test.want)
+			}
+		})
+	}
+}
+
+func testBulkEngineOptions(role Role) Options {
+	return Options{
+		Role: role, ExpectedBytes: 1024, ExpectedBytesSet: true,
+		ExpectedPayloadBytes: 1024, ExpectedPayloadBytesSet: true,
+		RequireDirectTransport: "udp", RequireFilePayloadEngine: FilePayloadEngineBulk,
+		RequireEngineTelemetry: true,
+	}
+}
+
+func testBulkEngineTrace(t *testing.T, role Role, overrides map[string]string) string {
+	t.Helper()
+	values := map[string]string{
+		"timestamp_unix_ms": "1000", "role": string(role), "phase": "complete", "app_bytes": "1024",
+		"last_error": "", "direct_validated": "true", "last_state": "stream-complete", "direct_transport": "udp",
+		"file_payload_engine": string(FilePayloadEngineBulk), "file_payload_bytes_committed": "0",
+		"file_payload_bytes_bulk": "0", "file_payload_bytes_quic": "0", "file_payload_lane_addrs": `["203.0.113.10:41000"]`,
+		"file_source_read_calls": "1", "file_source_read_bytes": "1024", "bulk_candidate_id": "combined-gso3",
+		"bulk_native_send_attempts": "2", "bulk_native_send_syscalls": "2", "bulk_gso_messages": "1",
+		"bulk_logical_datagrams": "8", "bulk_accepted_payload_bytes": "1024", "bulk_gso_segments_per_message": "3",
+		"bulk_batch_backend": "linux-gso", "bulk_gso_attempted": "true", "bulk_gso_active": "true",
+		"bulk_gso_segments": "8", "bulk_send_calls": "2", "bulk_send_datagrams": "8", "bulk_receive_calls": "0",
+		"bulk_receive_datagrams": "0", "bulk_max_send_batch": "8", "bulk_max_receive_batch": "0",
+		"bulk_crypto_queue_peak": "0", "bulk_writer_queue_peak": "0", "bulk_lane_queue_peak": "0",
+		"bulk_receive_queue_peak": "0", "bulk_decrypt_batches": "0", "bulk_decrypt_datagrams": "0",
+		"bulk_probe_selected_mbps": "2160", "bulk_probe_duration_ms": "250", "bulk_probe_trains": "5",
+		"bulk_probe_sent_datagrams": "100", "bulk_probe_received_datagrams": "99", "bulk_probe_loss_ppm": "10000",
+		"bulk_probe_pressure": "false", "local_enobufs_retries": "0", "local_enobufs_wait_us": "0",
+		"local_enobufs_max_consecutive": "0", "repair_queue_bytes": "0", "peer_recv_queue_depth": "0",
+		"peer_recv_queue_depth_max": "0", "retransmits": "0", "repair_requests": "0", "repair_bytes": "0",
+		"missing_scan_checks": "0", "pending_missing": "0", "pending_missing_peak": "0",
+		"repair_requested_packets": "0", "repair_request_batches": "0", "reorder_trail_packets": "0",
+		"receive_packet_rate_pps": "100",
+	}
+	if role == RoleReceive {
+		values["file_payload_bytes_committed"] = "1024"
+		values["file_payload_bytes_bulk"] = "1024"
+		values["file_source_read_calls"] = "0"
+		values["file_source_read_bytes"] = "0"
+		values["bulk_native_send_attempts"] = "0"
+		values["bulk_native_send_syscalls"] = "0"
+		values["bulk_gso_messages"] = "0"
+		values["bulk_logical_datagrams"] = "0"
+		values["bulk_accepted_payload_bytes"] = "0"
+		values["bulk_gso_segments_per_message"] = "0"
+		values["bulk_batch_backend"] = "linux-recvmmsg"
+		values["bulk_gso_attempted"] = "false"
+		values["bulk_gso_active"] = "false"
+		values["bulk_gso_segments"] = "0"
+		values["bulk_send_calls"] = "0"
+		values["bulk_send_datagrams"] = "0"
+		values["bulk_max_send_batch"] = "0"
+		values["bulk_receive_calls"] = "2"
+		values["bulk_receive_datagrams"] = "8"
+		values["bulk_max_receive_batch"] = "4"
+		values["bulk_decrypt_batches"] = "2"
+		values["bulk_decrypt_datagrams"] = "8"
+	}
+	for name, value := range overrides {
+		values[name] = value
+	}
+	var body bytes.Buffer
+	w := csv.NewWriter(&body)
+	if err := w.Write(Header); err != nil {
+		t.Fatal(err)
+	}
+	row := make([]string, len(Header))
+	for index, column := range Header {
+		row[index] = values[column]
+	}
+	if err := w.Write(row); err != nil {
+		t.Fatal(err)
+	}
+	w.Flush()
+	if err := w.Error(); err != nil {
+		t.Fatal(err)
+	}
+	return body.String()
+}
+
+func testQUICEngineTrace(t *testing.T, role Role, overrides map[string]string) string {
+	t.Helper()
+	columns := []string{
+		"timestamp_unix_ms", "role", "phase", "app_bytes", "last_error", "direct_validated", "last_state", "direct_transport",
+		"file_payload_engine", "file_payload_bytes_committed", "file_payload_bytes_bulk", "file_payload_bytes_quic", "file_payload_lane_addrs",
+		"quic_connections", "quic_streams", "quic_telemetry_present", "quic_version", "quic_raw_socket_backend", "quic_native_send_backend", "quic_native_receive_backend",
+		"quic_handshake_ms", "quic_first_byte_ms", "quic_smoothed_rtt_ms", "quic_packets_sent", "quic_packets_received", "quic_packets_lost",
+		"quic_wire_bytes_sent", "quic_recovery_wire_bytes", "quic_recovery_ratio", "quic_stream_bytes_sent", "quic_stream_bytes_received", "quic_close_reason",
+		"quic_native_gso", "quic_native_receive_batch", "file_source_read_calls", "file_source_read_bytes",
+	}
+	values := map[string]string{
+		"timestamp_unix_ms": "1000", "role": string(role), "phase": "complete", "app_bytes": "1024", "last_error": "",
+		"direct_validated": "true", "last_state": "stream-complete", "direct_transport": "quic",
+		"file_payload_engine": string(FilePayloadEngineQUIC), "file_payload_bytes_committed": "0", "file_payload_bytes_bulk": "0", "file_payload_bytes_quic": "0",
+		"file_payload_lane_addrs": `["203.0.113.10:41000"]`, "quic_connections": "1", "quic_streams": "1", "quic_telemetry_present": "true", "quic_version": "v1",
+		"quic_raw_socket_backend": "quic-go-oob", "quic_native_send_backend": "udp-gso-or-sendmsg", "quic_native_receive_backend": "udp-recvmmsg",
+		"quic_handshake_ms": "1", "quic_first_byte_ms": "2", "quic_smoothed_rtt_ms": "3", "quic_packets_sent": "10", "quic_packets_received": "8", "quic_packets_lost": "0",
+		"quic_wire_bytes_sent": "12000", "quic_recovery_wire_bytes": "0", "quic_recovery_ratio": "0", "quic_stream_bytes_sent": "1024", "quic_stream_bytes_received": "0",
+		"quic_close_reason": "complete", "quic_native_gso": "false", "quic_native_receive_batch": "true", "file_source_read_calls": "1", "file_source_read_bytes": "1024",
+	}
+	for name, value := range overrides {
+		values[name] = value
+	}
+	var body bytes.Buffer
+	w := csv.NewWriter(&body)
+	if err := w.Write(columns); err != nil {
+		t.Fatal(err)
+	}
+	row := make([]string, len(columns))
+	for i, column := range columns {
+		row[i] = values[column]
+	}
+	if err := w.Write(row); err != nil {
+		t.Fatal(err)
+	}
+	w.Flush()
+	if err := w.Error(); err != nil {
+		t.Fatal(err)
+	}
+	return body.String()
+}
+
 func TestCheckRequiresUDPDirectTransport(t *testing.T) {
 	csvText := HeaderLine + "\n" + testTraceRow(testTraceRowConfig{
 		timestampMS:     1000,
@@ -586,6 +898,118 @@ func TestCheckForbidsRelayPayload(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "relay payload bytes = 1, want 0") {
 		t.Fatalf("Check() error = %v, want relay payload rejection", err)
+	}
+}
+
+func TestCheckRequiresExactReceiverFilePayloadAccounting(t *testing.T) {
+	wantBytes := strconv.FormatInt(3<<30, 10)
+	trace := testBulkEngineTrace(t, RoleReceive, map[string]string{
+		"app_bytes":                    wantBytes,
+		"file_payload_bytes_committed": wantBytes,
+		"file_payload_bytes_bulk":      wantBytes,
+	})
+	result, err := Check(strings.NewReader(trace), Options{
+		Role:                       RoleReceive,
+		ExpectedPayloadBytes:       3 << 30,
+		ExpectedPayloadBytesSet:    true,
+		RequireFilePayloadEngine:   FilePayloadEngineBulk,
+		RequireEngineTelemetry:     true,
+		ExpectedSelectedPublicIPv4: "203.0.113.10",
+	})
+	if err != nil || result.FinalFilePayloadBytes != 3<<30 {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+	if result.FinalFilePayloadEngine != FilePayloadEngineBulk || result.FinalFilePayloadBytesBulk != 3<<30 || result.FinalFilePayloadBytesQUIC != 0 {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestCheckRejectsWrongFilePayloadEngineCounter(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		committed int64
+		bulk      int64
+		quic      int64
+	}{
+		{name: "committed mismatch", committed: 4095, bulk: 4096},
+		{name: "sum mismatch", committed: 4096, bulk: 4095},
+		{name: "other engine nonzero", committed: 4096, bulk: 4095, quic: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			trace := testTraceWithFilePayload(RoleReceive, FilePayloadEngineBulk, 4096, tt.committed, tt.bulk, tt.quic, `["203.0.113.10:41000"]`)
+			_, err := Check(strings.NewReader(trace), Options{
+				Role: RoleReceive, ExpectedPayloadBytes: 4096, ExpectedPayloadBytesSet: true,
+				RequireFilePayloadEngine: FilePayloadEngineBulk,
+			})
+			if err == nil {
+				t.Fatal("invalid file payload accounting accepted")
+			}
+		})
+	}
+}
+
+func TestCheckRejectsSenderOwnedFilePayloadCounters(t *testing.T) {
+	trace := testTraceWithFilePayload(RoleSend, FilePayloadEngineBulk, 4096, 1, 1, 0, `["203.0.113.10:41000"]`)
+	_, err := Check(strings.NewReader(trace), Options{
+		Role: RoleSend, ExpectedPayloadBytes: 4096, ExpectedPayloadBytesSet: true,
+		RequireFilePayloadEngine: FilePayloadEngineBulk,
+	})
+	if err == nil {
+		t.Fatal("sender-owned committed payload accepted")
+	}
+}
+
+func TestCheckRejectsSenderOwnedFilePayloadCountersWithoutExpectedSize(t *testing.T) {
+	trace := testTraceWithFilePayload(RoleSend, FilePayloadEngineBulk, 4096, 1, 1, 0, `["203.0.113.10:41000"]`)
+	_, err := Check(strings.NewReader(trace), Options{Role: RoleSend, RequireFilePayloadEngine: FilePayloadEngineBulk})
+	if err == nil {
+		t.Fatal("sender-owned committed payload accepted without expected size")
+	}
+}
+
+func TestCheckRequiresObservedFilePayloadZeroCounters(t *testing.T) {
+	trace := "timestamp_unix_ms,role,phase,app_bytes,last_error,file_payload_engine\n" +
+		"1000,send,complete,0,,bulk-packets-v1\n"
+	_, err := Check(strings.NewReader(trace), Options{Role: RoleSend, RequireFilePayloadEngine: FilePayloadEngineBulk})
+	if err == nil || !strings.Contains(err.Error(), "missing observed") {
+		t.Fatalf("Check() error = %v, want missing observed zero counter", err)
+	}
+}
+
+func TestCheckRejectsUnexpectedOrNonPublicLane(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		lanes string
+	}{
+		{name: "unexpected", lanes: `["198.51.100.20:42000"]`},
+		{name: "private", lanes: `["10.0.0.8:42000"]`},
+		{name: "link local", lanes: `["169.254.1.8:42000"]`},
+		{name: "cgnat", lanes: `["100.100.1.8:42000"]`},
+		{name: "ula", lanes: `["[fd00::8]:42000"]`},
+		{name: "multicast", lanes: `["224.0.0.8:42000"]`},
+		{name: "duplicate", lanes: `["203.0.113.10:41000","203.0.113.10:41000"]`},
+		{name: "malformed json", lanes: `203.0.113.10:41000`},
+		{name: "malformed address", lanes: `["not-an-address"]`},
+		{name: "empty", lanes: `[]`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			trace := testTraceWithFilePayload(RoleReceive, FilePayloadEngineBulk, 4096, 4096, 4096, 0, tt.lanes)
+			_, err := Check(strings.NewReader(trace), Options{
+				Role: RoleReceive, ExpectedPayloadBytes: 4096, ExpectedPayloadBytesSet: true,
+				RequireFilePayloadEngine: FilePayloadEngineBulk, ExpectedSelectedPublicIPv4: "203.0.113.10",
+			})
+			if err == nil {
+				t.Fatal("invalid selected lane accepted")
+			}
+		})
+	}
+}
+
+func TestCheckPairRejectsEngineDisagreement(t *testing.T) {
+	send := testTraceWithFilePayload(RoleSend, FilePayloadEngineQUIC, 4096, 0, 0, 0, `["203.0.113.10:41000"]`)
+	receive := testTraceWithFilePayload(RoleReceive, FilePayloadEngineBulk, 4096, 4096, 4096, 0, `["198.51.100.20:42000"]`)
+	if _, err := CheckPair(strings.NewReader(send), strings.NewReader(receive), PairOptions{Role: RoleSend}); err == nil {
+		t.Fatal("engine disagreement accepted")
 	}
 }
 
@@ -1099,6 +1523,14 @@ type testTraceRowConfig struct {
 	quicBytesSent                  int64
 	quicGoodputMbps                string
 	quicCloseReason                string
+	filePayloadEngine              FilePayloadEngine
+	filePayloadBytesCommitted      int64
+	filePayloadBytesBulk           int64
+	filePayloadBytesQUIC           int64
+	filePayloadLaneAddresses       string
+	fileSourceTelemetry            bool
+	fileSourceReadCalls            uint64
+	fileSourceReadBytes            uint64
 }
 
 func padLegacyTraceRow(row string) string {
@@ -1161,7 +1593,51 @@ func testTraceRow(cfg testTraceRowConfig) string {
 	set("quic_stream_bytes_sent", formatTestOptionalInt64(cfg.quicBytesSent))
 	set("quic_stream_goodput_mbps", cfg.quicGoodputMbps)
 	set("quic_close_reason", cfg.quicCloseReason)
-	return strings.Join(fields, ",") + "\n"
+	engine := cfg.filePayloadEngine
+	if engine == "" {
+		engine = FilePayloadEngineBulk
+	}
+	set("file_payload_engine", string(engine))
+	set("file_payload_bytes_committed", strconv.FormatInt(cfg.filePayloadBytesCommitted, 10))
+	set("file_payload_bytes_bulk", strconv.FormatInt(cfg.filePayloadBytesBulk, 10))
+	set("file_payload_bytes_quic", strconv.FormatInt(cfg.filePayloadBytesQUIC, 10))
+	lanes := cfg.filePayloadLaneAddresses
+	if lanes == "" {
+		lanes = "[]"
+	}
+	set("file_payload_lane_addrs", lanes)
+	if cfg.fileSourceTelemetry {
+		set("file_source_read_calls", strconv.FormatUint(cfg.fileSourceReadCalls, 10))
+		set("file_source_read_bytes", strconv.FormatUint(cfg.fileSourceReadBytes, 10))
+	}
+	var row bytes.Buffer
+	w := csv.NewWriter(&row)
+	if err := w.Write(fields); err != nil {
+		panic(err)
+	}
+	w.Flush()
+	if err := w.Error(); err != nil {
+		panic(err)
+	}
+	return row.String()
+}
+
+func testTraceWithFilePayload(role Role, engine FilePayloadEngine, appBytes, committed, bulk, quic int64, lanes string) string {
+	peerReceived := int64(0)
+	if role == RoleSend {
+		peerReceived = appBytes
+	}
+	readCalls, readBytes := uint64(0), uint64(0)
+	if role == RoleSend {
+		readCalls, readBytes = 1, uint64(appBytes)
+	}
+	return HeaderLine + "\n" + testTraceRow(testTraceRowConfig{
+		timestampMS: 1000, role: role, phase: PhaseComplete, appBytes: appBytes, deltaAppBytes: appBytes,
+		peerReceivedBytes: peerReceived, transferElapsedMS: 500, directValidated: true, lastState: "stream-complete",
+		filePayloadEngine: engine, filePayloadBytesCommitted: committed, filePayloadBytesBulk: bulk,
+		filePayloadBytesQUIC: quic, filePayloadLaneAddresses: lanes,
+		fileSourceTelemetry: true, fileSourceReadCalls: readCalls, fileSourceReadBytes: readBytes,
+	})
 }
 
 func formatTestOptionalInt(value int) string {

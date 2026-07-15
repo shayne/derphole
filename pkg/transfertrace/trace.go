@@ -22,6 +22,25 @@ const (
 	RoleReceive Role = "receive"
 )
 
+type FilePayloadEngine string
+
+const (
+	FilePayloadEngineBulk FilePayloadEngine = "bulk-packets-v1"
+	FilePayloadEngineQUIC FilePayloadEngine = "quic-blocks-v1"
+)
+
+func (e FilePayloadEngine) Valid() bool {
+	return e == FilePayloadEngineBulk || e == FilePayloadEngineQUIC
+}
+
+func ParseFilePayloadEngine(value string) (FilePayloadEngine, error) {
+	engine := FilePayloadEngine(value)
+	if !engine.Valid() {
+		return "", fmt.Errorf("invalid file payload engine %q", value)
+	}
+	return engine, nil
+}
+
 type Phase string
 
 const (
@@ -93,14 +112,30 @@ var header = [...]string{
 	"direct_packet_bytes",
 	"direct_committed_bytes",
 	"direct_transport",
+	"quic_connections",
+	"quic_streams",
+	"quic_telemetry_present",
+	"quic_version",
+	"quic_raw_socket_backend",
+	"quic_native_send_backend",
+	"quic_native_receive_backend",
 	"quic_handshake_ms",
 	"quic_first_byte_ms",
+	"quic_smoothed_rtt_ms",
+	"quic_packets_sent",
+	"quic_packets_received",
+	"quic_packets_lost",
+	"quic_wire_bytes_sent",
+	"quic_recovery_wire_bytes",
+	"quic_recovery_ratio",
 	"quic_stream_bytes_sent",
 	"quic_stream_bytes_received",
 	"quic_stream_goodput_mbps",
-	"quic_smoothed_rtt_ms",
-	"quic_loss_events",
 	"quic_close_reason",
+	"quic_native_gso",
+	"quic_native_receive_batch",
+	"file_source_read_calls",
+	"file_source_read_bytes",
 	"missing_scan_checks",
 	"pending_missing",
 	"pending_missing_peak",
@@ -108,6 +143,18 @@ var header = [...]string{
 	"repair_request_batches",
 	"reorder_trail_packets",
 	"receive_packet_rate_pps",
+	"file_payload_engine",
+	"file_payload_bytes_committed",
+	"file_payload_bytes_bulk",
+	"file_payload_bytes_quic",
+	"file_payload_lane_addrs",
+	"bulk_candidate_id",
+	"bulk_native_send_attempts",
+	"bulk_native_send_syscalls",
+	"bulk_gso_messages",
+	"bulk_logical_datagrams",
+	"bulk_accepted_payload_bytes",
+	"bulk_gso_segments_per_message",
 	"bulk_batch_backend",
 	"bulk_gso_attempted",
 	"bulk_gso_active",
@@ -181,50 +228,78 @@ type Snapshot struct {
 	StripedReceivePendingBytes     int64
 	StripedReceivePendingBytesMax  int64
 
-	DirectPacketBytes          int64
-	DirectCommittedBytes       int64
-	DirectTransport            string
-	QUICHandshakeMS            int64
-	QUICFirstByteMS            int64
-	QUICStreamBytesSent        int64
-	QUICStreamBytesReceived    int64
-	QUICStreamGoodputMbps      string
-	QUICSmoothedRTTMS          string
-	QUICLossEvents             int64
-	QUICCloseReason            string
-	MissingScanChecks          uint64
-	PendingMissing             uint32
-	PendingMissingPeak         uint32
-	RepairRequestedPackets     uint64
-	RepairRequestBatches       uint64
-	ReorderTrailPackets        uint32
-	ReceivePacketRatePPS       uint32
-	BulkBatchPresent           bool
-	BulkBatchBackend           string
-	BulkGSOAttempted           bool
-	BulkGSOActive              bool
-	BulkGSOSegments            uint64
-	BulkSendCalls              uint64
-	BulkSendDatagrams          uint64
-	BulkReceiveCalls           uint64
-	BulkReceiveDatagrams       uint64
-	BulkMaxSendBatch           uint32
-	BulkMaxReceiveBatch        uint32
-	BulkCryptoQueuePeak        uint32
-	BulkWriterQueuePeak        uint32
-	BulkLaneQueuePeak          uint32
-	BulkReceiveQueuePeak       uint32
-	BulkDecryptBatches         uint64
-	BulkDecryptDatagrams       uint64
-	BulkProbeSelectedMbps      int
-	BulkProbeDurationMS        int64
-	BulkProbeTrains            uint32
-	BulkProbeSentDatagrams     uint64
-	BulkProbeReceivedDatagrams uint64
-	BulkProbeLossPPM           uint64
-	BulkProbePressure          bool
-	LastState                  string
-	LastError                  string
+	DirectPacketBytes              int64
+	DirectCommittedBytes           int64
+	DirectTransport                string
+	QUICTelemetryPresent           bool
+	QUICConnections                uint32
+	QUICStreams                    uint32
+	QUICVersion                    string
+	QUICRawSocketBackend           string
+	QUICNativeSendBackend          string
+	QUICNativeReceiveBackend       string
+	QUICHandshakeMS                int64
+	QUICFirstByteMS                int64
+	QUICSmoothedRTTMS              string
+	QUICPacketsSent                uint64
+	QUICPacketsReceived            uint64
+	QUICPacketsLost                uint64
+	QUICWireBytesSent              uint64
+	QUICRecoveryWireBytes          uint64
+	QUICRecoveryRatio              string
+	QUICStreamBytesSent            int64
+	QUICStreamBytesReceived        int64
+	QUICStreamGoodputMbps          string
+	QUICCloseReason                string
+	QUICNativeGSO                  string
+	QUICNativeReceiveBatch         string
+	FileSourceReadCalls            uint64
+	FileSourceReadBytes            uint64
+	MissingScanChecks              uint64
+	PendingMissing                 uint32
+	PendingMissingPeak             uint32
+	RepairRequestedPackets         uint64
+	RepairRequestBatches           uint64
+	ReorderTrailPackets            uint32
+	ReceivePacketRatePPS           uint32
+	FilePayloadEngine              FilePayloadEngine
+	FilePayloadBytesCommitted      int64
+	FilePayloadBytesBulk           int64
+	FilePayloadBytesQUIC           int64
+	FilePayloadLaneAddresses       string
+	BulkBatchPresent               bool
+	BulkCandidateID                string
+	BulkNativeSendAttempts         uint64
+	BulkNativeSendSyscalls         uint64
+	BulkNativeGSOMessages          uint64
+	BulkLogicalDatagrams           uint64
+	BulkNativeAcceptedPayloadBytes uint64
+	BulkGSOSegmentsPerMessage      uint32
+	BulkBatchBackend               string
+	BulkGSOAttempted               bool
+	BulkGSOActive                  bool
+	BulkGSOSegments                uint64
+	BulkSendCalls                  uint64
+	BulkSendDatagrams              uint64
+	BulkReceiveCalls               uint64
+	BulkReceiveDatagrams           uint64
+	BulkMaxSendBatch               uint32
+	BulkMaxReceiveBatch            uint32
+	BulkCryptoQueuePeak            uint32
+	BulkWriterQueuePeak            uint32
+	BulkLaneQueuePeak              uint32
+	BulkReceiveQueuePeak           uint32
+	BulkDecryptBatches             uint64
+	BulkDecryptDatagrams           uint64
+	BulkProbeSelectedMbps          int
+	BulkProbeDurationMS            int64
+	BulkProbeTrains                uint32
+	BulkProbeSentDatagrams         uint64
+	BulkProbeReceivedDatagrams     uint64
+	BulkProbeLossPPM               uint64
+	BulkProbePressure              bool
+	LastState                      string
+	LastError                      string
 }
 
 type Recorder struct {
@@ -455,7 +530,7 @@ func (r *Recorder) row(snap Snapshot, deltaBytes int64, deltaMS int64, localSent
 		snap.DirectProbeState,
 		snap.DirectProbeSummary,
 		formatOptionalUint64(snap.ReplayWindowBytes),
-		formatOptionalUint64(snap.RepairQueueBytes),
+		formatOptionalOrPresentUint64(snap.RepairQueueBytes, snap.BulkBatchPresent),
 		formatOptionalInt64(snap.RetransmitCount),
 		formatOptionalUint64(snap.OutOfOrderBytes),
 		snap.LastState,
@@ -474,14 +549,14 @@ func (r *Recorder) row(snap Snapshot, deltaBytes int64, deltaMS int64, localSent
 		receiveGoodput,
 		receiverCommittedGoodput,
 		formatOptionalUint64(snap.ReplayBytes),
-		formatOptionalInt64(snap.RetransmitCount),
-		formatOptionalInt64(snap.RepairRequests),
-		formatOptionalInt64(snap.RepairBytes),
-		formatOptionalInt64(snap.LocalENOBUFSRetries),
-		formatOptionalInt64(snap.LocalENOBUFSWaitUS),
-		formatOptionalInt64(snap.LocalENOBUFSMaxConsecutive),
-		formatOptionalInt(snap.PeerRecvQueueDepth),
-		formatOptionalInt(snap.PeerRecvQueueDepthMax),
+		formatOptionalOrPresentInt64(snap.RetransmitCount, snap.BulkBatchPresent),
+		formatOptionalOrPresentInt64(snap.RepairRequests, snap.BulkBatchPresent),
+		formatOptionalOrPresentInt64(snap.RepairBytes, snap.BulkBatchPresent),
+		formatOptionalOrPresentInt64(snap.LocalENOBUFSRetries, snap.BulkBatchPresent),
+		formatOptionalOrPresentInt64(snap.LocalENOBUFSWaitUS, snap.BulkBatchPresent),
+		formatOptionalOrPresentInt64(snap.LocalENOBUFSMaxConsecutive, snap.BulkBatchPresent),
+		formatOptionalOrPresentInt(snap.PeerRecvQueueDepth, snap.BulkBatchPresent),
+		formatOptionalOrPresentInt(snap.PeerRecvQueueDepthMax, snap.BulkBatchPresent),
 		strconv.FormatInt(snap.StripedSendBlockedMS, 10),
 		strconv.Itoa(snap.StripedReceivePendingChunks),
 		strconv.Itoa(snap.StripedReceivePendingChunksMax),
@@ -490,14 +565,10 @@ func (r *Recorder) row(snap Snapshot, deltaBytes int64, deltaMS int64, localSent
 		formatOptionalInt64(snap.DirectPacketBytes),
 		formatOptionalInt64(snap.DirectCommittedBytes),
 		snap.DirectTransport,
-		formatOptionalInt64(snap.QUICHandshakeMS),
-		formatOptionalInt64(snap.QUICFirstByteMS),
-		formatOptionalInt64(snap.QUICStreamBytesSent),
-		formatOptionalInt64(snap.QUICStreamBytesReceived),
-		snap.QUICStreamGoodputMbps,
-		snap.QUICSmoothedRTTMS,
-		formatOptionalInt64(snap.QUICLossEvents),
-		snap.QUICCloseReason,
+	}
+	row = append(row, quicTraceColumns(snap)...)
+	row = append(row, fileSourceReadTraceColumns(snap)...)
+	row = append(row,
 		strconv.FormatUint(snap.MissingScanChecks, 10),
 		strconv.FormatUint(uint64(snap.PendingMissing), 10),
 		strconv.FormatUint(uint64(snap.PendingMissingPeak), 10),
@@ -505,15 +576,74 @@ func (r *Recorder) row(snap Snapshot, deltaBytes int64, deltaMS int64, localSent
 		strconv.FormatUint(snap.RepairRequestBatches, 10),
 		strconv.FormatUint(uint64(snap.ReorderTrailPackets), 10),
 		strconv.FormatUint(uint64(snap.ReceivePacketRatePPS), 10),
-	}
+		string(snap.FilePayloadEngine),
+		strconv.FormatInt(snap.FilePayloadBytesCommitted, 10),
+		strconv.FormatInt(snap.FilePayloadBytesBulk, 10),
+		strconv.FormatInt(snap.FilePayloadBytesQUIC, 10),
+		snap.FilePayloadLaneAddresses,
+	)
 	return append(row, bulkBatchTraceColumns(snap)...)
+}
+
+func quicTraceColumns(snap Snapshot) []string {
+	if !snap.QUICTelemetryPresent {
+		return make([]string, 22)
+	}
+	return []string{
+		strconv.FormatUint(uint64(snap.QUICConnections), 10),
+		strconv.FormatUint(uint64(snap.QUICStreams), 10),
+		"true",
+		snap.QUICVersion,
+		snap.QUICRawSocketBackend,
+		snap.QUICNativeSendBackend,
+		snap.QUICNativeReceiveBackend,
+		strconv.FormatInt(snap.QUICHandshakeMS, 10),
+		strconv.FormatInt(snap.QUICFirstByteMS, 10),
+		formatPresentDecimal(snap.QUICSmoothedRTTMS),
+		strconv.FormatUint(snap.QUICPacketsSent, 10),
+		strconv.FormatUint(snap.QUICPacketsReceived, 10),
+		strconv.FormatUint(snap.QUICPacketsLost, 10),
+		strconv.FormatUint(snap.QUICWireBytesSent, 10),
+		strconv.FormatUint(snap.QUICRecoveryWireBytes, 10),
+		formatPresentDecimal(snap.QUICRecoveryRatio),
+		strconv.FormatInt(snap.QUICStreamBytesSent, 10),
+		strconv.FormatInt(snap.QUICStreamBytesReceived, 10),
+		formatPresentDecimal(snap.QUICStreamGoodputMbps),
+		snap.QUICCloseReason,
+		snap.QUICNativeGSO,
+		snap.QUICNativeReceiveBatch,
+	}
+}
+
+func fileSourceReadTraceColumns(snap Snapshot) []string {
+	if !snap.FilePayloadEngine.Valid() && snap.FileSourceReadCalls == 0 && snap.FileSourceReadBytes == 0 {
+		return []string{"", ""}
+	}
+	return []string{
+		strconv.FormatUint(snap.FileSourceReadCalls, 10),
+		strconv.FormatUint(snap.FileSourceReadBytes, 10),
+	}
+}
+
+func formatPresentDecimal(value string) string {
+	if value == "" {
+		return "0"
+	}
+	return value
 }
 
 func bulkBatchTraceColumns(snap Snapshot) []string {
 	if !snap.BulkBatchPresent {
-		return make([]string, 23)
+		return make([]string, 30)
 	}
 	return []string{
+		snap.BulkCandidateID,
+		strconv.FormatUint(snap.BulkNativeSendAttempts, 10),
+		strconv.FormatUint(snap.BulkNativeSendSyscalls, 10),
+		strconv.FormatUint(snap.BulkNativeGSOMessages, 10),
+		strconv.FormatUint(snap.BulkLogicalDatagrams, 10),
+		strconv.FormatUint(snap.BulkNativeAcceptedPayloadBytes, 10),
+		strconv.FormatUint(uint64(snap.BulkGSOSegmentsPerMessage), 10),
 		snap.BulkBatchBackend,
 		strconv.FormatBool(snap.BulkGSOAttempted),
 		strconv.FormatBool(snap.BulkGSOActive),
@@ -574,6 +704,27 @@ func formatOptionalUint64(value uint64) string {
 		return ""
 	}
 	return strconv.FormatUint(value, 10)
+}
+
+func formatOptionalOrPresentInt(value int, present bool) string {
+	if present {
+		return strconv.Itoa(value)
+	}
+	return formatOptionalInt(value)
+}
+
+func formatOptionalOrPresentInt64(value int64, present bool) string {
+	if present {
+		return strconv.FormatInt(value, 10)
+	}
+	return formatOptionalInt64(value)
+}
+
+func formatOptionalOrPresentUint64(value uint64, present bool) string {
+	if present {
+		return strconv.FormatUint(value, 10)
+	}
+	return formatOptionalUint64(value)
 }
 
 func headerCopy() []string {

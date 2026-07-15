@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/shayne/derphole/pkg/directquic"
 	"github.com/shayne/derphole/pkg/quicpath"
@@ -369,32 +370,99 @@ func closeEndpointsAndAdapter(endpoints []*directquic.Endpoint, adapter *quicpat
 }
 
 func convertStats(endpoints []*directquic.Endpoint) Stats {
-	if len(endpoints) == 0 || endpoints[0] == nil {
-		return Stats{}
-	}
-	stats := endpoints[0].Stats()
-	for _, endpoint := range endpoints[1:] {
+	var stats Stats
+	endpointCount := 0
+	telemetryComplete := true
+	for _, endpoint := range endpoints {
+		if endpoint == nil {
+			continue
+		}
+		endpointCount++
 		next := endpoint.Stats()
-		stats.BytesSent += next.BytesSent
-		stats.BytesReceived += next.BytesReceived
-		if stats.OpenedAt.IsZero() || (!next.OpenedAt.IsZero() && next.OpenedAt.Before(stats.OpenedAt)) {
-			stats.OpenedAt = next.OpenedAt
-		}
-		if next.ClosedAt.After(stats.ClosedAt) {
-			stats.ClosedAt = next.ClosedAt
-		}
+		telemetryComplete = telemetryComplete && next.TelemetryPresent
+		mergeQUICStats(&stats, next)
 	}
-	return Stats{
-		BytesSent:     stats.BytesSent,
-		BytesReceived: stats.BytesReceived,
-		HandshakeMS:   stats.HandshakeMS,
-		FirstByteMS:   stats.FirstByteMS,
-		OpenedAt:      stats.OpenedAt,
-		HandshakeAt:   stats.HandshakeAt,
-		FirstByteAt:   stats.FirstByteAt,
-		ClosedAt:      stats.ClosedAt,
-		CloseReason:   stats.CloseReason,
+	stats.TelemetryPresent = endpointCount > 0 && telemetryComplete
+	return stats
+}
+
+func mergeQUICStats(stats *Stats, next directquic.Stats) {
+	mergeQUICStatsCounters(stats, next)
+	mergeQUICStatsIdentity(stats, next)
+	mergeQUICStatsTimes(stats, next)
+}
+
+func mergeQUICStatsCounters(stats *Stats, next directquic.Stats) {
+	stats.BytesSent += next.BytesSent
+	stats.BytesReceived += next.BytesReceived
+	stats.Connections += next.Connections
+	stats.Streams += next.Streams
+	stats.PacketsSent += next.PacketsSent
+	stats.PacketsReceived += next.PacketsReceived
+	stats.PacketsLost += next.PacketsLost
+	stats.WireBytesSent += next.WireBytesSent
+	stats.RecoveryWireBytes += next.RecoveryWireBytes
+	stats.StreamBytesSent += next.StreamBytesSent
+	stats.StreamBytesReceived += next.StreamBytesReceived
+	stats.SmoothedRTT = max(stats.SmoothedRTT, next.SmoothedRTT)
+	stats.HandshakeDuration = max(stats.HandshakeDuration, next.HandshakeDuration)
+	stats.FirstByteDuration = max(stats.FirstByteDuration, next.FirstByteDuration)
+	stats.HandshakeMS = max(stats.HandshakeMS, next.HandshakeMS)
+	stats.FirstByteMS = max(stats.FirstByteMS, next.FirstByteMS)
+}
+
+func mergeQUICStatsIdentity(stats *Stats, next directquic.Stats) {
+	stats.Version = mergeQUICIdentity(stats.Version, next.Version)
+	stats.RawSocketBackend = mergeQUICIdentity(stats.RawSocketBackend, next.RawSocketBackend)
+	stats.NativeSendBackend = mergeQUICIdentity(stats.NativeSendBackend, next.NativeSendBackend)
+	stats.NativeReceiveBackend = mergeQUICIdentity(stats.NativeReceiveBackend, next.NativeReceiveBackend)
+	stats.NativeGSO = mergeQUICTriState(stats.NativeGSO, next.NativeGSO)
+	stats.NativeReceiveBatch = mergeQUICTriState(stats.NativeReceiveBatch, next.NativeReceiveBatch)
+	if next.CloseReason != "" {
+		stats.CloseReason = mergeQUICIdentity(stats.CloseReason, next.CloseReason)
 	}
+}
+
+func mergeQUICStatsTimes(stats *Stats, next directquic.Stats) {
+	stats.OpenedAt = earliestQUICTime(stats.OpenedAt, next.OpenedAt)
+	stats.HandshakeAt = earliestQUICTime(stats.HandshakeAt, next.HandshakeAt)
+	stats.FirstByteAt = earliestQUICTime(stats.FirstByteAt, next.FirstByteAt)
+	if next.ClosedAt.After(stats.ClosedAt) {
+		stats.ClosedAt = next.ClosedAt
+	}
+}
+
+func earliestQUICTime(current, next time.Time) time.Time {
+	if current.IsZero() || !next.IsZero() && next.Before(current) {
+		return next
+	}
+	return current
+}
+
+func mergeQUICIdentity(current, next string) string {
+	if current == "" {
+		return next
+	}
+	if next == "" || next == current {
+		return current
+	}
+	return "mixed"
+}
+
+func mergeQUICTriState(current, next string) string {
+	if current == "" {
+		return next
+	}
+	if next == "" || next == current {
+		return current
+	}
+	if current == "true" || next == "true" {
+		return "true"
+	}
+	if current == "unsupported" || next == "unsupported" {
+		return "unsupported"
+	}
+	return "false"
 }
 
 func dialSendStreams(ctx context.Context, paths []packetPath, count int, identity quicpath.SessionIdentity, peer [32]byte) ([]*directquic.Endpoint, []io.WriteCloser, error) {

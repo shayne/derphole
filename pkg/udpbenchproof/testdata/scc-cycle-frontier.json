@@ -1,0 +1,1 @@
+{"candidates":["A","B","C"],"edges":[["A","B"],["B","C"],["C","A"]],"expected":["A","B","C"]}

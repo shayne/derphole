@@ -1,0 +1,1 @@
+{"three":{"candidates":["A","B","C"],"expected":[["A","B","C"],["C","B","A"],["B","C","A"]]},"latin":{"candidates":["A","B","C","D"],"expected":[["A","B","C","D"],["B","C","D","A"],["C","D","A","B"]]}}

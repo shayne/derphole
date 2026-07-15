@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/shayne/derphole/pkg/token"
+	"github.com/shayne/derphole/pkg/transfertrace"
 	"golang.org/x/time/rate"
 	"tailscale.com/types/key"
 )
@@ -264,6 +265,9 @@ func sendExternalV2BulkBlockPacketsWithProbe(ctx context.Context, src *BlockSour
 	if err := validateExternalV2BulkPacketSender(src, path, auth); err != nil {
 		return externalDirectTransferStats{}, err
 	}
+	if err := metrics.SetFilePayloadLaneAddrs(path.Addrs, time.Now()); err != nil {
+		return externalDirectTransferStats{}, err
+	}
 
 	sendCtx, cancel := context.WithCancel(ctx)
 	sender := newExternalV2BulkPacketSender(sendCtx, src, path, auth, metrics)
@@ -296,10 +300,14 @@ func sendExternalV2BulkBlockPacketsWithProbe(ctx context.Context, src *BlockSour
 			sender.batchConns[lane] = newExternalV2BulkPacketBatchConn(path.Conns[lane])
 		}
 	}
-	if len(path.Conns) > sender.laneCount {
-		for lane := range sender.batchConns {
-			enableExternalV2BulkPacketFixedPeerConnect(sender.batchConns[lane])
-		}
+	metrics.SelectFilePayloadEngine(transfertrace.FilePayloadEngineBulk, time.Now())
+	if err := enableExternalV2BulkPacketFixedPeers(path, sender.batchConns, sender.laneCount); err != nil {
+		cancel()
+		deadlineErr := <-writeDeadlineDone
+		<-controlDone
+		disarmExternalV2BulkPacketWriteCancellations(sender.batchConns)
+		cleanupErr := clearExternalV2BulkPacketDeadlines(path)
+		return sender.stats(false), errors.Join(err, deadlineErr, cleanupErr)
 	}
 
 	controllerDone := sender.startController(sendCtx)
@@ -318,6 +326,7 @@ func sendExternalV2BulkBlockPacketsWithProbe(ctx context.Context, src *BlockSour
 	<-controllerDone
 	<-repairDone
 	<-controlDone
+	disarmExternalV2BulkPacketWriteCancellations(sender.batchConns)
 	cleanupErr := clearExternalV2BulkPacketDeadlines(path)
 	return sender.stats(committed), errors.Join(err, deadlineErr, cleanupErr)
 }
@@ -819,6 +828,9 @@ func receiveExternalV2BulkBlockPacketsWithProbe(ctx context.Context, sink BlockR
 	if err := validateExternalV2BulkPacketReceiver(sink, cfg, path, auth); err != nil {
 		return 0, externalDirectTransferStats{}, err
 	}
+	if err := metrics.SetFilePayloadLaneAddrs(path.Addrs, time.Now()); err != nil {
+		return 0, externalDirectTransferStats{}, err
+	}
 
 	receiver := newExternalV2BulkPacketReceiver(sink, cfg, path, auth, metrics)
 	recvCtx, cancel := context.WithCancel(ctx)
@@ -835,6 +847,7 @@ func receiveExternalV2BulkBlockPacketsWithProbe(ctx context.Context, sink BlockR
 		if receiver.grouped && !receiver.groupAssembler.setExpectedRunID(probeResult.RunID) {
 			return receiver.result(errors.New("bulk packet grouped probe did not authenticate a run ID"))
 		}
+		metrics.SelectFilePayloadEngine(transfertrace.FilePayloadEngineBulk, time.Now())
 	}
 
 	dataCh := make(chan externalV2BulkPacketReceiveBatch, externalV2BulkPacketReceiveBatchQueue)
@@ -1049,6 +1062,7 @@ func (r *externalV2BulkPacketReceiver) handleDataResult(result externalV2BulkPac
 			}
 			if r.metrics != nil {
 				r.metrics.RecordDirectPacketReceive(int64(n), now)
+				r.metrics.RecordFilePayloadCommit(transfertrace.FilePayloadEngineBulk, int64(n), now)
 			}
 		}
 		r.receiveRate.observeN(now, 1)
@@ -1104,6 +1118,7 @@ func (r *externalV2BulkPacketReceiver) handleDataBatch(batch externalV2BulkPacke
 			}
 			if r.metrics != nil {
 				r.metrics.RecordDirectPacketReceive(int64(directBytes), now)
+				r.metrics.RecordFilePayloadCommit(transfertrace.FilePayloadEngineBulk, int64(directBytes), now)
 			}
 		}
 		r.receiveRate.observeN(now, accepted)
@@ -1129,6 +1144,7 @@ func (r *externalV2BulkPacketReceiver) handleGroupedDataResultAt(
 	if r.runID == 0 {
 		r.runID = header.runID
 		r.stopHello()
+		r.metrics.SelectFilePayloadEngine(transfertrace.FilePayloadEngineBulk, now)
 	}
 	if header.runID != r.runID || r.seen[firstFragment] {
 		return 0, 0, 0, nil
@@ -1143,6 +1159,7 @@ func (r *externalV2BulkPacketReceiver) handleGroupedDataResultAt(
 		}
 		if r.metrics != nil {
 			r.metrics.RecordDirectPacketReceive(int64(n), now)
+			r.metrics.RecordFilePayloadCommit(transfertrace.FilePayloadEngineBulk, int64(n), now)
 		}
 	}
 	for index := firstFragment; index < firstFragment+fragmentCount; index++ {
@@ -1181,6 +1198,7 @@ func (r *externalV2BulkPacketReceiver) handleDataResultAt(result externalV2BulkP
 	if r.runID == 0 {
 		r.runID = header.runID
 		r.stopHello()
+		r.metrics.SelectFilePayloadEngine(transfertrace.FilePayloadEngineBulk, now)
 	}
 	if header.runID != r.runID || r.seen[header.index] {
 		return false, nil
@@ -1217,6 +1235,9 @@ func (r *externalV2BulkPacketReceiver) handleDataResultAt(result externalV2BulkP
 	}
 	if err != nil {
 		return false, err
+	}
+	if n > 0 && !result.direct {
+		r.metrics.RecordFilePayloadCommit(transfertrace.FilePayloadEngineBulk, int64(n), now)
 	}
 	r.missing.resolve(header.index)
 	r.seen[header.index] = true

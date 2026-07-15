@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/csv"
 	"io"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -79,6 +80,66 @@ func TestRecorderComputesDeltaAndMbps(t *testing.T) {
 	assertColumn(t, row, indexes, "app_mbps", "8.39")
 }
 
+func TestTraceRecordsFilePayloadEngineCounters(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		engine    FilePayloadEngine
+		committed int64
+		bulk      int64
+		quic      int64
+	}{
+		{name: "bulk", engine: FilePayloadEngineBulk, committed: 3 << 30, bulk: 3 << 30},
+		{name: "quic", engine: FilePayloadEngineQUIC, committed: 2 << 30, quic: 2 << 30},
+		{name: "healthy zeroes", engine: FilePayloadEngineBulk},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			rec, err := NewRecorder(&out, RoleReceive, time.Unix(225, 0))
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec.Observe(Snapshot{
+				At:                        time.Unix(226, 0),
+				Phase:                     PhaseComplete,
+				FilePayloadEngine:         tt.engine,
+				FilePayloadBytesCommitted: tt.committed,
+				FilePayloadBytesBulk:      tt.bulk,
+				FilePayloadBytesQUIC:      tt.quic,
+				FilePayloadLaneAddresses:  `["203.0.113.10:41000"]`,
+			})
+			if err := rec.Close(); err != nil {
+				t.Fatal(err)
+			}
+			records, indexes := readTraceCSV(t, out.String())
+			row := records[1]
+			assertHeaderContainsSequence(t, records[0], []string{
+				"file_payload_engine",
+				"file_payload_bytes_committed",
+				"file_payload_bytes_bulk",
+				"file_payload_bytes_quic",
+				"file_payload_lane_addrs",
+			})
+			assertColumn(t, row, indexes, "file_payload_engine", string(tt.engine))
+			assertColumn(t, row, indexes, "file_payload_bytes_committed", strconv.FormatInt(tt.committed, 10))
+			assertColumn(t, row, indexes, "file_payload_bytes_bulk", strconv.FormatInt(tt.bulk, 10))
+			assertColumn(t, row, indexes, "file_payload_bytes_quic", strconv.FormatInt(tt.quic, 10))
+			assertColumn(t, row, indexes, "file_payload_lane_addrs", `["203.0.113.10:41000"]`)
+		})
+	}
+}
+
+func TestParseFilePayloadEngine(t *testing.T) {
+	for _, value := range []string{string(FilePayloadEngineBulk), string(FilePayloadEngineQUIC)} {
+		got, err := ParseFilePayloadEngine(value)
+		if err != nil || string(got) != value {
+			t.Fatalf("ParseFilePayloadEngine(%q) = %q, %v", value, got, err)
+		}
+	}
+	if _, err := ParseFilePayloadEngine("tcp"); err == nil {
+		t.Fatal("ParseFilePayloadEngine(tcp) error = nil")
+	}
+}
+
 func TestRecorderWritesRepairEfficiencyDiagnostics(t *testing.T) {
 	var out bytes.Buffer
 	rec, err := NewRecorder(&out, RoleReceive, time.Unix(250, 0))
@@ -127,38 +188,52 @@ func TestRecorderWritesBulkBatchDiagnosticsIncludingHealthyZeroes(t *testing.T) 
 		t.Fatal(err)
 	}
 	recorder.Observe(Snapshot{
-		At:                         time.Unix(261, 0),
-		Phase:                      PhaseDirectExecute,
-		BulkBatchPresent:           true,
-		BulkBatchBackend:           "linux-sendmmsg",
-		BulkGSOAttempted:           true,
-		BulkGSOActive:              false,
-		BulkGSOSegments:            0,
-		BulkSendCalls:              10,
-		BulkSendDatagrams:          640,
-		BulkReceiveCalls:           0,
-		BulkReceiveDatagrams:       0,
-		BulkMaxSendBatch:           64,
-		BulkMaxReceiveBatch:        0,
-		BulkCryptoQueuePeak:        4,
-		BulkWriterQueuePeak:        0,
-		BulkLaneQueuePeak:          2,
-		BulkReceiveQueuePeak:       3,
-		BulkDecryptBatches:         100,
-		BulkDecryptDatagrams:       6400,
-		BulkProbeSelectedMbps:      2160,
-		BulkProbeDurationMS:        250,
-		BulkProbeTrains:            5,
-		BulkProbeSentDatagrams:     30000,
-		BulkProbeReceivedDatagrams: 29800,
-		BulkProbeLossPPM:           6666,
-		BulkProbePressure:          false,
+		At:                             time.Unix(261, 0),
+		Phase:                          PhaseDirectExecute,
+		BulkBatchPresent:               true,
+		BulkCandidateID:                "combined-gso3",
+		BulkNativeSendAttempts:         12,
+		BulkNativeSendSyscalls:         11,
+		BulkNativeGSOMessages:          200,
+		BulkLogicalDatagrams:           640,
+		BulkNativeAcceptedPayloadBytes: 896_000,
+		BulkGSOSegmentsPerMessage:      3,
+		BulkBatchBackend:               "linux-sendmmsg",
+		BulkGSOAttempted:               true,
+		BulkGSOActive:                  false,
+		BulkGSOSegments:                0,
+		BulkSendCalls:                  10,
+		BulkSendDatagrams:              640,
+		BulkReceiveCalls:               0,
+		BulkReceiveDatagrams:           0,
+		BulkMaxSendBatch:               64,
+		BulkMaxReceiveBatch:            0,
+		BulkCryptoQueuePeak:            4,
+		BulkWriterQueuePeak:            0,
+		BulkLaneQueuePeak:              2,
+		BulkReceiveQueuePeak:           3,
+		BulkDecryptBatches:             100,
+		BulkDecryptDatagrams:           6400,
+		BulkProbeSelectedMbps:          2160,
+		BulkProbeDurationMS:            250,
+		BulkProbeTrains:                5,
+		BulkProbeSentDatagrams:         30000,
+		BulkProbeReceivedDatagrams:     29800,
+		BulkProbeLossPPM:               6666,
+		BulkProbePressure:              false,
 	})
 	if err := recorder.Close(); err != nil {
 		t.Fatal(err)
 	}
 	records, indexes := readTraceCSV(t, out.String())
 	assertHeaderSuffix(t, records[0], []string{
+		"bulk_candidate_id",
+		"bulk_native_send_attempts",
+		"bulk_native_send_syscalls",
+		"bulk_gso_messages",
+		"bulk_logical_datagrams",
+		"bulk_accepted_payload_bytes",
+		"bulk_gso_segments_per_message",
 		"bulk_batch_backend",
 		"bulk_gso_attempted",
 		"bulk_gso_active",
@@ -184,6 +259,13 @@ func TestRecorderWritesBulkBatchDiagnosticsIncludingHealthyZeroes(t *testing.T) 
 		"bulk_probe_pressure",
 	})
 	row := records[1]
+	assertColumn(t, row, indexes, "bulk_candidate_id", "combined-gso3")
+	assertColumn(t, row, indexes, "bulk_native_send_attempts", "12")
+	assertColumn(t, row, indexes, "bulk_native_send_syscalls", "11")
+	assertColumn(t, row, indexes, "bulk_gso_messages", "200")
+	assertColumn(t, row, indexes, "bulk_logical_datagrams", "640")
+	assertColumn(t, row, indexes, "bulk_accepted_payload_bytes", "896000")
+	assertColumn(t, row, indexes, "bulk_gso_segments_per_message", "3")
 	assertColumn(t, row, indexes, "bulk_batch_backend", "linux-sendmmsg")
 	assertColumn(t, row, indexes, "bulk_gso_attempted", "true")
 	assertColumn(t, row, indexes, "bulk_gso_active", "false")
@@ -216,7 +298,7 @@ func TestRecorderLeavesBulkBatchDiagnosticsEmptyWhenAbsent(t *testing.T) {
 		t.Fatal(err)
 	}
 	records, indexes := readTraceCSV(t, out.String())
-	for _, column := range []string{"bulk_batch_backend", "bulk_gso_attempted", "bulk_send_calls", "bulk_writer_queue_peak", "bulk_lane_queue_peak", "bulk_decrypt_datagrams", "bulk_probe_selected_mbps", "bulk_probe_pressure"} {
+	for _, column := range []string{"bulk_candidate_id", "bulk_native_send_attempts", "bulk_native_send_syscalls", "bulk_gso_messages", "bulk_logical_datagrams", "bulk_accepted_payload_bytes", "bulk_gso_segments_per_message", "bulk_batch_backend", "bulk_gso_attempted", "bulk_send_calls", "bulk_writer_queue_peak", "bulk_lane_queue_peak", "bulk_decrypt_datagrams", "bulk_probe_selected_mbps", "bulk_probe_pressure"} {
 		assertColumn(t, records[1], indexes, column, "")
 	}
 }
@@ -466,19 +548,35 @@ func TestRecorderWritesQUICTransportFields(t *testing.T) {
 		t.Fatalf("NewRecorder() error = %v", err)
 	}
 	rec.Observe(Snapshot{
-		At:                      time.Unix(0, int64(time.Second)),
-		Phase:                   PhaseDirectExecute,
-		AppBytes:                1024,
-		DirectTransport:         "quic",
-		QUICHandshakeMS:         12,
-		QUICFirstByteMS:         18,
-		QUICStreamBytesSent:     1024,
-		QUICStreamBytesReceived: 512,
-		QUICStreamGoodputMbps:   "8.19",
-		QUICSmoothedRTTMS:       "1.25",
-		QUICLossEvents:          2,
-		QUICCloseReason:         "normal",
-		LastState:               "connected-direct",
+		At:                       time.Unix(0, int64(time.Second)),
+		Phase:                    PhaseDirectExecute,
+		AppBytes:                 1024,
+		DirectTransport:          "quic",
+		QUICTelemetryPresent:     true,
+		QUICConnections:          2,
+		QUICStreams:              4,
+		QUICVersion:              "v1",
+		QUICRawSocketBackend:     "quic-go-oob",
+		QUICNativeSendBackend:    "udp-gso-or-sendmsg",
+		QUICNativeReceiveBackend: "udp-recvmmsg",
+		QUICHandshakeMS:          12,
+		QUICFirstByteMS:          18,
+		QUICSmoothedRTTMS:        "1.25",
+		QUICPacketsSent:          10,
+		QUICPacketsReceived:      8,
+		QUICPacketsLost:          2,
+		QUICWireBytesSent:        12_000,
+		QUICRecoveryWireBytes:    1_200,
+		QUICRecoveryRatio:        "0.111111",
+		QUICStreamBytesSent:      1024,
+		QUICStreamBytesReceived:  512,
+		QUICStreamGoodputMbps:    "8.19",
+		QUICCloseReason:          "complete",
+		QUICNativeGSO:            "true",
+		QUICNativeReceiveBatch:   "true",
+		FileSourceReadCalls:      1,
+		FileSourceReadBytes:      1024,
+		LastState:                "connected-direct",
 	})
 	if err := rec.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
@@ -487,14 +585,65 @@ func TestRecorderWritesQUICTransportFields(t *testing.T) {
 	records, indexes := readTraceCSV(t, out.String())
 	row := records[1]
 	assertColumn(t, row, indexes, "direct_transport", "quic")
+	assertColumn(t, row, indexes, "quic_connections", "2")
+	assertColumn(t, row, indexes, "quic_streams", "4")
+	assertColumn(t, row, indexes, "quic_telemetry_present", "true")
+	assertColumn(t, row, indexes, "quic_version", "v1")
+	assertColumn(t, row, indexes, "quic_raw_socket_backend", "quic-go-oob")
+	assertColumn(t, row, indexes, "quic_native_send_backend", "udp-gso-or-sendmsg")
+	assertColumn(t, row, indexes, "quic_native_receive_backend", "udp-recvmmsg")
 	assertColumn(t, row, indexes, "quic_handshake_ms", "12")
 	assertColumn(t, row, indexes, "quic_first_byte_ms", "18")
+	assertColumn(t, row, indexes, "quic_smoothed_rtt_ms", "1.25")
+	assertColumn(t, row, indexes, "quic_packets_sent", "10")
+	assertColumn(t, row, indexes, "quic_packets_received", "8")
+	assertColumn(t, row, indexes, "quic_packets_lost", "2")
+	assertColumn(t, row, indexes, "quic_wire_bytes_sent", "12000")
+	assertColumn(t, row, indexes, "quic_recovery_wire_bytes", "1200")
+	assertColumn(t, row, indexes, "quic_recovery_ratio", "0.111111")
 	assertColumn(t, row, indexes, "quic_stream_bytes_sent", "1024")
 	assertColumn(t, row, indexes, "quic_stream_bytes_received", "512")
 	assertColumn(t, row, indexes, "quic_stream_goodput_mbps", "8.19")
-	assertColumn(t, row, indexes, "quic_smoothed_rtt_ms", "1.25")
-	assertColumn(t, row, indexes, "quic_loss_events", "2")
-	assertColumn(t, row, indexes, "quic_close_reason", "normal")
+	assertColumn(t, row, indexes, "quic_close_reason", "complete")
+	assertColumn(t, row, indexes, "quic_native_gso", "true")
+	assertColumn(t, row, indexes, "quic_native_receive_batch", "true")
+	assertColumn(t, row, indexes, "file_source_read_calls", "1")
+	assertColumn(t, row, indexes, "file_source_read_bytes", "1024")
+}
+
+func TestRecorderWritesHealthyZeroQUICEvidenceOnlyWhenPresent(t *testing.T) {
+	var out bytes.Buffer
+	rec, err := NewRecorder(&out, RoleReceive, time.Unix(0, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.Observe(Snapshot{At: time.Unix(1, 0), Phase: PhaseRelay})
+	rec.Observe(Snapshot{
+		At:                       time.Unix(2, 0),
+		Phase:                    PhaseComplete,
+		QUICTelemetryPresent:     true,
+		QUICConnections:          1,
+		QUICStreams:              1,
+		QUICVersion:              "v1",
+		QUICRawSocketBackend:     "packet-conn",
+		QUICNativeSendBackend:    "packetconn-writeto",
+		QUICNativeReceiveBackend: "packetconn-readfrom",
+		QUICNativeGSO:            "false",
+		QUICNativeReceiveBatch:   "false",
+	})
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+	records, indexes := readTraceCSV(t, out.String())
+	assertColumn(t, records[1], indexes, "quic_telemetry_present", "")
+	for _, column := range []string{
+		"quic_handshake_ms", "quic_first_byte_ms", "quic_smoothed_rtt_ms",
+		"quic_packets_sent", "quic_packets_received", "quic_packets_lost",
+		"quic_wire_bytes_sent", "quic_recovery_wire_bytes", "quic_recovery_ratio",
+		"quic_stream_bytes_sent", "quic_stream_bytes_received",
+	} {
+		assertColumn(t, records[2], indexes, column, "0")
+	}
 }
 
 func TestRecorderLeavesRoleSpecificDiagnosticFieldsEmpty(t *testing.T) {
@@ -757,14 +906,30 @@ func directPathDiagnosticHeader() []string {
 		"direct_packet_bytes",
 		"direct_committed_bytes",
 		"direct_transport",
+		"quic_connections",
+		"quic_streams",
+		"quic_telemetry_present",
+		"quic_version",
+		"quic_raw_socket_backend",
+		"quic_native_send_backend",
+		"quic_native_receive_backend",
 		"quic_handshake_ms",
 		"quic_first_byte_ms",
+		"quic_smoothed_rtt_ms",
+		"quic_packets_sent",
+		"quic_packets_received",
+		"quic_packets_lost",
+		"quic_wire_bytes_sent",
+		"quic_recovery_wire_bytes",
+		"quic_recovery_ratio",
 		"quic_stream_bytes_sent",
 		"quic_stream_bytes_received",
 		"quic_stream_goodput_mbps",
-		"quic_smoothed_rtt_ms",
-		"quic_loss_events",
 		"quic_close_reason",
+		"quic_native_gso",
+		"quic_native_receive_batch",
+		"file_source_read_calls",
+		"file_source_read_bytes",
 		"missing_scan_checks",
 		"pending_missing",
 		"pending_missing_peak",

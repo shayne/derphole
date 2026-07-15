@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/shayne/derphole/pkg/telemetry"
+	"github.com/shayne/derphole/pkg/transfertrace"
 )
 
 func TestExternalV2BlockChunkSizeDefaultsToLargeBlocks(t *testing.T) {
@@ -196,6 +197,37 @@ func TestExternalV2BlockReceiveReturnsSinkError(t *testing.T) {
 	}
 	if got != 7 {
 		t.Fatalf("bytes received = %d, want header plus marked payload bytes 7", got)
+	}
+}
+
+func TestExternalV2BlockReceiveCountsOnlyCommittedQUICPayload(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		sink BlockReceiveSink
+		want int64
+	}{
+		{name: "exact write", sink: newMemoryBlockSink(4), want: 4},
+		{name: "failed write", sink: errorBlockSink{}, want: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var frame bytes.Buffer
+			if err := writeExternalV2BlockFrame(&frame, 0, []byte("data")); err != nil {
+				t.Fatal(err)
+			}
+			metrics := newExternalTransferMetricsWithTrace(time.Unix(190, 0), nil, transfertrace.RoleReceive)
+			_, _ = receiveExternalV2BlockStreams(context.Background(), tt.sink, externalV2BlockReceiveConfig{
+				PayloadSize: 4, ChunkSize: 4,
+			}, []io.ReadCloser{io.NopCloser(&frame)}, metrics)
+			metrics.mu.Lock()
+			got := metrics.filePayloadBytesCommitted
+			engine := metrics.filePayloadEngine
+			bulk := metrics.filePayloadBytesBulk
+			quic := metrics.filePayloadBytesQUIC
+			metrics.mu.Unlock()
+			if got != tt.want || engine != transfertrace.FilePayloadEngineQUIC || bulk != 0 || quic != tt.want {
+				t.Fatalf("engine=%q committed=%d bulk=%d quic=%d, want committed/quic=%d", engine, got, bulk, quic, tt.want)
+			}
+		})
 	}
 }
 

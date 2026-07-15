@@ -122,7 +122,7 @@ func TestQUICDataPlaneCopiesOverRelayManager(t *testing.T) {
 	}
 }
 
-func TestQUICDataPlaneCopiesOverMultiplePacketConns(t *testing.T) {
+func TestQUICStatsAggregateAcrossEndpoints(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -205,8 +205,22 @@ func TestQUICDataPlaneCopiesOverMultiplePacketConns(t *testing.T) {
 	if got.String() != "ab" {
 		t.Fatalf("received = %q, want ab", got.String())
 	}
-	if client.Stats().BytesSent == 0 || server.Stats().BytesReceived == 0 {
-		t.Fatalf("stats not populated: client=%+v server=%+v", client.Stats(), server.Stats())
+	clientStats := client.Stats()
+	serverStats := server.Stats()
+	if !clientStats.TelemetryPresent || !serverStats.TelemetryPresent {
+		t.Fatalf("aggregate mechanism evidence is absent: client=%+v server=%+v", clientStats, serverStats)
+	}
+	if clientStats.BytesSent == 0 || serverStats.BytesReceived == 0 {
+		t.Fatalf("stats not populated: client=%+v server=%+v", clientStats, serverStats)
+	}
+	if clientStats.Connections != streams || clientStats.Streams != streams || clientStats.PacketsSent == 0 || clientStats.WireBytesSent == 0 {
+		t.Fatalf("client aggregate is incomplete: %+v", clientStats)
+	}
+	if serverStats.Connections != streams || serverStats.Streams != streams || serverStats.PacketsReceived == 0 {
+		t.Fatalf("server aggregate is incomplete: %+v", serverStats)
+	}
+	if clientStats.Version == "" || clientStats.RawSocketBackend == "" || clientStats.NativeSendBackend == "" || clientStats.NativeReceiveBackend == "" || clientStats.NativeGSO == "" || clientStats.NativeReceiveBatch == "" {
+		t.Fatalf("client aggregate backend identity is incomplete: %+v", clientStats)
 	}
 	if err := client.CloseWithError(7, "test-close"); err != nil {
 		t.Fatalf("client CloseWithError() error = %v", err)
