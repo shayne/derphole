@@ -76,6 +76,29 @@ func TestShareInviteCustomDERPCredentialsDelegateTransportToDerptunAppMux(t *tes
 	}
 }
 
+func TestShareRejectsInvalidAutoAcceptRoleBeforeInvite(t *testing.T) {
+	oldGenerateServerToken := generateServerToken
+	defer func() { generateServerToken = oldGenerateServerToken }()
+
+	called := false
+	generateServerToken = func(derptun.ServerTokenOptions) (string, error) {
+		called = true
+		return "", errors.New("invite generation should not run")
+	}
+	err := Share(context.Background(), ShareConfig{
+		Stdin:          strings.NewReader(""),
+		Stdout:         io.Discard,
+		Stderr:         io.Discard,
+		AutoAcceptRole: protocol.Role("admin"),
+	})
+	if err == nil || !strings.Contains(err.Error(), `invalid auto-accept role "admin"`) {
+		t.Fatalf("Share() error = %v, want invalid role", err)
+	}
+	if called {
+		t.Fatal("generateServerToken called before auto-accept validation")
+	}
+}
+
 func newTestDerptunClientToken(t *testing.T) string {
 	t.Helper()
 	now := time.Now()
@@ -723,6 +746,134 @@ func TestShareUsesApprovalSeam(t *testing.T) {
 	}
 }
 
+func TestSelectShareApprovalAutoAcceptsEveryJoinWithoutConsoleApproval(t *testing.T) {
+	oldNewApproval := newShareApproval
+	defer func() { newShareApproval = oldNewApproval }()
+	interactiveFactoryCalls := 0
+	newShareApproval = func(ShareConfig) Approval {
+		interactiveFactoryCalls++
+		return StaticApproval{Role: protocol.RoleDenied}
+	}
+
+	for _, role := range []protocol.Role{protocol.RoleRead, protocol.RoleWrite} {
+		t.Run(string(role), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			console := newTerminalConsoleWithOptions(tuiConsoleOptions{ForceHeadless: true})
+			defer console.Stop()
+			preflight := newFakeShareInvitePreflight()
+			starter := newShareConsoleStarter(console, ctx, preflight)
+			modalCalls := 0
+			consoleApproval := approvalFunc(func(JoinRequest) protocol.Role {
+				modalCalls++
+				return protocol.RoleDenied
+			})
+			approval := selectShareApproval(
+				ShareConfig{AutoAcceptRole: role},
+				consoleApproval,
+				starter.Start,
+			)
+			for _, req := range []JoinRequest{
+				{ParticipantID: "guest-1", DisplayName: "Alex"},
+				{ParticipantID: "guest-2", DisplayName: "Sam"},
+			} {
+				if got := approval.Approve(req); got != role {
+					t.Fatalf("Approve(%s) = %q, want %q", req.ParticipantID, got, role)
+				}
+			}
+			if modalCalls != 0 {
+				t.Fatalf("console approval calls = %d, want 0", modalCalls)
+			}
+			if interactiveFactoryCalls != 0 {
+				t.Fatalf("interactive approval factory calls = %d, want 0", interactiveFactoryCalls)
+			}
+			if got := preflight.interruptCalls.Load(); got != 1 {
+				t.Fatalf("preflight interrupt calls = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestSelectShareApprovalDeniesAutoAcceptWhenInviteQuitWins(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	console := newTerminalConsoleWithOptions(tuiConsoleOptions{ForceHeadless: true})
+	defer console.Stop()
+	preflight := newFakeShareInvitePreflight()
+	preflight.finish(shareInvitePreflightResult{Action: invitePreflightQuit})
+	starter := newShareConsoleStarter(console, ctx, preflight)
+	approval := selectShareApproval(
+		ShareConfig{AutoAcceptRole: protocol.RoleWrite},
+		StaticApproval{Role: protocol.RoleDenied},
+		starter.Start,
+	)
+
+	if got := approval.Approve(JoinRequest{ParticipantID: "guest-1", DisplayName: "Alex"}); got != protocol.RoleDenied {
+		t.Fatalf("Approve() = %q, want %q", got, protocol.RoleDenied)
+	}
+}
+
+func TestSelectShareApprovalDeniesAutoAcceptWhenInvitePreflightFails(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	console := newTerminalConsoleWithOptions(tuiConsoleOptions{ForceHeadless: true})
+	defer console.Stop()
+	preflight := newFakeShareInvitePreflight()
+	preflight.finish(shareInvitePreflightResult{Action: invitePreflightContinue, Err: errors.New("preflight failed")})
+	starter := newShareConsoleStarter(console, ctx, preflight)
+	approval := selectShareApproval(
+		ShareConfig{AutoAcceptRole: protocol.RoleRead},
+		StaticApproval{Role: protocol.RoleDenied},
+		starter.Start,
+	)
+
+	if got := approval.Approve(JoinRequest{ParticipantID: "guest-1", DisplayName: "Alex"}); got != protocol.RoleDenied {
+		t.Fatalf("Approve() = %q, want %q", got, protocol.RoleDenied)
+	}
+}
+
+func TestSelectShareApprovalDeniesAutoAcceptWhenShareContextIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	console := newTerminalConsoleWithOptions(tuiConsoleOptions{ForceHeadless: true})
+	defer console.Stop()
+	starter := newShareConsoleStarter(console, ctx, nil)
+	approval := selectShareApproval(
+		ShareConfig{AutoAcceptRole: protocol.RoleRead},
+		StaticApproval{Role: protocol.RoleDenied},
+		starter.Start,
+	)
+
+	if got := approval.Approve(JoinRequest{ParticipantID: "guest-1", DisplayName: "Alex"}); got != protocol.RoleDenied {
+		t.Fatalf("Approve() = %q, want %q", got, protocol.RoleDenied)
+	}
+}
+
+func TestSelectShareApprovalKeepsInteractiveConsolePath(t *testing.T) {
+	oldNewApproval := newShareApproval
+	defer func() { newShareApproval = oldNewApproval }()
+	newShareApproval = func(cfg ShareConfig) Approval {
+		return terminalShareApproval{stdin: cfg.Stdin, stderr: cfg.Stderr}
+	}
+
+	modalCalls := 0
+	consoleApproval := approvalFunc(func(JoinRequest) protocol.Role {
+		modalCalls++
+		return protocol.RoleRead
+	})
+	startCalls := 0
+	approval := selectShareApproval(ShareConfig{}, consoleApproval, func() bool {
+		startCalls++
+		return true
+	})
+	if got := approval.Approve(JoinRequest{ParticipantID: "guest-1", DisplayName: "Alex"}); got != protocol.RoleRead {
+		t.Fatalf("Approve() = %q, want %q", got, protocol.RoleRead)
+	}
+	if modalCalls != 1 || startCalls != 1 {
+		t.Fatalf("modal/start calls = %d/%d, want 1/1", modalCalls, startCalls)
+	}
+}
+
 func TestShareDoesNotPassStdinToHostLocalInputWhenUsingTUI(t *testing.T) {
 	t.Setenv("DERPSSH_TEST_HARNESS", "1")
 	t.Setenv("DERPSSH_TEST_COMMAND", `printf ready`)
@@ -1319,11 +1470,12 @@ func closeFiles(files ...*os.File) {
 }
 
 type fakeShareInvitePreflight struct {
-	interrupted atomic.Bool
-	done        chan shareInvitePreflightResult
-	once        sync.Once
-	waitOnce    sync.Once
-	result      shareInvitePreflightResult
+	interrupted    atomic.Bool
+	interruptCalls atomic.Int32
+	done           chan shareInvitePreflightResult
+	once           sync.Once
+	waitOnce       sync.Once
+	result         shareInvitePreflightResult
 }
 
 func newFakeShareInvitePreflight() *fakeShareInvitePreflight {
@@ -1331,6 +1483,7 @@ func newFakeShareInvitePreflight() *fakeShareInvitePreflight {
 }
 
 func (p *fakeShareInvitePreflight) Interrupt() {
+	p.interruptCalls.Add(1)
 	p.interrupted.Store(true)
 	p.finish(shareInvitePreflightResult{Action: invitePreflightInterrupted})
 }

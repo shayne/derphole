@@ -162,8 +162,20 @@ npx -y derpssh@latest share
 npx -y derpssh@latest connect <invite>
 ```
 
-The host approves the guest as read-only or read/write. The session uses the
-`derptun` transport path, so neither side needs an inbound port.
+The host normally approves each guest as read-only or read/write. To use one
+policy for every join attempt while the host is running:
+
+```bash
+npx -y derpssh@latest share --auto-accept read
+npx -y derpssh@latest share --auto-accept write
+```
+
+Anyone with the valid invite is accepted. `read` lets the guest watch and chat.
+`write` also gives the guest control of the shared shell. The host can still
+change the role or kick the guest.
+
+The session uses the `derptun` transport path, so neither side needs an inbound
+port.
 
 Optional local lookup keeps the invite behind a service name on the connecting
 machine:
@@ -173,8 +185,8 @@ npx -y derpssh@latest service set ops-shell <invite>
 npx -y derpssh@latest connect --service ops-shell
 ```
 
-The host still approves the guest. The service name only finds the invite; it
-does not bypass approval.
+The service name only finds the invite. It does not change the host's approval
+policy.
 
 ### TCP Tunnels
 

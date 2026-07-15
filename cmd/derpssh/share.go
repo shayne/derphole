@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"syscall"
 
+	"github.com/shayne/derphole/pkg/derpssh/protocol"
 	derpsshsession "github.com/shayne/derphole/pkg/derpssh/session"
 	"github.com/shayne/derphole/pkg/telemetry"
 )
@@ -78,11 +79,12 @@ func runShare(args []string, level telemetry.Level, stdin io.Reader, stdout, std
 	ctx, stop := commandContext()
 	defer stop()
 	err := runShareSession(ctx, shareSessionConfig{
-		Stdin:      stdin,
-		Stdout:     stdout,
-		Stderr:     stderr,
-		ForceRelay: parsed.forceRelay,
-		Emitter:    telemetry.New(stderr, commandSessionTelemetryLevel(level)),
+		Stdin:          stdin,
+		Stdout:         stdout,
+		Stderr:         stderr,
+		ForceRelay:     parsed.forceRelay,
+		AutoAcceptRole: parsed.autoAccept,
+		Emitter:        telemetry.New(stderr, commandSessionTelemetryLevel(level)),
 	})
 	if code, failed := handleShareError(err, stderr); failed {
 		return code
@@ -92,6 +94,7 @@ func runShare(args []string, level telemetry.Level, stdin io.Reader, stdout, std
 
 type parsedShareArgs struct {
 	forceRelay bool
+	autoAccept protocol.Role
 	register   string
 	registry   string
 }
@@ -154,6 +157,18 @@ func parseShareFlagArg(args []string, index *int, stderr io.Writer, parsed *pars
 	case arg == "--force-relay":
 		parsed.forceRelay = true
 		return true, true
+	case arg == "--auto-accept":
+		value, ok := shareFlagValue(args, index, "--auto-accept", stderr)
+		if !ok {
+			return true, false
+		}
+		parsed.autoAccept, ok = parseAutoAcceptRole(value, stderr)
+		return true, ok
+	case strings.HasPrefix(arg, "--auto-accept="):
+		value := strings.TrimPrefix(arg, "--auto-accept=")
+		role, ok := parseAutoAcceptRole(value, stderr)
+		parsed.autoAccept = role
+		return true, ok
 	case arg == "--register":
 		value, ok := shareFlagValue(args, index, "--register", stderr)
 		parsed.register = value
@@ -170,6 +185,18 @@ func parseShareFlagArg(args []string, index *int, stderr io.Writer, parsed *pars
 		return true, true
 	default:
 		return false, false
+	}
+}
+
+func parseAutoAcceptRole(value string, stderr io.Writer) (protocol.Role, bool) {
+	role := protocol.Role(value)
+	switch role {
+	case protocol.RoleRead, protocol.RoleWrite:
+		return role, true
+	default:
+		_, _ = fmt.Fprintf(stderr, "invalid --auto-accept value %q: want read or write\n", value)
+		_, _ = fmt.Fprintln(stderr, shareUsage())
+		return "", false
 	}
 }
 
@@ -235,7 +262,7 @@ func firstInvite(text string) string {
 }
 
 func shareUsage() string {
-	return "Usage: derpssh share [--force-relay] [--register NAME] [--registry PATH]"
+	return "Usage: derpssh share [--auto-accept read|write] [--force-relay] [--register NAME] [--registry PATH]"
 }
 
 func commandSessionTelemetryLevel(level telemetry.Level) telemetry.Level {

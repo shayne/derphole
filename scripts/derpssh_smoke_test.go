@@ -20,9 +20,9 @@ func TestDerpsshLocalSmokeScriptUsesBuiltBinary(t *testing.T) {
 	for _, want := range []string{
 		"dist/derpssh",
 		"derpssh share",
+		"dist/derpssh share --auto-accept write",
 		"derpssh connect",
 		"DERPSSH_TEST_HARNESS=1",
-		"DERPSSH_TEST_AUTO_APPROVE=write",
 		"DERPSSH_TEST_COMMAND=",
 		"DERPSSH_TEST_HOST_ACTIONS=",
 		"DERPSSH_TEST_GUEST_ACTIONS=",
@@ -43,5 +43,8 @@ func TestDerpsshLocalSmokeScriptUsesBuiltBinary(t *testing.T) {
 		if strings.Contains(body, forbidden) {
 			t.Fatalf("smoke script still writes old stdin command %q", forbidden)
 		}
+	}
+	if strings.Contains(body, "DERPSSH_TEST_AUTO_APPROVE") {
+		t.Fatal("smoke script uses test-only auto approval instead of --auto-accept")
 	}
 }

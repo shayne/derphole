@@ -27,11 +27,12 @@ import (
 )
 
 type ShareConfig struct {
-	Stdin      io.Reader
-	Stdout     io.Writer
-	Stderr     io.Writer
-	ForceRelay bool
-	Emitter    *telemetry.Emitter
+	Stdin          io.Reader
+	Stdout         io.Writer
+	Stderr         io.Writer
+	ForceRelay     bool
+	AutoAcceptRole protocol.Role
+	Emitter        *telemetry.Emitter
 }
 
 var generateServerToken = derptun.GenerateServerTokenFromEnvironment
@@ -56,6 +57,9 @@ var runHostSession = func(ctx context.Context, cfg HostConfig, bindConsole func(
 
 func Share(ctx context.Context, cfg ShareConfig) error {
 	cfg = normalizeShareConfig(cfg)
+	if err := validateShareAutoAcceptRole(cfg.AutoAcceptRole); err != nil {
+		return err
+	}
 	serverToken, connectCommand, err := newShareInviteCommand()
 	if err != nil {
 		return err
@@ -71,6 +75,15 @@ func Share(ctx context.Context, cfg ShareConfig) error {
 		}
 	}
 	return runShare(ctx, cfg, serverToken, connectCommand, plainInvite)
+}
+
+func validateShareAutoAcceptRole(role protocol.Role) error {
+	switch role {
+	case "", protocol.RoleRead, protocol.RoleWrite:
+		return nil
+	default:
+		return fmt.Errorf("invalid auto-accept role %q: want read or write", role)
+	}
 }
 
 func newShareInviteCommand() (string, string, error) {
@@ -259,10 +272,7 @@ func runShareHostMux(ctx context.Context, mux *derptun.Mux, opts shareHostMuxOpt
 }
 
 func shareHostConfig(mux *derptun.Mux, opts shareHostMuxOptions) HostConfig {
-	approval := newShareApproval(opts.Config)
-	if _, ok := approval.(terminalShareApproval); ok {
-		approval = startingShareApproval{Approval: opts.Console, Start: opts.Starter.Start}
-	}
+	approval := selectShareApproval(opts.Config, opts.Console, opts.Starter.Start)
 	return HostConfig{
 		Mux:           mux,
 		HostID:        randomID("host"),
@@ -280,6 +290,20 @@ func shareHostConfig(mux *derptun.Mux, opts shareHostMuxOptions) HostConfig {
 		Approval:    approval,
 		Observer:    opts.Console,
 	}
+}
+
+func selectShareApproval(cfg ShareConfig, console Approval, start func() bool) Approval {
+	if cfg.AutoAcceptRole != "" {
+		return startingShareApproval{
+			Approval: StaticApproval{Role: cfg.AutoAcceptRole},
+			Start:    start,
+		}
+	}
+	approval := newShareApproval(cfg)
+	if _, ok := approval.(terminalShareApproval); ok {
+		return startingShareApproval{Approval: console, Start: start}
+	}
+	return approval
 }
 
 func shouldEndShareAfterHostSession(host *HostRuntime, err error) bool {
@@ -618,35 +642,53 @@ type shareConsoleStarter struct {
 	ctx       context.Context
 	preflight shareInvitePreflight
 	once      sync.Once
+	started   bool
 }
 
 func newShareConsoleStarter(console *tuiConsole, ctx context.Context, preflight shareInvitePreflight) *shareConsoleStarter {
 	return &shareConsoleStarter{console: console, ctx: ctx, preflight: preflight}
 }
 
-func (s *shareConsoleStarter) Start() {
+func (s *shareConsoleStarter) Start() bool {
 	if s == nil || s.console == nil {
-		return
+		return false
 	}
 	s.once.Do(func() {
-		if s.preflight != nil {
-			s.preflight.Interrupt()
-			if s.preflight.Wait().Action == invitePreflightQuit {
-				return
-			}
+		if s.ctx != nil && s.ctx.Err() != nil {
+			return
+		}
+		if !shareInvitePreflightAllowsStart(s.preflight) {
+			return
+		}
+		if s.ctx != nil && s.ctx.Err() != nil {
+			return
 		}
 		s.console.Start(s.ctx)
+		s.started = true
 	})
+	return s.started
+}
+
+func shareInvitePreflightAllowsStart(preflight shareInvitePreflight) bool {
+	if preflight == nil {
+		return true
+	}
+	preflight.Interrupt()
+	result := preflight.Wait()
+	if result.Err != nil {
+		return false
+	}
+	return result.Action == invitePreflightContinue || result.Action == invitePreflightInterrupted
 }
 
 type startingShareApproval struct {
 	Approval Approval
-	Start    func()
+	Start    func() bool
 }
 
 func (a startingShareApproval) Approve(req JoinRequest) protocol.Role {
-	if a.Start != nil {
-		a.Start()
+	if a.Start != nil && !a.Start() {
+		return protocol.RoleDenied
 	}
 	if a.Approval == nil {
 		return protocol.RoleDenied

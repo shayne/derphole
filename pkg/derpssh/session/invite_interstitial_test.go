@@ -42,7 +42,10 @@ func TestInviteInterstitialPrintsCommandAsOneLogicalLine(t *testing.T) {
 func TestInviteInterstitialGuestPendingStartsTUIBeforeApproval(t *testing.T) {
 	var order []string
 	approval := startingShareApproval{
-		Start: func() { order = append(order, "start") },
+		Start: func() bool {
+			order = append(order, "start")
+			return true
+		},
 		Approval: approvalFunc(func(JoinRequest) protocol.Role {
 			order = append(order, "approve")
 			return protocol.RoleRead

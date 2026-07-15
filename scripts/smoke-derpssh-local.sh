@@ -69,10 +69,9 @@ exec {share_fd}<>"$share_in"
 exec {connect_fd}<>"$connect_in"
 
 DERPSSH_TEST_HARNESS=1 \
-DERPSSH_TEST_AUTO_APPROVE=write \
 DERPSSH_TEST_COMMAND="printf ready; read line; printf input:%s \"\$line\"" \
 DERPSSH_TEST_HOST_ACTIONS=$'chat host-side\nsleep 5s\nquit' \
-  dist/derpssh share <&$share_fd >"$share_out" 2>"$share_err" &
+  dist/derpssh share --auto-accept write <&$share_fd >"$share_out" 2>"$share_err" &
 share_pid=$!
 
 for _ in $(seq 1 100); do
@@ -111,6 +110,12 @@ if ! grep -F 'role: write' "$connect_out" >/dev/null 2>&1; then
   cat "$connect_err" >&2
   cat "$share_out" >&2
   cat "$share_err" >&2
+  exit 1
+fi
+
+if grep -F 'wants to join' "$share_out" >/dev/null 2>&1; then
+  echo "auto-accept unexpectedly opened the host approval modal" >&2
+  cat "$share_out" >&2
   exit 1
 fi
 

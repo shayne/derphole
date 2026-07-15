@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shayne/derphole/pkg/derpssh/protocol"
 	"github.com/shayne/derphole/pkg/endpointlookup"
 	"github.com/shayne/derphole/pkg/telemetry"
 )
@@ -27,11 +28,93 @@ func TestRunShareHelpPrintsUsage(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("runShare(--help) = %d, want 0", code)
 	}
-	if got := stderr.String(); !strings.Contains(got, "Usage: derpssh share [--force-relay]") {
+	if got := stderr.String(); !strings.Contains(got, "Usage: derpssh share [--auto-accept read|write]") {
 		t.Fatalf("stderr = %q, want usage", got)
 	}
 	if stdout.Len() != 0 {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+}
+
+func TestRunSharePassesAutoAcceptRole(t *testing.T) {
+	old := runShareSession
+	defer func() { runShareSession = old }()
+
+	tests := []struct {
+		name string
+		args []string
+		want protocol.Role
+	}{
+		{name: "interactive default", want: ""},
+		{name: "read separate", args: []string{"--auto-accept", "read"}, want: protocol.RoleRead},
+		{name: "write equals", args: []string{"--auto-accept=write"}, want: protocol.RoleWrite},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got protocol.Role
+			runShareSession = func(_ context.Context, cfg shareSessionConfig) error {
+				got = cfg.AutoAcceptRole
+				return nil
+			}
+			var stderr bytes.Buffer
+			if code := runShare(tt.args, telemetry.LevelDefault, strings.NewReader(""), io.Discard, &stderr); code != 0 {
+				t.Fatalf("runShare(%v) = %d stderr=%s", tt.args, code, stderr.String())
+			}
+			if got != tt.want {
+				t.Fatalf("AutoAcceptRole = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRunShareRejectsInvalidAutoAcceptRole(t *testing.T) {
+	old := runShareSession
+	defer func() { runShareSession = old }()
+
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "missing", args: []string{"--auto-accept"}, want: "--auto-accept requires a value"},
+		{name: "empty", args: []string{"--auto-accept="}, want: "invalid --auto-accept value"},
+		{name: "unknown", args: []string{"--auto-accept", "admin"}, want: "invalid --auto-accept value"},
+		{name: "case sensitive", args: []string{"--auto-accept", "Read"}, want: "invalid --auto-accept value"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			called := false
+			runShareSession = func(context.Context, shareSessionConfig) error {
+				called = true
+				return nil
+			}
+			var stderr bytes.Buffer
+			if code := runShare(tt.args, telemetry.LevelDefault, strings.NewReader(""), io.Discard, &stderr); code != 2 {
+				t.Fatalf("runShare(%v) = %d, want 2", tt.args, code)
+			}
+			if called {
+				t.Fatal("runShareSession called for invalid auto-accept role")
+			}
+			if got := stderr.String(); !strings.Contains(got, tt.want) || !strings.Contains(got, shareUsage()) {
+				t.Fatalf("stderr = %q, want %q and usage", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseShareArgsCombinesAutoAcceptWithExistingFlags(t *testing.T) {
+	var stderr bytes.Buffer
+	parsed, ok := parseShareArgs([]string{
+		"--force-relay",
+		"--auto-accept", "read",
+		"--register", "ops-shell",
+		"--registry", "registry.json",
+	}, &stderr)
+	if !ok {
+		t.Fatalf("parseShareArgs() failed: %s", stderr.String())
+	}
+	if !parsed.forceRelay || parsed.autoAccept != protocol.RoleRead || parsed.register != "ops-shell" || parsed.registry != "registry.json" {
+		t.Fatalf("parsed = %+v", parsed)
 	}
 }
 
