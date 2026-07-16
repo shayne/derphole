@@ -28,6 +28,8 @@ Basic proxy authentication works only when the proxy URL contains both an explic
 
 Proxy selection is authoritative. Unsupported proxy schemes, malformed credentials, a failed proxy connection, or a rejected `CONNECT` fail closed. Once the standard resolver selects a proxy, the clients do not fall back to a direct DERP TCP connection. Use `NO_PROXY` for DERP hosts that should be reached directly.
 
+The first `CONNECT` always names the selected DERP hostname. Some proxies can route to the DERP server but silently fail their own hostname lookup. If that first attempt closes or times out before returning an HTTP response, the client can retry up to two known or locally resolved IP authorities through the same proxy. The original hostname still controls TLS SNI, certificate verification, and the DERP HTTP upgrade. A parsable proxy response—including 403, 407, 502, or 504—is final and does not trigger IP fallback. The client never opens a direct DERP socket as part of this recovery.
+
 A proxy changes only the DERP TCP path. It does not imply `--force-relay`, proxy UDP, or force all traffic through DERP. Direct UDP discovery and promotion still run unless you select `--force-relay`. On a locked-down network those attempts may fail, in which case the session simply remains on DERP.
 
 The proxy can observe the DERP destination, connection timing, and byte volume. For an `https://` DERP endpoint, DERP TLS remains inside the `CONNECT` tunnel. An `http://` DERP endpoint has no inner DERP TLS. Peer payload encryption remains separate in either case. Verbose diagnostics report only the sanitized proxy scheme and address plus the DERP target; URL credentials are never included.

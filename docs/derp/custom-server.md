@@ -38,6 +38,8 @@ The DERP route itself is authoritative. DNS, TCP, TLS, HTTP upgrade, or DERP fai
 
 `HTTPS_PROXY` and `NO_PROXY` govern the DERP TCP connection using Go's standard proxy rules. If a proxy is selected, it must allow a long-lived `CONNECT` tunnel to the embedded host and port. A rejected or broken proxy connection fails closed instead of retrying the custom DERP directly.
 
+The client tries `CONNECT` with the DERP hostname first. If the proxy closes or times out before returning an HTTP response, the client may resolve the DERP hostname locally and retry a literal IP authority through the same proxy. TLS still authenticates the original DERP hostname. Explicit proxy responses are final and never trigger this fallback. If both the proxy and the local process cannot resolve the hostname, the connection fails.
+
 The proxy applies only to DERP TCP. STUN and direct-path traffic use UDP and do not traverse the HTTP proxy. A locked-down network may therefore leave the session on DERP, but proxy configuration alone does not set `--force-relay`.
 
 See [DERP Client Runtime](./client-runtime.md#constrained-egress-through-an-http-proxy) for supported proxy URLs, authentication, diagnostics, and resolver details.

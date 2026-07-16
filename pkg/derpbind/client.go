@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"sync"
 	"time"
@@ -74,6 +75,10 @@ const (
 const losslessSubscriberQueueSize = 64
 
 var derpDialTimeout = 5 * time.Second
+
+const maxProxyIPFallbackTargets = 2
+
+var derpLookupNetIP = net.DefaultResolver.LookupNetIP
 
 var derpDialContext = func(ctx context.Context, logf logger.Logf, netMon *netmon.Monitor, network, addr string) (net.Conn, error) {
 	return netns.NewDialer(logf, netMon).DialContext(ctx, network, addr)
@@ -168,11 +173,7 @@ func newDERPNodeDialer(node *tailcfg.DERPNode, derpURL *url.URL, proxyInfo *prox
 			return nil, err
 		}
 		if selectedProxy != nil {
-			target, err := canonicalDERPTarget(derpURL)
-			if err != nil {
-				return nil, err
-			}
-			conn, info, err := dialDERPThroughProxy(ctx, selectedProxy, target, logf, netMon)
+			conn, info, err := dialDERPNodeThroughProxy(ctx, selectedProxy, node, derpURL, logf, netMon)
 			if err != nil {
 				return nil, err
 			}
@@ -181,6 +182,42 @@ func newDERPNodeDialer(node *tailcfg.DERPNode, derpURL *url.URL, proxyInfo *prox
 		}
 		return dialDERPDirect(ctx, node, logf, netMon, addr)
 	}
+}
+
+func dialDERPNodeThroughProxy(ctx context.Context, proxyURL *url.URL, node *tailcfg.DERPNode, derpURL *url.URL, logf logger.Logf, netMon *netmon.Monitor) (net.Conn, ProxyInfo, error) {
+	target, err := canonicalDERPTarget(derpURL)
+	if err != nil {
+		return nil, ProxyInfo{}, err
+	}
+	conn, info, err := dialDERPThroughProxy(ctx, proxyURL, target, logf, netMon)
+	if err == nil {
+		return conn, info, nil
+	}
+	attemptErrors := []error{fmt.Errorf("CONNECT %s through DERP proxy: %w", target, err)}
+	if !retryableProxyConnectResponseError(ctx, err) {
+		return nil, ProxyInfo{}, attemptErrors[0]
+	}
+
+	ipTargets, resolveErr := proxyDERPIPTargets(ctx, node, derpURL)
+	if resolveErr != nil {
+		attemptErrors = append(attemptErrors, resolveErr)
+		return nil, ProxyInfo{}, errors.Join(attemptErrors...)
+	}
+	for _, ipTarget := range ipTargets {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			attemptErrors = append(attemptErrors, ctxErr)
+			return nil, ProxyInfo{}, errors.Join(attemptErrors...)
+		}
+		conn, info, err = dialDERPThroughProxy(ctx, proxyURL, ipTarget, logf, netMon)
+		if err == nil {
+			return conn, info, nil
+		}
+		attemptErrors = append(attemptErrors, fmt.Errorf("CONNECT %s through DERP proxy: %w", ipTarget, err))
+		if !retryableProxyConnectResponseError(ctx, err) {
+			return nil, ProxyInfo{}, errors.Join(attemptErrors...)
+		}
+	}
+	return nil, ProxyInfo{}, errors.Join(attemptErrors...)
 }
 
 func canonicalDERPTarget(derpURL *url.URL) (string, error) {
@@ -205,6 +242,86 @@ func canonicalDERPTarget(derpURL *url.URL) (string, error) {
 		port = defaultPort
 	}
 	return net.JoinHostPort(host, port), nil
+}
+
+func proxyDERPIPTargets(ctx context.Context, node *tailcfg.DERPNode, derpURL *url.URL) ([]string, error) {
+	canonicalTarget, err := canonicalDERPTarget(derpURL)
+	if err != nil {
+		return nil, err
+	}
+	host := derpURL.Hostname()
+	if _, err := netip.ParseAddr(host); err == nil {
+		return nil, nil
+	}
+	_, port, err := net.SplitHostPort(canonicalTarget)
+	if err != nil {
+		return nil, err
+	}
+
+	addresses, allowResolvedV4, allowResolvedV6 := proxyDERPNodeAddresses(node)
+	if len(addresses) == 0 && (allowResolvedV4 || allowResolvedV6) {
+		addresses, err = resolveProxyDERPAddresses(ctx, host, allowResolvedV4, allowResolvedV6)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return proxyDERPTargetsForAddresses(addresses, port), nil
+}
+
+func proxyDERPNodeAddresses(node *tailcfg.DERPNode) ([]netip.Addr, bool, bool) {
+	allowResolvedV4 := node == nil || node.IPv4 == ""
+	allowResolvedV6 := node == nil || node.IPv6 == ""
+	if node == nil {
+		return nil, allowResolvedV4, allowResolvedV6
+	}
+
+	addresses := make([]netip.Addr, 0, 2)
+	if addr, err := netip.ParseAddr(node.IPv4); err == nil && addr.Is4() {
+		addresses = append(addresses, addr)
+	}
+	if addr, err := netip.ParseAddr(node.IPv6); err == nil && addr.Is6() && !addr.Is4() {
+		addresses = append(addresses, addr)
+	}
+	return addresses, allowResolvedV4, allowResolvedV6
+}
+
+func resolveProxyDERPAddresses(ctx context.Context, host string, allowV4, allowV6 bool) ([]netip.Addr, error) {
+	resolved, err := derpLookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve DERP hostname for proxy IP fallback %s: %w", host, err)
+	}
+	addresses := make([]netip.Addr, 0, len(resolved))
+	for _, addr := range resolved {
+		addr = addr.Unmap()
+		if addr.Is4() && !allowV4 || addr.Is6() && !addr.Is4() && !allowV6 {
+			continue
+		}
+		addresses = append(addresses, addr)
+	}
+	return addresses, nil
+}
+
+func proxyDERPTargetsForAddresses(addresses []netip.Addr, port string) []string {
+	targets := make([]string, 0, maxProxyIPFallbackTargets)
+	seen := make(map[netip.Addr]struct{}, maxProxyIPFallbackTargets)
+	for _, addr := range addresses {
+		if addr.Zone() != "" {
+			continue
+		}
+		addr = addr.Unmap()
+		if !addr.IsValid() || !addr.IsGlobalUnicast() && !addr.IsLoopback() {
+			continue
+		}
+		if _, ok := seen[addr]; ok {
+			continue
+		}
+		seen[addr] = struct{}{}
+		targets = append(targets, net.JoinHostPort(addr.String(), port))
+		if len(targets) == maxProxyIPFallbackTargets {
+			break
+		}
+	}
+	return targets
 }
 
 func dialDERPDirect(ctx context.Context, node *tailcfg.DERPNode, logf logger.Logf, netMon *netmon.Monitor, addr string) (net.Conn, error) {

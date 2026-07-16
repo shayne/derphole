@@ -33,6 +33,35 @@ type ProxyInfo struct {
 	TargetAddr string
 }
 
+type proxyConnectResponseError struct {
+	cause error
+}
+
+func (e *proxyConnectResponseError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *proxyConnectResponseError) Unwrap() error {
+	return e.cause
+}
+
+func retryableProxyConnectResponseError(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	var responseErr *proxyConnectResponseError
+	if !errors.As(err, &responseErr) {
+		return false
+	}
+	if errors.Is(responseErr, io.EOF) ||
+		errors.Is(responseErr, io.ErrUnexpectedEOF) ||
+		errors.Is(responseErr, context.DeadlineExceeded) {
+		return true
+	}
+	var timeoutErr net.Error
+	return errors.As(responseErr, &timeoutErr) && timeoutErr.Timeout()
+}
+
 func (i ProxyInfo) DebugString() string {
 	if i.Scheme == "" || i.ProxyAddr == "" || i.TargetAddr == "" {
 		return ""
@@ -172,9 +201,9 @@ func dialDERPThroughProxy(ctx context.Context, proxyURL *url.URL, target string,
 	res, err := http.ReadResponse(br, req)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ProxyInfo{}, fmt.Errorf("read CONNECT from DERP proxy %s://%s: %w", proxyURL.Scheme, proxyAddr, ctxErr)
+			return nil, ProxyInfo{}, fmt.Errorf("read CONNECT from DERP proxy %s://%s: %w", proxyURL.Scheme, proxyAddr, &proxyConnectResponseError{cause: ctxErr})
 		}
-		return nil, ProxyInfo{}, fmt.Errorf("read CONNECT from DERP proxy %s://%s: invalid HTTP response", proxyURL.Scheme, proxyAddr)
+		return nil, ProxyInfo{}, fmt.Errorf("read CONNECT from DERP proxy %s://%s: %w", proxyURL.Scheme, proxyAddr, &proxyConnectResponseError{cause: err})
 	}
 	if res.StatusCode != http.StatusOK {
 		return nil, ProxyInfo{}, proxyConnectRejectionError(ctx, res.Body, proxyURL, target, proxyAddr, res.StatusCode)

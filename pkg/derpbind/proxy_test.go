@@ -507,6 +507,82 @@ func TestDialDERPThroughProxyMalformedResponse(t *testing.T) {
 	}
 }
 
+func TestDialDERPThroughProxyPreservesResponseReadCause(t *testing.T) {
+	tests := []struct {
+		name       string
+		options    testConnectProxyOptions
+		wantCause  error
+		wantDetail string
+	}{
+		{
+			name: "empty response",
+			options: testConnectProxyOptions{
+				CloseWithoutResponse: map[string]bool{"derp.example:443": true},
+			},
+			wantCause: io.ErrUnexpectedEOF,
+		},
+		{
+			name:      "truncated response",
+			options:   testConnectProxyOptions{RawResponse: "HTTP/1.1 200"},
+			wantCause: io.ErrUnexpectedEOF,
+		},
+		{
+			name:       "malformed response",
+			options:    testConnectProxyOptions{RawResponse: "not-http\r\n\r\n"},
+			wantDetail: "malformed HTTP response",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxy := newTestConnectProxy(t, tt.options)
+			proxyURL, err := url.Parse(proxy.URL())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, _, err = dialDERPThroughProxy(context.Background(), proxyURL, "derp.example:443", t.Logf, netmon.NewStatic())
+			if err == nil {
+				t.Fatal("dialDERPThroughProxy() error = nil")
+			}
+			var responseErr *proxyConnectResponseError
+			if !errors.As(err, &responseErr) {
+				t.Fatalf("dialDERPThroughProxy() error = %T %v, want *proxyConnectResponseError", err, err)
+			}
+			if tt.wantCause != nil && !errors.Is(err, tt.wantCause) {
+				t.Fatalf("dialDERPThroughProxy() error = %v, want cause %v", err, tt.wantCause)
+			}
+			if tt.wantDetail != "" && !strings.Contains(err.Error(), tt.wantDetail) {
+				t.Fatalf("dialDERPThroughProxy() error = %q, want detail %q", err, tt.wantDetail)
+			}
+		})
+	}
+}
+
+func TestRetryableProxyConnectResponseError(t *testing.T) {
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	tests := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		{name: "EOF", ctx: context.Background(), err: &proxyConnectResponseError{cause: io.EOF}, want: true},
+		{name: "unexpected EOF", ctx: context.Background(), err: &proxyConnectResponseError{cause: io.ErrUnexpectedEOF}, want: true},
+		{name: "attempt timeout", ctx: context.Background(), err: &proxyConnectResponseError{cause: context.DeadlineExceeded}, want: true},
+		{name: "malformed response", ctx: context.Background(), err: &proxyConnectResponseError{cause: errors.New("malformed HTTP response")}},
+		{name: "untyped EOF", ctx: context.Background(), err: io.EOF},
+		{name: "caller canceled", ctx: canceledCtx, err: &proxyConnectResponseError{cause: io.EOF}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := retryableProxyConnectResponseError(tt.ctx, tt.err); got != tt.want {
+				t.Fatalf("retryableProxyConnectResponseError() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDialDERPThroughProxyCancellation(t *testing.T) {
 	proxy := newTestConnectProxy(t, testConnectProxyOptions{BlockResponse: true})
 	proxyURL, err := url.Parse(proxy.URL())
@@ -609,14 +685,16 @@ func TestSelectedProxyFailureDoesNotDialDERPDirectly(t *testing.T) {
 }
 
 type testConnectProxyOptions struct {
-	Status            int
-	Body              string
-	RawResponse       string
-	AfterResponse     []byte
-	BlockResponse     bool
-	StallResponseBody bool
-	TLS               bool
-	ForwardTarget     string
+	Status               int
+	Body                 string
+	RawResponse          string
+	AfterResponse        []byte
+	CloseWithoutResponse map[string]bool
+	BlockResponse        bool
+	BlockResponseFor     map[string]bool
+	StallResponseBody    bool
+	TLS                  bool
+	ForwardTarget        string
 }
 
 type testConnectProxy struct {
@@ -708,7 +786,21 @@ func (p *testConnectProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mu.Lock()
 	p.connects++
 	p.mu.Unlock()
-	if p.options.BlockResponse {
+	if p.options.CloseWithoutResponse[r.Host] {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			p.t.Errorf("ResponseWriter does not implement http.Hijacker")
+			return
+		}
+		conn, _, err := hijacker.Hijack()
+		if err != nil {
+			p.t.Errorf("Hijack() error = %v", err)
+			return
+		}
+		_ = conn.Close()
+		return
+	}
+	if p.options.BlockResponse || p.options.BlockResponseFor[r.Host] {
 		<-r.Context().Done()
 		return
 	}
