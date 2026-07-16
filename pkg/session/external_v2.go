@@ -219,6 +219,9 @@ func (rt *externalV2SendRuntime) run(ctx context.Context) (retErr error) {
 	}
 	stopLocalCancelAbort := watchExternalV2LocalCancelAbort(ctx, rt.derp, rt.listenerDERP, bytesTransferred, rt.auth)
 	defer stopLocalCancelAbort()
+	// Register the drain before the notification defers so LIFO execution keeps
+	// the DERP connection open briefly after its final abort frame is flushed.
+	defer drainExternalV2SenderAbortOnExit(&retErr, ctx)
 	defer notifyPeerAbortOnError(&retErr, ctx, rt.derp, rt.listenerDERP, bytesTransferred, rt.auth)
 	defer notifyPeerAbortOnLocalCancel(&retErr, ctx, rt.derp, rt.listenerDERP, bytesTransferred, rt.auth)
 
@@ -463,6 +466,19 @@ func drainExternalV2AbortSignal() {
 	timer := time.NewTimer(externalV2AbortSignalDrainWait)
 	defer timer.Stop()
 	<-timer.C
+}
+
+func drainExternalV2SenderAbortOnExit(errp *error, ctx context.Context) {
+	if errp == nil {
+		return
+	}
+	err := normalizePeerAbortError(ctx, *errp)
+	if !errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded) &&
+		!peerAbortErrorShouldNotify(err) {
+		return
+	}
+	drainExternalV2AbortSignal()
 }
 
 func (rt *externalV2SendRuntime) watchAbort(ctx context.Context, onAbort func()) (<-chan error, func()) {
