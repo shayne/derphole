@@ -6,6 +6,7 @@ package derptun
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -392,7 +393,12 @@ func TestVerifyClientCredentialChecksBearerProofAndExpiry(t *testing.T) {
 	}
 
 	badProof := clientCred
-	badProof.ProofMAC = "00" + badProof.ProofMAC[2:]
+	badProofMAC, err := hex.DecodeString(badProof.ProofMAC)
+	if err != nil {
+		t.Fatalf("decode proof MAC: %v", err)
+	}
+	badProofMAC[0] ^= 0xff
+	badProof.ProofMAC = hex.EncodeToString(badProofMAC)
 	if err := VerifyClientCredential(serverCred.SigningSecret, badProof, now); !errors.Is(err, ErrInvalidToken) {
 		t.Fatalf("VerifyClientCredential(bad proof) error = %v, want ErrInvalidToken", err)
 	}
