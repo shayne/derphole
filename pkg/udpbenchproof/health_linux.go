@@ -326,9 +326,14 @@ func captureLinuxOwnedProcess(expected ProcessRef, socketTables map[uint64]Socke
 	if err != nil || !present {
 		return present, nil, err
 	}
-	fds, err := os.ReadDir(filepath.Join(processRoot, "fd"))
+	fdDirectory, err := os.Open(filepath.Join(processRoot, "fd"))
 	if err != nil {
 		return false, nil, fmt.Errorf("inspect Linux process %d file descriptors: %w", expected.PID, err)
+	}
+	defer fdDirectory.Close()
+	fds, err := fdDirectory.ReadDir(-1)
+	if err != nil {
+		return false, nil, fmt.Errorf("read Linux process %d file descriptors: %w", expected.PID, err)
 	}
 	sockets, err := captureLinuxProcessSockets(processRoot, expected, fds, socketTables)
 	if err != nil {
@@ -455,10 +460,11 @@ func captureLinuxProcessSockets(processRoot string, process ProcessRef, fds []os
 }
 
 func parseLinuxSocketFD(target string) (uint64, string, bool, error) {
-	inodeText := strings.TrimSuffix(strings.TrimPrefix(target, "socket:["), "]")
-	if inodeText == target {
+	const prefix = "socket:["
+	if !strings.HasPrefix(target, prefix) || !strings.HasSuffix(target, "]") {
 		return 0, "", false, nil
 	}
+	inodeText := strings.TrimSuffix(strings.TrimPrefix(target, prefix), "]")
 	inode, err := strconv.ParseUint(inodeText, 10, 64)
 	if err != nil {
 		return 0, "", false, fmt.Errorf("linux process socket inode is malformed")
