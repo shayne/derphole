@@ -84,6 +84,10 @@ var derpDialContext = func(ctx context.Context, logf logger.Logf, netMon *netmon
 	return netns.NewDialer(logf, netMon).DialContext(ctx, network, addr)
 }
 
+var derpProxyDialContext = func(ctx context.Context, _ logger.Logf, _ *netmon.Monitor, network, addr string) (net.Conn, error) {
+	return (&net.Dialer{}).DialContext(ctx, network, addr)
+}
+
 func NewClient(ctx context.Context, node *tailcfg.DERPNode, serverURL string) (*Client, error) {
 	priv := key.NewNode()
 	return newClientWithPrivateKey(ctx, node, serverURL, priv)

@@ -18,15 +18,16 @@ Self-hosted routes use the same proxy machinery. See [Custom DERP Servers](./cus
 
 ```sh
 export HTTPS_PROXY=http://proxy.example:3128
-export NO_PROXY=localhost,127.0.0.1
 derphole send
 ```
 
-The proxy URL may use `http://` or `https://`. The proxy and network path must permit a long-lived HTTP `CONNECT` tunnel to the selected DERP host and port, normally TCP 443, plus the DERP HTTP upgrade that follows inside the tunnel. SOCKS, NTLM, PAC files, system keychains, and other proxy authentication mechanisms are not supported.
+The selected HTTP proxy URL may use `http://` or `https://`. The proxy and network path must permit a long-lived HTTP `CONNECT` tunnel to the selected DERP host and port, normally TCP 443, plus the DERP HTTP upgrade that follows inside the tunnel. SOCKS URLs are not accepted as HTTP proxy values; NTLM, PAC files, system keychains, and other proxy authentication mechanisms are not supported.
 
 Basic proxy authentication works only when the proxy URL contains both an explicit username and password. Percent-encode credentials as URL userinfo requires. Remember that proxy URLs stored in environment variables may be visible through local process inspection.
 
 Proxy selection is authoritative. Unsupported proxy schemes, malformed credentials, a failed proxy connection, or a rejected `CONNECT` fail closed. Once the standard resolver selects a proxy, the clients do not fall back to a direct DERP TCP connection. Use `NO_PROXY` for DERP hosts that should be reached directly.
+
+`NO_PROXY` is evaluated against the original DERP URL. Once an HTTP(S) proxy is selected, the connection to that proxy endpoint is dialed directly and is not routed through `ALL_PROXY`; a local selected proxy therefore does not require a loopback `NO_PROXY` entry. `ALL_PROXY` retains its existing SOCKS behavior only when the DERP connection is otherwise direct. If an operator intentionally needs a SOCKS-to-HTTP chain, the configured HTTP proxy endpoint must implement that chain itself.
 
 The first `CONNECT` always names the selected DERP hostname. Some proxies can route to the DERP server but silently fail their own hostname lookup. If that first attempt closes or times out before returning an HTTP response, the client can retry up to two known or locally resolved IP authorities through the same proxy. The original hostname still controls TLS SNI, certificate verification, and the DERP HTTP upgrade. A parsable proxy response—including 403, 407, 502, or 504—is final and does not trigger IP fallback. The client never opens a direct DERP socket as part of this recovery.
 

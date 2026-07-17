@@ -345,7 +345,7 @@ func TestClientsExchangePacketThroughHTTPProxyIPFallback(t *testing.T) {
 
 	var dialMu sync.Mutex
 	var dialAddresses []string
-	restoreDial := stubDERPDial(t, func(ctx context.Context, _ logger.Logf, _ *netmon.Monitor, network, addr string) (net.Conn, error) {
+	restoreDial := stubDERPProxyDial(t, func(ctx context.Context, _ logger.Logf, _ *netmon.Monitor, network, addr string) (net.Conn, error) {
 		dialMu.Lock()
 		dialAddresses = append(dialAddresses, addr)
 		dialMu.Unlock()
@@ -402,7 +402,7 @@ func TestClientsExchangePacketThroughHTTPProxyIPFallback(t *testing.T) {
 	defer dialMu.Unlock()
 	for _, addr := range dialAddresses {
 		if addr != proxyAddr {
-			t.Fatalf("derpDialContext dialed %q, want only proxy %q", addr, proxyAddr)
+			t.Fatalf("derpProxyDialContext dialed %q, want only proxy %q", addr, proxyAddr)
 		}
 	}
 }
@@ -1239,6 +1239,15 @@ func stubDERPDial(t *testing.T, fn func(context.Context, logger.Logf, *netmon.Mo
 	derpDialContext = fn
 	return func() {
 		derpDialContext = prev
+	}
+}
+
+func stubDERPProxyDial(t *testing.T, fn func(context.Context, logger.Logf, *netmon.Monitor, string, string) (net.Conn, error)) func() {
+	t.Helper()
+	prev := derpProxyDialContext
+	derpProxyDialContext = fn
+	return func() {
+		derpProxyDialContext = prev
 	}
 }
 

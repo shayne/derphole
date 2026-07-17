@@ -170,7 +170,7 @@ func dialDERPThroughProxy(ctx context.Context, proxyURL *url.URL, target string,
 	defer cancel()
 
 	proxyAddr := canonicalProxyAddr(proxyURL)
-	raw, err := derpDialContext(ctx, logf, netMon, "tcp", proxyAddr)
+	raw, err := derpProxyDialContext(ctx, logf, netMon, "tcp", proxyAddr)
 	if err != nil {
 		return nil, ProxyInfo{}, fmt.Errorf("dial DERP proxy %s://%s: %w", proxyURL.Scheme, proxyAddr, err)
 	}

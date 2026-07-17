@@ -119,6 +119,63 @@ func TestDERPProxyForURLUsesStandardEnvironment(t *testing.T) {
 	}
 }
 
+func TestDialDERPThroughProxyBypassesAllProxy(t *testing.T) {
+	if os.Getenv("DERPHOLE_PROXY_DIAL_HELPER") == "1" {
+		proxyURL, err := url.Parse(os.Getenv("DERPHOLE_PROXY_DIAL_URL"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		conn, _, err := dialDERPThroughProxy(ctx, proxyURL, "derp.example:443", t.Logf, netmon.NewStatic())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	proxy := newTestConnectProxy(t, testConnectProxyOptions{Status: http.StatusOK})
+	socksListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = socksListener.Close() })
+	socksContacted := make(chan struct{}, 1)
+	go func() {
+		conn, err := socksListener.Accept()
+		if err != nil {
+			return
+		}
+		socksContacted <- struct{}{}
+		_ = conn.Close()
+	}()
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestDialDERPThroughProxyBypassesAllProxy$")
+	cmd.Env = proxyTestEnvironment(os.Environ())
+	cmd.Env = append(cmd.Env,
+		"DERPHOLE_PROXY_DIAL_HELPER=1",
+		"DERPHOLE_PROXY_DIAL_URL="+proxy.URL(),
+		"HTTPS_PROXY="+proxy.URL(),
+		"ALL_PROXY=socks5://"+socksListener.Addr().String(),
+		"NO_PROXY=",
+		"no_proxy=",
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("proxy dial subprocess: %v\n%s", err, output)
+	}
+	if got := proxy.ConnectCount(); got != 1 {
+		t.Fatalf("HTTP proxy CONNECT count = %d, want 1", got)
+	}
+	select {
+	case <-socksContacted:
+		t.Fatal("selected HTTP proxy was dialed through ALL_PROXY")
+	default:
+	}
+}
+
 func proxyTestEnvironment(base []string) []string {
 	env := make([]string, 0, len(base))
 	for _, entry := range base {
@@ -126,7 +183,9 @@ func proxyTestEnvironment(base []string) []string {
 		switch name {
 		case "DERPHOLE_PROXY_TEST_HELPER", "DERPHOLE_PROXY_TEST_TARGET", "DERPHOLE_PROXY_TEST_WANT",
 			"DERPHOLE_PROXY_TEST_WANT_ERROR", "DERPHOLE_PROXY_TEST_NOT_WANT",
-			"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy", "REQUEST_METHOD":
+			"DERPHOLE_PROXY_DIAL_HELPER", "DERPHOLE_PROXY_DIAL_URL",
+			"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+			"http_proxy", "https_proxy", "no_proxy", "all_proxy", "REQUEST_METHOD":
 			continue
 		default:
 			env = append(env, entry)
@@ -663,10 +722,10 @@ func TestDialDERPThroughProxyCancellationDuringRejectionBody(t *testing.T) {
 }
 
 func TestSelectedProxyFailureDoesNotDialDERPDirectly(t *testing.T) {
-	oldDial := derpDialContext
-	defer func() { derpDialContext = oldDial }()
+	oldDial := derpProxyDialContext
+	defer func() { derpProxyDialContext = oldDial }()
 	var dials []string
-	derpDialContext = func(_ context.Context, _ logger.Logf, _ *netmon.Monitor, _ string, addr string) (net.Conn, error) {
+	derpProxyDialContext = func(_ context.Context, _ logger.Logf, _ *netmon.Monitor, _ string, addr string) (net.Conn, error) {
 		dials = append(dials, addr)
 		return nil, errors.New("blocked")
 	}
