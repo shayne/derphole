@@ -321,7 +321,7 @@ func captureLinuxOwnedState(owned []ProcessRef) ([]ProcessRef, []SocketRef, erro
 	return processes, sockets, nil
 }
 
-func captureLinuxOwnedProcess(expected ProcessRef, socketTables map[uint64]SocketRef) (bool, []SocketRef, error) {
+func captureLinuxOwnedProcess(expected ProcessRef, socketTables map[uint64]SocketRef) (present bool, sockets []SocketRef, err error) {
 	processRoot, present, err := matchingLinuxProcessRoot(expected)
 	if err != nil || !present {
 		return present, nil, err
@@ -330,12 +330,12 @@ func captureLinuxOwnedProcess(expected ProcessRef, socketTables map[uint64]Socke
 	if err != nil {
 		return false, nil, fmt.Errorf("inspect Linux process %d file descriptors: %w", expected.PID, err)
 	}
-	defer fdDirectory.Close()
+	defer func() { err = errors.Join(err, fdDirectory.Close()) }()
 	fds, err := fdDirectory.ReadDir(-1)
 	if err != nil {
 		return false, nil, fmt.Errorf("read Linux process %d file descriptors: %w", expected.PID, err)
 	}
-	sockets, err := captureLinuxProcessSockets(processRoot, expected, fds, socketTables)
+	sockets, err = captureLinuxProcessSockets(processRoot, expected, fds, socketTables)
 	if err != nil {
 		return false, nil, err
 	}
@@ -486,9 +486,7 @@ func readLinuxSocketTables() (map[uint64]SocketRef, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := mergeLinuxSocketTable(result, table); err != nil {
-			return nil, err
-		}
+		mergeLinuxSocketTable(result, table)
 	}
 	input, err := readHealthFile("/proc/net/unix")
 	if err != nil {
@@ -498,18 +496,12 @@ func readLinuxSocketTables() (map[uint64]SocketRef, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := mergeLinuxSocketTable(result, table); err != nil {
-		return nil, err
-	}
+	mergeLinuxSocketTable(result, table)
 	return result, nil
 }
 
-func mergeLinuxSocketTable(destination, source map[uint64]SocketRef) error {
+func mergeLinuxSocketTable(destination, source map[uint64]SocketRef) {
 	for inode, socket := range source {
-		if _, duplicate := destination[inode]; duplicate {
-			return fmt.Errorf("linux socket inode %d appears in multiple tables", inode)
-		}
-		destination[inode] = socket
+		mergeLinuxSocketRef(destination, inode, socket)
 	}
-	return nil
 }

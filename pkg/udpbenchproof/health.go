@@ -1139,12 +1139,20 @@ func parseLinuxNetworkSocketTable(input, network string) (map[uint64]SocketRef, 
 		if inode == 0 {
 			continue
 		}
-		if _, duplicate := result[inode]; duplicate {
-			return nil, fmt.Errorf("linux %s socket inode is duplicated", network)
-		}
-		result[inode] = socket
+		mergeLinuxSocketRef(result, inode, socket)
 	}
 	return result, nil
+}
+
+func mergeLinuxSocketRef(destination map[uint64]SocketRef, inode uint64, socket SocketRef) {
+	existing, duplicate := destination[inode]
+	if !duplicate {
+		destination[inode] = socket
+		return
+	}
+	if existing != socket {
+		destination[inode] = SocketRef{Network: "other", Local: "inode:" + strconv.FormatUint(inode, 10)}
+	}
 }
 
 func validateLinuxNetworkSocketHeader(lines []string, network string) error {
@@ -1229,10 +1237,7 @@ func parseLinuxUnixSocketTable(input string) (map[uint64]SocketRef, error) {
 		if err != nil {
 			return nil, err
 		}
-		if _, duplicate := result[inode]; duplicate {
-			return nil, fmt.Errorf("linux Unix socket inode is duplicated")
-		}
-		result[inode] = socket
+		mergeLinuxSocketRef(result, inode, socket)
 	}
 	return result, nil
 }

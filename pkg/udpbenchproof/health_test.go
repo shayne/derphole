@@ -459,8 +459,12 @@ func TestLinuxNetworkSocketTableSkipsOwnerlessTCPTimeWaitRows(t *testing.T) {
 	if _, err := parseLinuxNetworkSocketTable(header+timeWaitOne, "udp4"); err == nil {
 		t.Fatal("UDP zero inode accepted")
 	}
-	if _, err := parseLinuxNetworkSocketTable(header+owned+owned, "tcp4"); err == nil {
-		t.Fatal("duplicate nonzero inode accepted")
+	if table, err := parseLinuxNetworkSocketTable(header+owned+owned, "tcp4"); err != nil || len(table) != 1 || table[12345].Network != "tcp4" {
+		t.Fatalf("identical duplicate inode rows = %#v, %v", table, err)
+	}
+	conflicting := strings.Replace(owned, "0100007F:1F90", "0100007F:1F91", 1)
+	if table, err := parseLinuxNetworkSocketTable(header+owned+conflicting, "tcp4"); err != nil || len(table) != 1 || table[12345] != (SocketRef{Network: "other", Local: "inode:12345"}) {
+		t.Fatalf("conflicting duplicate inode rows = %#v, %v", table, err)
 	}
 }
 

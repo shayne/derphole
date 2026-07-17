@@ -139,64 +139,20 @@ func externalV2BulkPacketPrepareLinuxConnectedGSO(
 		headers, err := externalV2BulkPacketPrepareLinuxConnectedSend(messages, scratch)
 		return headers, scratch.groupEnds[:len(headers)], err
 	}
-	if len(messages) > externalV2BulkPacketMaxBatch {
-		messages = messages[:externalV2BulkPacketMaxBatch]
-	}
+	messages = externalV2BulkPacketLimitLinuxGSOMessages(messages)
 	if len(messages) == 0 {
 		return nil, nil, errors.New("bulk packet connected GSO send has no messages")
 	}
-	segmentSize := 0
-	for index := range messages {
-		if len(messages[index].Buffers) != 1 || len(messages[index].Buffers[0]) == 0 {
-			return nil, nil, errors.New("bulk packet connected GSO send requires one non-empty buffer")
-		}
-		if len(messages[index].OOB) != 0 {
-			return nil, nil, errors.New("bulk packet connected GSO send does not accept control data")
-		}
-		length := len(messages[index].Buffers[0])
-		if index == 0 {
-			segmentSize = length
-		}
-		if length > segmentSize || index != len(messages)-1 && length != segmentSize {
-			return nil, nil, errors.New("bulk packet connected GSO send requires equal segments with only a short final segment")
-		}
+	segmentSize, _, err := externalV2BulkPacketValidateLinuxGSOMessages(messages, "connected")
+	if err != nil {
+		return nil, nil, err
 	}
-	for start := 0; start < len(messages); start += segments {
-		end := min(start+segments, len(messages))
-		groupBytes := 0
-		for index := start; index < end; index++ {
-			groupBytes += len(messages[index].Buffers[0])
-		}
-		if groupBytes > externalV2BulkPacketMaxIPv4Payload {
-			return nil, nil, errors.New("bulk packet connected GSO message exceeds maximum IPv4 payload")
-		}
+	if err := externalV2BulkPacketValidateLinuxGSOGroups(messages, segments, "connected"); err != nil {
+		return nil, nil, err
 	}
-	for index := range messages {
-		length := len(messages[index].Buffers[0])
-		scratch.iovecs[index] = unix.Iovec{Base: &messages[index].Buffers[0][0]}
-		scratch.iovecs[index].SetLen(length)
-	}
-	controlBytes := externalV2BulkPacketMaxBatch * unix.CmsgSpace(2)
-	if cap(scratch.control) < controlBytes {
-		scratch.control = make([]byte, 0, controlBytes)
-	}
-	controlStorage := scratch.control[:cap(scratch.control)]
-	groupCount := 0
-	for start := 0; start < len(messages); start += segments {
-		end := min(start+segments, len(messages))
-		controlStart := groupCount * unix.CmsgSpace(2)
-		controlEnd := controlStart + unix.CmsgSpace(2)
-		control := controlStorage[controlStart:controlStart:controlEnd]
-		externalV2BulkPacketSetGSOSize(&control, uint16(segmentSize))
-		scratch.headers[groupCount] = externalV2BulkPacketMMsgHdr{hdr: unix.Msghdr{
-			Iov:        &scratch.iovecs[start],
-			Iovlen:     uint64(end - start),
-			Control:    &control[0],
-			Controllen: uint64(len(control)),
-		}}
-		scratch.groupEnds[groupCount] = end
-		groupCount++
-	}
+	externalV2BulkPacketPopulateLinuxGSOIovecs(messages, scratch)
+	controlStorage := externalV2BulkPacketLinuxGSOControlStorage(scratch)
+	groupCount := externalV2BulkPacketBuildLinuxConnectedGSOHeaders(messages, segments, segmentSize, scratch, controlStorage)
 	externalV2BulkPacketSetLinuxSendScratchActive(scratch, groupCount, len(messages), 0)
 	return scratch.headers[:groupCount], scratch.groupEnds[:groupCount], nil
 }
@@ -210,49 +166,25 @@ func externalV2BulkPacketPrepareLinuxAddressedGSO(
 		return nil, nil, errors.New("bulk packet addressed GSO send has no scratch")
 	}
 	externalV2BulkPacketResetLinuxConnectedSendScratch(scratch)
-	if !externalV2BulkPacketConnectedGSOSegmentsAllowed(segments) || segments == 1 {
+	if !externalV2BulkPacketAddressedGSOSegmentsAllowed(segments) {
 		return nil, nil, fmt.Errorf("invalid bulk packet addressed GSO segment count %d", segments)
 	}
-	if len(messages) > externalV2BulkPacketMaxBatch {
-		messages = messages[:externalV2BulkPacketMaxBatch]
-	}
+	messages = externalV2BulkPacketLimitLinuxGSOMessages(messages)
 	if len(messages) == 0 {
 		return nil, nil, errors.New("bulk packet addressed GSO send has no messages")
 	}
-	segmentSize := 0
-	for index := range messages {
-		if len(messages[index].Buffers) != 1 || len(messages[index].Buffers[0]) == 0 {
-			return externalV2BulkPacketFailLinuxAddressedGSO(scratch, 0, index, 0, errors.New("bulk packet addressed GSO send requires one non-empty buffer"))
-		}
-		if len(messages[index].OOB) != 0 {
-			return externalV2BulkPacketFailLinuxAddressedGSO(scratch, 0, index, 0, errors.New("bulk packet addressed GSO send does not accept control data"))
-		}
-		length := len(messages[index].Buffers[0])
-		if index == 0 {
-			segmentSize = length
-		}
-		if length > segmentSize || index != len(messages)-1 && length != segmentSize {
-			return externalV2BulkPacketFailLinuxAddressedGSO(scratch, 0, index, 0, errors.New("bulk packet addressed GSO send requires equal segments with only a short final segment"))
-		}
-		scratch.iovecs[index] = unix.Iovec{Base: &messages[index].Buffers[0][0]}
-		scratch.iovecs[index].SetLen(length)
-		externalV2BulkPacketSetLinuxSendScratchActive(scratch, 0, index+1, 0)
+	segmentSize, invalidIndex, err := externalV2BulkPacketValidateLinuxGSOMessages(messages, "addressed")
+	if err != nil {
+		return externalV2BulkPacketFailLinuxAddressedGSO(scratch, 0, invalidIndex, 0, err)
 	}
-	controlBytes := externalV2BulkPacketMaxBatch * unix.CmsgSpace(2)
-	if cap(scratch.control) < controlBytes {
-		scratch.control = make([]byte, 0, controlBytes)
+	if err := externalV2BulkPacketValidateLinuxGSOGroups(messages, segments, "addressed"); err != nil {
+		return externalV2BulkPacketFailLinuxAddressedGSO(scratch, 0, 0, 0, err)
 	}
-	controlStorage := scratch.control[:cap(scratch.control)]
+	externalV2BulkPacketPopulateLinuxGSOIovecs(messages, scratch)
+	controlStorage := externalV2BulkPacketLinuxGSOControlStorage(scratch)
 	groupCount := 0
 	for start := 0; start < len(messages); start += segments {
 		end := min(start+segments, len(messages))
-		groupBytes := 0
-		for index := start; index < end; index++ {
-			groupBytes += len(messages[index].Buffers[0])
-		}
-		if groupBytes > externalV2BulkPacketMaxIPv4Payload {
-			return externalV2BulkPacketFailLinuxAddressedGSO(scratch, groupCount, len(messages), groupCount, errors.New("bulk packet addressed GSO message exceeds maximum IPv4 payload"))
-		}
 		externalV2BulkPacketSetLinuxSendScratchActive(scratch, groupCount, len(messages), groupCount+1)
 		name, nameLen, err := externalV2BulkPacketLinuxRawSockaddr(&scratch.sockaddrs[groupCount], messages[start].Addr)
 		if err != nil {
@@ -276,6 +208,93 @@ func externalV2BulkPacketPrepareLinuxAddressedGSO(
 	}
 	externalV2BulkPacketSetLinuxSendScratchActive(scratch, groupCount, len(messages), groupCount)
 	return scratch.headers[:groupCount], scratch.groupEnds[:groupCount], nil
+}
+
+func externalV2BulkPacketLimitLinuxGSOMessages(messages []externalV2BulkPacketBatchMessage) []externalV2BulkPacketBatchMessage {
+	if len(messages) > externalV2BulkPacketMaxBatch {
+		return messages[:externalV2BulkPacketMaxBatch]
+	}
+	return messages
+}
+
+func externalV2BulkPacketValidateLinuxGSOMessages(messages []externalV2BulkPacketBatchMessage, mode string) (int, int, error) {
+	segmentSize := 0
+	for index := range messages {
+		if len(messages[index].Buffers) != 1 || len(messages[index].Buffers[0]) == 0 {
+			return 0, index, fmt.Errorf("bulk packet %s GSO send requires one non-empty buffer", mode)
+		}
+		if len(messages[index].OOB) != 0 {
+			return 0, index, fmt.Errorf("bulk packet %s GSO send does not accept control data", mode)
+		}
+		length := len(messages[index].Buffers[0])
+		if index == 0 {
+			segmentSize = length
+		}
+		if length > segmentSize || index != len(messages)-1 && length != segmentSize {
+			return 0, index, fmt.Errorf("bulk packet %s GSO send requires equal segments with only a short final segment", mode)
+		}
+	}
+	return segmentSize, len(messages), nil
+}
+
+func externalV2BulkPacketValidateLinuxGSOGroups(messages []externalV2BulkPacketBatchMessage, segments int, mode string) error {
+	for start := 0; start < len(messages); start += segments {
+		end := min(start+segments, len(messages))
+		groupBytes := 0
+		for index := start; index < end; index++ {
+			groupBytes += len(messages[index].Buffers[0])
+		}
+		if groupBytes > externalV2BulkPacketMaxIPv4Payload {
+			return fmt.Errorf("bulk packet %s GSO message exceeds maximum IPv4 payload", mode)
+		}
+	}
+	return nil
+}
+
+func externalV2BulkPacketPopulateLinuxGSOIovecs(messages []externalV2BulkPacketBatchMessage, scratch *externalV2BulkPacketLinuxSendScratch) {
+	for index := range messages {
+		buffer := messages[index].Buffers[0]
+		scratch.iovecs[index] = unix.Iovec{Base: &buffer[0]}
+		scratch.iovecs[index].SetLen(len(buffer))
+	}
+}
+
+func externalV2BulkPacketLinuxGSOControlStorage(scratch *externalV2BulkPacketLinuxSendScratch) []byte {
+	controlBytes := externalV2BulkPacketMaxBatch * unix.CmsgSpace(2)
+	if cap(scratch.control) < controlBytes {
+		scratch.control = make([]byte, 0, controlBytes)
+	}
+	return scratch.control[:cap(scratch.control)]
+}
+
+func externalV2BulkPacketBuildLinuxConnectedGSOHeaders(
+	messages []externalV2BulkPacketBatchMessage,
+	segments int,
+	segmentSize int,
+	scratch *externalV2BulkPacketLinuxSendScratch,
+	controlStorage []byte,
+) int {
+	groupCount := 0
+	for start := 0; start < len(messages); start += segments {
+		end := min(start+segments, len(messages))
+		controlStart := groupCount * unix.CmsgSpace(2)
+		controlEnd := controlStart + unix.CmsgSpace(2)
+		control := controlStorage[controlStart:controlStart:controlEnd]
+		externalV2BulkPacketSetGSOSize(&control, uint16(segmentSize))
+		scratch.headers[groupCount] = externalV2BulkPacketMMsgHdr{hdr: unix.Msghdr{
+			Iov:        &scratch.iovecs[start],
+			Iovlen:     uint64(end - start),
+			Control:    &control[0],
+			Controllen: uint64(len(control)),
+		}}
+		scratch.groupEnds[groupCount] = end
+		groupCount++
+	}
+	return groupCount
+}
+
+func externalV2BulkPacketAddressedGSOSegmentsAllowed(segments int) bool {
+	return segments != 1 && externalV2BulkPacketConnectedGSOSegmentsAllowed(segments)
 }
 
 func externalV2BulkPacketFailLinuxAddressedGSO(
