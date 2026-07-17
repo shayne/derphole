@@ -25,6 +25,8 @@ import (
 )
 
 func TestExternalV2BulkPacketLinuxConnectedSendMMsgRoundTrip(t *testing.T) {
+	useExternalV2BulkPacketCandidate(t, "connected-gso3")
+
 	receiver := listenExternalV2BulkPacketLinuxUDP(t)
 	defer receiver.Close()
 	senderConn := listenExternalV2BulkPacketLinuxUDP(t)
@@ -881,6 +883,8 @@ func TestExternalV2BulkPacketLinuxBatchFallsBackAddressedBeforeConnect(t *testin
 }
 
 func TestExternalV2BulkPacketLinuxBatchFailsCleanlyAfterConnectedFatalError(t *testing.T) {
+	useExternalV2BulkPacketCandidate(t, "connected-gso3")
+
 	receiver := listenExternalV2BulkPacketLinuxUDP(t)
 	defer receiver.Close()
 	senderConn := listenExternalV2BulkPacketLinuxUDP(t)

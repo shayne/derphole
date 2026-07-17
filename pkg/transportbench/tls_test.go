@@ -8,6 +8,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -224,14 +226,29 @@ func TestTLSSenderRejectsWrongFingerprint(t *testing.T) {
 		TracePath:         filepath.Join(tempDir, "sender.csv"),
 		Timeout:           750 * time.Millisecond,
 	})
-	if err == nil || !strings.Contains(err.Error(), "fingerprint") {
-		t.Fatalf("SendTLS() error = %v, want fingerprint failure", err)
+	if err == nil {
+		t.Fatal("SendTLS() error = nil, want rejected connection")
 	}
 	if err := <-receiveResult; err == nil {
 		t.Fatal("ReceiveTLS() error = nil after rejected clients")
 	}
 	if _, err := os.Stat(filepath.Join(tempDir, "output.bin")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("receiver created output before lane validation: %v", err)
+	}
+}
+
+func TestPinnedTLSClientConfigReportsWrongFingerprint(t *testing.T) {
+	certificate, _, err := newEphemeralTLSCertificate(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := newPinnedTLSClientConfig(strings.Repeat("0", sha256.Size*2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = config.VerifyConnection(tls.ConnectionState{PeerCertificates: []*x509.Certificate{certificate.Leaf}})
+	if err == nil || !strings.Contains(err.Error(), "fingerprint mismatch") {
+		t.Fatalf("VerifyConnection() error = %v, want fingerprint mismatch", err)
 	}
 }
 

@@ -119,6 +119,8 @@ func TestExternalV2BulkPacketLinuxPeerRejectsInvalidAddresses(t *testing.T) {
 }
 
 func TestExternalV2BulkPacketLinuxFixedPeerRejectsInvalidPeer(t *testing.T) {
+	useExternalV2BulkPacketCandidate(t, "connected-gso3")
+
 	for name, addr := range map[string]net.Addr{
 		"nil":           nil,
 		"wrong network": &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8123},
@@ -269,6 +271,8 @@ func TestExternalV2BulkPacketLinuxFixedPeerDisconnectJoinsCallbackAndControlErro
 }
 
 func TestExternalV2BulkPacketLinuxFixedPeersLeaveFifthSocketForSealedControl(t *testing.T) {
+	useExternalV2BulkPacketCandidate(t, "connected-gso3")
+
 	const laneCount = 4
 	path := externalV2BulkPacketPath{Conns: make([]net.PacketConn, laneCount+1), Addrs: make([]net.Addr, laneCount+1)}
 	receivers := make([]*net.UDPConn, laneCount+1)

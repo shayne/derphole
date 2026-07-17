@@ -163,10 +163,6 @@ func externalV2BulkPacketLinuxVerifyPeerWithOps(raw syscall.RawConn, expected ex
 	)
 }
 
-func externalV2BulkPacketLinuxVerifyPeerFD(fd int, expected externalV2BulkPacketLinuxPeer) error {
-	return externalV2BulkPacketLinuxVerifyPeerFDWithOps(fd, expected, externalV2BulkPacketLinuxSystemPeerOps())
-}
-
 func externalV2BulkPacketLinuxVerifyPeerFDWithOps(fd int, expected externalV2BulkPacketLinuxPeer, ops externalV2BulkPacketLinuxPeerOps) error {
 	sockaddr, err := ops.getpeername(fd)
 	if err != nil {
@@ -180,10 +176,6 @@ func externalV2BulkPacketLinuxVerifyPeerFDWithOps(fd int, expected externalV2Bul
 		return fmt.Errorf("bulk packet fixed peer mismatch: got %#v want %#v", actual, expected)
 	}
 	return nil
-}
-
-func externalV2BulkPacketLinuxDisconnectRaw(raw syscall.RawConn) error {
-	return externalV2BulkPacketLinuxDisconnectRawWithOps(raw, externalV2BulkPacketLinuxSystemPeerOps())
 }
 
 func externalV2BulkPacketLinuxDisconnectRawWithOps(raw syscall.RawConn, ops externalV2BulkPacketLinuxPeerOps) error {
