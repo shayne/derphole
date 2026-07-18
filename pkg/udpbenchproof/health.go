@@ -1184,17 +1184,17 @@ func parseLinuxNetworkSocketRow(fields []string, network string) (uint64, Socket
 		return 0, SocketRef{}, fmt.Errorf("linux %s socket address is malformed", network)
 	}
 	inode, err := strconv.ParseUint(fields[9], 10, 64)
-	if err != nil || (inode == 0 && !isOwnerlessLinuxTCPTimeWait(network, fields[3])) {
+	if err != nil || (inode == 0 && !isOwnerlessLinuxTCPRow(network, fields[3])) {
 		return 0, SocketRef{}, fmt.Errorf("linux %s socket inode is malformed", network)
 	}
 	return inode, SocketRef{Network: network, Local: fields[1], Remote: fields[2]}, nil
 }
 
-func isOwnerlessLinuxTCPTimeWait(network, state string) bool {
-	// Linux keeps completed TCP TIME_WAIT rows (state 06) in /proc/net/tcp{,6}
-	// after their process-owned socket inode is gone. UDP has no TIME_WAIT state,
-	// so inode zero remains malformed for both UDP tables and other TCP states.
-	return (network == "tcp4" || network == "tcp6") && state == "06"
+func isOwnerlessLinuxTCPRow(network, state string) bool {
+	// Linux prints inode zero for request sockets in SYN_RECV (state 03) and
+	// completed TIME_WAIT sockets (state 06). Neither row can belong to a
+	// process file descriptor, so omit them from ownership correlation.
+	return (network == "tcp4" || network == "tcp6") && (state == "03" || state == "06")
 }
 
 func validLinuxSocketAddress(value, network string) bool {

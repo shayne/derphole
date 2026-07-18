@@ -424,31 +424,33 @@ func TestHealthLinuxPlatformParsersFailClosed(t *testing.T) {
 	}
 }
 
-func TestLinuxNetworkSocketTableSkipsOwnerlessTCPTimeWaitRows(t *testing.T) {
+func TestLinuxNetworkSocketTableSkipsOwnerlessTCPRows(t *testing.T) {
 	t.Parallel()
 
 	header := "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
 	header6 := "  sl  local_address remote_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
 	timeWaitOne := "   3: 0100007F:9C55 0100007F:1F90 06 00000000:00000000 03:0000176F 00000000 0 0 0 3 0000000000000000 0\n"
 	timeWaitTwo := "   4: 0100007F:9C56 0100007F:1F90 06 00000000:00000000 03:00001770 00000000 0 0 0 3 0000000000000000 0\n"
-	owned := "   5: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 12345 1 0000000000000000 100 0 0 10 0\n"
+	synRecv := "   5: 0100007F:1F90 0100007F:9C57 03 00000000:00000000 01:00000064 00000000 1000 0 0 0 0000000000000000\n"
+	owned := "   6: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 12345 1 0000000000000000 100 0 0 10 0\n"
 
-	table, err := parseLinuxNetworkSocketTable(header+timeWaitOne+timeWaitTwo+owned, "tcp4")
+	table, err := parseLinuxNetworkSocketTable(header+timeWaitOne+timeWaitTwo+synRecv+owned, "tcp4")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(table) != 1 || table[12345].Network != "tcp4" {
 		t.Fatalf("socket table = %#v, want only owned inode 12345", table)
 	}
-	tcp6TimeWait := "   6: 00000000000000000000000001000000:9C55 00000000000000000000000001000000:1F90 06 00000000:00000000 03:0000176F 00000000 0 0 0 3 0000000000000000 0\n"
-	if table, err := parseLinuxNetworkSocketTable(header6+tcp6TimeWait, "tcp6"); err != nil || len(table) != 0 {
-		t.Fatalf("ownerless tcp6 TIME_WAIT table = %#v, %v", table, err)
+	tcp6TimeWait := "   7: 00000000000000000000000001000000:9C55 00000000000000000000000001000000:1F90 06 00000000:00000000 03:0000176F 00000000 0 0 0 3 0000000000000000 0\n"
+	tcp6SynRecv := "   8: 00000000000000000000000001000000:1F90 00000000000000000000000001000000:9C57 03 00000000:00000000 01:00000064 00000000 1000 0 0 0 0000000000000000\n"
+	if table, err := parseLinuxNetworkSocketTable(header6+tcp6TimeWait+tcp6SynRecv, "tcp6"); err != nil || len(table) != 0 {
+		t.Fatalf("ownerless tcp6 rows = %#v, %v", table, err)
 	}
 
 	for name, fixture := range map[string]string{
 		"malformed zero-inode index":   strings.Replace(timeWaitOne, "3:", "bad:", 1),
 		"malformed zero-inode address": strings.Replace(timeWaitOne, "0100007F:9C55", "malformed", 1),
-		"non-TIME-WAIT TCP zero inode": strings.Replace(timeWaitOne, " 06 ", " 01 ", 1),
+		"owned-state TCP zero inode":   strings.Replace(timeWaitOne, " 06 ", " 01 ", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := parseLinuxNetworkSocketTable(header+fixture, "tcp4"); err == nil {
