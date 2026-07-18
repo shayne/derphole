@@ -18,7 +18,15 @@ Use a dedicated GitButler branch for each agent session unless the user asks for
 
 Agents may create local checkpoint commits after a coherent unit of work is complete. Avoid micro-commits; prefer commits that match the current objective and would make sense when read later.
 
-Pre-commit hooks are intentionally expensive and should run normally. Report any pre-commit failure with the fix or remaining blocker.
+During iteration, run focused tests for the code you change, followed by the
+build-only `mise run check:fast`. It does not run formatting or commit hooks.
+When creating a checkpoint commit, let the installed commit hook format changed
+Go files and run deterministic hygiene; retry the commit if formatting changed
+tracked content. Do not run the exhaustive `mise run check` gate as part of the
+normal coding loop. Immediately before any push or direct landing to `main`, run
+`mise run check` once against the final commit stack. If tracked content changes
+afterward, run the exhaustive gate again. Report failures with the fix or
+remaining blocker.
 
 Treat checkpoint commits as local savepoints, not final history. Before finishing to `main`, use GitButler to tidy, squash, reword, or amend unpublished session commits into a clean final shape.
 
@@ -65,8 +73,9 @@ Use `mise` for toolchain consistency.
 - `mise run test` runs `go test ./...`
 - `mise run vet` runs `go vet ./...`
 - `mise run install-githooks` installs the local `pre-commit` and `prepare-commit-msg` hooks
-- `mise run check:hooks` runs the repository's `pre-commit` checks across all files
-- `mise run check` runs the same hook, build, and test sequence as the dedicated checks workflow
+- `mise run check:fast` is build-only: it builds every product without commit hooks, formatting, or the full test suite
+- `mise run check:hooks` runs both the fast and exhaustive pre-commit stages across all files
+- `mise run check` runs the exhaustive hook set and builds every product; the coverage-backed quality hook supplies the single full-suite test pass
 - `mise run smoke-local` runs the local end-to-end smoke test
 - `mise run release:build-all` builds vendored binaries, release tarballs, and `dist/npm-derphole`
 - `mise run release:npm-dry-run` validates the npm package without publishing

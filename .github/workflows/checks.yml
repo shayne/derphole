@@ -8,12 +8,58 @@ on:
     paths-ignore:
       - "README.md"
 
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
-  checks:
-    name: Checks
+  fast:
+    name: Fast contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+        with:
+          install: true
+          cache: true
+      - name: Run fast checks
+        run: mise run check:ci-fast
+
+  quality:
+    name: Tests + quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+        with:
+          install: true
+          cache: true
+      - name: Run coverage-backed quality gate
+        run: mise run quality
+
+  static:
+    name: Static + dependency
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+        with:
+          install: true
+          cache: true
+      - name: Run static and dependency analysis
+        run: mise run check:static
+
+  topology:
+    name: Topology
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -25,7 +71,5 @@ jobs:
           cache: true
       - name: Install topology tools
         run: sudo apt-get update && sudo apt-get install -y iproute2 iptables iputils-ping
-      - name: Run checks
-        run: mise run check
       - name: Run topology simulations
         run: mise run toposim

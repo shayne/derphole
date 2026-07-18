@@ -76,7 +76,7 @@ func TestReleaseWorkflowPublishesSwiftPMFramework(t *testing.T) {
 		"name: derphole-mobile-swiftpm",
 		"path: dist/swiftpm/DerpholeMobile.xcframework.zip",
 		"needs: [meta, check, build-binaries, build-web, build-swiftpm-framework, publish-npm-prod]",
-		"needs: [check, publish-packages-prod, build-swiftpm-framework]",
+		"needs: [meta, check, publish-packages-prod, build-swiftpm-framework]",
 		"-n derphole-mobile-swiftpm",
 		"dist/release/DerpholeMobile.xcframework.zip",
 	} {

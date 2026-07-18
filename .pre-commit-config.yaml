@@ -20,7 +20,7 @@ repos:
         entry: tools/hooks/go-vet
         language: system
         pass_filenames: false
-        stages: [pre-commit]
+        stages: [manual]
       - id: derphole-go-mod-tidy
         name: derphole go mod tidy
         entry: tools/hooks/go-mod-tidy-check
@@ -32,13 +32,13 @@ repos:
         entry: tools/hooks/staticcheck
         language: system
         pass_filenames: false
-        stages: [pre-commit]
+        stages: [manual]
       - id: derphole-govulncheck
         name: derphole govulncheck
         entry: tools/hooks/govulncheck
         language: system
         pass_filenames: false
-        stages: [pre-commit]
+        stages: [manual]
       - id: derphole-private-info-scan
         name: derphole private info scan
         entry: tools/hooks/private-info-scan
@@ -50,13 +50,13 @@ repos:
         entry: tools/hooks/quality
         language: system
         pass_filenames: false
-        stages: [pre-commit]
+        stages: [manual]
       - id: derphole-depaware
         name: derphole depaware
         entry: tools/hooks/depaware-check
         language: system
         pass_filenames: false
-        stages: [pre-commit]
+        stages: [manual]
       - id: derphole-depaware-deps
         name: derphole depaware dependency check
         entry: tools/hooks/depaware-deps-check

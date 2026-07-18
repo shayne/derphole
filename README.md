@@ -433,8 +433,19 @@ owning. Oops.
 ```bash
 mise install
 mise run install-githooks
+go test ./pkg/token -run TestEncode
+mise run check:fast
+```
+
+Run focused tests and the build-only `mise run check:fast` during iteration. It
+compiles every product without running formatting or commit hooks. When making
+a checkpoint commit, let the installed commit hook format changed Go files and
+run deterministic hygiene; retry the commit if formatting changed tracked
+content. Do not run the exhaustive gate as part of the normal coding loop.
+Immediately before a push or landing, run it once:
+
+```bash
 mise run check
-mise run build
 ```
 
 `mise run build` writes `dist/derphole`, `dist/derptun`, and `dist/derpssh`.

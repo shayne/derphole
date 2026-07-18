@@ -57,16 +57,55 @@ run = "tools/quality/goal"
 description = "Refresh the current CRAP and lint baselines"
 run = "tools/quality/check --update-baseline"
 
-[tasks."check:hooks"]
-run = "pre-commit run --all-files"
+[tasks."check:fast:hooks"]
+description = "Run deterministic pre-commit hygiene checks"
+run = "pre-commit run --all-files --hook-stage pre-commit"
 
-[tasks.check]
+[tasks."check:full:hooks"]
+description = "Run fast and exhaustive pre-commit checks"
 shell = "bash -c"
 run = """
 set -euo pipefail
-mise run check:hooks
+pre-commit run --all-files --hook-stage pre-commit
+pre-commit run --all-files --hook-stage manual
+"""
+
+[tasks."check:hooks"]
+description = "Compatibility alias for the exhaustive hook set"
+run = "mise run check:full:hooks"
+
+[tasks."check:static"]
+description = "Run static, vulnerability, and dependency analysis"
+shell = "bash -c"
+run = """
+set -euo pipefail
+tools/hooks/go-vet
+tools/hooks/staticcheck
+tools/hooks/govulncheck
+tools/hooks/depaware-check
+tools/hooks/depaware-deps-check
+"""
+
+[tasks."check:fast"]
+description = "Compile all products without running commit or exhaustive gates"
+run = "mise run build"
+
+[tasks."check:ci-fast"]
+description = "Run commit hygiene and compile all products"
+shell = "bash -c"
+run = """
+set -euo pipefail
+mise run check:fast:hooks
+mise run check:fast
+"""
+
+[tasks.check]
+description = "Run the exhaustive local verification gate"
+shell = "bash -c"
+run = """
+set -euo pipefail
+mise run check:full:hooks
 mise run build
-mise run test
 """
 
 [tasks.toposim]

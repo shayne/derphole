@@ -8,13 +8,10 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$repo_root"
 
-tools/hooks/check-license
-tools/hooks/gofmt-check
-tools/hooks/go-vet
-tools/hooks/go-mod-tidy-check
-tools/hooks/staticcheck
-tools/hooks/govulncheck
-tools/hooks/private-info-scan
-tools/hooks/quality
-tools/hooks/depaware-check
-tools/hooks/depaware-deps-check
+if ! command -v mise >/dev/null 2>&1; then
+  echo "mise is required to run the repository pre-commit checks." >&2
+  echo "Install and run: mise install" >&2
+  exit 1
+fi
+
+exec mise run check:fast:hooks
