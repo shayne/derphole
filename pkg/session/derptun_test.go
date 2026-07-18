@@ -1014,6 +1014,70 @@ func TestRecoverStaleDerptunActiveReleasesClosedTransport(t *testing.T) {
 	}
 }
 
+func TestDerptunNativeProbeWaitsForPeerClose(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(server) error = %v", err)
+	}
+	clientIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(client) error = %v", err)
+	}
+	serverPacketConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(server) error = %v", err)
+	}
+	defer serverPacketConn.Close()
+	listener, err := quic.Listen(serverPacketConn, quicpath.ServerTLSConfig(serverIdentity, clientIdentity.Public), derptunQUICConfig())
+	if err != nil {
+		t.Fatalf("quic.Listen() error = %v", err)
+	}
+	defer listener.Close()
+	clientPacketConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(client) error = %v", err)
+	}
+	defer clientPacketConn.Close()
+
+	serverConnCh := make(chan *quic.Conn, 1)
+	serverErrCh := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept(ctx)
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		serverConnCh <- conn
+	}()
+	clientConn, err := quic.Dial(ctx, clientPacketConn, serverPacketConn.LocalAddr(), quicpath.ClientTLSConfig(clientIdentity, serverIdentity.Public), derptunQUICConfig())
+	if err != nil {
+		t.Fatalf("quic.Dial() error = %v", err)
+	}
+	defer func() { _ = clientConn.CloseWithError(0, "") }()
+
+	var serverConn *quic.Conn
+	select {
+	case serverConn = <-serverConnCh:
+	case err := <-serverErrCh:
+		t.Fatalf("listener.Accept() error = %v", err)
+	case <-ctx.Done():
+		t.Fatal("listener did not accept client QUIC connection")
+	}
+	defer func() { _ = serverConn.CloseWithError(0, "") }()
+
+	active := &derptunServeActive{native: true, quicConn: serverConn}
+	go func() {
+		time.Sleep(25 * time.Millisecond)
+		_ = clientConn.CloseWithError(0, "")
+	}()
+	if err := active.probe(ctx, time.Second); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("probe() error = %v, want peer close", err)
+	}
+}
+
 func TestServeQUICListenerForwardsConcurrentStreams(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

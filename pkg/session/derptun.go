@@ -283,12 +283,12 @@ func (a *derptunServeActive) probe(ctx context.Context, timeout time.Duration) e
 		return net.ErrClosed
 	}
 	if a.mux == nil {
-		return a.probeNativeQUIC()
+		return a.probeNativeQUIC(ctx, timeout)
 	}
 	return a.mux.Ping(ctx, timeout)
 }
 
-func (a *derptunServeActive) probeNativeQUIC() error {
+func (a *derptunServeActive) probeNativeQUIC(ctx context.Context, timeout time.Duration) error {
 	if !a.native {
 		return net.ErrClosed
 	}
@@ -299,11 +299,18 @@ func (a *derptunServeActive) probeNativeQUIC() error {
 		}
 		return nil
 	}
+	if timeout <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case <-quicConn.Context().Done():
 		return net.ErrClosed
-	default:
+	case <-timer.C:
 		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -364,9 +371,7 @@ func emitDerptunActiveStats(emitter *telemetry.Emitter, active *derptunServeActi
 }
 
 func probeDerptunActive(ctx context.Context, emitter *telemetry.Emitter, gate *derptunClientGate, active *derptunServeActive, probeTimeout, stopTimeout time.Duration) (bool, error) {
-	probeCtx, probeCancel := context.WithTimeout(ctx, probeTimeout)
-	probeErr := active.probe(probeCtx, probeTimeout)
-	probeCancel()
+	probeErr := active.probe(ctx, probeTimeout)
 	if probeErr == nil {
 		if emitter != nil {
 			emitter.Debug("derptun-active-probe=alive")
