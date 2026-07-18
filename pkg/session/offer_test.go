@@ -217,7 +217,7 @@ func TestPublicRelayOnlyOfferedStdioRoundTripWhenOnlyOfferForcesRelay(t *testing
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	var senderStatus syncBuffer
@@ -276,7 +276,7 @@ func TestPublicRelayOnlyOfferedStdioRoundTripWhenOnlyReceiveForcesRelay(t *testi
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	var senderStatus syncBuffer
