@@ -123,7 +123,7 @@ func TestPromotionBenchmarkDefaultsToFileSendReceive(t *testing.T) {
 	body := readPromotionDriver(t)
 	for _, want := range []string{
 		`workload="${DERPHOLE_BENCH_WORKLOAD:-file}"`,
-		`--verbose send "${direct_tcp_args[@]}" "${payload}"`,
+		`--verbose send "${direct_tcp_args[@]+"${direct_tcp_args[@]}"}" "${payload}"`,
 		`--verbose receive -o '${remote_base}.out'`,
 		`benchmark-workload=${workload}`,
 		`benchmark-transfer-mode=${transfer_mode}`,
@@ -179,8 +179,8 @@ func TestPromotionBenchmarkSupportsLocalDirectTCPFileListener(t *testing.T) {
 		`direct_tcp_port="${DERPHOLE_BENCH_DIRECT_TCP_PORT:-}"`,
 		`DERPHOLE_BENCH_DIRECT_TCP_PORT must be an integer from 1 through 65535`,
 		`direct_tcp_args=(--direct-tcp-port "${direct_tcp_port}")`,
-		`--verbose send "${direct_tcp_args[@]}" "${payload}"`,
-		`--verbose receive "${direct_tcp_args[@]}" -o "${receiver_out}"`,
+		`--verbose send "${direct_tcp_args[@]+"${direct_tcp_args[@]}"}" "${payload}"`,
+		`--verbose receive "${direct_tcp_args[@]+"${direct_tcp_args[@]}"}" -o "${receiver_out}"`,
 		`transfer_mode="direct-tcp-files-v1"`,
 	} {
 		if !strings.Contains(body, want) {
@@ -267,6 +267,8 @@ case "${command}" in
   send)
     payload="${1:?missing payload}"
     printf 'send\n' >>"${FAKE_DERPHOLE_STATE}/events"
+    printf 'send-probe-outcome=%s\n' "${DERPHOLE_TEST_BULK_PROBE_OUTCOME-<unset>}" >>"${FAKE_DERPHOLE_STATE}/probe-outcome-events"
+    printf 'send-probe-dirty-rate=%s\n' "${DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS-<unset>}" >>"${FAKE_DERPHOLE_STATE}/probe-dirty-rate-events"
     printf '%s\n' "${payload}" >"${FAKE_DERPHOLE_STATE}/payload-path"
 	if [[ "${FAKE_SEND_STAY_RUNNING:-0}" == "1" ]]; then
 	  printf '%s\n' "$$" >"${FAKE_DERPHOLE_STATE}/remote-child-pid"
@@ -274,6 +276,14 @@ case "${command}" in
 	fi
     printf 'derphole receive AAAAAAAAAAAAAAAAAAAAAAAA\n' >&2
     printf 'connected-relay\nconnected-direct\nv2-block-transfer=bulk-packets\n' >&2
+	if [[ "${FAKE_BULK_QUIC_DECISION:-0}" == "1" ]]; then printf 'v2-bulk-decision=mode:quic\n' >&2; fi
+	if [[ "${DERPHOLE_TEST_BULK_PROBE_OUTCOME-}" == "sender-reject" && "${FAKE_SKIP_BULK_PROBE_OUTCOME_MARKER:-0}" != "1" ]]; then
+	  printf 'v2-bulk-probe-test-outcome=sender-reject\n' >&2
+	  if [[ "${FAKE_DUPLICATE_BULK_PROBE_OUTCOME_MARKER:-0}" == "1" ]]; then
+	    printf 'v2-bulk-probe-test-outcome=sender-reject\n' >&2
+	  fi
+	fi
+	if [[ "${FAKE_SENDER_BULK_PROBE_DIRTY_RATE_MARKER:-0}" == "1" ]]; then printf 'v2-bulk-probe-test-dirty-rate-mbps=1000\n' >&2; fi
 	if [[ "${FAKE_SEND_STAY_RUNNING:-0}" == "1" ]]; then
 	  while :; do
 	    sleep 1
@@ -294,8 +304,18 @@ case "${command}" in
     token="${3:?missing token}"
     [[ "${token}" == "AAAAAAAAAAAAAAAAAAAAAAAA" ]]
     printf 'receive\n' >>"${FAKE_DERPHOLE_STATE}/events"
+    printf 'receive-probe-outcome=%s\n' "${DERPHOLE_TEST_BULK_PROBE_OUTCOME-<unset>}" >>"${FAKE_DERPHOLE_STATE}/probe-outcome-events"
+    printf 'receive-probe-dirty-rate=%s\n' "${DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS-<unset>}" >>"${FAKE_DERPHOLE_STATE}/probe-dirty-rate-events"
     payload="$(cat "${FAKE_DERPHOLE_STATE}/payload-path")"
     printf 'connected-relay\nconnected-direct\nv2-block-transfer=bulk-packets\nremote-receive-diagnostic\n' >&2
+	if [[ "${FAKE_BULK_QUIC_DECISION:-0}" == "1" ]]; then printf 'v2-bulk-decision=mode:quic\n' >&2; fi
+	if [[ "${FAKE_RECEIVER_BULK_PROBE_OUTCOME_MARKER:-0}" == "1" ]]; then printf 'v2-bulk-probe-test-outcome=sender-reject\n' >&2; fi
+	if [[ -n "${DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS-}" && "${FAKE_SKIP_BULK_PROBE_DIRTY_RATE_MARKER:-0}" != "1" ]]; then
+	  printf 'v2-bulk-probe-test-dirty-rate-mbps=%s\n' "${DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS}" >&2
+	  if [[ "${FAKE_DUPLICATE_BULK_PROBE_DIRTY_RATE_MARKER:-0}" == "1" ]]; then
+	    printf 'v2-bulk-probe-test-dirty-rate-mbps=%s\n' "${DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS}" >&2
+	  fi
+	fi
     printf 'app_bytes,transfer_elapsed_ms,send_goodput_mbps,quic_first_byte_ms,direct_bytes,direct_validated\n1048576,10,838.86,1,1048576,true\n' >"${trace}"
     if [[ "${FAKE_RECEIVE_IDENTITY_DELAY:-0}" == "1" ]]; then sleep 0.25; fi
     if [[ "${FAKE_RECEIVE_STATUS:-0}" != "0" ]]; then
@@ -489,6 +509,10 @@ cp "${source}" "${destination}"
 }
 
 func (h promotionDriverTest) command(direction string, extraEnv map[string]string) *exec.Cmd {
+	return h.commandWithInterpreter("bash", direction, extraEnv)
+}
+
+func (h promotionDriverTest) commandWithInterpreter(interpreter, direction string, extraEnv map[string]string) *exec.Cmd {
 	values := map[string]string{
 		"DERPHOLE_BENCH_TOOL":                 "derphole",
 		"DERPHOLE_BENCH_DIRECTION":            direction,
@@ -502,7 +526,7 @@ func (h promotionDriverTest) command(direction string, extraEnv map[string]strin
 	for key, value := range extraEnv {
 		values[key] = value
 	}
-	cmd := exec.Command("bash", "scripts/promotion-benchmark-driver.sh", "stub@example", "1")
+	cmd := exec.Command(interpreter, "scripts/promotion-benchmark-driver.sh", "stub@example", "1")
 	cmd.Dir = h.root
 	cmd.Env = harnessTestEnv(h.fakeBin, values)
 	return cmd
@@ -533,7 +557,8 @@ func TestPromotionBenchmarkDefaultExecutesSendBeforeReceive(t *testing.T) {
 		t.Fatalf("default file benchmark failed: %v\n%s", err, output)
 	}
 	if !strings.Contains(string(output), "benchmark-workload=file") ||
-		!strings.Contains(string(output), "benchmark-transfer-mode=bulk-packets-v1") {
+		!strings.Contains(string(output), "benchmark-transfer-mode=bulk-packets-v1") ||
+		!strings.Contains(string(output), "benchmark-test-bulk-probe-outcome=unset") {
 		t.Fatalf("default file benchmark output missing workload or mode:\n%s", output)
 	}
 
@@ -546,6 +571,400 @@ func TestPromotionBenchmarkDefaultExecutesSendBeforeReceive(t *testing.T) {
 	}
 	if strings.Contains(string(events), "listen") || strings.Contains(string(events), "pipe") {
 		t.Fatalf("default file benchmark invoked stream command:\n%s", events)
+	}
+	probeEvents, err := os.ReadFile(filepath.Join(harness.stateDir, "probe-outcome-events"))
+	if err != nil {
+		t.Fatalf("read probe outcome events: %v", err)
+	}
+	if got, want := string(probeEvents), "send-probe-outcome=<unset>\nreceive-probe-outcome=<unset>\n"; got != want {
+		t.Fatalf("default probe outcome propagation = %q, want %q", got, want)
+	}
+	harness.assertCleaned(t, "forward")
+}
+
+func TestPromotionBenchmarkRejectsInvalidBulkProbeOutcome(t *testing.T) {
+	for _, value := range []string{"", "receiver-reject"} {
+		t.Run(strconv.Quote(value), func(t *testing.T) {
+			harness := newPromotionDriverTest(t)
+			cmd := harness.command("forward", map[string]string{
+				"DERPHOLE_TEST_BULK_PROBE_OUTCOME": value,
+			})
+			output, err := cmd.CombinedOutput()
+			if err == nil || !strings.Contains(string(output), "DERPHOLE_TEST_BULK_PROBE_OUTCOME must be unset or sender-reject") {
+				t.Fatalf("invalid outcome result = %v\n%s", err, output)
+			}
+			if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 2 {
+				t.Fatalf("invalid outcome exit = %v, want 2; output:\n%s", err, output)
+			}
+		})
+	}
+}
+
+func TestPromotionBenchmarkRejectsInvalidBulkProbeDirtyRate(t *testing.T) {
+	for _, value := range []string{"", "fast", "900", "01000"} {
+		t.Run(strconv.Quote(value), func(t *testing.T) {
+			harness := newPromotionDriverTest(t)
+			cmd := harness.command("forward", map[string]string{
+				"DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS": value,
+			})
+			output, err := cmd.CombinedOutput()
+			if err == nil || !strings.Contains(string(output), "DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS must be one configured probe rate") {
+				t.Fatalf("invalid dirty rate result = %v\n%s", err, output)
+			}
+			if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 2 {
+				t.Fatalf("invalid dirty rate exit = %v, want 2; output:\n%s", err, output)
+			}
+		})
+	}
+}
+
+func TestPromotionBenchmarkPropagatesBulkProbeDirtyRateToReceiverOnly(t *testing.T) {
+	for _, direction := range []string{"forward", "reverse"} {
+		t.Run(direction, func(t *testing.T) {
+			harness := newPromotionDriverTest(t)
+			cmd := harness.command(direction, map[string]string{
+				"DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS": "1000",
+				"DERPHOLE_BENCH_EXPECT_TRANSFER_MODE":      "bulk-packets-v1",
+			})
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("dirty-rate benchmark failed: %v\n%s", err, output)
+			}
+			if !strings.Contains(string(output), "benchmark-test-bulk-probe-dirty-rate-mbps=1000") {
+				t.Fatalf("missing dirty-rate evidence:\n%s", output)
+			}
+			events, err := os.ReadFile(filepath.Join(harness.stateDir, "probe-dirty-rate-events"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := string(events), "send-probe-dirty-rate=<unset>\nreceive-probe-dirty-rate=1000\n"; got != want {
+				t.Fatalf("dirty-rate propagation = %q, want %q", got, want)
+			}
+			harness.assertCleaned(t, direction)
+		})
+	}
+}
+
+func TestPromotionBenchmarkBulkProbeDirtyRateRequiresOneReceiverMarker(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{name: "missing", env: map[string]string{"FAKE_SKIP_BULK_PROBE_DIRTY_RATE_MARKER": "1"}, want: "receiver bulk probe dirty-rate marker count = 0, want 1"},
+		{name: "duplicate", env: map[string]string{"FAKE_DUPLICATE_BULK_PROBE_DIRTY_RATE_MARKER": "1"}, want: "receiver bulk probe dirty-rate marker count = 2, want 1"},
+		{name: "sender contamination", env: map[string]string{"FAKE_SENDER_BULK_PROBE_DIRTY_RATE_MARKER": "1"}, want: "sender unexpectedly emitted a bulk probe dirty-rate marker"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			harness := newPromotionDriverTest(t)
+			test.env["DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS"] = "1000"
+			cmd := harness.command("forward", test.env)
+			output, err := cmd.CombinedOutput()
+			if err == nil || !strings.Contains(string(output), test.want) {
+				t.Fatalf("dirty-rate marker result = %v\n%s", err, output)
+			}
+			harness.assertCleaned(t, "forward")
+		})
+	}
+}
+
+func TestPromotionBenchmarkRejectsBulkProbeDirtyRateForUnsupportedMode(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		env  map[string]string
+	}{
+		{name: "stream workload", env: map[string]string{"DERPHOLE_BENCH_WORKLOAD": "stream"}},
+		{name: "other tool", env: map[string]string{"DERPHOLE_BENCH_TOOL": "derptun"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			harness := newPromotionDriverTest(t)
+			test.env["DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS"] = "1000"
+			output, err := harness.command("forward", test.env).CombinedOutput()
+			if err == nil || !strings.Contains(string(output), "DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS requires the derphole file workload") {
+				t.Fatalf("unsupported dirty-rate result = %v\n%s", err, output)
+			}
+			if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 2 {
+				t.Fatalf("unsupported dirty-rate exit = %v, want 2; output:\n%s", err, output)
+			}
+		})
+	}
+}
+
+func TestPromotionBenchmarkSupportsSystemBash(t *testing.T) {
+	const systemBash = "/bin/bash"
+	if _, err := os.Stat(systemBash); err != nil {
+		if os.IsNotExist(err) {
+			t.Skip("/bin/bash is not available")
+		}
+		t.Fatal(err)
+	}
+
+	syntax := exec.Command(systemBash, "-n", "promotion-benchmark-driver.sh")
+	if output, err := syntax.CombinedOutput(); err != nil {
+		t.Fatalf("system bash rejected promotion driver syntax: %v\n%s", err, output)
+	}
+
+	t.Run("default forward with empty arrays", func(t *testing.T) {
+		harness := newPromotionDriverTest(t)
+		cmd := harness.commandWithInterpreter(systemBash, "forward", nil)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("system bash default benchmark failed: %v\n%s", err, output)
+		}
+		if !strings.Contains(string(output), "benchmark-test-bulk-probe-outcome=unset") {
+			t.Fatalf("system bash default output missing unset evidence:\n%s", output)
+		}
+		probeEvents, err := os.ReadFile(filepath.Join(harness.stateDir, "probe-outcome-events"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := string(probeEvents), "send-probe-outcome=<unset>\nreceive-probe-outcome=<unset>\n"; got != want {
+			t.Fatalf("system bash default propagation = %q, want %q", got, want)
+		}
+		harness.assertCleaned(t, "forward")
+	})
+
+	t.Run("configured sender only", func(t *testing.T) {
+		harness := newPromotionDriverTest(t)
+		cmd := harness.commandWithInterpreter(systemBash, "forward", map[string]string{
+			"DERPHOLE_TEST_BULK_PROBE_OUTCOME":    "sender-reject",
+			"DERPHOLE_BENCH_EXPECT_TRANSFER_MODE": "blocks-v1",
+			"FAKE_BULK_QUIC_DECISION":             "1",
+		})
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("system bash controlled benchmark failed: %v\n%s", err, output)
+		}
+		if !strings.Contains(string(output), "benchmark-test-bulk-probe-outcome=sender-reject") {
+			t.Fatalf("system bash controlled output missing outcome evidence:\n%s", output)
+		}
+		probeEvents, err := os.ReadFile(filepath.Join(harness.stateDir, "probe-outcome-events"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := string(probeEvents), "send-probe-outcome=sender-reject\nreceive-probe-outcome=<unset>\n"; got != want {
+			t.Fatalf("system bash controlled propagation = %q, want %q", got, want)
+		}
+		harness.assertCleaned(t, "forward")
+	})
+
+	t.Run("configured dirty rate reaches receiver only", func(t *testing.T) {
+		harness := newPromotionDriverTest(t)
+		cmd := harness.commandWithInterpreter(systemBash, "reverse", map[string]string{
+			"DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS": "1000",
+		})
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("system bash dirty-rate benchmark failed: %v\n%s", err, output)
+		}
+		events, err := os.ReadFile(filepath.Join(harness.stateDir, "probe-dirty-rate-events"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := string(events), "send-probe-dirty-rate=<unset>\nreceive-probe-dirty-rate=1000\n"; got != want {
+			t.Fatalf("system bash dirty-rate propagation = %q, want %q", got, want)
+		}
+		harness.assertCleaned(t, "reverse")
+	})
+
+	t.Run("configured marker required", func(t *testing.T) {
+		harness := newPromotionDriverTest(t)
+		cmd := harness.commandWithInterpreter(systemBash, "forward", map[string]string{
+			"DERPHOLE_TEST_BULK_PROBE_OUTCOME":    "sender-reject",
+			"DERPHOLE_BENCH_EXPECT_TRANSFER_MODE": "blocks-v1",
+			"FAKE_BULK_QUIC_DECISION":             "1",
+			"FAKE_SKIP_BULK_PROBE_OUTCOME_MARKER": "1",
+		})
+		output, err := cmd.CombinedOutput()
+		if err == nil || !strings.Contains(string(output), "sender bulk probe outcome marker count = 0, want 1") {
+			t.Fatalf("system bash missing-marker result = %v\n%s", err, output)
+		}
+		harness.assertCleaned(t, "forward")
+	})
+
+	t.Run("explicit empty", func(t *testing.T) {
+		harness := newPromotionDriverTest(t)
+		cmd := harness.commandWithInterpreter(systemBash, "forward", map[string]string{
+			"DERPHOLE_TEST_BULK_PROBE_OUTCOME": "",
+		})
+		output, err := cmd.CombinedOutput()
+		if err == nil || !strings.Contains(string(output), "DERPHOLE_TEST_BULK_PROBE_OUTCOME must be unset or sender-reject") {
+			t.Fatalf("system bash explicit-empty result = %v\n%s", err, output)
+		}
+		if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 2 {
+			t.Fatalf("system bash explicit-empty exit = %v, want 2; output:\n%s", err, output)
+		}
+	})
+}
+
+func TestPromotionBenchmarkRejectsBulkProbeOutcomeForUnsupportedMode(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  map[string]string
+	}{
+		{
+			name: "stream workload",
+			env: map[string]string{
+				"DERPHOLE_BENCH_WORKLOAD": "stream",
+			},
+		},
+		{
+			name: "other tool",
+			env: map[string]string{
+				"DERPHOLE_BENCH_TOOL": "derptun",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			harness := newPromotionDriverTest(t)
+			tc.env["DERPHOLE_TEST_BULK_PROBE_OUTCOME"] = "sender-reject"
+			cmd := harness.command("forward", tc.env)
+			output, err := cmd.CombinedOutput()
+			if err == nil || !strings.Contains(string(output), "DERPHOLE_TEST_BULK_PROBE_OUTCOME requires the derphole file workload") {
+				t.Fatalf("unsupported outcome result = %v\n%s", err, output)
+			}
+			if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 2 {
+				t.Fatalf("unsupported outcome exit = %v, want 2; output:\n%s", err, output)
+			}
+		})
+	}
+}
+
+func TestPromotionBenchmarkPropagatesBulkProbeOutcomeToSenderOnly(t *testing.T) {
+	for _, direction := range []string{"forward", "reverse"} {
+		t.Run(direction, func(t *testing.T) {
+			harness := newPromotionDriverTest(t)
+			cmd := harness.command(direction, map[string]string{
+				"DERPHOLE_TEST_BULK_PROBE_OUTCOME":    "sender-reject",
+				"DERPHOLE_BENCH_EXPECT_TRANSFER_MODE": "blocks-v1",
+				"FAKE_BULK_QUIC_DECISION":             "1",
+			})
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("controlled benchmark failed: %v\n%s", err, output)
+			}
+			if !strings.Contains(string(output), "benchmark-test-bulk-probe-outcome=sender-reject") {
+				t.Fatalf("missing outcome evidence:\n%s", output)
+			}
+			events, err := os.ReadFile(filepath.Join(harness.stateDir, "probe-outcome-events"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := string(events), "send-probe-outcome=sender-reject\nreceive-probe-outcome=<unset>\n"; got != want {
+				t.Fatalf("outcome propagation = %q, want %q", got, want)
+			}
+			harness.assertCleaned(t, direction)
+		})
+	}
+}
+
+func TestPromotionBenchmarkPropagatesBulkProbeOutcomeToIdentifiedRemoteSenderOnly(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+	evidenceDir := filepath.Join(harness.root, "evidence", "refs")
+	if err := os.MkdirAll(filepath.Dir(evidenceDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := harness.command("reverse", map[string]string{
+		"DERPHOLE_TEST_BULK_PROBE_OUTCOME":       "sender-reject",
+		"DERPHOLE_BENCH_EXPECT_TRANSFER_MODE":    "blocks-v1",
+		"DERPHOLE_BENCH_PROCESS_IDENTIFY_LOCAL":  filepath.Join(harness.fakeBin, "udppeak"),
+		"DERPHOLE_BENCH_PROCESS_IDENTIFY_REMOTE": filepath.Join(harness.fakeBin, "udppeak"),
+		"DERPHOLE_BENCH_PROCESS_EVIDENCE_DIR":    evidenceDir,
+		"DERPHOLE_BENCH_CHILD_CLEANUP_OUT":       filepath.Join(harness.root, "evidence", "child-cleanup.json"),
+		"FAKE_BULK_QUIC_DECISION":                "1",
+		"FAKE_RECEIVE_IDENTITY_DELAY":            "1",
+	})
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("identified remote sender benchmark failed: %v\n%s", err, output)
+	}
+	events, err := os.ReadFile(filepath.Join(harness.stateDir, "probe-outcome-events"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(events), "send-probe-outcome=sender-reject\nreceive-probe-outcome=<unset>\n"; got != want {
+		t.Fatalf("identified outcome propagation = %q, want %q", got, want)
+	}
+	harness.assertCleaned(t, "reverse")
+}
+
+func TestPromotionBenchmarkRequiresBulkProbeOutcomeMarker(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		env      map[string]string
+		wantText string
+	}{
+		{
+			name: "missing",
+			env: map[string]string{
+				"FAKE_SKIP_BULK_PROBE_OUTCOME_MARKER": "1",
+			},
+			wantText: "sender bulk probe outcome marker count = 0, want 1",
+		},
+		{
+			name: "duplicate",
+			env: map[string]string{
+				"FAKE_DUPLICATE_BULK_PROBE_OUTCOME_MARKER": "1",
+			},
+			wantText: "sender bulk probe outcome marker count = 2, want 1",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			harness := newPromotionDriverTest(t)
+			tc.env["DERPHOLE_TEST_BULK_PROBE_OUTCOME"] = "sender-reject"
+			tc.env["DERPHOLE_BENCH_EXPECT_TRANSFER_MODE"] = "blocks-v1"
+			tc.env["FAKE_BULK_QUIC_DECISION"] = "1"
+			cmd := harness.command("forward", tc.env)
+			output, err := cmd.CombinedOutput()
+			if err == nil || !strings.Contains(string(output), tc.wantText) {
+				t.Fatalf("%s marker result = %v\n%s", tc.name, err, output)
+			}
+			harness.assertCleaned(t, "forward")
+		})
+	}
+}
+
+func TestPromotionBenchmarkBulkProbeOutcomeStillRequiresExpectedTransferMode(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+	cmd := harness.command("forward", map[string]string{
+		"DERPHOLE_TEST_BULK_PROBE_OUTCOME":    "sender-reject",
+		"DERPHOLE_BENCH_EXPECT_TRANSFER_MODE": "bulk-packets-v1",
+		"FAKE_BULK_QUIC_DECISION":             "1",
+	})
+	output, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "unexpected benchmark transfer mode: got blocks-v1, want bulk-packets-v1") {
+		t.Fatalf("expected-mode result = %v\n%s", err, output)
+	}
+	harness.assertCleaned(t, "forward")
+}
+
+func TestPromotionBenchmarkRejectsReceiverBulkProbeOutcomeMarker(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+	cmd := harness.command("reverse", map[string]string{
+		"DERPHOLE_TEST_BULK_PROBE_OUTCOME":        "sender-reject",
+		"DERPHOLE_BENCH_EXPECT_TRANSFER_MODE":     "blocks-v1",
+		"FAKE_BULK_QUIC_DECISION":                 "1",
+		"FAKE_RECEIVER_BULK_PROBE_OUTCOME_MARKER": "1",
+	})
+	output, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "receiver unexpectedly emitted a bulk probe outcome marker") {
+		t.Fatalf("receiver marker result = %v\n%s", err, output)
+	}
+	harness.assertCleaned(t, "reverse")
+}
+
+func TestPromotionBenchmarkClassifiesNegotiatedQUICBeforeAttemptedBulk(t *testing.T) {
+	harness := newPromotionDriverTest(t)
+	cmd := harness.command("forward", map[string]string{
+		"DERPHOLE_BENCH_EXPECT_TRANSFER_MODE": "blocks-v1",
+		"FAKE_BULK_QUIC_DECISION":             "1",
+	})
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("negotiated QUIC benchmark failed: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "benchmark-transfer-mode=blocks-v1") {
+		t.Fatalf("negotiated QUIC benchmark mode missing:\n%s", output)
 	}
 	harness.assertCleaned(t, "forward")
 }
@@ -1424,7 +1843,7 @@ func TestPromotionDriverStopsCommandClockBeforePostflight(t *testing.T) {
 	forwardFile := scriptSection(t, body, "run_forward_derphole_file() {", "\nrun_reverse_derphole_stream() {")
 	assertScriptOrder(t, forwardFile,
 		`start_ms="$(now_ms)"`,
-		`--verbose send "${direct_tcp_args[@]}" "${payload}"`,
+		`--verbose send "${direct_tcp_args[@]+"${direct_tcp_args[@]}"}" "${payload}"`,
 		`--verbose receive -o '${remote_base}.out'`,
 		`wait "${send_pid}"`,
 		`command_end_ms="$(now_ms)"`,
@@ -1442,7 +1861,7 @@ func TestPromotionDriverStopsCommandClockBeforePostflight(t *testing.T) {
 	reverseFile := scriptSection(t, body, "run_reverse_derphole_file() {", "\nfinalize_run() {")
 	assertScriptOrder(t, reverseFile,
 		`start_ms="$(now_ms)"`,
-		`--verbose receive "${direct_tcp_args[@]}" -o "${receiver_out}"`,
+		`--verbose receive "${direct_tcp_args[@]+"${direct_tcp_args[@]}"}" -o "${receiver_out}"`,
 		"wait_remote_pid_status",
 		`command_end_ms="$(now_ms)"`,
 		`remote "cat '${remote_base}.err'"`,

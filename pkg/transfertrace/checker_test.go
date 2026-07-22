@@ -673,7 +673,7 @@ func TestCheckRequiresCompleteBulkEngineTelemetry(t *testing.T) {
 		"bulk_gso_segments_per_message", "bulk_batch_backend", "bulk_gso_attempted",
 		"bulk_gso_active", "bulk_gso_segments", "bulk_probe_selected_mbps",
 		"bulk_probe_duration_ms", "bulk_probe_trains", "bulk_probe_sent_datagrams",
-		"bulk_probe_received_datagrams", "bulk_probe_loss_ppm", "bulk_probe_pressure",
+		"bulk_probe_received_datagrams", "bulk_probe_loss_ppm", "bulk_probe_pressure", "bulk_probe_stop_reason",
 	}
 	required := map[Role][]string{
 		RoleSend: append(append([]string{}, common...),
@@ -722,6 +722,7 @@ func TestCheckRejectsInvalidBulkEngineRelations(t *testing.T) {
 		{name: "active GSO without accepted segments", role: RoleSend, overrides: map[string]string{"bulk_gso_segments": "0"}, want: "bulk_gso_segments"},
 		{name: "active GSO without segments", role: RoleSend, overrides: map[string]string{"bulk_gso_segments_per_message": "0"}, want: "bulk_gso_segments_per_message"},
 		{name: "probe receives more than sent", role: RoleSend, overrides: map[string]string{"bulk_probe_sent_datagrams": "9", "bulk_probe_received_datagrams": "10"}, want: "bulk_probe_received_datagrams"},
+		{name: "unknown probe stop reason", role: RoleSend, overrides: map[string]string{"bulk_probe_stop_reason": "timeout"}, want: "bulk probe stop reason"},
 		{name: "sender repair requests negative", role: RoleSend, overrides: map[string]string{"repair_requests": "-1"}, want: "repair"},
 		{name: "receiver repair requests negative", role: RoleReceive, overrides: map[string]string{"repair_requests": "-1"}, want: "repair"},
 		{name: "pending missing exceeds peak", role: RoleReceive, overrides: map[string]string{"pending_missing": "2", "pending_missing_peak": "1"}, want: "pending_missing"},
@@ -736,6 +737,160 @@ func TestCheckRejectsInvalidBulkEngineRelations(t *testing.T) {
 			_, err := Check(strings.NewReader(trace), testBulkEngineOptions(test.role))
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("Check() error = %v, want %s relation failure", err, test.want)
+			}
+		})
+	}
+}
+
+func TestCheckRejectsInvalidBulkDecisionRelations(t *testing.T) {
+	tests := []struct {
+		name  string
+		trace func(*testing.T) string
+		want  string
+	}{
+		{
+			name: "bulk engine with quic decision",
+			trace: func(t *testing.T) string {
+				return testBulkEngineTrace(t, RoleSend, map[string]string{
+					"bulk_decision_mode": "quic", "bulk_decision_reason": "sender-probe-rejected",
+				})
+			},
+			want: "bulk decision mode",
+		},
+		{
+			name: "quic engine with bulk decision",
+			trace: func(t *testing.T) string {
+				return testQUICEngineTrace(t, RoleSend, map[string]string{
+					"bulk_decision_mode": "bulk-packets-v1", "bulk_decision_reason": "both-probes-accepted", "bulk_decision_run_id": "77",
+				})
+			},
+			want: "bulk decision mode",
+		},
+		{
+			name: "decision with zero run id",
+			trace: func(t *testing.T) string {
+				return testQUICEngineTrace(t, RoleSend, map[string]string{
+					"bulk_decision_mode": "quic", "bulk_decision_reason": "sender-probe-rejected", "bulk_decision_run_id": "0",
+				})
+			},
+			want: "bulk decision run ID",
+		},
+		{
+			name: "bulk decision with zero selected rate",
+			trace: func(t *testing.T) string {
+				return testBulkEngineTrace(t, RoleSend, map[string]string{"bulk_probe_selected_mbps": "0"})
+			},
+			want: "bulk probe selected rate",
+		},
+		{
+			name: "unstable reason",
+			trace: func(t *testing.T) string {
+				return testQUICEngineTrace(t, RoleSend, map[string]string{
+					"bulk_decision_mode": "quic", "bulk_decision_reason": "peer-said-no", "bulk_decision_run_id": "77",
+				})
+			},
+			want: "bulk decision reason",
+		},
+		{
+			name: "non-decimal handoff datagrams",
+			trace: func(t *testing.T) string {
+				return testQUICEngineTrace(t, RoleSend, map[string]string{
+					"bulk_decision_mode": "quic", "bulk_decision_reason": "sender-probe-rejected", "bulk_decision_run_id": "77",
+					"bulk_probe_reject_stage": "ack-timeout", "bulk_handoff_drained_datagrams": "9.5", "bulk_handoff_drain_duration_ms": "17",
+				})
+			},
+			want: "bulk_handoff_drained_datagrams",
+		},
+		{
+			name: "non-decimal handoff duration",
+			trace: func(t *testing.T) string {
+				return testQUICEngineTrace(t, RoleSend, map[string]string{
+					"bulk_decision_mode": "quic", "bulk_decision_reason": "sender-probe-rejected", "bulk_decision_run_id": "77",
+					"bulk_probe_reject_stage": "ack-timeout", "bulk_handoff_drained_datagrams": "0", "bulk_handoff_drain_duration_ms": "17ms",
+				})
+			},
+			want: "bulk_handoff_drain_duration_ms",
+		},
+		{
+			name: "unknown rejection stage",
+			trace: func(t *testing.T) string {
+				return testQUICEngineTrace(t, RoleSend, map[string]string{
+					"bulk_decision_mode": "quic", "bulk_decision_reason": "sender-probe-rejected", "bulk_decision_run_id": "77",
+					"bulk_probe_reject_stage": "capacity", "bulk_handoff_drained_datagrams": "0", "bulk_handoff_drain_duration_ms": "17",
+				})
+			},
+			want: "bulk probe rejection stage",
+		},
+		{
+			name: "quic fallback without positive handoff duration",
+			trace: func(t *testing.T) string {
+				return testQUICEngineTrace(t, RoleSend, map[string]string{
+					"bulk_decision_mode": "quic", "bulk_decision_reason": "sender-probe-rejected", "bulk_decision_run_id": "77",
+					"bulk_probe_reject_stage": "selector", "bulk_handoff_drained_datagrams": "0", "bulk_handoff_drain_duration_ms": "0",
+				})
+			},
+			want: "bulk handoff drain duration",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := Check(strings.NewReader(test.trace(t)), Options{Role: RoleSend})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Check() error = %v, want %s failure", err, test.want)
+			}
+		})
+	}
+}
+
+func TestCheckAcceptsQUICBulkFallbackWithQuietHandoff(t *testing.T) {
+	trace := testQUICEngineTrace(t, RoleSend, map[string]string{
+		"bulk_decision_mode": "quic", "bulk_decision_reason": "sender-probe-rejected", "bulk_decision_run_id": "77",
+		"bulk_probe_reject_stage": "ack-timeout", "bulk_handoff_drained_datagrams": "0", "bulk_handoff_drain_duration_ms": "17",
+	})
+	if _, err := Check(strings.NewReader(trace), Options{Role: RoleSend}); err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+}
+
+func TestCheckRejectsChangingBulkDecisionAcrossRows(t *testing.T) {
+	trace := "timestamp_unix_ms,role,phase,app_bytes,last_error,bulk_decision_mode,bulk_decision_reason,bulk_decision_run_id\n" +
+		"1000,send,direct_prepare,0,,bulk-packets-v1,both-probes-accepted,77\n" +
+		"1100,send,complete,0,,quic,sender-probe-rejected,77\n"
+	_, err := Check(strings.NewReader(trace), Options{Role: RoleSend})
+	if err == nil || !strings.Contains(err.Error(), "bulk decision changed") {
+		t.Fatalf("Check() error = %v, want immutable decision failure", err)
+	}
+}
+
+func TestCheckRejectsDisappearingBulkDecisionAcrossRows(t *testing.T) {
+	trace := "timestamp_unix_ms,role,phase,app_bytes,last_error,bulk_decision_mode,bulk_decision_reason,bulk_decision_run_id\n" +
+		"1000,send,direct_prepare,0,,bulk-packets-v1,both-probes-accepted,77\n" +
+		"1100,send,complete,0,,,,\n"
+	_, err := Check(strings.NewReader(trace), Options{Role: RoleSend})
+	if err == nil || err.Error() != "row 3: bulk decision evidence disappeared" {
+		t.Fatalf("Check() error = %v, want exact disappearing evidence failure", err)
+	}
+}
+
+func TestCheckRejectsMalformedBulkDecisionTuple(t *testing.T) {
+	tests := []struct {
+		name   string
+		mode   string
+		reason string
+		runID  string
+		want   string
+	}{
+		{name: "incomplete", mode: "quic", reason: "sender-probe-rejected", want: "row 2: bulk decision mode, reason, and run ID must be set together"},
+		{name: "unknown mode", mode: "udp", reason: "both-probes-accepted", runID: "77", want: `row 2: bulk decision mode "udp" is invalid`},
+		{name: "bulk reason", mode: "bulk-packets-v1", reason: "sender-probe-rejected", runID: "77", want: `row 2: bulk decision reason "sender-probe-rejected" is invalid for bulk-packets-v1`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trace := "timestamp_unix_ms,role,phase,app_bytes,last_error,bulk_decision_mode,bulk_decision_reason,bulk_decision_run_id\n" +
+				"1000,send,complete,0,," + tt.mode + "," + tt.reason + "," + tt.runID + "\n"
+			_, err := Check(strings.NewReader(trace), Options{Role: RoleSend})
+			if err == nil || err.Error() != tt.want {
+				t.Fatalf("Check() error = %v, want %q", err, tt.want)
 			}
 		})
 	}
@@ -767,12 +922,15 @@ func testBulkEngineTrace(t *testing.T, role Role, overrides map[string]string) s
 		"bulk_receive_queue_peak": "0", "bulk_decrypt_batches": "0", "bulk_decrypt_datagrams": "0",
 		"bulk_probe_selected_mbps": "2160", "bulk_probe_duration_ms": "250", "bulk_probe_trains": "5",
 		"bulk_probe_sent_datagrams": "100", "bulk_probe_received_datagrams": "99", "bulk_probe_loss_ppm": "10000",
-		"bulk_probe_pressure": "false", "local_enobufs_retries": "0", "local_enobufs_wait_us": "0",
+		"bulk_probe_pressure": "false", "bulk_probe_stop_reason": "ladder-complete",
+		"local_enobufs_retries": "0", "local_enobufs_wait_us": "0",
 		"local_enobufs_max_consecutive": "0", "repair_queue_bytes": "0", "peer_recv_queue_depth": "0",
 		"peer_recv_queue_depth_max": "0", "retransmits": "0", "repair_requests": "0", "repair_bytes": "0",
 		"missing_scan_checks": "0", "pending_missing": "0", "pending_missing_peak": "0",
 		"repair_requested_packets": "0", "repair_request_batches": "0", "reorder_trail_packets": "0",
 		"receive_packet_rate_pps": "100",
+		"bulk_decision_mode":      "bulk-packets-v1", "bulk_decision_reason": "both-probes-accepted",
+		"bulk_decision_run_id": "77",
 	}
 	if role == RoleReceive {
 		values["file_payload_bytes_committed"] = "1024"
@@ -803,11 +961,12 @@ func testBulkEngineTrace(t *testing.T, role Role, overrides map[string]string) s
 	}
 	var body bytes.Buffer
 	w := csv.NewWriter(&body)
-	if err := w.Write(Header); err != nil {
+	columns := append([]string(nil), Header...)
+	if err := w.Write(columns); err != nil {
 		t.Fatal(err)
 	}
-	row := make([]string, len(Header))
-	for index, column := range Header {
+	row := make([]string, len(columns))
+	for index, column := range columns {
 		row[index] = values[column]
 	}
 	if err := w.Write(row); err != nil {
@@ -829,6 +988,8 @@ func testQUICEngineTrace(t *testing.T, role Role, overrides map[string]string) s
 		"quic_handshake_ms", "quic_first_byte_ms", "quic_smoothed_rtt_ms", "quic_packets_sent", "quic_packets_received", "quic_packets_lost",
 		"quic_wire_bytes_sent", "quic_recovery_wire_bytes", "quic_recovery_ratio", "quic_stream_bytes_sent", "quic_stream_bytes_received", "quic_close_reason",
 		"quic_native_gso", "quic_native_receive_batch", "file_source_read_calls", "file_source_read_bytes",
+		"bulk_decision_mode", "bulk_decision_reason", "bulk_decision_run_id",
+		"bulk_probe_reject_stage", "bulk_handoff_drained_datagrams", "bulk_handoff_drain_duration_ms",
 	}
 	values := map[string]string{
 		"timestamp_unix_ms": "1000", "role": string(role), "phase": "complete", "app_bytes": "1024", "last_error": "",
@@ -968,8 +1129,8 @@ func TestCheckRejectsSenderOwnedFilePayloadCountersWithoutExpectedSize(t *testin
 }
 
 func TestCheckRequiresObservedFilePayloadZeroCounters(t *testing.T) {
-	trace := "timestamp_unix_ms,role,phase,app_bytes,last_error,file_payload_engine\n" +
-		"1000,send,complete,0,,bulk-packets-v1\n"
+	trace := "timestamp_unix_ms,role,phase,app_bytes,last_error,file_payload_engine,bulk_probe_selected_mbps,bulk_decision_mode,bulk_decision_reason,bulk_decision_run_id\n" +
+		"1000,send,complete,0,,bulk-packets-v1,1,bulk-packets-v1,both-probes-accepted,77\n"
 	_, err := Check(strings.NewReader(trace), Options{Role: RoleSend, RequireFilePayloadEngine: FilePayloadEngineBulk})
 	if err == nil || !strings.Contains(err.Error(), "missing observed") {
 		t.Fatalf("Check() error = %v, want missing observed zero counter", err)
@@ -1010,6 +1171,57 @@ func TestCheckPairRejectsEngineDisagreement(t *testing.T) {
 	receive := testTraceWithFilePayload(RoleReceive, FilePayloadEngineBulk, 4096, 4096, 4096, 0, `["198.51.100.20:42000"]`)
 	if _, err := CheckPair(strings.NewReader(send), strings.NewReader(receive), PairOptions{Role: RoleSend}); err == nil {
 		t.Fatal("engine disagreement accepted")
+	}
+}
+
+func TestCheckPairRejectsBulkDecisionDisagreement(t *testing.T) {
+	quicSenderRejected := checkerRowBulkDecision{set: true, mode: "quic", reason: "sender-probe-rejected", runID: 77}
+	quicReceiverRejected := checkerRowBulkDecision{set: true, mode: "quic", reason: "receiver-probe-rejected", runID: 77}
+	quicDifferentRun := checkerRowBulkDecision{set: true, mode: "quic", reason: "sender-probe-rejected", runID: 88}
+	bulkAccepted := checkerRowBulkDecision{set: true, mode: "bulk-packets-v1", reason: "both-probes-accepted", runID: 77}
+	tests := []struct {
+		name             string
+		senderDecision   checkerRowBulkDecision
+		receiverDecision checkerRowBulkDecision
+		want             string
+	}{
+		{
+			name:             "presence",
+			senderDecision:   quicSenderRejected,
+			receiverDecision: checkerRowBulkDecision{},
+			want:             "sender/receiver bulk decision presence differs: sender=true receiver=false",
+		},
+		{
+			name:             "mode",
+			senderDecision:   quicSenderRejected,
+			receiverDecision: bulkAccepted,
+			want:             `sender bulk decision mode = "quic", receiver = "bulk-packets-v1"`,
+		},
+		{
+			name:             "reason",
+			senderDecision:   quicSenderRejected,
+			receiverDecision: quicReceiverRejected,
+			want:             `sender bulk decision reason = "sender-probe-rejected", receiver = "receiver-probe-rejected"`,
+		},
+		{
+			name:             "run ID",
+			senderDecision:   quicSenderRejected,
+			receiverDecision: quicDifferentRun,
+			want:             "sender bulk decision run ID = 77, receiver = 88",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			send := testTraceWithFilePayload(RoleSend, FilePayloadEngineQUIC, 4096, 0, 0, 0, `["203.0.113.10:41000"]`)
+			receive := testTraceWithFilePayload(RoleReceive, FilePayloadEngineQUIC, 4096, 4096, 0, 4096, `["198.51.100.20:42000"]`)
+			send = testTraceWithFinalBulkDecision(t, send, tt.senderDecision)
+			receive = testTraceWithFinalBulkDecision(t, receive, tt.receiverDecision)
+
+			_, err := CheckPair(strings.NewReader(send), strings.NewReader(receive), PairOptions{Role: RoleSend})
+			if err == nil || err.Error() != tt.want {
+				t.Fatalf("CheckPair() error = %v, want %q", err, tt.want)
+			}
+		})
 	}
 }
 
@@ -1598,6 +1810,12 @@ func testTraceRow(cfg testTraceRowConfig) string {
 		engine = FilePayloadEngineBulk
 	}
 	set("file_payload_engine", string(engine))
+	if engine == FilePayloadEngineBulk {
+		set("bulk_probe_selected_mbps", "1")
+		set("bulk_decision_mode", "bulk-packets-v1")
+		set("bulk_decision_reason", "both-probes-accepted")
+		set("bulk_decision_run_id", "77")
+	}
 	set("file_payload_bytes_committed", strconv.FormatInt(cfg.filePayloadBytesCommitted, 10))
 	set("file_payload_bytes_bulk", strconv.FormatInt(cfg.filePayloadBytesBulk, 10))
 	set("file_payload_bytes_quic", strconv.FormatInt(cfg.filePayloadBytesQUIC, 10))
@@ -1638,6 +1856,32 @@ func testTraceWithFilePayload(role Role, engine FilePayloadEngine, appBytes, com
 		filePayloadBytesQUIC: quic, filePayloadLaneAddresses: lanes,
 		fileSourceTelemetry: true, fileSourceReadCalls: readCalls, fileSourceReadBytes: readBytes,
 	})
+}
+
+func testTraceWithFinalBulkDecision(t *testing.T, trace string, decision checkerRowBulkDecision) string {
+	t.Helper()
+	records, err := csv.NewReader(strings.NewReader(trace)).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	positions := make(map[string]int, len(records[0]))
+	for i, name := range records[0] {
+		positions[name] = i
+	}
+	final := records[len(records)-1]
+	final[positions["bulk_decision_mode"]] = decision.mode
+	final[positions["bulk_decision_reason"]] = decision.reason
+	if decision.set {
+		final[positions["bulk_decision_run_id"]] = strconv.FormatUint(decision.runID, 10)
+	} else {
+		final[positions["bulk_decision_run_id"]] = ""
+	}
+	var output bytes.Buffer
+	w := csv.NewWriter(&output)
+	if err := w.WriteAll(records); err != nil {
+		t.Fatal(err)
+	}
+	return output.String()
 }
 
 func formatTestOptionalInt(value int) string {

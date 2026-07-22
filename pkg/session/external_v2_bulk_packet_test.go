@@ -7,6 +7,7 @@ package session
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -405,13 +406,13 @@ func TestExternalV2BulkPacketTopLevelClearsReadAndWriteDeadlines(t *testing.T) {
 
 	resultCh := make(chan error, 1)
 	go func() {
-		_, err := sendExternalV2BulkBlockPacketsWithProbe(ctx, &BlockSource{
+		_, err := sendExternalV2BulkBlockPackets(ctx, &BlockSource{
 			Payload:     bytes.NewReader(payload),
 			PayloadSize: int64(len(payload)),
 		}, externalV2BulkPacketPath{
 			Conns: []net.PacketConn{conn},
 			Addrs: externalV2BulkPacketTestAddrs(receivers),
-		}, auth, nil, false)
+		}, auth, nil, externalV2BulkPacketTransferOptions{})
 		resultCh <- err
 	}()
 
@@ -461,7 +462,6 @@ func TestExternalV2BulkPacketControlReaderReusesDeadlineAcrossSuccessfulReads(t 
 		make(chan []uint32, 1),
 		make(chan struct{}, 1),
 		make(chan struct{}, 2),
-		nil,
 		make(chan error, 1),
 		nil,
 		nil,
@@ -497,7 +497,6 @@ func TestExternalV2BulkPacketControlReaderRefreshesDeadlineAfterTimeout(t *testi
 		make(chan []uint32, 1),
 		make(chan struct{}, 1),
 		make(chan struct{}, 1),
-		nil,
 		make(chan error, 1),
 		nil,
 		nil,
@@ -1133,7 +1132,7 @@ func TestExternalV2BulkPacketControlAcceptsAckForCurrentTransfer(t *testing.T) {
 		runID: runID,
 		total: totalPackets,
 	}
-	if stop := handleExternalV2BulkPacketControl(valid, encodeExternalV2BulkPacketAck(4096, 64<<20), runID, totalPackets, nil, nil, nil, nil, nil, &ack); stop {
+	if stop := handleExternalV2BulkPacketControl(valid, encodeExternalV2BulkPacketAck(4096, 64<<20), runID, totalPackets, nil, nil, nil, nil, &ack); stop {
 		t.Fatal("ACK stopped the control reader")
 	}
 	if got, window, set := ack.snapshot(); !set || got != 4096 || window != 64<<20 {
@@ -1142,10 +1141,10 @@ func TestExternalV2BulkPacketControlAcceptsAckForCurrentTransfer(t *testing.T) {
 
 	wrongRun := valid
 	wrongRun.runID++
-	handleExternalV2BulkPacketControl(wrongRun, encodeExternalV2BulkPacketAck(8192, 64<<20), runID, totalPackets, nil, nil, nil, nil, nil, &ack)
+	handleExternalV2BulkPacketControl(wrongRun, encodeExternalV2BulkPacketAck(8192, 64<<20), runID, totalPackets, nil, nil, nil, nil, &ack)
 	wrongTotal := valid
 	wrongTotal.total++
-	handleExternalV2BulkPacketControl(wrongTotal, encodeExternalV2BulkPacketAck(8192, 64<<20), runID, totalPackets, nil, nil, nil, nil, nil, &ack)
+	handleExternalV2BulkPacketControl(wrongTotal, encodeExternalV2BulkPacketAck(8192, 64<<20), runID, totalPackets, nil, nil, nil, nil, &ack)
 	if got, _, _ := ack.snapshot(); got != 4096 {
 		t.Fatalf("mismatched ACK advanced frontier to %d", got)
 	}
@@ -1265,13 +1264,13 @@ func TestExternalV2BulkPacketTopLevelStopsWhenReadDeadlineCannotBeSet(t *testing
 
 	resultCh := make(chan error, 1)
 	go func() {
-		_, err := sendExternalV2BulkBlockPacketsWithProbe(ctx, &BlockSource{
+		_, err := sendExternalV2BulkBlockPackets(ctx, &BlockSource{
 			Payload:     bytes.NewReader([]byte{0x5a}),
 			PayloadSize: 1,
 		}, externalV2BulkPacketPath{
 			Conns: []net.PacketConn{conn},
 			Addrs: externalV2BulkPacketTestAddrs(receivers),
-		}, auth, nil, false)
+		}, auth, nil, externalV2BulkPacketTransferOptions{})
 		resultCh <- err
 	}()
 
@@ -1313,13 +1312,13 @@ func TestExternalV2BulkPacketTopLevelClosesBlockedWriteWhenDeadlinesFail(t *test
 
 	resultCh := make(chan error, 1)
 	go func() {
-		_, err := sendExternalV2BulkBlockPacketsWithProbe(ctx, &BlockSource{
+		_, err := sendExternalV2BulkBlockPackets(ctx, &BlockSource{
 			Payload:     bytes.NewReader(payload),
 			PayloadSize: int64(len(payload)),
 		}, externalV2BulkPacketPath{
 			Conns: []net.PacketConn{conn},
 			Addrs: externalV2BulkPacketTestAddrs(receivers),
-		}, auth, nil, false)
+		}, auth, nil, externalV2BulkPacketTransferOptions{})
 		resultCh <- err
 	}()
 
@@ -1372,13 +1371,13 @@ func TestExternalV2BulkPacketTopLevelInterruptsInitialSendOnPostHelloWorkerError
 
 	resultCh := make(chan error, 1)
 	go func() {
-		_, err := sendExternalV2BulkBlockPacketsWithProbe(ctx, &BlockSource{
+		_, err := sendExternalV2BulkBlockPackets(ctx, &BlockSource{
 			Payload:     bytes.NewReader(payload),
 			PayloadSize: int64(len(payload)),
 		}, externalV2BulkPacketPath{
 			Conns: []net.PacketConn{conn},
 			Addrs: externalV2BulkPacketTestAddrs(receivers),
-		}, auth, nil, false)
+		}, auth, nil, externalV2BulkPacketTransferOptions{})
 		resultCh <- err
 	}()
 
@@ -1677,7 +1676,7 @@ func TestExternalV2BulkPacketNoProbeReceiverSelectsEngineAfterAuthenticatedPaylo
 		release:    setupRelease,
 	}}
 	payload := bytes.Repeat([]byte{0x6b}, externalV2BulkPacketPayloadSize)
-	sink := newMemoryBlockSink(int64(len(payload)))
+	sink := &writeCountingBlockSink{memoryBlockSink: newMemoryBlockSink(int64(len(payload)))}
 	auth, err := externalV2BulkPacketAuthForToken(
 		testExternalV2BulkPacketToken(), key.NewNode().Public(), key.NewNode().Public(),
 	)
@@ -1687,14 +1686,14 @@ func TestExternalV2BulkPacketNoProbeReceiverSelectsEngineAfterAuthenticatedPaylo
 	metrics := newExternalTransferMetricsWithTrace(time.Unix(240, 0), nil, transfertrace.RoleReceive)
 	receiveErr := make(chan error, 1)
 	go func() {
-		_, _, err := receiveExternalV2BulkBlockPacketsWithProbe(
+		_, _, err := receiveExternalV2BulkBlockPackets(
 			ctx,
 			sink,
 			externalV2BlockReceiveConfig{PayloadSize: int64(len(payload)), ChunkSize: len(payload)},
 			externalV2BulkPacketPath{Conns: receivers, Addrs: externalV2BulkPacketTestAddrs(senders)},
 			auth,
 			metrics,
-			false,
+			externalV2BulkPacketTransferOptions{},
 		)
 		receiveErr <- err
 	}()
@@ -1719,13 +1718,13 @@ func TestExternalV2BulkPacketNoProbeReceiverSelectsEngineAfterAuthenticatedPaylo
 
 	close(setupRelease)
 	released = true
-	_, err = sendExternalV2BulkBlockPacketsWithProbe(
+	_, err = sendExternalV2BulkBlockPackets(
 		ctx,
 		&BlockSource{Payload: bytes.NewReader(payload), PayloadSize: int64(len(payload)), ChunkSize: len(payload)},
 		externalV2BulkPacketPath{Conns: senders, Addrs: externalV2BulkPacketTestAddrs(receiverConns)},
 		auth,
 		nil,
-		false,
+		externalV2BulkPacketTransferOptions{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1738,6 +1737,503 @@ func TestExternalV2BulkPacketNoProbeReceiverSelectsEngineAfterAuthenticatedPaylo
 	metrics.mu.Unlock()
 	if engineAfterPayload != transfertrace.FilePayloadEngineBulk {
 		t.Fatalf("no-probe receiver engine after authenticated payload = %q, want %q", engineAfterPayload, transfertrace.FilePayloadEngineBulk)
+	}
+}
+
+func TestExternalV2BulkPacketCapacityProbeRequiresDecisionCoordinator(t *testing.T) {
+	options := externalV2BulkPacketTransferOptions{CapacityProbe: true}
+	if err := options.validate(); err == nil || err.Error() != "bulk capacity probe requires decision coordinator" {
+		t.Fatalf("validation error = %v", err)
+	}
+}
+
+func TestExternalV2BulkPacketAcknowledgedBulkDisarmsProbeWriteCancellationBeforeReplacement(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	conn := &writeDeadlineStateBulkPacketConn{}
+	probeBatch := newDeferredWriteCancellationBatchConn(ctx, conn)
+	sender := &externalV2BulkPacketSender{
+		batchConns: []externalV2BulkPacketBatchConn{probeBatch},
+		laneCount:  1,
+	}
+	path := externalV2BulkPacketPath{Conns: []net.PacketConn{conn}}
+
+	replaceExternalV2BulkPacketSenderBatchConns(sender, path)
+	cancel()
+	close(probeBatch.release)
+	<-probeBatch.finished
+
+	if got := conn.writeDeadline(); !got.IsZero() {
+		t.Fatalf("replaced probe wrapper re-armed write deadline %v", got)
+	}
+}
+
+func TestExternalV2BulkPacketPrePayloadCleanupDisarmsProbeWriteCancellationBeforeDeadlineClear(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	conn := &writeDeadlineStateBulkPacketConn{}
+	probeBatch := newDeferredWriteCancellationBatchConn(ctx, conn)
+	sender := &externalV2BulkPacketSender{
+		src:        &BlockSource{},
+		batchConns: []externalV2BulkPacketBatchConn{probeBatch},
+		laneCount:  1,
+	}
+	writeDeadlineDone := make(chan error, 1)
+	writeDeadlineDone <- nil
+	close(writeDeadlineDone)
+	controlDone := make(chan struct{})
+	close(controlDone)
+
+	_, _ = cleanupExternalV2BulkPacketSenderBeforePayload(
+		sender,
+		cancel,
+		writeDeadlineDone,
+		controlDone,
+		externalV2BulkPacketPath{Conns: []net.PacketConn{conn}},
+		errExternalV2BulkPacketProbeRejected,
+	)
+	close(probeBatch.release)
+	<-probeBatch.finished
+
+	if got := conn.writeDeadline(); !got.IsZero() {
+		t.Fatalf("cleaned probe wrapper re-armed write deadline %v", got)
+	}
+}
+
+func TestExternalV2BulkPacketSenderFallbackWaitsForHandoffDrain(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseDrain := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseDrain)
+	previousDrain := externalV2BulkPacketDrainForHandoff
+	externalV2BulkPacketDrainForHandoff = func(context.Context, externalV2BulkPacketPath) (externalV2BulkPacketHandoffDrainResult, error) {
+		close(started)
+		select {
+		case <-release:
+			return externalV2BulkPacketHandoffDrainResult{Lanes: 1, Duration: time.Millisecond}, nil
+		case <-time.After(time.Second):
+			return externalV2BulkPacketHandoffDrainResult{}, errors.New("timed out waiting to release sender handoff drain")
+		}
+	}
+	t.Cleanup(func() { externalV2BulkPacketDrainForHandoff = previousDrain })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	sender := &externalV2BulkPacketSender{
+		ctx:        ctx,
+		src:        &BlockSource{},
+		batchConns: []externalV2BulkPacketBatchConn{staticExternalV2BulkPacketBatchConn{}},
+		laneCount:  1,
+		probeResult: externalV2BulkPacketProbeResult{
+			RunID: 77,
+		},
+	}
+	writeDeadlineDone := make(chan error, 1)
+	writeDeadlineDone <- nil
+	close(writeDeadlineDone)
+	controlDone := make(chan struct{})
+	close(controlDone)
+	type cleanupResult struct {
+		stats externalDirectTransferStats
+		err   error
+	}
+	done := make(chan cleanupResult, 1)
+	go func() {
+		stats, err := cleanupExternalV2BulkPacketSenderForQUICFallback(
+			sender,
+			cancel,
+			writeDeadlineDone,
+			controlDone,
+			externalV2BulkPacketPath{Conns: []net.PacketConn{&writeDeadlineStateBulkPacketConn{}}},
+			errExternalV2BulkPacketProbeRejected,
+		)
+		done <- cleanupResult{stats: stats, err: err}
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("sender handoff drain did not start")
+	}
+	select {
+	case result := <-done:
+		t.Fatalf("cleanup returned before drain release: %+v", result)
+	default:
+	}
+	releaseDrain()
+	var result cleanupResult
+	select {
+	case result = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("sender cleanup did not return after drain release")
+	}
+	if !externalV2NegotiatedBulkPacketFallback(result.err) {
+		t.Fatalf("cleanup error = %v, want negotiated fallback", result.err)
+	}
+	if sender.probeResult.HandoffDrain.Lanes != 1 || sender.probeResult.HandoffDrain.Duration != time.Millisecond {
+		t.Fatalf("sender handoff drain result = %+v", sender.probeResult.HandoffDrain)
+	}
+}
+
+func TestExternalV2BulkPacketReceiverCleanHandoffKeepsNaturalRejectionOrdinary(t *testing.T) {
+	previousRates := externalV2BulkPacketProbeRatesMbps
+	previousSelector := externalV2BulkPacketReceiverProbeSelector
+	previousDrain := externalV2BulkPacketDrainForHandoff
+	externalV2BulkPacketProbeRatesMbps = []int{1}
+	externalV2BulkPacketReceiverProbeSelector = func(trains []externalV2BulkPacketProbeTrainResult) (externalV2BulkPacketProbeResult, error) {
+		return externalV2BulkPacketProbeResult{
+			Trains:      append([]externalV2BulkPacketProbeTrainResult(nil), trains...),
+			RejectStage: "selector", RejectTrain: 0, RejectRateMbps: 1,
+		}, errExternalV2BulkPacketProbeRejected
+	}
+	wantDrain := externalV2BulkPacketHandoffDrainResult{Lanes: 1, Datagrams: 2, Duration: time.Millisecond}
+	externalV2BulkPacketDrainForHandoff = func(context.Context, externalV2BulkPacketPath) (externalV2BulkPacketHandoffDrainResult, error) {
+		return wantDrain, nil
+	}
+	t.Cleanup(func() {
+		externalV2BulkPacketProbeRatesMbps = previousRates
+		externalV2BulkPacketReceiverProbeSelector = previousSelector
+		externalV2BulkPacketDrainForHandoff = previousDrain
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	senders, receivers := listenExternalV2BulkPacketTestConns(t, 1)
+	auth, err := externalV2BulkPacketAuthForToken(testExternalV2BulkPacketToken(), key.NewNode().Public(), key.NewNode().Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := newExternalV2BulkPacketSender(
+		ctx,
+		&BlockSource{Payload: bytes.NewReader([]byte{0x5a}), PayloadSize: 1},
+		externalV2BulkPacketPath{Conns: senders, Addrs: externalV2BulkPacketTestAddrs(receivers)},
+		auth,
+		nil,
+	)
+	senderWire, receiverWire := newExternalV2BulkTestWirePair(t, nil)
+	senderCoordinator := newExternalV2BulkTestCoordinatorWithBarrier(ctx, senderWire, time.Second)
+	receiverCoordinator := newExternalV2BulkTestCoordinatorWithBarrier(ctx, receiverWire, time.Second)
+	defer senderCoordinator.Close()
+	defer receiverCoordinator.Close()
+	type receiverResult struct {
+		probe externalV2BulkPacketProbeResult
+		err   error
+	}
+	receiverCh := make(chan receiverResult, 1)
+	go func() {
+		probe, receiveErr := receiveExternalV2BulkPacketProbe(
+			ctx,
+			externalV2BulkPacketPath{Conns: receivers, Addrs: externalV2BulkPacketTestAddrs(senders)},
+			auth,
+			sender.totalPackets,
+			receiverCoordinator,
+		)
+		receiverCh <- receiverResult{probe: probe, err: receiveErr}
+	}()
+	expected := externalV2BulkPacketProbeDatagramCount(1)
+	train, _, err := sender.sendExternalV2BulkPacketProbeTrain(ctx, 0, 1, expected, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := senderCoordinator.sendProbeEndAndWaitResult(ctx, externalV2BulkControl{
+		Protocol: externalV2Protocol, Phase: externalV2BulkPhaseProbeEnd,
+		ProbeRunID: sender.runID, Mode: externalV2BulkModeBulk,
+		Probe: &externalV2BulkProbeControl{Train: 0, RateMbps: 1, Sent: train.Sent, Final: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var got receiverResult
+	select {
+	case got = <-receiverCh:
+	case <-ctx.Done():
+		t.Fatalf("receiver probe did not return: %v", ctx.Err())
+	}
+	if got.err != errExternalV2BulkPacketProbeRejected {
+		t.Fatalf("receiver probe error = %#v, want exact ordinary rejection", got.err)
+	}
+	if got.probe.RunID != sender.runID || got.probe.RejectStage != "selector" ||
+		got.probe.RejectTrain != 0 || got.probe.RejectRateMbps != 1 || got.probe.HandoffDrain != wantDrain {
+		t.Fatalf("receiver probe = %+v, want run %d rejection metadata and drain %+v", got.probe, sender.runID, wantDrain)
+	}
+	if len(got.probe.Trains) != 1 || got.probe.Trains[0].RateMbps != 1 || got.probe.Trains[0].Sent != expected {
+		t.Fatalf("receiver trains = %+v, want one completed 1 Mbps train with %d packets", got.probe.Trains, expected)
+	}
+}
+
+func TestExternalV2BulkPacketDirtyHigherTierSelectsReliableBulk(t *testing.T) {
+	previousRates := append([]int(nil), externalV2BulkPacketProbeRatesMbps...)
+	externalV2BulkPacketProbeRatesMbps = []int{128, 512, 1000}
+	t.Cleanup(func() { externalV2BulkPacketProbeRatesMbps = previousRates })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	senders, receiverSockets := listenExternalV2BulkPacketTestConns(t, 4)
+	auth, err := externalV2BulkPacketAuthForToken(testExternalV2BulkPacketToken(), key.NewNode().Public(), key.NewNode().Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receivers := make([]net.PacketConn, len(receiverSockets))
+	for lane, conn := range receiverSockets {
+		receivers[lane] = &dropExternalV2BulkProbeRatePacketConn{
+			PacketConn: conn, auth: auth, totalPackets: externalV2BulkPacketCount(4 << 20), rateMbps: 1000,
+		}
+	}
+	ackAttempted := make(chan struct{})
+	releaseAck := make(chan struct{})
+	var ackOnce sync.Once
+	observeAck := func(fromSender bool, message externalV2BulkControl) bool {
+		if !fromSender && message.Phase == externalV2BulkPhaseAck {
+			ackOnce.Do(func() { close(ackAttempted) })
+			select {
+			case <-releaseAck:
+			case <-ctx.Done():
+			}
+		}
+		return false
+	}
+	senderWire, receiverWire := newExternalV2BulkTestWirePair(t, observeAck)
+	senderDecision := newExternalV2BulkTestCoordinatorWithBarrier(ctx, senderWire, 8*time.Second)
+	receiverDecision := newExternalV2BulkTestCoordinatorWithBarrier(ctx, receiverWire, 8*time.Second)
+	defer senderDecision.Close()
+	defer receiverDecision.Close()
+
+	payload := make([]byte, 4<<20)
+	for index := range payload {
+		payload[index] = byte((index*31 + 19) % 251)
+	}
+	sink := &writeCountingBlockSink{memoryBlockSink: newMemoryBlockSink(int64(len(payload)))}
+	type receiveResult struct {
+		bytes int64
+		stats externalDirectTransferStats
+		err   error
+	}
+	receiveCh := make(chan receiveResult, 1)
+	go func() {
+		received, stats, receiveErr := receiveExternalV2BulkBlockPackets(
+			ctx, sink,
+			externalV2BlockReceiveConfig{PayloadSize: int64(len(payload)), ChunkSize: 1 << 20},
+			externalV2BulkPacketPath{Conns: receivers, Addrs: externalV2BulkPacketTestAddrs(senders)},
+			auth, nil,
+			externalV2BulkPacketTransferOptions{CapacityProbe: true, Decision: receiverDecision},
+		)
+		receiveCh <- receiveResult{bytes: received, stats: stats, err: receiveErr}
+	}()
+	type sendResult struct {
+		stats externalDirectTransferStats
+		err   error
+	}
+	sendCh := make(chan sendResult, 1)
+	go func() {
+		stats, sendErr := sendExternalV2BulkBlockPackets(
+			ctx,
+			&BlockSource{Payload: bytes.NewReader(payload), PayloadSize: int64(len(payload)), ChunkSize: 1 << 20},
+			externalV2BulkPacketPath{Conns: senders, Addrs: externalV2BulkPacketTestAddrs(receiverSockets)},
+			auth, nil,
+			externalV2BulkPacketTransferOptions{CapacityProbe: true, Decision: senderDecision},
+		)
+		sendCh <- sendResult{stats: stats, err: sendErr}
+	}()
+	select {
+	case <-ackAttempted:
+		if sink.writes != 0 {
+			t.Fatalf("committed %d payload writes before decision acknowledgement", sink.writes)
+		}
+	case <-ctx.Done():
+		t.Fatalf("decision acknowledgement was not attempted: %v", ctx.Err())
+	}
+	close(releaseAck)
+
+	sent := <-sendCh
+	received := <-receiveCh
+	if sent.err != nil || received.err != nil {
+		t.Fatalf("reliable dirty-tier transfer errors: send=%v receive=%v", sent.err, received.err)
+	}
+	if received.bytes != int64(len(payload)) {
+		t.Fatalf("received bytes = %d, want %d", received.bytes, len(payload))
+	}
+	for role, diagnostics := range map[string]externalDirectTransferDiagnostics{
+		"sender": sent.stats.Diagnostics, "receiver": received.stats.Diagnostics,
+	} {
+		if diagnostics.BulkProbeSelectedMbps != 460 || diagnostics.BulkProbeStopReason != externalV2BulkPacketProbeStopDirty || diagnostics.BulkProbeTrains != 3 {
+			t.Fatalf("%s probe diagnostics = %+v, want dirty third tier selected at 460 Mbps", role, diagnostics)
+		}
+	}
+	gotPayload := sink.bytes()
+	if sha256.Sum256(gotPayload) != sha256.Sum256(payload) {
+		t.Fatal("reliable dirty-tier payload hash mismatch")
+	}
+}
+
+func TestExternalV2BulkPacketDirtyFirstTierNegotiatesQUIC(t *testing.T) {
+	previousRates := append([]int(nil), externalV2BulkPacketProbeRatesMbps...)
+	externalV2BulkPacketProbeRatesMbps = []int{128}
+	t.Cleanup(func() { externalV2BulkPacketProbeRatesMbps = previousRates })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	senders, receiverSockets := listenExternalV2BulkPacketTestConns(t, 4)
+	auth, err := externalV2BulkPacketAuthForToken(testExternalV2BulkPacketToken(), key.NewNode().Public(), key.NewNode().Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receivers := make([]net.PacketConn, len(receiverSockets))
+	for lane, conn := range receiverSockets {
+		receivers[lane] = &dropExternalV2BulkProbeRatePacketConn{PacketConn: conn, auth: auth, totalPackets: 1, rateMbps: 128}
+	}
+	senderWire, receiverWire := newExternalV2BulkTestWirePair(t, nil)
+	senderDecision := newExternalV2BulkTestCoordinatorWithBarrier(ctx, senderWire, 4*time.Second)
+	receiverDecision := newExternalV2BulkTestCoordinatorWithBarrier(ctx, receiverWire, 4*time.Second)
+	defer senderDecision.Close()
+	defer receiverDecision.Close()
+	sink := &writeCountingBlockSink{memoryBlockSink: newMemoryBlockSink(1)}
+	receiveCh := make(chan error, 1)
+	go func() {
+		_, _, receiveErr := receiveExternalV2BulkBlockPackets(
+			ctx, sink, externalV2BlockReceiveConfig{PayloadSize: 1, ChunkSize: 1},
+			externalV2BulkPacketPath{Conns: receivers, Addrs: externalV2BulkPacketTestAddrs(senders)}, auth, nil,
+			externalV2BulkPacketTransferOptions{CapacityProbe: true, Decision: receiverDecision},
+		)
+		receiveCh <- receiveErr
+	}()
+	_, sendErr := sendExternalV2BulkBlockPackets(
+		ctx, &BlockSource{Payload: bytes.NewReader([]byte{0x5a}), PayloadSize: 1, ChunkSize: 1},
+		externalV2BulkPacketPath{Conns: senders, Addrs: externalV2BulkPacketTestAddrs(receiverSockets)}, auth, nil,
+		externalV2BulkPacketTransferOptions{CapacityProbe: true, Decision: senderDecision},
+	)
+	receiveErr := <-receiveCh
+	if !externalV2NegotiatedBulkPacketFallback(sendErr) || !externalV2NegotiatedBulkPacketFallback(receiveErr) {
+		t.Fatalf("first-tier fallback errors = (send=%v receive=%v), want negotiated QUIC", sendErr, receiveErr)
+	}
+	if sink.writes != 0 {
+		t.Fatalf("bulk sink committed %d writes after dirty first tier", sink.writes)
+	}
+}
+
+func TestExternalV2BulkPacketProbeControlFailureAbortsBothPeers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	senders, receivers := listenExternalV2BulkPacketTestConns(t, 1)
+	auth, err := externalV2BulkPacketAuthForToken(testExternalV2BulkPacketToken(), key.NewNode().Public(), key.NewNode().Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedEvents := func() <-chan externalV2BulkControlEvent {
+		events := make(chan externalV2BulkControlEvent)
+		close(events)
+		return events
+	}
+	failedWire := func() externalV2BulkControlWire {
+		return externalV2BulkTestWire{
+			send:   func(context.Context, externalV2BulkControl) error { return nil },
+			events: closedEvents(), close: func() {},
+		}
+	}
+	senderDecision := newExternalV2BulkTestCoordinatorWithBarrier(ctx, failedWire(), 4*time.Second)
+	receiverDecision := newExternalV2BulkTestCoordinatorWithBarrier(ctx, failedWire(), 4*time.Second)
+	defer senderDecision.Close()
+	defer receiverDecision.Close()
+	sink := &writeCountingBlockSink{memoryBlockSink: newMemoryBlockSink(1)}
+	receiveCh := make(chan error, 1)
+	go func() {
+		_, _, receiveErr := receiveExternalV2BulkBlockPackets(
+			ctx, sink, externalV2BlockReceiveConfig{PayloadSize: 1, ChunkSize: 1},
+			externalV2BulkPacketPath{Conns: receivers, Addrs: externalV2BulkPacketTestAddrs(senders)}, auth, nil,
+			externalV2BulkPacketTransferOptions{CapacityProbe: true, Decision: receiverDecision},
+		)
+		receiveCh <- receiveErr
+	}()
+	_, sendErr := sendExternalV2BulkBlockPackets(
+		ctx, &BlockSource{Payload: bytes.NewReader([]byte{0x5a}), PayloadSize: 1, ChunkSize: 1},
+		externalV2BulkPacketPath{Conns: senders, Addrs: externalV2BulkPacketTestAddrs(receivers)}, auth, nil,
+		externalV2BulkPacketTransferOptions{CapacityProbe: true, Decision: senderDecision},
+	)
+	receiveErr := <-receiveCh
+	for role, controlErr := range map[string]error{"sender": sendErr, "receiver": receiveErr} {
+		if !errors.Is(controlErr, ErrPeerDisconnected) || externalV2NegotiatedBulkPacketFallback(controlErr) {
+			t.Fatalf("%s control failure = %v, want fatal peer disconnect", role, controlErr)
+		}
+	}
+	if sink.writes != 0 {
+		t.Fatalf("bulk sink committed %d writes after control failure", sink.writes)
+	}
+}
+
+func TestExternalV2BulkPacketMissingDecisionAckCommitsNoPayload(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	previousSenderSelector := externalV2BulkPacketSenderProbeSelector
+	externalV2BulkPacketSenderProbeSelector = func(trains []externalV2BulkPacketProbeTrainResult) (externalV2BulkPacketProbeResult, error) {
+		return externalV2BulkPacketProbeResult{Trains: append([]externalV2BulkPacketProbeTrainResult(nil), trains...)}, errExternalV2BulkPacketProbeRejected
+	}
+	t.Cleanup(func() { externalV2BulkPacketSenderProbeSelector = previousSenderSelector })
+
+	senders, receivers := listenExternalV2BulkPacketTestConns(t, 4)
+	auth, err := externalV2BulkPacketAuthForToken(testExternalV2BulkPacketToken(), key.NewNode().Public(), key.NewNode().Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dropAck := func(fromSender bool, message externalV2BulkControl) bool {
+		return !fromSender && message.Phase == externalV2BulkPhaseAck
+	}
+	senderWire, receiverWire := newExternalV2BulkTestWirePair(t, dropAck)
+	senderDecision := newExternalV2BulkTestCoordinatorWithBarrier(ctx, senderWire, time.Second)
+	receiverDecision := newExternalV2BulkTestCoordinatorWithBarrier(ctx, receiverWire, time.Second)
+	defer senderDecision.Close()
+	defer receiverDecision.Close()
+
+	payload := bytes.Repeat([]byte{0x3c}, 1<<20)
+	sink := newMemoryBlockSink(0)
+	senderMetrics := newExternalTransferMetricsWithTrace(time.Now(), nil, transfertrace.RoleSend)
+	receiverMetrics := newExternalTransferMetricsWithTrace(time.Now(), nil, transfertrace.RoleReceive)
+	receiveResult := make(chan error, 1)
+	go func() {
+		_, _, receiveErr := receiveExternalV2BulkBlockPackets(
+			ctx,
+			sink,
+			externalV2BlockReceiveConfig{PayloadSize: int64(len(payload)), ChunkSize: 1 << 20},
+			externalV2BulkPacketPath{Conns: receivers, Addrs: externalV2BulkPacketTestAddrs(senders)},
+			auth,
+			receiverMetrics,
+			externalV2BulkPacketTransferOptions{CapacityProbe: true, Decision: receiverDecision},
+		)
+		receiveResult <- receiveErr
+	}()
+	sendResult := make(chan error, 1)
+	go func() {
+		_, sendErr := sendExternalV2BulkBlockPackets(
+			ctx,
+			&BlockSource{Payload: bytes.NewReader(payload), PayloadSize: int64(len(payload)), ChunkSize: 1 << 20},
+			externalV2BulkPacketPath{Conns: senders, Addrs: externalV2BulkPacketTestAddrs(receivers)},
+			auth,
+			senderMetrics,
+			externalV2BulkPacketTransferOptions{CapacityProbe: true, Decision: senderDecision},
+		)
+		sendResult <- sendErr
+	}()
+	for role, result := range map[string]<-chan error{"sender": sendResult, "receiver": receiveResult} {
+		select {
+		case <-result:
+		case <-ctx.Done():
+			t.Fatalf("%s did not return before deadline: %v", role, ctx.Err())
+		}
+	}
+	for role, metrics := range map[string]*externalTransferMetrics{"sender": senderMetrics, "receiver": receiverMetrics} {
+		metrics.mu.Lock()
+		engine := metrics.filePayloadEngine
+		reads, readBytes := metrics.fileSourceReadCalls, metrics.fileSourceReadBytes
+		committed, bulk, quic := metrics.filePayloadBytesCommitted, metrics.filePayloadBytesBulk, metrics.filePayloadBytesQUIC
+		metrics.mu.Unlock()
+		if engine != "" {
+			t.Errorf("%s file engine = %q, want empty", role, engine)
+		}
+		if role == "sender" && (reads != 0 || readBytes != 0) {
+			t.Errorf("sender source reads = calls:%d bytes:%d, want zero", reads, readBytes)
+		}
+		if role == "receiver" && (committed != 0 || bulk != 0 || quic != 0) {
+			t.Errorf("receiver payload bytes = committed:%d bulk:%d quic:%d, want zero", committed, bulk, quic)
+		}
+	}
+	if got := sink.bytes(); len(got) != 0 {
+		t.Fatalf("bulk committed %d bytes without decision acknowledgement", len(got))
 	}
 }
 
@@ -1766,7 +2262,7 @@ func TestExternalV2BulkPacketTransferRepairsDroppedPackets(t *testing.T) {
 		}, externalV2BulkPacketPath{
 			Conns: receivers,
 			Addrs: externalV2BulkPacketTestAddrs(senders),
-		}, auth, nil)
+		}, auth, nil, externalV2BulkPacketTransferOptions{})
 		receiveErr <- err
 	}()
 
@@ -1781,7 +2277,7 @@ func TestExternalV2BulkPacketTransferRepairsDroppedPackets(t *testing.T) {
 	}, externalV2BulkPacketPath{
 		Conns: sendConns,
 		Addrs: externalV2BulkPacketTestAddrs(receivers),
-	}, auth, nil)
+	}, auth, nil, externalV2BulkPacketTransferOptions{})
 	if err != nil {
 		t.Fatalf("sendExternalV2BulkBlockPackets() error = %v", err)
 	}
@@ -1834,7 +2330,7 @@ func TestExternalV2BulkPacketTransferSurvivesPrimaryControlLaneLoss(t *testing.T
 		}, externalV2BulkPacketPath{
 			Conns: receiveConns,
 			Addrs: externalV2BulkPacketTestAddrs(senders),
-		}, auth, nil)
+		}, auth, nil, externalV2BulkPacketTransferOptions{})
 		receiveErr <- err
 	}()
 
@@ -1849,7 +2345,7 @@ func TestExternalV2BulkPacketTransferSurvivesPrimaryControlLaneLoss(t *testing.T
 	}, externalV2BulkPacketPath{
 		Conns: sendConns,
 		Addrs: externalV2BulkPacketTestAddrs(receivers),
-	}, auth, nil)
+	}, auth, nil, externalV2BulkPacketTransferOptions{})
 	if err != nil {
 		t.Fatalf("sendExternalV2BulkBlockPackets() error = %v", err)
 	}
@@ -1900,7 +2396,7 @@ func TestExternalV2BulkPacketRepairsUseAlternateLanes(t *testing.T) {
 		}, externalV2BulkPacketPath{
 			Conns: receivers,
 			Addrs: externalV2BulkPacketTestAddrs(senders),
-		}, auth, nil)
+		}, auth, nil, externalV2BulkPacketTransferOptions{})
 		receiveErr <- err
 	}()
 
@@ -1920,7 +2416,7 @@ func TestExternalV2BulkPacketRepairsUseAlternateLanes(t *testing.T) {
 	}, externalV2BulkPacketPath{
 		Conns: sendConns,
 		Addrs: externalV2BulkPacketTestAddrs(receivers),
-	}, auth, nil)
+	}, auth, nil, externalV2BulkPacketTransferOptions{})
 	if err != nil {
 		t.Fatalf("sendExternalV2BulkBlockPackets() error = %v", err)
 	}
@@ -1971,7 +2467,7 @@ func TestExternalV2BulkPacketReceiveCoalescesSinkWrites(t *testing.T) {
 		}, externalV2BulkPacketPath{
 			Conns: receivers,
 			Addrs: externalV2BulkPacketTestAddrs(senders),
-		}, auth, nil)
+		}, auth, nil, externalV2BulkPacketTransferOptions{})
 		receiveErr <- err
 	}()
 
@@ -1982,7 +2478,7 @@ func TestExternalV2BulkPacketReceiveCoalescesSinkWrites(t *testing.T) {
 	}, externalV2BulkPacketPath{
 		Conns: senders,
 		Addrs: externalV2BulkPacketTestAddrs(receivers),
-	}, auth, nil)
+	}, auth, nil, externalV2BulkPacketTransferOptions{})
 	if err != nil {
 		t.Fatalf("sendExternalV2BulkBlockPackets() error = %v", err)
 	}
@@ -2654,6 +3150,90 @@ type dropPrimaryBulkDataPacketConn struct {
 	lane      int
 	laneCount int
 	modulo    uint32
+}
+
+type deferredWriteCancellationBatchConn struct {
+	conn     net.PacketConn
+	release  chan struct{}
+	finished chan struct{}
+	finish   sync.Once
+	stop     func() bool
+	disarmMu sync.Mutex
+	disarmed bool
+}
+
+func newDeferredWriteCancellationBatchConn(ctx context.Context, conn net.PacketConn) *deferredWriteCancellationBatchConn {
+	batch := &deferredWriteCancellationBatchConn{
+		conn: conn, release: make(chan struct{}), finished: make(chan struct{}),
+	}
+	batch.stop = context.AfterFunc(ctx, func() {
+		<-batch.release
+		_ = conn.SetWriteDeadline(time.Now())
+		batch.finish.Do(func() { close(batch.finished) })
+	})
+	return batch
+}
+
+func (c *deferredWriteCancellationBatchConn) WriteBatch(context.Context, []externalV2BulkPacketBatchMessage) (int, error) {
+	return 0, errors.New("unexpected batch write")
+}
+
+func (c *deferredWriteCancellationBatchConn) ReadBatch(context.Context, []externalV2BulkPacketBatchMessage) (int, error) {
+	return 0, errors.New("unexpected batch read")
+}
+
+func (c *deferredWriteCancellationBatchConn) Stats() externalV2BulkPacketBatchStats {
+	return externalV2BulkPacketBatchStats{}
+}
+
+func (c *deferredWriteCancellationBatchConn) disarmWriteCancellation() {
+	c.disarmMu.Lock()
+	defer c.disarmMu.Unlock()
+	if c.disarmed {
+		return
+	}
+	c.disarmed = true
+	if c.stop() {
+		c.finish.Do(func() { close(c.finished) })
+		return
+	}
+	<-c.finished
+}
+
+type writeDeadlineStateBulkPacketConn struct {
+	mu       sync.Mutex
+	deadline time.Time
+}
+
+func (*writeDeadlineStateBulkPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	return 0, nil, errors.New("unexpected read")
+}
+
+func (*writeDeadlineStateBulkPacketConn) WriteTo(packet []byte, _ net.Addr) (int, error) {
+	return len(packet), nil
+}
+
+func (*writeDeadlineStateBulkPacketConn) Close() error { return nil }
+
+func (*writeDeadlineStateBulkPacketConn) LocalAddr() net.Addr { return &net.UDPAddr{} }
+
+func (c *writeDeadlineStateBulkPacketConn) SetDeadline(deadline time.Time) error {
+	return c.SetWriteDeadline(deadline)
+}
+
+func (*writeDeadlineStateBulkPacketConn) SetReadDeadline(time.Time) error { return nil }
+
+func (c *writeDeadlineStateBulkPacketConn) SetWriteDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	c.deadline = deadline
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *writeDeadlineStateBulkPacketConn) writeDeadline() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.deadline
 }
 
 func (c *dropPrimaryBulkDataPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {

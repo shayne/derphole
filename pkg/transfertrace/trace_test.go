@@ -221,6 +221,10 @@ func TestRecorderWritesBulkBatchDiagnosticsIncludingHealthyZeroes(t *testing.T) 
 		BulkProbeReceivedDatagrams:     29800,
 		BulkProbeLossPPM:               6666,
 		BulkProbePressure:              false,
+		BulkProbeStopReason:            "dirty",
+		BulkProbeRejectStage:           "ack-timeout",
+		BulkHandoffDrainedDatagrams:    9628,
+		BulkHandoffDrainDurationMS:     17,
 	})
 	if err := recorder.Close(); err != nil {
 		t.Fatal(err)
@@ -257,6 +261,13 @@ func TestRecorderWritesBulkBatchDiagnosticsIncludingHealthyZeroes(t *testing.T) 
 		"bulk_probe_received_datagrams",
 		"bulk_probe_loss_ppm",
 		"bulk_probe_pressure",
+		"bulk_probe_stop_reason",
+		"bulk_decision_mode",
+		"bulk_decision_reason",
+		"bulk_decision_run_id",
+		"bulk_probe_reject_stage",
+		"bulk_handoff_drained_datagrams",
+		"bulk_handoff_drain_duration_ms",
 	})
 	row := records[1]
 	assertColumn(t, row, indexes, "bulk_candidate_id", "combined-gso3")
@@ -285,6 +296,10 @@ func TestRecorderWritesBulkBatchDiagnosticsIncludingHealthyZeroes(t *testing.T) 
 	assertColumn(t, row, indexes, "bulk_probe_received_datagrams", "29800")
 	assertColumn(t, row, indexes, "bulk_probe_loss_ppm", "6666")
 	assertColumn(t, row, indexes, "bulk_probe_pressure", "false")
+	assertColumn(t, row, indexes, "bulk_probe_stop_reason", "dirty")
+	assertColumn(t, row, indexes, "bulk_probe_reject_stage", "ack-timeout")
+	assertColumn(t, row, indexes, "bulk_handoff_drained_datagrams", "9628")
+	assertColumn(t, row, indexes, "bulk_handoff_drain_duration_ms", "17")
 }
 
 func TestRecorderLeavesBulkBatchDiagnosticsEmptyWhenAbsent(t *testing.T) {
@@ -298,9 +313,41 @@ func TestRecorderLeavesBulkBatchDiagnosticsEmptyWhenAbsent(t *testing.T) {
 		t.Fatal(err)
 	}
 	records, indexes := readTraceCSV(t, out.String())
-	for _, column := range []string{"bulk_candidate_id", "bulk_native_send_attempts", "bulk_native_send_syscalls", "bulk_gso_messages", "bulk_logical_datagrams", "bulk_accepted_payload_bytes", "bulk_gso_segments_per_message", "bulk_batch_backend", "bulk_gso_attempted", "bulk_send_calls", "bulk_writer_queue_peak", "bulk_lane_queue_peak", "bulk_decrypt_datagrams", "bulk_probe_selected_mbps", "bulk_probe_pressure"} {
+	for _, column := range []string{"bulk_candidate_id", "bulk_native_send_attempts", "bulk_native_send_syscalls", "bulk_gso_messages", "bulk_logical_datagrams", "bulk_accepted_payload_bytes", "bulk_gso_segments_per_message", "bulk_batch_backend", "bulk_gso_attempted", "bulk_send_calls", "bulk_writer_queue_peak", "bulk_lane_queue_peak", "bulk_decrypt_datagrams", "bulk_probe_selected_mbps", "bulk_probe_pressure", "bulk_probe_stop_reason"} {
 		assertColumn(t, records[1], indexes, column, "")
 	}
+	assertHeaderSuffix(t, records[0], []string{
+		"bulk_decision_mode",
+		"bulk_decision_reason",
+		"bulk_decision_run_id",
+		"bulk_probe_reject_stage",
+		"bulk_handoff_drained_datagrams",
+		"bulk_handoff_drain_duration_ms",
+	})
+	assertColumn(t, records[1], indexes, "bulk_decision_run_id", "")
+}
+
+func TestRecorderWritesBulkDecisionBeforePayloadEngine(t *testing.T) {
+	var out bytes.Buffer
+	recorder, err := NewRecorder(&out, RoleReceive, time.Unix(280, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder.Observe(Snapshot{
+		At:                 time.Unix(281, 0),
+		Phase:              PhaseDirectPrepare,
+		BulkDecisionMode:   "quic",
+		BulkDecisionReason: "sender-probe-rejected",
+		BulkDecisionRunID:  77,
+	})
+	if err := recorder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	records, indexes := readTraceCSV(t, out.String())
+	assertColumn(t, records[1], indexes, "bulk_decision_mode", "quic")
+	assertColumn(t, records[1], indexes, "bulk_decision_reason", "sender-probe-rejected")
+	assertColumn(t, records[1], indexes, "bulk_decision_run_id", "77")
+	assertColumn(t, records[1], indexes, "file_payload_engine", "")
 }
 
 func TestRecorderErrorRowIsTerminal(t *testing.T) {

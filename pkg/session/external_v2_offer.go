@@ -6,7 +6,6 @@ package session
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -286,11 +285,19 @@ func (rt *externalV2OfferRuntime) sendQUIC(preferenceCtx context.Context, ctx co
 		if err := metrics.SetFilePayloadLaneAddrs(rawPath.addrs, time.Now()); err != nil {
 			return err
 		}
-	}
-	if rawPath.raw {
-		handled, err := rt.tryOfferSendBulkPacketBlock(ctx, accepted, accept, rawPath, metrics, progress, pathEmitter, tr.manager, abortErrCh)
-		if handled {
-			return err
+		if externalV2UsesBulkPacketTransfer(accept.TransferMode) {
+			decision := newExternalV2BulkDecisionCoordinator(
+				ctx, rt.session.derp, accepted.peerDERP, rt.auth, rt.cfg.Emitter,
+			)
+			defer decision.Close()
+			ctx = decision.Context()
+			handled, err := rt.tryOfferSendBulkPacketBlock(
+				ctx, accepted, accept, rawPath, metrics, progress, pathEmitter, tr.manager, abortErrCh,
+				externalV2BulkPacketTransferOptions{CapacityProbe: true, Decision: decision},
+			)
+			if handled {
+				return err
+			}
 		}
 	}
 	endpoint, streams, err := rt.openOfferQUICStreams(preferenceCtx, ctx, accepted, tr, rawPath, managerConnections, streamCount, abortErrCh, metrics, setEndpoint)
@@ -300,7 +307,7 @@ func (rt *externalV2OfferRuntime) sendQUIC(preferenceCtx context.Context, ctx co
 	return rt.sendQUICStreams(ctx, accepted, accept, countedSrc, streams, endpoint, abortErrCh, metrics, progress, pathEmitter, tr.manager)
 }
 
-func (rt *externalV2OfferRuntime) tryOfferSendBulkPacketBlock(ctx context.Context, accepted externalV2AcceptedClaim, accept externalV2Accept, rawPath externalV2DirectPacketPath, metrics *externalTransferMetrics, progress *externalV2PeerProgressState, pathEmitter *transportPathEmitter, manager *transport.Manager, abortErrCh <-chan error) (bool, error) {
+func (rt *externalV2OfferRuntime) tryOfferSendBulkPacketBlock(ctx context.Context, accepted externalV2AcceptedClaim, accept externalV2Accept, rawPath externalV2DirectPacketPath, metrics *externalTransferMetrics, progress *externalV2PeerProgressState, pathEmitter *transportPathEmitter, manager *transport.Manager, abortErrCh <-chan error, options externalV2BulkPacketTransferOptions) (bool, error) {
 	if !externalV2UsesBulkPacketTransfer(accept.TransferMode) {
 		return false, nil
 	}
@@ -308,11 +315,11 @@ func (rt *externalV2OfferRuntime) tryOfferSendBulkPacketBlock(ctx context.Contex
 	batchNative := accepted.claim.BlockPacketBatchCapable && accept.BlockPacketBatchCapable
 	grouped := batchNative && externalV2GroupedBulk(accepted.claim.BlockPacketGroupCapable, accept.BlockPacketGroupCapable)
 	emitExternalV2BulkPacketRecordMode(rt.cfg.Emitter, grouped)
-	err := rt.sendBulkPacketBlock(ctx, accepted, rawPath, batchNative, grouped, metrics, progress, pathEmitter, manager, abortErrCh)
-	if !errors.Is(err, errExternalV2BulkPacketProbeRejected) {
+	err := rt.sendBulkPacketBlock(ctx, accepted, rawPath, batchNative, grouped, metrics, progress, pathEmitter, manager, abortErrCh, options)
+	if !externalV2NegotiatedBulkPacketFallback(err) {
 		return true, err
 	}
-	emitExternalV2Debug(rt.cfg.Emitter, "v2-bulk-probe=fallback-before-payload")
+	emitExternalV2BulkPacketProbeFallback(rt.cfg.Emitter, metrics, err)
 	return false, nil
 }
 
@@ -321,9 +328,9 @@ func (rt *externalV2OfferRuntime) openOfferQUICStreams(preferenceCtx, ctx contex
 		client := dataplane.NewQUICClientOnPacketConns(rawPath.conns, rawPath.addrs, rt.session.quicIdentity, accepted.claim.QUICPublic)
 		client.SetManagerConnectionCount(managerConnections)
 		setEndpoint(client)
-		openCtx, cancelOpen := context.WithTimeout(ctx, externalV2StreamOpenWait)
-		streams, err := client.OpenStreams(openCtx, streamCount)
-		cancelOpen()
+		streams, err := runExternalV2QUICStreamOpen(ctx, true, func(openCtx context.Context) ([]io.WriteCloser, error) {
+			return client.OpenStreams(openCtx, streamCount)
+		})
 		if err != nil {
 			err = externalV2StreamOpenFailure(externalV2PreferPeerAbort(preferenceCtx, abortErrCh, err))
 			_ = closeExternalV2QUICEndpoint(client, metrics, streamCount, true, 1, err.Error())
@@ -343,13 +350,13 @@ func (rt *externalV2OfferRuntime) openOfferQUICStreams(preferenceCtx, ctx contex
 	return server, streams, nil
 }
 
-func (rt *externalV2OfferRuntime) sendBulkPacketBlock(ctx context.Context, accepted externalV2AcceptedClaim, path externalV2DirectPacketPath, batchNative, grouped bool, metrics *externalTransferMetrics, progress *externalV2PeerProgressState, pathEmitter *transportPathEmitter, manager *transport.Manager, abortErrCh <-chan error) error {
+func (rt *externalV2OfferRuntime) sendBulkPacketBlock(ctx context.Context, accepted externalV2AcceptedClaim, path externalV2DirectPacketPath, batchNative, grouped bool, metrics *externalTransferMetrics, progress *externalV2PeerProgressState, pathEmitter *transportPathEmitter, manager *transport.Manager, abortErrCh <-chan error, options externalV2BulkPacketTransferOptions) error {
 	auth, err := externalV2BulkPacketAuthForToken(rt.session.token, rt.session.derp.PublicKey(), accepted.peerDERP)
 	if err != nil {
 		return err
 	}
 	auth = auth.withGrouped(grouped)
-	stats, err := sendExternalV2BulkBlockPacketsWithProbe(ctx, rt.cfg.BlockSource, externalV2BulkPacketPathFromRaw(path), auth, metrics, batchNative)
+	stats, err := sendExternalV2BulkBlockPackets(ctx, rt.cfg.BlockSource, externalV2BulkPacketPathFromRaw(path), auth, metrics, options)
 	metrics.SetDirectStats(stats)
 	if err != nil {
 		return externalV2PreferPeerAbort(ctx, abortErrCh, err)
@@ -853,9 +860,9 @@ func (rt *externalV2OfferReceiveRuntime) acceptReceiveStreams(tr externalV2Liste
 	if rawPath.raw {
 		server := dataplane.NewQUICServerOnPacketConns(rawPath.conns, rt.identity, rt.tok.QUICPublic)
 		server.SetManagerConnectionCount(managerConnections)
-		openCtx, cancelOpen := context.WithTimeout(tr.ctx, externalV2StreamOpenWait)
-		streams, err := server.AcceptStreamsWithReady(openCtx, streamCount, nil)
-		cancelOpen()
+		streams, err := runExternalV2QUICStreamOpen(tr.ctx, true, func(openCtx context.Context) ([]io.ReadCloser, error) {
+			return server.AcceptStreamsWithReady(openCtx, streamCount, nil)
+		})
 		if err != nil {
 			_ = closeExternalV2QUICEndpoint(server, metrics, streamCount, true, 1, err.Error())
 			rawPath.Close()

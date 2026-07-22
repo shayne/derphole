@@ -85,6 +85,29 @@ DERPHOLE_BENCH_WORKLOAD=stream \
 ./scripts/promotion-test.sh ubuntu@eric-nuc 3072
 ```
 
+To prove that a dirty higher probe tier preserves lower clean capacity, inject a
+deterministic 10 percent accounting loss at one configured rate:
+
+```bash
+DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES=1 \
+DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS=1000 \
+DERPHOLE_BENCH_EXPECT_TRANSFER_MODE=bulk-packets-v1 \
+./scripts/promotion-test.sh "$REMOTE_HOST" 1024
+```
+
+The harness removes the variable from its ambient environment and passes it only
+to the receiver. A successful 1,000 Mbps injection must show clean 128 and 512
+Mbps train results, a dirty 1,000 Mbps result, and a 460 Mbps selection on both
+peers. The receiver must emit exactly one
+`v2-bulk-probe-test-dirty-rate-mbps=1000` marker, and the sender must emit none.
+
+Before a large run, verify that the receiver output filesystem has room for the
+payload plus working overhead. Do not assume `/tmp` is large enough; prefer a
+larger user-home or data filesystem when needed. After verification, remove the
+exact task-owned receiver output, build, and staging paths on both endpoints and
+verify those paths are absent. Do not broaden cleanup to unrelated temporary or
+home-directory content.
+
 Production leaves `DERPHOLE_TEST_DISABLE_TAILSCALE_CANDIDATES` unset so route discovery can use Tailscale candidates. The primary public harness defaults to the file workload, and benchmark summaries always record the workload and negotiated transfer mode.
 
 The public-path throughput gate is Mac -> remote by default:

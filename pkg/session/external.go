@@ -42,6 +42,7 @@ const (
 	envelopeV2Accept         = "v2_accept"
 	envelopeV2Complete       = "v2_complete"
 	envelopeV2DataPlaneReady = "v2_data_plane_ready"
+	envelopeV2BulkControl    = "v2_bulk_control"
 	maxEnvelopeBytes         = 16 << 10
 )
 const externalCopyBufferSize = 256 << 10
@@ -98,6 +99,7 @@ type envelope struct {
 	V2Accept         *externalV2Accept         `json:"v2_accept,omitempty"`
 	V2Complete       *externalV2Complete       `json:"v2_complete,omitempty"`
 	V2DataPlaneReady *externalV2DataPlaneReady `json:"v2_data_plane_ready,omitempty"`
+	V2BulkControl    *externalV2BulkControl    `json:"v2_bulk_control,omitempty"`
 }
 
 type peerProgress struct {

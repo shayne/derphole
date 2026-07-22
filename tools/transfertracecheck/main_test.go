@@ -591,6 +591,43 @@ func writeTrace(t *testing.T, text string) string {
 	return path
 }
 
+func TestHealthyFinalBulkFixturesIncludeDecisionEvidence(t *testing.T) {
+	assertDecision := func(t *testing.T, values map[string]string) {
+		t.Helper()
+		want := map[string]string{
+			"bulk_decision_mode":       "bulk-packets-v1",
+			"bulk_decision_reason":     "both-probes-accepted",
+			"bulk_decision_run_id":     "77",
+			"bulk_probe_selected_mbps": "2160",
+		}
+		for name, value := range want {
+			if got := values[name]; got != value {
+				t.Fatalf("%s = %q, want %q", name, got, value)
+			}
+		}
+	}
+
+	t.Run("healthy bulk engine values", func(t *testing.T) {
+		assertDecision(t, healthyBulkEngineTraceValues("4096"))
+	})
+	for name, row := range map[string]string{
+		"trace row":  traceCSVRow(t, map[string]string{"timestamp_unix_ms": "1000", "role": "send", "phase": "complete", "app_bytes": "4096"}),
+		"legacy row": padLegacyTraceRow("1000,0,send,complete,4096,0,4096,4096,0.00,4096,4096,,500,false,,,,,,,,,,,,stream-complete,"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			record, err := csv.NewReader(strings.NewReader(row)).Read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			values := make(map[string]string, len(transfertrace.Header))
+			for index, column := range transfertrace.Header {
+				values[column] = record[index]
+			}
+			assertDecision(t, values)
+		})
+	}
+}
+
 func traceCSVRow(t *testing.T, values map[string]string) string {
 	t.Helper()
 	fields := make([]string, len(transfertrace.Header))
@@ -603,6 +640,10 @@ func traceCSVRow(t *testing.T, values map[string]string) string {
 	fields[positions["file_payload_bytes_bulk"]] = "0"
 	fields[positions["file_payload_bytes_quic"]] = "0"
 	fields[positions["file_payload_lane_addrs"]] = "[]"
+	fields[positions["bulk_probe_selected_mbps"]] = "2160"
+	fields[positions["bulk_decision_mode"]] = "bulk-packets-v1"
+	fields[positions["bulk_decision_reason"]] = "both-probes-accepted"
+	fields[positions["bulk_decision_run_id"]] = "77"
 	for name, value := range values {
 		index, ok := positions[name]
 		if !ok {
@@ -665,12 +706,15 @@ func healthyBulkEngineTraceValues(expectedPayloadBytes string) map[string]string
 		"bulk_lane_queue_peak": "0", "bulk_receive_queue_peak": "0", "bulk_decrypt_batches": "0",
 		"bulk_decrypt_datagrams": "0", "bulk_probe_selected_mbps": "2160", "bulk_probe_duration_ms": "250",
 		"bulk_probe_trains": "5", "bulk_probe_sent_datagrams": "100", "bulk_probe_received_datagrams": "99",
-		"bulk_probe_loss_ppm": "10000", "bulk_probe_pressure": "false", "repair_queue_bytes": "0",
+		"bulk_probe_loss_ppm": "10000", "bulk_probe_pressure": "false", "bulk_probe_stop_reason": "ladder-complete",
+		"repair_queue_bytes": "0",
 		"local_enobufs_retries": "0", "local_enobufs_wait_us": "0", "local_enobufs_max_consecutive": "0",
 		"peer_recv_queue_depth": "0", "peer_recv_queue_depth_max": "0", "retransmits": "0",
 		"repair_requests": "0", "repair_bytes": "0", "missing_scan_checks": "0", "pending_missing": "0",
 		"pending_missing_peak": "0", "repair_requested_packets": "0", "repair_request_batches": "0",
 		"reorder_trail_packets": "0", "receive_packet_rate_pps": "100",
+		"bulk_decision_mode": "bulk-packets-v1", "bulk_decision_reason": "both-probes-accepted",
+		"bulk_decision_run_id": "77",
 	}
 }
 
@@ -688,6 +732,14 @@ func padLegacyTraceRow(row string) string {
 			fields[i] = "0"
 		case "file_payload_lane_addrs":
 			fields[i] = "[]"
+		case "bulk_probe_selected_mbps":
+			fields[i] = "2160"
+		case "bulk_decision_mode":
+			fields[i] = "bulk-packets-v1"
+		case "bulk_decision_reason":
+			fields[i] = "both-probes-accepted"
+		case "bulk_decision_run_id":
+			fields[i] = "77"
 		}
 	}
 	return strings.Join(fields, ",") + "\n"

@@ -178,6 +178,13 @@ var header = [...]string{
 	"bulk_probe_received_datagrams",
 	"bulk_probe_loss_ppm",
 	"bulk_probe_pressure",
+	"bulk_probe_stop_reason",
+	"bulk_decision_mode",
+	"bulk_decision_reason",
+	"bulk_decision_run_id",
+	"bulk_probe_reject_stage",
+	"bulk_handoff_drained_datagrams",
+	"bulk_handoff_drain_duration_ms",
 }
 
 var Header = append([]string(nil), header[:]...)
@@ -298,6 +305,13 @@ type Snapshot struct {
 	BulkProbeReceivedDatagrams     uint64
 	BulkProbeLossPPM               uint64
 	BulkProbePressure              bool
+	BulkProbeStopReason            string
+	BulkDecisionMode               string
+	BulkDecisionReason             string
+	BulkDecisionRunID              uint64
+	BulkProbeRejectStage           string
+	BulkHandoffDrainedDatagrams    uint64
+	BulkHandoffDrainDurationMS     int64
 	LastState                      string
 	LastError                      string
 }
@@ -582,7 +596,15 @@ func (r *Recorder) row(snap Snapshot, deltaBytes int64, deltaMS int64, localSent
 		strconv.FormatInt(snap.FilePayloadBytesQUIC, 10),
 		snap.FilePayloadLaneAddresses,
 	)
-	return append(row, bulkBatchTraceColumns(snap)...)
+	row = append(row, bulkBatchTraceColumns(snap)...)
+	return append(row,
+		snap.BulkDecisionMode,
+		snap.BulkDecisionReason,
+		formatOptionalUint64(snap.BulkDecisionRunID),
+		snap.BulkProbeRejectStage,
+		strconv.FormatUint(snap.BulkHandoffDrainedDatagrams, 10),
+		strconv.FormatUint(uint64(snap.BulkHandoffDrainDurationMS), 10),
+	)
 }
 
 func quicTraceColumns(snap Snapshot) []string {
@@ -634,7 +656,7 @@ func formatPresentDecimal(value string) string {
 
 func bulkBatchTraceColumns(snap Snapshot) []string {
 	if !snap.BulkBatchPresent {
-		return make([]string, 30)
+		return make([]string, 31)
 	}
 	return []string{
 		snap.BulkCandidateID,
@@ -667,6 +689,7 @@ func bulkBatchTraceColumns(snap Snapshot) []string {
 		strconv.FormatUint(snap.BulkProbeReceivedDatagrams, 10),
 		strconv.FormatUint(snap.BulkProbeLossPPM, 10),
 		strconv.FormatBool(snap.BulkProbePressure),
+		snap.BulkProbeStopReason,
 	}
 }
 

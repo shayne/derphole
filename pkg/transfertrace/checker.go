@@ -120,6 +120,9 @@ type checkerIndexes struct {
 	filePayloadBulk      int
 	filePayloadQUIC      int
 	filePayloadLaneAddrs int
+	bulkDecisionMode     int
+	bulkDecisionReason   int
+	bulkDecisionRunID    int
 	senderHealthSchema   bool
 	receiverRepairSchema bool
 	numericDiagnostics   []checkerNumericDiagnostic
@@ -145,7 +148,15 @@ type checkerRow struct {
 	filePayload        checkerRowFilePayload
 	quicEvidence       checkerRowQUICEvidence
 	bulkEvidence       checkerRowBulkEvidence
+	bulkDecision       checkerRowBulkDecision
 	diagnostics        checkerRowDiagnostics
+}
+
+type checkerRowBulkDecision struct {
+	mode   string
+	reason string
+	runID  uint64
+	set    bool
 }
 
 type checkerRowQUICEvidence struct {
@@ -440,6 +451,10 @@ var checkerBulkEvidenceColumns = [...]string{
 	"bulk_probe_received_datagrams",
 	"bulk_probe_loss_ppm",
 	"bulk_probe_pressure",
+	"bulk_probe_stop_reason",
+	"bulk_probe_reject_stage",
+	"bulk_handoff_drained_datagrams",
+	"bulk_handoff_drain_duration_ms",
 }
 
 type checker struct {
@@ -455,6 +470,8 @@ type checker struct {
 	filePayloadObserved map[string]bool
 	finalQUICEvidence   checkerRowQUICEvidence
 	finalBulkEvidence   checkerRowBulkEvidence
+	finalBulkDecision   checkerRowBulkDecision
+	bulkDecision        checkerRowBulkDecision
 	finalRowDiagnostics checkerRowDiagnostics
 }
 
@@ -533,6 +550,20 @@ func (c *checker) scanRows(cr *csv.Reader, indexes checkerIndexes) error {
 }
 
 func (c *checker) consume(row checkerRow) error {
+	c.recordRowSnapshot(row)
+	if row.lastError != "" {
+		return fmt.Errorf("row %d: terminal error: %s", row.rowNo, row.lastError)
+	}
+	if err := validateCheckerRowStatus(row); err != nil {
+		return err
+	}
+	if err := c.consumeBulkDecision(row); err != nil {
+		return err
+	}
+	return c.consumeProgress(row)
+}
+
+func (c *checker) recordRowSnapshot(row checkerRow) {
 	c.result.Rows++
 	c.result.FinalAppBytes = row.appBytes
 	c.result.FinalFilePayloadBytes = row.filePayload.committed
@@ -543,17 +574,28 @@ func (c *checker) consume(row checkerRow) error {
 	c.filePayloadObserved = row.filePayload.observed
 	c.finalQUICEvidence = row.quicEvidence
 	c.finalBulkEvidence = row.bulkEvidence
+	c.finalBulkDecision = row.bulkDecision
 	c.finalRowDiagnostics = row.diagnostics
 	c.result.FinalPhase = row.phase
 	c.maxRelayBytes = maxInt64(c.maxRelayBytes, row.relayBytes)
 	c.recordDiagnostics(row)
-	if row.lastError != "" {
-		return fmt.Errorf("row %d: terminal error: %s", row.rowNo, row.lastError)
-	}
-	if err := validateCheckerRowStatus(row); err != nil {
-		return err
-	}
+}
 
+func (c *checker) consumeBulkDecision(row checkerRow) error {
+	if row.bulkDecision.set {
+		if c.bulkDecision.set && row.bulkDecision != c.bulkDecision {
+			return fmt.Errorf("row %d: bulk decision changed from mode=%q reason=%q run=%d to mode=%q reason=%q run=%d",
+				row.rowNo, c.bulkDecision.mode, c.bulkDecision.reason, c.bulkDecision.runID,
+				row.bulkDecision.mode, row.bulkDecision.reason, row.bulkDecision.runID)
+		}
+		c.bulkDecision = row.bulkDecision
+	} else if c.bulkDecision.set {
+		return fmt.Errorf("row %d: bulk decision evidence disappeared", row.rowNo)
+	}
+	return nil
+}
+
+func (c *checker) consumeProgress(row checkerRow) error {
 	active := isActivePhase(row.phase)
 	if c.result.Rows == 1 {
 		c.recordFirstRow(row, active)
@@ -750,7 +792,45 @@ func (c *checker) validateFilePayloadEvidence() error {
 			return err
 		}
 	}
-	return c.validateSelectedPayloadLanes()
+	if err := c.validateSelectedPayloadLanes(); err != nil {
+		return err
+	}
+	return c.validateFinalBulkDecision()
+}
+
+func (c *checker) validateFinalBulkDecision() error {
+	decision := c.finalBulkDecision
+	switch c.result.FinalFilePayloadEngine {
+	case FilePayloadEngineBulk:
+		if err := c.validateFinalBulkPacketDecision(decision); err != nil {
+			return err
+		}
+	case FilePayloadEngineQUIC:
+		if err := validateFinalQUICBulkDecision(decision); err != nil {
+			return err
+		}
+		if decision.set && c.finalBulkEvidence.uints["bulk_handoff_drain_duration_ms"] == 0 {
+			return errors.New("bulk handoff drain duration must be positive for final QUIC bulk decision")
+		}
+	}
+	return nil
+}
+
+func (c *checker) validateFinalBulkPacketDecision(decision checkerRowBulkDecision) error {
+	if !decision.set || decision.mode != "bulk-packets-v1" || decision.reason != "both-probes-accepted" {
+		return fmt.Errorf("bulk decision mode=%q reason=%q, want bulk-packets-v1 and both-probes-accepted", decision.mode, decision.reason)
+	}
+	if c.finalBulkEvidence.uints["bulk_probe_selected_mbps"] == 0 {
+		return errors.New("bulk probe selected rate must be non-zero")
+	}
+	return nil
+}
+
+func validateFinalQUICBulkDecision(decision checkerRowBulkDecision) error {
+	if decision.set && decision.mode != "quic" {
+		return fmt.Errorf("bulk decision mode=%q, want quic for final QUIC block engine", decision.mode)
+	}
+	return nil
 }
 
 func (c *checker) validateRequiredFilePayloadEngine(required bool) error {
@@ -888,6 +968,7 @@ var checkerBulkCommonRequiredColumns = []string{
 	"bulk_probe_received_datagrams",
 	"bulk_probe_loss_ppm",
 	"bulk_probe_pressure",
+	"bulk_probe_stop_reason",
 }
 
 var checkerBulkSenderRequiredColumns = []string{
@@ -1379,6 +1460,9 @@ func compareCheckerPair(primaryRows []checkerRow, peerRows []checkerRow, opts Pa
 	if senderFinal.filePayload.engine != receiverFinal.filePayload.engine {
 		return PairResult{PrimaryRows: len(primaryRows), PeerRows: len(peerRows)}, fmt.Errorf("sender file payload engine = %q, receiver = %q", senderFinal.filePayload.engine, receiverFinal.filePayload.engine)
 	}
+	if err := compareCheckerPairBulkDecision(senderFinal.bulkDecision, receiverFinal.bulkDecision); err != nil {
+		return PairResult{PrimaryRows: len(primaryRows), PeerRows: len(peerRows)}, err
+	}
 	if senderFinal.phase != PhaseComplete {
 		return PairResult{PrimaryRows: len(primaryRows), PeerRows: len(peerRows)}, fmt.Errorf("sender final phase = %s, want %s", senderFinal.phase, PhaseComplete)
 	}
@@ -1405,6 +1489,25 @@ func compareCheckerPair(primaryRows []checkerRow, peerRows []checkerRow, opts Pa
 		return result, fmt.Errorf("transfer rate diverged: sender_peer_mbps=%.2f receiver_mbps=%.2f tolerance=%.2f", result.SenderRateMbps, result.ReceiverRateMbps, normalizedRateTolerance(opts.RateTolerance))
 	}
 	return result, nil
+}
+
+func compareCheckerPairBulkDecision(sender, receiver checkerRowBulkDecision) error {
+	if sender.set != receiver.set {
+		return fmt.Errorf("sender/receiver bulk decision presence differs: sender=%t receiver=%t", sender.set, receiver.set)
+	}
+	if !sender.set {
+		return nil
+	}
+	if sender.mode != receiver.mode {
+		return fmt.Errorf("sender bulk decision mode = %q, receiver = %q", sender.mode, receiver.mode)
+	}
+	if sender.reason != receiver.reason {
+		return fmt.Errorf("sender bulk decision reason = %q, receiver = %q", sender.reason, receiver.reason)
+	}
+	if sender.runID != receiver.runID {
+		return fmt.Errorf("sender bulk decision run ID = %d, receiver = %d", sender.runID, receiver.runID)
+	}
+	return nil
 }
 
 func senderReceiverRows(primaryRows []checkerRow, peerRows []checkerRow, role Role) ([]checkerRow, []checkerRow) {
@@ -1596,6 +1699,9 @@ func checkerHeaderIndexes(header []string) (checkerIndexes, error) {
 		filePayloadBulk:      optional("file_payload_bytes_bulk"),
 		filePayloadQUIC:      optional("file_payload_bytes_quic"),
 		filePayloadLaneAddrs: optional("file_payload_lane_addrs"),
+		bulkDecisionMode:     optional("bulk_decision_mode"),
+		bulkDecisionReason:   optional("bulk_decision_reason"),
+		bulkDecisionRunID:    optional("bulk_decision_run_id"),
 		senderHealthSchema:   checkerSenderHealthSchema(positions),
 		receiverRepairSchema: checkerReceiverRepairSchema(positions),
 		numericDiagnostics:   checkerNumericDiagnostics(positions),
@@ -1711,6 +1817,10 @@ func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int) (checke
 	if err != nil {
 		return checkerRow{}, err
 	}
+	bulkDecision, err := parseCheckerRowBulkDecision(record, indexes, rowNo)
+	if err != nil {
+		return checkerRow{}, err
+	}
 	return checkerRow{
 		rowNo:              rowNo,
 		role:               role,
@@ -1729,8 +1839,69 @@ func parseCheckerRow(record []string, indexes checkerIndexes, rowNo int) (checke
 		filePayload:        filePayload,
 		quicEvidence:       quicEvidence,
 		bulkEvidence:       bulkEvidence,
+		bulkDecision:       bulkDecision,
 		diagnostics:        diagnostics,
 	}, nil
+}
+
+func parseCheckerRowBulkDecision(record []string, indexes checkerIndexes, rowNo int) (checkerRowBulkDecision, error) {
+	decision := checkerRowBulkDecision{
+		mode:   field(record, indexes.bulkDecisionMode),
+		reason: field(record, indexes.bulkDecisionReason),
+	}
+	rawRunID := field(record, indexes.bulkDecisionRunID)
+	set, err := checkerBulkDecisionFieldsSet(decision, rawRunID, rowNo)
+	if err != nil {
+		return checkerRowBulkDecision{}, err
+	}
+	if !set {
+		return decision, nil
+	}
+	runID, err := strconv.ParseUint(rawRunID, 10, 64)
+	if err != nil || runID == 0 {
+		return checkerRowBulkDecision{}, fmt.Errorf("row %d: bulk decision run ID = %q, want non-zero decimal", rowNo, rawRunID)
+	}
+	decision.runID = runID
+	decision.set = true
+	if err := validateCheckerRowBulkDecisionReason(decision, rowNo); err != nil {
+		return checkerRowBulkDecision{}, err
+	}
+	return decision, nil
+}
+
+func checkerBulkDecisionFieldsSet(decision checkerRowBulkDecision, rawRunID string, rowNo int) (bool, error) {
+	fields := 0
+	for _, value := range []string{decision.mode, decision.reason, rawRunID} {
+		if value != "" {
+			fields++
+		}
+	}
+	switch fields {
+	case 0:
+		return false, nil
+	case 3:
+		return true, nil
+	default:
+		return false, fmt.Errorf("row %d: bulk decision mode, reason, and run ID must be set together", rowNo)
+	}
+}
+
+func validateCheckerRowBulkDecisionReason(decision checkerRowBulkDecision, rowNo int) error {
+	switch decision.mode {
+	case "bulk-packets-v1":
+		if decision.reason != "both-probes-accepted" {
+			return fmt.Errorf("row %d: bulk decision reason %q is invalid for bulk-packets-v1", rowNo, decision.reason)
+		}
+	case "quic":
+		switch decision.reason {
+		case "sender-probe-rejected", "receiver-probe-rejected", "receiver-readiness-timeout":
+		default:
+			return fmt.Errorf("row %d: bulk decision reason %q is invalid for quic", rowNo, decision.reason)
+		}
+	default:
+		return fmt.Errorf("row %d: bulk decision mode %q is invalid", rowNo, decision.mode)
+	}
+	return nil
 }
 
 func parseCheckerRowFilePayload(record []string, indexes checkerIndexes, rowNo int) (checkerRowFilePayload, error) {
@@ -1919,7 +2090,9 @@ func parseCheckerRowBulkEvidence(record []string, indexes checkerIndexes, rowNo 
 		uints:    make(map[string]uint64),
 		bools:    make(map[string]bool),
 	}
-	parseCheckerBulkStrings(record, indexes, &evidence)
+	if err := parseCheckerBulkStrings(record, indexes, rowNo, &evidence); err != nil {
+		return checkerRowBulkEvidence{}, err
+	}
 	if err := parseCheckerBulkBools(record, indexes, rowNo, &evidence); err != nil {
 		return checkerRowBulkEvidence{}, err
 	}
@@ -1929,13 +2102,30 @@ func parseCheckerRowBulkEvidence(record []string, indexes checkerIndexes, rowNo 
 	return evidence, nil
 }
 
-func parseCheckerBulkStrings(record []string, indexes checkerIndexes, evidence *checkerRowBulkEvidence) {
+func parseCheckerBulkStrings(record []string, indexes checkerIndexes, rowNo int, evidence *checkerRowBulkEvidence) error {
 	for _, name := range []string{"bulk_candidate_id", "bulk_batch_backend"} {
 		if raw := checkerEvidenceValue(record, indexes.bulkEvidence, name); raw != "" {
 			evidence.strings[name] = raw
 			evidence.observed[name] = true
 		}
 	}
+	if reason := checkerEvidenceValue(record, indexes.bulkEvidence, "bulk_probe_stop_reason"); reason != "" {
+		if reason != "dirty" && reason != "pressure" && reason != "ladder-complete" {
+			return fmt.Errorf("row %d: bulk probe stop reason %q is invalid", rowNo, reason)
+		}
+		evidence.strings["bulk_probe_stop_reason"] = reason
+		evidence.observed["bulk_probe_stop_reason"] = true
+	}
+	stage := checkerEvidenceValue(record, indexes.bulkEvidence, "bulk_probe_reject_stage")
+	if stage == "" {
+		return nil
+	}
+	if stage != "ack-timeout" && stage != "selector" {
+		return fmt.Errorf("row %d: bulk probe rejection stage %q is invalid", rowNo, stage)
+	}
+	evidence.strings["bulk_probe_reject_stage"] = stage
+	evidence.observed["bulk_probe_reject_stage"] = true
+	return nil
 }
 
 func parseCheckerBulkBools(record []string, indexes checkerIndexes, rowNo int, evidence *checkerRowBulkEvidence) error {
@@ -2133,6 +2323,9 @@ func isOptionalTrailingDiagnosticColumn(name string) bool {
 		"peer_recv_queue_depth",
 		"peer_recv_queue_depth_max",
 		"striped_send_blocked_ms",
+		"bulk_decision_mode",
+		"bulk_decision_reason",
+		"bulk_decision_run_id",
 		"striped_receive_pending_chunks",
 		"striped_receive_pending_chunks_max",
 		"striped_receive_pending_bytes",

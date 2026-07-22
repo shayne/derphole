@@ -230,6 +230,117 @@ func TestQUICStatsAggregateAcrossEndpoints(t *testing.T) {
 	}
 }
 
+func TestQUICServerStatsConcurrentWithAcceptStreams(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	serverConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(server) error = %v", err)
+	}
+	defer serverConn.Close()
+	clientConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(client) error = %v", err)
+	}
+	defer clientConn.Close()
+
+	serverIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(server) error = %v", err)
+	}
+	clientIdentity, err := quicpath.GenerateSessionIdentity()
+	if err != nil {
+		t.Fatalf("GenerateSessionIdentity(client) error = %v", err)
+	}
+
+	server := NewQUICServerOnPacketConn(serverConn, serverIdentity, clientIdentity.Public)
+	ready := make(chan struct{})
+	acceptResult := make(chan struct {
+		readers []io.ReadCloser
+		err     error
+	}, 1)
+	go func() {
+		readers, err := server.AcceptStreamsWithReady(ctx, 1, func() error {
+			close(ready)
+			return nil
+		})
+		acceptResult <- struct {
+			readers []io.ReadCloser
+			err     error
+		}{readers: readers, err: err}
+	}()
+
+	select {
+	case <-ready:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for packet listener")
+	}
+
+	statsCtx, stopStats := context.WithCancel(ctx)
+	defer stopStats()
+	statsStarted := make(chan struct{})
+	statsDone := make(chan struct{})
+	go func() {
+		defer close(statsDone)
+		server.Stats()
+		close(statsStarted)
+		for {
+			select {
+			case <-statsCtx.Done():
+				return
+			default:
+				server.Stats()
+			}
+		}
+	}()
+	select {
+	case <-statsStarted:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for stats reader to start")
+	}
+
+	client := NewQUICClientOnPacketConn(clientConn, serverConn.LocalAddr(), clientIdentity, serverIdentity.Public)
+	writers, err := client.OpenStreams(ctx, 1)
+	if err != nil {
+		t.Fatalf("OpenStreams() error = %v", err)
+	}
+	if _, err := writers[0].Write([]byte("x")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := writers[0].Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	var accepted struct {
+		readers []io.ReadCloser
+		err     error
+	}
+	select {
+	case accepted = <-acceptResult:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for accepted stream")
+	}
+	stopStats()
+	select {
+	case <-statsDone:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for stats reader to stop")
+	}
+	if accepted.err != nil {
+		t.Fatalf("AcceptStreamsWithReady() error = %v", accepted.err)
+	}
+	for _, reader := range accepted.readers {
+		_ = reader.Close()
+	}
+	if err := client.CloseWithError(0, ""); err != nil {
+		t.Fatalf("client CloseWithError() error = %v", err)
+	}
+	if err := server.CloseWithError(0, ""); err != nil {
+		t.Fatalf("server CloseWithError() error = %v", err)
+	}
+}
+
 func TestEndpointConnectionCountUsesOneConnectionPerPacketPath(t *testing.T) {
 	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {

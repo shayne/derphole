@@ -550,8 +550,18 @@ func TestDerptunServeRejectsConcurrentConnector(t *testing.T) {
 
 	cancel()
 	_ = firstInputWriter.Close()
-	<-firstErr
-	<-serveErr
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cleanupCancel()
+	select {
+	case <-firstErr:
+	case <-cleanupCtx.Done():
+		t.Fatal("first connector did not stop after cancellation")
+	}
+	select {
+	case <-serveErr:
+	case <-cleanupCtx.Done():
+		t.Fatal("derptun server did not stop after cancellation")
+	}
 }
 
 func TestDerptunRejectsWrongTokenRoles(t *testing.T) {
@@ -909,11 +919,11 @@ func TestRecoverStaleDerptunActiveReleasesUnresponsiveClaim(t *testing.T) {
 		claim:  first,
 		mux:    mux,
 		cancel: activeCancel,
-		done:   make(chan error, 1),
+		done:   make(chan struct{}),
 	}
 	go func() {
 		<-activeCtx.Done()
-		active.done <- activeCtx.Err()
+		active.complete(activeCtx.Err())
 	}()
 
 	second := derptunTestClaim(tok, 22)
@@ -938,6 +948,27 @@ func TestRecoverStaleDerptunActiveReleasesUnresponsiveClaim(t *testing.T) {
 	}
 }
 
+func TestDerptunServeActiveStopReturnsCompletionAfterEarlierWait(t *testing.T) {
+	wantErr := errors.New("tunnel failed")
+	active := &derptunServeActive{
+		cancel: func() {},
+		done:   make(chan struct{}),
+	}
+	active.complete(wantErr)
+
+	firstCtx, firstCancel := context.WithTimeout(context.Background(), time.Second)
+	defer firstCancel()
+	if err := active.stop(firstCtx); !errors.Is(err, wantErr) {
+		t.Fatalf("first stop() error = %v, want %v", err, wantErr)
+	}
+
+	secondCtx, secondCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer secondCancel()
+	if err := active.stop(secondCtx); !errors.Is(err, wantErr) {
+		t.Fatalf("second stop() error = %v, want preserved completion %v", err, wantErr)
+	}
+}
+
 func TestRecoverStaleDerptunActiveKeepsResponsiveClaim(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -957,7 +988,7 @@ func TestRecoverStaleDerptunActiveKeepsResponsiveClaim(t *testing.T) {
 		claim:  first,
 		mux:    serverMux,
 		cancel: func() {},
-		done:   make(chan error, 1),
+		done:   make(chan struct{}),
 	}
 
 	recovered, err := recoverStaleDerptunActive(ctx, nil, gate, active, 200*time.Millisecond, 50*time.Millisecond)
@@ -992,9 +1023,9 @@ func TestRecoverStaleDerptunActiveReleasesClosedTransport(t *testing.T) {
 		claim:    first,
 		quicDone: quicDone,
 		cancel:   func() {},
-		done:     make(chan error, 1),
+		done:     make(chan struct{}),
 	}
-	active.done <- context.Canceled
+	active.complete(context.Canceled)
 
 	recovered, err := recoverStaleDerptunActive(ctx, nil, gate, active, 200*time.Millisecond, 50*time.Millisecond)
 	if err != nil {

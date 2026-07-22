@@ -370,12 +370,17 @@ func TestExternalV2BulkPacketBatchedTransferEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	senderWire, receiverWire := newExternalV2BulkTestWirePair(t, nil)
+	senderDecision := newExternalV2BulkTestCoordinatorWithBarrier(ctx, senderWire, 4*time.Second)
+	receiverDecision := newExternalV2BulkTestCoordinatorWithBarrier(ctx, receiverWire, 4*time.Second)
+	defer senderDecision.Close()
+	defer receiverDecision.Close()
 	receiveResult := make(chan error, 1)
 	var receiveStats externalDirectTransferStats
 	go func() {
 		received, stats, err := receiveExternalV2BulkBlockPackets(ctx, sink, externalV2BlockReceiveConfig{
 			PayloadSize: int64(len(payload)), ChunkSize: 1 << 20, HeaderBytes: 7,
-		}, externalV2BulkPacketPath{Conns: receivers, Addrs: externalV2BulkPacketTestAddrs(senders)}, auth, nil)
+		}, externalV2BulkPacketPath{Conns: receivers, Addrs: externalV2BulkPacketTestAddrs(senders)}, auth, nil, externalV2BulkPacketTransferOptions{CapacityProbe: true, Decision: receiverDecision})
 		receiveStats = stats
 		if err == nil && received != int64(len(payload))+7 {
 			err = errors.New("received byte count does not include exact payload and header")
@@ -384,7 +389,7 @@ func TestExternalV2BulkPacketBatchedTransferEndToEnd(t *testing.T) {
 	}()
 	sendStats, err := sendExternalV2BulkBlockPackets(ctx, &BlockSource{
 		Payload: bytes.NewReader(payload), PayloadSize: int64(len(payload)), ChunkSize: 1 << 20,
-	}, externalV2BulkPacketPath{Conns: senders, Addrs: externalV2BulkPacketTestAddrs(receivers)}, auth, nil)
+	}, externalV2BulkPacketPath{Conns: senders, Addrs: externalV2BulkPacketTestAddrs(receivers)}, auth, nil, externalV2BulkPacketTransferOptions{CapacityProbe: true, Decision: senderDecision})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -426,17 +431,17 @@ func TestExternalV2BulkPacketBatchedDirectTransferEndToEnd(t *testing.T) {
 		err   error
 	}, 1)
 	go func() {
-		_, stats, receiveErr := receiveExternalV2BulkBlockPacketsWithProbe(ctx, sink, externalV2BlockReceiveConfig{
+		_, stats, receiveErr := receiveExternalV2BulkBlockPackets(ctx, sink, externalV2BlockReceiveConfig{
 			PayloadSize: int64(len(payload)), ChunkSize: 1 << 20,
-		}, externalV2BulkPacketPath{Conns: receivers, Addrs: externalV2BulkPacketTestAddrs(senders)}, auth, nil, false)
+		}, externalV2BulkPacketPath{Conns: receivers, Addrs: externalV2BulkPacketTestAddrs(senders)}, auth, nil, externalV2BulkPacketTransferOptions{})
 		receiveResult <- struct {
 			stats externalDirectTransferStats
 			err   error
 		}{stats: stats, err: receiveErr}
 	}()
-	_, err = sendExternalV2BulkBlockPacketsWithProbe(ctx, &BlockSource{
+	_, err = sendExternalV2BulkBlockPackets(ctx, &BlockSource{
 		Payload: bytes.NewReader(payload), PayloadSize: int64(len(payload)), ChunkSize: 1 << 20,
-	}, externalV2BulkPacketPath{Conns: senders, Addrs: externalV2BulkPacketTestAddrs(receivers)}, auth, nil, false)
+	}, externalV2BulkPacketPath{Conns: senders, Addrs: externalV2BulkPacketTestAddrs(receivers)}, auth, nil, externalV2BulkPacketTransferOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -487,6 +492,11 @@ func TestExternalV2BulkPacketProbeRejectsBeforePayload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	senderWire, receiverWire := newExternalV2BulkTestWirePair(t, nil)
+	senderDecision := newExternalV2BulkTestCoordinatorWithBarrier(ctx, senderWire, 4*time.Second)
+	receiverDecision := newExternalV2BulkTestCoordinatorWithBarrier(ctx, receiverWire, 4*time.Second)
+	defer senderDecision.Close()
+	defer receiverDecision.Close()
 	receiveResult := make(chan struct {
 		stats externalDirectTransferStats
 		err   error
@@ -494,7 +504,7 @@ func TestExternalV2BulkPacketProbeRejectsBeforePayload(t *testing.T) {
 	go func() {
 		_, stats, err := receiveExternalV2BulkBlockPackets(ctx, sink, externalV2BlockReceiveConfig{
 			PayloadSize: int64(len(payload)), ChunkSize: 1 << 20,
-		}, externalV2BulkPacketPath{Conns: receivers, Addrs: externalV2BulkPacketTestAddrs(senders)}, auth, nil)
+		}, externalV2BulkPacketPath{Conns: receivers, Addrs: externalV2BulkPacketTestAddrs(senders)}, auth, nil, externalV2BulkPacketTransferOptions{CapacityProbe: true, Decision: receiverDecision})
 		receiveResult <- struct {
 			stats externalDirectTransferStats
 			err   error
@@ -502,7 +512,7 @@ func TestExternalV2BulkPacketProbeRejectsBeforePayload(t *testing.T) {
 	}()
 	sendStats, sendErr := sendExternalV2BulkBlockPackets(ctx, &BlockSource{
 		Payload: bytes.NewReader(payload), PayloadSize: int64(len(payload)), ChunkSize: 1 << 20,
-	}, externalV2BulkPacketPath{Conns: senders, Addrs: externalV2BulkPacketTestAddrs(receiverConns)}, auth, nil)
+	}, externalV2BulkPacketPath{Conns: senders, Addrs: externalV2BulkPacketTestAddrs(receiverConns)}, auth, nil, externalV2BulkPacketTransferOptions{CapacityProbe: true, Decision: senderDecision})
 	received := <-receiveResult
 	if !errors.Is(sendErr, errExternalV2BulkPacketProbeRejected) || !errors.Is(received.err, errExternalV2BulkPacketProbeRejected) {
 		t.Fatalf("probe errors: send=%v receive=%v", sendErr, received.err)

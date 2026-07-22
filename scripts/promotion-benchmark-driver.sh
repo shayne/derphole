@@ -34,6 +34,50 @@ if [[ -n "${force_bulk_packets}" && "${force_bulk_packets}" != "1" ]]; then
   echo "DERPHOLE_TEST_FORCE_BULK_PACKET_TRANSFER must be empty or 1" >&2
   exit 2
 fi
+bulk_probe_outcome="${DERPHOLE_TEST_BULK_PROBE_OUTCOME-}"
+bulk_probe_outcome_configured=false
+if [[ "${DERPHOLE_TEST_BULK_PROBE_OUTCOME+x}" == x ]]; then
+  bulk_probe_outcome_configured=true
+  if [[ "${bulk_probe_outcome}" != "sender-reject" ]]; then
+    echo "DERPHOLE_TEST_BULK_PROBE_OUTCOME must be unset or sender-reject" >&2
+    exit 2
+  fi
+  if [[ "${tool}" != "derphole" || "${workload}" != "file" ]]; then
+    echo "DERPHOLE_TEST_BULK_PROBE_OUTCOME requires the derphole file workload" >&2
+    exit 2
+  fi
+fi
+unset DERPHOLE_TEST_BULK_PROBE_OUTCOME
+bulk_probe_outcome_label="unset"
+sender_test_env=()
+sender_test_env_remote=""
+if [[ "${bulk_probe_outcome_configured}" == true ]]; then
+  bulk_probe_outcome_label="${bulk_probe_outcome}"
+  sender_test_env+=(DERPHOLE_TEST_BULK_PROBE_OUTCOME="${bulk_probe_outcome}")
+  sender_test_env_remote="DERPHOLE_TEST_BULK_PROBE_OUTCOME=sender-reject "
+fi
+bulk_probe_dirty_rate="${DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS-}"
+bulk_probe_dirty_rate_configured=false
+if [[ "${DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS+x}" == x ]]; then
+  bulk_probe_dirty_rate_configured=true
+  if [[ ! "${bulk_probe_dirty_rate}" =~ ^(128|512|1000|1600|2000|2200|2400)$ ]]; then
+    echo "DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS must be one configured probe rate" >&2
+    exit 2
+  fi
+  if [[ "${tool}" != "derphole" || "${workload}" != "file" ]]; then
+    echo "DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS requires the derphole file workload" >&2
+    exit 2
+  fi
+fi
+unset DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS
+bulk_probe_dirty_rate_label="unset"
+receiver_test_env=()
+receiver_test_env_remote=""
+if [[ "${bulk_probe_dirty_rate_configured}" == true ]]; then
+  bulk_probe_dirty_rate_label="${bulk_probe_dirty_rate}"
+  receiver_test_env+=(DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS="${bulk_probe_dirty_rate}")
+  receiver_test_env_remote="DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS=${bulk_probe_dirty_rate} "
+fi
 direct_tcp_port="${DERPHOLE_BENCH_DIRECT_TCP_PORT:-}"
 if [[ -n "${direct_tcp_port}" ]]; then
   if [[ ! "${direct_tcp_port}" =~ ^[0-9]+$ ]] ||
@@ -103,6 +147,9 @@ for expected_sha256 in "${local_expected_sha256}" "${linux_expected_sha256}"; do
     exit 2
   fi
 done
+
+echo "benchmark-test-bulk-probe-outcome=${bulk_probe_outcome_label}"
+echo "benchmark-test-bulk-probe-dirty-rate-mbps=${bulk_probe_dirty_rate_label}"
 
 target="${1:?usage: $0 <target> [size-mib]}"
 size_mib="${2:-1024}"
@@ -229,7 +276,7 @@ fi
 remote() {
   local remote_command='env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}"'
   local assignment quoted
-  for assignment in "${remote_env[@]}"; do
+  for assignment in "${remote_env[@]+"${remote_env[@]}"}"; do
     printf -v quoted '%q' "${assignment}"
     remote_command+=" ${quoted}"
   done
@@ -350,6 +397,8 @@ emit_benchmark_footer() {
     echo "benchmark-direction=${direction}"
     echo "benchmark-workload=${workload}"
     echo "benchmark-transfer-mode=${transfer_mode}"
+    echo "benchmark-test-bulk-probe-outcome=${bulk_probe_outcome_label}"
+    echo "benchmark-test-bulk-probe-dirty-rate-mbps=${bulk_probe_dirty_rate_label}"
     echo "benchmark-size-bytes=${expected_size}"
     echo "benchmark-transfer-elapsed-ms=${sender_transfer_elapsed_ms:-0}"
     echo "benchmark-command-duration-ms=${command_duration_ms:-0}"
@@ -1347,7 +1396,7 @@ run_forward_derphole_file() {
   remote "rm -f '${remote_base}.pid' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_receiver_resource_json}'"
 
   start_ms="$(now_ms)"
-  DERPHOLE_TRANSFER_TRACE_CSV="${sender_trace_csv}" "${local_runstats}" -out "${sender_resource_json}" -- "${local_bin}" --verbose send "${direct_tcp_args[@]}" "${payload}" >/dev/null 2>"${sender_log}" &
+  env "${sender_test_env[@]+"${sender_test_env[@]}"}" DERPHOLE_TRANSFER_TRACE_CSV="${sender_trace_csv}" "${local_runstats}" -out "${sender_resource_json}" -- "${local_bin}" --verbose send "${direct_tcp_args[@]+"${direct_tcp_args[@]}"}" "${payload}" >/dev/null 2>"${sender_log}" &
   send_pid="$!"
   if [[ "${identity_evidence_enabled}" == true ]]; then
     send_ref="$(identify_local_owned_process local-runstats runstats "${send_pid}")"
@@ -1367,7 +1416,7 @@ run_forward_derphole_file() {
     remote "set +e
 printf '%s\n' \"\$\$\" >'${remote_base}.wrapper.pid'
 '${process_identify_remote}' process-identify -name bash -pid \"\$\$\" -timeout 5s -out '${remote_base}.wrapper.ref.json' >'${remote_base}.wrapper.ref.json.sha256' || exit 1
-DERPHOLE_TRANSFER_TRACE_CSV='${remote_base}.trace.csv' '${remote_runstats}' -out '${remote_receiver_resource_json}' -- '${remote_bin}' --verbose receive -o '${remote_base}.out' '${token}' >/dev/null 2>'${remote_base}.err' &
+${receiver_test_env_remote}DERPHOLE_TRANSFER_TRACE_CSV='${remote_base}.trace.csv' '${remote_runstats}' -out '${remote_receiver_resource_json}' -- '${remote_bin}' --verbose receive -o '${remote_base}.out' '${token}' >/dev/null 2>'${remote_base}.err' &
 child=\$!
 printf '%s\n' \"\${child}\" >'${remote_base}.runstats.pid'
 '${process_identify_remote}' process-identify -name runstats -pid \"\${child}\" -timeout 5s -out '${remote_base}.runstats.ref.json' >'${remote_base}.runstats.ref.json.sha256' || exit 1
@@ -1381,7 +1430,7 @@ wait \"\${child}\""
     copy_remote_process_identity runstats
     copy_remote_process_identity derphole
   else
-    remote "DERPHOLE_TRANSFER_TRACE_CSV='${remote_base}.trace.csv' '${remote_runstats}' -out '${remote_receiver_resource_json}' -- '${remote_bin}' --verbose receive -o '${remote_base}.out' '${token}' >/dev/null 2>'${remote_base}.err'"
+    remote "${receiver_test_env_remote}DERPHOLE_TRANSFER_TRACE_CSV='${remote_base}.trace.csv' '${remote_runstats}' -out '${remote_receiver_resource_json}' -- '${remote_bin}' --verbose receive -o '${remote_base}.out' '${token}' >/dev/null 2>'${remote_base}.err'"
   fi
   wait "${send_pid}"
   send_pid=""
@@ -1438,9 +1487,9 @@ run_reverse_derphole_file() {
   prepare_remote_payload
   source_sha="$(remote "sha256sum '${remote_payload}' | awk '{print \$1}'")"
   if [[ "${identity_evidence_enabled}" == true ]]; then
-    remote "rm -f '${remote_base}.pid' '${remote_base}.child.pid' '${remote_base}.child.pid.tmp' '${remote_base}.status' '${remote_base}.status.tmp' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_sender_resource_json}'; nohup sh -c 'set +e; DERPHOLE_TRANSFER_TRACE_CSV=\"${remote_base}.trace.csv\" \"${remote_runstats}\" -out \"${remote_sender_resource_json}\" -- \"${remote_bin}\" --verbose send \"${remote_payload}\" >\"${remote_base}.out\" 2>\"${remote_base}.err\" & child_pid=\$!; printf \"%s\\n\" \"\${child_pid}\" >\"${remote_base}.child.pid.tmp\"; mv \"${remote_base}.child.pid.tmp\" \"${remote_base}.child.pid\"; wait \"\${child_pid}\"; status=\$?; printf \"%s\\n\" \"\${status}\" >\"${remote_base}.status.tmp\"; mv \"${remote_base}.status.tmp\" \"${remote_base}.status\"; exit \"\${status}\"' >/dev/null 2>&1 </dev/null & echo \$! >'${remote_base}.pid'"
+    remote "rm -f '${remote_base}.pid' '${remote_base}.child.pid' '${remote_base}.child.pid.tmp' '${remote_base}.status' '${remote_base}.status.tmp' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_sender_resource_json}'; nohup sh -c 'set +e; ${sender_test_env_remote}DERPHOLE_TRANSFER_TRACE_CSV=\"${remote_base}.trace.csv\" \"${remote_runstats}\" -out \"${remote_sender_resource_json}\" -- \"${remote_bin}\" --verbose send \"${remote_payload}\" >\"${remote_base}.out\" 2>\"${remote_base}.err\" & child_pid=\$!; printf \"%s\\n\" \"\${child_pid}\" >\"${remote_base}.child.pid.tmp\"; mv \"${remote_base}.child.pid.tmp\" \"${remote_base}.child.pid\"; wait \"\${child_pid}\"; status=\$?; printf \"%s\\n\" \"\${status}\" >\"${remote_base}.status.tmp\"; mv \"${remote_base}.status.tmp\" \"${remote_base}.status\"; exit \"\${status}\"' >/dev/null 2>&1 </dev/null & echo \$! >'${remote_base}.pid'"
   else
-    remote "rm -f '${remote_base}.pid' '${remote_base}.child.pid' '${remote_base}.child.pid.tmp' '${remote_base}.status' '${remote_base}.status.tmp' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_sender_resource_json}'; nohup sh -c 'set +e; child_pid=; forward_signal() { signal=\$1; if [ -n \"\${child_pid}\" ]; then kill -\"\${signal}\" \"\${child_pid}\" 2>/dev/null || true; fi; }; trap \"forward_signal TERM\" TERM; trap \"forward_signal INT\" INT; DERPHOLE_TRANSFER_TRACE_CSV=\"${remote_base}.trace.csv\" \"${remote_runstats}\" -out \"${remote_sender_resource_json}\" -- \"${remote_bin}\" --verbose send \"${remote_payload}\" >\"${remote_base}.out\" 2>\"${remote_base}.err\" & child_pid=\$!; printf \"%s\\n\" \"\${child_pid}\" >\"${remote_base}.child.pid.tmp\"; mv \"${remote_base}.child.pid.tmp\" \"${remote_base}.child.pid\"; wait \"\${child_pid}\"; status=\$?; printf \"%s\\n\" \"\${status}\" >\"${remote_base}.status.tmp\"; mv \"${remote_base}.status.tmp\" \"${remote_base}.status\"; exit \"\${status}\"' >/dev/null 2>&1 </dev/null & echo \$! >'${remote_base}.pid'"
+    remote "rm -f '${remote_base}.pid' '${remote_base}.child.pid' '${remote_base}.child.pid.tmp' '${remote_base}.status' '${remote_base}.status.tmp' '${remote_base}.out' '${remote_base}.err' '${remote_base}.trace.csv' '${remote_sender_resource_json}'; nohup sh -c 'set +e; child_pid=; forward_signal() { signal=\$1; if [ -n \"\${child_pid}\" ]; then kill -\"\${signal}\" \"\${child_pid}\" 2>/dev/null || true; fi; }; trap \"forward_signal TERM\" TERM; trap \"forward_signal INT\" INT; ${sender_test_env_remote}DERPHOLE_TRANSFER_TRACE_CSV=\"${remote_base}.trace.csv\" \"${remote_runstats}\" -out \"${remote_sender_resource_json}\" -- \"${remote_bin}\" --verbose send \"${remote_payload}\" >\"${remote_base}.out\" 2>\"${remote_base}.err\" & child_pid=\$!; printf \"%s\\n\" \"\${child_pid}\" >\"${remote_base}.child.pid.tmp\"; mv \"${remote_base}.child.pid.tmp\" \"${remote_base}.child.pid\"; wait \"\${child_pid}\"; status=\$?; printf \"%s\\n\" \"\${status}\" >\"${remote_base}.status.tmp\"; mv \"${remote_base}.status.tmp\" \"${remote_base}.status\"; exit \"\${status}\"' >/dev/null 2>&1 </dev/null & echo \$! >'${remote_base}.pid'"
   fi
   if [[ "${identity_evidence_enabled}" == true ]]; then
     record_remote_process_identity wrapper sh "${remote_base}.pid"
@@ -1458,7 +1507,7 @@ run_reverse_derphole_file() {
   [[ -n "${token}" ]] || { echo "failed to capture remote send token" >&2; exit 1; }
 
   start_ms="$(now_ms)"
-  DERPHOLE_TRANSFER_TRACE_CSV="${receiver_trace_csv}" "${local_runstats}" -out "${receiver_resource_json}" -- "${local_bin}" --verbose receive "${direct_tcp_args[@]}" -o "${receiver_out}" "${token}" >/dev/null 2>"${receiver_log}" &
+  env "${receiver_test_env[@]+"${receiver_test_env[@]}"}" DERPHOLE_TRANSFER_TRACE_CSV="${receiver_trace_csv}" "${local_runstats}" -out "${receiver_resource_json}" -- "${local_bin}" --verbose receive "${direct_tcp_args[@]+"${direct_tcp_args[@]}"}" -o "${receiver_out}" "${token}" >/dev/null 2>"${receiver_log}" &
   listener_pid="$!"
   if [[ "${identity_evidence_enabled}" == true ]]; then
     listener_ref="$(identify_local_owned_process local-runstats runstats "${listener_pid}")"
@@ -1476,17 +1525,51 @@ run_reverse_derphole_file() {
   sink_size="$(wc -c < "${receiver_out}" | tr -d '[:space:]')"
 }
 
+require_bulk_probe_outcome_marker() {
+  [[ "${bulk_probe_outcome_configured}" == true ]] || return 0
+  local marker="v2-bulk-probe-test-outcome=${bulk_probe_outcome}"
+  local sender_count
+  sender_count="$(grep -Fxc "${marker}" "${sender_log}" || true)"
+  if [[ "${sender_count}" != "1" ]]; then
+    echo "sender bulk probe outcome marker count = ${sender_count}, want 1" >&2
+    return 1
+  fi
+  if grep -Fq 'v2-bulk-probe-test-outcome=' "${receiver_log}"; then
+    echo "receiver unexpectedly emitted a bulk probe outcome marker" >&2
+    return 1
+  fi
+}
+
+require_bulk_probe_dirty_rate_marker() {
+  [[ "${bulk_probe_dirty_rate_configured}" == true ]] || return 0
+  local marker="v2-bulk-probe-test-dirty-rate-mbps=${bulk_probe_dirty_rate}"
+  local receiver_count
+  receiver_count="$(grep -Fxc "${marker}" "${receiver_log}" || true)"
+  if [[ "${receiver_count}" != "1" ]]; then
+    echo "receiver bulk probe dirty-rate marker count = ${receiver_count}, want 1" >&2
+    return 1
+  fi
+  if grep -Fq 'v2-bulk-probe-test-dirty-rate-mbps=' "${sender_log}"; then
+    echo "sender unexpectedly emitted a bulk probe dirty-rate marker" >&2
+    return 1
+  fi
+}
+
 finalize_run() {
   local sender_trace
   local receiver_trace
   local sender_path_changed="false"
   local receiver_path_changed="false"
 
+  require_bulk_probe_outcome_marker
+  require_bulk_probe_dirty_rate_marker
   sender_trace="$(path_trace "${sender_log}")"
   receiver_trace="$(path_trace "${receiver_log}")"
 
   if grep -Fq 'v2-block-transfer=direct-tcp-files' "${sender_log}" && grep -Fq 'v2-block-transfer=direct-tcp-files' "${receiver_log}"; then
     transfer_mode="direct-tcp-files-v1"
+  elif grep -Fq 'v2-bulk-decision=mode:quic' "${sender_log}" && grep -Fq 'v2-bulk-decision=mode:quic' "${receiver_log}"; then
+    transfer_mode="blocks-v1"
   elif grep -Fq 'v2-block-transfer=bulk-packets' "${sender_log}" && grep -Fq 'v2-block-transfer=bulk-packets' "${receiver_log}"; then
     transfer_mode="bulk-packets-v1"
   elif grep -Fq 'v2-block-policy=mode:blocks-v1' "${sender_log}" || grep -Fq 'v2-block-policy=mode:blocks-v1' "${receiver_log}"; then

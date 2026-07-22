@@ -225,15 +225,17 @@ func (r *derptunServeRuntime) close() {
 }
 
 type derptunServeActive struct {
-	mu       sync.Mutex
-	claim    rendezvous.Claim
-	decision rendezvous.Decision
-	mux      *derptun.Mux
-	quicConn *quic.Conn
-	native   bool
-	quicDone <-chan struct{}
-	cancel   context.CancelFunc
-	done     chan error
+	mu           sync.Mutex
+	completeOnce sync.Once
+	claim        rendezvous.Claim
+	decision     rendezvous.Decision
+	mux          *derptun.Mux
+	quicConn     *quic.Conn
+	native       bool
+	quicDone     <-chan struct{}
+	cancel       context.CancelFunc
+	done         chan struct{}
+	doneErr      error
 }
 
 func (a *derptunServeActive) setQUICConn(conn *quic.Conn) bool {
@@ -270,12 +272,40 @@ func (a *derptunServeActive) stop(ctx context.Context) error {
 		return nil
 	}
 	a.cancel()
-	select {
-	case err := <-a.done:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, derptunActiveStopTimeout)
+		defer cancel()
 	}
+	select {
+	case <-a.done:
+		return a.completionErr()
+	case <-ctx.Done():
+		select {
+		case <-a.done:
+			return a.completionErr()
+		default:
+			return ctx.Err()
+		}
+	}
+}
+
+func (a *derptunServeActive) complete(err error) {
+	if a == nil {
+		return
+	}
+	a.completeOnce.Do(func() {
+		a.mu.Lock()
+		a.doneErr = err
+		a.mu.Unlock()
+		close(a.done)
+	})
+}
+
+func (a *derptunServeActive) completionErr() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.doneErr
 }
 
 func (a *derptunServeActive) probe(ctx context.Context, timeout time.Duration) error {
@@ -553,8 +583,8 @@ type derptunClaimServer struct {
 
 func (s *derptunClaimServer) step(ctx context.Context, claimCh <-chan derpbind.Packet) error {
 	select {
-	case err := <-s.activeDone():
-		return s.handleActiveDone(ctx, err)
+	case <-s.activeDone():
+		return s.handleActiveDone(ctx)
 	case pkt, ok := <-claimCh:
 		return s.handleClaimPacket(ctx, pkt, ok)
 	case <-ctx.Done():
@@ -562,14 +592,15 @@ func (s *derptunClaimServer) step(ctx context.Context, claimCh <-chan derpbind.P
 	}
 }
 
-func (s *derptunClaimServer) activeDone() <-chan error {
+func (s *derptunClaimServer) activeDone() <-chan struct{} {
 	if s.active == nil {
 		return nil
 	}
 	return s.active.done
 }
 
-func (s *derptunClaimServer) handleActiveDone(ctx context.Context, err error) error {
+func (s *derptunClaimServer) handleActiveDone(ctx context.Context) error {
+	err := s.active.completionErr()
 	s.gate.Release(s.active.claim.DERPPublic)
 	s.active = nil
 	if ctx.Err() != nil {
@@ -794,7 +825,7 @@ func startDerptunServeClaimTunnel(
 	}
 	tunnelCtx, tunnelCancel := context.WithCancel(ctx)
 	transportDone := make(chan struct{})
-	next := &derptunServeActive{claim: claim, decision: decision, mux: mux, native: cfg.nativeTCP(), quicDone: transportDone, cancel: tunnelCancel, done: make(chan error, 1)}
+	next := &derptunServeActive{claim: claim, decision: decision, mux: mux, native: cfg.nativeTCP(), quicDone: transportDone, cancel: tunnelCancel, done: make(chan struct{})}
 	cancelDecisionResends := startDerptunDecisionResender(ctx, runtime.derpClient, request.peerDERP, decision, issued.auth, cfg.Emitter)
 	go runDerptunServeTunnel(cfg, next, tunnelCtx, tunnelCancel, cancelDecisionResends, quicListener, adapter, rawPath, rawDirect, pathEmitter, transportManager, transportCleanup, transportCancel, transportDone)
 	return next, nil
@@ -899,7 +930,7 @@ func runDerptunServeTunnel(
 		rawPath.Close()
 		cleanupDerptunServeTransport(pathEmitter, transportManager, transportCleanup, transportCancel)
 		close(transportDone)
-		active.done <- err
+		active.complete(err)
 	}()
 
 	if cfg.nativeTCP() {

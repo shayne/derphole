@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/shayne/derphole/pkg/dataplane"
+	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/transfertrace"
 	"github.com/shayne/derphole/pkg/transport"
 )
@@ -704,6 +705,44 @@ func TestExternalTransferMetricsRecordsReceiverOwnedQUICPayload(t *testing.T) {
 	}
 }
 
+func TestExternalTransferMetricsRecordsBulkDecisionBeforeEngine(t *testing.T) {
+	metrics := newExternalTransferMetricsWithTrace(time.Unix(300, 0), nil, transfertrace.RoleReceive)
+	decision := externalV2BulkDecision{
+		Mode: externalV2BulkModeQUIC, ProbeRunID: 77,
+		Reason: externalV2BulkReasonSenderProbeRejected,
+	}
+	metrics.SetBulkDecision(decision, time.Unix(300, 1))
+
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	if metrics.bulkDecisionMode != externalV2BulkModeQUIC ||
+		metrics.bulkDecisionReason != externalV2BulkReasonSenderProbeRejected ||
+		metrics.bulkDecisionRunID != 77 || metrics.filePayloadEngine != "" ||
+		metrics.filePayloadBytesCommitted != 0 {
+		t.Fatalf("unexpected decision metrics: mode=%q reason=%q run=%d engine=%q bytes=%d",
+			metrics.bulkDecisionMode, metrics.bulkDecisionReason, metrics.bulkDecisionRunID,
+			metrics.filePayloadEngine, metrics.filePayloadBytesCommitted)
+	}
+}
+
+func TestExternalTransferMetricsKeepsFirstBulkDecision(t *testing.T) {
+	metrics := newExternalTransferMetrics(time.Unix(301, 0))
+	metrics.SetBulkDecision(externalV2BulkDecision{
+		Mode: externalV2BulkModeBulk, ProbeRunID: 77, Reason: externalV2BulkReasonBothAccepted,
+	}, time.Unix(301, 1))
+	metrics.SetBulkDecision(externalV2BulkDecision{
+		Mode: externalV2BulkModeQUIC, ProbeRunID: 88, Reason: externalV2BulkReasonSenderProbeRejected,
+	}, time.Unix(301, 2))
+
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	if metrics.bulkDecisionMode != externalV2BulkModeBulk ||
+		metrics.bulkDecisionReason != externalV2BulkReasonBothAccepted || metrics.bulkDecisionRunID != 77 {
+		t.Fatalf("bulk decision overwritten: mode=%q reason=%q run=%d",
+			metrics.bulkDecisionMode, metrics.bulkDecisionReason, metrics.bulkDecisionRunID)
+	}
+}
+
 func TestExternalTransferMetricsRecordsCompleteQUICEvidence(t *testing.T) {
 	var out bytes.Buffer
 	start := time.Unix(183, 0)
@@ -1347,6 +1386,7 @@ func TestExternalTransferMetricsBulkBatchDiagnosticsAreMonotonic(t *testing.T) {
 		BulkProbeReceivedDatagrams:     29800,
 		BulkProbeLossPPM:               6666,
 		BulkProbePressure:              false,
+		BulkProbeStopReason:            externalV2BulkPacketProbeStopLadderComplete,
 	}, time.Now())
 	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
 		BulkBatchPresent:               true,
@@ -1380,6 +1420,7 @@ func TestExternalTransferMetricsBulkBatchDiagnosticsAreMonotonic(t *testing.T) {
 		BulkProbeReceivedDatagrams:     24000,
 		BulkProbeLossPPM:               40000,
 		BulkProbePressure:              true,
+		BulkProbeStopReason:            externalV2BulkPacketProbeStopPressure,
 	}, time.Now())
 
 	metrics.mu.Lock()
@@ -1401,6 +1442,101 @@ func TestExternalTransferMetricsBulkBatchDiagnosticsAreMonotonic(t *testing.T) {
 	}
 	if metrics.bulkProbeSelectedMbps != 1800 || metrics.bulkProbeDurationMS != 200 || metrics.bulkProbeTrains != 5 || metrics.bulkProbeSentDatagrams != 30000 || metrics.bulkProbeReceivedDatagrams != 29800 || metrics.bulkProbeLossPPM != 40000 || !metrics.bulkProbePressure {
 		t.Fatalf("probe diagnostics = selected:%d duration:%d trains:%d sent:%d received:%d loss_ppm:%d pressure:%t", metrics.bulkProbeSelectedMbps, metrics.bulkProbeDurationMS, metrics.bulkProbeTrains, metrics.bulkProbeSentDatagrams, metrics.bulkProbeReceivedDatagrams, metrics.bulkProbeLossPPM, metrics.bulkProbePressure)
+	}
+	if metrics.bulkProbeStopReason != externalV2BulkPacketProbeStopLadderComplete {
+		t.Fatalf("probe stop reason = %q, want first stable value", metrics.bulkProbeStopReason)
+	}
+}
+
+func TestExternalTransferMetricsBulkPacketFallbackDiagnosticsRoundTrip(t *testing.T) {
+	metrics := newExternalTransferMetrics(time.Now())
+	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
+		BulkProbeRejectStage:        "ack-timeout",
+		BulkProbeRejectTrain:        5,
+		BulkProbeRejectRateMbps:     2200,
+		BulkHandoffLanes:            8,
+		BulkHandoffDrainedDatagrams: 9628,
+		BulkHandoffDrainDurationMS:  17,
+	}, time.Now())
+
+	want := externalV2BulkPacketFallbackDiagnostics{
+		RejectStage:      "ack-timeout",
+		RejectTrain:      5,
+		RejectRateMbps:   2200,
+		HandoffLanes:     8,
+		DrainedDatagrams: 9628,
+		DrainDurationMS:  17,
+	}
+	if got := metrics.BulkPacketFallbackDiagnostics(); got != want {
+		t.Fatalf("BulkPacketFallbackDiagnostics() = %+v, want %+v", got, want)
+	}
+
+	mutated := metrics.BulkPacketFallbackDiagnostics()
+	mutated.RejectStage = "selector"
+	mutated.DrainedDatagrams = 1
+	if got := metrics.BulkPacketFallbackDiagnostics(); got != want {
+		t.Fatalf("fallback diagnostics changed through returned snapshot: got %+v, want %+v", got, want)
+	}
+
+	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
+		BulkProbeRejectStage:        "selector",
+		BulkProbeRejectTrain:        2,
+		BulkProbeRejectRateMbps:     900,
+		BulkHandoffLanes:            4,
+		BulkHandoffDrainedDatagrams: 10_000,
+		BulkHandoffDrainDurationMS:  12,
+	}, time.Now())
+	want.DrainedDatagrams = 10_000
+	if got := metrics.BulkPacketFallbackDiagnostics(); got != want {
+		t.Fatalf("monotonic fallback diagnostics = %+v, want %+v", got, want)
+	}
+}
+
+func TestExternalTransferMetricsBulkPacketProbeDiagnosticsRoundsSuccessfulSubMillisecondDrainUp(t *testing.T) {
+	var diagnostics externalDirectTransferDiagnostics
+	setExternalV2BulkPacketProbeDiagnostics(&diagnostics, externalV2BulkPacketProbeResult{
+		RejectStage:    "selector",
+		RejectTrain:    2,
+		RejectRateMbps: 900,
+		HandoffDrain: externalV2BulkPacketHandoffDrainResult{
+			Lanes: 4, Datagrams: 27, Duration: 500 * time.Microsecond,
+		},
+	})
+	if diagnostics.BulkProbeRejectStage != "selector" ||
+		diagnostics.BulkProbeRejectTrain != 2 ||
+		diagnostics.BulkProbeRejectRateMbps != 900 ||
+		diagnostics.BulkHandoffLanes != 4 ||
+		diagnostics.BulkHandoffDrainedDatagrams != 27 ||
+		diagnostics.BulkHandoffDrainDurationMS != 1 {
+		t.Fatalf("probe fallback diagnostics = %+v", diagnostics)
+	}
+}
+
+func TestExternalV2BulkPacketProbeFallbackEmitsOrderedDiagnostics(t *testing.T) {
+	metrics := newExternalTransferMetrics(time.Now())
+	metrics.SetDirectDiagnostics(externalDirectTransferDiagnostics{
+		BulkProbeRejectStage:        "ack-timeout",
+		BulkProbeRejectTrain:        5,
+		BulkProbeRejectRateMbps:     2200,
+		BulkHandoffLanes:            8,
+		BulkHandoffDrainedDatagrams: 9628,
+		BulkHandoffDrainDurationMS:  17,
+	}, time.Now())
+	var out bytes.Buffer
+	emitExternalV2BulkPacketProbeFallback(
+		telemetry.New(&out, telemetry.LevelVerbose),
+		metrics,
+		errors.Join(errExternalV2BulkPacketProbeRejected, errExternalV2BulkPacketProbeForcedSenderReject),
+	)
+	want := strings.Join([]string{
+		"v2-bulk-probe-rejected=stage:ack-timeout train:5 rate_mbps:2200",
+		"v2-bulk-handoff-drain=lanes:8 datagrams:9628 duration_ms:17",
+		"v2-bulk-probe-test-outcome=sender-reject",
+		"v2-bulk-probe=fallback-before-payload",
+		"",
+	}, "\n")
+	if got := out.String(); got != want {
+		t.Fatalf("fallback diagnostics markers = %q, want %q", got, want)
 	}
 }
 

@@ -7,11 +7,13 @@ package session
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -699,11 +701,11 @@ func TestExternalV2OfferReceiveRawDirectBulk(t *testing.T) {
 func TestExternalV2ProbeFallbackCompletesThroughQUICBeforePayload(t *testing.T) {
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
 	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
-	previousSelector := externalV2BulkPacketProbeSelector
-	externalV2BulkPacketProbeSelector = func(trains []externalV2BulkPacketProbeTrainResult) (externalV2BulkPacketProbeResult, error) {
-		return externalV2BulkPacketProbeResult{Trains: append([]externalV2BulkPacketProbeTrainResult(nil), trains...)}, errExternalV2BulkPacketProbeRejected
-	}
-	t.Cleanup(func() { externalV2BulkPacketProbeSelector = previousSelector })
+	t.Setenv("DERPHOLE_TEST_BULK_PROBE_OUTCOME", "sender-reject")
+	previousBarrierWait := externalV2BulkDecisionBarrierWait
+	externalV2BulkDecisionBarrierWait = 2 * time.Second
+	t.Cleanup(func() { externalV2BulkDecisionBarrierWait = previousBarrierWait })
+	var offerStatus, receiveStatus syncBuffer
 
 	previousInterfaceAddrs := publicInterfaceAddrs
 	publicInterfaceAddrs = func() ([]net.Addr, error) {
@@ -719,8 +721,8 @@ func TestExternalV2ProbeFallbackCompletesThroughQUICBeforePayload(t *testing.T) 
 
 	header := []byte("probe-fallback")
 	payload := bytes.Repeat([]byte("quic-after-rejected-udp-probe"), 16<<10)
-	sink := newMemoryBlockSink(int64(len(payload)))
-	var offerStatus, receiveStatus syncBuffer
+	sink := newGatedMemoryBlockSink(int64(len(payload)))
+	t.Cleanup(sink.releaseWrites)
 	tokenSink := make(chan string, 1)
 	offerErr := make(chan error, 1)
 	go func() {
@@ -739,12 +741,24 @@ func TestExternalV2ProbeFallbackCompletesThroughQUICBeforePayload(t *testing.T) 
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	receiveErr := Receive(ctx, ReceiveConfig{
-		Token: raw, Emitter: telemetry.New(&receiveStatus, telemetry.LevelVerbose), UsePublicDERP: true,
-		BlockReceiver: func(context.Context, BlockReceiveRequest) (BlockReceiveSink, error) { return sink, nil },
-	})
-	if receiveErr != nil {
-		t.Fatalf("Receive() error = %v offer=%q receive=%q", receiveErr, offerStatus.String(), receiveStatus.String())
+	receiveErr := make(chan error, 1)
+	go func() {
+		receiveErr <- Receive(ctx, ReceiveConfig{
+			Token: raw, Emitter: telemetry.New(&receiveStatus, telemetry.LevelVerbose), UsePublicDERP: true,
+			BlockReceiver: func(context.Context, BlockReceiveRequest) (BlockReceiveSink, error) { return sink, nil },
+		})
+	}()
+	select {
+	case <-sink.firstWrite:
+	case err := <-receiveErr:
+		t.Fatalf("Receive() returned before first payload write: %v offer=%q receive=%q", err, offerStatus.String(), receiveStatus.String())
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	time.Sleep(externalV2BulkDecisionBarrierWait + 100*time.Millisecond)
+	sink.releaseWrites()
+	if err := <-receiveErr; err != nil {
+		t.Fatalf("Receive() error after payload outlived decision barrier = %v offer=%q receive=%q", err, offerStatus.String(), receiveStatus.String())
 	}
 	if err := <-offerErr; err != nil {
 		t.Fatalf("Offer() error = %v offer=%q receive=%q", err, offerStatus.String(), receiveStatus.String())
@@ -752,11 +766,312 @@ func TestExternalV2ProbeFallbackCompletesThroughQUICBeforePayload(t *testing.T) 
 	if !bytes.Equal(sink.bytes(), payload) {
 		t.Fatal("QUIC fallback payload mismatch")
 	}
-	for role, status := range map[string]string{"offer": offerStatus.String(), "receive": receiveStatus.String()} {
-		if !strings.Contains(status, "v2-bulk-probe=fallback-before-payload") {
-			t.Fatalf("%s status missing pre-payload fallback marker: %q", role, status)
+	offerLog := offerStatus.String()
+	receiveLog := receiveStatus.String()
+	if readiness := strings.Index(offerLog, "v2-bulk-ready=mode:"); readiness >= 0 {
+		decision := strings.Index(offerLog, "v2-bulk-decision=mode:quic")
+		ack := strings.Index(offerLog, "v2-bulk-decision-ack=mode:quic")
+		if !(decision < readiness && readiness < ack) {
+			t.Fatalf("offer readiness ordering decision=%d readiness=%d ack=%d status=%q", decision, readiness, ack, offerLog)
 		}
 	}
+	if readiness := strings.Index(receiveLog, "v2-bulk-ready=mode:"); readiness >= 0 {
+		decision := strings.Index(receiveLog, "v2-bulk-decision=mode:quic")
+		if readiness >= decision {
+			t.Fatalf("receiver readiness ordering readiness=%d decision=%d status=%q", readiness, decision, receiveLog)
+		}
+	}
+	for role, status := range map[string]string{"offer": offerLog, "receive": receiveLog} {
+		markers := []string{
+			"v2-bulk-decision=mode:quic",
+			"v2-bulk-decision-ack=mode:quic",
+			"v2-bulk-probe=fallback-before-payload",
+		}
+		previous := -1
+		for _, marker := range markers {
+			if !strings.Contains(status, marker) {
+				t.Fatalf("%s status missing %q: %q", role, marker, status)
+			}
+			index := strings.Index(status, marker)
+			if index <= previous {
+				t.Fatalf("%s status marker %q out of order: %q", role, marker, status)
+			}
+			previous = index
+		}
+	}
+	const forcedMarker = "v2-bulk-probe-test-outcome=sender-reject"
+	if count := strings.Count(offerLog, forcedMarker); count != 1 {
+		t.Fatalf("offer status marker count = %d, want 1 for %q: %q", count, forcedMarker, offerLog)
+	}
+	ack := strings.Index(offerLog, "v2-bulk-decision-ack=mode:quic")
+	forced := strings.Index(offerLog, forcedMarker)
+	fallback := strings.Index(offerLog, "v2-bulk-probe=fallback-before-payload")
+	if !(ack < forced && forced < fallback) {
+		t.Fatalf("offer controlled marker ordering ack=%d forced=%d fallback=%d: %q", ack, forced, fallback, offerLog)
+	}
+	if strings.Contains(receiveLog, forcedMarker) {
+		t.Fatalf("receiver status unexpectedly contains %q: %q", forcedMarker, receiveLog)
+	}
+	offerStatusBefore := offerStatus.String()
+	receiveStatusBefore := receiveStatus.String()
+	time.Sleep(250 * time.Millisecond)
+	if got := offerStatus.String(); got != offerStatusBefore {
+		t.Fatalf("offer status grew after return: before=%q after=%q", offerStatusBefore, got)
+	}
+	if got := receiveStatus.String(); got != receiveStatusBefore {
+		t.Fatalf("receive status grew after return: before=%q after=%q", receiveStatusBefore, got)
+	}
+}
+
+func TestExternalV2NegotiatedBulkPacketFallbackAcceptsControlledSenderRejectionOnly(t *testing.T) {
+	controlled := errors.Join(errExternalV2BulkPacketProbeRejected, errExternalV2BulkPacketProbeForcedSenderReject)
+	if !externalV2NegotiatedBulkPacketFallback(controlled) {
+		t.Fatal("controlled sender rejection was not classified as negotiated fallback")
+	}
+	if externalV2NegotiatedBulkPacketFallback(errors.Join(controlled, errors.New("cleanup failed"))) {
+		t.Fatal("controlled sender rejection with cleanup failure was classified as negotiated fallback")
+	}
+}
+
+func TestExternalV2InvalidBulkPacketProbeTestOutcomeFailsSenderBeforeQUIC(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{
+			name: "explicit empty",
+			want: `DERPHOLE_TEST_BULK_PROBE_OUTCOME must be unset or "sender-reject" (got "")`,
+		},
+		{
+			name:  "unsupported",
+			value: "receiver-reject",
+			want:  `DERPHOLE_TEST_BULK_PROBE_OUTCOME must be unset or "sender-reject" (got "receiver-reject")`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testExternalV2InvalidBulkPacketProbeTestOutcomeFailsSenderBeforeQUIC(t, tt.value, tt.want)
+		})
+	}
+}
+
+func testExternalV2InvalidBulkPacketProbeTestOutcomeFailsSenderBeforeQUIC(t *testing.T, value, want string) {
+	t.Helper()
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+	t.Setenv(externalV2BulkPacketProbeTestOutcomeEnv, value)
+
+	previousInterfaceAddrs := publicInterfaceAddrs
+	publicInterfaceAddrs = func() ([]net.Addr, error) {
+		return []net.Addr{&net.IPNet{IP: net.IPv4(127, 0, 0, 1), Mask: net.CIDRMask(8, 32)}}, nil
+	}
+	t.Cleanup(func() { publicInterfaceAddrs = previousInterfaceAddrs })
+
+	var quicReceiveOpens atomic.Int32
+	previousQUICOpenObserver := externalV2ObserveQUICBlockReceiveOpen
+	externalV2ObserveQUICBlockReceiveOpen = func() { quicReceiveOpens.Add(1) }
+	t.Cleanup(func() { externalV2ObserveQUICBlockReceiveOpen = previousQUICOpenObserver })
+
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	payload := bytes.Repeat([]byte("invalid-probe-test-outcome"), 16<<10)
+	sink := newMemoryBlockSink(int64(len(payload)))
+	var offerStatus, receiveStatus syncBuffer
+	tokenSink := make(chan string, 1)
+	offerErr := make(chan error, 1)
+	go func() {
+		_, err := Offer(ctx, OfferConfig{
+			TokenSink: tokenSink, Emitter: telemetry.New(&offerStatus, telemetry.LevelVerbose), UsePublicDERP: true,
+			BlockSource: &BlockSource{Header: []byte("invalid-outcome"), Payload: bytes.NewReader(payload), PayloadSize: int64(len(payload))},
+		})
+		offerErr <- err
+	}()
+	raw := waitExternalV2BlockTestToken(t, ctx, tokenSink, offerErr)
+	receiveErr := make(chan error, 1)
+	go func() {
+		receiveErr <- Receive(ctx, ReceiveConfig{
+			Token: raw, Emitter: telemetry.New(&receiveStatus, telemetry.LevelVerbose), UsePublicDERP: true,
+			BlockReceiver: func(context.Context, BlockReceiveRequest) (BlockReceiveSink, error) { return sink, nil },
+		})
+	}()
+
+	var senderErr error
+	select {
+	case senderErr = <-offerErr:
+	case <-ctx.Done():
+		t.Fatalf("sender did not return: %v offer=%q receive=%q", ctx.Err(), offerStatus.String(), receiveStatus.String())
+	}
+	if senderErr == nil || senderErr.Error() != want {
+		t.Fatalf("sender error = %v, want %q; offer=%q receive=%q", senderErr, want, offerStatus.String(), receiveStatus.String())
+	}
+	for role, status := range map[string]string{"offer": offerStatus.String(), "receive": receiveStatus.String()} {
+		for _, marker := range []string{"v2-bulk-decision=", "v2-bulk-decision-ack=", "v2-bulk-probe=fallback-before-payload"} {
+			if strings.Contains(status, marker) {
+				t.Fatalf("%s status unexpectedly contains %q: %q", role, marker, status)
+			}
+		}
+	}
+	if got := quicReceiveOpens.Load(); got != 0 {
+		t.Fatalf("QUIC block receive open count = %d, want 0; offer=%q receive=%q", got, offerStatus.String(), receiveStatus.String())
+	}
+	if got := sink.bytes(); !bytes.Equal(got, make([]byte, len(got))) {
+		t.Fatal("receiver committed payload bytes after invalid probe test outcome")
+	}
+
+	cancel()
+	select {
+	case <-receiveErr:
+	case <-time.After(2 * time.Second):
+		t.Fatal("receiver did not stop after invalid probe test outcome")
+	}
+}
+
+func TestExternalV2ReceiverProbeCleanupFailureDoesNotOpenQUIC(t *testing.T) {
+	for _, topology := range []string{"claimant-receiver", "offerer-receiver"} {
+		for _, cleanup := range []string{"interrupt", "drain"} {
+			t.Run(topology+"/"+cleanup, func(t *testing.T) {
+				testExternalV2ReceiverProbeCleanupFailureDoesNotOpenQUIC(t, topology, cleanup)
+			})
+		}
+	}
+}
+
+func testExternalV2ReceiverProbeCleanupFailureDoesNotOpenQUIC(t *testing.T, topology, cleanup string) {
+	t.Helper()
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT", "1")
+	t.Setenv("DERPHOLE_FAKE_TRANSPORT_ENABLE_DIRECT_AT", "0")
+	previousInterfaceAddrs := publicInterfaceAddrs
+	publicInterfaceAddrs = func() ([]net.Addr, error) {
+		return []net.Addr{&net.IPNet{IP: net.IPv4(127, 0, 0, 1), Mask: net.CIDRMask(8, 32)}}, nil
+	}
+	t.Cleanup(func() { publicInterfaceAddrs = previousInterfaceAddrs })
+
+	fault := errors.New("injected receiver probe " + cleanup + " failure")
+	previousInterrupt := externalV2BulkPacketProbeInterruptReads
+	previousDrain := externalV2BulkPacketDrainForHandoff
+	switch cleanup {
+	case "interrupt":
+		externalV2BulkPacketProbeInterruptReads = func(path externalV2BulkPacketPath, deadline time.Time) error {
+			return errors.Join(interruptExternalV2BulkPacketReads(path, deadline), fault)
+		}
+	case "drain":
+		externalV2BulkPacketDrainForHandoff = func(ctx context.Context, path externalV2BulkPacketPath) (externalV2BulkPacketHandoffDrainResult, error) {
+			result, err := previousDrain(ctx, path)
+			return result, errors.Join(err, fault)
+		}
+	default:
+		t.Fatalf("unknown cleanup fault %q", cleanup)
+	}
+	t.Cleanup(func() {
+		externalV2BulkPacketProbeInterruptReads = previousInterrupt
+		externalV2BulkPacketDrainForHandoff = previousDrain
+	})
+
+	var quicReceiveOpens atomic.Int32
+	previousQUICOpenObserver := externalV2ObserveQUICBlockReceiveOpen
+	externalV2ObserveQUICBlockReceiveOpen = func() { quicReceiveOpens.Add(1) }
+	t.Cleanup(func() { externalV2ObserveQUICBlockReceiveOpen = previousQUICOpenObserver })
+
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	payload := bytes.Repeat([]byte("receiver-probe-cleanup"), 32<<10)
+	sink := newMemoryBlockSink(int64(len(payload)))
+	var receiverStatus syncBuffer
+	var senderStatus syncBuffer
+	receiverConfig := func() BlockReceiver {
+		return func(context.Context, BlockReceiveRequest) (BlockReceiveSink, error) { return sink, nil }
+	}
+
+	var receiverErr error
+	var senderErrCh <-chan error
+	switch topology {
+	case "claimant-receiver":
+		tokenSink := make(chan string, 1)
+		offerErr := make(chan error, 1)
+		go func() {
+			_, err := Offer(ctx, OfferConfig{
+				TokenSink: tokenSink, Emitter: telemetry.New(&senderStatus, telemetry.LevelVerbose), UsePublicDERP: true,
+				BlockSource: &BlockSource{Header: []byte("cleanup"), Payload: bytes.NewReader(payload), PayloadSize: int64(len(payload))},
+			})
+			offerErr <- err
+		}()
+		raw := waitExternalV2BlockTestToken(t, ctx, tokenSink, offerErr)
+		receiverErr = Receive(ctx, ReceiveConfig{
+			Token: raw, Emitter: telemetry.New(&receiverStatus, telemetry.LevelVerbose), UsePublicDERP: true,
+			BlockReceiver: receiverConfig(),
+		})
+		senderErrCh = offerErr
+	case "offerer-receiver":
+		tokenSink := make(chan string, 1)
+		listenErr := make(chan error, 1)
+		go func() {
+			_, err := listenExternal(ctx, ListenConfig{
+				TokenSink: tokenSink, Emitter: telemetry.New(&receiverStatus, telemetry.LevelVerbose), UsePublicDERP: true,
+				BlockReceiver: receiverConfig(),
+			})
+			listenErr <- err
+		}()
+		raw := waitExternalV2BlockTestToken(t, ctx, tokenSink, listenErr)
+		sendErr := make(chan error, 1)
+		go func() {
+			sendErr <- sendExternal(ctx, SendConfig{
+				Token: raw, Emitter: telemetry.New(&senderStatus, telemetry.LevelVerbose), UsePublicDERP: true,
+				BlockSource: &BlockSource{Header: []byte("cleanup"), Payload: bytes.NewReader(payload), PayloadSize: int64(len(payload))},
+			})
+		}()
+		select {
+		case receiverErr = <-listenErr:
+		case <-ctx.Done():
+			t.Fatalf("receiver did not return: %v", ctx.Err())
+		}
+		senderErrCh = sendErr
+	default:
+		t.Fatalf("unknown receiver topology %q", topology)
+	}
+
+	if !errors.Is(receiverErr, fault) {
+		t.Fatalf("receiver error = %v, want cleanup fault %v; status=%q", receiverErr, fault, receiverStatus.String())
+	}
+	if got := quicReceiveOpens.Load(); got != 0 {
+		t.Fatalf("QUIC block receive open count = %d, want 0; status=%q", got, receiverStatus.String())
+	}
+	if got := sink.bytes(); !bytes.Equal(got, make([]byte, len(got))) {
+		t.Fatal("receiver committed payload bytes after probe cleanup failure")
+	}
+	for role, status := range map[string]string{"receiver": receiverStatus.String(), "sender": senderStatus.String()} {
+		if strings.Contains(status, "v2-bulk-probe=fallback-before-payload") {
+			t.Fatalf("%s emitted negotiated fallback after cleanup failure: %q", role, status)
+		}
+	}
+
+	cancel()
+	select {
+	case <-senderErrCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sender did not stop after receiver cleanup failure")
+	}
+}
+
+func waitExternalV2BlockTestToken(t *testing.T, ctx context.Context, tokenSink <-chan string, earlyErr <-chan error) string {
+	t.Helper()
+	select {
+	case raw := <-tokenSink:
+		return raw
+	case err := <-earlyErr:
+		t.Fatalf("runtime returned before token: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for token: %v", ctx.Err())
+	}
+	return ""
 }
 
 func TestExternalV2OfferReceiveDirectTCPFileRoundTripReceiverListens(t *testing.T) {

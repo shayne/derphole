@@ -20,9 +20,7 @@ type QUICClient struct {
 	manager            *transport.Manager
 	identity           quicpath.SessionIdentity
 	peer               [32]byte
-	endpoint           *directquic.Endpoint
-	endpoints          []*directquic.Endpoint
-	adapter            *quicpath.Adapter
+	endpointState      quicEndpointState
 	conn               net.PacketConn
 	remote             net.Addr
 	conns              []net.PacketConn
@@ -34,13 +32,17 @@ type QUICServer struct {
 	manager            *transport.Manager
 	identity           quicpath.SessionIdentity
 	peer               [32]byte
-	endpoint           *directquic.Endpoint
-	endpoints          []*directquic.Endpoint
-	adapter            *quicpath.Adapter
+	endpointState      quicEndpointState
 	conn               net.PacketConn
 	remote             net.Addr
 	conns              []net.PacketConn
 	managerConnections int
+}
+
+type quicEndpointState struct {
+	mu        sync.RWMutex
+	endpoints []*directquic.Endpoint
+	adapter   *quicpath.Adapter
 }
 
 type packetPath struct {
@@ -107,8 +109,7 @@ func (q *QUICClient) OpenStreams(ctx context.Context, count int) ([]io.WriteClos
 			closePacketPaths(paths)
 			return nil, err
 		}
-		q.endpoints = endpoints
-		q.endpoint = firstEndpoint(endpoints)
+		q.endpointState.publish(endpoints, nil)
 		return streams, nil
 	}
 	path := paths[0]
@@ -129,9 +130,7 @@ func (q *QUICClient) OpenStreams(ctx context.Context, count int) ([]io.WriteClos
 		closePacketPath(path)
 		return nil, err
 	}
-	q.endpoint = endpoint
-	q.endpoints = []*directquic.Endpoint{endpoint}
-	q.adapter = path.adapter
+	q.endpointState.publish([]*directquic.Endpoint{endpoint}, path.adapter)
 	return streams, nil
 }
 
@@ -151,8 +150,7 @@ func (q *QUICClient) AcceptStreams(ctx context.Context, count int) ([]io.ReadClo
 			closePacketPaths(paths)
 			return nil, err
 		}
-		q.endpoints = endpoints
-		q.endpoint = firstEndpoint(endpoints)
+		q.endpointState.publish(endpoints, nil)
 		return streams, nil
 	}
 	path := paths[0]
@@ -173,9 +171,7 @@ func (q *QUICClient) AcceptStreams(ctx context.Context, count int) ([]io.ReadClo
 		closePacketPath(path)
 		return nil, err
 	}
-	q.endpoint = endpoint
-	q.endpoints = []*directquic.Endpoint{endpoint}
-	q.adapter = path.adapter
+	q.endpointState.publish([]*directquic.Endpoint{endpoint}, path.adapter)
 	return streams, nil
 }
 
@@ -199,8 +195,7 @@ func (q *QUICServer) AcceptStreamsWithReady(ctx context.Context, count int, read
 			closePacketPaths(paths)
 			return nil, err
 		}
-		q.endpoints = endpoints
-		q.endpoint = firstEndpoint(endpoints)
+		q.endpointState.publish(endpoints, nil)
 		return streams, nil
 	}
 	path := paths[0]
@@ -220,9 +215,7 @@ func (q *QUICServer) AcceptStreamsWithReady(ctx context.Context, count int, read
 		closePacketPath(path)
 		return nil, err
 	}
-	q.endpoint = endpoint
-	q.endpoints = []*directquic.Endpoint{endpoint}
-	q.adapter = path.adapter
+	q.endpointState.publish([]*directquic.Endpoint{endpoint}, path.adapter)
 	return streams, nil
 }
 
@@ -242,8 +235,7 @@ func (q *QUICServer) OpenStreamsWithReady(ctx context.Context, count int, ready 
 			closePacketPaths(paths)
 			return nil, err
 		}
-		q.endpoints = endpoints
-		q.endpoint = firstEndpoint(endpoints)
+		q.endpointState.publish(endpoints, nil)
 		return streams, nil
 	}
 	path := paths[0]
@@ -263,9 +255,7 @@ func (q *QUICServer) OpenStreamsWithReady(ctx context.Context, count int, ready 
 		closePacketPath(path)
 		return nil, err
 	}
-	q.endpoint = endpoint
-	q.endpoints = []*directquic.Endpoint{endpoint}
-	q.adapter = path.adapter
+	q.endpointState.publish([]*directquic.Endpoint{endpoint}, path.adapter)
 	return streams, nil
 }
 
@@ -324,19 +314,38 @@ func endpointConnectionCount(path packetPath, streams int) int {
 }
 
 func (q *QUICClient) Stats() Stats {
-	return convertStats(q.endpoints)
+	endpoints, _ := q.endpointState.snapshot()
+	return convertStats(endpoints)
 }
 
 func (q *QUICServer) Stats() Stats {
-	return convertStats(q.endpoints)
+	endpoints, _ := q.endpointState.snapshot()
+	return convertStats(endpoints)
 }
 
 func (q *QUICClient) CloseWithError(code uint64, reason string) error {
-	return closeEndpointsAndAdapter(q.endpoints, q.adapter, code, reason)
+	endpoints, adapter := q.endpointState.snapshot()
+	return closeEndpointsAndAdapter(endpoints, adapter, code, reason)
 }
 
 func (q *QUICServer) CloseWithError(code uint64, reason string) error {
-	return closeEndpointsAndAdapter(q.endpoints, q.adapter, code, reason)
+	endpoints, adapter := q.endpointState.snapshot()
+	return closeEndpointsAndAdapter(endpoints, adapter, code, reason)
+}
+
+func (s *quicEndpointState) publish(endpoints []*directquic.Endpoint, adapter *quicpath.Adapter) {
+	s.mu.Lock()
+	s.endpoints = append([]*directquic.Endpoint(nil), endpoints...)
+	s.adapter = adapter
+	s.mu.Unlock()
+}
+
+func (s *quicEndpointState) snapshot() ([]*directquic.Endpoint, *quicpath.Adapter) {
+	s.mu.RLock()
+	endpoints := append([]*directquic.Endpoint(nil), s.endpoints...)
+	adapter := s.adapter
+	s.mu.RUnlock()
+	return endpoints, adapter
 }
 
 type writeOnlyStream struct{ io.WriteCloser }
@@ -670,13 +679,6 @@ func trimPacketPaths(paths []packetPath, count int) []packetPath {
 		return paths[:count]
 	}
 	return paths
-}
-
-func firstEndpoint(endpoints []*directquic.Endpoint) *directquic.Endpoint {
-	if len(endpoints) == 0 {
-		return nil
-	}
-	return endpoints[0]
 }
 
 func closeDirectQUICEndpoints(endpoints []*directquic.Endpoint) {

@@ -31,9 +31,18 @@ const externalV2AbortNotifyWait = 2 * time.Second
 const externalV2AbortDrainWait = time.Second
 const externalV2AbortSignalDrainWait = 150 * time.Millisecond
 const externalV2CompleteWait = 5 * time.Second
-const externalV2StreamOpenWait = 2 * time.Second
+const externalV2QUICStreamOpenWait = 10 * time.Second
 const externalV2DirectNudgeInterval = 250 * time.Millisecond
 const externalV2DirectNudgeDuration = 2 * time.Second
+
+func runExternalV2QUICStreamOpen[T any](ctx context.Context, bounded bool, open func(context.Context) (T, error)) (T, error) {
+	if !bounded {
+		return open(ctx)
+	}
+	openCtx, cancel := context.WithTimeout(ctx, externalV2QUICStreamOpenWait)
+	defer cancel()
+	return open(openCtx)
+}
 
 type externalV2SendRuntime struct {
 	cfg          SendConfig
@@ -328,6 +337,7 @@ func (rt *externalV2SendRuntime) acceptAndStartTransport(ctx context.Context, pa
 func (rt *externalV2SendRuntime) sendStream(ctx context.Context, accept externalV2Accept, tr externalV2ListenTransport, metrics *externalTransferMetrics, streamCount int, managerConnections int, rawDirectBudget time.Duration, progress *externalV2PeerProgressState) error {
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	defer cancelStream()
+	completeCtx := ctx
 	path, err := negotiateExternalV2DirectPacketPath(streamCtx, rt.derp, rt.listenerDERP, tr.manager, rt.dm, rt.auth, rt.cfg.Emitter, streamCount, externalV2DataPlaneSenderPunchDelay, rawDirectBudget, tr.relayOnly)
 	if err != nil {
 		return err
@@ -340,6 +350,12 @@ func (rt *externalV2SendRuntime) sendStream(ctx context.Context, accept external
 		}
 	}
 	if path.raw && externalV2UsesBulkPacketTransfer(accept.TransferMode) {
+		decision := newExternalV2BulkDecisionCoordinator(
+			streamCtx, rt.derp, rt.listenerDERP, rt.auth, rt.cfg.Emitter,
+		)
+		defer decision.Close()
+		streamCtx = decision.Context()
+		completeCtx = streamCtx
 		emitExternalV2Debug(rt.cfg.Emitter, "v2-block-transfer=bulk-packets")
 		batchNative := accept.BlockPacketBatchCapable && externalV2BulkPacketBatchCapability()
 		grouped := batchNative && externalV2GroupedBulk(accept.BlockPacketGroupCapable, externalV2BulkPacketGroupCapability())
@@ -347,22 +363,59 @@ func (rt *externalV2SendRuntime) sendStream(ctx context.Context, accept external
 		abortErrCh, stopAbortWatch := rt.watchAbort(ctx, cancelStream)
 		err := rt.sendBulkPacketBlock(
 			streamCtx,
-			ctx,
+			completeCtx,
 			path,
 			batchNative,
 			grouped,
 			metrics,
 			abortErrCh,
 			progress,
+			externalV2BulkPacketTransferOptions{CapacityProbe: true, Decision: decision},
 		)
 		stopAbortWatch()
-		if !errors.Is(err, errExternalV2BulkPacketProbeRejected) {
+		if !externalV2NegotiatedBulkPacketFallback(err) {
 			return err
 		}
-		emitExternalV2Debug(rt.cfg.Emitter, "v2-bulk-probe=fallback-before-payload")
+		emitExternalV2BulkPacketProbeFallback(rt.cfg.Emitter, metrics, err)
 	}
 	client := rt.newExternalV2SendClient(tr.manager, path, managerConnections)
-	return rt.copySendStreamWithClient(streamCtx, ctx, accept, path.raw, streamCount, client, cancelStream, metrics, progress)
+	return rt.copySendStreamWithClient(streamCtx, completeCtx, accept, path.raw, streamCount, client, cancelStream, metrics, progress)
+}
+
+func emitExternalV2BulkPacketProbeFallback(emitter *telemetry.Emitter, metrics *externalTransferMetrics, err error) {
+	diagnostics := metrics.BulkPacketFallbackDiagnostics()
+	if diagnostics.RejectStage != "" {
+		emitExternalV2Debug(emitter, fmt.Sprintf(
+			"v2-bulk-probe-rejected=stage:%s train:%d rate_mbps:%d",
+			diagnostics.RejectStage, diagnostics.RejectTrain, diagnostics.RejectRateMbps,
+		))
+	}
+	if diagnostics.HandoffLanes > 0 && diagnostics.DrainDurationMS > 0 {
+		emitExternalV2Debug(emitter, fmt.Sprintf(
+			"v2-bulk-handoff-drain=lanes:%d datagrams:%d duration_ms:%d",
+			diagnostics.HandoffLanes, diagnostics.DrainedDatagrams, diagnostics.DrainDurationMS,
+		))
+	}
+	if outcome := externalV2BulkPacketProbeTestOutcome(err); outcome != "" {
+		emitExternalV2Debug(emitter, "v2-bulk-probe-test-outcome="+outcome)
+	}
+	emitExternalV2Debug(emitter, "v2-bulk-probe=fallback-before-payload")
+}
+
+func externalV2NegotiatedBulkPacketFallback(err error) bool {
+	if err == errExternalV2BulkPacketProbeRejected {
+		return true
+	}
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		return false
+	}
+	errs := joined.Unwrap()
+	if len(errs) == 2 {
+		return errs[0] == errExternalV2BulkPacketProbeRejected &&
+			errs[1] == errExternalV2BulkPacketProbeForcedSenderReject
+	}
+	return len(errs) == 1 && externalV2NegotiatedBulkPacketFallback(errs[0])
 }
 
 func (rt *externalV2SendRuntime) newExternalV2SendClient(manager *transport.Manager, path externalV2DirectPacketPath, managerConnections int) *dataplane.QUICClient {
@@ -382,13 +435,9 @@ func (rt *externalV2SendRuntime) copySendStreamWithClient(streamCtx context.Cont
 		_ = closeExternalV2QUICEndpoint(client, metrics, streamCount, boundedOpen, 1, "peer aborted transfer")
 	})
 	defer stopAbortWatch()
-	openCtx := streamCtx
-	cancelOpen := func() {}
-	if boundedOpen {
-		openCtx, cancelOpen = context.WithTimeout(streamCtx, externalV2StreamOpenWait)
-	}
-	streams, err := client.OpenStreams(openCtx, streamCount)
-	cancelOpen()
+	streams, err := runExternalV2QUICStreamOpen(streamCtx, boundedOpen, func(openCtx context.Context) ([]io.WriteCloser, error) {
+		return client.OpenStreams(openCtx, streamCount)
+	})
 	if err != nil {
 		err = externalV2PreferPeerAbort(ctx, abortErrCh, err)
 		if boundedOpen {
@@ -415,13 +464,13 @@ func (rt *externalV2SendRuntime) copySendStreamWithClient(streamCtx context.Cont
 	return nil
 }
 
-func (rt *externalV2SendRuntime) sendBulkPacketBlock(streamCtx context.Context, completeCtx context.Context, path externalV2DirectPacketPath, batchNative, grouped bool, metrics *externalTransferMetrics, abortErrCh <-chan error, progress *externalV2PeerProgressState) error {
+func (rt *externalV2SendRuntime) sendBulkPacketBlock(streamCtx context.Context, completeCtx context.Context, path externalV2DirectPacketPath, batchNative, grouped bool, metrics *externalTransferMetrics, abortErrCh <-chan error, progress *externalV2PeerProgressState, options externalV2BulkPacketTransferOptions) error {
 	auth, err := externalV2BulkPacketAuthForToken(rt.tok, rt.derp.PublicKey(), rt.listenerDERP)
 	if err != nil {
 		return err
 	}
 	auth = auth.withGrouped(grouped)
-	stats, err := sendExternalV2BulkBlockPacketsWithProbe(streamCtx, rt.cfg.BlockSource, externalV2BulkPacketPathFromRaw(path), auth, metrics, batchNative)
+	stats, err := sendExternalV2BulkBlockPackets(streamCtx, rt.cfg.BlockSource, externalV2BulkPacketPathFromRaw(path), auth, metrics, options)
 	metrics.SetDirectStats(stats)
 	if err != nil {
 		return externalV2PreferPeerAbort(completeCtx, abortErrCh, err)
@@ -903,13 +952,9 @@ func (rt *externalV2ListenRuntime) listenQUICServer(tr externalV2ListenTransport
 }
 
 func acceptExternalV2ListenQUICStreams(streamCtx, preferenceCtx context.Context, abortErrCh <-chan error, server *dataplane.QUICServer, streamCount int, bounded bool) ([]io.ReadCloser, error) {
-	openCtx := streamCtx
-	cancelOpen := func() {}
-	if bounded {
-		openCtx, cancelOpen = context.WithTimeout(streamCtx, externalV2StreamOpenWait)
-	}
-	streams, err := server.AcceptStreamsWithReady(openCtx, streamCount, nil)
-	cancelOpen()
+	streams, err := runExternalV2QUICStreamOpen(streamCtx, bounded, func(openCtx context.Context) ([]io.ReadCloser, error) {
+		return server.AcceptStreamsWithReady(openCtx, streamCount, nil)
+	})
 	if err == nil {
 		return streams, nil
 	}

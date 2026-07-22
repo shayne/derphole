@@ -109,6 +109,16 @@ type externalTransferMetrics struct {
 	bulkProbeReceivedDatagrams     uint64
 	bulkProbeLossPPM               uint64
 	bulkProbePressure              bool
+	bulkProbeStopReason            string
+	bulkProbeRejectStage           string
+	bulkProbeRejectTrain           int
+	bulkProbeRejectRateMbps        int
+	bulkHandoffLanes               int
+	bulkHandoffDrainedDatagrams    uint64
+	bulkHandoffDrainDurationMS     int64
+	bulkDecisionMode               string
+	bulkDecisionReason             string
+	bulkDecisionRunID              uint64
 	filePayloadEngine              transfertrace.FilePayloadEngine
 	filePayloadBytesCommitted      int64
 	filePayloadBytesBulk           int64
@@ -225,6 +235,22 @@ type externalDirectTransferDiagnostics struct {
 	BulkProbeReceivedDatagrams     uint64
 	BulkProbeLossPPM               uint64
 	BulkProbePressure              bool
+	BulkProbeStopReason            string
+	BulkProbeRejectStage           string
+	BulkProbeRejectTrain           int
+	BulkProbeRejectRateMbps        int
+	BulkHandoffLanes               int
+	BulkHandoffDrainedDatagrams    uint64
+	BulkHandoffDrainDurationMS     int64
+}
+
+type externalV2BulkPacketFallbackDiagnostics struct {
+	RejectStage      string
+	RejectTrain      int
+	RejectRateMbps   int
+	HandoffLanes     int
+	DrainedDatagrams uint64
+	DrainDurationMS  int64
 }
 
 type externalPeerProgressSnapshot struct {
@@ -267,6 +293,21 @@ func (m *externalTransferMetrics) SelectFilePayloadEngine(engine transfertrace.F
 	m.mu.Lock()
 	if m.filePayloadBytesCommitted == 0 || m.filePayloadEngine == engine {
 		m.filePayloadEngine = engine
+	}
+	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
+	m.mu.Unlock()
+	sampleExternalTransferTrace(trace, snap, ok)
+}
+
+func (m *externalTransferMetrics) SetBulkDecision(decision externalV2BulkDecision, at time.Time) {
+	if m == nil || decision.ProbeRunID == 0 {
+		return
+	}
+	m.mu.Lock()
+	if m.bulkDecisionRunID == 0 {
+		m.bulkDecisionMode = decision.Mode
+		m.bulkDecisionReason = decision.Reason
+		m.bulkDecisionRunID = decision.ProbeRunID
 	}
 	trace, snap, ok := m.updateTraceLocked(nonZeroTime(at))
 	m.mu.Unlock()
@@ -768,6 +809,22 @@ func (m *externalTransferMetrics) SetDirectStatsWithoutByteProgress(stats extern
 	m.setDirectStats(stats, false)
 }
 
+func (m *externalTransferMetrics) BulkPacketFallbackDiagnostics() externalV2BulkPacketFallbackDiagnostics {
+	if m == nil {
+		return externalV2BulkPacketFallbackDiagnostics{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return externalV2BulkPacketFallbackDiagnostics{
+		RejectStage:      m.bulkProbeRejectStage,
+		RejectTrain:      m.bulkProbeRejectTrain,
+		RejectRateMbps:   m.bulkProbeRejectRateMbps,
+		HandoffLanes:     m.bulkHandoffLanes,
+		DrainedDatagrams: m.bulkHandoffDrainedDatagrams,
+		DrainDurationMS:  m.bulkHandoffDrainDurationMS,
+	}
+}
+
 func (m *externalTransferMetrics) SetDirectDiagnostics(
 	diagnostics externalDirectTransferDiagnostics,
 	at time.Time,
@@ -1028,6 +1085,13 @@ func (m *externalTransferMetrics) updateTraceLocked(at time.Time) (*transfertrac
 		BulkProbeReceivedDatagrams:     m.bulkProbeReceivedDatagrams,
 		BulkProbeLossPPM:               m.bulkProbeLossPPM,
 		BulkProbePressure:              m.bulkProbePressure,
+		BulkProbeStopReason:            m.bulkProbeStopReason,
+		BulkProbeRejectStage:           m.bulkProbeRejectStage,
+		BulkHandoffDrainedDatagrams:    m.bulkHandoffDrainedDatagrams,
+		BulkHandoffDrainDurationMS:     m.bulkHandoffDrainDurationMS,
+		BulkDecisionMode:               m.bulkDecisionMode,
+		BulkDecisionReason:             m.bulkDecisionReason,
+		BulkDecisionRunID:              m.bulkDecisionRunID,
 		LocalENOBUFSRetries:            m.localENOBUFSRetries,
 		LocalENOBUFSWaitUS:             m.localENOBUFSWaitUS,
 		LocalENOBUFSMaxConsecutive:     m.localENOBUFSMaxConsecutive,
@@ -1118,7 +1182,19 @@ func (m *externalTransferMetrics) setDirectDiagnosticsLocked(diagnostics externa
 	m.setDirectLaneDiagnosticsLocked(diagnostics)
 	m.setDirectControllerDiagnosticsLocked(diagnostics)
 	m.setDirectCounterDiagnosticsLocked(diagnostics)
+	m.setBulkPacketFallbackDiagnosticsLocked(diagnostics)
 	m.setBulkBatchDiagnosticsLocked(diagnostics)
+}
+
+func (m *externalTransferMetrics) setBulkPacketFallbackDiagnosticsLocked(diagnostics externalDirectTransferDiagnostics) {
+	if m.bulkProbeRejectStage == "" && diagnostics.BulkProbeRejectStage != "" {
+		m.bulkProbeRejectStage = diagnostics.BulkProbeRejectStage
+		m.bulkProbeRejectTrain = diagnostics.BulkProbeRejectTrain
+		m.bulkProbeRejectRateMbps = diagnostics.BulkProbeRejectRateMbps
+	}
+	m.bulkHandoffLanes = max(m.bulkHandoffLanes, diagnostics.BulkHandoffLanes)
+	m.bulkHandoffDrainedDatagrams = max(m.bulkHandoffDrainedDatagrams, diagnostics.BulkHandoffDrainedDatagrams)
+	m.bulkHandoffDrainDurationMS = max(m.bulkHandoffDrainDurationMS, diagnostics.BulkHandoffDrainDurationMS)
 }
 
 func (m *externalTransferMetrics) setBulkBatchDiagnosticsLocked(diagnostics externalDirectTransferDiagnostics) {
@@ -1162,6 +1238,9 @@ func (m *externalTransferMetrics) setBulkBatchDiagnosticsLocked(diagnostics exte
 	m.bulkProbeReceivedDatagrams = max(m.bulkProbeReceivedDatagrams, diagnostics.BulkProbeReceivedDatagrams)
 	m.bulkProbeLossPPM = max(m.bulkProbeLossPPM, diagnostics.BulkProbeLossPPM)
 	m.bulkProbePressure = m.bulkProbePressure || diagnostics.BulkProbePressure
+	if m.bulkProbeStopReason == "" && diagnostics.BulkProbeStopReason != "" {
+		m.bulkProbeStopReason = diagnostics.BulkProbeStopReason
+	}
 }
 
 func (m *externalTransferMetrics) setDirectRateDiagnosticsLocked(diagnostics externalDirectTransferDiagnostics) {

@@ -32,6 +32,7 @@ const (
 	externalV2BulkPacketPayloadSize      = 1358
 	externalV2BulkPacketMaxSize          = 1400
 	externalV2BulkPacketHeaderSize       = 26
+	externalV2BulkPacketHelloWait        = 2 * time.Second
 	externalV2BulkPacketRepairWait       = 30 * time.Second
 	externalV2BulkPacketReadIdle         = 100 * time.Millisecond
 	externalV2BulkPacketRepairSkip       = 250 * time.Millisecond
@@ -63,8 +64,6 @@ const (
 	externalV2BulkPacketDone            byte = 3
 	externalV2BulkPacketHello           byte = 4
 	externalV2BulkPacketProbeData       byte = 5
-	externalV2BulkPacketProbeEnd        byte = 6
-	externalV2BulkPacketProbeAck        byte = 7
 	externalV2BulkPacketAck             byte = 8
 	externalV2BulkPacketPrimaryComplete byte = 9
 	externalV2BulkPacketProbeTaggedData byte = 11
@@ -257,11 +256,57 @@ func externalV2BulkPacketDerivedKey(tok token.Token, senderDERP key.NodePublic, 
 	return mac.Sum(nil)
 }
 
-func sendExternalV2BulkBlockPackets(ctx context.Context, src *BlockSource, path externalV2BulkPacketPath, auth externalV2BulkPacketAuth, metrics *externalTransferMetrics) (externalDirectTransferStats, error) {
-	return sendExternalV2BulkBlockPacketsWithProbe(ctx, src, path, auth, metrics, true)
+type externalV2BulkPacketTransferOptions struct {
+	CapacityProbe bool
+	Decision      *externalV2BulkDecisionCoordinator
 }
 
-func sendExternalV2BulkBlockPacketsWithProbe(ctx context.Context, src *BlockSource, path externalV2BulkPacketPath, auth externalV2BulkPacketAuth, metrics *externalTransferMetrics, capacityProbe bool) (externalDirectTransferStats, error) {
+func (o externalV2BulkPacketTransferOptions) validate() error {
+	if o.CapacityProbe && o.Decision == nil {
+		return errors.New("bulk capacity probe requires decision coordinator")
+	}
+	return nil
+}
+
+type externalV2BulkPacketDecisionContext struct {
+	context.Context
+	caller context.Context
+}
+
+func (c externalV2BulkPacketDecisionContext) Deadline() (time.Time, bool) {
+	decisionDeadline, decisionOK := c.Context.Deadline()
+	callerDeadline, callerOK := c.caller.Deadline()
+	if !decisionOK || callerOK && callerDeadline.Before(decisionDeadline) {
+		return callerDeadline, callerOK
+	}
+	return decisionDeadline, true
+}
+
+func (c externalV2BulkPacketDecisionContext) Value(key any) any {
+	return c.caller.Value(key)
+}
+
+func externalV2BulkPacketContext(ctx context.Context, options externalV2BulkPacketTransferOptions) (context.Context, context.CancelCauseFunc, func() bool) {
+	if !options.CapacityProbe {
+		return ctx, func(error) {}, func() bool { return false }
+	}
+	parent := externalV2BulkPacketDecisionContext{Context: options.Decision.Context(), caller: ctx}
+	linkedCtx, cancel := context.WithCancelCause(parent)
+	stop := context.AfterFunc(ctx, func() {
+		cancel(context.Cause(ctx))
+	})
+	return linkedCtx, cancel, stop
+}
+
+func sendExternalV2BulkBlockPackets(ctx context.Context, src *BlockSource, path externalV2BulkPacketPath, auth externalV2BulkPacketAuth, metrics *externalTransferMetrics, options externalV2BulkPacketTransferOptions) (externalDirectTransferStats, error) {
+	if err := options.validate(); err != nil {
+		return externalDirectTransferStats{}, err
+	}
+	ctx, cancelTransfer, stopCallerLink := externalV2BulkPacketContext(ctx, options)
+	defer func() {
+		stopCallerLink()
+		cancelTransfer(context.Canceled)
+	}()
 	if err := validateExternalV2BulkPacketSender(src, path, auth); err != nil {
 		return externalDirectTransferStats{}, err
 	}
@@ -276,29 +321,25 @@ func sendExternalV2BulkBlockPacketsWithProbe(ctx context.Context, src *BlockSour
 	missingCh := make(chan []uint32, externalV2BulkPacketRepairQueue)
 	doneCh := make(chan struct{}, 1)
 	helloCh := make(chan struct{}, 1)
-	probeAckCh := make(chan externalV2BulkPacketProbeAckFrame, 32)
 	workerErrCh := make(chan error, len(path.Conns)+1)
-	controlDone := startExternalV2BulkPacketControlReaders(sendCtx, path, auth, sender.runID, sender.totalPackets, missingCh, doneCh, helloCh, probeAckCh, workerErrCh, &sender.repairRequests, &sender.receiveAck)
+	controlDone := startExternalV2BulkPacketControlReaders(sendCtx, path, auth, sender.runID, sender.totalPackets, missingCh, doneCh, helloCh, workerErrCh, &sender.repairRequests, &sender.receiveAck)
 	if err := waitExternalV2BulkPacketHello(ctx, helloCh, workerErrCh); err != nil {
-		cancel()
-		deadlineErr := <-writeDeadlineDone
-		<-controlDone
-		cleanupErr := clearExternalV2BulkPacketDeadlines(path)
-		return sender.stats(false), errors.Join(err, deadlineErr, cleanupErr)
+		return cleanupExternalV2BulkPacketSenderBeforePayload(sender, cancel, writeDeadlineDone, controlDone, path, err)
 	}
-	if capacityProbe {
-		probeResult, err := sendExternalV2BulkPacketProbe(sendCtx, sender, probeAckCh)
-		sender.probeResult = probeResult
-		if err != nil {
-			cancel()
-			deadlineErr := <-writeDeadlineDone
-			<-controlDone
-			cleanupErr := clearExternalV2BulkPacketDeadlines(path)
-			return sender.stats(false), errors.Join(err, deadlineErr, cleanupErr)
+	if options.CapacityProbe {
+		decision, probeErr, decisionErr := resolveExternalV2BulkPacketSenderDecision(sendCtx, sender, options.Decision)
+		if decisionErr != nil {
+			return cleanupExternalV2BulkPacketSenderBeforePayload(sender, cancel, writeDeadlineDone, controlDone, path, decisionErr)
 		}
-		for lane := range sender.batchConns {
-			sender.batchConns[lane] = newExternalV2BulkPacketBatchConn(path.Conns[lane])
+		metrics.SetBulkDecision(decision, time.Now())
+		if decision.Mode == externalV2BulkModeQUIC {
+			return cleanupExternalV2BulkPacketSenderForQUICFallback(
+				sender, cancel, writeDeadlineDone, controlDone, path,
+				externalV2BulkPacketSenderFallbackError(probeErr),
+			)
 		}
+		sender.setInitialPaceMbps(decision.SelectedMbps)
+		replaceExternalV2BulkPacketSenderBatchConns(sender, path)
 	}
 	metrics.SelectFilePayloadEngine(transfertrace.FilePayloadEngineBulk, time.Now())
 	if err := enableExternalV2BulkPacketFixedPeers(path, sender.batchConns, sender.laneCount); err != nil {
@@ -328,7 +369,79 @@ func sendExternalV2BulkBlockPacketsWithProbe(ctx context.Context, src *BlockSour
 	<-controlDone
 	disarmExternalV2BulkPacketWriteCancellations(sender.batchConns)
 	cleanupErr := clearExternalV2BulkPacketDeadlines(path)
-	return sender.stats(committed), errors.Join(err, deadlineErr, cleanupErr)
+	return sender.stats(committed), errors.Join(err, deadlineErr, cleanupErr, externalV2BulkPacketContextCause(ctx))
+}
+
+func resolveExternalV2BulkPacketSenderDecision(
+	ctx context.Context,
+	sender *externalV2BulkPacketSender,
+	coordinator *externalV2BulkDecisionCoordinator,
+) (decision externalV2BulkDecision, probeErr, err error) {
+	probeResult, probeErr := sendExternalV2BulkPacketProbe(ctx, sender, coordinator)
+	sender.probeResult = probeResult
+	if externalV2BulkPacketProbeTestOutcomeInvalid(probeErr) {
+		return decision, probeErr, probeErr
+	}
+	if probeFailure := externalV2BulkPacketProbeDecisionFailure(probeErr, false); probeFailure != nil {
+		return decision, probeErr, probeFailure
+	}
+	decision, err = coordinator.ResolveSender(ctx, sender.runID, probeResult, probeErr)
+	return decision, probeErr, err
+}
+
+func externalV2BulkPacketSenderFallbackError(probeErr error) error {
+	if errors.Is(probeErr, errExternalV2BulkPacketProbeForcedSenderReject) {
+		return errors.Join(errExternalV2BulkPacketProbeRejected, errExternalV2BulkPacketProbeForcedSenderReject)
+	}
+	return errExternalV2BulkPacketProbeRejected
+}
+
+func replaceExternalV2BulkPacketSenderBatchConns(sender *externalV2BulkPacketSender, path externalV2BulkPacketPath) {
+	disarmExternalV2BulkPacketWriteCancellations(sender.batchConns)
+	for lane := range sender.batchConns {
+		sender.batchConns[lane] = newExternalV2BulkPacketBatchConn(path.Conns[lane])
+	}
+}
+
+func cleanupExternalV2BulkPacketSenderBeforePayload(
+	sender *externalV2BulkPacketSender,
+	cancel context.CancelFunc,
+	writeDeadlineDone <-chan error,
+	controlDone <-chan struct{},
+	path externalV2BulkPacketPath,
+	cause error,
+) (externalDirectTransferStats, error) {
+	disarmExternalV2BulkPacketWriteCancellations(sender.batchConns)
+	cancel()
+	deadlineErr := <-writeDeadlineDone
+	<-controlDone
+	cleanupErr := clearExternalV2BulkPacketDeadlines(path)
+	return sender.stats(false), errors.Join(cause, deadlineErr, cleanupErr)
+}
+
+func cleanupExternalV2BulkPacketSenderForQUICFallback(
+	sender *externalV2BulkPacketSender,
+	cancel context.CancelFunc,
+	writeDeadlineDone <-chan error,
+	controlDone <-chan struct{},
+	path externalV2BulkPacketPath,
+	cause error,
+) (externalDirectTransferStats, error) {
+	disarmExternalV2BulkPacketWriteCancellations(sender.batchConns)
+	cancel()
+	deadlineErr := <-writeDeadlineDone
+	<-controlDone
+	drain, drainErr := externalV2BulkPacketDrainForHandoff(sender.ctx, path)
+	sender.probeResult.HandoffDrain = drain
+	return sender.stats(false), errors.Join(cause, deadlineErr, drainErr)
+}
+
+func externalV2BulkPacketContextCause(ctx context.Context) error {
+	cause := context.Cause(ctx)
+	if cause == nil || errors.Is(cause, context.Canceled) {
+		return nil
+	}
+	return cause
 }
 
 func validateExternalV2BulkPacketSender(src *BlockSource, path externalV2BulkPacketPath, auth externalV2BulkPacketAuth) error {
@@ -820,11 +933,15 @@ func signalExternalV2BulkPacketRepairActivity(ch chan<- struct{}) {
 	}
 }
 
-func receiveExternalV2BulkBlockPackets(ctx context.Context, sink BlockReceiveSink, cfg externalV2BlockReceiveConfig, path externalV2BulkPacketPath, auth externalV2BulkPacketAuth, metrics *externalTransferMetrics) (int64, externalDirectTransferStats, error) {
-	return receiveExternalV2BulkBlockPacketsWithProbe(ctx, sink, cfg, path, auth, metrics, true)
-}
-
-func receiveExternalV2BulkBlockPacketsWithProbe(ctx context.Context, sink BlockReceiveSink, cfg externalV2BlockReceiveConfig, path externalV2BulkPacketPath, auth externalV2BulkPacketAuth, metrics *externalTransferMetrics, capacityProbe bool) (int64, externalDirectTransferStats, error) {
+func receiveExternalV2BulkBlockPackets(ctx context.Context, sink BlockReceiveSink, cfg externalV2BlockReceiveConfig, path externalV2BulkPacketPath, auth externalV2BulkPacketAuth, metrics *externalTransferMetrics, options externalV2BulkPacketTransferOptions) (int64, externalDirectTransferStats, error) {
+	if err := options.validate(); err != nil {
+		return 0, externalDirectTransferStats{}, err
+	}
+	ctx, cancelTransfer, stopCallerLink := externalV2BulkPacketContext(ctx, options)
+	defer func() {
+		stopCallerLink()
+		cancelTransfer(context.Canceled)
+	}()
 	if err := validateExternalV2BulkPacketReceiver(sink, cfg, path, auth); err != nil {
 		return 0, externalDirectTransferStats{}, err
 	}
@@ -838,16 +955,10 @@ func receiveExternalV2BulkBlockPacketsWithProbe(ctx context.Context, sink BlockR
 
 	receiver.stopHello = startExternalV2BulkPacketHelloLoop(recvCtx, path, auth, receiver.totalPackets)
 	defer receiver.stopHello()
-	if capacityProbe {
-		probeResult, probeErr := receiveExternalV2BulkPacketProbe(recvCtx, path, auth, receiver.totalPackets)
-		receiver.probeResult = probeResult
-		if probeErr != nil {
-			return receiver.result(probeErr)
+	if options.CapacityProbe {
+		if err := receiver.resolveCapacityProbe(recvCtx, options.Decision); err != nil {
+			return receiver.result(err)
 		}
-		if receiver.grouped && !receiver.groupAssembler.setExpectedRunID(probeResult.RunID) {
-			return receiver.result(errors.New("bulk packet grouped probe did not authenticate a run ID"))
-		}
-		metrics.SelectFilePayloadEngine(transfertrace.FilePayloadEngineBulk, time.Now())
 	}
 
 	dataCh := make(chan externalV2BulkPacketReceiveBatch, externalV2BulkPacketReceiveBatchQueue)
@@ -868,6 +979,32 @@ func receiveExternalV2BulkBlockPacketsWithProbe(ctx context.Context, sink BlockR
 	return runExternalV2BulkPacketReceiver(ctx, receiver, cancel, dataReadersDone, dataCh, errCh)
 }
 
+func (r *externalV2BulkPacketReceiver) resolveCapacityProbe(ctx context.Context, coordinator *externalV2BulkDecisionCoordinator) error {
+	probeResult, decision, probeCleanupErr, decisionErr := coordinator.ResolveReceiver(ctx, func(probeCtx context.Context) (externalV2BulkPacketProbeResult, error) {
+		return receiveExternalV2BulkPacketProbe(probeCtx, r.path, r.auth, r.totalPackets, coordinator)
+	})
+	r.probeResult = probeResult
+	if decisionErr != nil {
+		return errors.Join(decisionErr, probeCleanupErr)
+	}
+	r.metrics.SetBulkDecision(decision, time.Now())
+	if decision.Mode == externalV2BulkModeQUIC {
+		if probeCleanupErr != nil {
+			return errors.Join(errExternalV2BulkPacketProbeRejected, probeCleanupErr)
+		}
+		return errExternalV2BulkPacketProbeRejected
+	}
+	if probeCleanupErr != nil {
+		return probeCleanupErr
+	}
+	r.probeResult.SelectedMbps = decision.SelectedMbps
+	if r.grouped && !r.groupAssembler.setExpectedRunID(decision.ProbeRunID) {
+		return errors.New("bulk packet grouped decision did not authenticate a run ID")
+	}
+	r.metrics.SelectFilePayloadEngine(transfertrace.FilePayloadEngineBulk, time.Now())
+	return nil
+}
+
 func runExternalV2BulkPacketReceiver(ctx context.Context, receiver *externalV2BulkPacketReceiver, cancel context.CancelFunc, dataReadersDone <-chan struct{}, dataCh <-chan externalV2BulkPacketReceiveBatch, errCh <-chan error) (int64, externalDirectTransferStats, error) {
 	received, stats, err := receiver.runBatched(ctx, dataCh, errCh)
 	cancel()
@@ -877,7 +1014,7 @@ func runExternalV2BulkPacketReceiver(ctx context.Context, receiver *externalV2Bu
 		case batch := <-dataCh:
 			batch.release()
 		default:
-			return received, stats, err
+			return received, stats, errors.Join(err, externalV2BulkPacketContextCause(ctx))
 		}
 	}
 }
@@ -1603,14 +1740,14 @@ func (a *externalV2BulkPacketReceiveAssembler) newGroup(groupID uint32) *externa
 	}
 }
 
-func startExternalV2BulkPacketControlReaders(ctx context.Context, path externalV2BulkPacketPath, auth externalV2BulkPacketAuth, runID uint64, totalPackets uint32, missingCh chan<- []uint32, doneCh chan<- struct{}, helloCh chan<- struct{}, probeAckCh chan<- externalV2BulkPacketProbeAckFrame, errCh chan<- error, repairRequests *atomic.Int64, receiveAck *externalV2BulkPacketReceiveAck) <-chan struct{} {
+func startExternalV2BulkPacketControlReaders(ctx context.Context, path externalV2BulkPacketPath, auth externalV2BulkPacketAuth, runID uint64, totalPackets uint32, missingCh chan<- []uint32, doneCh chan<- struct{}, helloCh chan<- struct{}, errCh chan<- error, repairRequests *atomic.Int64, receiveAck *externalV2BulkPacketReceiveAck) <-chan struct{} {
 	done := make(chan struct{})
 	var readers sync.WaitGroup
 	readers.Add(len(path.Conns))
 	for _, conn := range path.Conns {
 		go func(conn net.PacketConn) {
 			defer readers.Done()
-			readExternalV2BulkPacketControlLoop(ctx, conn, auth, runID, totalPackets, missingCh, doneCh, helloCh, probeAckCh, errCh, repairRequests, receiveAck)
+			readExternalV2BulkPacketControlLoop(ctx, conn, auth, runID, totalPackets, missingCh, doneCh, helloCh, errCh, repairRequests, receiveAck)
 		}(conn)
 	}
 	go func() {
@@ -1626,7 +1763,7 @@ type externalV2BulkPacketReader struct {
 	nonceScratch  [externalV2BulkPacketMaximumNonceSize]byte
 }
 
-func readExternalV2BulkPacketControlLoop(ctx context.Context, conn net.PacketConn, auth externalV2BulkPacketAuth, runID uint64, totalPackets uint32, missingCh chan<- []uint32, doneCh chan<- struct{}, helloCh chan<- struct{}, probeAckCh chan<- externalV2BulkPacketProbeAckFrame, errCh chan<- error, repairRequests *atomic.Int64, receiveAck *externalV2BulkPacketReceiveAck) {
+func readExternalV2BulkPacketControlLoop(ctx context.Context, conn net.PacketConn, auth externalV2BulkPacketAuth, runID uint64, totalPackets uint32, missingCh chan<- []uint32, doneCh chan<- struct{}, helloCh chan<- struct{}, errCh chan<- error, repairRequests *atomic.Int64, receiveAck *externalV2BulkPacketReceiveAck) {
 	buf := make([]byte, externalV2BulkPacketMaxSize)
 	reader := externalV2BulkPacketReader{conn: conn}
 	for {
@@ -1637,7 +1774,7 @@ func readExternalV2BulkPacketControlLoop(ctx context.Context, conn net.PacketCon
 		if !ok {
 			continue
 		}
-		if handleExternalV2BulkPacketControl(header, payload, runID, totalPackets, missingCh, doneCh, helloCh, probeAckCh, repairRequests, receiveAck) {
+		if handleExternalV2BulkPacketControl(header, payload, runID, totalPackets, missingCh, doneCh, helloCh, repairRequests, receiveAck) {
 			return
 		}
 	}
@@ -1652,7 +1789,7 @@ func readExternalV2BulkPacketControl(ctx context.Context, reader *externalV2Bulk
 	return header, payload, opened, false
 }
 
-func handleExternalV2BulkPacketControl(header externalV2BulkPacketHeader, payload []byte, runID uint64, totalPackets uint32, missingCh chan<- []uint32, doneCh chan<- struct{}, helloCh chan<- struct{}, probeAckCh chan<- externalV2BulkPacketProbeAckFrame, repairRequests *atomic.Int64, receiveAck *externalV2BulkPacketReceiveAck) bool {
+func handleExternalV2BulkPacketControl(header externalV2BulkPacketHeader, payload []byte, runID uint64, totalPackets uint32, missingCh chan<- []uint32, doneCh chan<- struct{}, helloCh chan<- struct{}, repairRequests *atomic.Int64, receiveAck *externalV2BulkPacketReceiveAck) bool {
 	switch header.kind {
 	case externalV2BulkPacketHello:
 		handleExternalV2BulkPacketHello(header, totalPackets, helloCh)
@@ -1660,15 +1797,6 @@ func handleExternalV2BulkPacketControl(header externalV2BulkPacketHeader, payloa
 		handleExternalV2BulkPacketMissing(header, payload, runID, missingCh, repairRequests)
 	case externalV2BulkPacketDone:
 		return handleExternalV2BulkPacketDone(header, runID, doneCh)
-	case externalV2BulkPacketProbeAck:
-		if header.runID == runID && header.total == totalPackets {
-			if prefix, ok := decodeExternalV2BulkPacketProbePrefix(payload); ok {
-				select {
-				case probeAckCh <- externalV2BulkPacketProbeAckFrame{header: header, prefix: prefix}:
-				default:
-				}
-			}
-		}
 	case externalV2BulkPacketAck:
 		if header.runID == runID && header.total == totalPackets {
 			if bytes, window, ok := decodeExternalV2BulkPacketAck(payload); ok {
@@ -1712,7 +1840,11 @@ func handleExternalV2BulkPacketDone(header externalV2BulkPacketHeader, runID uin
 }
 
 func waitExternalV2BulkPacketHello(ctx context.Context, helloCh <-chan struct{}, errCh <-chan error) error {
-	timer := time.NewTimer(externalV2StreamOpenWait)
+	return waitExternalV2BulkPacketHelloWithin(ctx, helloCh, errCh, externalV2BulkPacketHelloWait)
+}
+
+func waitExternalV2BulkPacketHelloWithin(ctx context.Context, helloCh <-chan struct{}, errCh <-chan error, wait time.Duration) error {
+	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
 	case <-helloCh:

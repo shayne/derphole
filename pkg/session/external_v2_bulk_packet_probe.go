@@ -12,30 +12,41 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/shayne/derphole/pkg/telemetry"
 	"golang.org/x/time/rate"
 )
 
-var errExternalV2BulkPacketProbeRejected = errors.New("bulk packet capacity probe rejected")
+var (
+	errExternalV2BulkPacketProbeRejected           = errors.New("bulk packet capacity probe rejected")
+	errExternalV2BulkPacketProbeForcedSenderReject = errors.New("bulk packet sender probe rejected by test outcome")
+)
 
-var externalV2BulkPacketProbeRatesMbps = [...]int{128, 512, 1000, 1600, 2000, 2200, 2400}
+var externalV2BulkPacketProbeRatesMbps = []int{128, 512, 1000, 1600, 2000, 2200, 2400}
 
-var externalV2BulkPacketProbeSelector = selectExternalV2BulkPacketProbe
+var externalV2BulkPacketSenderProbeSelector = selectExternalV2BulkPacketProbe
+var externalV2BulkPacketReceiverProbeSelector = selectExternalV2BulkPacketProbe
 
 const (
+	externalV2BulkPacketProbeTestOutcomeEnv          = "DERPHOLE_TEST_BULK_PROBE_OUTCOME"
+	externalV2BulkPacketProbeTestOutcomeSenderReject = "sender-reject"
+	externalV2BulkPacketProbeDirtyRateEnv            = "DERPHOLE_TEST_BULK_PROBE_DIRTY_RATE_MBPS"
+
 	externalV2BulkPacketProbeDuration    = 50 * time.Millisecond
 	externalV2BulkPacketProbeMaxBytes    = 16 << 20
-	externalV2BulkPacketProbeAckTimeout  = 250 * time.Millisecond
 	externalV2BulkPacketProbeSettle      = 10 * time.Millisecond
-	externalV2BulkPacketProbeEndRepeats  = 3
-	externalV2BulkPacketProbeAckRepeats  = 3
 	externalV2BulkPacketProbePrefixSize  = 16
-	externalV2BulkPacketProbePressure    = uint16(1)
 	externalV2BulkPacketProbeTagSize     = 16
 	externalV2BulkPacketProbeSeedPercent = 90
+
+	externalV2BulkPacketProbeStopDirty          = "dirty"
+	externalV2BulkPacketProbeStopPressure       = "pressure"
+	externalV2BulkPacketProbeStopLadderComplete = "ladder-complete"
 )
 
 type externalV2BulkPacketProbeTrainResult struct {
@@ -46,10 +57,109 @@ type externalV2BulkPacketProbeTrainResult struct {
 }
 
 type externalV2BulkPacketProbeResult struct {
-	RunID        uint64
-	SelectedMbps int
-	Duration     time.Duration
-	Trains       []externalV2BulkPacketProbeTrainResult
+	RunID          uint64
+	SelectedMbps   int
+	Duration       time.Duration
+	Trains         []externalV2BulkPacketProbeTrainResult
+	StopReason     string
+	RejectStage    string
+	RejectTrain    int
+	RejectRateMbps int
+	HandoffDrain   externalV2BulkPacketHandoffDrainResult
+}
+
+type externalV2BulkPacketProbeRejection struct {
+	Stage    string
+	Train    int
+	RateMbps int
+	cause    error
+}
+
+func (e *externalV2BulkPacketProbeRejection) Error() string {
+	return fmt.Sprintf("bulk packet capacity probe rejected at %s train %d rate %d Mbps: %v", e.Stage, e.Train, e.RateMbps, e.cause)
+}
+
+func (e *externalV2BulkPacketProbeRejection) Unwrap() error { return e.cause }
+
+func (e *externalV2BulkPacketProbeRejection) Is(target error) bool {
+	return target == errExternalV2BulkPacketProbeRejected
+}
+
+func externalV2BulkPacketProbeOrdinaryRejection(err error) bool {
+	if err == errExternalV2BulkPacketProbeRejected {
+		return true
+	}
+	if _, ok := err.(*externalV2BulkPacketProbeRejection); ok {
+		return true
+	}
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		return false
+	}
+	errs := joined.Unwrap()
+	return len(errs) == 2 &&
+		externalV2BulkPacketProbeOrdinaryRejection(errs[0]) &&
+		errs[1] == errExternalV2BulkPacketProbeForcedSenderReject
+}
+
+type externalV2BulkPacketProbeTestOutcomeError struct {
+	value string
+}
+
+func (e *externalV2BulkPacketProbeTestOutcomeError) Error() string {
+	return fmt.Sprintf(
+		"%s must be unset or %q (got %q)",
+		externalV2BulkPacketProbeTestOutcomeEnv,
+		externalV2BulkPacketProbeTestOutcomeSenderReject,
+		e.value,
+	)
+}
+
+type externalV2BulkPacketProbeRole string
+
+const (
+	externalV2BulkPacketProbeSender   externalV2BulkPacketProbeRole = "sender"
+	externalV2BulkPacketProbeReceiver externalV2BulkPacketProbeRole = "receiver"
+)
+
+type externalV2BulkPacketProbeDirtyRateError struct {
+	value string
+	role  externalV2BulkPacketProbeRole
+}
+
+func (e *externalV2BulkPacketProbeDirtyRateError) Error() string {
+	if e.role != externalV2BulkPacketProbeReceiver {
+		return fmt.Sprintf("%s is receiver-only (got role %q)", externalV2BulkPacketProbeDirtyRateEnv, e.role)
+	}
+	return fmt.Sprintf("%s must be unset or one configured probe rate (got %q)", externalV2BulkPacketProbeDirtyRateEnv, e.value)
+}
+
+func parseExternalV2BulkPacketProbeDirtyRate(
+	value string,
+	configured bool,
+	role externalV2BulkPacketProbeRole,
+) (int, bool, error) {
+	if !configured {
+		return 0, false, nil
+	}
+	if role != externalV2BulkPacketProbeReceiver {
+		return 0, false, &externalV2BulkPacketProbeDirtyRateError{value: value, role: role}
+	}
+	rateMbps, err := strconv.Atoi(value)
+	if err != nil || strconv.Itoa(rateMbps) != value {
+		return 0, false, &externalV2BulkPacketProbeDirtyRateError{value: value, role: role}
+	}
+	for _, configuredRate := range externalV2BulkPacketProbeRatesMbps {
+		if rateMbps == configuredRate {
+			return rateMbps, true, nil
+		}
+	}
+	return 0, false, &externalV2BulkPacketProbeDirtyRateError{value: value, role: role}
+}
+
+func externalV2BulkPacketProbeDirtyRate(role externalV2BulkPacketProbeRole) (int, bool, error) {
+	value, configured := os.LookupEnv(externalV2BulkPacketProbeDirtyRateEnv)
+	return parseExternalV2BulkPacketProbeDirtyRate(value, configured, role)
 }
 
 type externalV2BulkPacketProbePrefix struct {
@@ -58,10 +168,6 @@ type externalV2BulkPacketProbePrefix struct {
 	Sequence uint32
 	Expected uint32
 	RateMbps uint32
-}
-
-func (p externalV2BulkPacketProbePrefix) pressure() bool {
-	return p.Flags&externalV2BulkPacketProbePressure != 0
 }
 
 func encodeExternalV2BulkPacketProbePrefix(prefix externalV2BulkPacketProbePrefix) [externalV2BulkPacketProbePrefixSize]byte {
@@ -98,13 +204,17 @@ func externalV2BulkPacketProbeDatagramCount(rateMbps int) uint32 {
 }
 
 func selectExternalV2BulkPacketProbe(trains []externalV2BulkPacketProbeTrainResult) (externalV2BulkPacketProbeResult, error) {
-	result := externalV2BulkPacketProbeResult{Trains: append([]externalV2BulkPacketProbeTrainResult(nil), trains...)}
+	result := externalV2BulkPacketProbeResult{
+		Trains:     append([]externalV2BulkPacketProbeTrainResult(nil), trains...),
+		StopReason: externalV2BulkPacketProbeStopReason(trains),
+	}
 	highestClean := 0
 	for _, train := range trains {
-		if !train.Pressure && train.Sent > 0 && uint64(train.Received)*100 >= uint64(train.Sent)*95 {
+		clean := !train.Pressure && train.Sent > 0 && uint64(train.Received)*100 >= uint64(train.Sent)*95
+		if clean {
 			highestClean = max(highestClean, train.RateMbps)
 		}
-		if train.Pressure {
+		if !clean {
 			break
 		}
 	}
@@ -118,9 +228,106 @@ func selectExternalV2BulkPacketProbe(trains []externalV2BulkPacketProbeTrainResu
 	return result, nil
 }
 
-type externalV2BulkPacketProbeAckFrame struct {
-	header externalV2BulkPacketHeader
-	prefix externalV2BulkPacketProbePrefix
+func externalV2BulkPacketProbeStopReason(trains []externalV2BulkPacketProbeTrainResult) string {
+	if len(trains) == 0 {
+		return ""
+	}
+	last := trains[len(trains)-1]
+	switch {
+	case last.Pressure:
+		return externalV2BulkPacketProbeStopPressure
+	case last.Sent == 0 || uint64(last.Received)*100 < uint64(last.Sent)*95:
+		return externalV2BulkPacketProbeStopDirty
+	case len(trains) == len(externalV2BulkPacketProbeRatesMbps):
+		return externalV2BulkPacketProbeStopLadderComplete
+	default:
+		return ""
+	}
+}
+
+func externalV2BulkPacketProbeHighestCleanMbps(trains []externalV2BulkPacketProbeTrainResult) int {
+	highestClean := 0
+	for _, train := range trains {
+		if train.Pressure || train.Sent == 0 || uint64(train.Received)*100 < uint64(train.Sent)*95 {
+			break
+		}
+		highestClean = max(highestClean, train.RateMbps)
+	}
+	return highestClean
+}
+
+func emitExternalV2BulkPacketProbeDiagnostics(emitter *telemetry.Emitter, result externalV2BulkPacketProbeResult) {
+	for trainIndex, train := range result.Trains {
+		final := result.StopReason != "" && trainIndex == len(result.Trains)-1
+		emitExternalV2Debug(emitter, fmt.Sprintf(
+			"v2-bulk-probe-result=train:%d rate_mbps:%d sent:%d received:%d pressure:%t final:%t",
+			trainIndex, train.RateMbps, train.Sent, train.Received, train.Pressure, final,
+		))
+	}
+	emitExternalV2Debug(emitter, fmt.Sprintf(
+		"v2-bulk-probe-selected=selected_mbps:%d highest_clean_mbps:%d trains:%d",
+		result.SelectedMbps, externalV2BulkPacketProbeHighestCleanMbps(result.Trains), len(result.Trains),
+	))
+}
+
+func selectExternalV2BulkPacketSenderProbe(trains []externalV2BulkPacketProbeTrainResult) (externalV2BulkPacketProbeResult, error) {
+	result, err := externalV2BulkPacketSenderProbeSelector(trains)
+	if err == errExternalV2BulkPacketProbeRejected {
+		rejectTrain := len(result.Trains) - 1
+		rejectRateMbps := 0
+		if rejectTrain >= 0 {
+			rejectRateMbps = result.Trains[rejectTrain].RateMbps
+		}
+		result.RejectStage = "selector"
+		result.RejectTrain = rejectTrain
+		result.RejectRateMbps = rejectRateMbps
+		err = &externalV2BulkPacketProbeRejection{
+			Stage: "selector", Train: rejectTrain, RateMbps: rejectRateMbps, cause: err,
+		}
+	}
+	return finalizeExternalV2BulkPacketSenderProbe(result, err)
+}
+
+func finalizeExternalV2BulkPacketSenderProbe(
+	result externalV2BulkPacketProbeResult,
+	selectionErr error,
+) (externalV2BulkPacketProbeResult, error) {
+	if selectionErr != nil && !externalV2BulkPacketProbeOrdinaryRejection(selectionErr) {
+		return result, selectionErr
+	}
+	value, configured := os.LookupEnv(externalV2BulkPacketProbeTestOutcomeEnv)
+	return applyExternalV2BulkPacketSenderProbeTestOutcome(result, selectionErr, value, configured)
+}
+
+func applyExternalV2BulkPacketSenderProbeTestOutcome(
+	result externalV2BulkPacketProbeResult,
+	selectionErr error,
+	value string,
+	configured bool,
+) (externalV2BulkPacketProbeResult, error) {
+	if !configured {
+		return result, selectionErr
+	}
+	if selectionErr != nil && !externalV2BulkPacketProbeOrdinaryRejection(selectionErr) {
+		return result, selectionErr
+	}
+	if value != externalV2BulkPacketProbeTestOutcomeSenderReject {
+		return result, &externalV2BulkPacketProbeTestOutcomeError{value: value}
+	}
+	result.SelectedMbps = 0
+	return result, errors.Join(errExternalV2BulkPacketProbeRejected, errExternalV2BulkPacketProbeForcedSenderReject)
+}
+
+func externalV2BulkPacketProbeTestOutcomeInvalid(err error) bool {
+	var outcomeErr *externalV2BulkPacketProbeTestOutcomeError
+	return errors.As(err, &outcomeErr)
+}
+
+func externalV2BulkPacketProbeTestOutcome(err error) string {
+	if errors.Is(err, errExternalV2BulkPacketProbeForcedSenderReject) {
+		return externalV2BulkPacketProbeTestOutcomeSenderReject
+	}
+	return ""
 }
 
 type externalV2BulkPacketProbeEvent struct {
@@ -147,6 +354,15 @@ func setExternalV2BulkPacketProbeDiagnostics(diagnostics *externalDirectTransfer
 	if diagnostics == nil {
 		return
 	}
+	diagnostics.BulkProbeRejectStage = result.RejectStage
+	diagnostics.BulkProbeRejectTrain = result.RejectTrain
+	diagnostics.BulkProbeRejectRateMbps = result.RejectRateMbps
+	diagnostics.BulkProbeStopReason = result.StopReason
+	diagnostics.BulkHandoffLanes = result.HandoffDrain.Lanes
+	diagnostics.BulkHandoffDrainedDatagrams = result.HandoffDrain.Datagrams
+	if result.HandoffDrain.Duration > 0 {
+		diagnostics.BulkHandoffDrainDurationMS = max(int64(1), result.HandoffDrain.Duration.Milliseconds())
+	}
 	diagnostics.BulkProbeSelectedMbps = result.SelectedMbps
 	diagnostics.BulkProbeDurationMS = result.Duration.Milliseconds()
 	diagnostics.BulkProbeTrains = uint32(len(result.Trains))
@@ -161,9 +377,14 @@ func setExternalV2BulkPacketProbeDiagnostics(diagnostics *externalDirectTransfer
 func sendExternalV2BulkPacketProbe(
 	ctx context.Context,
 	sender *externalV2BulkPacketSender,
-	ackCh <-chan externalV2BulkPacketProbeAckFrame,
+	coordinator *externalV2BulkDecisionCoordinator,
 ) (externalV2BulkPacketProbeResult, error) {
 	started := time.Now()
+	result := externalV2BulkPacketProbeResult{RunID: sender.runID}
+	if _, _, err := externalV2BulkPacketProbeDirtyRate(externalV2BulkPacketProbeSender); err != nil {
+		result.Duration = time.Since(started)
+		return result, err
+	}
 	trains := make([]externalV2BulkPacketProbeTrainResult, 0, len(externalV2BulkPacketProbeRatesMbps))
 	nextPacketIndex := uint32(1)
 	for trainIndex, rateMbps := range externalV2BulkPacketProbeRatesMbps {
@@ -171,22 +392,37 @@ func sendExternalV2BulkPacketProbe(
 		train, nextIndex, err := sender.sendExternalV2BulkPacketProbeTrain(ctx, uint16(trainIndex), rateMbps, expected, nextPacketIndex)
 		nextPacketIndex = nextIndex
 		if err != nil {
-			return externalV2BulkPacketProbeResult{Duration: time.Since(started), Trains: trains}, errors.Join(errExternalV2BulkPacketProbeRejected, err)
+			result.Duration = time.Since(started)
+			result.Trains = append(result.Trains, trains...)
+			return result, err
 		}
-		ack, err := waitExternalV2BulkPacketProbeAck(ctx, ackCh, sender.runID, uint16(trainIndex), rateMbps)
+		end := externalV2BulkControl{
+			Protocol: externalV2Protocol, Phase: externalV2BulkPhaseProbeEnd,
+			ProbeRunID: sender.runID, Mode: externalV2BulkModeBulk,
+			Probe: &externalV2BulkProbeControl{
+				Train: trainIndex, RateMbps: rateMbps, Sent: train.Sent,
+				Pressure: train.Pressure,
+				Final:    train.Pressure || trainIndex == len(externalV2BulkPacketProbeRatesMbps)-1,
+			},
+		}
+		measured, err := coordinator.sendProbeEndAndWaitResult(ctx, end)
 		if err != nil {
-			return externalV2BulkPacketProbeResult{Duration: time.Since(started), Trains: trains}, errors.Join(errExternalV2BulkPacketProbeRejected, err)
+			result.Duration = time.Since(started)
+			result.Trains = append(result.Trains, trains...)
+			return result, err
 		}
-		train.Received = ack.prefix.Sequence
-		train.Pressure = train.Pressure || ack.prefix.pressure()
+		train.Received = measured.Probe.Received
+		train.Pressure = measured.Probe.Pressure
 		trains = append(trains, train)
-		if train.Pressure {
+		if measured.Probe.Final {
 			break
 		}
 	}
-	result, err := externalV2BulkPacketProbeSelector(trains)
+	selected, err := selectExternalV2BulkPacketSenderProbe(trains)
+	result = selected
 	result.RunID = sender.runID
 	result.Duration = time.Since(started)
+	emitExternalV2BulkPacketProbeDiagnostics(coordinator.emitter, result)
 	if err == nil {
 		sender.setInitialPaceMbps(result.SelectedMbps)
 	}
@@ -247,21 +483,6 @@ func (s *externalV2BulkPacketSender) sendExternalV2BulkPacketProbeTrain(
 			return result, nextIndex, err
 		}
 	}
-	flags := uint16(0)
-	if result.Pressure {
-		flags = externalV2BulkPacketProbePressure
-	}
-	for repeat := range externalV2BulkPacketProbeEndRepeats {
-		prefix := encodeExternalV2BulkPacketProbePrefix(externalV2BulkPacketProbePrefix{
-			Train: train, Flags: flags, Sequence: uint32(repeat), Expected: result.Sent, RateMbps: uint32(rateMbps),
-		})
-		if err := writeExternalV2BulkPacketControl(s.path, s.auth, externalV2BulkPacketHeader{
-			kind: externalV2BulkPacketProbeEnd, runID: s.runID, index: nextIndex, total: s.totalPackets,
-		}, prefix[:]); err != nil {
-			return result, nextIndex, err
-		}
-		nextIndex++
-	}
 	return result, nextIndex, nil
 }
 
@@ -282,139 +503,359 @@ func writeExternalV2BulkPacketProbeBatch(ctx context.Context, conn externalV2Bul
 	return nil
 }
 
-func waitExternalV2BulkPacketProbeAck(ctx context.Context, ackCh <-chan externalV2BulkPacketProbeAckFrame, runID uint64, train uint16, rateMbps int) (externalV2BulkPacketProbeAckFrame, error) {
-	timer := time.NewTimer(externalV2BulkPacketProbeAckTimeout)
-	defer timer.Stop()
-	for {
-		select {
-		case ack := <-ackCh:
-			if ack.header.runID == runID && ack.prefix.Train == train && ack.prefix.RateMbps == uint32(rateMbps) {
-				return ack, nil
-			}
-		case <-timer.C:
-			return externalV2BulkPacketProbeAckFrame{}, errors.New("bulk packet capacity probe acknowledgement timed out")
-		case <-ctx.Done():
-			return externalV2BulkPacketProbeAckFrame{}, ctx.Err()
-		}
-	}
-}
-
 func receiveExternalV2BulkPacketProbe(
 	ctx context.Context,
 	path externalV2BulkPacketPath,
 	auth externalV2BulkPacketAuth,
 	totalPackets uint32,
+	coordinator *externalV2BulkDecisionCoordinator,
+) (externalV2BulkPacketProbeResult, error) {
+	return receiveExternalV2BulkPacketProbeWithRunObserver(ctx, path, auth, totalPackets, coordinator, nil)
+}
+
+func receiveExternalV2BulkPacketProbeWithRunObserver(
+	ctx context.Context,
+	path externalV2BulkPacketPath,
+	auth externalV2BulkPacketAuth,
+	totalPackets uint32,
+	coordinator *externalV2BulkDecisionCoordinator,
+	observeRunID func(uint64),
 ) (externalV2BulkPacketProbeResult, error) {
 	started := time.Now()
+	dirtyRateMbps, dirtyRateConfigured, err := externalV2BulkPacketProbeDirtyRate(externalV2BulkPacketProbeReceiver)
+	if err != nil {
+		return externalV2BulkPacketProbeResult{Duration: time.Since(started)}, err
+	}
+	if dirtyRateConfigured {
+		emitExternalV2Debug(coordinator.emitter, fmt.Sprintf("v2-bulk-probe-test-dirty-rate-mbps=%d", dirtyRateMbps))
+	}
 	probeCtx, cancel := context.WithCancel(ctx)
 	events := make(chan externalV2BulkPacketProbeEvent, externalV2BulkPacketDataQueue)
 	errCh := make(chan error, len(path.Conns))
 	done := startExternalV2BulkPacketProbeReaders(probeCtx, path, auth, totalPackets, events, errCh)
-	trains := make([]externalV2BulkPacketProbeTrainResult, 0, len(externalV2BulkPacketProbeRatesMbps))
-	var probeRunID uint64
-	var ackIndex uint32 = 1
-	var finalPrefix externalV2BulkPacketProbePrefix
-	for trainIndex, rateMbps := range externalV2BulkPacketProbeRatesMbps {
-		train, runID, err := receiveExternalV2BulkPacketProbeTrain(probeCtx, events, errCh, uint16(trainIndex), rateMbps, probeRunID)
-		if err != nil {
-			cancel()
-			_ = interruptExternalV2BulkPacketReads(path, time.Now())
-			<-done
-			_ = clearExternalV2BulkPacketDeadlines(path)
-			return externalV2BulkPacketProbeResult{Duration: time.Since(started), Trains: trains}, errors.Join(errExternalV2BulkPacketProbeRejected, err)
-		}
-		probeRunID = runID
-		trains = append(trains, train)
-		finalPrefix = externalV2BulkPacketProbePrefix{
-			Train: uint16(trainIndex), Sequence: train.Received, Expected: train.Sent, RateMbps: uint32(rateMbps),
-		}
-		if train.Pressure {
-			finalPrefix.Flags = externalV2BulkPacketProbePressure
-		}
-		final := train.Pressure || trainIndex == len(externalV2BulkPacketProbeRatesMbps)-1
-		if !final {
-			if err := sendExternalV2BulkPacketProbeAck(path, auth, probeRunID, totalPackets, &ackIndex, finalPrefix); err != nil {
-				cancel()
-				_ = interruptExternalV2BulkPacketReads(path, time.Now())
-				<-done
-				_ = clearExternalV2BulkPacketDeadlines(path)
-				return externalV2BulkPacketProbeResult{Duration: time.Since(started), Trains: trains}, err
-			}
-			continue
-		}
-		break
+	trains, probeRunID, probeErr := receiveExternalV2BulkPacketProbeTrains(
+		probeCtx, events, errCh, coordinator, dirtyRateMbps, observeRunID,
+	)
+	drain, cleanupErr := finishExternalV2BulkPacketReceiverProbe(ctx, path, cancel, done)
+	if probeErr != nil {
+		return externalV2BulkPacketProbeResult{
+			RunID: probeRunID, Duration: time.Since(started), Trains: trains, HandoffDrain: drain,
+		}, joinExternalV2BulkPacketProbeCleanup(probeErr, cleanupErr)
 	}
-	cancel()
-	interruptErr := interruptExternalV2BulkPacketReads(path, time.Now())
-	<-done
-	cleanupErr := clearExternalV2BulkPacketDeadlines(path)
-	ackErr := sendExternalV2BulkPacketProbeAck(path, auth, probeRunID, totalPackets, &ackIndex, finalPrefix)
-	result, selectionErr := externalV2BulkPacketProbeSelector(trains)
+	result, selectionErr := externalV2BulkPacketReceiverProbeSelector(trains)
 	result.RunID = probeRunID
 	result.Duration = time.Since(started)
-	return result, errors.Join(selectionErr, interruptErr, cleanupErr, ackErr)
+	result.HandoffDrain = drain
+	emitExternalV2BulkPacketProbeDiagnostics(coordinator.emitter, result)
+	if cleanupErr == nil {
+		return result, selectionErr
+	}
+	return result, errors.Join(selectionErr, cleanupErr)
 }
 
-func receiveExternalV2BulkPacketProbeTrain(
+func receiveExternalV2BulkPacketProbeTrains(
 	ctx context.Context,
 	events <-chan externalV2BulkPacketProbeEvent,
 	errCh <-chan error,
-	train uint16,
+	coordinator *externalV2BulkDecisionCoordinator,
+	dirtyRateMbps int,
+	observeRunID func(uint64),
+) ([]externalV2BulkPacketProbeTrainResult, uint64, error) {
+	trains := make([]externalV2BulkPacketProbeTrainResult, 0, len(externalV2BulkPacketProbeRatesMbps))
+	var probeRunID uint64
+	var previousEnd externalV2BulkControl
+	var previousResult externalV2BulkControl
+	for trainIndex, rateMbps := range externalV2BulkPacketProbeRatesMbps {
+		train, end, runID, err := receiveExternalV2BulkPacketReliableProbeTrain(
+			ctx, events, errCh, coordinator, trainIndex, rateMbps, dirtyRateMbps, probeRunID,
+			previousEnd, previousResult, observeRunID,
+		)
+		if runID != 0 {
+			probeRunID = runID
+		}
+		if err != nil {
+			return trains, probeRunID, err
+		}
+		trains = append(trains, train)
+		resultControl := externalV2BulkPacketProbeResultControl(probeRunID, trainIndex, train)
+		if err := coordinator.sendProbeResult(ctx, resultControl); err != nil {
+			return trains, probeRunID, err
+		}
+		previousEnd, previousResult = end, resultControl
+		if resultControl.Probe.Final {
+			coordinator.respondToDuplicateProbeEnds(end, resultControl)
+			break
+		}
+	}
+	return trains, probeRunID, nil
+}
+
+func externalV2BulkPacketProbeResultControl(
+	probeRunID uint64,
+	trainIndex int,
+	train externalV2BulkPacketProbeTrainResult,
+) externalV2BulkControl {
+	return externalV2BulkControl{
+		Protocol: externalV2Protocol, Phase: externalV2BulkPhaseProbeResult,
+		ProbeRunID: probeRunID, Mode: externalV2BulkModeBulk,
+		Probe: &externalV2BulkProbeControl{
+			Train: trainIndex, RateMbps: train.RateMbps, Sent: train.Sent, Received: train.Received,
+			Pressure: train.Pressure,
+			Final: train.Pressure || train.Sent == 0 ||
+				uint64(train.Received)*100 < uint64(train.Sent)*95 ||
+				trainIndex == len(externalV2BulkPacketProbeRatesMbps)-1,
+		},
+	}
+}
+
+func joinExternalV2BulkPacketProbeCleanup(err, cleanupErr error) error {
+	if cleanupErr == nil {
+		return err
+	}
+	return errors.Join(err, cleanupErr)
+}
+
+func receiveExternalV2BulkPacketReliableProbeTrain(
+	ctx context.Context,
+	events <-chan externalV2BulkPacketProbeEvent,
+	errCh <-chan error,
+	coordinator *externalV2BulkDecisionCoordinator,
+	train int,
 	rateMbps int,
+	dirtyRateMbps int,
 	runID uint64,
-) (externalV2BulkPacketProbeTrainResult, uint64, error) {
+	previousEnd externalV2BulkControl,
+	previousResult externalV2BulkControl,
+	observeRunID func(uint64),
+) (externalV2BulkPacketProbeTrainResult, externalV2BulkControl, uint64, error) {
 	result := externalV2BulkPacketProbeTrainResult{RateMbps: rateMbps}
 	seen := make(map[uint32]struct{}, externalV2BulkPacketProbeDatagramCount(rateMbps))
-	var settle *time.Timer
-	var settleCh <-chan time.Time
-	defer func() {
-		if settle != nil {
-			settle.Stop()
-		}
-	}()
+	end, runID, err := waitForExternalV2BulkPacketProbeBoundary(
+		ctx, events, errCh, coordinator, train, rateMbps, dirtyRateMbps, runID,
+		previousEnd, previousResult, observeRunID, seen,
+	)
+	if err != nil {
+		return result, end, runID, err
+	}
+	result, runID, err = settleExternalV2BulkPacketProbeTrain(
+		ctx, events, errCh, coordinator, train, rateMbps, dirtyRateMbps, runID,
+		end, observeRunID, seen,
+	)
+	return result, end, runID, err
+}
+
+func waitForExternalV2BulkPacketProbeBoundary(
+	ctx context.Context,
+	events <-chan externalV2BulkPacketProbeEvent,
+	errCh <-chan error,
+	coordinator *externalV2BulkDecisionCoordinator,
+	train int,
+	rateMbps int,
+	dirtyRateMbps int,
+	runID uint64,
+	previousEnd externalV2BulkControl,
+	previousResult externalV2BulkControl,
+	observeRunID func(uint64),
+	seen map[uint32]struct{},
+) (externalV2BulkControl, uint64, error) {
+	retryCh, stopRetry := externalV2BulkPacketProbeRetry(previousResult, coordinator.retry)
+	defer stopRetry()
+	var end externalV2BulkControl
 	for {
 		select {
 		case event := <-events:
-			if externalV2BulkPacketProbeEventMatchesTrain(event, train, rateMbps, &runID) {
-				end := applyExternalV2BulkPacketProbeEvent(event, seen, &result)
-				if end && settle == nil {
-					settle = time.NewTimer(externalV2BulkPacketProbeSettle)
-					settleCh = settle.C
-				}
-			}
+			collectExternalV2BulkPacketProbeData(event, train, rateMbps, dirtyRateMbps, &runID, observeRunID, seen)
 		case err := <-errCh:
-			return result, runID, err
-		case <-settleCh:
-			result.Received = uint32(len(seen))
-			return result, runID, nil
+			return end, runID, err
+		case event, ok := <-coordinator.probeControlEvents():
+			message, accepted, err := acceptExternalV2BulkPacketProbeBoundaryControl(
+				ctx, coordinator, event, ok, train, rateMbps, previousEnd, previousResult, &runID, observeRunID,
+			)
+			if err != nil {
+				return end, runID, err
+			}
+			if accepted {
+				return message, runID, nil
+			}
+		case <-retryCh:
+			if err := coordinator.sendProbeResult(ctx, previousResult); err != nil {
+				return end, runID, err
+			}
 		case <-ctx.Done():
-			return result, runID, ctx.Err()
+			return end, runID, externalV2BulkContextError(ctx)
 		}
 	}
 }
 
-func externalV2BulkPacketProbeEventMatchesTrain(event externalV2BulkPacketProbeEvent, train uint16, rateMbps int, runID *uint64) bool {
-	if event.prefix.Train != train || event.prefix.RateMbps != uint32(rateMbps) {
-		return false
+func externalV2BulkPacketProbeRetry(
+	previousResult externalV2BulkControl,
+	retryInterval time.Duration,
+) (<-chan time.Time, func()) {
+	if previousResult.Probe == nil {
+		return nil, func() {}
+	}
+	retry := time.NewTicker(retryInterval)
+	return retry.C, retry.Stop
+}
+
+func acceptExternalV2BulkPacketProbeBoundaryControl(
+	ctx context.Context,
+	coordinator *externalV2BulkDecisionCoordinator,
+	event externalV2BulkControlEvent,
+	ok bool,
+	train int,
+	rateMbps int,
+	previousEnd externalV2BulkControl,
+	previousResult externalV2BulkControl,
+	runID *uint64,
+	observeRunID func(uint64),
+) (externalV2BulkControl, bool, error) {
+	message, err := externalV2BulkControlFromEvent(event, ok)
+	if err != nil {
+		return externalV2BulkControl{}, false, err
+	}
+	if previousEnd.Probe != nil && message.Probe != nil && message.Probe.Train == previousEnd.Probe.Train {
+		if !externalV2BulkControlsEqual(message, previousEnd) {
+			return externalV2BulkControl{}, false, fmt.Errorf("%w: contradictory probe boundary for train %d", errExternalV2BulkDecisionProtocol, message.Probe.Train)
+		}
+		return externalV2BulkControl{}, false, coordinator.sendProbeResult(ctx, previousResult)
+	}
+	if err := validateExternalV2BulkPacketProbeBoundary(message, train, rateMbps, runID, observeRunID); err != nil {
+		return externalV2BulkControl{}, false, err
+	}
+	return message, true, nil
+}
+
+func settleExternalV2BulkPacketProbeTrain(
+	ctx context.Context,
+	events <-chan externalV2BulkPacketProbeEvent,
+	errCh <-chan error,
+	coordinator *externalV2BulkDecisionCoordinator,
+	train int,
+	rateMbps int,
+	dirtyRateMbps int,
+	runID uint64,
+	end externalV2BulkControl,
+	observeRunID func(uint64),
+	seen map[uint32]struct{},
+) (externalV2BulkPacketProbeTrainResult, uint64, error) {
+	result := externalV2BulkPacketProbeTrainResult{RateMbps: rateMbps}
+	settle := time.NewTimer(externalV2BulkPacketProbeSettle)
+	defer settle.Stop()
+	for {
+		select {
+		case event := <-events:
+			collectExternalV2BulkPacketProbeData(event, train, rateMbps, dirtyRateMbps, &runID, observeRunID, seen)
+		case err := <-errCh:
+			return result, runID, err
+		case event, ok := <-coordinator.probeControlEvents():
+			message, err := externalV2BulkControlFromEvent(event, ok)
+			if err != nil {
+				return result, runID, err
+			}
+			if !externalV2BulkControlsEqual(message, end) {
+				return result, runID, fmt.Errorf("%w: contradictory probe boundary for train %d", errExternalV2BulkDecisionProtocol, train)
+			}
+		case <-settle.C:
+			result.Sent = end.Probe.Sent
+			result.Received = uint32(len(seen))
+			result.Pressure = end.Probe.Pressure
+			if result.Received > result.Sent {
+				return result, runID, fmt.Errorf("%w: received %d probe datagrams after %d sent", errExternalV2BulkDecisionProtocol, result.Received, result.Sent)
+			}
+			return result, runID, nil
+		case <-ctx.Done():
+			return result, runID, externalV2BulkContextError(ctx)
+		}
+	}
+}
+
+func validateExternalV2BulkPacketProbeBoundary(
+	message externalV2BulkControl,
+	train int,
+	rateMbps int,
+	runID *uint64,
+	observeRunID func(uint64),
+) error {
+	if message.Phase != externalV2BulkPhaseProbeEnd || message.Probe == nil ||
+		message.Probe.Train != train || message.Probe.RateMbps != rateMbps {
+		return fmt.Errorf("%w: unexpected probe boundary", errExternalV2BulkDecisionProtocol)
+	}
+	if *runID == 0 {
+		*runID = message.ProbeRunID
+		if observeRunID != nil {
+			observeRunID(*runID)
+		}
+	}
+	if message.ProbeRunID != *runID {
+		return fmt.Errorf("%w: probe boundary run ID %d does not match %d", errExternalV2BulkDecisionProtocol, message.ProbeRunID, *runID)
+	}
+	return nil
+}
+
+func collectExternalV2BulkPacketProbeData(
+	event externalV2BulkPacketProbeEvent,
+	train int,
+	rateMbps int,
+	dirtyRateMbps int,
+	runID *uint64,
+	observeRunID func(uint64),
+	seen map[uint32]struct{},
+) {
+	if event.header.kind != externalV2BulkPacketProbeData && event.header.kind != externalV2BulkPacketProbeTaggedData ||
+		int(event.prefix.Train) != train || event.prefix.RateMbps != uint32(rateMbps) {
+		return
 	}
 	if *runID == 0 {
 		*runID = event.header.runID
+		if observeRunID != nil {
+			observeRunID(*runID)
+		}
 	}
-	return event.header.runID == *runID
+	if event.header.runID == *runID && (rateMbps != dirtyRateMbps || event.prefix.Sequence%10 != 0) {
+		seen[event.prefix.Sequence] = struct{}{}
+	}
 }
 
-func applyExternalV2BulkPacketProbeEvent(event externalV2BulkPacketProbeEvent, seen map[uint32]struct{}, result *externalV2BulkPacketProbeTrainResult) bool {
-	switch event.header.kind {
-	case externalV2BulkPacketProbeData, externalV2BulkPacketProbeTaggedData:
-		seen[event.prefix.Sequence] = struct{}{}
-		return false
-	case externalV2BulkPacketProbeEnd:
-		result.Sent = event.prefix.Expected
-		result.Pressure = event.prefix.pressure()
-		return true
-	default:
-		return false
+func finishExternalV2BulkPacketReceiverProbe(
+	ctx context.Context,
+	path externalV2BulkPacketPath,
+	cancel context.CancelFunc,
+	done <-chan struct{},
+) (externalV2BulkPacketHandoffDrainResult, error) {
+	cancel()
+	interruptErr := externalV2BulkPacketProbeInterruptReads(path, time.Now())
+	<-done
+	drain, drainErr := externalV2BulkPacketDrainForHandoff(ctx, path)
+	return drain, newExternalV2BulkPacketProbeCleanupError(interruptErr, drainErr)
+}
+
+type externalV2BulkPacketProbeCleanupError struct {
+	err error
+}
+
+func newExternalV2BulkPacketProbeCleanupError(errs ...error) error {
+	err := errors.Join(errs...)
+	if err == nil {
+		return nil
 	}
+	return &externalV2BulkPacketProbeCleanupError{err: err}
+}
+
+func (e *externalV2BulkPacketProbeCleanupError) Error() string {
+	return fmt.Sprintf("bulk packet probe cleanup: %v", e.err)
+}
+
+func (e *externalV2BulkPacketProbeCleanupError) Unwrap() error {
+	return e.err
+}
+
+func externalV2BulkPacketProbeCleanupFailure(err error) error {
+	var cleanup *externalV2BulkPacketProbeCleanupError
+	if !errors.As(err, &cleanup) {
+		return nil
+	}
+	return cleanup.err
 }
 
 func startExternalV2BulkPacketProbeReaders(
@@ -480,7 +921,7 @@ func decodeExternalV2BulkPacketProbeEvent(auth externalV2BulkPacketAuth, totalPa
 		}
 	}
 	header, payload, ok := openExternalV2BulkPacket(auth.control, message.Buffers[0][:message.N])
-	if !ok || header.total != totalPackets || (header.kind != externalV2BulkPacketProbeData && header.kind != externalV2BulkPacketProbeEnd) {
+	if !ok || header.total != totalPackets || header.kind != externalV2BulkPacketProbeData {
 		return externalV2BulkPacketProbeEvent{}, false
 	}
 	prefix, ok := decodeExternalV2BulkPacketProbePrefix(payload)
@@ -549,26 +990,6 @@ func externalV2BulkPacketProbeTagInput(runID uint64, prefix externalV2BulkPacket
 	return input
 }
 
-func sendExternalV2BulkPacketProbeAck(
-	path externalV2BulkPacketPath,
-	auth externalV2BulkPacketAuth,
-	runID uint64,
-	totalPackets uint32,
-	ackIndex *uint32,
-	prefix externalV2BulkPacketProbePrefix,
-) error {
-	encoded := encodeExternalV2BulkPacketProbePrefix(prefix)
-	for range externalV2BulkPacketProbeAckRepeats {
-		if err := writeExternalV2BulkPacketControl(path, auth, externalV2BulkPacketHeader{
-			kind: externalV2BulkPacketProbeAck, runID: runID, index: *ackIndex, total: totalPackets,
-		}, encoded[:]); err != nil {
-			return err
-		}
-		*ackIndex = *ackIndex + 1
-	}
-	return nil
-}
-
 func interruptExternalV2BulkPacketReads(path externalV2BulkPacketPath, deadline time.Time) error {
 	var errs []error
 	for lane, conn := range path.Conns {
@@ -578,3 +999,5 @@ func interruptExternalV2BulkPacketReads(path externalV2BulkPacketPath, deadline 
 	}
 	return errors.Join(errs...)
 }
+
+var externalV2BulkPacketProbeInterruptReads = interruptExternalV2BulkPacketReads

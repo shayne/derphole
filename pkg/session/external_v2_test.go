@@ -21,6 +21,70 @@ import (
 	"github.com/shayne/derphole/pkg/transfertrace"
 )
 
+func TestExternalV2StreamOpenBudgetsAreIndependent(t *testing.T) {
+	if got, want := externalV2QUICStreamOpenWait, 10*time.Second; got != want {
+		t.Fatalf("QUIC stream-open budget = %s, want %s", got, want)
+	}
+	if got, want := externalV2BulkPacketHelloWait, 2*time.Second; got != want {
+		t.Fatalf("bulk-packet HELLO budget = %s, want %s", got, want)
+	}
+}
+
+func TestRunExternalV2QUICStreamOpenAllowsWANDelayBeyondTwoSeconds(t *testing.T) {
+	started := time.Now()
+	got, err := runExternalV2QUICStreamOpen(context.Background(), true, func(ctx context.Context) (string, error) {
+		timer := time.NewTimer(2100 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			return "opened", nil
+		case <-ctx.Done():
+			return "", context.Cause(ctx)
+		}
+	})
+	if err != nil || got != "opened" {
+		t.Fatalf("delayed QUIC stream open = (%q, %v), want (opened, nil)", got, err)
+	}
+	if elapsed := time.Since(started); elapsed < 2*time.Second || elapsed >= externalV2QUICStreamOpenWait {
+		t.Fatalf("delayed QUIC stream open elapsed = %s, want [2s, %s)", elapsed, externalV2QUICStreamOpenWait)
+	}
+}
+
+func TestRunExternalV2QUICStreamOpenPreservesParentCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := runExternalV2QUICStreamOpen(ctx, true, func(openCtx context.Context) (struct{}, error) {
+			close(started)
+			<-openCtx.Done()
+			return struct{}{}, context.Cause(openCtx)
+		})
+		done <- err
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled QUIC stream open error = %v, want canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("QUIC stream open ignored parent cancellation")
+	}
+}
+
+func TestWaitExternalV2BulkPacketHelloWithinRetainsPeerDisconnectTimeout(t *testing.T) {
+	started := time.Now()
+	err := waitExternalV2BulkPacketHelloWithin(context.Background(), make(chan struct{}), make(chan error), 25*time.Millisecond)
+	if !errors.Is(err, ErrPeerDisconnected) {
+		t.Fatalf("bulk-packet HELLO timeout error = %v, want peer disconnected", err)
+	}
+	if elapsed := time.Since(started); elapsed < 20*time.Millisecond || elapsed >= time.Second {
+		t.Fatalf("bulk-packet HELLO timeout elapsed = %s, want short injected budget", elapsed)
+	}
+}
+
 func TestExternalV2SendReceiveRoundTrip(t *testing.T) {
 	srv := newSessionTestDERPServer(t)
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)

@@ -164,6 +164,11 @@ func isV2DataPlaneReadyPayload(payload []byte) bool {
 	return ok && env.V2DataPlaneReady != nil
 }
 
+func isV2BulkControlPayload(payload []byte) bool {
+	env, ok := decodeExternalV2Payload(payload, envelopeV2BulkControl)
+	return ok && env.V2BulkControl != nil
+}
+
 func decodeExternalV2Payload(payload []byte, typ string) (envelope, bool) {
 	var env envelope
 	if len(payload) == 0 || payload[0] != '{' {
