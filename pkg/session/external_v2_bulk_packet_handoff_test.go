@@ -124,6 +124,20 @@ type handoffScriptedBatchConn struct {
 	read  func(context.Context, []externalV2BulkPacketBatchMessage) (int, error)
 }
 
+type handoffDelayedDeadlineContext struct {
+	context.Context
+	deadline time.Time
+	done     <-chan struct{}
+}
+
+func (c handoffDelayedDeadlineContext) Deadline() (time.Time, bool) {
+	return c.deadline, true
+}
+
+func (c handoffDelayedDeadlineContext) Done() <-chan struct{} {
+	return c.done
+}
+
 func (*handoffScriptedBatchConn) WriteBatch(context.Context, []externalV2BulkPacketBatchMessage) (int, error) {
 	return 0, errors.New("unexpected handoff test write")
 }
@@ -263,6 +277,25 @@ func TestDrainExternalV2BulkPacketHandoffHardDeadlineIsFatal(t *testing.T) {
 	}
 	conn.assertCleared(t)
 	conn.assertDeadlineClearCalls(t, 0, 0)
+}
+
+func TestDrainExternalV2BulkPacketHandoffHardDeadlineWinsWhenTimerDeliveryLags(t *testing.T) {
+	hardDeadline := time.Now().Add(10 * time.Millisecond)
+	drainCtx := handoffDelayedDeadlineContext{
+		Context:  context.Background(),
+		deadline: hardDeadline,
+		done:     make(chan struct{}),
+	}
+	reader := &handoffScriptedBatchConn{read: func(ctx context.Context, _ []externalV2BulkPacketBatchMessage) (int, error) {
+		<-ctx.Done()
+		time.Sleep(time.Until(hardDeadline) + time.Millisecond)
+		return 0, ctx.Err()
+	}}
+
+	_, err := drainExternalV2BulkPacketHandoffLane(drainCtx, time.Millisecond, reader)
+	if err == nil || !strings.Contains(err.Error(), "hard deadline") {
+		t.Fatalf("drain error = %v, want hard-deadline failure", err)
+	}
 }
 
 func TestDrainExternalV2BulkPacketHandoffReadFailureJoinsOtherLanes(t *testing.T) {

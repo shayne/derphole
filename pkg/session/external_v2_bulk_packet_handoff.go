@@ -104,7 +104,7 @@ func drainExternalV2BulkPacketHandoffLane(
 ) (uint64, error) {
 	var datagrams uint64
 	for {
-		if err := drainCtx.Err(); err != nil {
+		if err := externalV2BulkPacketHandoffHardDeadlineErr(drainCtx); err != nil {
 			return datagrams, fmt.Errorf("hard deadline: %w", err)
 		}
 
@@ -117,7 +117,7 @@ func drainExternalV2BulkPacketHandoffLane(
 		}
 		datagrams += uint64(count)
 
-		if drainErr := drainCtx.Err(); drainErr != nil {
+		if drainErr := externalV2BulkPacketHandoffHardDeadlineErr(drainCtx); drainErr != nil {
 			return datagrams, fmt.Errorf("hard deadline: %w", drainErr)
 		}
 		if count == 0 && errors.Is(err, context.DeadlineExceeded) {
@@ -130,4 +130,15 @@ func drainExternalV2BulkPacketHandoffLane(
 			return datagrams, fmt.Errorf("read queued datagrams: %w", io.ErrNoProgress)
 		}
 	}
+}
+
+func externalV2BulkPacketHandoffHardDeadlineErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline, ok := ctx.Deadline()
+	if ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
