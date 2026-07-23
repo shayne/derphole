@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime/debug"
 	"sync"
 	"testing"
 	"time"
@@ -683,6 +684,10 @@ func TestExternalV2BulkPacketGroupAssemblerBypassesLegacyClaimsAndRejectsLateDup
 }
 
 func TestExternalV2BulkPacketGroupAssemblerReusesCiphertextBuffers(t *testing.T) {
+	// sync.Pool may discard every cached entry during a GC. Keep this assertion
+	// within one pool generation so it tests reuse rather than GC policy.
+	previousGCPercent := debug.SetGCPercent(-1)
+	t.Cleanup(func() { debug.SetGCPercent(previousGCPercent) })
 	auth, err := externalV2BulkPacketAuthForToken(
 		testExternalV2BulkPacketToken(), key.NewNode().Public(), key.NewNode().Public(),
 	)
