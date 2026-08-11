@@ -202,6 +202,15 @@ type checkerRowBulkEvidence struct {
 	bools    map[string]bool
 }
 
+type checkerBulkFallbackContinuity struct {
+	rejectStage              string
+	rejectStageObserved      bool
+	drainedDatagrams         uint64
+	drainedDatagramsObserved bool
+	drainDurationMS          uint64
+	drainDurationMSObserved  bool
+}
+
 type checkerRowDiagnostics struct {
 	observed                       map[string]bool
 	rateTargetMbps                 int
@@ -472,6 +481,7 @@ type checker struct {
 	finalBulkEvidence   checkerRowBulkEvidence
 	finalBulkDecision   checkerRowBulkDecision
 	bulkDecision        checkerRowBulkDecision
+	bulkFallback        checkerBulkFallbackContinuity
 	finalRowDiagnostics checkerRowDiagnostics
 }
 
@@ -557,10 +567,64 @@ func (c *checker) consume(row checkerRow) error {
 	if err := validateCheckerRowStatus(row); err != nil {
 		return err
 	}
+	if err := c.consumeBulkFallbackEvidence(row); err != nil {
+		return err
+	}
 	if err := c.consumeBulkDecision(row); err != nil {
 		return err
 	}
 	return c.consumeProgress(row)
+}
+
+func (c *checker) consumeBulkFallbackEvidence(row checkerRow) error {
+	evidence := row.bulkEvidence
+	stageObserved := evidence.observed["bulk_probe_reject_stage"]
+	if c.bulkFallback.rejectStageObserved {
+		if !stageObserved {
+			return fmt.Errorf("row %d: bulk probe rejection stage disappeared", row.rowNo)
+		}
+		stage := evidence.strings["bulk_probe_reject_stage"]
+		if stage != c.bulkFallback.rejectStage {
+			return fmt.Errorf("row %d: bulk probe rejection stage changed from %q to %q", row.rowNo, c.bulkFallback.rejectStage, stage)
+		}
+	}
+	if stageObserved {
+		c.bulkFallback.rejectStage = evidence.strings["bulk_probe_reject_stage"]
+		c.bulkFallback.rejectStageObserved = true
+	}
+	if err := consumeBulkFallbackCounter(
+		row.rowNo, evidence, "bulk_handoff_drained_datagrams",
+		&c.bulkFallback.drainedDatagrams, &c.bulkFallback.drainedDatagramsObserved,
+	); err != nil {
+		return err
+	}
+	return consumeBulkFallbackCounter(
+		row.rowNo, evidence, "bulk_handoff_drain_duration_ms",
+		&c.bulkFallback.drainDurationMS, &c.bulkFallback.drainDurationMSObserved,
+	)
+}
+
+func consumeBulkFallbackCounter(
+	rowNo int,
+	evidence checkerRowBulkEvidence,
+	name string,
+	previous *uint64,
+	previouslyObserved *bool,
+) error {
+	observed := evidence.observed[name]
+	if *previouslyObserved {
+		if !observed {
+			return fmt.Errorf("row %d: %s disappeared", rowNo, name)
+		}
+		if value := evidence.uints[name]; value < *previous {
+			return fmt.Errorf("row %d: %s decreased from %d to %d", rowNo, name, *previous, value)
+		}
+	}
+	if observed {
+		*previous = evidence.uints[name]
+		*previouslyObserved = true
+	}
+	return nil
 }
 
 func (c *checker) recordRowSnapshot(row checkerRow) {
@@ -809,9 +873,9 @@ func (c *checker) validateFinalBulkDecision() error {
 		if err := validateFinalQUICBulkDecision(decision); err != nil {
 			return err
 		}
-		if decision.set && c.finalBulkEvidence.uints["bulk_handoff_drain_duration_ms"] == 0 {
-			return errors.New("bulk handoff drain duration must be positive for final QUIC bulk decision")
-		}
+	}
+	if decision.set && decision.mode == "quic" && c.finalBulkEvidence.uints["bulk_handoff_drain_duration_ms"] == 0 {
+		return errors.New("bulk handoff drain duration must be positive for final QUIC bulk decision")
 	}
 	return nil
 }

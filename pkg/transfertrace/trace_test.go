@@ -327,6 +327,30 @@ func TestRecorderLeavesBulkBatchDiagnosticsEmptyWhenAbsent(t *testing.T) {
 	assertColumn(t, records[1], indexes, "bulk_decision_run_id", "")
 }
 
+func TestRecorderWritesNegativeBulkHandoffDurationAsRejectableDecimal(t *testing.T) {
+	var out bytes.Buffer
+	recorder, err := NewRecorder(&out, RoleSend, time.Unix(275, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder.Observe(Snapshot{
+		At:                         time.Unix(276, 0),
+		Phase:                      PhaseComplete,
+		BulkDecisionMode:           "quic",
+		BulkDecisionReason:         "sender-probe-rejected",
+		BulkDecisionRunID:          77,
+		BulkHandoffDrainDurationMS: -1,
+	})
+	if err := recorder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	records, indexes := readTraceCSV(t, out.String())
+	assertColumn(t, records[1], indexes, "bulk_handoff_drain_duration_ms", "-1")
+	if _, err := Check(strings.NewReader(out.String()), Options{Role: RoleSend}); err == nil || !strings.Contains(err.Error(), "bulk_handoff_drain_duration_ms") {
+		t.Fatalf("Check() error = %v, want negative duration parse failure", err)
+	}
+}
+
 func TestRecorderWritesBulkDecisionBeforePayloadEngine(t *testing.T) {
 	var out bytes.Buffer
 	recorder, err := NewRecorder(&out, RoleReceive, time.Unix(280, 0))

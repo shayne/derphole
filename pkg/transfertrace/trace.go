@@ -603,7 +603,7 @@ func (r *Recorder) row(snap Snapshot, deltaBytes int64, deltaMS int64, localSent
 		formatOptionalUint64(snap.BulkDecisionRunID),
 		snap.BulkProbeRejectStage,
 		strconv.FormatUint(snap.BulkHandoffDrainedDatagrams, 10),
-		strconv.FormatUint(uint64(snap.BulkHandoffDrainDurationMS), 10),
+		strconv.FormatInt(snap.BulkHandoffDrainDurationMS, 10),
 	)
 }
 

@@ -852,6 +852,162 @@ func TestCheckAcceptsQUICBulkFallbackWithQuietHandoff(t *testing.T) {
 	}
 }
 
+func TestCheckRejectsQUICBulkDecisionWithoutHandoffDurationWhenEngineOptional(t *testing.T) {
+	tests := []struct {
+		name  string
+		trace string
+	}{
+		{
+			name: "duration column omitted with engine omitted",
+			trace: "timestamp_unix_ms,role,phase,app_bytes,last_error,bulk_decision_mode,bulk_decision_reason,bulk_decision_run_id\n" +
+				"1000,send,complete,0,,quic,sender-probe-rejected,77\n",
+		},
+		{
+			name: "zero duration with empty optional engine",
+			trace: "timestamp_unix_ms,role,phase,app_bytes,last_error,bulk_decision_mode,bulk_decision_reason,bulk_decision_run_id,file_payload_engine,bulk_handoff_drain_duration_ms\n" +
+				"1000,send,complete,0,,quic,sender-probe-rejected,77,,0\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := Check(strings.NewReader(test.trace), Options{Role: RoleSend})
+			if err == nil || !strings.Contains(err.Error(), "bulk handoff drain duration") {
+				t.Fatalf("Check() error = %v, want decision-keyed handoff duration failure", err)
+			}
+		})
+	}
+}
+
+func TestCheckRejectsDiscontinuousBulkFallbackEvidence(t *testing.T) {
+	tests := []struct {
+		name string
+		rows []testBulkFallbackEvidenceRow
+		want string
+	}{
+		{
+			name: "rejection stage changes",
+			rows: []testBulkFallbackEvidenceRow{
+				{stage: "ack-timeout", datagrams: "10", durationMS: "17"},
+				{stage: "selector", datagrams: "10", durationMS: "17"},
+			},
+			want: "bulk probe rejection stage changed",
+		},
+		{
+			name: "rejection stage disappears",
+			rows: []testBulkFallbackEvidenceRow{
+				{stage: "ack-timeout", datagrams: "10", durationMS: "17"},
+				{datagrams: "10", durationMS: "17"},
+			},
+			want: "bulk probe rejection stage disappeared",
+		},
+		{
+			name: "drained datagrams decrease",
+			rows: []testBulkFallbackEvidenceRow{
+				{stage: "selector", datagrams: "10", durationMS: "17"},
+				{stage: "selector", datagrams: "9", durationMS: "17"},
+			},
+			want: "bulk_handoff_drained_datagrams decreased",
+		},
+		{
+			name: "drain duration decreases",
+			rows: []testBulkFallbackEvidenceRow{
+				{stage: "selector", datagrams: "10", durationMS: "17"},
+				{stage: "selector", datagrams: "10", durationMS: "16"},
+			},
+			want: "bulk_handoff_drain_duration_ms decreased",
+		},
+		{
+			name: "drained datagrams disappear",
+			rows: []testBulkFallbackEvidenceRow{
+				{stage: "selector", datagrams: "10", durationMS: "17"},
+				{stage: "selector", durationMS: "17"},
+			},
+			want: "bulk_handoff_drained_datagrams disappeared",
+		},
+		{
+			name: "drain duration disappears",
+			rows: []testBulkFallbackEvidenceRow{
+				{stage: "selector", datagrams: "10", durationMS: "17"},
+				{stage: "selector", datagrams: "10"},
+			},
+			want: "bulk_handoff_drain_duration_ms disappeared",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := Check(strings.NewReader(testBulkFallbackEvidenceTrace(t, test.rows)), Options{Role: RoleSend})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Check() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestCheckAcceptsStableAndIncreasingBulkFallbackEvidence(t *testing.T) {
+	tests := []struct {
+		name string
+		rows []testBulkFallbackEvidenceRow
+	}{
+		{
+			name: "stable",
+			rows: []testBulkFallbackEvidenceRow{
+				{stage: "ack-timeout", datagrams: "10", durationMS: "17"},
+				{stage: "ack-timeout", datagrams: "10", durationMS: "17"},
+			},
+		},
+		{
+			name: "increasing",
+			rows: []testBulkFallbackEvidenceRow{
+				{stage: "selector", datagrams: "10", durationMS: "17"},
+				{stage: "selector", datagrams: "12", durationMS: "19"},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := Check(strings.NewReader(testBulkFallbackEvidenceTrace(t, test.rows)), Options{Role: RoleSend}); err != nil {
+				t.Fatalf("Check() error = %v", err)
+			}
+		})
+	}
+}
+
+type testBulkFallbackEvidenceRow struct {
+	stage      string
+	datagrams  string
+	durationMS string
+}
+
+func testBulkFallbackEvidenceTrace(t *testing.T, rows []testBulkFallbackEvidenceRow) string {
+	t.Helper()
+	columns := []string{
+		"timestamp_unix_ms", "role", "phase", "app_bytes", "last_error",
+		"bulk_probe_reject_stage", "bulk_handoff_drained_datagrams", "bulk_handoff_drain_duration_ms",
+	}
+	var body bytes.Buffer
+	w := csv.NewWriter(&body)
+	if err := w.Write(columns); err != nil {
+		t.Fatal(err)
+	}
+	for i, row := range rows {
+		phase := string(PhaseDirectPrepare)
+		if i == len(rows)-1 {
+			phase = string(PhaseComplete)
+		}
+		if err := w.Write([]string{
+			strconv.Itoa(1000 + i*100), string(RoleSend), phase, "0", "",
+			row.stage, row.datagrams, row.durationMS,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.Flush()
+	if err := w.Error(); err != nil {
+		t.Fatal(err)
+	}
+	return body.String()
+}
+
 func TestCheckRejectsChangingBulkDecisionAcrossRows(t *testing.T) {
 	trace := "timestamp_unix_ms,role,phase,app_bytes,last_error,bulk_decision_mode,bulk_decision_reason,bulk_decision_run_id\n" +
 		"1000,send,direct_prepare,0,,bulk-packets-v1,both-probes-accepted,77\n" +
