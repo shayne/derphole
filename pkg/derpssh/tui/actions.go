@@ -54,7 +54,7 @@ func NewActionRegistry() ActionRegistry {
 		{ID: ActionFocusChat, Label: "Focus Chat", Shortcut: "Ctrl-X C", Menu: true, Visible: alwaysVisible, Enabled: alwaysEnabled, Run: appAction(focusChatAction)},
 		{ID: ActionFocusTerminal, Label: "Focus Terminal", Shortcut: "Ctrl-X T", Menu: true, Visible: alwaysVisible, Enabled: alwaysEnabled, Run: appAction(focusTerminalAction)},
 		{ID: ActionShowInvite, Label: "Show Invite", Shortcut: "Ctrl-X I", Menu: true, Visible: hostInviteVisible, Enabled: alwaysEnabled, Run: appAction(inviteAction)},
-		{ID: ActionToggleSelect, Label: "Native Selection", Shortcut: "Ctrl-X Y", Menu: true, Visible: alwaysVisible, Enabled: alwaysEnabled, Run: appAction(copyModeAction)},
+		{ID: ActionToggleSelect, Label: "Terminal Selection", Shortcut: "Ctrl-X Y", Menu: true, Visible: alwaysVisible, Enabled: alwaysEnabled, Run: appAction(copyModeAction)},
 		{ID: ActionQuit, Label: "Quit", Shortcut: "Ctrl-X Q", Menu: true, Visible: alwaysVisible, Enabled: alwaysEnabled, Run: appAction(quitAction)},
 		{ID: ActionWidenChat, Label: "Widen Chat", Shortcut: "Ctrl-X [", Visible: alwaysVisible, Enabled: alwaysEnabled, Run: appAction(widenChatAction)},
 		{ID: ActionNarrowChat, Label: "Narrow Chat", Shortcut: "Ctrl-X ]", Visible: alwaysVisible, Enabled: alwaysEnabled, Run: appAction(narrowChatAction)},

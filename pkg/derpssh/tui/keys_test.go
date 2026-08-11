@@ -6,6 +6,7 @@ package tui
 
 import (
 	"bytes"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -389,6 +390,59 @@ func TestTerminalFocusCtrlRReachesPTY(t *testing.T) {
 	}
 	if !bytes.Equal(got.Data, []byte{0x12}) {
 		t.Fatalf("TerminalInputCommand.Data = %v, want ctrl-r byte", got.Data)
+	}
+}
+
+func TestTerminalKeyResetsViewportAndSelectionBeforeForwarding(t *testing.T) {
+	pane := &orderedInteractionPane{interactiveFakePane: interactiveFakePane{
+		fakePane:    fakePane{view: "ok"},
+		viewport:    terminalViewportState{OffsetFromBottom: 4},
+		selectionOn: true,
+	}}
+	app := NewApp(Options{Terminal: pane})
+
+	app.Update(textKey("a"))
+
+	if got, want := pane.events, []string{"input-mode", "reset", "clear"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("terminal interaction order = %v, want %v", got, want)
+	}
+	cmd, ok := readCommand(app).(TerminalInputCommand)
+	if !ok {
+		t.Fatalf("command = %T, want TerminalInputCommand", cmd)
+	}
+	if got, want := string(cmd.Data), "a"; got != want {
+		t.Fatalf("TerminalInputCommand.Data = %q, want %q", got, want)
+	}
+}
+
+func TestTerminalKeyRejectedInputDoesNotResetViewportOrSelection(t *testing.T) {
+	pane := &orderedInteractionPane{interactiveFakePane: interactiveFakePane{
+		fakePane:    fakePane{view: "ok"},
+		viewport:    terminalViewportState{OffsetFromBottom: 4},
+		selectionOn: true,
+	}}
+	app := NewApp(Options{Terminal: pane})
+	pane.viewport.OffsetFromBottom = 4
+	pane.selectionOn = true
+	resetCalls := pane.resetCalls
+	clearCalls := pane.clearCalls
+
+	app.Update(modifiedKey(tea.KeyRight, "", tea.ModSuper))
+
+	if pane.resetCalls != resetCalls {
+		t.Fatalf("ResetViewport calls = %d, want %d", pane.resetCalls, resetCalls)
+	}
+	if pane.clearCalls != clearCalls {
+		t.Fatalf("ClearSelection calls = %d, want %d", pane.clearCalls, clearCalls)
+	}
+	if got := pane.viewport.OffsetFromBottom; got != 4 {
+		t.Fatalf("viewport offset = %d, want 4", got)
+	}
+	if !pane.selectionOn {
+		t.Fatal("selection cleared for encoder-rejected key")
+	}
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("encoder-rejected key emitted command %+v, want none", cmd)
 	}
 }
 
@@ -809,8 +863,22 @@ func TestPrefixCopyModeTogglesSelectionMode(t *testing.T) {
 	if cmd != nil {
 		t.Fatalf("copy mode toggle command = %T, want nil", cmd)
 	}
-	if got := app.View().MouseMode; got != tea.MouseModeNone {
-		t.Fatalf("copy mode mouse mode = %v, want none", got)
+	if got := app.View().MouseMode; got != tea.MouseModeCellMotion {
+		t.Fatalf("copy mode mouse mode = %v, want cell motion", got)
+	}
+}
+
+func TestCopyModeMenuUsesTerminalSelectionLabel(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+	app.Update(modifiedKey('x', "", tea.ModCtrl))
+	app.Update(textKey("?"))
+
+	view := appContent(app)
+	if !strings.Contains(view, "Terminal Selection") {
+		t.Fatalf("menu missing Terminal Selection label:\n%s", view)
+	}
+	if strings.Contains(view, "Native Selection") {
+		t.Fatalf("menu retains Native Selection label:\n%s", view)
 	}
 }
 

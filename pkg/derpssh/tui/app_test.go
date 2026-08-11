@@ -50,10 +50,28 @@ func TestInviteCopyUsesBubbleTeaClipboardCommand(t *testing.T) {
 	}
 }
 
-func TestViewDeclarativelyDisablesMouseForSelectionAndInvite(t *testing.T) {
+func TestTerminalSelectionClearTickSequenceGuard(t *testing.T) {
+	pane := &interactiveFakePane{fakePane: fakePane{view: "ok"}}
+	app := NewApp(Options{Terminal: pane})
+	pane.selectionOn = true
+	pane.clearCalls = 0
+	app.selectionSeq = 4
+
+	app.applyMessage(clearTerminalSelectionMsg{seq: 3})
+	if !pane.SelectionActive() || pane.clearCalls != 0 {
+		t.Fatalf("stale clear tick changed selection: active=%v clears=%d", pane.SelectionActive(), pane.clearCalls)
+	}
+
+	app.applyMessage(clearTerminalSelectionMsg{seq: 4})
+	if pane.SelectionActive() || pane.clearCalls != 1 {
+		t.Fatalf("matching clear tick did not clear selection: active=%v clears=%d", pane.SelectionActive(), pane.clearCalls)
+	}
+}
+
+func TestViewKeepsMouseReportingForTerminalSelectionButNotInvite(t *testing.T) {
 	app := NewApp(Options{Side: "host", InviteCommand: "invite"})
 	app.copyMode = true
-	if got := app.View().MouseMode; got != tea.MouseModeNone {
+	if got := app.View().MouseMode; got != tea.MouseModeCellMotion {
 		t.Fatalf("selection mouse mode = %v", got)
 	}
 	app.copyMode = false
@@ -116,7 +134,7 @@ func TestTerminalDataUpdatesTerminalPane(t *testing.T) {
 }
 
 func TestShellExitedNoticeShowsRestartDialog(t *testing.T) {
-	app := NewApp(Options{Side: string(ModeHost), DisplayName: "root@hetz", Terminal: NewVTTerminalPane(80, 24)})
+	app := NewApp(Options{Side: string(ModeHost), DisplayName: "root@hetz", Terminal: newVTTerminalPaneForTest(t, 80, 24)})
 	app.SetWindowSize(100, 30)
 	app.Update(NoticeMsg{Title: "Shell exited", Body: "The shared shell exited."})
 
@@ -129,7 +147,7 @@ func TestShellExitedNoticeShowsRestartDialog(t *testing.T) {
 }
 
 func TestShellExitedRestartChoiceEmitsRestartCommand(t *testing.T) {
-	app := NewApp(Options{Side: string(ModeHost), DisplayName: "root@hetz", Terminal: NewVTTerminalPane(80, 24)})
+	app := NewApp(Options{Side: string(ModeHost), DisplayName: "root@hetz", Terminal: newVTTerminalPaneForTest(t, 80, 24)})
 	app.SetWindowSize(100, 30)
 	app.Update(NoticeMsg{Title: "Shell exited", Body: "The shared shell exited."})
 
@@ -1138,6 +1156,96 @@ func (p *fakePane) MouseMode() MouseMode {
 
 func (p *fakePane) InputMode() TerminalInputMode {
 	return p.input
+}
+
+type interactiveFakePane struct {
+	fakePane
+	viewport       terminalViewportState
+	scrolls        []int
+	resetCalls     int
+	begins         []terminalPoint
+	updates        []terminalPoint
+	finishCalls    int
+	words          []terminalPoint
+	clearCalls     int
+	selectionText  string
+	wordText       string
+	anchor         terminalPoint
+	selectionOn    bool
+	selectionMoved bool
+}
+
+func (p *interactiveFakePane) Resize(cols int, rows int) {
+	p.fakePane.Resize(cols, rows)
+	p.ClearSelection()
+}
+
+func (p *interactiveFakePane) ScrollLines(delta int) bool {
+	p.scrolls = append(p.scrolls, delta)
+	return true
+}
+
+func (p *interactiveFakePane) ResetViewport() bool {
+	p.resetCalls++
+	changed := p.viewport.OffsetFromBottom != 0
+	p.viewport.OffsetFromBottom = 0
+	return changed
+}
+
+func (p *interactiveFakePane) ViewportState() terminalViewportState {
+	return p.viewport
+}
+
+func (p *interactiveFakePane) BeginSelection(x, y int) bool {
+	point := terminalPoint{X: x, Y: y}
+	p.begins = append(p.begins, point)
+	p.anchor = point
+	p.selectionOn = true
+	p.selectionMoved = false
+	return true
+}
+
+func (p *interactiveFakePane) UpdateSelection(x, y int) bool {
+	point := terminalPoint{X: x, Y: y}
+	p.updates = append(p.updates, point)
+	if p.selectionOn && point != p.anchor {
+		p.selectionMoved = true
+	}
+	return p.selectionOn
+}
+
+func (p *interactiveFakePane) FinishSelection() (string, bool) {
+	p.finishCalls++
+	if !p.selectionOn || !p.selectionMoved {
+		p.selectionOn = false
+		return "", false
+	}
+	p.selectionOn = true
+	text := p.selectionText
+	if text == "" {
+		text = "selected text"
+	}
+	return text, true
+}
+
+func (p *interactiveFakePane) SelectWord(x, y int) (string, bool) {
+	p.words = append(p.words, terminalPoint{X: x, Y: y})
+	p.selectionOn = true
+	text := p.wordText
+	if text == "" {
+		text = "selected word"
+	}
+	return text, true
+}
+
+func (p *interactiveFakePane) ClearSelection() {
+	p.clearCalls++
+	p.selectionOn = false
+	p.selectionMoved = false
+}
+
+func (p *interactiveFakePane) SelectionActive() bool {
+	return p.selectionOn
 }
 
 type focusPane struct {

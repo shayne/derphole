@@ -5,12 +5,10 @@
 package tui
 
 import (
-	"fmt"
-	"regexp"
-	"strconv"
+	"io"
 	"strings"
 
-	"github.com/hinshun/vt10x"
+	uv "github.com/charmbracelet/ultraviolet"
 )
 
 type TerminalPane interface {
@@ -21,6 +19,22 @@ type TerminalPane interface {
 	InputMode() TerminalInputMode
 }
 
+type terminalViewportInteraction interface {
+	ScrollLines(delta int) bool
+	ResetViewport() bool
+	ViewportState() terminalViewportState
+}
+
+type terminalInteraction interface {
+	terminalViewportInteraction
+	BeginSelection(x, y int) bool
+	UpdateSelection(x, y int) bool
+	FinishSelection() (string, bool)
+	SelectWord(x, y int) (string, bool)
+	ClearSelection()
+	SelectionActive() bool
+}
+
 type MouseMode struct {
 	Enabled bool
 	SGR     bool
@@ -29,11 +43,19 @@ type MouseMode struct {
 type TerminalInputMode struct {
 	ApplicationCursor bool
 	BracketedPaste    bool
+	AlternateScroll   bool
 }
 
 type vtTerminalPane struct {
 	surface *vtTerminalSurface
 }
+
+var (
+	_ TerminalPane                = (*vtTerminalPane)(nil)
+	_ terminalViewportInteraction = (*vtTerminalPane)(nil)
+	_ terminalInteraction         = (*vtTerminalPane)(nil)
+	_ io.Closer                   = (*vtTerminalPane)(nil)
+)
 
 func NewVTTerminalPane(cols int, rows int) TerminalPane {
 	return &vtTerminalPane{surface: newVTTerminalSurface(terminalSize{Cols: cols, Rows: rows})}
@@ -64,50 +86,48 @@ func (p *vtTerminalPane) SetCursorActive(active bool) {
 	p.surface.SetCursorActive(active)
 }
 
-const (
-	_ int16 = 1 << iota
-	vtAttrUnderline
-	vtAttrBold
-	_
-	vtAttrItalic
-	vtAttrBlink
-)
+func (p *vtTerminalPane) ScrollLines(delta int) bool {
+	return p.surface.ScrollLines(delta)
+}
 
-const vtRenderedAttrMask = vtAttrUnderline | vtAttrBold | vtAttrItalic | vtAttrBlink
+func (p *vtTerminalPane) ResetViewport() bool {
+	return p.surface.ResetViewport()
+}
 
-type terminalCellStyle struct {
-	mode    int16
-	fg      vt10x.Color
-	bg      vt10x.Color
-	reverse bool
+func (p *vtTerminalPane) ViewportState() terminalViewportState {
+	return p.surface.ViewportState()
+}
+
+func (p *vtTerminalPane) BeginSelection(x, y int) bool { return p.surface.BeginSelection(x, y) }
+
+func (p *vtTerminalPane) UpdateSelection(x, y int) bool { return p.surface.UpdateSelection(x, y) }
+
+func (p *vtTerminalPane) FinishSelection() (string, bool) { return p.surface.FinishSelection() }
+
+func (p *vtTerminalPane) SelectWord(x, y int) (string, bool) { return p.surface.SelectWord(x, y) }
+
+func (p *vtTerminalPane) ClearSelection() { p.surface.ClearSelection() }
+
+func (p *vtTerminalPane) SelectionActive() bool { return p.surface.SelectionActive() }
+
+func (p *vtTerminalPane) Close() error {
+	return p.surface.Close()
 }
 
 type terminalCursorView struct {
-	cursor  vt10x.Cursor
+	cursor  terminalPoint
 	visible bool
 }
 
-func writeTerminalCell(b *strings.Builder, r rune, style terminalCellStyle, activeStyle *terminalCellStyle, styleActive *bool) {
-	if terminalBlankCellShouldUseDefaultStyle(r, style) {
-		style = defaultTerminalCellStyle()
+func writeTerminalCell(b *strings.Builder, content string, style uv.Style, activeStyle *uv.Style) {
+	if terminalBlankCellShouldUseDefaultStyle(content, style) {
+		style = uv.Style{}
 	}
-	if !style.equal(*activeStyle) {
-		resetTerminalStyle(b, styleActive)
-		if style.active() {
-			b.WriteString(style.sgr())
-			*styleActive = true
-		}
+	if !style.Equal(activeStyle) {
+		b.WriteString(style.Diff(activeStyle))
 		*activeStyle = style
 	}
-	b.WriteRune(r)
-}
-
-func resetTerminalStyle(b *strings.Builder, styleActive *bool) {
-	if !*styleActive {
-		return
-	}
-	b.WriteString("\x1b[0m")
-	*styleActive = false
+	b.WriteString(content)
 }
 
 func (c terminalCursorView) lastColumn(surface TerminalSurface, width int, y int) int {
@@ -118,13 +138,16 @@ func (c terminalCursorView) lastColumn(surface TerminalSurface, width int, y int
 	return last
 }
 
-func (c terminalCursorView) styleCell(cell terminalCell, x int, y int) terminalCellStyle {
+func (c terminalCursorView) styleCell(cell terminalCell, x int, y int) uv.Style {
+	style := cell.Style
+	if cell.Selected {
+		style.Attrs ^= uv.AttrReverse
+	}
 	if c.visible && c.cursor.Y == y && c.cursor.X == x {
-		style := cell.Style
-		style.reverse = true
+		style.Attrs |= uv.AttrReverse
 		return style
 	}
-	return cell.Style
+	return style
 }
 
 func (c terminalCursorView) visibleAt(y int, width int) bool {
@@ -134,7 +157,13 @@ func (c terminalCursorView) visibleAt(y int, width int) bool {
 func terminalLastRenderableColumn(surface TerminalSurface, width int, y int) int {
 	for x := width - 1; x >= 0; x-- {
 		cell := surface.Cell(x, y)
-		if cell.Rune != ' ' {
+		if cell.Selected {
+			return x
+		}
+		if cell.Width == 0 {
+			continue
+		}
+		if cell.Content != "" && cell.Content != " " {
 			return x
 		}
 		if terminalBlankCellHasVisibleStyle(cell) {
@@ -144,106 +173,24 @@ func terminalLastRenderableColumn(surface TerminalSurface, width int, y int) int
 	return -1
 }
 
-func terminalBlankCellShouldUseDefaultStyle(r rune, style terminalCellStyle) bool {
-	return r == ' ' && !terminalCellVisibleOnBlank(style)
+func normalizeTerminalCell(cell terminalCell) terminalCell {
+	if cell.Content == "" {
+		cell.Content = " "
+		cell.Width = 1
+	}
+	return cell
+}
+
+func terminalBlankCellShouldUseDefaultStyle(content string, style uv.Style) bool {
+	return content == " " && !terminalCellVisibleOnBlank(style)
 }
 
 func terminalBlankCellHasVisibleStyle(cell terminalCell) bool {
-	return cell.Rune == ' ' && terminalCellVisibleOnBlank(cell.Style)
+	return cell.Content == " " && terminalCellVisibleOnBlank(cell.Style)
 }
 
-func terminalStyleFromGlyph(glyph vt10x.Glyph) terminalCellStyle {
-	if glyph.Char == 0 {
-		return defaultTerminalCellStyle()
-	}
-	return terminalStyleFromAttr(glyph)
-}
-
-func terminalStyleFromAttr(glyph vt10x.Glyph) terminalCellStyle {
-	return terminalCellStyle{
-		mode: glyph.Mode & vtRenderedAttrMask,
-		fg:   glyph.FG,
-		bg:   glyph.BG,
-	}
-}
-
-func defaultTerminalCellStyle() terminalCellStyle {
-	return terminalCellStyle{fg: vt10x.DefaultFG, bg: vt10x.DefaultBG}
-}
-
-func (s terminalCellStyle) equal(other terminalCellStyle) bool {
-	return s.mode == other.mode && s.fg == other.fg && s.bg == other.bg && s.reverse == other.reverse
-}
-
-func (s terminalCellStyle) active() bool {
-	return s.mode != 0 || s.fg != vt10x.DefaultFG || s.bg != vt10x.DefaultBG || s.reverse
-}
-
-func terminalCellVisibleOnBlank(style terminalCellStyle) bool {
-	return style.reverse || style.bg != vt10x.DefaultBG
-}
-
-func (s terminalCellStyle) sgr() string {
-	codes := make([]string, 0, 7)
-	if s.mode&vtAttrBold != 0 {
-		codes = append(codes, "1")
-	}
-	if s.reverse {
-		codes = append(codes, "7")
-	}
-	if s.mode&vtAttrItalic != 0 {
-		codes = append(codes, "3")
-	}
-	if s.mode&vtAttrUnderline != 0 {
-		codes = append(codes, "4")
-	}
-	if s.mode&vtAttrBlink != 0 {
-		codes = append(codes, "5")
-	}
-	appendTerminalColorCodes(&codes, s.fg, true)
-	appendTerminalColorCodes(&codes, s.bg, false)
-	if len(codes) == 0 {
-		return ""
-	}
-	return "\x1b[" + strings.Join(codes, ";") + "m"
-}
-
-func appendTerminalColorCodes(codes *[]string, color vt10x.Color, foreground bool) {
-	if color == vt10x.DefaultFG || color == vt10x.DefaultBG || color > 0xFFFFFF {
-		return
-	}
-	n := int(color)
-	if color < 16 {
-		base := 30
-		brightBase := 90
-		if !foreground {
-			base = 40
-			brightBase = 100
-		}
-		if n < 8 {
-			*codes = append(*codes, strconv.Itoa(base+n))
-		} else {
-			*codes = append(*codes, strconv.Itoa(brightBase+n-8))
-		}
-		return
-	}
-	if color < 256 {
-		target := 38
-		if !foreground {
-			target = 48
-		}
-		*codes = append(*codes, fmt.Sprintf("%d;5;%d", target, n))
-		return
-	}
-
-	target := 38
-	if !foreground {
-		target = 48
-	}
-	r := int((color >> 16) & 0xff)
-	g := int((color >> 8) & 0xff)
-	b := int(color & 0xff)
-	*codes = append(*codes, fmt.Sprintf("%d;2;%d;%d;%d", target, r, g, b))
+func terminalCellVisibleOnBlank(style uv.Style) bool {
+	return style.Attrs&uv.AttrReverse != 0 || style.Bg != nil
 }
 
 type staticTerminalPane struct {
@@ -267,75 +214,4 @@ func (p *staticTerminalPane) MouseMode() MouseMode {
 
 func (p *staticTerminalPane) InputMode() TerminalInputMode {
 	return TerminalInputMode{}
-}
-
-var privateModePattern = regexp.MustCompile(`\x1b\[\?([0-9;]+)([hl])`)
-
-func TrackMouseMode(current MouseMode, output []byte) MouseMode {
-	next := current
-	for _, match := range privateModePattern.FindAllSubmatch(output, -1) {
-		enable := len(match[2]) == 1 && match[2][0] == 'h'
-		for _, raw := range strings.Split(string(match[1]), ";") {
-			param, err := strconv.Atoi(raw)
-			if err != nil {
-				continue
-			}
-			switch param {
-			case 1000, 1002, 1003:
-				next.Enabled = enable
-				if !enable {
-					next.SGR = false
-				}
-			case 1006:
-				if enable {
-					next.Enabled = true
-				}
-				next.SGR = enable
-			}
-		}
-	}
-	if !next.Enabled {
-		next.SGR = false
-	}
-	return next
-}
-
-func TrackInputMode(current TerminalInputMode, output []byte) TerminalInputMode {
-	next := current
-	for _, match := range privateModePattern.FindAllSubmatch(output, -1) {
-		enable := len(match[2]) == 1 && match[2][0] == 'h'
-		for _, raw := range strings.Split(string(match[1]), ";") {
-			param, err := strconv.Atoi(raw)
-			if err != nil {
-				continue
-			}
-			switch param {
-			case 1:
-				next.ApplicationCursor = enable
-			case 2004:
-				next.BracketedPaste = enable
-			}
-		}
-	}
-	return next
-}
-
-func incompletePrivateModeTail(s string) string {
-	idx := strings.LastIndex(s, "\x1b[?")
-	if idx == -1 {
-		return ""
-	}
-	tail := s[idx:]
-	if privateModePattern.MatchString(tail) {
-		return ""
-	}
-	if len(tail) > 32 {
-		return ""
-	}
-	for _, r := range tail[len("\x1b[?"):] {
-		if (r < '0' || r > '9') && r != ';' {
-			return ""
-		}
-	}
-	return tail
 }

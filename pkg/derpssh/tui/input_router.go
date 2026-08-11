@@ -35,7 +35,46 @@ func (r InputRouter) RouteKey(msg tea.KeyPressMsg) tea.Cmd {
 	if a.focus == FocusChat {
 		return a.handleChatKey(msg)
 	}
-	return a.handleTerminalKey(msg)
+	if a.handleTerminalViewportKey(msg) {
+		return nil
+	}
+	data, ok := EncodeTerminalKeyWithMode(msg, a.terminal.InputMode())
+	if !ok {
+		return nil
+	}
+	a.resetTerminalViewportForInput()
+	a.emit(TerminalInputCommand{Data: data})
+	return nil
+}
+
+func (a *App) handleTerminalViewportKey(msg tea.KeyPressMsg) bool {
+	if msg.Mod != 0 || (msg.Code != tea.KeyPgUp && msg.Code != tea.KeyPgDown) {
+		return false
+	}
+	interaction, ok := a.terminal.(terminalViewportInteraction)
+	if !ok {
+		return false
+	}
+	state := interaction.ViewportState()
+	inputMode := a.terminal.InputMode()
+	if state.AlternateScreen || a.terminal.MouseMode().Enabled || inputMode.ApplicationCursor || inputMode.BracketedPaste {
+		return false
+	}
+	delta := state.Rows
+	if msg.Code == tea.KeyPgDown {
+		delta = -delta
+	}
+	interaction.ScrollLines(delta)
+	return true
+}
+
+func (a *App) resetTerminalViewportForInput() {
+	if interaction, ok := a.terminal.(terminalViewportInteraction); ok {
+		interaction.ResetViewport()
+	}
+	if interaction, ok := a.terminal.(terminalInteraction); ok {
+		interaction.ClearSelection()
+	}
 }
 
 func (r InputRouter) RoutePaste(msg tea.PasteMsg) tea.Cmd {
@@ -48,6 +87,7 @@ func (r InputRouter) RoutePaste(msg tea.PasteMsg) tea.Cmd {
 		a.composer, cmd = a.composer.Update(msg)
 		return cmd
 	}
+	a.resetTerminalViewportForInput()
 	a.emit(TerminalInputCommand{Data: EncodeTerminalPaste(msg, a.terminal.InputMode())})
 	return nil
 }

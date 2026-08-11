@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -69,6 +70,76 @@ func TestTUIConsoleStopBeforeStartDoesNotQuitProgram(t *testing.T) {
 	case <-time.After(time.Second):
 		program.releaseQuit()
 		t.Fatal("Stop blocked before Start")
+	}
+}
+
+func TestTUIConsoleStopClosesTerminalPaneOnce(t *testing.T) {
+	pane := newClosingTerminalPane()
+	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, pane)
+
+	console.Stop()
+	console.Stop()
+
+	if got := pane.closeCount.Load(); got != 1 {
+		t.Fatalf("terminal pane Close calls = %d, want 1", got)
+	}
+}
+
+func TestTUIConsoleProgramExitClosesTerminalPane(t *testing.T) {
+	pane := newClosingTerminalPane()
+	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, pane)
+	console.program = &sendBeforeRunProgram{}
+	console.Start(context.Background())
+
+	select {
+	case <-pane.closeCalled:
+	case <-time.After(time.Second):
+		t.Fatal("Program.Run exit did not close terminal pane")
+	}
+	if got := pane.closeCount.Load(); got != 1 {
+		t.Fatalf("terminal pane Close calls = %d, want 1", got)
+	}
+}
+
+func TestTUIConsoleStopAcceptsPaneWithoutCloser(t *testing.T) {
+	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, &recordingTerminalPane{})
+
+	console.Stop()
+}
+
+func TestTUIConsoleStopAndProgramExitCloseTerminalPaneOnce(t *testing.T) {
+	pane := newClosingTerminalPane()
+	console := newHeadlessTUIConsole(tui.ModeHost, 100, 30, pane)
+	program := newExternallyClosedProgram()
+	console.program = program
+	console.Start(context.Background())
+
+	select {
+	case <-program.runEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Program.Run did not start")
+	}
+
+	var shutdown sync.WaitGroup
+	shutdown.Add(2)
+	go func() {
+		defer shutdown.Done()
+		program.close()
+	}()
+	go func() {
+		defer shutdown.Done()
+		console.Stop()
+	}()
+	shutdown.Wait()
+	program.Wait()
+
+	select {
+	case <-pane.closeCalled:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not close terminal pane")
+	}
+	if got := pane.closeCount.Load(); got != 1 {
+		t.Fatalf("terminal pane Close calls = %d, want 1", got)
 	}
 }
 
@@ -1042,6 +1113,25 @@ type recordingTerminalPane struct {
 	cols   int
 	rows   int
 	view   string
+}
+
+type closingTerminalPane struct {
+	recordingTerminalPane
+	closeCount  atomic.Int32
+	closeCalled chan struct{}
+	closeOnce   sync.Once
+}
+
+func newClosingTerminalPane() *closingTerminalPane {
+	return &closingTerminalPane{closeCalled: make(chan struct{})}
+}
+
+func (p *closingTerminalPane) Close() error {
+	p.closeCount.Add(1)
+	p.closeOnce.Do(func() {
+		close(p.closeCalled)
+	})
+	return nil
 }
 
 func (p *recordingTerminalPane) Write(b []byte) (int, error) {

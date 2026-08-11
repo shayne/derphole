@@ -103,6 +103,8 @@ type tuiConsole struct {
 	programNotify         chan struct{}
 	programQuitOnce       sync.Once
 	programWaitOnce       sync.Once
+	terminalCloser        io.Closer
+	terminalCloseOnce     sync.Once
 	startOnce             sync.Once
 	cancel                context.CancelFunc
 	lifecycleMu           sync.Mutex
@@ -158,6 +160,9 @@ func newTUIConsole(opts tuiConsoleOptions) *tuiConsole {
 		runtime:                   newConsoleRuntimeState(opts),
 		approvals:                 make(map[string]chan protocol.Role),
 		allowHeadlessApprovalWait: opts.AllowHeadlessApprovalWait,
+	}
+	if closer, ok := terminal.(io.Closer); ok {
+		c.terminalCloser = closer
 	}
 	c.configureProgram(opts)
 	return c
@@ -253,6 +258,7 @@ func (c *tuiConsole) Start(ctx context.Context) {
 			_, _ = c.program.Run()
 			c.handleProgramExit(runCtx)
 			c.restoreTerminal()
+			c.closeTerminalPane()
 			cancel()
 		}()
 	})
@@ -270,6 +276,15 @@ func (c *tuiConsole) Stop() {
 		}
 		c.restoreTerminal()
 	}
+	c.closeTerminalPane()
+}
+
+func (c *tuiConsole) closeTerminalPane() {
+	c.terminalCloseOnce.Do(func() {
+		if c.terminalCloser != nil {
+			_ = c.terminalCloser.Close()
+		}
+	})
 }
 
 func (c *tuiConsole) SetCommandCallbacks(callbacks tuiConsoleCallbacks) {

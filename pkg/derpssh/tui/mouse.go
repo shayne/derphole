@@ -5,10 +5,18 @@
 package tui
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+)
+
+const terminalWheelRows = 3
+
+const (
+	terminalSelectionAutoscrollMinRows = 3
+	terminalSelectionAutoscrollMaxRows = 15
 )
 
 var mouseButtonCodes = map[tea.MouseButton]int{
@@ -99,8 +107,8 @@ func HandleMouse(app *App, pointer pointerMsg) tea.Cmd {
 	if app == nil {
 		return nil
 	}
-	if pointer.action() == pointerRelease {
-		defer app.clearPointerCapture()
+	if pointer.action() == pointerRelease && !app.terminalSGRReleasePending {
+		defer app.releasePointerCapture()
 	}
 	if cmd, handled := app.handleModalMouse(pointer); handled {
 		return cmd
@@ -109,7 +117,9 @@ func HandleMouse(app *App, pointer pointerMsg) tea.Cmd {
 		if isMouseClick(pointer) && pointer.Target != targetTerminal {
 			return app.setCopyMode(false)
 		}
-		return nil
+		if pointer.Target != targetTerminal {
+			return nil
+		}
 	}
 	return app.handleTargetMouse(pointer)
 }
@@ -123,8 +133,7 @@ func (a *App) handleTargetMouse(pointer pointerMsg) tea.Cmd {
 		a.handleChatMouse(pointer)
 		return nil
 	case pointer.Target == targetTerminal:
-		a.handleTerminalMouse(pointer)
-		return nil
+		return a.handleTerminalMouse(pointer)
 	case strings.HasPrefix(string(pointer.Target), "action:"):
 		return a.handleActionMouse(pointer)
 	case strings.HasPrefix(string(pointer.Target), "peer:"):
@@ -304,8 +313,27 @@ func (a *App) clearMousePress() {
 }
 
 func (a *App) clearPointerCapture() {
+	a.releasePointerCapture()
+	a.clearTerminalSelection()
+}
+
+func (a *App) releasePointerCapture() {
+	a.stopTerminalSelectionAutoscroll()
+	a.terminalSGRReleasePending = false
 	a.pointerCapture = ""
 	a.draggingDivider = false
+	if a.terminalGesture == terminalGestureDrag {
+		a.terminalGesture = terminalGestureNone
+	}
+}
+
+func (a *App) clearTerminalSelection() {
+	a.terminalGesture = terminalGestureNone
+	a.lastTerminalClick = terminalClick{}
+	a.selectionSeq++
+	if interaction, ok := a.terminal.(terminalInteraction); ok {
+		interaction.ClearSelection()
+	}
 }
 
 func (a *App) handleDividerMouse(msg pointerMsg) bool {
@@ -439,15 +467,253 @@ func (a *App) handleChatScrollMouse(msg pointerMsg) bool {
 	}
 }
 
-func (a *App) handleTerminalMouse(msg pointerMsg) {
+func (a *App) handleTerminalMouse(msg pointerMsg) tea.Cmd {
+	interaction, interactive := a.terminal.(terminalInteraction)
+	mode := a.terminal.MouseMode()
+	forceLocal := a.shouldHandleTerminalMouseLocally(msg)
+	if !interactive {
+		return a.handleNoninteractiveTerminalMouse(msg, mode, forceLocal)
+	}
+	if mode.Enabled && mode.SGR && !forceLocal {
+		a.resetTerminalClickCandidate()
+		interaction.ResetViewport()
+		return a.forwardTerminalMouse(msg, mode)
+	}
+
+	terminal := a.currentTerminalRect()
+	point, ok := terminalMousePoint(msg.Mouse, terminal)
+	if !ok {
+		return nil
+	}
+	switch msg.action() {
+	case pointerClick:
+		return a.handleLocalTerminalClick(interaction, msg, point)
+	case pointerMotion:
+		return a.handleLocalTerminalMotion(interaction, msg, point, terminal)
+	case pointerRelease:
+		return a.handleLocalTerminalRelease(interaction, point)
+	}
+	return nil
+}
+
+func (a *App) handleNoninteractiveTerminalMouse(msg pointerMsg, mode terminalMouseMode, forceLocal bool) tea.Cmd {
+	if forceLocal {
+		if msg.action() == pointerClick && msg.Mouse.Button == tea.MouseLeft {
+			a.pointerCapture = targetTerminal
+			a.terminalGesture = terminalGestureDrag
+		}
+		return nil
+	}
 	if msg.action() == pointerClick {
 		a.focusTerminal()
 	}
-	mode := a.terminal.MouseMode()
-	if !mode.Enabled || !mode.SGR {
+	return a.forwardTerminalMouse(msg, mode)
+}
+
+func (a *App) handleLocalTerminalClick(interaction terminalInteraction, msg pointerMsg, point terminalPoint) tea.Cmd {
+	if msg.Mouse.Button == tea.MouseWheelUp || msg.Mouse.Button == tea.MouseWheelDown {
+		a.resetTerminalClickCandidate()
+		a.handleTerminalWheel(interaction, msg, point)
+		return nil
+	}
+	if msg.Mouse.Button != tea.MouseLeft {
+		a.resetTerminalClickCandidate()
+		return nil
+	}
+	a.focusTerminal()
+	if a.isTerminalDoubleClick(point, msg.Mouse.Mod) {
+		a.resetTerminalClickCandidate()
+		a.selectionSeq++
+		if text, selected := interaction.SelectWord(point.X, point.Y); selected {
+			a.terminalGesture = terminalGestureWord
+			a.pointerCapture = targetTerminal
+			return tea.Batch(tea.SetClipboard(text), terminalSelectionClearTick(a.selectionSeq))
+		}
+	}
+	a.selectionSeq++
+	a.stopTerminalSelectionAutoscroll()
+	a.recordTerminalClickCandidate(point, msg.Mouse.Mod)
+	if interaction.BeginSelection(point.X, point.Y) {
+		a.terminalGesture = terminalGestureDrag
+		a.pointerCapture = targetTerminal
+	}
+	return nil
+}
+
+func (a *App) handleLocalTerminalMotion(
+	interaction terminalInteraction,
+	msg pointerMsg,
+	point terminalPoint,
+	terminal Rect,
+) tea.Cmd {
+	if a.terminalGesture != terminalGestureDrag {
+		return nil
+	}
+	a.resetTerminalClickCandidate()
+	interaction.UpdateSelection(point.X, point.Y)
+	if interaction.ViewportState().AlternateScreen {
+		a.stopTerminalSelectionAutoscroll()
+		return nil
+	}
+	return a.updateTerminalSelectionAutoscroll(msg.Mouse, terminal)
+}
+
+func (a *App) handleLocalTerminalRelease(interaction terminalInteraction, point terminalPoint) tea.Cmd {
+	if a.terminalGesture == terminalGestureWord {
+		a.terminalGesture = terminalGestureNone
+		return nil
+	}
+	if a.terminalGesture != terminalGestureDrag {
+		return nil
+	}
+	interaction.UpdateSelection(point.X, point.Y)
+	text, selected := interaction.FinishSelection()
+	if !selected {
+		return nil
+	}
+	a.resetTerminalClickCandidate()
+	cmd := tea.SetClipboard(text)
+	interaction.ClearSelection()
+	return cmd
+}
+
+func (a *App) updateTerminalSelectionAutoscroll(mouse tea.Mouse, terminal Rect) tea.Cmd {
+	if mouse.Y >= terminal.Y && mouse.Y < terminal.Y+terminal.H {
+		a.stopTerminalSelectionAutoscroll()
+		return nil
+	}
+	a.terminalPointer = terminalPoint{X: mouse.X, Y: mouse.Y}
+	a.terminalAutoscrollSeq++
+	a.terminalAutoscrollActive = true
+	return terminalSelectionAutoscrollTick(a.terminalAutoscrollSeq)
+}
+
+func (a *App) stopTerminalSelectionAutoscroll() {
+	if a.terminalAutoscrollActive {
+		a.terminalAutoscrollSeq++
+	}
+	a.terminalAutoscrollActive = false
+}
+
+func (a *App) handleTerminalSelectionAutoscroll(msg terminalSelectionAutoscrollMsg) tea.Cmd {
+	if !a.terminalAutoscrollActive || msg.seq != a.terminalAutoscrollSeq ||
+		a.pointerCapture != targetTerminal || a.terminalGesture != terminalGestureDrag || a.modalActive() {
+		return nil
+	}
+	interaction, ok := a.terminal.(terminalInteraction)
+	if !ok {
+		a.stopTerminalSelectionAutoscroll()
+		return nil
+	}
+	terminal := a.currentTerminalRect()
+	distance, direction := terminalSelectionOverflow(a.terminalPointer.Y, terminal)
+	if distance == 0 {
+		a.stopTerminalSelectionAutoscroll()
+		return nil
+	}
+	rows := minInt(maxInt(distance, terminalSelectionAutoscrollMinRows), terminalSelectionAutoscrollMaxRows)
+	interaction.ScrollLines(direction * rows)
+	point, pointOK := terminalMousePoint(tea.Mouse{X: a.terminalPointer.X, Y: a.terminalPointer.Y}, terminal)
+	if pointOK {
+		interaction.UpdateSelection(point.X, point.Y)
+	}
+	return terminalSelectionAutoscrollTick(msg.seq)
+}
+
+func terminalSelectionOverflow(y int, terminal Rect) (distance int, direction int) {
+	if y < terminal.Y {
+		return terminal.Y - y, 1
+	}
+	lastRow := terminal.Y + terminal.H - 1
+	if y > lastRow {
+		return y - lastRow, -1
+	}
+	return 0, 0
+}
+
+func (a *App) isTerminalDoubleClick(point terminalPoint, mod tea.KeyMod) bool {
+	if mod != 0 || a.lastTerminalClick.at.IsZero() || a.lastTerminalClick.point != point {
+		return false
+	}
+	elapsed := a.currentTime().Sub(a.lastTerminalClick.at)
+	return elapsed >= 0 && elapsed <= terminalDoubleClickInterval
+}
+
+func (a *App) recordTerminalClickCandidate(point terminalPoint, mod tea.KeyMod) {
+	if mod != 0 {
+		a.resetTerminalClickCandidate()
 		return
+	}
+	a.lastTerminalClick = terminalClick{point: point, at: a.currentTime()}
+}
+
+func (a *App) resetTerminalClickCandidate() {
+	a.lastTerminalClick = terminalClick{}
+}
+
+func (a *App) handleTerminalWheel(interaction terminalInteraction, msg pointerMsg, point terminalPoint) {
+	delta := terminalWheelRows
+	key := tea.KeyUp
+	if msg.Mouse.Button == tea.MouseWheelDown {
+		delta = -terminalWheelRows
+		key = tea.KeyDown
+	}
+	if interaction.ViewportState().AlternateScreen {
+		mode := a.terminal.InputMode()
+		mouseMode := a.terminal.MouseMode()
+		if mouseMode.Enabled && mouseMode.SGR || !mode.AlternateScroll {
+			return
+		}
+		if data, ok := EncodeTerminalKeyWithMode(tea.KeyPressMsg{Code: key}, mode); ok {
+			a.emit(TerminalInputCommand{Data: bytes.Repeat(data, terminalWheelRows)})
+		}
+		return
+	}
+	interaction.ScrollLines(delta)
+	if a.terminalGesture == terminalGestureDrag {
+		interaction.UpdateSelection(point.X, point.Y)
+	}
+}
+
+func (a *App) forwardTerminalMouse(msg pointerMsg, mode MouseMode) tea.Cmd {
+	if msg.action() == pointerRelease && a.terminalSGRReleasePending {
+		defer func() { a.terminalSGRReleasePending = false }()
+	}
+	if !mode.Enabled || !mode.SGR {
+		return nil
 	}
 	if data, ok := EncodeSGRMouse(msg.Event, a.currentTerminalRect()); ok {
 		a.emit(TerminalInputCommand{Data: data})
+		if msg.action() == pointerClick &&
+			(msg.Mouse.Button == tea.MouseMiddle || msg.Mouse.Button == tea.MouseRight) &&
+			a.terminalGesture != terminalGestureNone {
+			a.terminalSGRReleasePending = true
+		}
 	}
+	return nil
+}
+
+func (a *App) shouldHandleTerminalMouseLocally(msg pointerMsg) bool {
+	if msg.action() == pointerRelease && a.terminalSGRReleasePending {
+		return false
+	}
+	if !a.copyMode && a.terminalGesture == terminalGestureNone {
+		return false
+	}
+	switch msg.Mouse.Button {
+	case tea.MouseLeft, tea.MouseWheelUp, tea.MouseWheelDown:
+		return true
+	default:
+		return msg.action() == pointerRelease && a.terminalGesture != terminalGestureNone
+	}
+}
+
+func terminalMousePoint(mouse tea.Mouse, terminal Rect) (terminalPoint, bool) {
+	if terminal.empty() {
+		return terminalPoint{}, false
+	}
+	return terminalPoint{
+		X: minInt(maxInt(mouse.X-terminal.X, 0), terminal.W-1),
+		Y: minInt(maxInt(mouse.Y-terminal.Y, 0), terminal.H-1),
+	}, true
 }

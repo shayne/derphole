@@ -5,8 +5,10 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -250,6 +252,685 @@ func TestSelectionModeRejectsNonterminalTargetAtTerminalCoordinates(t *testing.T
 	}
 }
 
+func TestMouseLocalTerminalDrag(t *testing.T) {
+	pane := &interactiveFakePane{fakePane: fakePane{view: "ok"}}
+	app := NewApp(Options{Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	terminal := app.currentTerminalRect()
+
+	_, cmd := app.Update(leftClick(terminal.X+4, terminal.Y+3))
+	if cmd != nil {
+		t.Fatalf("selection press command = %T, want nil", cmd)
+	}
+	if app.focus != FocusTerminal {
+		t.Fatalf("focus = %v, want terminal", app.focus)
+	}
+	if app.pointerCapture != targetTerminal {
+		t.Fatalf("pointer capture = %q, want terminal", app.pointerCapture)
+	}
+	if got := pane.begins; len(got) != 1 || got[0] != (terminalPoint{X: 4, Y: 3}) {
+		t.Fatalf("BeginSelection calls = %+v, want (4,3)", got)
+	}
+
+	_, cmd = app.Update(tea.MouseMotionMsg{X: terminal.X + 7, Y: 0, Button: tea.MouseLeft})
+	if cmd == nil {
+		t.Fatal("selection edge motion did not schedule autoscroll")
+	}
+	if got := pane.updates; len(got) != 1 || got[0] != (terminalPoint{X: 7, Y: 0}) {
+		t.Fatalf("UpdateSelection calls = %+v, want captured header motion at pane edge (7,0)", got)
+	}
+
+	_, cmd = app.Update(leftRelease(terminal.X+7, 0))
+	if pane.finishCalls != 1 {
+		t.Fatalf("FinishSelection calls = %d, want 1", pane.finishCalls)
+	}
+	if app.pointerCapture != "" {
+		t.Fatalf("pointer capture after release = %q, want empty", app.pointerCapture)
+	}
+	if cmd == nil || fmt.Sprint(cmd()) != "selected text" {
+		t.Fatalf("selection release clipboard = %v, want selected text", cmd)
+	}
+	if pane.SelectionActive() {
+		t.Fatal("selection remains active after completed drag copy")
+	}
+}
+
+func TestMouseTerminalClickWithoutDrag(t *testing.T) {
+	pane := &interactiveFakePane{fakePane: fakePane{view: "ok"}}
+	app := NewApp(Options{Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	terminal := app.currentTerminalRect()
+
+	app.Update(leftClick(terminal.X+2, terminal.Y+2))
+	_, cmd := app.Update(leftRelease(terminal.X+2, terminal.Y+2))
+
+	if pane.finishCalls != 1 {
+		t.Fatalf("FinishSelection calls = %d, want 1", pane.finishCalls)
+	}
+	if cmd != nil {
+		t.Fatalf("click-only selection command = %T, want nil", cmd)
+	}
+}
+
+func TestMouseTerminalWheelLocal(t *testing.T) {
+	pane := &interactiveFakePane{fakePane: fakePane{view: "ok"}}
+	app := NewApp(Options{Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	terminal := app.currentTerminalRect()
+
+	app.Update(tea.MouseWheelMsg{X: terminal.X + 2, Y: terminal.Y + 4, Button: tea.MouseWheelUp})
+	app.Update(tea.MouseWheelMsg{X: terminal.X + 2, Y: terminal.Y + 4, Button: tea.MouseWheelDown})
+
+	if got, want := fmt.Sprint(pane.scrolls), "[3 -3]"; got != want {
+		t.Fatalf("ScrollLines calls = %s, want %s", got, want)
+	}
+}
+
+func TestMouseTerminalWheelDuringActiveDrag(t *testing.T) {
+	pane := &interactiveFakePane{fakePane: fakePane{view: "ok"}}
+	app := NewApp(Options{Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	terminal := app.currentTerminalRect()
+
+	app.Update(leftClick(terminal.X+2, terminal.Y+2))
+	app.Update(tea.MouseWheelMsg{X: terminal.X + 6, Y: terminal.Y + 5, Button: tea.MouseWheelUp})
+
+	if got, want := fmt.Sprint(pane.scrolls), "[3]"; got != want {
+		t.Fatalf("ScrollLines calls = %s, want %s", got, want)
+	}
+	if got := pane.updates; len(got) != 1 || got[0] != (terminalPoint{X: 6, Y: 5}) {
+		t.Fatalf("UpdateSelection calls after wheel = %+v, want (6,5)", got)
+	}
+}
+
+func TestMouseTerminalWheelSGR(t *testing.T) {
+	pane := &interactiveFakePane{fakePane: fakePane{view: "ok", mouse: MouseMode{Enabled: true, SGR: true}}, viewport: terminalViewportState{OffsetFromBottom: 7}}
+	app := NewApp(Options{Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	terminal := app.currentTerminalRect()
+
+	app.Update(tea.MouseWheelMsg{X: terminal.X + 2, Y: terminal.Y + 4, Button: tea.MouseWheelUp})
+
+	if len(pane.scrolls) != 0 {
+		t.Fatalf("local ScrollLines calls = %v, want none", pane.scrolls)
+	}
+	if pane.resetCalls != 1 || pane.viewport.OffsetFromBottom != 0 {
+		t.Fatalf("ResetViewport calls, offset = %d, %d; want 1, 0", pane.resetCalls, pane.viewport.OffsetFromBottom)
+	}
+	got, ok := readCommand(app).(TerminalInputCommand)
+	if !ok || string(got.Data) != "\x1b[<64;3;5M" {
+		t.Fatalf("SGR wheel command = %#v, want wheel-up bytes", got)
+	}
+}
+
+func TestMouseTerminalWheelForcedSelection(t *testing.T) {
+	pane := &interactiveFakePane{fakePane: fakePane{view: "ok", mouse: MouseMode{Enabled: true, SGR: true}}}
+	app := NewApp(Options{Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	app.copyMode = true
+	terminal := app.currentTerminalRect()
+
+	app.Update(tea.MouseWheelMsg{X: terminal.X + 2, Y: terminal.Y + 4, Button: tea.MouseWheelDown})
+
+	if got, want := fmt.Sprint(pane.scrolls), "[-3]"; got != want {
+		t.Fatalf("forced ScrollLines calls = %s, want %s", got, want)
+	}
+	if pane.resetCalls != 0 {
+		t.Fatalf("forced ResetViewport calls = %d, want 0", pane.resetCalls)
+	}
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("forced wheel emitted terminal command %+v", cmd)
+	}
+}
+
+func TestMouseForcedSelectionAlternateSGRWheelDoesNotEmitAlternateScroll(t *testing.T) {
+	pane := &interactiveFakePane{
+		fakePane: fakePane{
+			view:  "ok",
+			mouse: MouseMode{Enabled: true, SGR: true},
+			input: TerminalInputMode{AlternateScroll: true},
+		},
+		viewport: terminalViewportState{AlternateScreen: true},
+	}
+	app := NewApp(Options{Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	app.copyMode = true
+	terminal := app.currentTerminalRect()
+
+	app.Update(tea.MouseWheelMsg{X: terminal.X + 2, Y: terminal.Y + 4, Button: tea.MouseWheelUp})
+
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("forced alternate-screen SGR wheel emitted remote input %+v, want none", cmd)
+	}
+	if len(pane.scrolls) != 0 {
+		t.Fatalf("forced alternate-screen SGR wheel scrolled host viewport: %v", pane.scrolls)
+	}
+}
+
+func TestMouseForcedSelectionCustomPaneForwardsNonlocalSGRButtons(t *testing.T) {
+	tests := []struct {
+		name      string
+		button    tea.MouseButton
+		wantPress string
+	}{
+		{name: "middle", button: tea.MouseMiddle, wantPress: "\x1b[<1;3;5M"},
+		{name: "right", button: tea.MouseRight, wantPress: "\x1b[<2;3;5M"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pane := &fakePane{view: "ok", mouse: MouseMode{Enabled: true, SGR: true}}
+			app := NewApp(Options{Terminal: pane})
+			app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+			drainCommands(app)
+			app.copyMode = true
+			terminal := app.currentTerminalRect()
+			x, y := terminal.X+2, terminal.Y+4
+
+			app.Update(clickAt(x, y, tt.button))
+			press, ok := readCommand(app).(TerminalInputCommand)
+			if !ok || string(press.Data) != tt.wantPress {
+				t.Fatalf("forced custom-pane %s press = %#v, want %q", tt.name, press, tt.wantPress)
+			}
+			app.Update(releaseAt(x, y, tea.MouseNone))
+			release, ok := readCommand(app).(TerminalInputCommand)
+			if !ok || string(release.Data) != "\x1b[<0;3;5m" {
+				t.Fatalf("forced custom-pane %s release = %#v, want forwarded SGR release", tt.name, release)
+			}
+		})
+	}
+}
+
+func TestMouseForcedSelectionViewportOnlyPaneOverlappingNonleftSGRPair(t *testing.T) {
+	tests := []struct {
+		name      string
+		button    tea.MouseButton
+		wantPress string
+	}{
+		{name: "middle", button: tea.MouseMiddle, wantPress: "\x1b[<1;3;5M"},
+		{name: "right", button: tea.MouseRight, wantPress: "\x1b[<2;3;5M"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pane := &viewportOnlyFakePane{fakePane: fakePane{view: "ok", mouse: MouseMode{Enabled: true, SGR: true}}}
+			app := NewApp(Options{Terminal: pane})
+			app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+			drainCommands(app)
+			app.copyMode = true
+			terminal := app.currentTerminalRect()
+			x, y := terminal.X+2, terminal.Y+4
+
+			app.Update(leftClick(x, y))
+			if app.pointerCapture != targetTerminal || app.terminalGesture != terminalGestureDrag {
+				t.Fatalf("forced local left ownership = (%q, %v), want terminal drag", app.pointerCapture, app.terminalGesture)
+			}
+			if cmd := readCommand(app); cmd != nil {
+				t.Fatalf("forced local left press emitted remote input %+v", cmd)
+			}
+
+			app.Update(clickAt(x, y, tt.button))
+			press, ok := readCommand(app).(TerminalInputCommand)
+			if !ok || string(press.Data) != tt.wantPress {
+				t.Fatalf("overlapping %s press = %#v, want %q", tt.name, press, tt.wantPress)
+			}
+			app.Update(releaseAt(x, y, tea.MouseNone))
+			release, ok := readCommand(app).(TerminalInputCommand)
+			if !ok || string(release.Data) != "\x1b[<0;3;5m" {
+				t.Fatalf("overlapping %s release = %#v, want forwarded SGR release", tt.name, release)
+			}
+			if app.pointerCapture != targetTerminal || app.terminalGesture != terminalGestureDrag {
+				t.Fatalf("local left ownership after %s release = (%q, %v), want preserved terminal drag", tt.name, app.pointerCapture, app.terminalGesture)
+			}
+
+			app.Update(releaseAt(x, y, tea.MouseNone))
+			if cmd := readCommand(app); cmd != nil {
+				t.Fatalf("matching local left release emitted remote input %+v", cmd)
+			}
+			if app.pointerCapture != "" || app.terminalGesture != terminalGestureNone {
+				t.Fatalf("local left ownership after matching release = (%q, %v), want cleared", app.pointerCapture, app.terminalGesture)
+			}
+		})
+	}
+}
+
+func TestMouseForcedSelectionForwardsRightSGRRelease(t *testing.T) {
+	pane := &interactiveFakePane{fakePane: fakePane{view: "ok", mouse: MouseMode{Enabled: true, SGR: true}}}
+	app := NewApp(Options{Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	app.copyMode = true
+	terminal := app.currentTerminalRect()
+	x, y := terminal.X+2, terminal.Y+4
+
+	app.Update(clickAt(x, y, tea.MouseRight))
+	press, ok := readCommand(app).(TerminalInputCommand)
+	if !ok || string(press.Data) != "\x1b[<2;3;5M" {
+		t.Fatalf("forced right press = %#v, want forwarded SGR right press", press)
+	}
+	app.Update(releaseAt(x, y, tea.MouseNone))
+	release, ok := readCommand(app).(TerminalInputCommand)
+	if !ok || string(release.Data) != "\x1b[<0;3;5m" {
+		t.Fatalf("forced right release = %#v, want forwarded SGR release", release)
+	}
+}
+
+func TestMouseTerminalWheelStaysLocalDuringCapturedDrag(t *testing.T) {
+	pane := &interactiveFakePane{fakePane: fakePane{view: "ok"}}
+	app := NewApp(Options{Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	terminal := app.currentTerminalRect()
+	app.Update(leftClick(terminal.X+2, terminal.Y+2))
+	pane.mouse = MouseMode{Enabled: true, SGR: true}
+
+	app.Update(tea.MouseWheelMsg{X: terminal.X + 4, Y: terminal.Y + 4, Button: tea.MouseWheelUp})
+
+	if got, want := fmt.Sprint(pane.scrolls), "[3]"; got != want {
+		t.Fatalf("captured drag ScrollLines calls = %s, want %s", got, want)
+	}
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("captured drag wheel emitted SGR command %+v", cmd)
+	}
+}
+
+func TestMouseTerminalWheelAlternateScroll(t *testing.T) {
+	pane := &interactiveFakePane{
+		fakePane: fakePane{view: "ok", input: TerminalInputMode{AlternateScroll: true}},
+		viewport: terminalViewportState{AlternateScreen: true},
+	}
+	app := NewApp(Options{Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	terminal := app.currentTerminalRect()
+
+	app.Update(tea.MouseWheelMsg{X: terminal.X + 2, Y: terminal.Y + 4, Button: tea.MouseWheelUp})
+	up, ok := readCommand(app).(TerminalInputCommand)
+	if !ok || string(up.Data) != "\x1b[A\x1b[A\x1b[A" {
+		t.Fatalf("alternate wheel-up command = %#v, want three cursor-up sequences", up)
+	}
+	app.Update(tea.MouseWheelMsg{X: terminal.X + 2, Y: terminal.Y + 4, Button: tea.MouseWheelDown})
+	down, ok := readCommand(app).(TerminalInputCommand)
+	if !ok || string(down.Data) != "\x1b[B\x1b[B\x1b[B" {
+		t.Fatalf("alternate wheel-down command = %#v, want three cursor-down sequences", down)
+	}
+	if len(pane.scrolls) != 0 {
+		t.Fatalf("alternate screen ScrollLines calls = %v, want none", pane.scrolls)
+	}
+}
+
+func TestMouseTerminalWheelAlternateScreenWithoutAlternateScroll(t *testing.T) {
+	pane := &interactiveFakePane{fakePane: fakePane{view: "ok"}, viewport: terminalViewportState{AlternateScreen: true}}
+	app := NewApp(Options{Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	terminal := app.currentTerminalRect()
+
+	app.Update(tea.MouseWheelMsg{X: terminal.X + 2, Y: terminal.Y + 4, Button: tea.MouseWheelUp})
+
+	if len(pane.scrolls) != 0 {
+		t.Fatalf("alternate screen ScrollLines calls = %v, want none", pane.scrolls)
+	}
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("alternate screen wheel command = %+v, want nil", cmd)
+	}
+}
+
+func TestMouseDoubleClickCopiesWord(t *testing.T) {
+	pane := &interactiveFakePane{fakePane: fakePane{view: "ok"}, wordText: "selected word"}
+	app := NewApp(Options{Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	now := time.Unix(1_000, 0)
+	app.now = func() time.Time { return now }
+	terminal := app.currentTerminalRect()
+	x, y := terminal.X+4, terminal.Y+3
+
+	app.Update(leftClick(x, y))
+	app.Update(leftRelease(x, y))
+	now = now.Add(499 * time.Millisecond)
+	_, cmd := app.Update(leftClick(x, y))
+
+	if got := pane.words; len(got) != 1 || got[0] != (terminalPoint{X: 4, Y: 3}) {
+		t.Fatalf("SelectWord calls = %+v, want (4,3)", got)
+	}
+	if app.pointerCapture != targetTerminal {
+		t.Fatalf("word pointer capture = %q, want terminal", app.pointerCapture)
+	}
+	if !pane.SelectionActive() {
+		t.Fatal("word selection is not retained for feedback")
+	}
+	assertImmediateClipboard(t, cmd, "selected word")
+	_ = app.View()
+	if !pane.SelectionActive() {
+		t.Fatal("declarative render cleared word selection before feedback tick")
+	}
+
+	app.Update(leftRelease(x, y))
+	if app.pointerCapture != "" {
+		t.Fatalf("word pointer capture after release = %q, want empty", app.pointerCapture)
+	}
+	if !pane.SelectionActive() {
+		t.Fatal("word release cleared highlight before feedback tick")
+	}
+}
+
+func TestMouseWordFeedbackReleaseRestoresNonleftSGRPair(t *testing.T) {
+	pane := &interactiveFakePane{fakePane: fakePane{view: "ok"}, wordText: "selected word"}
+	app := NewApp(Options{Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	now := time.Unix(1_500, 0)
+	app.now = func() time.Time { return now }
+	terminal := app.currentTerminalRect()
+	x, y := terminal.X+4, terminal.Y+3
+
+	app.Update(leftClick(x, y))
+	app.Update(leftRelease(x, y))
+	now = now.Add(100 * time.Millisecond)
+	_, clipboard := app.Update(leftClick(x, y))
+	if clipboard == nil || !pane.SelectionActive() {
+		t.Fatal("double click did not create retained word feedback")
+	}
+	pane.mouse = MouseMode{Enabled: true, SGR: true}
+	app.Update(leftRelease(x, y))
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("matching word release emitted remote input %+v", cmd)
+	}
+	if !pane.SelectionActive() {
+		t.Fatal("matching word release cleared feedback highlight")
+	}
+
+	app.Update(clickAt(x, y, tea.MouseRight))
+	press, ok := readCommand(app).(TerminalInputCommand)
+	if !ok || string(press.Data) != "\x1b[<2;5;4M" {
+		t.Fatalf("right press during word feedback = %#v, want forwarded SGR press", press)
+	}
+	app.Update(releaseAt(x, y, tea.MouseNone))
+	release, ok := readCommand(app).(TerminalInputCommand)
+	if !ok || string(release.Data) != "\x1b[<0;5;4m" {
+		t.Fatalf("right release during word feedback = %#v, want forwarded SGR release", release)
+	}
+	if !pane.SelectionActive() {
+		t.Fatal("forwarded non-left pair cleared word feedback before tick")
+	}
+}
+
+func TestMouseDoubleClickCandidateReset(t *testing.T) {
+	tests := []struct {
+		name   string
+		second func(*App, *interactiveFakePane, Rect, *time.Time)
+	}{
+		{
+			name: "different cell",
+			second: func(app *App, _ *interactiveFakePane, terminal Rect, _ *time.Time) {
+				app.Update(leftClick(terminal.X+5, terminal.Y+3))
+			},
+		},
+		{
+			name: "modifier",
+			second: func(app *App, _ *interactiveFakePane, terminal Rect, _ *time.Time) {
+				app.Update(tea.MouseClickMsg{X: terminal.X + 4, Y: terminal.Y + 3, Button: tea.MouseLeft, Mod: tea.ModShift})
+			},
+		},
+		{
+			name: "timeout",
+			second: func(app *App, _ *interactiveFakePane, terminal Rect, now *time.Time) {
+				*now = (*now).Add(501 * time.Millisecond)
+				app.Update(leftClick(terminal.X+4, terminal.Y+3))
+			},
+		},
+		{
+			name: "drag",
+			second: func(app *App, _ *interactiveFakePane, terminal Rect, _ *time.Time) {
+				app.Update(tea.MouseMotionMsg{X: terminal.X + 7, Y: terminal.Y + 3, Button: tea.MouseLeft})
+				app.Update(leftRelease(terminal.X+7, terminal.Y+3))
+				app.Update(leftClick(terminal.X+4, terminal.Y+3))
+			},
+		},
+		{
+			name: "forwarded SGR click",
+			second: func(app *App, pane *interactiveFakePane, terminal Rect, _ *time.Time) {
+				pane.mouse = MouseMode{Enabled: true, SGR: true}
+				app.Update(leftClick(terminal.X+4, terminal.Y+3))
+				pane.mouse = MouseMode{}
+				app.Update(leftClick(terminal.X+4, terminal.Y+3))
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pane := &interactiveFakePane{fakePane: fakePane{view: "ok"}}
+			app := NewApp(Options{Terminal: pane})
+			app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+			drainCommands(app)
+			now := time.Unix(2_000, 0)
+			app.now = func() time.Time { return now }
+			terminal := app.currentTerminalRect()
+
+			app.Update(leftClick(terminal.X+4, terminal.Y+3))
+			if tt.name != "drag" {
+				app.Update(leftRelease(terminal.X+4, terminal.Y+3))
+			}
+			tt.second(app, pane, terminal, &now)
+
+			if len(pane.words) != 0 {
+				t.Fatalf("SelectWord calls = %+v, want none", pane.words)
+			}
+		})
+	}
+}
+
+func assertImmediateClipboard(t *testing.T, cmd tea.Cmd, want string) {
+	t.Helper()
+	if cmd == nil {
+		t.Fatal("clipboard command = nil")
+	}
+	msg := cmd()
+	if fmt.Sprint(msg) == want {
+		return
+	}
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("clipboard command message = %T %v, want %q", msg, msg, want)
+	}
+	results := make(chan tea.Msg, len(batch))
+	for _, child := range batch {
+		go func(child tea.Cmd) { results <- child() }(child)
+	}
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+	for range batch {
+		select {
+		case child := <-results:
+			if fmt.Sprint(child) == want {
+				return
+			}
+		case <-timer.C:
+			t.Fatalf("clipboard message %q was not immediate", want)
+		}
+	}
+	t.Fatalf("batch contained no clipboard message %q", want)
+}
+
+func TestTerminalSelectionAutoscrollSpeedAndReschedule(t *testing.T) {
+	pane, app, terminal := startTerminalSelectionForAutoscroll(t)
+
+	_, start := app.Update(tea.MouseMotionMsg{X: terminal.X + 7, Y: terminal.Y - 1, Button: tea.MouseLeft})
+	if start == nil {
+		t.Fatal("one-row top overflow did not schedule autoscroll")
+	}
+	seq := app.terminalAutoscrollSeq
+	_, next := app.Update(terminalSelectionAutoscrollMsg{seq: seq})
+	if got, want := fmt.Sprint(pane.scrolls), "[3]"; got != want {
+		t.Fatalf("one-row top overflow ScrollLines = %s, want %s", got, want)
+	}
+	if got := pane.updates[len(pane.updates)-1]; got != (terminalPoint{X: 7, Y: 0}) {
+		t.Fatalf("top autoscroll endpoint = %+v, want (7,0)", got)
+	}
+	if next == nil {
+		t.Fatal("valid autoscroll tick did not reschedule")
+	}
+
+	_, start = app.Update(tea.MouseMotionMsg{X: terminal.X + 8, Y: terminal.Y - 8, Button: tea.MouseLeft})
+	if start == nil {
+		t.Fatal("medium top overflow did not schedule autoscroll")
+	}
+	seq = app.terminalAutoscrollSeq
+	app.Update(terminalSelectionAutoscrollMsg{seq: seq})
+	if got := pane.scrolls[len(pane.scrolls)-1]; got != 8 {
+		t.Fatalf("eight-row top overflow ScrollLines = %d, want 8", got)
+	}
+
+	_, start = app.Update(tea.MouseMotionMsg{X: terminal.X + 9, Y: terminal.Y + terminal.H + 20, Button: tea.MouseLeft})
+	if start == nil {
+		t.Fatal("far bottom overflow did not schedule autoscroll")
+	}
+	seq = app.terminalAutoscrollSeq
+	app.Update(terminalSelectionAutoscrollMsg{seq: seq})
+	if got := pane.scrolls[len(pane.scrolls)-1]; got != -15 {
+		t.Fatalf("far bottom overflow ScrollLines = %d, want -15 cap", got)
+	}
+	if got := pane.updates[len(pane.updates)-1]; got != (terminalPoint{X: 9, Y: terminal.H - 1}) {
+		t.Fatalf("bottom autoscroll endpoint = %+v, want (9,%d)", got, terminal.H-1)
+	}
+}
+
+func TestTerminalSelectionAutoscrollDoesNotScrollAlternateScreen(t *testing.T) {
+	pane, app, terminal := startTerminalSelectionForAutoscroll(t)
+	pane.viewport.AlternateScreen = true
+
+	_, cmd := app.Update(tea.MouseMotionMsg{X: terminal.X + 2, Y: terminal.Y - 1, Button: tea.MouseLeft})
+
+	if cmd != nil {
+		t.Fatalf("alternate-screen edge motion scheduled %T, want no host autoscroll", cmd)
+	}
+	if len(pane.scrolls) != 0 {
+		t.Fatalf("alternate-screen edge motion scrolled host viewport: %v", pane.scrolls)
+	}
+}
+
+func TestTerminalSelectionAutoscrollStopsOnHostTerminalResize(t *testing.T) {
+	pane := &interactiveFakePane{fakePane: fakePane{view: "ok"}}
+	app := NewApp(Options{Side: "guest", Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	app.Update(RuntimeStateMsg{HostCols: 80, HostRows: 24, LocalRole: RoleRead})
+	drainCommands(app)
+	terminal := app.currentTerminalRect()
+	app.Update(leftClick(terminal.X+2, terminal.Y+2))
+	pane.clearCalls = 0
+	app.Update(tea.MouseMotionMsg{X: terminal.X + 2, Y: terminal.Y - 1, Button: tea.MouseLeft})
+	seq := app.terminalAutoscrollSeq
+
+	app.Update(RuntimeStateMsg{HostCols: 81, HostRows: 24, LocalRole: RoleRead})
+	app.Update(terminalSelectionAutoscrollMsg{seq: seq})
+
+	if len(pane.scrolls) != 0 {
+		t.Fatalf("host-resize stale tick scrolled: %v", pane.scrolls)
+	}
+	if pane.clearCalls == 0 {
+		t.Fatal("host terminal resize did not clear active selection")
+	}
+}
+
+func TestTerminalSelectionAutoscrollStops(t *testing.T) {
+	tests := []struct {
+		name      string
+		stop      func(*App, Rect)
+		wantClear bool
+	}{
+		{
+			name: "pointer re-entry",
+			stop: func(app *App, terminal Rect) {
+				app.Update(tea.MouseMotionMsg{X: terminal.X + 2, Y: terminal.Y + 2, Button: tea.MouseLeft})
+			},
+		},
+		{
+			name: "release",
+			stop: func(app *App, terminal Rect) {
+				app.Update(leftRelease(terminal.X+2, terminal.Y-1))
+			},
+		},
+		{
+			name: "modal open",
+			stop: func(app *App, _ Rect) {
+				app.openQuitConfirm()
+			},
+			wantClear: true,
+		},
+		{
+			name: "resize",
+			stop: func(app *App, _ Rect) {
+				app.Update(tea.WindowSizeMsg{Width: 101, Height: 31})
+			},
+			wantClear: true,
+		},
+		{
+			name: "forced mode exit",
+			stop: func(app *App, _ Rect) {
+				app.copyMode = true
+				app.setCopyMode(false)
+			},
+			wantClear: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pane, app, terminal := startTerminalSelectionForAutoscroll(t)
+			app.Update(tea.MouseMotionMsg{X: terminal.X + 2, Y: terminal.Y - 1, Button: tea.MouseLeft})
+			seq := app.terminalAutoscrollSeq
+			clearCalls := pane.clearCalls
+
+			tt.stop(app, terminal)
+			app.Update(terminalSelectionAutoscrollMsg{seq: seq})
+
+			if len(pane.scrolls) != 0 {
+				t.Fatalf("stale autoscroll tick scrolled after stop: %v", pane.scrolls)
+			}
+			if tt.wantClear && pane.clearCalls <= clearCalls {
+				t.Fatalf("selection clear calls = %d, want more than %d", pane.clearCalls, clearCalls)
+			}
+		})
+	}
+}
+
+func TestTerminalSelectionAutoscrollSequenceReplacement(t *testing.T) {
+	pane, app, terminal := startTerminalSelectionForAutoscroll(t)
+	app.Update(tea.MouseMotionMsg{X: terminal.X + 2, Y: terminal.Y - 1, Button: tea.MouseLeft})
+	stale := app.terminalAutoscrollSeq
+	app.Update(tea.MouseMotionMsg{X: terminal.X + 2, Y: terminal.Y - 3, Button: tea.MouseLeft})
+	current := app.terminalAutoscrollSeq
+	if current == stale {
+		t.Fatalf("autoscroll sequence = %d after pointer replacement, want new sequence", current)
+	}
+
+	app.Update(terminalSelectionAutoscrollMsg{seq: stale})
+	if len(pane.scrolls) != 0 {
+		t.Fatalf("stale replacement tick scrolled: %v", pane.scrolls)
+	}
+	app.Update(terminalSelectionAutoscrollMsg{seq: current})
+	if got, want := fmt.Sprint(pane.scrolls), "[3]"; got != want {
+		t.Fatalf("current replacement tick ScrollLines = %s, want %s", got, want)
+	}
+}
+
+func startTerminalSelectionForAutoscroll(t *testing.T) (*interactiveFakePane, *App, Rect) {
+	t.Helper()
+	pane := &interactiveFakePane{fakePane: fakePane{view: "ok"}}
+	app := NewApp(Options{Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	drainCommands(app)
+	terminal := app.currentTerminalRect()
+	app.Update(leftClick(terminal.X+2, terminal.Y+2))
+	pane.clearCalls = 0
+	return pane, app, terminal
+}
+
 func TestMouseClickShellExitQuitCommitsOnRelease(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
@@ -377,7 +1058,7 @@ func TestViewDoesNotMutatePointerCapture(t *testing.T) {
 			configure: func(app *App) {
 				app.copyMode = true
 			},
-			wantMouseMode: tea.MouseModeNone,
+			wantMouseMode: tea.MouseModeCellMotion,
 		},
 		{
 			name: "modal",
@@ -721,6 +1402,19 @@ func topBarActionRect(t *testing.T, app *App, action ActionID) Rect {
 	t.Helper()
 	return topBarTargetRect(t, app, actionTarget(action))
 }
+
+type viewportOnlyFakePane struct {
+	fakePane
+	viewport terminalViewportState
+}
+
+var _ terminalViewportInteraction = (*viewportOnlyFakePane)(nil)
+
+func (p *viewportOnlyFakePane) ScrollLines(int) bool { return true }
+
+func (p *viewportOnlyFakePane) ResetViewport() bool { return true }
+
+func (p *viewportOnlyFakePane) ViewportState() terminalViewportState { return p.viewport }
 
 func topBarPeerRect(t *testing.T, app *App, peerID string) Rect {
 	t.Helper()

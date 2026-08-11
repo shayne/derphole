@@ -5,12 +5,78 @@
 package tui
 
 import (
+	"io"
 	"strings"
 	"testing"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
+func newVTTerminalPaneForTest(t *testing.T, cols, rows int) TerminalPane {
+	t.Helper()
+	pane := NewVTTerminalPane(cols, rows)
+	closer, ok := pane.(io.Closer)
+	if !ok {
+		t.Fatal("VT terminal pane does not implement io.Closer")
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+	return pane
+}
+
+func TestVTTerminalPaneForwardsViewportInteraction(t *testing.T) {
+	pane := NewVTTerminalPane(12, 5)
+	closer, ok := pane.(io.Closer)
+	if !ok {
+		t.Fatal("VT terminal pane does not implement io.Closer")
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+	viewport, ok := pane.(terminalViewportInteraction)
+	if !ok {
+		t.Fatal("VT terminal pane does not implement terminalViewportInteraction")
+	}
+
+	if _, err := pane.Write([]byte("01\r\n02\r\n03\r\n04\r\n05\r\n06\r\n07")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if !viewport.ScrollLines(2) {
+		t.Fatal("ScrollLines(2) = false, want visible viewport change")
+	}
+	if got := viewport.ViewportState().OffsetFromBottom; got != 2 {
+		t.Fatalf("offset = %d, want 2", got)
+	}
+	if view := ansiPattern.ReplaceAllString(pane.View(12, 5), ""); !strings.HasPrefix(view, "01\n02\n03") {
+		t.Fatalf("historical pane view = %q", view)
+	}
+	if !viewport.ResetViewport() || viewport.ViewportState().OffsetFromBottom != 0 {
+		t.Fatalf("ResetViewport() did not return pane to live bottom: %+v", viewport.ViewportState())
+	}
+}
+
+func TestVTTerminalPaneForwardsTerminalInteraction(t *testing.T) {
+	pane := NewVTTerminalPane(12, 2)
+	closer := pane.(io.Closer)
+	t.Cleanup(func() { _ = closer.Close() })
+	interaction, ok := pane.(terminalInteraction)
+	if !ok {
+		t.Fatal("VT terminal pane does not implement terminalInteraction")
+	}
+	if _, err := pane.Write([]byte("alpha\r\nbeta")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if !interaction.BeginSelection(0, 0) || !interaction.UpdateSelection(3, 1) {
+		t.Fatal("could not create selection through pane")
+	}
+	if got, ok := interaction.FinishSelection(); !ok || got != "alpha\nbeta" {
+		t.Fatalf("FinishSelection() = (%q, %v), want (alpha\\nbeta, true)", got, ok)
+	}
+	interaction.ClearSelection()
+	if interaction.SelectionActive() {
+		t.Fatal("SelectionActive() = true after ClearSelection()")
+	}
+}
+
 func TestVTTerminalPanePreservesANSIStyleOutput(t *testing.T) {
-	pane := NewVTTerminalPane(20, 4)
+	pane := newVTTerminalPaneForTest(t, 20, 4)
 
 	if _, err := pane.Write([]byte("plain \x1b[31mred\x1b[0m\x1b[?25l")); err != nil {
 		t.Fatalf("Write() error = %v", err)
@@ -21,7 +87,7 @@ func TestVTTerminalPanePreservesANSIStyleOutput(t *testing.T) {
 	if !strings.Contains(stripped, "plain red") {
 		t.Fatalf("View() = %q, want rendered ANSI text", view)
 	}
-	if !strings.Contains(view, "\x1b[31mred\x1b[0m") {
+	if !strings.Contains(view, "\x1b[31mred"+ansi.ResetStyle) {
 		t.Fatalf("View() stripped terminal color styling: %q", view)
 	}
 	if width := visibleWidth(strings.Split(view, "\n")[0]); width != len("plain red") {
@@ -30,14 +96,14 @@ func TestVTTerminalPanePreservesANSIStyleOutput(t *testing.T) {
 }
 
 func TestVTTerminalPanePreservesStyledSpaces(t *testing.T) {
-	pane := NewVTTerminalPane(20, 4)
+	pane := newVTTerminalPaneForTest(t, 20, 4)
 
 	if _, err := pane.Write([]byte("load \x1b[48;5;34m  \x1b[0m done")); err != nil {
 		t.Fatalf("Write() error = %v", err)
 	}
 
 	view := pane.View(20, 4)
-	if !strings.Contains(view, "\x1b[48;5;34m  \x1b[0m") {
+	if !strings.Contains(view, "\x1b[48;5;34m  "+ansi.ResetStyle) {
 		t.Fatalf("View() stripped styled spaces used by rich TUIs: %q", view)
 	}
 	if !strings.Contains(view, "load ") || !strings.Contains(view, " done") {
@@ -46,7 +112,7 @@ func TestVTTerminalPanePreservesStyledSpaces(t *testing.T) {
 }
 
 func TestVTTerminalPaneSuppressesUnderlineOnlyBlankCells(t *testing.T) {
-	pane := NewVTTerminalPane(20, 4)
+	pane := newVTTerminalPaneForTest(t, 20, 4)
 
 	if _, err := pane.Write([]byte("vim\x1b[4m          \x1b[0m\x1b[?25l")); err != nil {
 		t.Fatalf("Write() error = %v", err)
@@ -63,7 +129,7 @@ func TestVTTerminalPaneSuppressesUnderlineOnlyBlankCells(t *testing.T) {
 }
 
 func TestVTTerminalPaneHandlesCursorMovement(t *testing.T) {
-	pane := NewVTTerminalPane(10, 3)
+	pane := newVTTerminalPaneForTest(t, 10, 3)
 
 	if _, err := pane.Write([]byte("abc\x1b[2DZ")); err != nil {
 		t.Fatalf("Write() error = %v", err)
@@ -76,142 +142,15 @@ func TestVTTerminalPaneHandlesCursorMovement(t *testing.T) {
 	}
 }
 
-func TestTrackMouseModeSGREnableDisable(t *testing.T) {
-	mode := TrackMouseMode(MouseMode{}, []byte("\x1b[?1000h\x1b[?1006h"))
-	if !mode.Enabled || !mode.SGR {
-		t.Fatalf("enable mode = %+v, want enabled SGR", mode)
-	}
-
-	mode = TrackMouseMode(mode, []byte("\x1b[?1006l"))
-	if !mode.Enabled || mode.SGR {
-		t.Fatalf("disable SGR mode = %+v, want enabled non-SGR", mode)
-	}
-
-	mode = TrackMouseMode(mode, []byte("\x1b[?1000l"))
-	if mode.Enabled || mode.SGR {
-		t.Fatalf("disable mouse mode = %+v, want disabled", mode)
-	}
-}
-
-func TestVTTerminalPaneTracksSplitSGRMouseMode(t *testing.T) {
-	pane := NewVTTerminalPane(20, 4)
-
-	if _, err := pane.Write([]byte("\x1b[?100")); err != nil {
-		t.Fatalf("first Write() error = %v", err)
-	}
-	if mode := pane.MouseMode(); mode.Enabled || mode.SGR {
-		t.Fatalf("MouseMode after partial sequence = %+v, want disabled", mode)
-	}
-
-	if _, err := pane.Write([]byte("6h")); err != nil {
-		t.Fatalf("second Write() error = %v", err)
-	}
-
-	if mode := pane.MouseMode(); !mode.Enabled || !mode.SGR {
-		t.Fatalf("MouseMode after split SGR enable = %+v, want enabled SGR", mode)
-	}
-}
-
-func TestVTTerminalPaneTracksApplicationCursorMode(t *testing.T) {
-	pane := NewVTTerminalPane(20, 4)
-
-	if _, err := pane.Write([]byte("\x1b[?1h")); err != nil {
-		t.Fatalf("enable Write() error = %v", err)
-	}
-	if mode := pane.InputMode(); !mode.ApplicationCursor {
-		t.Fatalf("InputMode after application cursor enable = %+v, want enabled", mode)
-	}
-
-	if _, err := pane.Write([]byte("\x1b[?1l")); err != nil {
-		t.Fatalf("disable Write() error = %v", err)
-	}
-	if mode := pane.InputMode(); mode.ApplicationCursor {
-		t.Fatalf("InputMode after application cursor disable = %+v, want disabled", mode)
-	}
-}
-
-func TestTrackInputModeApplicationCursorEnableDisable(t *testing.T) {
-	mode := TrackInputMode(TerminalInputMode{}, []byte("\x1b[?1h"))
-	if !mode.ApplicationCursor {
-		t.Fatalf("TrackInputMode enable = %+v, want application cursor enabled", mode)
-	}
-
-	mode = TrackInputMode(mode, []byte("\x1b[?25l\x1b[?1l"))
-	if mode.ApplicationCursor {
-		t.Fatalf("TrackInputMode disable = %+v, want application cursor disabled", mode)
-	}
-}
-
-func TestTrackInputModeBracketedPasteEnableDisable(t *testing.T) {
-	mode := TrackInputMode(TerminalInputMode{}, []byte("\x1b[?2004h"))
-	if !mode.BracketedPaste {
-		t.Fatalf("TrackInputMode enable = %+v, want bracketed paste enabled", mode)
-	}
-
-	mode = TrackInputMode(mode, []byte("\x1b[?25l\x1b[?2004l"))
-	if mode.BracketedPaste {
-		t.Fatalf("TrackInputMode disable = %+v, want bracketed paste disabled", mode)
-	}
-}
-
-func TestVTTerminalPaneTracksSplitBracketedPasteMode(t *testing.T) {
-	pane := NewVTTerminalPane(20, 4)
-
-	if _, err := pane.Write([]byte("\x1b[?20")); err != nil {
-		t.Fatalf("first Write() error = %v", err)
-	}
-	if mode := pane.InputMode(); mode.BracketedPaste {
-		t.Fatalf("InputMode after partial sequence = %+v, want disabled", mode)
-	}
-
-	if _, err := pane.Write([]byte("04h")); err != nil {
-		t.Fatalf("second Write() error = %v", err)
-	}
-	if mode := pane.InputMode(); !mode.BracketedPaste {
-		t.Fatalf("InputMode after split enable = %+v, want bracketed paste enabled", mode)
-	}
-}
-
-func TestTrackInputModePreservesStateForUnrelatedPrivateModes(t *testing.T) {
-	mode := TrackInputMode(TerminalInputMode{ApplicationCursor: true}, []byte("\x1b[?25l\x1b[?1006h\x1b[?bad?h"))
-	if !mode.ApplicationCursor {
-		t.Fatalf("TrackInputMode unrelated modes = %+v, want application cursor unchanged", mode)
-	}
-}
-
-func TestIncompletePrivateModeTail(t *testing.T) {
-	longTail := "\x1b[?" + strings.Repeat("1", 33)
-	tests := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{name: "none", in: "plain output", want: ""},
-		{name: "partial tail", in: "prefix \x1b[?100", want: "\x1b[?100"},
-		{name: "complete sequence", in: "\x1b[?1006h", want: ""},
-		{name: "invalid tail", in: "\x1b[?100x", want: ""},
-		{name: "too long", in: longTail, want: ""},
-		{name: "last partial wins", in: "first \x1b[?1006h second \x1b[?1", want: "\x1b[?1"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := incompletePrivateModeTail(tt.in); got != tt.want {
-				t.Fatalf("incompletePrivateModeTail(%q) = %q, want %q", tt.in, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestVTTerminalPaneRendersVisibleCursorOnBlankCell(t *testing.T) {
-	pane := NewVTTerminalPane(10, 3)
+	pane := newVTTerminalPaneForTest(t, 10, 3)
 
 	if _, err := pane.Write([]byte("$ ")); err != nil {
 		t.Fatalf("Write() error = %v", err)
 	}
 
 	view := pane.View(10, 3)
-	if !strings.Contains(view, "\x1b[7m \x1b[0m") {
+	if !strings.Contains(view, "\x1b[7m "+ansi.ResetStyle) {
 		t.Fatalf("View() = %q, want visible reverse-video cursor cell", view)
 	}
 	if width := visibleWidth(strings.Split(view, "\n")[0]); width != len("$  ") {
@@ -220,7 +159,7 @@ func TestVTTerminalPaneRendersVisibleCursorOnBlankCell(t *testing.T) {
 }
 
 func TestVTTerminalPaneViewClampsReadsToBufferSize(t *testing.T) {
-	pane := NewVTTerminalPane(101, 30)
+	pane := newVTTerminalPaneForTest(t, 101, 30)
 
 	if _, err := pane.Write([]byte("root@host:~# ")); err != nil {
 		t.Fatalf("Write() error = %v", err)
@@ -237,7 +176,7 @@ func TestVTTerminalPaneViewClampsReadsToBufferSize(t *testing.T) {
 }
 
 func TestVTTerminalPaneHidesCursorWhenDECTCEMDisabled(t *testing.T) {
-	pane := NewVTTerminalPane(10, 3)
+	pane := newVTTerminalPaneForTest(t, 10, 3)
 
 	if _, err := pane.Write([]byte("$ \x1b[?25l")); err != nil {
 		t.Fatalf("Write() error = %v", err)

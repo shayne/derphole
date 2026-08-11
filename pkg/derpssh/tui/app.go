@@ -28,9 +28,24 @@ type Options struct {
 
 const approvalInputGrace = 200 * time.Millisecond
 const unreadChatPulseInterval = 500 * time.Millisecond
+const terminalDoubleClickInterval = 500 * time.Millisecond
+const terminalSelectionAutoscrollInterval = 50 * time.Millisecond
 
 type unreadChatPulseMsg struct {
 	seq uint64
+}
+
+type clearTerminalSelectionMsg struct {
+	seq uint64
+}
+
+type terminalSelectionAutoscrollMsg struct {
+	seq uint64
+}
+
+type terminalClick struct {
+	point terminalPoint
+	at    time.Time
 }
 
 type approvalChoice int
@@ -113,6 +128,14 @@ type mousePressTarget struct {
 	choice int
 }
 
+type terminalGestureKind uint8
+
+const (
+	terminalGestureNone terminalGestureKind = iota
+	terminalGestureDrag
+	terminalGestureWord
+)
+
 type App struct {
 	side          string
 	displayName   string
@@ -123,41 +146,50 @@ type App struct {
 	commandQueue  []Command
 	commandPump   bool
 
-	width            int
-	height           int
-	layout           Layout
-	sidebarOpen      bool
-	sidebarWidth     int
-	draggingDivider  bool
-	focus            Focus
-	prefix           bool
-	copyMode         bool
-	helpOpen         bool
-	approvalPeerID   string
-	approvalPeer     string
-	approvalChoice   approvalChoice
-	approvalGraceEnd time.Time
-	kickPeerID       string
-	kickPeer         string
-	inviteOpen       bool
-	quitOpen         bool
-	quitChoice       quitChoice
-	quitTitle        string
-	quitBody         string
-	shellExitOpen    bool
-	shellExitChoice  shellExitChoice
-	peerDialogOpen   bool
-	peerDialogPeer   Peer
-	peerDialogChoice peerActionChoice
-	mousePress       mousePressTarget
-	pointerCapture   layerTarget
-	noticeTitle      string
-	noticeBody       string
+	width                     int
+	height                    int
+	layout                    Layout
+	sidebarOpen               bool
+	sidebarWidth              int
+	draggingDivider           bool
+	focus                     Focus
+	prefix                    bool
+	copyMode                  bool
+	helpOpen                  bool
+	approvalPeerID            string
+	approvalPeer              string
+	approvalChoice            approvalChoice
+	approvalGraceEnd          time.Time
+	kickPeerID                string
+	kickPeer                  string
+	inviteOpen                bool
+	quitOpen                  bool
+	quitChoice                quitChoice
+	quitTitle                 string
+	quitBody                  string
+	shellExitOpen             bool
+	shellExitChoice           shellExitChoice
+	peerDialogOpen            bool
+	peerDialogPeer            Peer
+	peerDialogChoice          peerActionChoice
+	mousePress                mousePressTarget
+	pointerCapture            layerTarget
+	terminalGesture           terminalGestureKind
+	lastTerminalClick         terminalClick
+	selectionSeq              uint64
+	terminalPointer           terminalPoint
+	terminalAutoscrollSeq     uint64
+	terminalAutoscrollActive  bool
+	terminalSGRReleasePending bool
+	noticeTitle               string
+	noticeBody                string
 
 	localRole      Role
 	transport      string
 	hostCols       int
 	hostRows       int
+	terminalCols   int
+	terminalRows   int
 	peers          []Peer
 	chatMessages   []ChatMessage
 	chatScroll     int
@@ -242,13 +274,14 @@ func (a *App) handleInteractiveMessage(msg tea.Msg) (tea.Cmd, bool) {
 }
 
 func (a *App) applyMessage(msg tea.Msg) tea.Cmd {
+	if cmd, handled := a.applyTerminalMessage(msg); handled {
+		return cmd
+	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		a.resize(msg.Width, msg.Height, true)
 	case tea.BackgroundColorMsg:
 		a.applyBackgroundColor(msg)
-	case TerminalDataMsg:
-		_, _ = a.terminal.Write([]byte(msg))
 	case RuntimeStateMsg:
 		a.applyRuntimeState(msg)
 	case ChatMsg:
@@ -261,6 +294,23 @@ func (a *App) applyMessage(msg tea.Msg) tea.Cmd {
 		return a.handleUnreadChatPulse(msg)
 	}
 	return nil
+}
+
+func (a *App) applyTerminalMessage(msg tea.Msg) (tea.Cmd, bool) {
+	switch msg := msg.(type) {
+	case TerminalDataMsg:
+		_, _ = a.terminal.Write([]byte(msg))
+		return nil, true
+	case clearTerminalSelectionMsg:
+		if msg.seq == a.selectionSeq {
+			a.clearTerminalSelection()
+		}
+		return nil, true
+	case terminalSelectionAutoscrollMsg:
+		return a.handleTerminalSelectionAutoscroll(msg), true
+	default:
+		return nil, false
+	}
 }
 
 func (a *App) applyBackgroundColor(msg tea.BackgroundColorMsg) {
@@ -296,6 +346,9 @@ func (a *App) configureComposerStyles() {
 
 func (a *App) applyRuntimeState(msg RuntimeStateMsg) {
 	a.transport = valueOr(msg.Transport, a.transport)
+	if msg.HostCols != a.hostCols || msg.HostRows != a.hostRows {
+		a.clearPointerCapture()
+	}
 	a.hostCols = msg.HostCols
 	a.hostRows = msg.HostRows
 	if msg.LocalRole != "" {
@@ -362,7 +415,7 @@ func (a *App) buildScene() Scene {
 func (a *App) configureView(view tea.View, scene Scene) tea.View {
 	view.AltScreen = true
 	view.MouseMode = tea.MouseModeCellMotion
-	if a.copyMode || a.inviteOpen {
+	if a.inviteOpen {
 		view.MouseMode = tea.MouseModeNone
 	}
 	view.Cursor = scene.Cursor
@@ -425,6 +478,9 @@ func (a *App) TerminalSize() (int, int) {
 
 func (a *App) resize(cols int, rows int, emitResize bool) {
 	oldTerminal := a.currentTerminalRect()
+	if cols > 0 && cols != a.width || rows > 0 && rows != a.height {
+		a.clearPointerCapture()
+	}
 	if cols > 0 {
 		a.width = cols
 	}
@@ -456,7 +512,11 @@ func (a *App) applyLayout() {
 	}
 	if !a.currentTerminalRect().empty() {
 		cols, rows := a.terminalBufferSize()
-		a.terminal.Resize(cols, rows)
+		if cols != a.terminalCols || rows != a.terminalRows {
+			a.terminal.Resize(cols, rows)
+			a.terminalCols = cols
+			a.terminalRows = rows
+		}
 	}
 }
 
@@ -959,6 +1019,18 @@ func unreadChatPulseTick(seq uint64) tea.Cmd {
 	})
 }
 
+func terminalSelectionClearTick(seq uint64) tea.Cmd {
+	return tea.Tick(terminalDoubleClickInterval, func(time.Time) tea.Msg {
+		return clearTerminalSelectionMsg{seq: seq}
+	})
+}
+
+func terminalSelectionAutoscrollTick(seq uint64) tea.Cmd {
+	return tea.Tick(terminalSelectionAutoscrollInterval, func(time.Time) tea.Msg {
+		return terminalSelectionAutoscrollMsg{seq: seq}
+	})
+}
+
 func (a *App) isLocalEcho(msg ChatMessage) bool {
 	if msg.Local {
 		return false
@@ -979,13 +1051,6 @@ func (a *App) isLocalEcho(msg ChatMessage) bool {
 		}
 	}
 	return false
-}
-
-func (a *App) handleTerminalKey(msg tea.KeyPressMsg) tea.Cmd {
-	if data, ok := EncodeTerminalKeyWithMode(msg, a.terminal.InputMode()); ok {
-		a.emit(TerminalInputCommand{Data: data})
-	}
-	return nil
 }
 
 func (a *App) leftTopBarSegments() []topBarSegment {
@@ -1919,9 +1984,7 @@ func (a *App) setCopyMode(enabled bool) tea.Cmd {
 	if a.copyMode == enabled {
 		return nil
 	}
-	if enabled {
-		a.clearPointerCapture()
-	}
+	a.clearPointerCapture()
 	a.copyMode = enabled
 	return nil
 }
