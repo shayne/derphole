@@ -65,7 +65,10 @@ func (p *ChatPane) RenderLines(Theme) []string {
 	counts := p.displayNameCounts()
 	lines := make([]string, 0, len(p.messages))
 	for _, msg := range p.messages {
-		prefix := displayHandleWithCounts(string(msg.Author), 16, counts)
+		prefix := "you"
+		if !msg.Local {
+			prefix = displayHandleWithCounts(string(msg.Author), 16, counts)
+		}
 		if prefix == "" {
 			prefix = "peer"
 		}
@@ -86,7 +89,6 @@ func (p *ChatPane) absorbLocalEcho(line ChatLine) bool {
 		}
 		if strings.TrimSpace(string(existing.Author)) == strings.TrimSpace(string(line.Author)) &&
 			strings.TrimSpace(existing.Text) == strings.TrimSpace(line.Text) {
-			p.messages[i].Local = false
 			return true
 		}
 	}

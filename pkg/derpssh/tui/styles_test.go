@@ -56,10 +56,10 @@ func TestDarkThemeUsesOpenCodeSurfaces(t *testing.T) {
 	}{
 		{name: "top bar", style: styles.TopBar, foreground: "#EEEEEE", background: "#141414"},
 		{name: "muted top bar", style: styles.TopBarMuted, foreground: "#808080", background: "#141414"},
-		{name: "hover", style: styles.TopBarHover, foreground: "#EEEEEE", background: "#1E1E1E"},
+		{name: "hover", style: styles.TopBarHover, foreground: "#EEEEEE", background: "#282828"},
 		{name: "active", style: styles.TopBarActive, foreground: "#FAB283", background: "#1E1E1E"},
 		{name: "sidebar", style: styles.Sidebar, foreground: "#EEEEEE", background: "#141414"},
-		{name: "local message", style: styles.MessageLocal, foreground: "#EEEEEE", background: "#1E1E1E"},
+		{name: "local message", style: styles.MessageLocal, foreground: "#EEEEEE", background: "#141414"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -81,12 +81,12 @@ func TestLightThemeUsesOpenCodeSurfaces(t *testing.T) {
 		foreground string
 		background string
 	}{
-		{name: "top bar", style: styles.TopBar, foreground: "#1A1A1A", background: "#FAFAFA"},
-		{name: "muted top bar", style: styles.TopBarMuted, foreground: "#686868", background: "#FAFAFA"},
-		{name: "hover", style: styles.TopBarHover, foreground: "#1A1A1A", background: "#F5F5F5"},
-		{name: "active", style: styles.TopBarActive, foreground: "#3B7DD8", background: "#F5F5F5"},
-		{name: "sidebar", style: styles.Sidebar, foreground: "#1A1A1A", background: "#FAFAFA"},
-		{name: "local message", style: styles.MessageLocal, foreground: "#1A1A1A", background: "#F5F5F5"},
+		{name: "top bar", style: styles.TopBar, foreground: "#201E1B", background: "#F8F7F5"},
+		{name: "muted top bar", style: styles.TopBarMuted, foreground: "#6F6A64", background: "#F8F7F5"},
+		{name: "hover", style: styles.TopBarHover, foreground: "#201E1B", background: "#E8E4DF"},
+		{name: "active", style: styles.TopBarActive, foreground: "#A9501E", background: "#E8E4DF"},
+		{name: "sidebar", style: styles.Sidebar, foreground: "#201E1B", background: "#F8F7F5"},
+		{name: "local message", style: styles.MessageLocal, foreground: "#201E1B", background: "#F8F7F5"},
 	}
 
 	for _, tt := range tests {
@@ -108,7 +108,7 @@ func TestRestingHeaderMetadataUsesPanelAndSuccessColors(t *testing.T) {
 		success string
 	}{
 		{scheme: SchemeDark, panel: "#141414", success: "#7FD88F"},
-		{scheme: SchemeLight, panel: "#FAFAFA", success: "#3D9A57"},
+		{scheme: SchemeLight, panel: "#F8F7F5", success: "#397A4A"},
 	}
 	for _, tt := range tests {
 		t.Run(string(tt.scheme), func(t *testing.T) {

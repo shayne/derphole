@@ -5,6 +5,7 @@
 package tui
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -41,14 +42,59 @@ func TestSceneTargetsHeaderTerminalSidebarAndDivider(t *testing.T) {
 	if got := scene.TargetAt(app.layout.Sidebar.X+1, app.layout.Sidebar.Y+1); got != chatMessageTarget(0) {
 		t.Fatalf("message target = %q, want %q", got, chatMessageTarget(0))
 	}
-	if got := scene.TargetAt(app.layout.Sidebar.X+app.layout.Sidebar.W-1, app.layout.Sidebar.Y); got != actionTarget(ActionToggleChat) {
-		t.Fatalf("sidebar close target = %q, want %q", got, actionTarget(ActionToggleChat))
+	if got := scene.TargetAt(app.layout.Sidebar.X+1, app.layout.Sidebar.Y); got != chatMessageTarget(0) {
+		t.Fatalf("first sidebar row target = %q, want first message with no inner header", got)
+	}
+	if got := scene.TargetAt(app.layout.Sidebar.X+app.layout.Sidebar.W-1, app.layout.Sidebar.Y); got == actionTarget(ActionToggleChat) {
+		t.Fatalf("sidebar retained duplicate close target %q", got)
 	}
 	if got := scene.TargetAt(app.layout.Composer.X+1, app.layout.Composer.Y); got != targetComposer {
 		t.Fatalf("composer target = %q", got)
 	}
 	if got := scene.TargetAt(app.width-2, 0); !strings.HasPrefix(string(got), "action:") {
 		t.Fatalf("top bar target = %q, want action", got)
+	}
+}
+
+func TestChatMessageHoverPaintsEveryCellInVisibleBlock(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "shell$"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	app.setSidebarOpen(true)
+	app.chatMessages = []ChatMessage{{Author: "alex", Body: "a message that wraps across more than one visible row in the chat sidebar"}}
+	target := chatMessageTarget(0)
+	app.hoverTarget = target
+	scene := app.buildScene()
+	rect := targetRect(t, scene, target)
+	want := app.styles.MessageHover.GetBackground()
+
+	for y := rect.Y; y < rect.Y+rect.H; y++ {
+		for x := rect.X; x < rect.X+rect.W; x++ {
+			if got := scene.Canvas.CellAt(x, y).Style.Bg; !reflect.DeepEqual(got, want) {
+				t.Fatalf("message hover background at (%d,%d) = %v, want %v across full block %v", x, y, got, want, rect)
+			}
+		}
+	}
+}
+
+func TestCopiedChatMessageHighlightsEveryCellInVisibleBlock(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "shell$"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	app.setSidebarOpen(true)
+	app.chatMessages = []ChatMessage{{Author: "alex", Body: "copy this command"}}
+	app.copiedChatActive = true
+	app.copiedChatIndex = 0
+	scene := app.buildScene()
+	rect := targetRect(t, scene, chatMessageTarget(0))
+	want := scene.Canvas.CellAt(rect.X, rect.Y).Style.Bg
+	if want == nil || reflect.DeepEqual(want, app.styles.MessageRemote.GetBackground()) {
+		t.Fatalf("copied background = %v, want distinct full-block feedback", want)
+	}
+	for y := rect.Y; y < rect.Y+rect.H; y++ {
+		for x := rect.X; x < rect.X+rect.W; x++ {
+			if got := scene.Canvas.CellAt(x, y).Style.Bg; !reflect.DeepEqual(got, want) {
+				t.Fatalf("copied background at (%d,%d) = %v, want %v across full block %v", x, y, got, want, rect)
+			}
+		}
 	}
 }
 

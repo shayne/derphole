@@ -40,6 +40,29 @@ func TestDarkChatPlaceholderKeepsOpenCodeMutedText(t *testing.T) {
 	}
 }
 
+func TestLightThemeUsesWarmNeutralSurfacesAndOrangeBlueChatAccents(t *testing.T) {
+	theme := newTheme(SchemeLight)
+	if got := colorString(theme.Role(SurfaceBackground).GetBackground()); got != "#FDFCFB" {
+		t.Fatalf("light background = %q, want warm #FDFCFB", got)
+	}
+	if got := colorString(theme.Role(SurfacePanel).GetBackground()); got != "#F8F7F5" {
+		t.Fatalf("light panel = %q, want #F8F7F5", got)
+	}
+	if got := colorString(theme.Role(AccentPrimary).GetForeground()); got != "#A9501E" {
+		t.Fatalf("light local accent = %q, want orange #A9501E", got)
+	}
+	if got := colorString(theme.Role(AccentSecondary).GetForeground()); got != "#2F69B3" {
+		t.Fatalf("light remote accent = %q, want blue #2F69B3", got)
+	}
+}
+
+func TestDarkComposerCursorUsesVisibleWarmColor(t *testing.T) {
+	style := newTheme(SchemeDark).Role(ComposerCursor)
+	if got := colorString(style.GetForeground()); got != "#FAB283" {
+		t.Fatalf("dark composer cursor = %q, want warm #FAB283", got)
+	}
+}
+
 func TestThemeDefinesEveryRoleForLightAndDark(t *testing.T) {
 	expectedOpenCodeRoles := []ThemeRole{
 		"SurfaceBackground",

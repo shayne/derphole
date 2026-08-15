@@ -21,11 +21,13 @@ type StyleSet struct {
 	Composer, ComposerHover, ComposerPlaceholder, ComposerCursor                 lipgloss.Style
 	ComposerBorder, LocalChat                                                    lipgloss.Style
 	MessageRemote, MessageLocal, MessageHover, MessageLocalHover, MessagePressed lipgloss.Style
+	MessageCopiedSurface                                                         lipgloss.Style
 	MessageAuthorRemote, MessageAuthorLocal                                      lipgloss.Style
 	MessageAccentRemote, MessageAccentLocal, MessageCopied                       lipgloss.Style
 	Divider, DividerHover, DividerDragging                                       lipgloss.Style
-	Modal, ModalInterior, Label, Dim, Separator                                  lipgloss.Style
-	ApprovalButton, ApprovalButtonSelected                                       lipgloss.Style
+	Modal, ModalInterior, ModalBackdrop, Label, Dim, Separator                   lipgloss.Style
+	ApprovalButton, ApprovalButtonSelected, ApprovalButtonHover                  lipgloss.Style
+	ApprovalButtonPressed                                                        lipgloss.Style
 	MenuLabel, MenuShortcut                                                      lipgloss.Style
 }
 
@@ -42,7 +44,7 @@ func NewStyleSet(scheme ColorScheme) StyleSet {
 		Scheme:            theme.scheme,
 		TopBar:            role(ChromeBase),
 		TopBarBrand:       role(ChromeBase).Foreground(pickColor(AccentPrimary, true)).Bold(true),
-		TopBarHover:       role(MessageHover),
+		TopBarHover:       role(SurfaceHover),
 		TopBarPressed:     role(MessagePressed).Bold(true),
 		TopBarActive:      role(MessageHover).Foreground(pickColor(AccentPrimary, true)).Bold(true),
 		TopBarDangerHover: role(MessageHover).Foreground(pickColor(ChromeDanger, true)).Bold(true),
@@ -51,7 +53,7 @@ func NewStyleSet(scheme ColorScheme) StyleSet {
 		TopBarChip:        role(ChromeBase),
 		TopBarMuted:       role(ChromeMuted),
 		TopBarWarn:        role(ChromeNotice).Bold(true),
-		TopBarAction:      role(MessageHover).Foreground(pickColor(AccentPrimary, true)).Bold(true),
+		TopBarAction:      role(ChromeBase).Foreground(pickColor(AccentPrimary, true)).Bold(true),
 		TopBarSeparator: lipgloss.NewStyle().
 			Foreground(pickColor(BorderBase, true)).
 			Background(pickColor(ChromeBase, false)),
@@ -67,32 +69,38 @@ func NewStyleSet(scheme ColorScheme) StyleSet {
 		ComposerBorder: lipgloss.NewStyle().
 			Foreground(pickColor(BorderBase, true)).
 			Background(pickColor(ChatBase, false)),
-		LocalChat:           lipgloss.NewStyle().Foreground(pickColor(AccentPrimary, true)),
-		MessageRemote:       role(ChatMessageUser),
-		MessageLocal:        role(ChatMessageSelf),
-		MessageHover:        role(MessageHover),
-		MessageLocalHover:   role(ChatMessageSelf).Background(pickColor(SurfacePanel, false)),
-		MessagePressed:      role(MessagePressed),
-		MessageAuthorRemote: lipgloss.NewStyle().Foreground(pickColor(AccentSecondary, true)).Bold(true),
-		MessageAuthorLocal:  lipgloss.NewStyle().Foreground(pickColor(AccentPrimary, true)).Bold(true),
-		MessageAccentRemote: lipgloss.NewStyle().Foreground(pickColor(AccentSecondary, true)),
-		MessageAccentLocal:  lipgloss.NewStyle().Foreground(pickColor(AccentPrimary, true)),
-		MessageCopied:       role(CopiedFeedback).Bold(true),
-		Divider:             lipgloss.NewStyle().Foreground(pickColor(BorderBase, true)),
-		DividerHover:        lipgloss.NewStyle().Foreground(pickColor(BorderActive, true)),
-		DividerDragging:     lipgloss.NewStyle().Foreground(pickColor(AccentPrimary, true)),
+		LocalChat:            lipgloss.NewStyle().Foreground(pickColor(AccentPrimary, true)),
+		MessageRemote:        role(ChatMessageUser),
+		MessageLocal:         role(ChatMessageSelf),
+		MessageHover:         role(MessageHover),
+		MessageLocalHover:    role(MessageHover),
+		MessagePressed:       role(MessagePressed),
+		MessageCopiedSurface: role(MessageCopied),
+		MessageAuthorRemote:  lipgloss.NewStyle().Foreground(pickColor(AccentSecondary, true)).Bold(true),
+		MessageAuthorLocal:   lipgloss.NewStyle().Foreground(pickColor(AccentPrimary, true)).Bold(true),
+		MessageAccentRemote:  lipgloss.NewStyle().Foreground(pickColor(AccentSecondary, true)),
+		MessageAccentLocal:   lipgloss.NewStyle().Foreground(pickColor(AccentPrimary, true)),
+		MessageCopied:        role(CopiedFeedback).Bold(true),
+		Divider:              lipgloss.NewStyle().Foreground(pickColor(BorderBase, true)),
+		DividerHover:         lipgloss.NewStyle().Foreground(pickColor(BorderActive, true)),
+		DividerDragging:      lipgloss.NewStyle().Foreground(pickColor(AccentPrimary, true)),
 		Modal: role(DialogBase).
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(pickColor(DialogBorder, true)).
 			Padding(0, 1),
 		ModalInterior: role(DialogBase),
+		ModalBackdrop: role(ModalBackdrop),
 		Label:         role(DialogText).Foreground(pickColor(AccentPrimary, true)).Bold(true),
 		Dim:           role(DialogMuted),
 		Separator: lipgloss.NewStyle().
 			Foreground(pickColor(BorderBase, true)),
 		ApprovalButton:         role(ButtonDefault),
 		ApprovalButtonSelected: role(ButtonFocused).Bold(true),
-		MenuLabel:              role(DialogText),
-		MenuShortcut:           role(DialogMuted),
+		ApprovalButtonHover: role(ButtonDefault).
+			Background(pickColor(SurfaceHover, false)).Bold(true),
+		ApprovalButtonPressed: role(ButtonDefault).
+			Background(pickColor(BorderBase, true)).Bold(true),
+		MenuLabel:    role(DialogText),
+		MenuShortcut: role(DialogMuted),
 	}
 }

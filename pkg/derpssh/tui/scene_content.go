@@ -5,11 +5,11 @@
 package tui
 
 import (
-	"fmt"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 )
 
 const (
@@ -79,7 +79,6 @@ func (a *App) buildSidebarLayers(layout Layout) []*lipgloss.Layer {
 	layers := []*lipgloss.Layer{
 		sceneLayer(targetSidebar, layout.Sidebar, sidebarLayerZ, sceneFill(a.styles.Sidebar, layout.Sidebar)),
 	}
-	layers = append(layers, a.buildSidebarHeaderLayers(layout.Sidebar)...)
 	layers = append(layers, a.buildChatMessageLayers(layout.Sidebar)...)
 	if !layout.Divider.empty() {
 		layers = append(layers, a.buildDividerLayer(layout.Divider))
@@ -94,9 +93,9 @@ func (a *App) buildChatMessageLayers(sidebar Rect) []*lipgloss.Layer {
 	reserved := a.sidebarComposerRows(sidebar.H)
 	messageViewport := Rect{
 		X: sidebar.X,
-		Y: sidebar.Y + 1,
+		Y: sidebar.Y,
 		W: sidebar.W,
-		H: maxInt(sidebar.H-1-reserved, 0),
+		H: maxInt(sidebar.H-reserved, 0),
 	}
 	blocks := visibleChatBlocks(a.chatRows(messageViewport.W), messageViewport, a.chatScroll)
 	layers := make([]*lipgloss.Layer, 0, len(blocks))
@@ -105,50 +104,68 @@ func (a *App) buildChatMessageLayers(sidebar Rect) []*lipgloss.Layer {
 			continue
 		}
 		target := chatMessageTarget(block.messageIndex)
-		accent := a.styles.MessageAccentRemote
-		surface := a.styles.MessageRemote
-		local := a.chatMessages[block.messageIndex].Local
-		if local {
-			accent = a.styles.MessageAccentLocal
-			surface = a.styles.MessageLocal
-		}
-		if a.hoverTarget == target {
-			if local {
-				surface = a.styles.MessageLocalHover
-			} else {
-				surface = a.styles.MessageHover
-			}
-		}
-		if a.pressedTarget == target {
-			surface = a.styles.MessagePressed
-		}
-		content := prefixChatBlock(block.content, accent.Render("┃")+" ")
-		content = surface.Width(block.rect.W).Height(block.rect.H).Render(content)
+		accent, surface, author := a.chatMessageStyles(block.messageIndex, target)
+		content := renderChatMessageBlock(block, surface, accent, author)
 		layers = append(layers, sceneLayer(target, block.rect, sidebarLayerZ+1, content))
 	}
 	return layers
 }
 
-func (a *App) buildSidebarHeaderLayers(sidebar Rect) []*lipgloss.Layer {
-	if sidebar.empty() {
-		return nil
+func (a *App) chatMessageStyles(index int, target layerTarget) (
+	accent lipgloss.Style,
+	surface lipgloss.Style,
+	author lipgloss.Style,
+) {
+	local := a.chatMessages[index].Local
+	accent = a.styles.MessageAccentRemote
+	surface = a.styles.MessageRemote
+	author = a.styles.MessageAuthorRemote
+	if local {
+		accent = a.styles.MessageAccentLocal
+		surface = a.styles.MessageLocal
+		author = a.styles.MessageAuthorLocal
 	}
-	headerRect := Rect{X: sidebar.X, Y: sidebar.Y, W: maxInt(sidebar.W-1, 0), H: 1}
-	header := a.styles.SidebarHeader.Render("◈ Chat") +
-		a.styles.TopBarMuted.Render(fmt.Sprintf(" %d peers", len(a.peers)))
-	layers := []*lipgloss.Layer{
-		sceneLayer(targetSidebar, headerRect, sidebarLayerZ+1, header),
+	if a.copiedChatActive && a.copiedChatIndex == index {
+		surface = a.styles.MessageCopiedSurface
 	}
-	closeTarget := actionTarget(ActionToggleChat)
-	closeStyle := a.styles.SidebarHeaderAction
-	if a.hoverTarget == closeTarget {
-		closeStyle = a.styles.SidebarHeaderActionHover
+	if a.hoverTarget == target {
+		surface = a.styles.MessageHover
 	}
-	if a.pressedTarget == closeTarget {
-		closeStyle = a.styles.TopBarPressed
+	if a.pressedTarget == target {
+		surface = a.styles.MessagePressed
 	}
-	closeRect := Rect{X: sidebar.X + sidebar.W - 1, Y: sidebar.Y, W: 1, H: 1}
-	return append(layers, sceneLayer(closeTarget, closeRect, sidebarLayerZ+2, closeStyle.Render("×")))
+	return accent, surface, author
+}
+
+func renderChatMessageBlock(
+	block chatRenderBlock,
+	surface lipgloss.Style,
+	accent lipgloss.Style,
+	author lipgloss.Style,
+) string {
+	if block.rect.empty() {
+		return ""
+	}
+	contentWidth := maxInt(block.rect.W-2, 0)
+	background := surface.GetBackground()
+	accent = accent.Background(background)
+	author = surface.Foreground(author.GetForeground()).Bold(true)
+	lines := make([]string, block.rect.H)
+	for i := range lines {
+		row := chatRenderRow{}
+		if i < len(block.rows) {
+			row = block.rows[i]
+		}
+		content := ansi.Truncate(row.content, contentWidth, "")
+		contentStyle := surface
+		if row.author {
+			contentStyle = author
+		}
+		padding := strings.Repeat(" ", maxInt(contentWidth-ansi.StringWidth(content), 0))
+		lines[i] = accent.Render("┃") + surface.Render(" ") +
+			contentStyle.Render(content) + surface.Render(padding)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (a *App) buildDividerLayer(rect Rect) *lipgloss.Layer {

@@ -117,14 +117,16 @@ func (a *App) headerSegmentStyle(segment topBarSegment, target layerTarget) lipg
 	if a.pressedTarget == target {
 		return a.styles.TopBarPressed
 	}
-	if segment.preserveHoverStyle {
-		return segment.style
-	}
-	if a.hoverTarget == target {
+	if a.hoverTarget == target && (segment.action != "" || segment.peer.ID != "") {
 		if segment.action == ActionQuit {
 			return a.styles.TopBarDangerHover
 		}
-		return a.styles.TopBarHover
+		return a.styles.TopBarHover.
+			Foreground(segment.style.GetForeground()).
+			Bold(segment.style.GetBold())
+	}
+	if segment.preserveHoverStyle {
+		return segment.style
 	}
 	if segment.action == ActionToggleChat && a.sidebarVisible() {
 		return a.styles.TopBarActive

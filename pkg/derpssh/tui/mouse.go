@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 )
 
 const (
@@ -48,7 +49,35 @@ func (a *App) handleMouseMessage(msg tea.MouseMsg) tea.Cmd {
 		mouse := msg.Mouse()
 		target = a.buildScene().TargetAt(mouse.X, mouse.Y)
 	}
-	return HandleMouse(a, newPointerMsg(target, msg))
+	interaction := HandleMouse(a, newPointerMsg(target, msg))
+	var pointer tea.Cmd
+	if _, motion := msg.(tea.MouseMotionMsg); motion {
+		pointer = a.updatePointerShape(target)
+	}
+	return tea.Batch(interaction, pointer)
+}
+
+func pointerShapeForTarget(target layerTarget) string {
+	switch target {
+	case targetTerminal:
+		return "text"
+	case targetDivider:
+		return "ew-resize"
+	default:
+		return "default"
+	}
+}
+
+func (a *App) updatePointerShape(target layerTarget) tea.Cmd {
+	shape := pointerShapeForTarget(target)
+	if a.modalActive() {
+		shape = "default"
+	}
+	if shape == a.pointerShape {
+		return nil
+	}
+	a.pointerShape = shape
+	return tea.Raw(ansi.SetPointerShape(shape))
 }
 
 type pointerAction int
@@ -113,7 +142,7 @@ func HandleMouse(app *App, pointer pointerMsg) tea.Cmd {
 	if app == nil {
 		return nil
 	}
-	if app.modalActive() || app.inviteOpen {
+	if app.inviteOpen {
 		app.clearLayerInteractionState()
 	}
 	if pointer.action() == pointerRelease && pointer.Target != app.pressedTarget {
@@ -174,7 +203,15 @@ func isChromeTarget(target layerTarget) bool {
 }
 
 func (a *App) updateHover(pointer pointerMsg) {
-	if pointer.action() != pointerMotion || a.pointerCapture != "" || a.modalActive() {
+	if pointer.action() != pointerMotion || a.pointerCapture != "" {
+		return
+	}
+	if a.modalActive() {
+		if a.frontModalHoverTarget(pointer.Target) {
+			a.hoverTarget = pointer.Target
+		} else {
+			a.hoverTarget = ""
+		}
 		return
 	}
 	if isChromeTarget(pointer.Target) || pointer.Target == targetDivider ||
@@ -183,6 +220,28 @@ func (a *App) updateHover(pointer pointerMsg) {
 		return
 	}
 	a.hoverTarget = ""
+}
+
+func (a *App) frontModalHoverTarget(target layerTarget) bool {
+	id, ok := a.frontModalID()
+	if !ok {
+		return false
+	}
+	switch id {
+	case ModalHelp:
+		_, ok = actionIDFromTarget(target)
+	case ModalPeerAction:
+		_, ok = peerActionChoiceFromTarget(target)
+	case ModalApproval:
+		_, ok = approvalChoiceFromTarget(target)
+	case ModalQuit:
+		_, ok = quitChoiceFromTarget(target)
+	case ModalShellExit:
+		_, ok = shellExitChoiceFromTarget(target)
+	default:
+		ok = false
+	}
+	return ok
 }
 
 func isMouseClick(msg pointerMsg) bool {
@@ -320,6 +379,7 @@ func (a *App) handleModalControlPress(msg pointerMsg, validTarget bool) (armed b
 			return false, false
 		}
 		a.mousePress = mousePressTarget{modalIdentity: identity, target: msg.Target}
+		a.pressedTarget = msg.Target
 		return true, false
 	case pointerRelease:
 		return false, a.releaseModalControlPress(msg, validTarget)
@@ -358,6 +418,7 @@ func (a *App) frontModalMouseIdentity() (string, bool) {
 
 func (a *App) clearMousePress() {
 	a.mousePress = mousePressTarget{}
+	a.pressedTarget = ""
 }
 
 func (a *App) clearPointerCapture() {

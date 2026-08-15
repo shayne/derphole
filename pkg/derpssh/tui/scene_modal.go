@@ -34,7 +34,7 @@ func (a *App) buildModalLayers(frame ModalFrame) []*lipgloss.Layer {
 
 	var front []*lipgloss.Layer
 	outer := Rect{W: frame.Width, H: frame.Height}
-	backdrop := fitSceneContent(frame.Backdrop, frame.Width, frame.Height)
+	backdrop := dimModalBackdrop(frame.Backdrop, frame.Width, frame.Height, frame.Styles.ModalBackdrop)
 	for i, dialog := range stack.dialogs {
 		z := modalLayerZ + i*modalLayerStride
 		modalLayers := []*lipgloss.Layer{sceneLayer(
@@ -51,6 +51,11 @@ func (a *App) buildModalLayers(frame ModalFrame) []*lipgloss.Layer {
 		}
 	}
 	return front
+}
+
+func dimModalBackdrop(backdrop string, width int, height int, style lipgloss.Style) string {
+	plain := ansi.Strip(backdrop)
+	return style.Width(width).Height(height).Render(fitSceneContent(plain, width, height))
 }
 
 func modalPanelLayers(dialog ModalDialog, frame ModalFrame, z int) []*lipgloss.Layer {

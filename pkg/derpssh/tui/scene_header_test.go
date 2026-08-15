@@ -6,6 +6,7 @@ package tui
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -118,7 +119,7 @@ func TestHeaderPackingReservesBrandAndFixedControlsBeforeTransientHints(t *testi
 	}
 }
 
-func TestHeaderSegmentStylePreservesUnreadChatStyleWhenHovered(t *testing.T) {
+func TestHeaderSegmentStyleShowsUnreadChatHover(t *testing.T) {
 	for _, tt := range []struct {
 		name  string
 		pulse bool
@@ -134,12 +135,31 @@ func TestHeaderSegmentStylePreservesUnreadChatStyleWhenHovered(t *testing.T) {
 			target := actionTarget(ActionToggleChat)
 			app.hoverTarget = target
 
-			got := app.headerSegmentStyle(segment, target).Render(segment.text)
-			want := segment.style.Render(segment.text)
-			if got != want {
-				t.Fatalf("hovered unread style = %q, want %q", got, want)
+			got := app.headerSegmentStyle(segment, target)
+			if !reflect.DeepEqual(got.GetBackground(), app.styles.TopBarHover.GetBackground()) {
+				t.Fatalf("hovered unread background = %v, want hover %v", got.GetBackground(), app.styles.TopBarHover.GetBackground())
+			}
+			if reflect.DeepEqual(got.GetBackground(), segment.style.GetBackground()) {
+				t.Fatalf("hovered unread background remained unchanged at %v", got.GetBackground())
 			}
 		})
+	}
+}
+
+func TestHeaderSegmentStyleShowsOpenChatAndPeerHover(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+	app.sidebarOpen = true
+	app.peers = []Peer{{ID: "guest-1", Name: "Alex", Role: RoleWrite}}
+	for _, segment := range []topBarSegment{app.chatTopBarSegments()[0], app.peerTopBarSegments()[0]} {
+		target := headerSegmentTarget(segment)
+		app.hoverTarget = target
+		got := app.headerSegmentStyle(segment, target)
+		if !reflect.DeepEqual(got.GetBackground(), app.styles.TopBarHover.GetBackground()) {
+			t.Fatalf("hovered %q background = %v, want %v", segment.text, got.GetBackground(), app.styles.TopBarHover.GetBackground())
+		}
+		if reflect.DeepEqual(got.GetBackground(), segment.style.GetBackground()) {
+			t.Fatalf("hovered %q retained resting background %v", segment.text, got.GetBackground())
+		}
 	}
 }
 

@@ -28,6 +28,33 @@ func TestMouseHoverTracksSemanticTopBarTarget(t *testing.T) {
 	}
 }
 
+func TestMousePointerShapeFollowsSemanticSurface(t *testing.T) {
+	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	app.setSidebarOpen(true)
+
+	app.Update(tea.MouseMotionMsg{X: app.layout.Terminal.X + 1, Y: app.layout.Terminal.Y + 1})
+	if app.pointerShape != "text" {
+		t.Fatalf("terminal pointer = %q, want text", app.pointerShape)
+	}
+	app.Update(tea.MouseMotionMsg{X: app.layout.Divider.X, Y: app.layout.Divider.Y + 1})
+	if app.pointerShape != "ew-resize" {
+		t.Fatalf("divider pointer = %q, want ew-resize", app.pointerShape)
+	}
+	chat := topBarActionRect(t, app, ActionToggleChat)
+	app.Update(tea.MouseMotionMsg{X: chat.X, Y: chat.Y})
+	if app.pointerShape != "default" {
+		t.Fatalf("chrome pointer = %q, want default", app.pointerShape)
+	}
+
+	app.Update(ApprovalRequestMsg{PeerID: "guest-1", Peer: "Alex"})
+	read, _, _ := app.approvalButtonRects()
+	app.Update(tea.MouseMotionMsg{X: read.X, Y: read.Y})
+	if app.pointerShape != "default" {
+		t.Fatalf("dialog pointer = %q, want default", app.pointerShape)
+	}
+}
+
 func TestMouseTopBarActionRequiresMatchingRelease(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
@@ -1004,6 +1031,7 @@ func TestTerminalSelectionAutoscrollSpeedAndReschedule(t *testing.T) {
 func TestTerminalSelectionAutoscrollDoesNotScrollAlternateScreen(t *testing.T) {
 	pane, app, terminal := startTerminalSelectionForAutoscroll(t)
 	pane.viewport.AlternateScreen = true
+	app.pointerShape = "text"
 
 	_, cmd := app.Update(tea.MouseMotionMsg{X: terminal.X + 2, Y: terminal.Y - 1, Button: tea.MouseLeft})
 
@@ -1223,6 +1251,29 @@ func TestMouseDragDividerRepaintsTerminalDuringMotion(t *testing.T) {
 	}
 	if got := pane.lastViewWidth(); got != app.layout.Terminal.W {
 		t.Fatalf("terminal view width = %d, want current layout width %d", got, app.layout.Terminal.W)
+	}
+}
+
+func TestMouseDividerCaptureSurvivesResizeAcknowledgementUntilRelease(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	app.setSidebarOpen(true)
+	start := app.layout.Divider
+
+	app.Update(leftClick(start.X, start.Y+2))
+	app.Update(tea.MouseMotionMsg{X: start.X - 1, Y: start.Y + 2, Button: tea.MouseLeft})
+	app.Update(RuntimeStateMsg{HostCols: app.hostCols + 1, HostRows: 29})
+	if app.pointerCapture != targetDivider || !app.draggingDivider {
+		t.Fatalf("capture after resize acknowledgement = %q/%v, want divider/true", app.pointerCapture, app.draggingDivider)
+	}
+
+	app.Update(tea.MouseMotionMsg{X: start.X - 8, Y: start.Y + 2, Button: tea.MouseLeft})
+	if app.sidebarWidth < 8 {
+		t.Fatalf("sidebar width after continued drag = %d, want motion to continue", app.sidebarWidth)
+	}
+	app.Update(leftRelease(start.X-8, start.Y+2))
+	if app.pointerCapture != "" || app.draggingDivider {
+		t.Fatalf("capture after release = %q/%v, want cleared", app.pointerCapture, app.draggingDivider)
 	}
 }
 

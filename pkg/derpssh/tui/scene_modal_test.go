@@ -36,6 +36,39 @@ func TestModalLayersCoverUnderlyingTargetsAndExposeButtons(t *testing.T) {
 	}
 }
 
+func TestModalBackdropDimsUnderlyingScene(t *testing.T) {
+	app := newModalSceneApp()
+	base := app.buildScene()
+	app.Update(ApprovalRequestMsg{PeerID: "guest-1", Peer: "Alex"})
+	dimmed := app.buildScene()
+
+	baseCell := base.Canvas.CellAt(1, 0)
+	dimmedCell := dimmed.Canvas.CellAt(1, 0)
+	if reflect.DeepEqual(baseCell.Style, dimmedCell.Style) {
+		t.Fatalf("modal backdrop style = base style %+v, want visibly dimmed scene", dimmedCell.Style)
+	}
+}
+
+func TestModalChoiceHoverAndPressUseWholeButtonState(t *testing.T) {
+	app := newModalSceneApp()
+	app.Update(ApprovalRequestMsg{PeerID: "guest-1", Peer: "Alex"})
+	target := modalChoiceTarget(ModalApproval, "read")
+
+	app.Update(newPointerMsg(target, tea.MouseMotionMsg{}))
+	if app.hoverTarget != target {
+		t.Fatalf("modal hover target = %q, want %q", app.hoverTarget, target)
+	}
+	hovered := app.renderApprovalButton(approvalChoiceRead)
+	app.Update(newPointerMsg(target, clickAt(0, 0, tea.MouseLeft)))
+	if app.pressedTarget != target {
+		t.Fatalf("modal pressed target = %q, want %q", app.pressedTarget, target)
+	}
+	pressed := app.renderApprovalButton(approvalChoiceRead)
+	if hovered == pressed {
+		t.Fatalf("modal hover and pressed rendering are identical: %q", hovered)
+	}
+}
+
 func TestModalLayersExposeModalChoiceAndHelpActionTargets(t *testing.T) {
 	t.Run("peer action", func(t *testing.T) {
 		app := newModalSceneApp()

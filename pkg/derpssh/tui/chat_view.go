@@ -17,12 +17,14 @@ const chatSpacerMessageIndex = -1
 type chatRenderRow struct {
 	messageIndex int
 	content      string
+	author       bool
 }
 
 type chatRenderBlock struct {
 	messageIndex int
 	rect         Rect
 	content      string
+	rows         []chatRenderRow
 }
 
 func chatMessageTarget(index int) layerTarget {
@@ -43,17 +45,16 @@ func (a *App) chatRows(width int) []chatRenderRow {
 	counts := a.identityCounts()
 	rows := make([]chatRenderRow, 0, len(a.chatMessages)*3)
 	for index, msg := range a.chatMessages {
-		author := a.displayHandleWithCounts(msg.Author, 16, counts)
+		author := "you"
+		if !msg.Local {
+			author = a.displayHandleWithCounts(msg.Author, 16, counts)
+		}
 		if author == "" {
 			author = "peer"
 		}
-		authorStyle := a.styles.MessageAuthorRemote
-		if msg.Local {
-			authorStyle = a.styles.MessageAuthorLocal
-		}
-		authorRow := authorStyle.Render(author)
+		authorRow := author
 		if a.copiedChatActive && a.copiedChatIndex == index {
-			copied := a.styles.MessageCopied.Render("✓ Copied")
+			copied := "✓ Copied"
 			copiedWidth := ansi.StringWidth(copied)
 			if copiedWidth <= contentWidth {
 				authorRow = ansi.Truncate(authorRow, maxInt(contentWidth-copiedWidth-1, 0), "")
@@ -61,7 +62,7 @@ func (a *App) chatRows(width int) []chatRenderRow {
 				authorRow += strings.Repeat(" ", maxInt(gap, 0)) + copied
 			}
 		}
-		rows = append(rows, chatRenderRow{messageIndex: index, content: authorRow})
+		rows = append(rows, chatRenderRow{messageIndex: index, content: authorRow, author: true})
 		for _, line := range wrapPlainLines(msg.Body, contentWidth) {
 			rows = append(rows, chatRenderRow{messageIndex: index, content: line})
 		}
@@ -88,12 +89,14 @@ func visibleChatBlocks(rows []chatRenderRow, viewport Rect, scroll int) []chatRe
 			blocks[last].rect.Y+blocks[last].rect.H == y {
 			blocks[last].rect.H++
 			blocks[last].content += "\n" + row.content
+			blocks[last].rows = append(blocks[last].rows, row)
 			continue
 		}
 		blocks = append(blocks, chatRenderBlock{
 			messageIndex: row.messageIndex,
 			rect:         Rect{X: viewport.X, Y: y, W: viewport.W, H: 1},
 			content:      row.content,
+			rows:         []chatRenderRow{row},
 		})
 	}
 	return blocks

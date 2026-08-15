@@ -80,6 +80,23 @@ func TestCopiedChatFeedbackIgnoresStaleTick(t *testing.T) {
 	}
 }
 
+func TestAppAbsorbsTransportEchoWithoutChangingLocalIdentity(t *testing.T) {
+	app := NewApp(Options{DisplayName: "shayne", Terminal: &fakePane{view: "ok"}})
+	app.appendChatMessage(ChatMessage{Author: "shayne", Body: "hello", Local: true})
+	app.appendChatMessage(ChatMessage{Author: "shayne", Body: "hello"})
+
+	if len(app.chatMessages) != 1 {
+		t.Fatalf("messages = %d, want one after absorbing transport echo", len(app.chatMessages))
+	}
+	if !app.chatMessages[0].Local {
+		t.Fatal("transport echo changed local message identity")
+	}
+	rows := app.chatRows(24)
+	if got := strings.TrimSpace(ansiPattern.ReplaceAllString(rows[0].content, "")); got != "you" {
+		t.Fatalf("local author after echo = %q, want you", got)
+	}
+}
+
 func TestCopiedChatFeedbackRendersOnlyOnCopiedMessageAndClearsOnMatchingTick(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
@@ -711,8 +728,8 @@ func TestLocalChatAuthorDefaultsToUser(t *testing.T) {
 	app.Update(keyCode(tea.KeyEnter))
 
 	view := ansiPattern.ReplaceAllString(appContent(app), "")
-	if !strings.Contains(view, "shayne") || !strings.Contains(view, "hello") {
-		t.Fatalf("View() missing USER chat author:\n%s", view)
+	if !strings.Contains(view, "you") || !strings.Contains(view, "hello") {
+		t.Fatalf("View() missing local you chat author:\n%s", view)
 	}
 	if strings.Contains(view, "me") {
 		t.Fatalf("View() used generic me author:\n%s", view)
@@ -743,8 +760,8 @@ func TestLocalChatEchoIsDeduplicated(t *testing.T) {
 	if strings.Contains(message, "root@hetz") {
 		t.Fatalf("chat message rendered with host-qualified local name:\n%s", message)
 	}
-	if strings.Count(message, "root") != 1 || strings.Count(message, "hello") != 1 {
-		t.Fatalf("chat message did not render compact author and body once:\n%s", message)
+	if strings.Count(message, "you") != 1 || strings.Count(message, "hello") != 1 {
+		t.Fatalf("chat message did not render you and body once:\n%s", message)
 	}
 	view := appContent(app)
 	if got := strings.Count(view, "Message"); got > 1 {

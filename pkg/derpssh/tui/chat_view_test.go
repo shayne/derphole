@@ -4,7 +4,10 @@
 
 package tui
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestChatRowsGroupAuthorAndBodyBySourceMessage(t *testing.T) {
 	app := NewApp(Options{DisplayName: "shayne", Terminal: &fakePane{view: "ok"}})
@@ -25,6 +28,27 @@ func TestChatRowsGroupAuthorAndBodyBySourceMessage(t *testing.T) {
 	}
 	if remote < 3 || local < 2 {
 		t.Fatalf("message rows = remote %d local %d, want grouped author/body rows", remote, local)
+	}
+}
+
+func TestChatRowsLabelLocalAsYouAndRemoteByUsername(t *testing.T) {
+	app := NewApp(Options{DisplayName: "shayne", Terminal: &fakePane{view: "ok"}})
+	app.chatMessages = []ChatMessage{
+		{Author: "alex", Body: "remote"},
+		{Author: "shayne", Body: "local", Local: true},
+	}
+
+	rows := app.chatRows(24)
+	remote := ansiPattern.ReplaceAllString(rows[0].content, "")
+	local := ""
+	for _, row := range rows {
+		if row.messageIndex == 1 {
+			local = ansiPattern.ReplaceAllString(row.content, "")
+			break
+		}
+	}
+	if strings.TrimSpace(remote) != "alex" || strings.TrimSpace(local) != "you" {
+		t.Fatalf("authors = remote %q local %q, want alex/you", remote, local)
 	}
 }
 

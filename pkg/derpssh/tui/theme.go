@@ -48,6 +48,7 @@ const (
 	SurfaceBackground ThemeRole = "SurfaceBackground"
 	SurfacePanel      ThemeRole = "SurfacePanel"
 	SurfaceElement    ThemeRole = "SurfaceElement"
+	SurfaceHover      ThemeRole = "SurfaceHover"
 	BorderSubtle      ThemeRole = "BorderSubtle"
 	BorderBase        ThemeRole = "BorderBase"
 	BorderActive      ThemeRole = "BorderActive"
@@ -56,7 +57,9 @@ const (
 	StateSuccess      ThemeRole = "StateSuccess"
 	MessageHover      ThemeRole = "MessageHover"
 	MessagePressed    ThemeRole = "MessagePressed"
+	MessageCopied     ThemeRole = "MessageCopied"
 	CopiedFeedback    ThemeRole = "CopiedFeedback"
+	ModalBackdrop     ThemeRole = "ModalBackdrop"
 )
 
 type themeColorPair struct {
@@ -128,6 +131,7 @@ func allThemeRoles() []ThemeRole {
 		SurfaceBackground,
 		SurfacePanel,
 		SurfaceElement,
+		SurfaceHover,
 		BorderSubtle,
 		BorderBase,
 		BorderActive,
@@ -136,51 +140,57 @@ func allThemeRoles() []ThemeRole {
 		StateSuccess,
 		MessageHover,
 		MessagePressed,
+		MessageCopied,
 		CopiedFeedback,
+		ModalBackdrop,
 	}
 }
 
 func themeRolesForScheme(scheme ColorScheme) map[ThemeRole]themeColorPair {
 	if scheme == SchemeLight {
 		return map[ThemeRole]themeColorPair{
-			SurfaceBackground: {foreground: "#1A1A1A", background: "#FFFFFF"},
-			SurfacePanel:      {foreground: "#1A1A1A", background: "#FAFAFA"},
-			SurfaceElement:    {foreground: "#1A1A1A", background: "#F5F5F5"},
-			BorderSubtle:      {foreground: "#D4D4D4", background: "#FFFFFF"},
-			BorderBase:        {foreground: "#B8B8B8", background: "#FFFFFF"},
-			BorderActive:      {foreground: "#A0A0A0", background: "#FFFFFF"},
-			AccentPrimary:     {foreground: "#3B7DD8", background: "#FAFAFA"},
-			AccentSecondary:   {foreground: "#7B5BB6", background: "#FAFAFA"},
-			StateSuccess:      {foreground: "#3D9A57", background: "#FAFAFA"},
-			ChromeBase:        {foreground: "#1A1A1A", background: "#FAFAFA"},
-			ChromeMuted:       {foreground: "#686868", background: "#FAFAFA"},
-			ChromeActive:      {foreground: "#0A0A0A", background: "#3B7DD8"},
-			ChromeDanger:      {foreground: "#D1383D", background: "#FAFAFA"},
-			ChromeNotice:      {foreground: "#1A1A1A", background: "#D68C27"},
-			DialogBase:        {foreground: "#1A1A1A", background: "#FAFAFA"},
-			DialogBorder:      {foreground: "#B8B8B8", background: "#FAFAFA"},
-			DialogText:        {foreground: "#1A1A1A", background: "#FAFAFA"},
-			DialogMuted:       {foreground: "#686868", background: "#FAFAFA"},
-			ButtonDefault:     {foreground: "#1A1A1A", background: "#F5F5F5"},
-			ButtonFocused:     {foreground: "#0A0A0A", background: "#3B7DD8"},
-			ButtonDanger:      {foreground: "#FFFFFF", background: "#D1383D"},
-			ChatBase:          {foreground: "#1A1A1A", background: "#FAFAFA"},
-			ChatHeader:        {foreground: "#1A1A1A", background: "#F5F5F5"},
-			ChatMessageUser:   {foreground: "#1A1A1A", background: "#FAFAFA"},
-			ChatMessageSelf:   {foreground: "#1A1A1A", background: "#F5F5F5"},
-			ChatPlaceholder:   {foreground: "#686868", background: "#F5F5F5"},
-			ComposerBase:      {foreground: "#1A1A1A", background: "#F5F5F5"},
-			ComposerCursor:    {foreground: "#0A0A0A", background: "#3B7DD8"},
-			SelectionMode:     {foreground: "#1A1A1A", background: "#F5F5F5"},
-			MessageHover:      {foreground: "#1A1A1A", background: "#F5F5F5"},
-			MessagePressed:    {foreground: "#1A1A1A", background: "#FFFFFF"},
-			CopiedFeedback:    {foreground: "#1A1A1A", background: "#3D9A57"},
+			SurfaceBackground: {foreground: "#201E1B", background: "#FDFCFB"},
+			SurfacePanel:      {foreground: "#201E1B", background: "#F8F7F5"},
+			SurfaceElement:    {foreground: "#201E1B", background: "#F1EFEC"},
+			SurfaceHover:      {foreground: "#201E1B", background: "#E8E4DF"},
+			BorderSubtle:      {foreground: "#D6D0C9", background: "#FDFCFB"},
+			BorderBase:        {foreground: "#BEB6AD", background: "#FDFCFB"},
+			BorderActive:      {foreground: "#9E958B", background: "#FDFCFB"},
+			AccentPrimary:     {foreground: "#A9501E", background: "#F8F7F5"},
+			AccentSecondary:   {foreground: "#2F69B3", background: "#F8F7F5"},
+			StateSuccess:      {foreground: "#397A4A", background: "#F8F7F5"},
+			ChromeBase:        {foreground: "#201E1B", background: "#F8F7F5"},
+			ChromeMuted:       {foreground: "#6F6A64", background: "#F8F7F5"},
+			ChromeActive:      {foreground: "#FDFCFB", background: "#A9501E"},
+			ChromeDanger:      {foreground: "#B7353A", background: "#F8F7F5"},
+			ChromeNotice:      {foreground: "#FDFCFB", background: "#A9501E"},
+			DialogBase:        {foreground: "#201E1B", background: "#F8F7F5"},
+			DialogBorder:      {foreground: "#9E958B", background: "#F8F7F5"},
+			DialogText:        {foreground: "#201E1B", background: "#F8F7F5"},
+			DialogMuted:       {foreground: "#6F6A64", background: "#F8F7F5"},
+			ButtonDefault:     {foreground: "#201E1B", background: "#F1EFEC"},
+			ButtonFocused:     {foreground: "#FDFCFB", background: "#A9501E"},
+			ButtonDanger:      {foreground: "#FDFCFB", background: "#B7353A"},
+			ChatBase:          {foreground: "#201E1B", background: "#F8F7F5"},
+			ChatHeader:        {foreground: "#201E1B", background: "#F1EFEC"},
+			ChatMessageUser:   {foreground: "#201E1B", background: "#F8F7F5"},
+			ChatMessageSelf:   {foreground: "#201E1B", background: "#F8F7F5"},
+			ChatPlaceholder:   {foreground: "#6F6A64", background: "#F1EFEC"},
+			ComposerBase:      {foreground: "#201E1B", background: "#F1EFEC"},
+			ComposerCursor:    {foreground: "#A9501E", background: "#F1EFEC"},
+			SelectionMode:     {foreground: "#201E1B", background: "#F1EFEC"},
+			MessageHover:      {foreground: "#201E1B", background: "#E8E4DF"},
+			MessagePressed:    {foreground: "#201E1B", background: "#DED9D3"},
+			MessageCopied:     {foreground: "#201E1B", background: "#E4F0E5"},
+			CopiedFeedback:    {foreground: "#FDFCFB", background: "#397A4A"},
+			ModalBackdrop:     {foreground: "#8A837B", background: "#DED9D3"},
 		}
 	}
 	return map[ThemeRole]themeColorPair{
 		SurfaceBackground: {foreground: "#EEEEEE", background: "#0A0A0A"},
 		SurfacePanel:      {foreground: "#EEEEEE", background: "#141414"},
 		SurfaceElement:    {foreground: "#EEEEEE", background: "#1E1E1E"},
+		SurfaceHover:      {foreground: "#EEEEEE", background: "#282828"},
 		BorderSubtle:      {foreground: "#3C3C3C", background: "#0A0A0A"},
 		BorderBase:        {foreground: "#484848", background: "#0A0A0A"},
 		BorderActive:      {foreground: "#606060", background: "#0A0A0A"},
@@ -202,14 +212,16 @@ func themeRolesForScheme(scheme ColorScheme) map[ThemeRole]themeColorPair {
 		ChatBase:          {foreground: "#EEEEEE", background: "#141414"},
 		ChatHeader:        {foreground: "#EEEEEE", background: "#1E1E1E"},
 		ChatMessageUser:   {foreground: "#EEEEEE", background: "#141414"},
-		ChatMessageSelf:   {foreground: "#EEEEEE", background: "#1E1E1E"},
+		ChatMessageSelf:   {foreground: "#EEEEEE", background: "#141414"},
 		ChatPlaceholder:   {foreground: "#808080", background: "#1E1E1E"},
 		ComposerBase:      {foreground: "#EEEEEE", background: "#1E1E1E"},
-		ComposerCursor:    {foreground: "#0A0A0A", background: "#FAB283"},
+		ComposerCursor:    {foreground: "#FAB283", background: "#1E1E1E"},
 		SelectionMode:     {foreground: "#EEEEEE", background: "#1E1E1E"},
 		MessageHover:      {foreground: "#EEEEEE", background: "#1E1E1E"},
 		MessagePressed:    {foreground: "#EEEEEE", background: "#0A0A0A"},
+		MessageCopied:     {foreground: "#EEEEEE", background: "#203425"},
 		CopiedFeedback:    {foreground: "#0A0A0A", background: "#7FD88F"},
+		ModalBackdrop:     {foreground: "#606060", background: "#0A0A0A"},
 	}
 }
 

@@ -619,6 +619,9 @@ func TestTUIConsoleStopRestoresTerminalExactlyOnce(t *testing.T) {
 	if got := strings.Count(out.String(), "\x1b[?1049l"); got != 1 {
 		t.Fatalf("terminal restore writes = %d, want 1; output %q", got, out.String())
 	}
+	if got := strings.Count(out.String(), "\x1b]22;default\x07"); got != 1 {
+		t.Fatalf("pointer restore writes = %d, want 1; output %q", got, out.String())
+	}
 }
 
 func TestTUIConsoleNonTTYApprovalDeniesWithoutEnv(t *testing.T) {

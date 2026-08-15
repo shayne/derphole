@@ -170,6 +170,7 @@ type App struct {
 	peerDialogChoice          peerActionChoice
 	mousePress                mousePressTarget
 	pointerCapture            layerTarget
+	pointerShape              string
 	hoverTarget               layerTarget
 	pressedTarget             layerTarget
 	terminalGesture           terminalGestureKind
@@ -237,6 +238,7 @@ func NewApp(opts Options) *App {
 		focus:           FocusTerminal,
 		inviteOpen:      opts.InitialInviteOpen,
 		copiedChatIndex: -1,
+		pointerShape:    "default",
 		localRole:       RolePending,
 		transport:       "starting",
 		composer:        composer,
@@ -250,7 +252,10 @@ func NewApp(opts Options) *App {
 }
 
 func (a *App) Init() tea.Cmd {
-	return tea.RequestBackgroundColor
+	return tea.Batch(
+		tea.RequestBackgroundColor,
+		tea.Raw(ansi.SetPointerShape("default")),
+	)
 }
 
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -351,7 +356,9 @@ func (a *App) configureComposerStyles() {
 func (a *App) applyRuntimeState(msg RuntimeStateMsg) {
 	a.transport = valueOr(msg.Transport, a.transport)
 	if msg.HostCols != a.hostCols || msg.HostRows != a.hostRows {
-		a.clearPointerCapture()
+		if a.pointerCapture != targetDivider {
+			a.clearPointerCapture()
+		}
 	}
 	a.hostCols = msg.HostCols
 	a.hostRows = msg.HostRows
@@ -1091,7 +1098,6 @@ func (a *App) isLocalEcho(msg ChatMessage) bool {
 			continue
 		}
 		if strings.TrimSpace(existing.Author) == author && strings.TrimSpace(existing.Body) == body {
-			a.chatMessages[i].Local = false
 			return true
 		}
 	}
@@ -1678,34 +1684,75 @@ func (a *App) waitingApprovalContentWidth() int {
 
 func (a *App) renderQuitButton(choice quitChoice) string {
 	text := quitButtonText(choice)
-	if a.quitChoice == choice {
-		return a.styles.ApprovalButtonSelected.Render(text)
-	}
-	return a.styles.ApprovalButton.Render(text)
+	style := a.modalButtonStyle(modalChoiceTarget(ModalQuit, stringForQuitChoice(choice)), a.quitChoice == choice)
+	return style.Render(text)
 }
 
 func (a *App) renderShellExitButton(choice shellExitChoice) string {
 	text := shellExitButtonText(choice)
-	if a.shellExitChoice == choice {
-		return a.styles.ApprovalButtonSelected.Render(text)
-	}
-	return a.styles.ApprovalButton.Render(text)
+	style := a.modalButtonStyle(modalChoiceTarget(ModalShellExit, stringForShellExitChoice(choice)), a.shellExitChoice == choice)
+	return style.Render(text)
 }
 
 func (a *App) renderApprovalButton(choice approvalChoice) string {
 	text := approvalButtonText(choice)
-	if a.approvalChoice == choice {
-		return a.styles.ApprovalButtonSelected.Render(text)
-	}
-	return a.styles.ApprovalButton.Render(text)
+	style := a.modalButtonStyle(modalChoiceTarget(ModalApproval, stringForApprovalChoice(choice)), a.approvalChoice == choice)
+	return style.Render(text)
 }
 
 func (a *App) renderPeerActionButton(choice peerActionChoice) string {
 	text := peerActionButtonText(choice)
-	if a.peerDialogChoice == choice {
-		return a.styles.ApprovalButtonSelected.Render(text)
+	style := a.modalButtonStyle(modalChoiceTarget(ModalPeerAction, stringForPeerActionChoice(choice)), a.peerDialogChoice == choice)
+	return style.Render(text)
+}
+
+func (a *App) modalButtonStyle(target layerTarget, selected bool) lipgloss.Style {
+	if a.pressedTarget == target {
+		return a.styles.ApprovalButtonPressed
 	}
-	return a.styles.ApprovalButton.Render(text)
+	if a.hoverTarget == target {
+		return a.styles.ApprovalButtonHover
+	}
+	if selected {
+		return a.styles.ApprovalButtonSelected
+	}
+	return a.styles.ApprovalButton
+}
+
+func stringForQuitChoice(choice quitChoice) string {
+	if choice == quitChoiceCancel {
+		return "cancel"
+	}
+	return "quit"
+}
+
+func stringForShellExitChoice(choice shellExitChoice) string {
+	if choice == shellExitChoiceQuit {
+		return "quit"
+	}
+	return "restart"
+}
+
+func stringForApprovalChoice(choice approvalChoice) string {
+	switch choice {
+	case approvalChoiceRead:
+		return "read"
+	case approvalChoiceDeny:
+		return "deny"
+	default:
+		return "write"
+	}
+}
+
+func stringForPeerActionChoice(choice peerActionChoice) string {
+	switch choice {
+	case peerActionRead:
+		return "read"
+	case peerActionKick:
+		return "kick"
+	default:
+		return "write"
+	}
 }
 
 func (a *App) approvalActive() bool {
