@@ -175,7 +175,8 @@ func TestInputRouterCtrlXStartsPrefixWithoutTerminalInput(t *testing.T) {
 
 func TestInputRouterChatFocusRoutesTextToComposer(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
-	app.focusChat()
+	app.setSidebarOpen(true)
+	drainCommands(app)
 
 	_ = app.routeInput(textKey("h"))
 	_ = app.routeInput(textKey("i"))
@@ -224,7 +225,8 @@ func TestInputRouterRoutesChatPasteToComposer(t *testing.T) {
 		fakePane: fakePane{view: "ok"},
 	}}
 	app := NewApp(Options{Terminal: pane})
-	app.focusChat()
+	app.setSidebarOpen(true)
+	drainCommands(app)
 
 	app.Update(tea.PasteMsg{Content: "one\ntwo"})
 
@@ -236,6 +238,79 @@ func TestInputRouterRoutesChatPasteToComposer(t *testing.T) {
 	}
 	if len(pane.events) != 0 {
 		t.Fatalf("chat paste terminal interactions = %v, want none", pane.events)
+	}
+}
+
+func TestInputRouterCollapsedRequestedChatRoutesTerminalAndCountsUnread(t *testing.T) {
+	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	drainCommands(app)
+	app.setSidebarOpen(true)
+	drainCommands(app)
+	if !app.layout.SidebarOpen || app.focus != FocusChat || !app.composer.Focused() {
+		t.Fatalf("open chat state = layout %v focus %v composer %v, want visible chat focus",
+			app.layout.SidebarOpen, app.focus, app.composer.Focused())
+	}
+
+	app.Update(tea.WindowSizeMsg{Width: 55, Height: 24})
+	drainCommands(app)
+	if !app.sidebarOpen {
+		t.Fatal("requested chat state was lost after narrow collapse")
+	}
+	if app.layout.SidebarOpen {
+		t.Fatal("effective chat state stayed open at 55 columns")
+	}
+	if app.focus != FocusTerminal || app.composer.Focused() {
+		t.Fatalf("collapsed chat focus = %v/composer %v, want terminal/blurred",
+			app.focus, app.composer.Focused())
+	}
+
+	app.Update(textKey("x"))
+	app.Update(tea.PasteMsg{Content: "paste"})
+	app.Update(keyCode(tea.KeyEnter))
+	var terminalData []string
+	for cmd := readCommand(app); cmd != nil; cmd = readCommand(app) {
+		switch cmd := cmd.(type) {
+		case TerminalInputCommand:
+			terminalData = append(terminalData, string(cmd.Data))
+		case ChatSendCommand:
+			t.Fatalf("collapsed composer emitted ChatSendCommand %+v", cmd)
+		default:
+			t.Fatalf("collapsed input emitted unexpected command %T", cmd)
+		}
+	}
+	if got, want := terminalData, []string{"x", "paste", "\r"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("collapsed terminal input = %q, want %q", got, want)
+	}
+	if got := app.composer.Value(); got != "" {
+		t.Fatalf("collapsed composer value = %q, want empty", got)
+	}
+
+	_, pulse := app.Update(ChatMsg{Author: "alex", Body: "hidden ping"})
+	if pulse == nil {
+		t.Fatal("hidden remote message did not start unread attention")
+	}
+	if app.unreadChat != 1 {
+		t.Fatalf("hidden remote unread = %d, want 1", app.unreadChat)
+	}
+	if got := app.chatTopBarSegments()[0].text; got != "◈ Chat 1" {
+		t.Fatalf("collapsed chat header = %q, want unread inactive state", got)
+	}
+
+	app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	drainCommands(app)
+	if !app.sidebarOpen || !app.layout.SidebarOpen {
+		t.Fatalf("expanded chat state = requested %v effective %v, want both open",
+			app.sidebarOpen, app.layout.SidebarOpen)
+	}
+	if app.unreadChat != 0 {
+		t.Fatalf("visible chat unread = %d, want cleared", app.unreadChat)
+	}
+	segment := app.chatTopBarSegments()[0]
+	got := app.headerSegmentStyle(segment, actionTarget(ActionToggleChat)).Render(segment.text)
+	want := app.styles.TopBarActive.Render(segment.text)
+	if got != want {
+		t.Fatalf("expanded chat header style = %q, want effective active style %q", got, want)
 	}
 }
 

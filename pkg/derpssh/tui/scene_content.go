@@ -5,6 +5,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -75,13 +76,11 @@ func (a *App) buildSidebarLayers(layout Layout) []*lipgloss.Layer {
 		return nil
 	}
 
-	sidebar := a.sidebarLines(layout.Sidebar.W, layout.Sidebar.H)
-	layers := []*lipgloss.Layer{sceneLayer(
-		targetSidebar,
-		layout.Sidebar,
-		sidebarLayerZ,
-		strings.Join(sidebar, "\n"),
-	)}
+	layers := []*lipgloss.Layer{
+		sceneLayer(targetSidebar, layout.Sidebar, sidebarLayerZ, sceneFill(a.styles.Sidebar, layout.Sidebar)),
+	}
+	layers = append(layers, a.buildSidebarHeaderLayers(layout.Sidebar)...)
+	layers = append(layers, a.buildChatMessageLayers(layout.Sidebar)...)
 	if !layout.Divider.empty() {
 		layers = append(layers, a.buildDividerLayer(layout.Divider))
 	}
@@ -91,8 +90,75 @@ func (a *App) buildSidebarLayers(layout Layout) []*lipgloss.Layer {
 	return layers
 }
 
+func (a *App) buildChatMessageLayers(sidebar Rect) []*lipgloss.Layer {
+	reserved := a.sidebarComposerRows(sidebar.H)
+	messageViewport := Rect{
+		X: sidebar.X,
+		Y: sidebar.Y + 1,
+		W: sidebar.W,
+		H: maxInt(sidebar.H-1-reserved, 0),
+	}
+	blocks := visibleChatBlocks(a.chatRows(messageViewport.W), messageViewport, a.chatScroll)
+	layers := make([]*lipgloss.Layer, 0, len(blocks))
+	for _, block := range blocks {
+		if block.messageIndex < 0 || block.messageIndex >= len(a.chatMessages) {
+			continue
+		}
+		target := chatMessageTarget(block.messageIndex)
+		accent := a.styles.MessageAccentRemote
+		surface := a.styles.MessageRemote
+		local := a.chatMessages[block.messageIndex].Local
+		if local {
+			accent = a.styles.MessageAccentLocal
+			surface = a.styles.MessageLocal
+		}
+		if a.hoverTarget == target {
+			if local {
+				surface = a.styles.MessageLocalHover
+			} else {
+				surface = a.styles.MessageHover
+			}
+		}
+		if a.pressedTarget == target {
+			surface = a.styles.MessagePressed
+		}
+		content := prefixChatBlock(block.content, accent.Render("┃")+" ")
+		content = surface.Width(block.rect.W).Height(block.rect.H).Render(content)
+		layers = append(layers, sceneLayer(target, block.rect, sidebarLayerZ+1, content))
+	}
+	return layers
+}
+
+func (a *App) buildSidebarHeaderLayers(sidebar Rect) []*lipgloss.Layer {
+	if sidebar.empty() {
+		return nil
+	}
+	headerRect := Rect{X: sidebar.X, Y: sidebar.Y, W: maxInt(sidebar.W-1, 0), H: 1}
+	header := a.styles.SidebarHeader.Render("◈ Chat") +
+		a.styles.TopBarMuted.Render(fmt.Sprintf(" %d peers", len(a.peers)))
+	layers := []*lipgloss.Layer{
+		sceneLayer(targetSidebar, headerRect, sidebarLayerZ+1, header),
+	}
+	closeTarget := actionTarget(ActionToggleChat)
+	closeStyle := a.styles.SidebarHeaderAction
+	if a.hoverTarget == closeTarget {
+		closeStyle = a.styles.SidebarHeaderActionHover
+	}
+	if a.pressedTarget == closeTarget {
+		closeStyle = a.styles.TopBarPressed
+	}
+	closeRect := Rect{X: sidebar.X + sidebar.W - 1, Y: sidebar.Y, W: 1, H: 1}
+	return append(layers, sceneLayer(closeTarget, closeRect, sidebarLayerZ+2, closeStyle.Render("×")))
+}
+
 func (a *App) buildDividerLayer(rect Rect) *lipgloss.Layer {
-	line := a.styles.Separator.Render(strings.Repeat("│", rect.W))
+	style := a.styles.Divider
+	if a.draggingDivider {
+		style = a.styles.DividerDragging
+	} else if a.hoverTarget == targetDivider {
+		style = a.styles.DividerHover
+	}
+	line := style.Render(strings.Repeat("┃", rect.W))
 	content := make([]string, rect.H)
 	for i := range content {
 		content[i] = line
@@ -105,7 +171,16 @@ func (a *App) composerLayer(layout Layout) *lipgloss.Layer {
 		return nil
 	}
 	rect := layout.Composer
-	content := fitSceneContent(a.composer.View(), rect.W, rect.H)
+	contentRect := composerContentRect(rect)
+	content := fitSceneContent(a.composer.View(), contentRect.W, contentRect.H)
+	if contentRect.X > rect.X {
+		content = prefixChatBlock(content, a.styles.MessageAccentLocal.Render("┃")+" ")
+	}
+	surface := a.styles.Composer
+	if a.hoverTarget == targetComposer {
+		surface = a.styles.ComposerHover
+	}
+	content = surface.Width(rect.W).Height(rect.H).Render(content)
 	return sceneLayer(targetComposer, rect, composerLayerZ, content)
 }
 
@@ -117,8 +192,9 @@ func (a *App) composerCursor() *tea.Cursor {
 	if cursor == nil {
 		return nil
 	}
-	cursor.X += a.layout.Composer.X
-	cursor.Y += a.layout.Composer.Y
+	contentRect := composerContentRect(a.layout.Composer)
+	cursor.X += contentRect.X
+	cursor.Y += contentRect.Y
 	return cursor
 }
 
@@ -126,13 +202,21 @@ func (a *App) prepareComposerViewport(layout Layout) bool {
 	if !a.composerLayerVisible(layout) {
 		return false
 	}
-	a.composer.SetWidth(maxInt(layout.Composer.W, 1))
-	height := maxInt(layout.Composer.H, 1)
+	contentRect := composerContentRect(layout.Composer)
+	a.composer.SetWidth(maxInt(contentRect.W, 1))
+	height := maxInt(contentRect.H, 1)
 	if a.composer.Height() != height {
 		_ = a.composer.View()
 		a.composer.SetHeight(height)
 	}
 	return true
+}
+
+func composerContentRect(rect Rect) Rect {
+	if rect.W <= 2 {
+		return rect
+	}
+	return Rect{X: rect.X + 2, Y: rect.Y, W: rect.W - 2, H: rect.H}
 }
 
 func (a *App) composerLayerVisible(layout Layout) bool {

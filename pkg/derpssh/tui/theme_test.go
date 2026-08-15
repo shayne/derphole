@@ -12,13 +12,14 @@ func TestThemeRolesHaveReadableContrast(t *testing.T) {
 		for _, role := range []ThemeRole{
 			ChromeActive,
 			ChromeMuted,
-			DialogBase,
-			DialogText,
-			DialogMuted,
-			ButtonFocused,
+			ChromeNotice,
+			ChatBase,
 			ChatHeader,
-			ChatPlaceholder,
+			ChatMessageUser,
+			ChatMessageSelf,
 			ComposerBase,
+			MessageHover,
+			MessagePressed,
 		} {
 			if got := theme.ContrastRatio(role); got < 4.5 {
 				t.Fatalf("%s %s contrast = %.2f, want >= 4.5", scheme, role, got)
@@ -27,10 +28,45 @@ func TestThemeRolesHaveReadableContrast(t *testing.T) {
 	}
 }
 
+func TestDarkChatPlaceholderKeepsOpenCodeMutedText(t *testing.T) {
+	// The approved OpenCode color has 4.22:1 contrast on the composer element;
+	// it is intentionally the only exception to TestThemeRolesHaveReadableContrast.
+	style := newTheme(SchemeDark).Role(ChatPlaceholder)
+	if got := colorString(style.GetForeground()); got != "#808080" {
+		t.Fatalf("foreground = %q, want #808080", got)
+	}
+	if got := colorString(style.GetBackground()); got != "#1E1E1E" {
+		t.Fatalf("background = %q, want #1E1E1E", got)
+	}
+}
+
 func TestThemeDefinesEveryRoleForLightAndDark(t *testing.T) {
+	expectedOpenCodeRoles := []ThemeRole{
+		"SurfaceBackground",
+		"SurfacePanel",
+		"SurfaceElement",
+		"BorderSubtle",
+		"BorderBase",
+		"BorderActive",
+		"AccentPrimary",
+		"AccentSecondary",
+		"StateSuccess",
+		"MessageHover",
+		"MessagePressed",
+		"CopiedFeedback",
+	}
+	for _, role := range expectedOpenCodeRoles {
+		if !themeRoleIncluded(allThemeRoles(), role) {
+			t.Fatalf("allThemeRoles missing %s", role)
+		}
+	}
+
 	for _, scheme := range []ColorScheme{SchemeLight, SchemeDark} {
 		theme := newTheme(scheme)
 		for _, role := range allThemeRoles() {
+			if _, ok := theme.roles[role]; !ok {
+				t.Fatalf("%s %s missing role colors", scheme, role)
+			}
 			style := theme.Role(role)
 			if style.GetForeground() == nil {
 				t.Fatalf("%s %s missing foreground", scheme, role)
@@ -40,4 +76,13 @@ func TestThemeDefinesEveryRoleForLightAndDark(t *testing.T) {
 			}
 		}
 	}
+}
+
+func themeRoleIncluded(roles []ThemeRole, want ThemeRole) bool {
+	for _, role := range roles {
+		if role == want {
+			return true
+		}
+	}
+	return false
 }

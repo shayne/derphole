@@ -12,7 +12,10 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
-const terminalWheelRows = 3
+const (
+	chatWheelRows     = 3
+	terminalWheelRows = 3
+)
 
 const (
 	terminalSelectionAutoscrollMinRows = 3
@@ -53,14 +56,17 @@ type pointerAction int
 const (
 	pointerUnknown pointerAction = iota
 	pointerClick
+	pointerWheel
 	pointerRelease
 	pointerMotion
 )
 
 func (m pointerMsg) action() pointerAction {
 	switch m.Event.(type) {
-	case tea.MouseClickMsg, tea.MouseWheelMsg:
+	case tea.MouseClickMsg:
 		return pointerClick
+	case tea.MouseWheelMsg:
+		return pointerWheel
 	case tea.MouseReleaseMsg:
 		return pointerRelease
 	case tea.MouseMotionMsg:
@@ -107,21 +113,33 @@ func HandleMouse(app *App, pointer pointerMsg) tea.Cmd {
 	if app == nil {
 		return nil
 	}
+	if app.modalActive() || app.inviteOpen {
+		app.clearLayerInteractionState()
+	}
+	if pointer.action() == pointerRelease && pointer.Target != app.pressedTarget {
+		app.pressedTarget = ""
+	}
+	app.updateHover(pointer)
 	if pointer.action() == pointerRelease && !app.terminalSGRReleasePending {
 		defer app.releasePointerCapture()
 	}
 	if cmd, handled := app.handleModalMouse(pointer); handled {
 		return cmd
 	}
-	if app.copyMode {
-		if isMouseClick(pointer) && pointer.Target != targetTerminal {
-			return app.setCopyMode(false)
-		}
-		if pointer.Target != targetTerminal {
-			return nil
-		}
+	if cmd, handled := app.handleCopyModeMouse(pointer); handled {
+		return cmd
 	}
 	return app.handleTargetMouse(pointer)
+}
+
+func (a *App) handleCopyModeMouse(pointer pointerMsg) (tea.Cmd, bool) {
+	if !a.copyMode || pointer.Target == targetTerminal {
+		return nil, false
+	}
+	if isMouseClick(pointer) {
+		return a.setCopyMode(false), true
+	}
+	return nil, true
 }
 
 func (a *App) handleTargetMouse(pointer pointerMsg) tea.Cmd {
@@ -129,6 +147,12 @@ func (a *App) handleTargetMouse(pointer pointerMsg) tea.Cmd {
 	case pointer.Target == targetDivider:
 		a.handleDividerMouse(pointer)
 		return nil
+	case strings.HasPrefix(string(pointer.Target), "chat-message:"):
+		index, ok := chatMessageIndex(pointer.Target)
+		if !ok {
+			return nil
+		}
+		return a.handleChatMessageMouse(pointer, index)
 	case pointer.Target == targetSidebar || pointer.Target == targetComposer:
 		a.handleChatMouse(pointer)
 		return nil
@@ -142,6 +166,23 @@ func (a *App) handleTargetMouse(pointer pointerMsg) tea.Cmd {
 	default:
 		return nil
 	}
+}
+
+func isChromeTarget(target layerTarget) bool {
+	value := string(target)
+	return strings.HasPrefix(value, "action:") || strings.HasPrefix(value, "peer:")
+}
+
+func (a *App) updateHover(pointer pointerMsg) {
+	if pointer.action() != pointerMotion || a.pointerCapture != "" || a.modalActive() {
+		return
+	}
+	if isChromeTarget(pointer.Target) || pointer.Target == targetDivider ||
+		pointer.Target == targetComposer || strings.HasPrefix(string(pointer.Target), "chat-message:") {
+		a.hoverTarget = pointer.Target
+		return
+	}
+	a.hoverTarget = ""
 }
 
 func isMouseClick(msg pointerMsg) bool {
@@ -177,74 +218,47 @@ func (a *App) handleModalMouse(msg pointerMsg) (tea.Cmd, bool) {
 
 func (a *App) handleShellExitMouse(msg pointerMsg) tea.Cmd {
 	choice, ok := shellExitChoiceFromTarget(msg.Target)
-	switch msg.action() {
-	case pointerClick:
-		if !ok {
-			a.clearMousePress()
-			return nil
-		}
+	armed, activated := a.handleModalControlPress(msg, ok)
+	if armed {
 		a.shellExitChoice = choice
-		a.armMousePress(mousePressShellExit, int(a.shellExitChoice))
-	case pointerRelease:
-		if ok && a.releaseMousePress(mousePressShellExit, int(choice)) {
-			a.shellExitChoice = choice
-			a.confirmShellExitChoice()
-		} else {
-			a.clearMousePress()
-		}
+	}
+	if activated {
+		a.shellExitChoice = choice
+		a.confirmShellExitChoice()
 	}
 	return nil
 }
 
 func (a *App) handleQuitMouse(msg pointerMsg) tea.Cmd {
 	choice, ok := quitChoiceFromTarget(msg.Target)
-	switch msg.action() {
-	case pointerClick:
-		if !ok {
-			a.clearMousePress()
-			return nil
-		}
+	armed, activated := a.handleModalControlPress(msg, ok)
+	if armed {
 		a.quitChoice = choice
-		a.armMousePress(mousePressQuit, int(a.quitChoice))
-	case pointerRelease:
-		if ok && a.releaseMousePress(mousePressQuit, int(choice)) {
-			a.quitChoice = choice
-			a.confirmQuitChoice()
-		} else {
-			a.clearMousePress()
-		}
+	}
+	if activated {
+		a.quitChoice = choice
+		a.confirmQuitChoice()
 	}
 	return nil
 }
 
 func (a *App) handlePeerDialogMouse(msg pointerMsg) tea.Cmd {
 	choice, ok := peerActionChoiceFromTarget(msg.Target)
-	switch msg.action() {
-	case pointerClick:
-		if !ok {
-			a.clearMousePress()
-			return nil
-		}
+	armed, activated := a.handleModalControlPress(msg, ok)
+	if armed {
 		a.peerDialogChoice = choice
-		a.armMousePress(mousePressPeerAction, int(a.peerDialogChoice))
-	case pointerRelease:
-		if ok && a.releaseMousePress(mousePressPeerAction, int(choice)) {
-			a.peerDialogChoice = choice
-			a.confirmPeerActionChoice()
-		} else {
-			a.clearMousePress()
-		}
+	}
+	if activated {
+		a.peerDialogChoice = choice
+		a.confirmPeerActionChoice()
 	}
 	return nil
 }
 
 func (a *App) handleHelpMouse(msg pointerMsg) tea.Cmd {
-	if msg.action() == pointerClick {
-		action, ok := actionIDFromTarget(msg.Target)
-		if !ok {
-			a.helpOpen = false
-			return nil
-		}
+	action, ok := actionIDFromTarget(msg.Target)
+	_, activated := a.handleModalControlPress(msg, ok)
+	if activated {
 		return a.runMenuAction(action)
 	}
 	return nil
@@ -259,7 +273,9 @@ func (a *App) handleNoticeMouse(msg pointerMsg) bool {
 	if !a.noticeOpen() {
 		return false
 	}
-	if msg.action() == pointerClick {
+	valid := msg.Target == modalTarget(ModalNotice) || msg.Target == targetModalBlocker
+	_, activated := a.handleModalControlPress(msg, valid)
+	if activated {
 		a.closeNotice()
 	}
 	return true
@@ -267,21 +283,13 @@ func (a *App) handleNoticeMouse(msg pointerMsg) bool {
 
 func (a *App) handleApprovalMouse(msg pointerMsg) (tea.Cmd, bool) {
 	choice, ok := approvalChoiceFromTarget(msg.Target)
-	switch msg.action() {
-	case pointerClick:
-		if !ok {
-			a.clearMousePress()
-			return nil, true
-		}
+	armed, activated := a.handleModalControlPress(msg, ok)
+	if armed {
 		a.approvalChoice = choice
-		a.armMousePress(mousePressApproval, int(a.approvalChoice))
-	case pointerRelease:
-		if ok && a.releaseMousePress(mousePressApproval, int(choice)) {
-			a.approvalChoice = choice
-			a.approveSelected()
-		} else {
-			a.clearMousePress()
-		}
+	}
+	if activated {
+		a.approvalChoice = choice
+		a.approveSelected()
 	}
 	return nil, true
 }
@@ -290,7 +298,9 @@ func (a *App) handleKickMouse(msg pointerMsg) bool {
 	if a.kickPeer == "" {
 		return false
 	}
-	if msg.action() == pointerClick {
+	valid := msg.Target == modalTarget(ModalKick) || msg.Target == targetModalBlocker
+	_, activated := a.handleModalControlPress(msg, valid)
+	if activated {
 		a.kickPeerID = ""
 		a.kickPeer = ""
 		a.focusTerminal()
@@ -298,14 +308,52 @@ func (a *App) handleKickMouse(msg pointerMsg) bool {
 	return true
 }
 
-func (a *App) armMousePress(kind mousePressKind, choice int) {
-	a.mousePress = mousePressTarget{kind: kind, choice: choice}
+func (a *App) handleModalControlPress(msg pointerMsg, validTarget bool) (armed bool, activated bool) {
+	switch msg.action() {
+	case pointerClick:
+		a.clearMousePress()
+		if msg.Mouse.Button != tea.MouseLeft || !validTarget {
+			return false, false
+		}
+		identity, ok := a.frontModalMouseIdentity()
+		if !ok {
+			return false, false
+		}
+		a.mousePress = mousePressTarget{modalIdentity: identity, target: msg.Target}
+		return true, false
+	case pointerRelease:
+		return false, a.releaseModalControlPress(msg, validTarget)
+	case pointerWheel:
+		a.clearMousePress()
+	}
+	return false, false
 }
 
-func (a *App) releaseMousePress(kind mousePressKind, choice int) bool {
+func (a *App) releaseModalControlPress(msg pointerMsg, validTarget bool) bool {
 	pressed := a.mousePress
 	a.clearMousePress()
-	return pressed.kind == kind && pressed.choice == choice
+	identity, ok := a.frontModalMouseIdentity()
+	return ok && msg.Mouse.Button == tea.MouseLeft && validTarget &&
+		pressed.modalIdentity == identity && pressed.target == msg.Target
+}
+
+func (a *App) frontModalMouseIdentity() (string, bool) {
+	id, ok := a.frontModalID()
+	if !ok {
+		return "", false
+	}
+	owner := ""
+	switch id {
+	case ModalApproval:
+		owner = a.approvalPeerID + "\x00" + a.approvalPeer
+	case ModalPeerAction:
+		owner = a.peerDialogPeer.ID + "\x00" + a.peerDialogPeer.Name
+	case ModalKick:
+		owner = a.kickPeerID + "\x00" + a.kickPeer
+	case ModalNotice:
+		owner = a.noticeTitle + "\x00" + a.noticeBody
+	}
+	return string(id) + "\x00" + owner, true
 }
 
 func (a *App) clearMousePress() {
@@ -313,8 +361,14 @@ func (a *App) clearMousePress() {
 }
 
 func (a *App) clearPointerCapture() {
+	a.clearLayerInteractionState()
 	a.releasePointerCapture()
 	a.clearTerminalSelection()
+}
+
+func (a *App) clearLayerInteractionState() {
+	a.hoverTarget = ""
+	a.pressedTarget = ""
 }
 
 func (a *App) releasePointerCapture() {
@@ -355,7 +409,8 @@ func (a *App) handleDividerMouse(msg pointerMsg) bool {
 }
 
 func (a *App) handleActionMouse(msg pointerMsg) tea.Cmd {
-	if !isMouseClick(msg) {
+	matched := a.handleChromePress(msg)
+	if msg.action() != pointerRelease || !matched {
 		return nil
 	}
 	action, ok := actionIDFromTarget(msg.Target)
@@ -364,6 +419,24 @@ func (a *App) handleActionMouse(msg pointerMsg) tea.Cmd {
 	}
 	cmd, _ := NewActionRegistry().Run(a, action)
 	return cmd
+}
+
+func (a *App) handleChromePress(pointer pointerMsg) bool {
+	switch pointer.action() {
+	case pointerClick:
+		if pointer.Mouse.Button != tea.MouseLeft {
+			return false
+		}
+		a.pressedTarget = pointer.Target
+		return true
+	case pointerRelease:
+		matched := pointer.Mouse.Button == tea.MouseLeft &&
+			a.pressedTarget != "" && a.pressedTarget == pointer.Target
+		a.pressedTarget = ""
+		return matched
+	default:
+		return false
+	}
 }
 
 func actionIDFromTarget(target layerTarget) (ActionID, bool) {
@@ -425,7 +498,8 @@ func shellExitChoiceFromTarget(target layerTarget) (shellExitChoice, bool) {
 }
 
 func (a *App) handlePeerTargetMouse(msg pointerMsg) {
-	if !isMouseClick(msg) {
+	matched := a.handleChromePress(msg)
+	if msg.action() != pointerRelease || !matched {
 		return
 	}
 	id, ok := strings.CutPrefix(string(msg.Target), "peer:")
@@ -449,17 +523,45 @@ func (a *App) handleChatMouse(msg pointerMsg) {
 	}
 }
 
+func (a *App) handleChatMessageMouse(msg pointerMsg, index int) tea.Cmd {
+	if a.handleChatScrollMouse(msg) {
+		return nil
+	}
+	matched := a.handleChromePress(msg)
+	if msg.action() != pointerRelease || !matched {
+		return nil
+	}
+	return a.copyChatMessage(index)
+}
+
+func (a *App) copyChatMessage(index int) tea.Cmd {
+	a.clearInvalidCopiedChatFeedback()
+	if index < 0 || index >= len(a.chatMessages) {
+		return nil
+	}
+	body := a.chatMessages[index].Body
+	if strings.TrimSpace(body) == "" {
+		return nil
+	}
+	a.copiedChatSeq++
+	a.copiedChatIndex = index
+	a.copiedChatActive = true
+	return tea.Batch(tea.SetClipboard(body), clearCopiedChatTick(a.copiedChatSeq))
+}
+
 func (a *App) handleChatScrollMouse(msg pointerMsg) bool {
-	if msg.action() != pointerClick {
+	if msg.action() != pointerWheel {
 		return false
 	}
 	switch msg.Mouse.Button {
-	case tea.MouseWheelUp:
-		a.chatScroll++
-		return true
-	case tea.MouseWheelDown:
-		if a.chatScroll > 0 {
-			a.chatScroll--
+	case tea.MouseWheelUp, tea.MouseWheelDown:
+		viewportHeight := maxInt(a.layout.Sidebar.H-1-a.sidebarComposerRows(a.layout.Sidebar.H), 0)
+		maxScroll := maxInt(len(a.chatRows(a.layout.Sidebar.W))-viewportHeight, 0)
+		a.chatScroll = clampInt(a.chatScroll, 0, maxScroll)
+		if msg.Mouse.Button == tea.MouseWheelUp {
+			a.chatScroll = minInt(a.chatScroll+chatWheelRows, maxScroll)
+		} else {
+			a.chatScroll = maxInt(a.chatScroll-chatWheelRows, 0)
 		}
 		return true
 	default:
@@ -486,7 +588,7 @@ func (a *App) handleTerminalMouse(msg pointerMsg) tea.Cmd {
 		return nil
 	}
 	switch msg.action() {
-	case pointerClick:
+	case pointerClick, pointerWheel:
 		return a.handleLocalTerminalClick(interaction, msg, point)
 	case pointerMotion:
 		return a.handleLocalTerminalMotion(interaction, msg, point, terminal)

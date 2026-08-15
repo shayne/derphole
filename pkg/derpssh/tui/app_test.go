@@ -68,6 +68,109 @@ func TestTerminalSelectionClearTickSequenceGuard(t *testing.T) {
 	}
 }
 
+func TestCopiedChatFeedbackIgnoresStaleTick(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.chatMessages = []ChatMessage{{Body: "one"}, {Body: "two"}}
+	_ = app.copyChatMessage(0)
+	stale := app.copiedChatSeq
+	_ = app.copyChatMessage(1)
+	app.Update(clearCopiedChatMsg{seq: stale})
+	if !app.copiedChatActive || app.copiedChatIndex != 1 {
+		t.Fatalf("stale tick cleared newer copied feedback")
+	}
+}
+
+func TestCopiedChatFeedbackRendersOnlyOnCopiedMessageAndClearsOnMatchingTick(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	app.setSidebarOpen(true)
+	app.chatMessages = []ChatMessage{
+		{Author: "alex", Body: "one"},
+		{Author: "blair", Body: "two"},
+	}
+	_ = app.copyChatMessage(0)
+
+	scene := app.buildScene()
+	copiedLayer := scene.Compositor.GetLayer(string(chatMessageTarget(0)))
+	otherLayer := scene.Compositor.GetLayer(string(chatMessageTarget(1)))
+	if copiedLayer == nil || otherLayer == nil {
+		t.Fatalf("message layers = %v/%v, want both", copiedLayer, otherLayer)
+	}
+	copied := ansiPattern.ReplaceAllString(copiedLayer.GetContent(), "")
+	other := ansiPattern.ReplaceAllString(otherLayer.GetContent(), "")
+	if strings.Count(copied, "✓ Copied") != 1 || strings.Contains(other, "✓ Copied") {
+		t.Fatalf("copied labels for messages 0/1 = %q/%q, want label only on message 0", copied, other)
+	}
+	if authorRow := strings.Split(copied, "\n")[0]; !strings.HasSuffix(authorRow, "✓ Copied") {
+		t.Fatalf("copied author row = %q, want right-aligned feedback", authorRow)
+	}
+
+	app.Update(clearCopiedChatMsg{seq: app.copiedChatSeq})
+	if app.copiedChatActive || app.copiedChatIndex != -1 {
+		t.Fatalf("copied state after matching tick = %v/%d, want inactive", app.copiedChatActive, app.copiedChatIndex)
+	}
+	if got := ansiPattern.ReplaceAllString(app.buildScene().Content, ""); strings.Contains(got, "✓ Copied") {
+		t.Fatalf("matching tick left copied feedback visible:\n%s", got)
+	}
+}
+
+func TestCopiedChatFeedbackSurvivesChatToggle(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.chatMessages = []ChatMessage{{Body: "one"}}
+	_ = app.copyChatMessage(0)
+
+	app.setSidebarOpen(true)
+	app.setSidebarOpen(false)
+
+	if !app.copiedChatActive || app.copiedChatIndex != 0 {
+		t.Fatalf("chat toggle cleared copied feedback: active/index = %v/%d", app.copiedChatActive, app.copiedChatIndex)
+	}
+}
+
+func TestCopiedChatFeedbackClearsWhenSourceIndexBecomesInvalid(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.chatMessages = []ChatMessage{{Body: "one"}}
+	_ = app.copyChatMessage(0)
+	app.chatMessages = nil
+
+	_ = app.buildScene()
+
+	if app.copiedChatActive || app.copiedChatIndex != -1 {
+		t.Fatalf("invalid copied source left feedback active at index %d", app.copiedChatIndex)
+	}
+}
+
+func TestLayerInteractionStateClearsWhenGeometryChangesOrOverlayTakesOver(t *testing.T) {
+	tests := []struct {
+		name   string
+		change func(*App)
+	}{
+		{name: "chat close", change: func(app *App) { app.setSidebarOpen(false) }},
+		{name: "resize", change: func(app *App) { app.resize(101, 24, false) }},
+		{name: "modal", change: func(app *App) { app.openQuitConfirm() }},
+		{name: "invite", change: func(app *App) {
+			app.side = string(ModeHost)
+			app.inviteCommand = "derpssh connect invite"
+			_ = app.openInvite()
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+			app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+			app.setSidebarOpen(true)
+			app.hoverTarget = chatMessageTarget(0)
+			app.pressedTarget = chatMessageTarget(0)
+
+			tt.change(app)
+
+			if app.hoverTarget != "" || app.pressedTarget != "" {
+				t.Fatalf("hover/pressed = %q/%q after %s, want empty", app.hoverTarget, app.pressedTarget, tt.name)
+			}
+		})
+	}
+}
+
 func TestViewKeepsMouseReportingForTerminalSelectionButNotInvite(t *testing.T) {
 	app := NewApp(Options{Side: "host", InviteCommand: "invite"})
 	app.copyMode = true
@@ -437,10 +540,13 @@ func TestViewRendersSingleQuietTopBar(t *testing.T) {
 
 	view := appContent(app)
 	firstLine := strings.Split(view, "\n")[0]
-	for _, want := range []string{"derpssh", "host", "Chat", "☰"} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("View() missing top-bar item %q:\n%s", want, view)
+	for _, want := range []string{"◆ derpssh", "host", "◈ Chat", "⋮", "×"} {
+		if !strings.Contains(firstLine, want) {
+			t.Fatalf("top bar missing %q:\n%s", want, firstLine)
 		}
+	}
+	if strings.Contains(firstLine, "›") || strings.Contains(firstLine, "☰") {
+		t.Fatalf("top bar retained legacy separators or menu glyph:\n%s", firstLine)
 	}
 	if strings.Contains(firstLine, "Ctrl-X") {
 		t.Fatalf("top bar should keep keyboard hints out of normal chrome:\n%s", view)
@@ -461,11 +567,19 @@ func TestTopBarHidesInviteBehindMenu(t *testing.T) {
 	if strings.Contains(firstLine, "Invite") {
 		t.Fatalf("top bar exposes invite chip:\n%s", firstLine)
 	}
+	for _, want := range []string{"◆ derpssh", "host", "◈ Chat", "⋮", "×"} {
+		if !strings.Contains(firstLine, want) {
+			t.Fatalf("top bar missing %q:\n%s", want, firstLine)
+		}
+	}
 	if strings.Contains(firstLine, "?") {
 		t.Fatalf("top bar should use the menu glyph, not a question mark:\n%s", firstLine)
 	}
-	if !strings.Contains(firstLine, "☰") {
+	if !strings.Contains(firstLine, "⋮") {
 		t.Fatalf("top bar missing menu glyph:\n%s", firstLine)
+	}
+	if strings.Contains(firstLine, "›") || strings.Contains(firstLine, "☰") {
+		t.Fatalf("top bar retained legacy separators or menu glyph:\n%s", firstLine)
 	}
 }
 
@@ -596,11 +710,11 @@ func TestLocalChatAuthorDefaultsToUser(t *testing.T) {
 	}
 	app.Update(keyCode(tea.KeyEnter))
 
-	view := appContent(app)
-	if !strings.Contains(view, "shayne: hello") {
+	view := ansiPattern.ReplaceAllString(appContent(app), "")
+	if !strings.Contains(view, "shayne") || !strings.Contains(view, "hello") {
 		t.Fatalf("View() missing USER chat author:\n%s", view)
 	}
-	if strings.Contains(view, "me: hello") {
+	if strings.Contains(view, "me") {
 		t.Fatalf("View() used generic me author:\n%s", view)
 	}
 }
@@ -617,13 +731,22 @@ func TestLocalChatEchoIsDeduplicated(t *testing.T) {
 	app.Update(keyCode(tea.KeyEnter))
 	app.Update(ChatMsg{Author: "root@hetz", Body: "hello"})
 
+	if got := len(app.chatMessages); got != 1 {
+		t.Fatalf("chat message count = %d, want one deduplicated local echo", got)
+	}
+	scene := app.buildScene()
+	layer := scene.Compositor.GetLayer(string(chatMessageTarget(0)))
+	if layer == nil {
+		t.Fatal("chat message layer = nil")
+	}
+	message := ansiPattern.ReplaceAllString(layer.GetContent(), "")
+	if strings.Contains(message, "root@hetz") {
+		t.Fatalf("chat message rendered with host-qualified local name:\n%s", message)
+	}
+	if strings.Count(message, "root") != 1 || strings.Count(message, "hello") != 1 {
+		t.Fatalf("chat message did not render compact author and body once:\n%s", message)
+	}
 	view := appContent(app)
-	if got := strings.Count(view, "root@hetz: hello"); got != 0 {
-		t.Fatalf("chat message rendered with host-qualified local name %d times, want compact username:\n%s", got, view)
-	}
-	if got := strings.Count(view, "root: hello"); got != 1 {
-		t.Fatalf("chat message rendered %d times, want once:\n%s", got, view)
-	}
 	if got := strings.Count(view, "Message"); got > 1 {
 		t.Fatalf("composer label rendered %d Message copies, want at most one:\n%s", got, view)
 	}
@@ -767,7 +890,7 @@ func TestChatComposerGrowsToThreeRows(t *testing.T) {
 		t.Fatalf("composer height = %d, want 3", app.layout.Composer.H)
 	}
 	view := appContent(app)
-	for _, want := range []string{"this message is long", "composer rows"} {
+	for _, want := range []string{"enough to wrap across", "multiple visible composer", "rows"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("composer missing visible text fragment %q:\n%s", want, view)
 		}
@@ -780,7 +903,7 @@ func TestChatComposerShowsAllRowsWhileGrowingToThree(t *testing.T) {
 	app.Update(modifiedKey('x', "", tea.ModCtrl))
 	app.Update(textKey("c"))
 	appContent(app)
-	width := app.layout.Composer.W
+	width := composerContentRect(app.layout.Composer).W
 	if width < 10 {
 		t.Fatalf("composer width = %d, want useful test width", width)
 	}
@@ -868,7 +991,7 @@ func TestFocusedEmptyChatComposerShowsCursorBeforePlaceholder(t *testing.T) {
 	if view.Cursor == nil {
 		t.Fatal("focused empty composer cursor = nil")
 	}
-	if got, want := view.Cursor.Position.X, app.layout.Composer.X; got != want {
+	if got, want := view.Cursor.Position.X, composerContentRect(app.layout.Composer).X; got != want {
 		t.Fatalf("empty composer cursor X = %d, want placeholder start %d", got, want)
 	}
 	if !strings.Contains(view.Content, "Message") {

@@ -28,6 +28,7 @@ type Options struct {
 
 const approvalInputGrace = 200 * time.Millisecond
 const unreadChatPulseInterval = 500 * time.Millisecond
+const copiedChatFeedbackDuration = 1200 * time.Millisecond
 const terminalDoubleClickInterval = 500 * time.Millisecond
 const terminalSelectionAutoscrollInterval = 50 * time.Millisecond
 
@@ -36,6 +37,10 @@ type unreadChatPulseMsg struct {
 }
 
 type clearTerminalSelectionMsg struct {
+	seq uint64
+}
+
+type clearCopiedChatMsg struct {
 	seq uint64
 }
 
@@ -101,10 +106,11 @@ var peerActionChoiceOrder = []peerActionChoice{
 }
 
 type topBarSegment struct {
-	text   string
-	style  lipgloss.Style
-	action ActionID
-	peer   Peer
+	text               string
+	style              lipgloss.Style
+	action             ActionID
+	peer               Peer
+	preserveHoverStyle bool
 }
 
 type menuEntry struct {
@@ -113,19 +119,9 @@ type menuEntry struct {
 	action   ActionID
 }
 
-type mousePressKind int
-
-const (
-	mousePressNone mousePressKind = iota
-	mousePressQuit
-	mousePressShellExit
-	mousePressPeerAction
-	mousePressApproval
-)
-
 type mousePressTarget struct {
-	kind   mousePressKind
-	choice int
+	modalIdentity string
+	target        layerTarget
 }
 
 type terminalGestureKind uint8
@@ -174,6 +170,8 @@ type App struct {
 	peerDialogChoice          peerActionChoice
 	mousePress                mousePressTarget
 	pointerCapture            layerTarget
+	hoverTarget               layerTarget
+	pressedTarget             layerTarget
 	terminalGesture           terminalGestureKind
 	lastTerminalClick         terminalClick
 	selectionSeq              uint64
@@ -184,23 +182,26 @@ type App struct {
 	noticeTitle               string
 	noticeBody                string
 
-	localRole      Role
-	transport      string
-	hostCols       int
-	hostRows       int
-	terminalCols   int
-	terminalRows   int
-	peers          []Peer
-	chatMessages   []ChatMessage
-	chatScroll     int
-	unreadChat     int
-	unreadPulse    bool
-	unreadTicking  bool
-	unreadPulseSeq uint64
-	composer       textarea.Model
-	styles         StyleSet
-	scheme         ColorScheme
-	now            func() time.Time
+	localRole        Role
+	transport        string
+	hostCols         int
+	hostRows         int
+	terminalCols     int
+	terminalRows     int
+	peers            []Peer
+	chatMessages     []ChatMessage
+	chatScroll       int
+	copiedChatIndex  int
+	copiedChatActive bool
+	copiedChatSeq    uint64
+	unreadChat       int
+	unreadPulse      bool
+	unreadTicking    bool
+	unreadPulseSeq   uint64
+	composer         textarea.Model
+	styles           StyleSet
+	scheme           ColorScheme
+	now              func() time.Time
 }
 
 func NewApp(opts Options) *App {
@@ -225,22 +226,23 @@ func NewApp(opts Options) *App {
 	composer.SetVirtualCursor(false)
 
 	app := &App{
-		side:          side,
-		displayName:   opts.DisplayName,
-		inviteCommand: opts.InviteCommand,
-		terminal:      terminal,
-		commands:      make(chan Command, 64),
-		width:         80,
-		height:        24,
-		sidebarOpen:   false,
-		focus:         FocusTerminal,
-		inviteOpen:    opts.InitialInviteOpen,
-		localRole:     RolePending,
-		transport:     "starting",
-		composer:      composer,
-		styles:        NewStyleSet(SchemeDark),
-		scheme:        SchemeDark,
-		now:           time.Now,
+		side:            side,
+		displayName:     opts.DisplayName,
+		inviteCommand:   opts.InviteCommand,
+		terminal:        terminal,
+		commands:        make(chan Command, 64),
+		width:           80,
+		height:          24,
+		sidebarOpen:     false,
+		focus:           FocusTerminal,
+		inviteOpen:      opts.InitialInviteOpen,
+		copiedChatIndex: -1,
+		localRole:       RolePending,
+		transport:       "starting",
+		composer:        composer,
+		styles:          NewStyleSet(SchemeDark),
+		scheme:          SchemeDark,
+		now:             time.Now,
 	}
 	app.configureComposerStyles()
 	app.applyLayout()
@@ -292,6 +294,8 @@ func (a *App) applyMessage(msg tea.Msg) tea.Cmd {
 		a.applyNotice(msg)
 	case unreadChatPulseMsg:
 		return a.handleUnreadChatPulse(msg)
+	case clearCopiedChatMsg:
+		a.handleCopiedChatTick(msg)
 	}
 	return nil
 }
@@ -398,6 +402,7 @@ func (a *App) View() tea.View {
 }
 
 func (a *App) buildScene() Scene {
+	a.clearInvalidCopiedChatFeedback()
 	a.applyLayout()
 	layers := a.buildBaseLayers(a.layout)
 	layers = append(layers, a.buildHeaderLayers(a.layout)...)
@@ -497,10 +502,12 @@ func (a *App) resize(cols int, rows int, emitResize bool) {
 }
 
 func (a *App) applyLayout() {
+	wasSidebarVisible := a.sidebarVisible()
 	a.layout = ComputeLayoutWithSidebarWidth(a.width, a.height, a.sidebarOpen, a.sidebarWidth)
 	if a.layout.SidebarOpen && a.layout.Sidebar.W > 0 {
 		a.sidebarWidth = a.layout.Sidebar.W
-		a.composer.SetWidth(maxInt(a.layout.Sidebar.W, 1))
+		contentRect := composerContentRect(a.layout.Composer)
+		a.composer.SetWidth(maxInt(contentRect.W, 1))
 		composerRows := a.composer.Height()
 		composerRows = minInt(composerRows, maxInt(a.layout.Sidebar.H-1, 1))
 		a.layout.Composer = Rect{
@@ -517,6 +524,12 @@ func (a *App) applyLayout() {
 			a.terminalCols = cols
 			a.terminalRows = rows
 		}
+	}
+	if !a.sidebarVisible() && a.focus == FocusChat {
+		a.focusTerminal()
+	}
+	if a.sidebarVisible() && !wasSidebarVisible {
+		a.clearUnreadChat()
 	}
 }
 
@@ -537,7 +550,11 @@ func (a *App) currentTerminalRect() Rect {
 }
 
 func (a *App) guestChatOverlay() bool {
-	return a.isGuest() && a.hostCols > 0 && a.hostRows > 0 && a.sidebarOpen && !a.layout.Sidebar.empty()
+	return a.isGuest() && a.hostCols > 0 && a.hostRows > 0 && a.sidebarVisible()
+}
+
+func (a *App) sidebarVisible() bool {
+	return a.layout.SidebarOpen && !a.layout.Sidebar.empty()
 }
 
 func (a *App) isGuest() bool {
@@ -551,12 +568,15 @@ func (a *App) isHost() bool {
 func (a *App) setSidebarOpen(open bool) {
 	oldTerminal := a.currentTerminalRect()
 	a.sidebarOpen = open
-	if open {
+	a.applyLayout()
+	if a.sidebarVisible() {
 		a.focusChat()
 	} else if a.focus == FocusChat {
 		a.focusTerminal()
 	}
-	a.applyLayout()
+	if !open {
+		a.clearLayerInteractionState()
+	}
 	a.emitTerminalResizeIfChanged(oldTerminal)
 }
 
@@ -970,7 +990,7 @@ func (a *App) appendChatMessage(msg ChatMessage) tea.Cmd {
 	if msg.Local {
 		a.chatScroll = 0
 	}
-	if !a.sidebarOpen && !msg.Local {
+	if !a.sidebarVisible() && !msg.Local {
 		a.unreadChat++
 		return a.startUnreadChatAttention()
 	}
@@ -992,7 +1012,7 @@ func (a *App) handleUnreadChatPulse(msg unreadChatPulseMsg) tea.Cmd {
 	if msg.seq != a.unreadPulseSeq {
 		return nil
 	}
-	if a.unreadChat == 0 || a.sidebarOpen {
+	if a.unreadChat == 0 || a.sidebarVisible() {
 		a.stopUnreadChatAttention()
 		return nil
 	}
@@ -1025,6 +1045,31 @@ func terminalSelectionClearTick(seq uint64) tea.Cmd {
 	})
 }
 
+func (a *App) handleCopiedChatTick(msg clearCopiedChatMsg) {
+	if msg.seq != a.copiedChatSeq {
+		return
+	}
+	a.copiedChatActive = false
+	a.copiedChatIndex = -1
+}
+
+func (a *App) clearInvalidCopiedChatFeedback() {
+	if !a.copiedChatActive {
+		return
+	}
+	if a.copiedChatIndex >= 0 && a.copiedChatIndex < len(a.chatMessages) {
+		return
+	}
+	a.copiedChatActive = false
+	a.copiedChatIndex = -1
+}
+
+func clearCopiedChatTick(seq uint64) tea.Cmd {
+	return tea.Tick(copiedChatFeedbackDuration, func(time.Time) tea.Msg {
+		return clearCopiedChatMsg{seq: seq}
+	})
+}
+
 func terminalSelectionAutoscrollTick(seq uint64) tea.Cmd {
 	return tea.Tick(terminalSelectionAutoscrollInterval, func(time.Time) tea.Msg {
 		return terminalSelectionAutoscrollMsg{seq: seq}
@@ -1054,10 +1099,7 @@ func (a *App) isLocalEcho(msg ChatMessage) bool {
 }
 
 func (a *App) leftTopBarSegments() []topBarSegment {
-	segments := []topBarSegment{
-		{text: "×", style: a.styles.TopBarQuit, action: ActionQuit},
-		{text: "derpssh", style: a.styles.TopBarBrand},
-	}
+	segments := []topBarSegment{{text: "◆ derpssh", style: a.styles.TopBarBrand}}
 	segments = append(segments, a.identityTopBarSegments()...)
 	segments = append(segments, a.stateTopBarSegments()...)
 	return segments
@@ -1066,6 +1108,10 @@ func (a *App) leftTopBarSegments() []topBarSegment {
 func (a *App) rightTopBarSegments() []topBarSegment {
 	segments := a.chatTopBarSegments()
 	segments = append(segments, a.actionTopBarSegments()...)
+	segments = append(segments,
+		topBarSegment{text: "⋮", style: a.styles.TopBarMuted, action: ActionShowMenu},
+		topBarSegment{text: "×", style: a.styles.TopBarQuit, action: ActionQuit},
+	)
 	return segments
 }
 
@@ -1084,7 +1130,11 @@ func (a *App) identityTopBarSegments() []topBarSegment {
 func (a *App) stateTopBarSegments() []topBarSegment {
 	var parts []topBarSegment
 	if transport := compactTransportStatus(a.transport); transport != "" {
-		parts = append(parts, topBarSegment{text: transport, style: a.styles.TopBarMuted})
+		style := a.styles.TopBarMuted
+		if healthyTransportStatus(a.transport) {
+			style = a.styles.TopBarSuccess
+		}
+		parts = append(parts, topBarSegment{text: "● " + transport, style: style})
 	}
 	if a.hostCols > 0 && a.hostRows > 0 {
 		parts = append(parts, topBarSegment{text: fmt.Sprintf("%dx%d", a.hostCols, a.hostRows), style: a.styles.TopBarMuted})
@@ -1114,34 +1164,42 @@ func (a *App) peerTopBarSegments() []topBarSegment {
 		if a.isHost() {
 			action = ActionManagePeer
 		}
-		segments = append(segments, topBarSegment{text: label, style: a.styles.TopBarChip, action: action, peer: peer})
+		segments = append(segments, topBarSegment{text: "● " + label, style: a.styles.TopBarSuccess, action: action, peer: peer})
 	}
 	return segments
 }
 
 func (a *App) chatTopBarSegments() []topBarSegment {
-	if a.sidebarOpen {
-		return []topBarSegment{{text: "Chat", style: a.styles.TopBarAction, action: ActionToggleChat}}
+	if a.sidebarVisible() {
+		return []topBarSegment{{text: "◈ Chat", style: a.styles.TopBarAction, action: ActionToggleChat}}
 	}
 	if a.unreadChat > 0 {
 		style := a.styles.TopBarWarn
 		if a.unreadPulse {
 			style = a.styles.TopBarAction
 		}
-		return []topBarSegment{{text: fmt.Sprintf("Chat %d", a.unreadChat), style: style, action: ActionToggleChat}}
+		return []topBarSegment{{
+			text:               fmt.Sprintf("◈ Chat %d", a.unreadChat),
+			style:              style,
+			action:             ActionToggleChat,
+			preserveHoverStyle: true,
+		}}
 	}
-	return []topBarSegment{{text: "Chat", style: a.styles.TopBarMuted, action: ActionToggleChat}}
+	return []topBarSegment{{text: "◈ Chat", style: a.styles.TopBarMuted, action: ActionToggleChat}}
 }
 
 func (a *App) actionTopBarSegments() []topBarSegment {
 	segments := []topBarSegment{}
-	segments = append(segments, topBarSegment{text: "☰", style: a.styles.TopBarMuted, action: ActionShowMenu})
 	if a.prefix {
-		segments = append([]topBarSegment{{text: a.prefixHintText(), style: a.styles.TopBarWarn}}, segments...)
+		segments = append(segments, topBarSegment{
+			text:               a.prefixHintText(),
+			style:              a.styles.TopBarWarn,
+			preserveHoverStyle: true,
+		})
 		return segments
 	}
 	if a.copyMode {
-		segments = append([]topBarSegment{{text: "select on · Esc/Y off", style: a.styles.TopBarWarn, action: ActionToggleSelect}}, segments...)
+		segments = append(segments, topBarSegment{text: "select on · Esc/Y off", style: a.styles.TopBarWarn, action: ActionToggleSelect})
 		return segments
 	}
 	return segments
@@ -1179,72 +1237,6 @@ func (a *App) currentTime() time.Time {
 		return a.now()
 	}
 	return time.Now()
-}
-
-func (a *App) sidebarLines(width int, height int) []string {
-	lines := make([]string, height)
-	if height <= 0 || width <= 0 {
-		return lines
-	}
-	contentW := sidebarContentWidth(width)
-	content := make([]string, height)
-	a.writeSidebarHeader(content, contentW)
-	messageStart := 1
-	a.writeSidebarMessages(content, contentW, height, messageStart)
-	a.writeSidebarComposer(content, contentW, height)
-	for i := range lines {
-		lines[i] = fitLine(a.styles.Sidebar.Width(width).Render(fitLine(content[i], width)), width)
-	}
-	return lines
-}
-
-func sidebarContentWidth(width int) int {
-	return nonNegative(width)
-}
-
-func (a *App) writeSidebarHeader(content []string, width int) {
-	if len(content) == 0 {
-		return
-	}
-	content[0] = fitLine(a.styles.SidebarHeader.Width(width).Render(" Chat"), width)
-}
-
-func (a *App) writeSidebarMessages(content []string, width int, height int, row int) {
-	messageRows := a.chatRenderLines(width)
-	reserved := a.sidebarComposerRows(height)
-	available := maxInt(0, height-reserved-row)
-	start := chatWindowStart(len(messageRows), available, a.chatScroll)
-	for _, line := range messageRows[start:minInt(start+available, len(messageRows))] {
-		if row >= height-reserved {
-			return
-		}
-		content[row] = fitLine(line, width)
-		row++
-	}
-}
-
-func (a *App) chatRenderLines(width int) []string {
-	counts := a.identityCounts()
-	lines := make([]string, 0, len(a.chatMessages))
-	for _, msg := range a.chatMessages {
-		lines = append(lines, a.renderChatMessageLines(msg, width, counts)...)
-	}
-	return lines
-}
-
-func (a *App) renderChatMessageLines(msg ChatMessage, width int, counts map[string]int) []string {
-	prefix := a.displayHandleWithCounts(msg.Author, 16, counts)
-	body := msg.Body
-	if prefix != "" && !strings.HasPrefix(body, prefix+":") {
-		body = prefix + ": " + body
-	}
-	wrapped := wrapPlainLines(body, width)
-	if msg.Local {
-		for i := range wrapped {
-			wrapped[i] = a.styles.LocalChat.Render(wrapped[i])
-		}
-	}
-	return wrapped
 }
 
 func wrapPlainLines(s string, width int) []string {
@@ -1310,18 +1302,6 @@ func chatWindowStart(total int, available int, scroll int) int {
 		scroll = maxStart
 	}
 	return maxStart - scroll
-}
-
-func (a *App) writeSidebarComposer(content []string, width int, height int) {
-	if height < 2 {
-		return
-	}
-	rows := clampInt(a.layout.Composer.H, 1, 3)
-	rows = minInt(rows, height)
-	borderY := height - rows - 1
-	if borderY >= 0 {
-		content[borderY] = fitLine(a.styles.ComposerBorder.Width(width).Render(strings.Repeat(" ", width)), width)
-	}
 }
 
 func (a *App) sidebarComposerRows(height int) int {
@@ -1877,6 +1857,10 @@ func (a *App) focusTerminal() {
 }
 
 func (a *App) focusChat() {
+	if !a.sidebarVisible() {
+		a.focusTerminal()
+		return
+	}
 	a.focus = FocusChat
 	_ = a.composer.Focus()
 	a.clearUnreadChat()
@@ -2282,6 +2266,17 @@ func compactTransportStatus(status string) string {
 		return compact
 	}
 	return status
+}
+
+func healthyTransportStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "connected-relay", "connected-direct", "direct-fallback-relay",
+		"guest connected", "approved", "stream-complete",
+		"relay", "direct", "relay fallback", "connected", "complete":
+		return true
+	default:
+		return false
+	}
 }
 
 var compactTransportStatuses = map[string]string{

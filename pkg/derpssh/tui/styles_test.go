@@ -36,8 +36,8 @@ func TestStructuralStylesUseConcreteSchemeBackgrounds(t *testing.T) {
 
 func TestSeparatorStyleUsesConcreteForegroundOnly(t *testing.T) {
 	styles := NewStyleSet(SchemeDark)
-	if got := colorString(styles.Separator.GetForeground()); got != "#74C7EC" {
-		t.Fatalf("separator foreground = %q, want #74C7EC", got)
+	if got := colorString(styles.Separator.GetForeground()); got != "#484848" {
+		t.Fatalf("separator foreground = %q, want #484848", got)
 	}
 	if got := styles.Separator.GetBackground(); got != nil {
 		if _, ok := got.(lipgloss.NoColor); !ok {
@@ -46,7 +46,34 @@ func TestSeparatorStyleUsesConcreteForegroundOnly(t *testing.T) {
 	}
 }
 
-func TestLightThemeChromeUsesRestrainedCatppuccinSurfaces(t *testing.T) {
+func TestDarkThemeUsesOpenCodeSurfaces(t *testing.T) {
+	styles := NewStyleSet(SchemeDark)
+	tests := []struct {
+		name       string
+		style      lipgloss.Style
+		foreground string
+		background string
+	}{
+		{name: "top bar", style: styles.TopBar, foreground: "#EEEEEE", background: "#141414"},
+		{name: "muted top bar", style: styles.TopBarMuted, foreground: "#808080", background: "#141414"},
+		{name: "hover", style: styles.TopBarHover, foreground: "#EEEEEE", background: "#1E1E1E"},
+		{name: "active", style: styles.TopBarActive, foreground: "#FAB283", background: "#1E1E1E"},
+		{name: "sidebar", style: styles.Sidebar, foreground: "#EEEEEE", background: "#141414"},
+		{name: "local message", style: styles.MessageLocal, foreground: "#EEEEEE", background: "#1E1E1E"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := colorString(tt.style.GetForeground()); got != tt.foreground {
+				t.Fatalf("foreground = %q, want %q", got, tt.foreground)
+			}
+			if got := colorString(tt.style.GetBackground()); got != tt.background {
+				t.Fatalf("background = %q, want %q", got, tt.background)
+			}
+		})
+	}
+}
+
+func TestLightThemeUsesOpenCodeSurfaces(t *testing.T) {
 	styles := NewStyleSet(SchemeLight)
 	tests := []struct {
 		name       string
@@ -54,11 +81,12 @@ func TestLightThemeChromeUsesRestrainedCatppuccinSurfaces(t *testing.T) {
 		foreground string
 		background string
 	}{
-		{name: "muted top bar text", style: styles.TopBarMuted, foreground: "#5C5F77", background: "#DCE0E8"},
-		{name: "warning top bar chip", style: styles.TopBarWarn, foreground: "#D20F39", background: "#E6E9EF"},
-		{name: "modal interior", style: styles.ModalInterior, foreground: "#4C4F69", background: "#E6E9EF"},
-		{name: "modal label", style: styles.Label, foreground: "#209FB5", background: "#E6E9EF"},
-		{name: "default modal button", style: styles.ApprovalButton, foreground: "#4C4F69", background: "#DCE0E8"},
+		{name: "top bar", style: styles.TopBar, foreground: "#1A1A1A", background: "#FAFAFA"},
+		{name: "muted top bar", style: styles.TopBarMuted, foreground: "#686868", background: "#FAFAFA"},
+		{name: "hover", style: styles.TopBarHover, foreground: "#1A1A1A", background: "#F5F5F5"},
+		{name: "active", style: styles.TopBarActive, foreground: "#3B7DD8", background: "#F5F5F5"},
+		{name: "sidebar", style: styles.Sidebar, foreground: "#1A1A1A", background: "#FAFAFA"},
+		{name: "local message", style: styles.MessageLocal, foreground: "#1A1A1A", background: "#F5F5F5"},
 	}
 
 	for _, tt := range tests {
@@ -68,6 +96,54 @@ func TestLightThemeChromeUsesRestrainedCatppuccinSurfaces(t *testing.T) {
 			}
 			if got := colorString(tt.style.GetBackground()); got != tt.background {
 				t.Fatalf("background = %q, want %q", got, tt.background)
+			}
+		})
+	}
+}
+
+func TestRestingHeaderMetadataUsesPanelAndSuccessColors(t *testing.T) {
+	tests := []struct {
+		scheme  ColorScheme
+		panel   string
+		success string
+	}{
+		{scheme: SchemeDark, panel: "#141414", success: "#7FD88F"},
+		{scheme: SchemeLight, panel: "#FAFAFA", success: "#3D9A57"},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.scheme), func(t *testing.T) {
+			app := NewApp(Options{Side: "host", DisplayName: "Shayne", Terminal: &fakePane{view: "ok"}})
+			app.styles = NewStyleSet(tt.scheme)
+			app.transport = "connected-direct"
+			app.hostCols = 120
+			app.hostRows = 40
+			app.localRole = RoleWrite
+			app.peers = []Peer{{ID: "guest-1", Name: "Alex", Role: RoleRead}}
+
+			segments := append(app.identityTopBarSegments(), app.stateTopBarSegments()...)
+			wantSuccess := map[string]bool{
+				"● direct":    true,
+				"● Alex/read": true,
+			}
+			seen := map[string]bool{}
+			for _, segment := range segments {
+				switch segment.text {
+				case "host Shayne", "● direct", "120x40", "write", "● Alex/read":
+					seen[segment.text] = true
+					if got := colorString(segment.style.GetBackground()); got != tt.panel {
+						t.Errorf("%q background = %q, want panel %q", segment.text, got, tt.panel)
+					}
+					if wantSuccess[segment.text] {
+						if got := colorString(segment.style.GetForeground()); got != tt.success {
+							t.Errorf("%q foreground = %q, want success %q", segment.text, got, tt.success)
+						}
+					}
+				}
+			}
+			for _, label := range []string{"host Shayne", "● direct", "120x40", "write", "● Alex/read"} {
+				if !seen[label] {
+					t.Errorf("resting metadata missing %q in %+v", label, segments)
+				}
 			}
 		})
 	}

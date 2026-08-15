@@ -32,8 +32,8 @@ func (r InputRouter) RouteKey(msg tea.KeyPressMsg) tea.Cmd {
 	if a.copyMode && msg.Code == tea.KeyEsc {
 		return a.setCopyMode(false)
 	}
-	if a.focus == FocusChat {
-		return a.handleChatKey(msg)
+	if cmd, handled := a.routeFocusedChatKey(msg); handled {
+		return cmd
 	}
 	if a.handleTerminalViewportKey(msg) {
 		return nil
@@ -45,6 +45,17 @@ func (r InputRouter) RouteKey(msg tea.KeyPressMsg) tea.Cmd {
 	a.resetTerminalViewportForInput()
 	a.emit(TerminalInputCommand{Data: data})
 	return nil
+}
+
+func (a *App) routeFocusedChatKey(msg tea.KeyPressMsg) (tea.Cmd, bool) {
+	if a.focus != FocusChat {
+		return nil, false
+	}
+	if a.sidebarVisible() {
+		return a.handleChatKey(msg), true
+	}
+	a.focusTerminal()
+	return nil, false
 }
 
 func (a *App) handleTerminalViewportKey(msg tea.KeyPressMsg) bool {
@@ -83,9 +94,12 @@ func (r InputRouter) RoutePaste(msg tea.PasteMsg) tea.Cmd {
 		return nil
 	}
 	if a.focus == FocusChat {
-		var cmd tea.Cmd
-		a.composer, cmd = a.composer.Update(msg)
-		return cmd
+		if a.sidebarVisible() {
+			var cmd tea.Cmd
+			a.composer, cmd = a.composer.Update(msg)
+			return cmd
+		}
+		a.focusTerminal()
 	}
 	a.resetTerminalViewportForInput()
 	a.emit(TerminalInputCommand{Data: EncodeTerminalPaste(msg, a.terminal.InputMode())})

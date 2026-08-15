@@ -23,9 +23,10 @@ func TestComposerUsesTextareaViewAndRealCursor(t *testing.T) {
 	if view.Cursor == nil {
 		t.Fatal("View().Cursor = nil, want textarea cursor")
 	}
-	if view.Cursor.Position.X < app.layout.Composer.X ||
-		view.Cursor.Position.X >= app.layout.Composer.X+app.layout.Composer.W {
-		t.Fatalf("cursor X = %d outside composer %+v", view.Cursor.Position.X, app.layout.Composer)
+	contentRect := composerContentRect(app.layout.Composer)
+	if view.Cursor.Position.X < contentRect.X ||
+		view.Cursor.Position.X >= contentRect.X+contentRect.W {
+		t.Fatalf("cursor X = %d outside composer content %+v", view.Cursor.Position.X, contentRect)
 	}
 	if !strings.Contains(view.Content, "abc") {
 		t.Fatalf("view missing textarea content: %q", view.Content)
@@ -110,7 +111,8 @@ func TestComposerShortSidebarSynchronizesTextareaViewport(t *testing.T) {
 	if nativeCursor == nil {
 		t.Fatal("native textarea cursor = nil")
 	}
-	if got, want := view.Cursor.X, app.layout.Composer.X+nativeCursor.X; got != want {
+	contentRect := composerContentRect(app.layout.Composer)
+	if got, want := view.Cursor.X, contentRect.X+nativeCursor.X; got != want {
 		t.Fatalf("root cursor X = %d, want native textarea offset %d", got, want)
 	}
 	if got, want := view.Cursor.Y, app.layout.Composer.Y+nativeCursor.Y; got != want {
@@ -119,7 +121,7 @@ func TestComposerShortSidebarSynchronizesTextareaViewport(t *testing.T) {
 
 	lines := strings.Split(ansiPattern.ReplaceAllString(view.Content, ""), "\n")
 	row := lines[app.layout.Composer.Y]
-	composerRow := string([]rune(row)[app.layout.Composer.X:])
+	composerRow := string([]rune(row)[contentRect.X:])
 	if !strings.Contains(composerRow, "Z") {
 		t.Fatalf("visible composer row does not contain cursor-adjacent tail marker: %q", row)
 	}
@@ -134,5 +136,24 @@ func TestComposerShortSidebarSynchronizesTextareaViewport(t *testing.T) {
 	}
 	if view.Cursor == nil || view.Cursor.Y < app.layout.Composer.Y || view.Cursor.Y >= app.layout.Composer.Y+app.layout.Composer.H {
 		t.Fatalf("cursor after enlarging viewport = %+v outside composer %+v", view.Cursor, app.layout.Composer)
+	}
+}
+
+func TestComposerContentRectReservesAccentColumnsWhenWideEnough(t *testing.T) {
+	tests := []struct {
+		name string
+		rect Rect
+		want Rect
+	}{
+		{name: "wide", rect: Rect{X: 70, Y: 20, W: 24, H: 3}, want: Rect{X: 72, Y: 20, W: 22, H: 3}},
+		{name: "two columns", rect: Rect{X: 7, Y: 2, W: 2, H: 1}, want: Rect{X: 7, Y: 2, W: 2, H: 1}},
+		{name: "one column", rect: Rect{X: 7, Y: 2, W: 1, H: 1}, want: Rect{X: 7, Y: 2, W: 1, H: 1}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := composerContentRect(tc.rect); got != tc.want {
+				t.Fatalf("composerContentRect(%+v) = %+v, want %+v", tc.rect, got, tc.want)
+			}
+		})
 	}
 }

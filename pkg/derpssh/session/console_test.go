@@ -893,7 +893,7 @@ func TestTUIConsoleRuntimeEventsUpdateApp(t *testing.T) {
 	console.send(tea.KeyPressMsg{Code: 's', Text: "s"})
 
 	view := console.View()
-	for _, want := range []string{"closed: done", "120x40", "write", "Alex", "read", "Blair", "denied", "Alex: hello"} {
+	for _, want := range []string{"closed: done", "120x40", "write", "Alex", "read", "Blair", "denied", "hello"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("console view missing %q:\n%s", want, view)
 		}

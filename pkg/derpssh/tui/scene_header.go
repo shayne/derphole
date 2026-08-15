@@ -35,9 +35,27 @@ func (a *App) buildHeaderLayers(layout Layout) []*lipgloss.Layer {
 		return nil
 	}
 
-	right, rightW := a.packHeaderSegments(a.rightTopBarSegments(), rect.W)
-	leftMax := maxInt(rect.W-rightW-1, 0)
-	left, leftW := a.packHeaderSegments(a.leftTopBarSegments(), leftMax)
+	leftSegments := a.leftTopBarSegments()
+	brandSegments := leftSegments
+	metadataSegments := []topBarSegment(nil)
+	if len(leftSegments) > 1 {
+		brandSegments = leftSegments[:1]
+		metadataSegments = leftSegments[1:]
+	}
+	fixedRightSegments, transientRightSegments := fixedAndTransientRightSegments(a.rightTopBarSegments())
+
+	brand, brandW := a.packHeaderSegments(brandSegments, rect.W)
+	remaining := maxInt(rect.W-brandW, 0)
+	fixedRight, fixedRightW := a.packHeaderSegments(fixedRightSegments, remaining)
+	remaining = maxInt(remaining-fixedRightW, 0)
+	transientRight, transientRightW := a.packHeaderSegments(transientRightSegments, remaining)
+	remaining = maxInt(remaining-transientRightW, 0)
+	metadata, metadataW := a.packHeaderSegments(metadataSegments, remaining)
+
+	left := append(brand, shiftPackedHeaderItems(metadata, brandW)...)
+	leftW := brandW + metadataW
+	right := append(transientRight, shiftPackedHeaderItems(fixedRight, transientRightW)...)
+	rightW := transientRightW + fixedRightW
 	rightX := rect.X + leftW + maxInt(rect.W-leftW-rightW, 0)
 
 	layers := []*lipgloss.Layer{
@@ -48,39 +66,70 @@ func (a *App) buildHeaderLayers(layout Layout) []*lipgloss.Layer {
 	return layers
 }
 
+func fixedAndTransientRightSegments(segments []topBarSegment) (fixed []topBarSegment, transient []topBarSegment) {
+	for _, segment := range segments {
+		switch segment.action {
+		case ActionToggleChat, ActionShowMenu, ActionQuit:
+			fixed = append(fixed, segment)
+		default:
+			transient = append(transient, segment)
+		}
+	}
+	return fixed, transient
+}
+
+func shiftPackedHeaderItems(items []packedHeaderItem, offset int) []packedHeaderItem {
+	shifted := make([]packedHeaderItem, len(items))
+	copy(shifted, items)
+	for i := range shifted {
+		shifted[i].x += offset
+	}
+	return shifted
+}
+
 func (a *App) packHeaderSegments(segments []topBarSegment, maxWidth int) ([]packedHeaderItem, int) {
 	if maxWidth <= 0 {
 		return nil, 0
 	}
-	items := make([]packedHeaderItem, 0, len(segments)*2)
+	items := make([]packedHeaderItem, 0, len(segments))
 	x := 0
 	for _, segment := range segments {
 		if strings.TrimSpace(segment.text) == "" {
 			continue
 		}
-		separator := ""
-		separatorW := 0
-		if x > 0 {
-			separator = a.styles.TopBarSeparator.Render("›")
-			separatorW = displayWidth(separator)
-		}
-		part := segment.style.Render(" " + segment.text + " ")
+		target := headerSegmentTarget(segment)
+		part := a.headerSegmentStyle(segment, target).Render(" " + segment.text + " ")
 		partW := displayWidth(part)
-		if x+separatorW+partW > maxWidth {
+		if x+partW > maxWidth {
 			continue
-		}
-		if separator != "" {
-			items = append(items, packedHeaderItem{x: x, content: separator, target: targetBase})
-			x += separatorW
 		}
 		items = append(items, packedHeaderItem{
 			x:       x,
 			content: part,
-			target:  headerSegmentTarget(segment),
+			target:  target,
 		})
 		x += partW
 	}
 	return items, x
+}
+
+func (a *App) headerSegmentStyle(segment topBarSegment, target layerTarget) lipgloss.Style {
+	if a.pressedTarget == target {
+		return a.styles.TopBarPressed
+	}
+	if segment.preserveHoverStyle {
+		return segment.style
+	}
+	if a.hoverTarget == target {
+		if segment.action == ActionQuit {
+			return a.styles.TopBarDangerHover
+		}
+		return a.styles.TopBarHover
+	}
+	if segment.action == ActionToggleChat && a.sidebarVisible() {
+		return a.styles.TopBarActive
+	}
+	return segment.style
 }
 
 func (a *App) positionHeaderItems(items []packedHeaderItem, originX int, y int) []*lipgloss.Layer {

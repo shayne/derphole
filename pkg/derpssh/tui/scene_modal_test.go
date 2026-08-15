@@ -132,14 +132,117 @@ func TestPointerDispatchRequiresMatchingModalChoiceRelease(t *testing.T) {
 func TestPointerDispatchUsesHelpActionTarget(t *testing.T) {
 	app := newModalSceneApp()
 	app.helpOpen = true
+	drainCommands(app)
+	target := actionTarget(ActionToggleChat)
 
-	app.Update(newPointerMsg(actionTarget(ActionToggleChat), clickAt(0, 0, tea.MouseLeft)))
+	app.Update(newPointerMsg(target, clickAt(0, 0, tea.MouseLeft)))
+	if !app.helpOpen || app.sidebarOpen {
+		t.Fatalf("help press changed modal/sidebar = %v/%v, want activation on release", app.helpOpen, app.sidebarOpen)
+	}
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("help press emitted command %+v, want none", cmd)
+	}
+
+	app.Update(newPointerMsg(target, releaseAt(0, 0, tea.MouseLeft)))
 
 	if app.helpOpen {
 		t.Fatal("helpOpen = true, want false after semantic menu action")
 	}
 	if !app.sidebarOpen {
 		t.Fatal("sidebarOpen = false, want true after semantic menu action")
+	}
+}
+
+func TestModalPointerGateRejectsWheelAndNonLeftInput(t *testing.T) {
+	target := modalChoiceTarget(ModalApproval, "read")
+	for _, event := range []tea.MouseMsg{
+		tea.MouseWheelMsg{Button: tea.MouseWheelUp},
+		clickAt(0, 0, tea.MouseRight),
+		clickAt(0, 0, tea.MouseMiddle),
+	} {
+		app := newModalSceneApp()
+		app.applyApprovalRequest(ApprovalRequestMsg{PeerID: "guest-1", Peer: "Alex"})
+		drainCommands(app)
+
+		app.Update(newPointerMsg(target, event))
+		app.Update(newPointerMsg(target, releaseAt(0, 0, event.Mouse().Button)))
+
+		if cmd := readCommand(app); cmd != nil {
+			t.Fatalf("%T emitted modal command %+v", event, cmd)
+		}
+		if !app.approvalActive() {
+			t.Fatalf("%T closed approval", event)
+		}
+	}
+}
+
+func TestPassiveModalDismissalCommitsOnMatchingLeftRelease(t *testing.T) {
+	app := newModalSceneApp()
+	app.applyNotice(NoticeMsg{Title: "Notice", Body: "done"})
+	target := modalTarget(ModalNotice)
+
+	app.Update(newPointerMsg(target, clickAt(0, 0, tea.MouseLeft)))
+	if !app.noticeOpen() {
+		t.Fatal("notice dismissed on press")
+	}
+	app.Update(newPointerMsg(target, releaseAt(0, 0, tea.MouseLeft)))
+	if app.noticeOpen() {
+		t.Fatal("notice remained open after matching release")
+	}
+
+	app.kickPeerID, app.kickPeer = "guest-1", "Alex"
+	target = modalTarget(ModalKick)
+	app.Update(newPointerMsg(target, clickAt(0, 0, tea.MouseLeft)))
+	if app.kickPeer == "" {
+		t.Fatal("kick notice dismissed on press")
+	}
+	app.Update(newPointerMsg(target, releaseAt(0, 0, tea.MouseLeft)))
+	if app.kickPeer != "" {
+		t.Fatal("kick notice remained open after matching release")
+	}
+}
+
+func TestApprovalPressDoesNotRetargetReplacementRequest(t *testing.T) {
+	app := newModalSceneApp()
+	drainCommands(app)
+	app.applyApprovalRequest(ApprovalRequestMsg{PeerID: "guest-a", Peer: "Alex"})
+	target := modalChoiceTarget(ModalApproval, "read")
+
+	app.Update(newPointerMsg(target, clickAt(0, 0, tea.MouseLeft)))
+	app.applyApprovalRequest(ApprovalRequestMsg{PeerID: "guest-b", Peer: "Blair"})
+	app.Update(newPointerMsg(target, releaseAt(0, 0, tea.MouseLeft)))
+
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("replacement approval received stale command %+v", cmd)
+	}
+	if !app.approvalActive() || app.approvalPeerID != "guest-b" {
+		t.Fatalf("replacement approval = active %v peer %q, want guest-b pending", app.approvalActive(), app.approvalPeerID)
+	}
+}
+
+func TestModalPressDoesNotSurviveNoticeTakeover(t *testing.T) {
+	app := newModalSceneApp()
+	drainCommands(app)
+	app.applyApprovalRequest(ApprovalRequestMsg{PeerID: "guest-a", Peer: "Alex"})
+	target := modalChoiceTarget(ModalApproval, "read")
+
+	app.Update(newPointerMsg(target, clickAt(0, 0, tea.MouseLeft)))
+	app.applyNotice(NoticeMsg{Title: "Connection changed", Body: "review state"})
+	app.Update(newPointerMsg(target, releaseAt(0, 0, tea.MouseLeft)))
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("notice takeover release emitted command %+v", cmd)
+	}
+	if !app.noticeOpen() {
+		t.Fatal("stale approval release dismissed front notice")
+	}
+
+	app.closeNotice()
+	app.Update(newPointerMsg(target, releaseAt(0, 0, tea.MouseLeft)))
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("post-notice stale release emitted command %+v", cmd)
+	}
+	if !app.approvalActive() {
+		t.Fatal("post-notice stale release approved underlying request")
 	}
 }
 

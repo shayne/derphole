@@ -13,6 +13,200 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
+func TestMouseHoverTracksSemanticTopBarTarget(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	chat := topBarActionRect(t, app, ActionToggleChat)
+
+	app.Update(tea.MouseMotionMsg{X: chat.X, Y: chat.Y})
+	if app.hoverTarget != actionTarget(ActionToggleChat) {
+		t.Fatalf("hover = %q, want chat target", app.hoverTarget)
+	}
+	app.Update(tea.MouseMotionMsg{X: app.layout.Terminal.X, Y: app.layout.Terminal.Y})
+	if app.hoverTarget != "" {
+		t.Fatalf("hover = %q after leaving chrome, want empty", app.hoverTarget)
+	}
+}
+
+func TestMouseTopBarActionRequiresMatchingRelease(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	chat := topBarActionRect(t, app, ActionToggleChat)
+	menu := topBarActionRect(t, app, ActionShowMenu)
+
+	app.Update(leftClick(chat.X, chat.Y))
+	if app.sidebarOpen {
+		t.Fatal("chat opened on press")
+	}
+	app.Update(leftRelease(menu.X, menu.Y))
+	if app.sidebarOpen {
+		t.Fatal("chat opened after release on a different target")
+	}
+}
+
+func TestMouseChatMessageCopiesOnlyBodyOnMatchingRelease(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	app.setSidebarOpen(true)
+	app.chatMessages = []ChatMessage{{Author: "alex", Body: "sudo systemctl restart derphole"}}
+	rect := targetRect(t, app.buildScene(), chatMessageTarget(0))
+
+	app.Update(leftClick(rect.X+1, rect.Y))
+	if app.focus != FocusChat {
+		// setSidebarOpen focuses chat; the message press itself must not change it.
+		t.Fatalf("unexpected focus %v", app.focus)
+	}
+	_, cmd := app.Update(leftRelease(rect.X+1, rect.Y))
+	assertImmediateClipboard(t, cmd, "sudo systemctl restart derphole")
+	if !app.copiedChatActive || app.copiedChatIndex != 0 {
+		t.Fatalf("copied state = %v/%d, want active message 0", app.copiedChatActive, app.copiedChatIndex)
+	}
+}
+
+func TestMouseChatMessageReleaseOnAnotherMessageDoesNotCopy(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	app.setSidebarOpen(true)
+	app.chatMessages = []ChatMessage{
+		{Author: "alex", Body: "one"},
+		{Author: "blair", Body: "two"},
+	}
+	scene := app.buildScene()
+	first := targetRect(t, scene, chatMessageTarget(0))
+	second := targetRect(t, scene, chatMessageTarget(1))
+
+	app.Update(leftClick(first.X+1, first.Y))
+	_, cmd := app.Update(leftRelease(second.X+1, second.Y))
+
+	if cmd != nil {
+		t.Fatalf("mismatched release command = %T, want nil", cmd())
+	}
+	if app.copiedChatActive || app.copiedChatIndex != -1 {
+		t.Fatalf("copied state = %v/%d after mismatched release, want inactive", app.copiedChatActive, app.copiedChatIndex)
+	}
+	if app.pressedTarget != "" {
+		t.Fatalf("pressed target = %q after mismatched release, want empty", app.pressedTarget)
+	}
+}
+
+func TestMouseChatMessageEmptyBodyDoesNotCopy(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	app.setSidebarOpen(true)
+	app.chatMessages = []ChatMessage{{Author: "alex", Body: " \n\t "}}
+	rect := targetRect(t, app.buildScene(), chatMessageTarget(0))
+
+	app.Update(leftClick(rect.X+1, rect.Y))
+	_, cmd := app.Update(leftRelease(rect.X+1, rect.Y))
+
+	if cmd != nil {
+		t.Fatalf("empty message command = %T, want nil", cmd())
+	}
+	if app.copiedChatActive || app.copiedChatIndex != -1 {
+		t.Fatalf("copied state = %v/%d for empty body, want inactive", app.copiedChatActive, app.copiedChatIndex)
+	}
+}
+
+func TestMouseChatMessageCopiesMultilineBodyVerbatim(t *testing.T) {
+	const body = "first line\n  indented second line\n"
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	app.setSidebarOpen(true)
+	app.chatMessages = []ChatMessage{{Author: "alex", Body: body}}
+	rect := targetRect(t, app.buildScene(), chatMessageTarget(0))
+
+	app.Update(leftClick(rect.X+1, rect.Y))
+	_, cmd := app.Update(leftRelease(rect.X+1, rect.Y))
+
+	assertImmediateClipboard(t, cmd, body)
+}
+
+func TestMouseChatMessageRejectsStaleIndex(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.chatMessages = []ChatMessage{{Body: "one"}}
+
+	if cmd := app.copyChatMessage(1); cmd != nil {
+		t.Fatalf("stale message command = %T, want nil", cmd())
+	}
+	if app.copiedChatActive || app.copiedChatIndex != -1 || app.copiedChatSeq != 0 {
+		t.Fatalf("copied state = %v/%d seq %d for stale index, want inactive zero state",
+			app.copiedChatActive, app.copiedChatIndex, app.copiedChatSeq)
+	}
+}
+
+func TestMouseChatMessagePreservesScrollFocusAndTerminalSelection(t *testing.T) {
+	pane := &interactiveFakePane{fakePane: fakePane{view: "ok"}, selectionOn: true}
+	app := chatAppWithScrollableMessages(t)
+	app.terminal = pane
+	app.focusTerminal()
+	app.chatScroll = 3
+	rect := targetRect(t, app.buildScene(), chatMessageTarget(len(app.chatMessages)-2))
+
+	app.Update(leftClick(rect.X+1, rect.Y))
+	_, cmd := app.Update(leftRelease(rect.X+1, rect.Y))
+
+	assertImmediateClipboard(t, cmd, app.chatMessages[len(app.chatMessages)-2].Body)
+	if app.chatScroll != 3 {
+		t.Fatalf("chatScroll = %d after message click, want 3", app.chatScroll)
+	}
+	if app.focus != FocusTerminal || app.composer.Focused() {
+		t.Fatalf("focus/composer = %v/%v after message click, want terminal/blurred", app.focus, app.composer.Focused())
+	}
+	if !pane.SelectionActive() || pane.clearCalls != 0 {
+		t.Fatalf("terminal selection after message click = active %v, clears %d; want active, zero clears",
+			pane.SelectionActive(), pane.clearCalls)
+	}
+	if app.helpOpen || app.peerDialogOpen || app.quitOpen {
+		t.Fatal("message click opened a menu or dialog")
+	}
+}
+
+func TestMouseChatMessagePreservesOutOfRangeScroll(t *testing.T) {
+	app := chatAppWithScrollableMessages(t)
+	app.chatScroll = 999
+	rect := targetRect(t, app.buildScene(), chatMessageTarget(0))
+
+	app.Update(leftClick(rect.X+1, rect.Y))
+	afterPress := app.chatScroll
+	_, cmd := app.Update(leftRelease(rect.X+1, rect.Y))
+
+	assertImmediateClipboard(t, cmd, app.chatMessages[0].Body)
+	if afterPress != 999 || app.chatScroll != 999 {
+		t.Fatalf("chatScroll after press/release = %d/%d, want 999/999", afterPress, app.chatScroll)
+	}
+}
+
+func TestMouseChatWheelMovesThreeRenderedRows(t *testing.T) {
+	app := chatAppWithScrollableMessages(t)
+	app.Update(tea.MouseWheelMsg{X: app.layout.Sidebar.X + 2, Y: app.layout.Sidebar.Y + 3, Button: tea.MouseWheelUp})
+	if app.chatScroll != 3 {
+		t.Fatalf("chatScroll = %d, want 3", app.chatScroll)
+	}
+	app.Update(tea.MouseWheelMsg{X: app.layout.Sidebar.X + 2, Y: app.layout.Sidebar.Y + 3, Button: tea.MouseWheelDown})
+	if app.chatScroll != 0 {
+		t.Fatalf("chatScroll after wheel down = %d, want 0", app.chatScroll)
+	}
+}
+
+func TestMouseChatWheelClampsToRenderedRows(t *testing.T) {
+	app := chatAppWithScrollableMessages(t)
+	viewportHeight := maxInt(app.layout.Sidebar.H-1-app.sidebarComposerRows(app.layout.Sidebar.H), 0)
+	wantMax := maxInt(len(app.chatRows(app.layout.Sidebar.W))-viewportHeight, 0)
+
+	for range 100 {
+		app.Update(tea.MouseWheelMsg{X: app.layout.Sidebar.X + 2, Y: app.layout.Sidebar.Y + 3, Button: tea.MouseWheelUp})
+	}
+	if app.chatScroll != wantMax {
+		t.Fatalf("chatScroll = %d after repeated wheel up, want max %d", app.chatScroll, wantMax)
+	}
+	for range 100 {
+		app.Update(tea.MouseWheelMsg{X: app.layout.Sidebar.X + 2, Y: app.layout.Sidebar.Y + 3, Button: tea.MouseWheelDown})
+	}
+	if app.chatScroll != 0 {
+		t.Fatalf("chatScroll = %d after repeated wheel down, want 0", app.chatScroll)
+	}
+}
+
 func TestMouseClickTopBarChatToggle(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
@@ -20,6 +214,7 @@ func TestMouseClickTopBarChatToggle(t *testing.T) {
 	chat := topBarActionRect(t, app, ActionToggleChat)
 
 	dispatchMouse(t, app, leftClick(chat.X+chat.W/2, chat.Y))
+	dispatchMouse(t, app, leftRelease(chat.X+chat.W/2, chat.Y))
 
 	if !app.sidebarOpen {
 		t.Fatalf("sidebarOpen = false, want true after top-bar chat click")
@@ -39,7 +234,9 @@ func TestMouseClickTopBarChatToggle(t *testing.T) {
 		t.Fatalf("resize command = %+v, want %+v", got, want)
 	}
 
+	chat = topBarActionRect(t, app, ActionToggleChat)
 	dispatchMouse(t, app, leftClick(chat.X+chat.W/2, chat.Y))
+	dispatchMouse(t, app, leftRelease(chat.X+chat.W/2, chat.Y))
 
 	if app.sidebarOpen {
 		t.Fatalf("sidebarOpen = true, want false after second top-bar chat click")
@@ -56,6 +253,7 @@ func TestMouseClickTopBarQuitOpensConfirmation(t *testing.T) {
 	quit := topBarActionRect(t, app, ActionQuit)
 
 	dispatchMouse(t, app, leftClick(quit.X+quit.W/2, quit.Y))
+	dispatchMouse(t, app, leftRelease(quit.X+quit.W/2, quit.Y))
 
 	if !app.quitOpen {
 		t.Fatalf("quitOpen = false, want true after top-bar X click")
@@ -76,6 +274,7 @@ func TestMouseClickPeerTopBarOpensPeerDialog(t *testing.T) {
 	peer := topBarPeerRect(t, app, "guest-2")
 
 	dispatchMouse(t, app, leftClick(peer.X+peer.W/2, peer.Y))
+	dispatchMouse(t, app, leftRelease(peer.X+peer.W/2, peer.Y))
 
 	if !app.peerDialogOpen {
 		t.Fatal("peer dialog did not open after clicking peer chip")
@@ -98,6 +297,7 @@ func TestMouseClickPeerDialogReadChangesClickedPeer(t *testing.T) {
 	drainCommands(app)
 	peer := topBarPeerRect(t, app, "guest-2")
 	dispatchMouse(t, app, leftClick(peer.X+peer.W/2, peer.Y))
+	dispatchMouse(t, app, leftRelease(peer.X+peer.W/2, peer.Y))
 	read, _, _ := app.peerActionButtonRects()
 
 	dispatchMouse(t, app, leftClick(read.X+read.W/2, read.Y))
@@ -958,6 +1158,7 @@ func TestMouseMenuShowsHostInvite(t *testing.T) {
 	menu := topBarActionRect(t, app, ActionShowMenu)
 
 	dispatchMouse(t, app, leftClick(menu.X+menu.W/2, menu.Y))
+	dispatchMouse(t, app, leftRelease(menu.X+menu.W/2, menu.Y))
 
 	if !strings.Contains(appContent(app), "Show Invite") || !strings.Contains(appContent(app), "Ctrl-X I") {
 		t.Fatalf("menu missing invite action:\n%s", appContent(app))
@@ -1379,6 +1580,38 @@ func leftClick(x int, y int) tea.MouseClickMsg {
 
 func leftRelease(x int, y int) tea.MouseReleaseMsg {
 	return releaseAt(x, y, tea.MouseLeft)
+}
+
+func targetRect(t *testing.T, scene Scene, target layerTarget) Rect {
+	t.Helper()
+	for y := 0; y < scene.Height; y++ {
+		start := -1
+		for x := 0; x <= scene.Width; x++ {
+			matches := x < scene.Width && scene.TargetAt(x, y) == target
+			if matches && start < 0 {
+				start = x
+			}
+			if !matches && start >= 0 {
+				return Rect{X: start, Y: y, W: x - start, H: 1}
+			}
+		}
+	}
+	t.Fatalf("scene target %q not found", target)
+	return Rect{}
+}
+
+func chatAppWithScrollableMessages(t *testing.T) *App {
+	t.Helper()
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 12})
+	app.setSidebarOpen(true)
+	for index := range 12 {
+		app.chatMessages = append(app.chatMessages, ChatMessage{
+			Author: fmt.Sprintf("peer-%d", index),
+			Body:   fmt.Sprintf("message-%d", index),
+		})
+	}
+	return app
 }
 
 type recordingViewPane struct {
