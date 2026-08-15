@@ -1184,17 +1184,12 @@ func parseLinuxNetworkSocketRow(fields []string, network string) (uint64, Socket
 		return 0, SocketRef{}, fmt.Errorf("linux %s socket address is malformed", network)
 	}
 	inode, err := strconv.ParseUint(fields[9], 10, 64)
-	if err != nil || (inode == 0 && !isOwnerlessLinuxTCPRow(network, fields[3])) {
+	// A TCP row without an inode cannot correlate to a process file
+	// descriptor, regardless of the socket state, so the table omits it.
+	if err != nil || (inode == 0 && network != "tcp4" && network != "tcp6") {
 		return 0, SocketRef{}, fmt.Errorf("linux %s socket inode is malformed", network)
 	}
 	return inode, SocketRef{Network: network, Local: fields[1], Remote: fields[2]}, nil
-}
-
-func isOwnerlessLinuxTCPRow(network, state string) bool {
-	// Linux prints inode zero for request sockets in SYN_RECV (state 03) and
-	// completed TIME_WAIT sockets (state 06). Neither row can belong to a
-	// process file descriptor, so omit them from ownership correlation.
-	return (network == "tcp4" || network == "tcp6") && (state == "03" || state == "06")
 }
 
 func validLinuxSocketAddress(value, network string) bool {

@@ -432,9 +432,10 @@ func TestLinuxNetworkSocketTableSkipsOwnerlessTCPRows(t *testing.T) {
 	timeWaitOne := "   3: 0100007F:9C55 0100007F:1F90 06 00000000:00000000 03:0000176F 00000000 0 0 0 3 0000000000000000 0\n"
 	timeWaitTwo := "   4: 0100007F:9C56 0100007F:1F90 06 00000000:00000000 03:00001770 00000000 0 0 0 3 0000000000000000 0\n"
 	synRecv := "   5: 0100007F:1F90 0100007F:9C57 03 00000000:00000000 01:00000064 00000000 1000 0 0 0 0000000000000000\n"
+	establishedWithoutInode := strings.Replace(timeWaitOne, " 06 ", " 01 ", 1)
 	owned := "   6: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 12345 1 0000000000000000 100 0 0 10 0\n"
 
-	table, err := parseLinuxNetworkSocketTable(header+timeWaitOne+timeWaitTwo+synRecv+owned, "tcp4")
+	table, err := parseLinuxNetworkSocketTable(header+timeWaitOne+timeWaitTwo+synRecv+establishedWithoutInode+owned, "tcp4")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,7 +451,6 @@ func TestLinuxNetworkSocketTableSkipsOwnerlessTCPRows(t *testing.T) {
 	for name, fixture := range map[string]string{
 		"malformed zero-inode index":   strings.Replace(timeWaitOne, "3:", "bad:", 1),
 		"malformed zero-inode address": strings.Replace(timeWaitOne, "0100007F:9C55", "malformed", 1),
-		"owned-state TCP zero inode":   strings.Replace(timeWaitOne, " 06 ", " 01 ", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := parseLinuxNetworkSocketTable(header+fixture, "tcp4"); err == nil {
