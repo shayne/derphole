@@ -268,7 +268,7 @@ func TestDrainExternalV2BulkPacketHandoffHardDeadlineIsFatal(t *testing.T) {
 	}}
 	path := externalV2BulkPacketPath{Conns: []net.PacketConn{conn}}
 	_, err := drainExternalV2BulkPacketHandoffWithDeps(context.Background(), path, externalV2BulkPacketHandoffDrainDeps{
-		quietWindow:  time.Millisecond,
+		quietWindow:  time.Second,
 		hardTimeout:  5 * time.Millisecond,
 		newBatchConn: func(net.PacketConn) externalV2BulkPacketBatchConn { return reader },
 	})
