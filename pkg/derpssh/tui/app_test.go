@@ -24,8 +24,8 @@ func TestViewDeclaresTerminalModes(t *testing.T) {
 	if !view.AltScreen {
 		t.Fatal("View().AltScreen = false, want true")
 	}
-	if view.MouseMode != tea.MouseModeCellMotion {
-		t.Fatalf("View().MouseMode = %v, want cell motion", view.MouseMode)
+	if view.MouseMode != tea.MouseModeAllMotion {
+		t.Fatalf("View().MouseMode = %v, want all motion", view.MouseMode)
 	}
 	if !view.KeyboardEnhancements.ReportAlternateKeys ||
 		!view.KeyboardEnhancements.ReportAllKeysAsEscapeCodes ||
@@ -191,7 +191,7 @@ func TestLayerInteractionStateClearsWhenGeometryChangesOrOverlayTakesOver(t *tes
 func TestViewKeepsMouseReportingForTerminalSelectionButNotInvite(t *testing.T) {
 	app := NewApp(Options{Side: "host", InviteCommand: "invite"})
 	app.copyMode = true
-	if got := app.View().MouseMode; got != tea.MouseModeCellMotion {
+	if got := app.View().MouseMode; got != tea.MouseModeAllMotion {
 		t.Fatalf("selection mouse mode = %v", got)
 	}
 	app.copyMode = false

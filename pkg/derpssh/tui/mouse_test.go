@@ -55,6 +55,17 @@ func TestMousePointerShapeFollowsSemanticSurface(t *testing.T) {
 	}
 }
 
+func TestFirstWindowSizeResetsPointerShape(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+
+	_, first := app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	assertRawPointerShape(t, first, "default")
+	_, second := app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	if second != nil {
+		t.Fatalf("second window size command = %T, want no repeated pointer reset", second)
+	}
+}
+
 func TestMouseTopBarActionRequiresMatchingRelease(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
@@ -423,8 +434,8 @@ func TestSelectionModeClickOutsideTerminalRestoresMouse(t *testing.T) {
 	if cmd != nil {
 		t.Fatalf("click outside selection mode command = %T, want nil", cmd)
 	}
-	if got := app.View().MouseMode; got != tea.MouseModeCellMotion {
-		t.Fatalf("mouse mode after click = %v, want cell motion", got)
+	if got := app.View().MouseMode; got != tea.MouseModeAllMotion {
+		t.Fatalf("mouse mode after click = %v, want all motion", got)
 	}
 }
 
@@ -515,8 +526,9 @@ func TestMouseLocalTerminalDrag(t *testing.T) {
 	if app.pointerCapture != "" {
 		t.Fatalf("pointer capture after release = %q, want empty", app.pointerCapture)
 	}
-	if cmd == nil || fmt.Sprint(cmd()) != "selected text" {
-		t.Fatalf("selection release clipboard = %v, want selected text", cmd)
+	assertImmediateClipboard(t, cmd, "selected text")
+	if app.pointerShape != "default" {
+		t.Fatalf("selection release pointer = %q, want default over top bar", app.pointerShape)
 	}
 	if pane.SelectionActive() {
 		t.Fatal("selection remains active after completed drag copy")
@@ -536,9 +548,7 @@ func TestMouseTerminalClickWithoutDrag(t *testing.T) {
 	if pane.finishCalls != 1 {
 		t.Fatalf("FinishSelection calls = %d, want 1", pane.finishCalls)
 	}
-	if cmd != nil {
-		t.Fatalf("click-only selection command = %T, want nil", cmd)
-	}
+	assertRawPointerShape(t, cmd, "text")
 }
 
 func TestMouseTerminalWheelLocal(t *testing.T) {
@@ -1231,6 +1241,56 @@ func TestMouseDragDividerResizesChat(t *testing.T) {
 	}
 }
 
+func TestMouseDividerReleaseRestoresPointerFromReleaseSurface(t *testing.T) {
+	tests := []struct {
+		name    string
+		release func(*App) (int, int)
+		want    string
+	}{
+		{
+			name: "terminal",
+			release: func(app *App) (int, int) {
+				terminal := app.currentTerminalRect()
+				return terminal.X + 1, terminal.Y + 1
+			},
+			want: "text",
+		},
+		{
+			name: "top bar",
+			release: func(app *App) (int, int) {
+				chat := topBarActionRect(t, app, ActionToggleChat)
+				return chat.X, chat.Y
+			},
+			want: "default",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+			app.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+			app.setSidebarOpen(true)
+			divider := app.layout.Divider
+
+			app.Update(leftClick(divider.X, divider.Y+2))
+			app.Update(tea.MouseMotionMsg{X: divider.X - 4, Y: divider.Y + 2, Button: tea.MouseLeft})
+			if app.pointerShape != "ew-resize" {
+				t.Fatalf("drag pointer = %q, want ew-resize", app.pointerShape)
+			}
+
+			x, y := tt.release(app)
+			_, cmd := app.Update(leftRelease(x, y))
+
+			if app.pointerCapture != "" || app.draggingDivider {
+				t.Fatalf("capture after release = %q/%v, want cleared", app.pointerCapture, app.draggingDivider)
+			}
+			if app.pointerShape != tt.want {
+				t.Fatalf("release pointer = %q, want %q", app.pointerShape, tt.want)
+			}
+			assertRawPointerShape(t, cmd, tt.want)
+		})
+	}
+}
+
 func TestMouseDragDividerRepaintsTerminalDuringMotion(t *testing.T) {
 	pane := &recordingViewPane{fakePane: fakePane{view: "ok"}}
 	app := NewApp(Options{Terminal: pane})
@@ -1310,14 +1370,14 @@ func TestViewDoesNotMutatePointerCapture(t *testing.T) {
 			configure: func(app *App) {
 				app.copyMode = true
 			},
-			wantMouseMode: tea.MouseModeCellMotion,
+			wantMouseMode: tea.MouseModeAllMotion,
 		},
 		{
 			name: "modal",
 			configure: func(app *App) {
 				app.quitOpen = true
 			},
-			wantMouseMode: tea.MouseModeCellMotion,
+			wantMouseMode: tea.MouseModeAllMotion,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1475,10 +1535,8 @@ func TestHostApprovalClickAtDisplayedWriteButtonRendersDeclaratively(t *testing.
 		t.Fatalf("approval press emitted command %+v, want none until release", cmd)
 	}
 
-	_, repaint := app.Update(leftRelease(x, y))
-	if repaint != nil {
-		t.Fatalf("approval release returned command %T, want declarative render", repaint())
-	}
+	_, pointer := app.Update(leftRelease(x, y))
+	assertRawPointerShape(t, pointer, "text")
 	got, ok := readCommand(app).(ApprovalDecisionCommand)
 	if !ok {
 		t.Fatalf("command = %T, want ApprovalDecisionCommand", got)
@@ -1631,6 +1689,21 @@ func leftClick(x int, y int) tea.MouseClickMsg {
 
 func leftRelease(x int, y int) tea.MouseReleaseMsg {
 	return releaseAt(x, y, tea.MouseLeft)
+}
+
+func assertRawPointerShape(t *testing.T, cmd tea.Cmd, want string) {
+	t.Helper()
+	if cmd == nil {
+		t.Fatalf("pointer command = nil, want %q", want)
+	}
+	result := cmd()
+	msg, ok := result.(tea.RawMsg)
+	if !ok {
+		t.Fatalf("pointer command message = %T, want tea.RawMsg", result)
+	}
+	if got, expected := fmt.Sprint(msg.Msg), "\x1b]22;"+want+"\x07"; got != expected {
+		t.Fatalf("pointer command = %q, want %q", got, expected)
+	}
 }
 
 func targetRect(t *testing.T, scene Scene, target layerTarget) Rect {

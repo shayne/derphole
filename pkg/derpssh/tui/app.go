@@ -238,7 +238,7 @@ func NewApp(opts Options) *App {
 		focus:           FocusTerminal,
 		inviteOpen:      opts.InitialInviteOpen,
 		copiedChatIndex: -1,
-		pointerShape:    "default",
+		pointerShape:    "",
 		localRole:       RolePending,
 		transport:       "starting",
 		composer:        composer,
@@ -252,10 +252,7 @@ func NewApp(opts Options) *App {
 }
 
 func (a *App) Init() tea.Cmd {
-	return tea.Batch(
-		tea.RequestBackgroundColor,
-		tea.Raw(ansi.SetPointerShape("default")),
-	)
+	return tea.RequestBackgroundColor
 }
 
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -286,7 +283,7 @@ func (a *App) applyMessage(msg tea.Msg) tea.Cmd {
 	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		a.resize(msg.Width, msg.Height, true)
+		return a.applyWindowSize(msg)
 	case tea.BackgroundColorMsg:
 		a.applyBackgroundColor(msg)
 	case RuntimeStateMsg:
@@ -301,6 +298,14 @@ func (a *App) applyMessage(msg tea.Msg) tea.Cmd {
 		return a.handleUnreadChatPulse(msg)
 	case clearCopiedChatMsg:
 		a.handleCopiedChatTick(msg)
+	}
+	return nil
+}
+
+func (a *App) applyWindowSize(msg tea.WindowSizeMsg) tea.Cmd {
+	a.resize(msg.Width, msg.Height, true)
+	if a.pointerShape == "" {
+		return a.updatePointerShape(targetBase)
 	}
 	return nil
 }
@@ -426,7 +431,7 @@ func (a *App) buildScene() Scene {
 
 func (a *App) configureView(view tea.View, scene Scene) tea.View {
 	view.AltScreen = true
-	view.MouseMode = tea.MouseModeCellMotion
+	view.MouseMode = tea.MouseModeAllMotion
 	if a.inviteOpen {
 		view.MouseMode = tea.MouseModeNone
 	}

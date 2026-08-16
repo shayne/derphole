@@ -863,8 +863,8 @@ func TestPrefixCopyModeTogglesSelectionMode(t *testing.T) {
 	if cmd != nil {
 		t.Fatalf("copy mode toggle command = %T, want nil", cmd)
 	}
-	if got := app.View().MouseMode; got != tea.MouseModeCellMotion {
-		t.Fatalf("copy mode mouse mode = %v, want cell motion", got)
+	if got := app.View().MouseMode; got != tea.MouseModeAllMotion {
+		t.Fatalf("copy mode mouse mode = %v, want all motion", got)
 	}
 }
 
@@ -899,8 +899,8 @@ func TestCopyModeEscapeLeavesSelectionMode(t *testing.T) {
 	if cmd != nil {
 		t.Fatalf("escape in copy mode command = %T, want nil", cmd)
 	}
-	if got := app.View().MouseMode; got != tea.MouseModeCellMotion {
-		t.Fatalf("mouse mode after escape = %v, want cell motion", got)
+	if got := app.View().MouseMode; got != tea.MouseModeAllMotion {
+		t.Fatalf("mouse mode after escape = %v, want all motion", got)
 	}
 	if got := readCommand(app); got != nil {
 		t.Fatalf("escape in copy mode emitted terminal command %+v, want none", got)

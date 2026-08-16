@@ -44,14 +44,19 @@ func newPointerMsg(target layerTarget, msg tea.MouseMsg) pointerMsg {
 }
 
 func (a *App) handleMouseMessage(msg tea.MouseMsg) tea.Cmd {
+	mouse := msg.Mouse()
 	target := a.pointerCapture
 	if target == "" {
-		mouse := msg.Mouse()
 		target = a.buildScene().TargetAt(mouse.X, mouse.Y)
 	}
 	interaction := HandleMouse(a, newPointerMsg(target, msg))
 	var pointer tea.Cmd
-	if _, motion := msg.(tea.MouseMotionMsg); motion {
+	switch msg.(type) {
+	case tea.MouseMotionMsg:
+		pointer = a.updatePointerShape(target)
+	case tea.MouseReleaseMsg:
+		target = a.buildScene().TargetAt(mouse.X, mouse.Y)
+		a.updateHover(newPointerMsg(target, tea.MouseMotionMsg(mouse)))
 		pointer = a.updatePointerShape(target)
 	}
 	return tea.Batch(interaction, pointer)
