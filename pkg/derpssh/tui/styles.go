@@ -11,28 +11,35 @@ import (
 )
 
 type StyleSet struct {
-	Scheme                                                                       ColorScheme
-	TopBar, TopBarBrand, TopBarHover, TopBarPressed                              lipgloss.Style
-	TopBarActive, TopBarDangerHover, TopBarSuccess                               lipgloss.Style
-	TopBarQuit, TopBarChip, TopBarMuted, TopBarWarn                              lipgloss.Style
-	TopBarAction, TopBarSeparator, StatusBar                                     lipgloss.Style
-	Sidebar, SidebarHeader, SidebarHeaderAction                                  lipgloss.Style
-	SidebarHeaderActionHover                                                     lipgloss.Style
-	Composer, ComposerHover, ComposerPlaceholder, ComposerCursor                 lipgloss.Style
-	ComposerBorder, LocalChat                                                    lipgloss.Style
-	MessageRemote, MessageLocal, MessageHover, MessageLocalHover, MessagePressed lipgloss.Style
-	MessageCopiedSurface                                                         lipgloss.Style
-	MessageAuthorRemote, MessageAuthorLocal                                      lipgloss.Style
-	MessageAccentRemote, MessageAccentLocal, MessageCopied                       lipgloss.Style
-	Divider, DividerHover, DividerDragging                                       lipgloss.Style
-	Modal, ModalInterior, ModalBackdrop, Label, Dim, Separator                   lipgloss.Style
-	ApprovalButton, ApprovalButtonSelected, ApprovalButtonHover                  lipgloss.Style
-	ApprovalButtonPressed                                                        lipgloss.Style
-	MenuLabel, MenuShortcut                                                      lipgloss.Style
+	Scheme                                                                         ColorScheme
+	TopBar, TopBarBrand, TopBarHover, TopBarPressed                                lipgloss.Style
+	TopBarActive, TopBarDangerHover, TopBarSuccess                                 lipgloss.Style
+	TopBarQuit, TopBarChip, TopBarMuted, TopBarWarn                                lipgloss.Style
+	TopBarAction, TopBarSeparator, StatusBar                                       lipgloss.Style
+	Sidebar, SidebarHeader, SidebarHeaderAction                                    lipgloss.Style
+	SidebarHeaderActionHover                                                       lipgloss.Style
+	Composer, ComposerHover, ComposerPlaceholder, ComposerCursor                   lipgloss.Style
+	ComposerBorder, LocalChat                                                      lipgloss.Style
+	MessageRemote, MessageLocal, MessageHover, MessageLocalHover, MessagePressed   lipgloss.Style
+	MessageCopiedSurface                                                           lipgloss.Style
+	MessageAuthorRemote, MessageAuthorLocal                                        lipgloss.Style
+	MessageAccentRemote, MessageAccentLocal, MessageCopied                         lipgloss.Style
+	Divider, DividerHover, DividerDragging                                         lipgloss.Style
+	Modal, ModalInterior, ModalFooter, ModalBackdrop, Toast, Label, Dim, Separator lipgloss.Style
+	ApprovalButton, ApprovalButtonSelected, ApprovalButtonHover                    lipgloss.Style
+	ApprovalButtonPressed                                                          lipgloss.Style
+	MenuLabel, MenuShortcut                                                        lipgloss.Style
 }
 
 func NewStyleSet(scheme ColorScheme) StyleSet {
-	theme := newTheme(scheme)
+	return newStyleSet(newTheme(scheme))
+}
+
+func NewTerminalStyleSet(background color.Color, foreground color.Color) StyleSet {
+	return newStyleSet(newTerminalTheme(background, foreground))
+}
+
+func newStyleSet(theme Theme) StyleSet {
 	role := func(r ThemeRole) lipgloss.Style { return theme.Role(r) }
 	pickColor := func(r ThemeRole, foreground bool) color.Color {
 		return theme.RoleColor(r, foreground)
@@ -86,12 +93,17 @@ func NewStyleSet(scheme ColorScheme) StyleSet {
 		DividerDragging:      lipgloss.NewStyle().Foreground(pickColor(AccentPrimary, true)),
 		Modal: role(DialogBase).
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(pickColor(DialogBorder, true)).
+			BorderForeground(pickColor(BorderSubtle, true)).
 			Padding(0, 1),
 		ModalInterior: role(DialogBase),
+		ModalFooter:   role(SurfaceElement),
 		ModalBackdrop: role(ModalBackdrop),
-		Label:         role(DialogText).Foreground(pickColor(AccentPrimary, true)).Bold(true),
-		Dim:           role(DialogMuted),
+		Toast: role(DialogBase).
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(pickColor(BorderSubtle, true)).
+			Padding(0, 1),
+		Label: role(DialogText).Foreground(pickColor(AccentPrimary, true)).Bold(true),
+		Dim:   role(DialogMuted),
 		Separator: lipgloss.NewStyle().
 			Foreground(pickColor(BorderBase, true)),
 		ApprovalButton:         role(ButtonDefault),
@@ -103,4 +115,19 @@ func NewStyleSet(scheme ColorScheme) StyleSet {
 		MenuLabel:    role(DialogText),
 		MenuShortcut: role(DialogMuted),
 	}
+}
+
+func (a *App) interactionStyle(
+	target layerTarget,
+	base lipgloss.Style,
+	hover lipgloss.Style,
+	pressed lipgloss.Style,
+) lipgloss.Style {
+	if a.pressedTarget == target {
+		return pressed
+	}
+	if a.hoverTarget == target {
+		return hover
+	}
+	return base
 }

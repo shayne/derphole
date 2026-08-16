@@ -4,7 +4,10 @@
 
 package tui
 
-import "testing"
+import (
+	"image/color"
+	"testing"
+)
 
 func TestThemeRolesHaveReadableContrast(t *testing.T) {
 	for _, scheme := range []ColorScheme{SchemeLight, SchemeDark} {
@@ -60,6 +63,41 @@ func TestDarkComposerCursorUsesVisibleWarmColor(t *testing.T) {
 	style := newTheme(SchemeDark).Role(ComposerCursor)
 	if got := colorString(style.GetForeground()); got != "#FAB283" {
 		t.Fatalf("dark composer cursor = %q, want warm #FAB283", got)
+	}
+}
+
+func TestTerminalThemeUsesReportedNeutralsAndKeepsSemanticAccents(t *testing.T) {
+	background := color.RGBA{R: 0x20, G: 0x24, B: 0x2A, A: 0xFF}
+	foreground := color.RGBA{R: 0xD8, G: 0xDE, B: 0xE9, A: 0xFF}
+	theme := newTerminalTheme(background, foreground)
+
+	if got := colorString(theme.Role(SurfaceBackground).GetBackground()); got != "#20242A" {
+		t.Fatalf("terminal background = %q, want #20242A", got)
+	}
+	if got := colorString(theme.Role(ChromeBase).GetForeground()); got != "#D8DEE9" {
+		t.Fatalf("terminal foreground = %q, want #D8DEE9", got)
+	}
+	if got := colorString(theme.Role(SurfacePanel).GetBackground()); got == "#141414" || got == "#20242A" {
+		t.Fatalf("terminal panel = %q, want a derived neutral distinct from fixed and base colors", got)
+	}
+	if got := colorString(theme.Role(AccentPrimary).GetForeground()); got != "#FAB283" {
+		t.Fatalf("local accent = %q, want #FAB283", got)
+	}
+	if got := colorString(theme.Role(AccentSecondary).GetForeground()); got != "#5C9CF5" {
+		t.Fatalf("remote accent = %q, want #5C9CF5", got)
+	}
+}
+
+func TestTerminalThemeFallsBackWhenAColorIsMissing(t *testing.T) {
+	theme := newTerminalTheme(color.RGBA{R: 0xF4, G: 0xF2, B: 0xEE, A: 0xFF}, nil)
+	if theme.scheme != SchemeLight {
+		t.Fatalf("scheme = %q, want light", theme.scheme)
+	}
+	if theme.Role(ChromeBase).GetForeground() == nil {
+		t.Fatal("missing foreground fallback")
+	}
+	if got := theme.ContrastRatio(ChromeBase); got < 4.5 {
+		t.Fatalf("fallback contrast = %.2f, want >= 4.5", got)
 	}
 }
 

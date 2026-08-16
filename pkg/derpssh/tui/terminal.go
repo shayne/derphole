@@ -5,10 +5,13 @@
 package tui
 
 import (
+	"image/color"
 	"io"
 	"strings"
 
 	uv "github.com/charmbracelet/ultraviolet"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/charmbracelet/x/vt"
 )
 
 type TerminalPane interface {
@@ -35,6 +38,10 @@ type terminalInteraction interface {
 	SelectionActive() bool
 }
 
+type terminalCursorProvider interface {
+	TerminalCursor() terminalCursorView
+}
+
 type MouseMode struct {
 	Enabled bool
 	SGR     bool
@@ -44,6 +51,7 @@ type TerminalInputMode struct {
 	ApplicationCursor bool
 	BracketedPaste    bool
 	AlternateScroll   bool
+	FocusEvents       bool
 }
 
 type vtTerminalPane struct {
@@ -71,7 +79,7 @@ func (p *vtTerminalPane) Resize(cols int, rows int) {
 }
 
 func (p *vtTerminalPane) View(width int, height int) string {
-	return renderTerminalSurfaceRows(p.surface, terminalRenderOptions{Width: width, Height: height, Focused: true})
+	return renderTerminalSurfaceRows(p.surface, terminalRenderOptions{Width: width, Height: height})
 }
 
 func (p *vtTerminalPane) MouseMode() MouseMode {
@@ -80,6 +88,10 @@ func (p *vtTerminalPane) MouseMode() MouseMode {
 
 func (p *vtTerminalPane) InputMode() TerminalInputMode {
 	return p.surface.InputMode()
+}
+
+func (p *vtTerminalPane) TerminalCursor() terminalCursorView {
+	return p.surface.Cursor()
 }
 
 func (p *vtTerminalPane) SetCursorActive(active bool) {
@@ -117,15 +129,33 @@ func (p *vtTerminalPane) Close() error {
 type terminalCursorView struct {
 	cursor  terminalPoint
 	visible bool
+	style   vt.CursorStyle
+	steady  bool
+	color   color.Color
 }
 
-func writeTerminalCell(b *strings.Builder, content string, style uv.Style, activeStyle *uv.Style) {
+func writeTerminalCell(
+	b *strings.Builder,
+	content string,
+	style uv.Style,
+	link uv.Link,
+	activeStyle *uv.Style,
+	activeLink *uv.Link,
+) {
 	if terminalBlankCellShouldUseDefaultStyle(content, style) {
 		style = uv.Style{}
 	}
 	if !style.Equal(activeStyle) {
 		b.WriteString(style.Diff(activeStyle))
 		*activeStyle = style
+	}
+	if link != *activeLink && !activeLink.IsZero() {
+		b.WriteString(ansi.ResetHyperlink())
+		*activeLink = uv.Link{}
+	}
+	if link != *activeLink && !link.IsZero() {
+		b.WriteString(ansi.SetHyperlink(link.URL, link.Params))
+		*activeLink = link
 	}
 	b.WriteString(content)
 }

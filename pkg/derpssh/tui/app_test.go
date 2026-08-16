@@ -6,17 +6,36 @@ package tui
 
 import (
 	"fmt"
+	"image/color"
 	"regexp"
 	"strings"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 	"github.com/shayne/derphole/pkg/derpssh/brand"
 )
 
 var _ tea.Model = (*App)(nil)
+
+func TestInitRequestsTerminalForegroundAndBackground(t *testing.T) {
+	app := NewApp(Options{})
+	batch, ok := app.Init()().(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Init message = %T, want tea.BatchMsg", app.Init()())
+	}
+	seen := map[string]bool{}
+	for _, cmd := range batch {
+		seen[fmt.Sprintf("%T", cmd())] = true
+	}
+	for _, want := range []string{"tea.backgroundColorMsg", "tea.foregroundColorMsg"} {
+		if !seen[want] {
+			t.Fatalf("Init requests = %+v, missing %s", seen, want)
+		}
+	}
+}
 
 func TestViewDeclaresTerminalModes(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "shell$"}})
@@ -27,11 +46,41 @@ func TestViewDeclaresTerminalModes(t *testing.T) {
 	if view.MouseMode != tea.MouseModeAllMotion {
 		t.Fatalf("View().MouseMode = %v, want all motion", view.MouseMode)
 	}
+	if !view.ReportFocus {
+		t.Fatal("View().ReportFocus = false, want focus events")
+	}
 	if !view.KeyboardEnhancements.ReportAlternateKeys ||
 		!view.KeyboardEnhancements.ReportAllKeysAsEscapeCodes ||
 		!view.KeyboardEnhancements.ReportAssociatedText ||
 		view.KeyboardEnhancements.ReportEventTypes {
 		t.Fatalf("unexpected keyboard enhancements: %+v", view.KeyboardEnhancements)
+	}
+}
+
+func TestOuterFocusStateForwardsOnlyWhenChildRequestsIt(t *testing.T) {
+	pane := &fakePane{view: "ok", input: TerminalInputMode{FocusEvents: true}}
+	app := NewApp(Options{Terminal: pane})
+
+	app.Update(tea.BlurMsg{})
+	if app.outerFocused {
+		t.Fatal("outerFocused = true after blur")
+	}
+	if got, ok := readCommand(app).(TerminalInputCommand); !ok || string(got.Data) != ansi.Blur {
+		t.Fatalf("blur command = %#v, want terminal blur sequence", got)
+	}
+
+	app.Update(tea.FocusMsg{})
+	if !app.outerFocused {
+		t.Fatal("outerFocused = false after focus")
+	}
+	if got, ok := readCommand(app).(TerminalInputCommand); !ok || string(got.Data) != ansi.Focus {
+		t.Fatalf("focus command = %#v, want terminal focus sequence", got)
+	}
+
+	pane.input.FocusEvents = false
+	app.Update(tea.BlurMsg{})
+	if cmd := readCommand(app); cmd != nil {
+		t.Fatalf("unrequested focus event emitted %#v", cmd)
 	}
 }
 
@@ -77,6 +126,31 @@ func TestCopiedChatFeedbackIgnoresStaleTick(t *testing.T) {
 	app.Update(clearCopiedChatMsg{seq: stale})
 	if !app.copiedChatActive || app.copiedChatIndex != 1 {
 		t.Fatalf("stale tick cleared newer copied feedback")
+	}
+}
+
+func TestCopyAndRoleChangesShowSequenceSafeToasts(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	app.chatMessages = []ChatMessage{{Author: "alex", Body: "make test"}}
+	_ = app.copyChatMessage(0)
+	if app.toast.text != "Copied message" || !strings.Contains(app.buildScene().Content, "Copied message") {
+		t.Fatalf("copy toast = %+v, want visible copied feedback", app.toast)
+	}
+	stale := app.toast.seq
+
+	app.peers = []Peer{{ID: "guest-1", Name: "Alex", Role: RoleRead}}
+	cmd := app.changeFirstPeerRole(RoleWrite)
+	if cmd == nil || app.toast.text != "Alex can write" {
+		t.Fatalf("role toast/cmd = %+v/%T, want Alex can write with expiry", app.toast, cmd)
+	}
+	app.Update(clearToastMsg{seq: stale})
+	if app.toast.text != "Alex can write" {
+		t.Fatalf("stale toast tick cleared newer feedback: %+v", app.toast)
+	}
+	app.Update(clearToastMsg{seq: app.toast.seq})
+	if app.toast.text != "" || strings.Contains(app.buildScene().Content, "Alex can write") {
+		t.Fatalf("matching toast tick left feedback visible: %+v", app.toast)
 	}
 }
 
@@ -216,6 +290,34 @@ func TestBackgroundColorMessageRebuildsConcreteStyles(t *testing.T) {
 	}
 	if got, want := colorString(composerStyles.Cursor.Color), colorString(app.styles.ComposerCursor.GetForeground()); got != want {
 		t.Fatalf("textarea cursor after scheme change = %q, want %q", got, want)
+	}
+}
+
+func TestTerminalColorMessagesRebuildStylesWithinSameScheme(t *testing.T) {
+	app := NewApp(Options{})
+	app.Update(backgroundMsg(color.RGBA{R: 0x20, G: 0x24, B: 0x2A, A: 0xFF}))
+	if got := colorString(app.styles.TopBar.GetBackground()); got == "#141414" {
+		t.Fatalf("same-scheme background left fixed top bar color %q", got)
+	}
+
+	app.Update(foregroundMsg(color.RGBA{R: 0xD8, G: 0xDE, B: 0xE9, A: 0xFF}))
+	if got := colorString(app.styles.TopBar.GetForeground()); got != "#D8DEE9" {
+		t.Fatalf("foreground reply produced %q, want #D8DEE9", got)
+	}
+	if got := colorString(app.composer.Styles().Focused.Text.GetForeground()); got != "#D8DEE9" {
+		t.Fatalf("composer foreground = %q, want #D8DEE9", got)
+	}
+}
+
+func TestTerminalLayerDoesNotPaintDefaultBackground(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "shell$"}})
+	app.SetWindowSize(80, 24)
+	layer := app.buildTerminalLayer(app.layout)
+	if layer == nil {
+		t.Fatal("terminal layer = nil")
+	}
+	if strings.Contains(layer.GetContent(), "\x1b[48;") {
+		t.Fatalf("terminal layer paints a background: %q", layer.GetContent())
 	}
 }
 
@@ -1087,32 +1189,13 @@ func TestClosedChatUnreadIgnoresStalePulseTick(t *testing.T) {
 	}
 }
 
-func TestClosedChatUnreadEmitsBellCommand(t *testing.T) {
+func TestClosedChatUnreadDoesNotEmitAudibleBell(t *testing.T) {
 	app := NewApp(Options{Side: "guest", Terminal: &fakePane{view: "ok"}})
 
 	app.Update(ChatMsg{Author: "alex", Body: "ping"})
-	if _, ok := readCommand(app).(TerminalBellCommand); !ok {
-		t.Fatal("remote unread chat did not emit TerminalBellCommand")
-	}
-
-	app.Update(ChatMsg{Author: "alex", Body: "again"})
-	if _, ok := readCommand(app).(TerminalBellCommand); !ok {
-		t.Fatal("next remote unread chat did not emit another TerminalBellCommand")
-	}
-
-	app.Update(modifiedKey('x', "", tea.ModCtrl))
-	app.Update(textKey("s"))
-	app.Update(ChatMsg{Author: "alex", Body: "open chat"})
 	for cmd := readCommand(app); cmd != nil; cmd = readCommand(app) {
 		if _, ok := cmd.(TerminalBellCommand); ok {
-			t.Fatal("open chat emitted TerminalBellCommand")
-		}
-	}
-
-	app.Update(ChatMsg{Author: "me", Body: "local", Local: true})
-	for cmd := readCommand(app); cmd != nil; cmd = readCommand(app) {
-		if _, ok := cmd.(TerminalBellCommand); ok {
-			t.Fatal("local chat emitted TerminalBellCommand")
+			t.Fatal("remote unread chat emitted audible TerminalBellCommand")
 		}
 	}
 }

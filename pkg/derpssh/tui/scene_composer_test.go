@@ -5,6 +5,7 @@
 package tui
 
 import (
+	"image/color"
 	"strings"
 	"testing"
 
@@ -35,6 +36,44 @@ func TestComposerUsesTextareaViewAndRealCursor(t *testing.T) {
 	app.focusTerminal()
 	if cursor := app.View().Cursor; cursor != nil {
 		t.Fatalf("terminal-focused View().Cursor = %+v, want nil", cursor)
+	}
+}
+
+func TestTerminalUsesChildCursorShapeBlinkColorAndPosition(t *testing.T) {
+	pane := newVTTerminalPaneForTest(t, 80, 23)
+	app := NewApp(Options{Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	if _, err := pane.Write([]byte("abc\x1b[6 q\x1b]12;#ABCDEF\x07")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	view := app.View()
+	if view.Cursor == nil {
+		t.Fatal("terminal-focused View().Cursor = nil, want child cursor")
+	}
+	if got, want := view.Cursor.Position, (tea.Position{X: 3, Y: app.layout.Terminal.Y}); got != want {
+		t.Fatalf("cursor position = %+v, want %+v", got, want)
+	}
+	if view.Cursor.Shape != tea.CursorBar || view.Cursor.Blink {
+		t.Fatalf("cursor shape/blink = %v/%v, want steady bar", view.Cursor.Shape, view.Cursor.Blink)
+	}
+	wantColor := color.RGBA{R: 0xAB, G: 0xCD, B: 0xEF, A: 0xFF}
+	if got := colorString(view.Cursor.Color); got != colorString(wantColor) {
+		t.Fatalf("cursor color = %q, want %q", got, colorString(wantColor))
+	}
+	if strings.Contains(view.Content, "\x1b[7m") {
+		t.Fatalf("native cursor still rendered as reverse-video content: %q", view.Content)
+	}
+}
+
+func TestTerminalChildCursorIsSuppressedBehindModal(t *testing.T) {
+	pane := newVTTerminalPaneForTest(t, 80, 23)
+	app := NewApp(Options{Terminal: pane})
+	app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	_ = helpAction(app)
+
+	if cursor := app.View().Cursor; cursor != nil {
+		t.Fatalf("modal View().Cursor = %+v, want nil", cursor)
 	}
 }
 

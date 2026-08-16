@@ -28,6 +28,66 @@ func TestMouseHoverTracksSemanticTopBarTarget(t *testing.T) {
 	}
 }
 
+func TestKeyboardModalityIgnoresStationarySyntheticMouseMotion(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	chat := topBarActionRect(t, app, ActionToggleChat)
+
+	app.Update(tea.MouseMotionMsg{X: chat.X, Y: chat.Y})
+	if app.hoverTarget != actionTarget(ActionToggleChat) {
+		t.Fatalf("initial hover = %q", app.hoverTarget)
+	}
+	app.Update(textKey("x"))
+	if app.hoverTarget != "" {
+		t.Fatalf("keyboard input left hover = %q", app.hoverTarget)
+	}
+	app.Update(tea.MouseMotionMsg{X: chat.X, Y: chat.Y})
+	if app.hoverTarget != "" {
+		t.Fatalf("stationary synthetic motion restored hover = %q", app.hoverTarget)
+	}
+	app.Update(tea.MouseMotionMsg{X: chat.X + 1, Y: chat.Y})
+	if app.hoverTarget != actionTarget(ActionToggleChat) {
+		t.Fatalf("deliberate motion hover = %q, want chat", app.hoverTarget)
+	}
+}
+
+func TestPointerShapesSupportedUsesConservativeTerminalAllowlist(t *testing.T) {
+	tests := []struct {
+		name        string
+		term        string
+		termProgram string
+		want        bool
+	}{
+		{name: "ghostty program", term: "xterm-256color", termProgram: "ghostty", want: true},
+		{name: "ghostty term", term: "xterm-ghostty", want: true},
+		{name: "kitty", term: "xterm-kitty", want: true},
+		{name: "foot", term: "foot-extra", want: true},
+		{name: "iterm", term: "xterm-256color", termProgram: "iTerm.app", want: true},
+		{name: "alacritty", term: "alacritty", want: false},
+		{name: "vte", term: "xterm-256color", termProgram: "vte", want: false},
+		{name: "unknown", term: "xterm-256color", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pointerShapesSupported(tt.term, tt.termProgram); got != tt.want {
+				t.Fatalf("pointerShapesSupported(%q, %q) = %v, want %v", tt.term, tt.termProgram, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUnsupportedTerminalDoesNotEmitPointerShapeOSC(t *testing.T) {
+	disabled := false
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}, PointerShapes: &disabled})
+	_, cmd := app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	if cmd != nil {
+		t.Fatalf("unsupported terminal pointer command = %T, want nil", cmd())
+	}
+	if app.pointerShape != "default" {
+		t.Fatalf("tracked pointer shape = %q, want default", app.pointerShape)
+	}
+}
+
 func TestMousePointerShapeFollowsSemanticSurface(t *testing.T) {
 	app := NewApp(Options{Side: "host", Terminal: &fakePane{view: "ok"}})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
@@ -56,7 +116,8 @@ func TestMousePointerShapeFollowsSemanticSurface(t *testing.T) {
 }
 
 func TestFirstWindowSizeResetsPointerShape(t *testing.T) {
-	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	enabled := true
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}, PointerShapes: &enabled})
 
 	_, first := app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
 	assertRawPointerShape(t, first, "default")
@@ -537,7 +598,8 @@ func TestMouseLocalTerminalDrag(t *testing.T) {
 
 func TestMouseTerminalClickWithoutDrag(t *testing.T) {
 	pane := &interactiveFakePane{fakePane: fakePane{view: "ok"}}
-	app := NewApp(Options{Terminal: pane})
+	enabled := true
+	app := NewApp(Options{Terminal: pane, PointerShapes: &enabled})
 	app.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	drainCommands(app)
 	terminal := app.currentTerminalRect()
@@ -1266,7 +1328,8 @@ func TestMouseDividerReleaseRestoresPointerFromReleaseSurface(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+			enabled := true
+			app := NewApp(Options{Terminal: &fakePane{view: "ok"}, PointerShapes: &enabled})
 			app.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 			app.setSidebarOpen(true)
 			divider := app.layout.Divider
@@ -1521,7 +1584,8 @@ func TestMouseDuringApprovalDoesNotReachTerminalOrChangeFocus(t *testing.T) {
 
 func TestHostApprovalClickAtDisplayedWriteButtonRendersDeclaratively(t *testing.T) {
 	pane := &fakePane{view: "ubuntu@host:~$ ", mouse: MouseMode{Enabled: true, SGR: true}}
-	app := NewApp(Options{Side: "host", Terminal: pane})
+	enabled := true
+	app := NewApp(Options{Side: "host", Terminal: pane, PointerShapes: &enabled})
 	app.Update(tea.WindowSizeMsg{Width: 101, Height: 30})
 	drainCommands(app)
 	app.Update(ApprovalRequestMsg{PeerID: "guest-1", Peer: "shayne@m5mbp"})

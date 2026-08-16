@@ -6,9 +6,9 @@ require (
 	charm.land/bubbles/v2 v2.1.1
 	charm.land/bubbletea/v2 v2.0.8
 	charm.land/lipgloss/v2 v2.0.6
-	github.com/charmbracelet/ultraviolet v0.0.0-20260811164956-006e29f97886
+	github.com/charmbracelet/ultraviolet v0.0.0-20260812204455-68fa937c71be
 	github.com/charmbracelet/x/ansi v0.11.8
-	github.com/charmbracelet/x/vt v0.0.0-20260803091719-3755ebad01b1
+	github.com/charmbracelet/x/vt v0.0.0-20260816001655-68d539dca504
 	github.com/creack/pty v1.1.24
 	github.com/google/addlicense v1.2.0
 	github.com/mattn/go-runewidth v0.0.24

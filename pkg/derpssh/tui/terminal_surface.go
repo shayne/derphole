@@ -43,6 +43,7 @@ type terminalCell struct {
 	Content  string
 	Width    int
 	Style    uv.Style
+	Link     uv.Link
 	Selected bool
 }
 
@@ -71,6 +72,8 @@ type vtTerminalSurface struct {
 	selection        terminalSelection
 	cursorVisible    bool
 	cursorActive     bool
+	cursorStyle      vt.CursorStyle
+	cursorSteady     bool
 	closed           bool
 	drainDone        chan struct{}
 }
@@ -101,6 +104,10 @@ func newVTTerminalSurfaceWithScrollbackLimit(size terminalSize, scrollbackLimit 
 	surface.term.SetCallbacks(vt.Callbacks{
 		CursorVisibility: func(visible bool) {
 			surface.cursorVisible = visible
+		},
+		CursorStyle: func(style vt.CursorStyle, steady bool) {
+			surface.cursorStyle = style
+			surface.cursorSteady = steady
 		},
 		EnableMode: func(mode ansi.Mode) {
 			surface.setPrivateMode(mode, true)
@@ -336,6 +343,9 @@ func (s *vtTerminalSurface) Cursor() terminalCursorView {
 	return terminalCursorView{
 		cursor:  terminalPoint{X: cursor.X, Y: cursor.Y},
 		visible: s.cursorVisible && s.cursorActive && s.offsetFromBottom == 0,
+		style:   s.cursorStyle,
+		steady:  s.cursorSteady,
+		color:   s.term.CursorColor(),
 	}
 }
 
@@ -439,11 +449,17 @@ func (s *vtTerminalSurface) setPrivateMode(mode ansi.Mode, enabled bool) {
 		ApplicationCursor: s.privateModes[ansi.ModeCursorKeys.Mode()],
 		BracketedPaste:    s.privateModes[ansi.ModeBracketedPaste.Mode()],
 		AlternateScroll:   s.privateModes[ansi.DECMode(1007).Mode()],
+		FocusEvents:       s.privateModes[ansi.ModeFocusEvent.Mode()],
 	}
 }
 
 func terminalCellFromUV(cell uv.Cell) terminalCell {
-	return terminalCell{Content: cell.Content, Width: cell.Width, Style: cell.Style}
+	link := cell.Link
+	if !link.IsZero() {
+		// x/vt stores OSC 8's params and URI fields in reverse order.
+		link = uv.Link{URL: cell.Link.Params, Params: cell.Link.URL}
+	}
+	return terminalCell{Content: cell.Content, Width: cell.Width, Style: cell.Style, Link: link}
 }
 
 func renderTerminalSurfaceRows(surface TerminalSurface, opts terminalRenderOptions) string {
@@ -453,6 +469,9 @@ func renderTerminalSurfaceRows(surface TerminalSurface, opts terminalRenderOptio
 	lines := make([]string, 0, opts.Height)
 	size := surface.Size()
 	cursor := surface.Cursor()
+	if !opts.Focused {
+		cursor.visible = false
+	}
 	renderWidth := minInt(opts.Width, size.Cols)
 	for y := 0; y < opts.Height; y++ {
 		if y >= size.Rows || renderWidth <= 0 {
@@ -467,6 +486,7 @@ func renderTerminalSurfaceRows(surface TerminalSurface, opts terminalRenderOptio
 func renderTerminalSurfaceRow(surface TerminalSurface, width int, y int, cursor terminalCursorView) string {
 	var b strings.Builder
 	activeStyle := uv.Style{}
+	activeLink := uv.Link{}
 	last := cursor.lastColumn(surface, width, y)
 	for x := 0; x <= last; {
 		cell := surface.Cell(x, y)
@@ -476,8 +496,11 @@ func renderTerminalSurfaceRow(surface TerminalSurface, width int, y int, cursor 
 		}
 		cell = normalizeTerminalCell(cell)
 		style := cursor.styleCell(cell, x, y)
-		writeTerminalCell(&b, cell.Content, style, &activeStyle)
+		writeTerminalCell(&b, cell.Content, style, cell.Link, &activeStyle, &activeLink)
 		x += maxInt(cell.Width, 1)
+	}
+	if !activeLink.IsZero() {
+		b.WriteString(ansi.ResetHyperlink())
 	}
 	if !activeStyle.IsZero() {
 		b.WriteString(ansi.ResetStyle)

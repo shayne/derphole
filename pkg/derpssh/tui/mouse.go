@@ -45,6 +45,7 @@ func newPointerMsg(target layerTarget, msg tea.MouseMsg) pointerMsg {
 
 func (a *App) handleMouseMessage(msg tea.MouseMsg) tea.Cmd {
 	mouse := msg.Mouse()
+	a.recordMouseModality(msg)
 	target := a.pointerCapture
 	if target == "" {
 		target = a.buildScene().TargetAt(mouse.X, mouse.Y)
@@ -60,6 +61,32 @@ func (a *App) handleMouseMessage(msg tea.MouseMsg) tea.Cmd {
 		pointer = a.updatePointerShape(target)
 	}
 	return tea.Batch(interaction, pointer)
+}
+
+func (a *App) useKeyboardModality() {
+	a.inputModality = inputModalityKeyboard
+	a.hoverTarget = ""
+}
+
+func (a *App) recordMouseModality(msg tea.MouseMsg) {
+	mouse := msg.Mouse()
+	position := terminalPoint{X: mouse.X, Y: mouse.Y}
+	_, motion := msg.(tea.MouseMotionMsg)
+	if !motion || !a.pointerPositionKnown || position != a.lastPointerPosition {
+		a.inputModality = inputModalityMouse
+	}
+	a.lastPointerPosition = position
+	a.pointerPositionKnown = true
+}
+
+func pointerShapesSupported(term string, termProgram string) bool {
+	term = strings.ToLower(strings.TrimSpace(term))
+	termProgram = strings.ToLower(strings.TrimSpace(termProgram))
+	if termProgram == "ghostty" || termProgram == "iterm.app" || termProgram == "iterm2" {
+		return true
+	}
+	return strings.Contains(term, "ghostty") || strings.Contains(term, "kitty") ||
+		term == "foot" || strings.HasPrefix(term, "foot-")
 }
 
 func pointerShapeForTarget(target layerTarget) string {
@@ -82,6 +109,9 @@ func (a *App) updatePointerShape(target layerTarget) tea.Cmd {
 		return nil
 	}
 	a.pointerShape = shape
+	if !a.pointerShapes {
+		return nil
+	}
 	return tea.Raw(ansi.SetPointerShape(shape))
 }
 
@@ -208,7 +238,8 @@ func isChromeTarget(target layerTarget) bool {
 }
 
 func (a *App) updateHover(pointer pointerMsg) {
-	if pointer.action() != pointerMotion || a.pointerCapture != "" {
+	if pointer.action() != pointerMotion || a.pointerCapture != "" ||
+		a.inputModality == inputModalityKeyboard {
 		return
 	}
 	if a.modalActive() {
@@ -314,7 +345,7 @@ func (a *App) handlePeerDialogMouse(msg pointerMsg) tea.Cmd {
 	}
 	if activated {
 		a.peerDialogChoice = choice
-		a.confirmPeerActionChoice()
+		return a.confirmPeerActionChoice()
 	}
 	return nil
 }
@@ -612,7 +643,11 @@ func (a *App) copyChatMessage(index int) tea.Cmd {
 	a.copiedChatSeq++
 	a.copiedChatIndex = index
 	a.copiedChatActive = true
-	return tea.Batch(tea.SetClipboard(body), clearCopiedChatTick(a.copiedChatSeq))
+	return tea.Batch(
+		tea.SetClipboard(body),
+		clearCopiedChatTick(a.copiedChatSeq),
+		a.showToast("Copied message"),
+	)
 }
 
 func (a *App) handleChatScrollMouse(msg pointerMsg) bool {

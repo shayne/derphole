@@ -142,7 +142,7 @@ func TestVTTerminalPaneHandlesCursorMovement(t *testing.T) {
 	}
 }
 
-func TestVTTerminalPaneRendersVisibleCursorOnBlankCell(t *testing.T) {
+func TestVTTerminalPaneExposesVisibleCursorWithoutPaintingCell(t *testing.T) {
 	pane := newVTTerminalPaneForTest(t, 10, 3)
 
 	if _, err := pane.Write([]byte("$ ")); err != nil {
@@ -150,11 +150,18 @@ func TestVTTerminalPaneRendersVisibleCursorOnBlankCell(t *testing.T) {
 	}
 
 	view := pane.View(10, 3)
-	if !strings.Contains(view, "\x1b[7m "+ansi.ResetStyle) {
-		t.Fatalf("View() = %q, want visible reverse-video cursor cell", view)
+	if strings.Contains(view, "\x1b[7m") {
+		t.Fatalf("View() = %q, want native cursor kept out of cell content", view)
 	}
-	if width := visibleWidth(strings.Split(view, "\n")[0]); width != len("$  ") {
-		t.Fatalf("first line visible width = %d, want cursor cell included: %q", width, view)
+	if width := visibleWidth(strings.Split(view, "\n")[0]); width != len("$") {
+		t.Fatalf("first line visible width = %d, want content only: %q", width, view)
+	}
+	provider, ok := pane.(terminalCursorProvider)
+	if !ok {
+		t.Fatal("VT terminal pane does not implement terminalCursorProvider")
+	}
+	if cursor := provider.TerminalCursor(); !cursor.visible || cursor.cursor != (terminalPoint{X: 2, Y: 0}) {
+		t.Fatalf("TerminalCursor() = %+v, want visible cursor at 2,0", cursor)
 	}
 }
 

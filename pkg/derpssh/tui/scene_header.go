@@ -114,24 +114,20 @@ func (a *App) packHeaderSegments(segments []topBarSegment, maxWidth int) ([]pack
 }
 
 func (a *App) headerSegmentStyle(segment topBarSegment, target layerTarget) lipgloss.Style {
-	if a.pressedTarget == target {
-		return a.styles.TopBarPressed
+	base := segment.style
+	if !segment.preserveHoverStyle && segment.action == ActionToggleChat && a.sidebarVisible() {
+		base = a.styles.TopBarActive
 	}
-	if a.hoverTarget == target && (segment.action != "" || segment.peer.ID != "") {
-		if segment.action == ActionQuit {
-			return a.styles.TopBarDangerHover
-		}
-		return a.styles.TopBarHover.
-			Foreground(segment.style.GetForeground()).
-			Bold(segment.style.GetBold())
+	if segment.action == "" && segment.peer.ID == "" {
+		return base
 	}
-	if segment.preserveHoverStyle {
-		return segment.style
+	hover := a.styles.TopBarHover.
+		Foreground(base.GetForeground()).
+		Bold(base.GetBold())
+	if segment.action == ActionQuit {
+		hover = a.styles.TopBarDangerHover
 	}
-	if segment.action == ActionToggleChat && a.sidebarVisible() {
-		return a.styles.TopBarActive
-	}
-	return segment.style
+	return a.interactionStyle(target, base, hover, a.styles.TopBarPressed)
 }
 
 func (a *App) positionHeaderItems(items []packedHeaderItem, originX int, y int) []*lipgloss.Layer {

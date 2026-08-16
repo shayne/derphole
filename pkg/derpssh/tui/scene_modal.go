@@ -5,9 +5,11 @@
 package tui
 
 import (
+	"image/color"
 	"strings"
 
 	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -54,8 +56,37 @@ func (a *App) buildModalLayers(frame ModalFrame) []*lipgloss.Layer {
 }
 
 func dimModalBackdrop(backdrop string, width int, height int, style lipgloss.Style) string {
-	plain := ansi.Strip(backdrop)
-	return style.Width(width).Height(height).Render(fitSceneContent(plain, width, height))
+	if width <= 0 || height <= 0 {
+		return ""
+	}
+	canvas := lipgloss.NewCanvas(width, height)
+	uv.NewStyledString(fitSceneContent(backdrop, width, height)).Draw(canvas, canvas.Bounds())
+	target := style.GetBackground()
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			cell := canvas.CellAt(x, y).Clone()
+			if cell.Style.Fg == nil {
+				cell.Style.Fg = style.GetForeground()
+			} else {
+				cell.Style.Fg = dimModalColor(cell.Style.Fg, target, 0.35)
+			}
+			cell.Style.Bg = dimModalColor(cell.Style.Bg, target, 0.45)
+			canvas.SetCell(x, y, cell)
+		}
+	}
+	return fitSceneContent(canvas.Render(), width, height)
+}
+
+func dimModalColor(value color.Color, target color.Color, amount float64) color.Color {
+	if value == nil || target == nil {
+		return value
+	}
+	vr, vg, vb, _ := value.RGBA()
+	tr, tg, tb, _ := target.RGBA()
+	mix := func(from uint32, to uint32) uint8 {
+		return uint8(float64(from>>8)*(1-amount) + float64(to>>8)*amount)
+	}
+	return color.RGBA{R: mix(vr, tr), G: mix(vg, tg), B: mix(vb, tb), A: 0xFF}
 }
 
 func modalPanelLayers(dialog ModalDialog, frame ModalFrame, z int) []*lipgloss.Layer {

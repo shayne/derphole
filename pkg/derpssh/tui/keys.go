@@ -328,13 +328,11 @@ func quitAction(a *App) tea.Cmd {
 }
 
 func readRoleAction(a *App) tea.Cmd {
-	a.changeFirstPeerRole(RoleRead)
-	return nil
+	return a.changeFirstPeerRole(RoleRead)
 }
 
 func writeRoleAction(a *App) tea.Cmd {
-	a.changeFirstPeerRole(RoleWrite)
-	return nil
+	return a.changeFirstPeerRole(RoleWrite)
 }
 
 func kickPeerAction(a *App) tea.Cmd {

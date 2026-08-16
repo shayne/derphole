@@ -41,6 +41,10 @@ func backgroundMsg(c color.Color) tea.BackgroundColorMsg {
 	return tea.BackgroundColorMsg{Color: c}
 }
 
+func foregroundMsg(c color.Color) tea.ForegroundColorMsg {
+	return tea.ForegroundColorMsg{Color: c}
+}
+
 func appContent(app *App) string {
 	if app == nil {
 		return ""

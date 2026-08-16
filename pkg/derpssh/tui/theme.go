@@ -79,6 +79,96 @@ func newTheme(scheme ColorScheme) Theme {
 	return Theme{scheme: scheme, roles: themeRolesForScheme(scheme)}
 }
 
+func newTerminalTheme(background color.Color, foreground color.Color) Theme {
+	scheme := terminalColorScheme(background)
+	fallback := newTheme(scheme)
+	backgroundHex := terminalColorHex(background, fallback.roles[SurfaceBackground].background)
+	foregroundHex := terminalColorHex(foreground, fallback.roles[SurfaceBackground].foreground)
+
+	panelMix, elementMix, hoverMix := 0.06, 0.11, 0.16
+	borderSubtleMix, borderBaseMix, borderActiveMix := 0.23, 0.32, 0.43
+	mutedMix, pressedMix, copiedMix := 0.64, 0.22, 0.16
+	if scheme == SchemeLight {
+		panelMix, elementMix, hoverMix = 0.035, 0.07, 0.12
+		borderSubtleMix, borderBaseMix, borderActiveMix = 0.18, 0.25, 0.35
+		mutedMix, pressedMix, copiedMix = 0.58, 0.17, 0.11
+	}
+
+	panel := mixHexColors(backgroundHex, foregroundHex, panelMix)
+	element := mixHexColors(backgroundHex, foregroundHex, elementMix)
+	hover := mixHexColors(backgroundHex, foregroundHex, hoverMix)
+	pressed := mixHexColors(backgroundHex, foregroundHex, pressedMix)
+	copied := mixHexColors(backgroundHex, fallback.roles[StateSuccess].foreground, copiedMix)
+	muted := mixHexColors(backgroundHex, foregroundHex, mutedMix)
+	borderSubtle := mixHexColors(backgroundHex, foregroundHex, borderSubtleMix)
+	borderBase := mixHexColors(backgroundHex, foregroundHex, borderBaseMix)
+	borderActive := mixHexColors(backgroundHex, foregroundHex, borderActiveMix)
+
+	roles := fallback.roles
+	roles[SurfaceBackground] = themeColorPair{foreground: foregroundHex, background: backgroundHex}
+	roles[SurfacePanel] = themeColorPair{foreground: foregroundHex, background: panel}
+	roles[SurfaceElement] = themeColorPair{foreground: foregroundHex, background: element}
+	roles[SurfaceHover] = themeColorPair{foreground: foregroundHex, background: hover}
+	roles[BorderSubtle] = themeColorPair{foreground: borderSubtle, background: backgroundHex}
+	roles[BorderBase] = themeColorPair{foreground: borderBase, background: backgroundHex}
+	roles[BorderActive] = themeColorPair{foreground: borderActive, background: backgroundHex}
+	roles[AccentPrimary] = themeColorPair{foreground: fallback.roles[AccentPrimary].foreground, background: panel}
+	roles[AccentSecondary] = themeColorPair{foreground: fallback.roles[AccentSecondary].foreground, background: panel}
+	roles[StateSuccess] = themeColorPair{foreground: fallback.roles[StateSuccess].foreground, background: panel}
+	roles[ChromeBase] = themeColorPair{foreground: foregroundHex, background: panel}
+	roles[ChromeMuted] = themeColorPair{foreground: muted, background: panel}
+	roles[ChromeDanger] = themeColorPair{foreground: fallback.roles[ChromeDanger].foreground, background: panel}
+	roles[DialogBase] = themeColorPair{foreground: foregroundHex, background: panel}
+	roles[DialogBorder] = themeColorPair{foreground: borderBase, background: panel}
+	roles[DialogText] = themeColorPair{foreground: foregroundHex, background: panel}
+	roles[DialogMuted] = themeColorPair{foreground: muted, background: panel}
+	roles[ButtonDefault] = themeColorPair{foreground: foregroundHex, background: element}
+	roles[ChatBase] = themeColorPair{foreground: foregroundHex, background: panel}
+	roles[ChatHeader] = themeColorPair{foreground: foregroundHex, background: element}
+	roles[ChatMessageUser] = themeColorPair{foreground: foregroundHex, background: panel}
+	roles[ChatMessageSelf] = themeColorPair{foreground: foregroundHex, background: panel}
+	roles[ChatPlaceholder] = themeColorPair{foreground: muted, background: element}
+	roles[ComposerBase] = themeColorPair{foreground: foregroundHex, background: element}
+	roles[ComposerCursor] = themeColorPair{foreground: fallback.roles[ComposerCursor].foreground, background: element}
+	roles[SelectionMode] = themeColorPair{foreground: foregroundHex, background: element}
+	roles[MessageHover] = themeColorPair{foreground: foregroundHex, background: hover}
+	roles[MessagePressed] = themeColorPair{foreground: foregroundHex, background: pressed}
+	roles[MessageCopied] = themeColorPair{foreground: foregroundHex, background: copied}
+	roles[ModalBackdrop] = themeColorPair{foreground: muted, background: pressed}
+
+	return Theme{scheme: scheme, roles: roles}
+}
+
+func terminalColorScheme(background color.Color) ColorScheme {
+	if background == nil {
+		return SchemeDark
+	}
+	r, g, b, _ := background.RGBA()
+	rgb := [3]float64{float64(r >> 8), float64(g >> 8), float64(b >> 8)}
+	if relativeLuminance(rgb) > 0.42 {
+		return SchemeLight
+	}
+	return SchemeDark
+}
+
+func terminalColorHex(value color.Color, fallback string) string {
+	if value == nil {
+		return fallback
+	}
+	r, g, b, _ := value.RGBA()
+	return fmt.Sprintf("#%02X%02X%02X", uint8(r>>8), uint8(g>>8), uint8(b>>8))
+}
+
+func mixHexColors(from string, to string, amount float64) string {
+	amount = math.Max(0, math.Min(amount, 1))
+	start := mustParseHexColor(from)
+	end := mustParseHexColor(to)
+	component := func(index int) uint8 {
+		return uint8(math.Round(start[index] + (end[index]-start[index])*amount))
+	}
+	return fmt.Sprintf("#%02X%02X%02X", component(0), component(1), component(2))
+}
+
 func (t Theme) Role(role ThemeRole) lipgloss.Style {
 	colors := t.roles[role]
 	if colors.foreground == "" || colors.background == "" {

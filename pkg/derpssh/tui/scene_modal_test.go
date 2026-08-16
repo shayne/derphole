@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 )
 
 func TestModalLayersCoverUnderlyingTargetsAndExposeButtons(t *testing.T) {
@@ -46,6 +48,41 @@ func TestModalBackdropDimsUnderlyingScene(t *testing.T) {
 	dimmedCell := dimmed.Canvas.CellAt(1, 0)
 	if reflect.DeepEqual(baseCell.Style, dimmedCell.Style) {
 		t.Fatalf("modal backdrop style = base style %+v, want visibly dimmed scene", dimmedCell.Style)
+	}
+}
+
+func TestModalBackdropPreservesUnderlyingColorHierarchy(t *testing.T) {
+	red := lipgloss.NewStyle().Foreground(lipgloss.Color("#E06C75")).Render("A")
+	blue := lipgloss.NewStyle().Foreground(lipgloss.Color("#5C9CF5")).Render("B")
+	dimmed := dimModalBackdrop(red+blue, 2, 1, NewStyleSet(SchemeDark).ModalBackdrop)
+	canvas := lipgloss.NewCanvas(2, 1)
+	uv.NewStyledString(dimmed).Draw(canvas, canvas.Bounds())
+	first := canvas.CellAt(0, 0)
+	second := canvas.CellAt(1, 0)
+	if first.Content != "A" || second.Content != "B" {
+		t.Fatalf("dimmed output = %q cells = %+v/%+v, want A/B", dimmed, first, second)
+	}
+	if reflect.DeepEqual(first.Style.Fg, second.Style.Fg) {
+		t.Fatalf("dimmed foregrounds collapsed to one color: %v", first.Style.Fg)
+	}
+	for i, cell := range []*uv.Cell{first, second} {
+		if cell.Style.Fg == nil {
+			t.Fatalf("cell %d missing dimmed foreground", i)
+		}
+	}
+}
+
+func TestModalActionLineUsesUnifiedFooterSurface(t *testing.T) {
+	app := newModalSceneApp()
+	app.Update(ApprovalRequestMsg{PeerID: "guest-1", Peer: "Alex"})
+	line := app.approvalButtonLine(app.approvalContentWidth())
+	canvas := lipgloss.NewCanvas(app.approvalContentWidth(), 1)
+	uv.NewStyledString(line).Draw(canvas, canvas.Bounds())
+	want := app.styles.ModalFooter.GetBackground()
+	for _, x := range []int{0, canvas.Width() - 1} {
+		if got := canvas.CellAt(x, 0).Style.Bg; !reflect.DeepEqual(got, want) {
+			t.Fatalf("footer background at %d = %v, want %v", x, got, want)
+		}
 	}
 }
 

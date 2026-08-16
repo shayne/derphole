@@ -163,6 +163,24 @@ func TestHeaderSegmentStyleShowsOpenChatAndPeerHover(t *testing.T) {
 	}
 }
 
+func TestHeaderAndModalControlsSharePressedPrecedence(t *testing.T) {
+	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
+	target := actionTarget(ActionToggleChat)
+	app.hoverTarget = target
+	app.pressedTarget = target
+	segment := app.chatTopBarSegments()[0]
+	if got := app.headerSegmentStyle(segment, target).Render("x"); got != app.styles.TopBarPressed.Render("x") {
+		t.Fatalf("header pressed style = %q, want shared pressed precedence", got)
+	}
+
+	modalTarget := modalChoiceTarget(ModalQuit, "quit")
+	app.hoverTarget = modalTarget
+	app.pressedTarget = modalTarget
+	if got := app.modalButtonStyle(modalTarget, true).Render("x"); got != app.styles.ApprovalButtonPressed.Render("x") {
+		t.Fatalf("modal pressed style = %q, want shared pressed precedence", got)
+	}
+}
+
 func TestHeaderSegmentStylePreservesPrefixHintStyleWhenHovered(t *testing.T) {
 	app := NewApp(Options{Terminal: &fakePane{view: "ok"}})
 	app.prefix = true

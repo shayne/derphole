@@ -6,6 +6,7 @@ package tui
 
 import (
 	"fmt"
+	"image/color"
 	"os"
 	"strings"
 	"sync"
@@ -24,11 +25,13 @@ type Options struct {
 	InviteCommand     string
 	InitialInviteOpen bool
 	Terminal          TerminalPane
+	PointerShapes     *bool
 }
 
 const approvalInputGrace = 200 * time.Millisecond
 const unreadChatPulseInterval = 500 * time.Millisecond
 const copiedChatFeedbackDuration = 1200 * time.Millisecond
+const toastFeedbackDuration = 1800 * time.Millisecond
 const terminalDoubleClickInterval = 500 * time.Millisecond
 const terminalSelectionAutoscrollInterval = 50 * time.Millisecond
 
@@ -42,6 +45,15 @@ type clearTerminalSelectionMsg struct {
 
 type clearCopiedChatMsg struct {
 	seq uint64
+}
+
+type clearToastMsg struct {
+	seq uint64
+}
+
+type toastState struct {
+	text string
+	seq  uint64
 }
 
 type terminalSelectionAutoscrollMsg struct {
@@ -132,6 +144,13 @@ const (
 	terminalGestureWord
 )
 
+type inputModality uint8
+
+const (
+	inputModalityMouse inputModality = iota
+	inputModalityKeyboard
+)
+
 type App struct {
 	side          string
 	displayName   string
@@ -171,38 +190,46 @@ type App struct {
 	mousePress                mousePressTarget
 	pointerCapture            layerTarget
 	pointerShape              string
+	pointerShapes             bool
 	hoverTarget               layerTarget
 	pressedTarget             layerTarget
 	terminalGesture           terminalGestureKind
 	lastTerminalClick         terminalClick
 	selectionSeq              uint64
 	terminalPointer           terminalPoint
+	lastPointerPosition       terminalPoint
+	pointerPositionKnown      bool
+	inputModality             inputModality
 	terminalAutoscrollSeq     uint64
 	terminalAutoscrollActive  bool
 	terminalSGRReleasePending bool
 	noticeTitle               string
 	noticeBody                string
 
-	localRole        Role
-	transport        string
-	hostCols         int
-	hostRows         int
-	terminalCols     int
-	terminalRows     int
-	peers            []Peer
-	chatMessages     []ChatMessage
-	chatScroll       int
-	copiedChatIndex  int
-	copiedChatActive bool
-	copiedChatSeq    uint64
-	unreadChat       int
-	unreadPulse      bool
-	unreadTicking    bool
-	unreadPulseSeq   uint64
-	composer         textarea.Model
-	styles           StyleSet
-	scheme           ColorScheme
-	now              func() time.Time
+	localRole          Role
+	transport          string
+	hostCols           int
+	hostRows           int
+	terminalCols       int
+	terminalRows       int
+	peers              []Peer
+	chatMessages       []ChatMessage
+	chatScroll         int
+	copiedChatIndex    int
+	copiedChatActive   bool
+	copiedChatSeq      uint64
+	toast              toastState
+	unreadChat         int
+	unreadPulse        bool
+	unreadTicking      bool
+	unreadPulseSeq     uint64
+	composer           textarea.Model
+	styles             StyleSet
+	scheme             ColorScheme
+	terminalBackground color.Color
+	terminalForeground color.Color
+	outerFocused       bool
+	now                func() time.Time
 }
 
 func NewApp(opts Options) *App {
@@ -225,6 +252,10 @@ func NewApp(opts Options) *App {
 	composer.MaxHeight = 3
 	composer.MaxContentHeight = 4096
 	composer.SetVirtualCursor(false)
+	pointerShapes := pointerShapesSupported(os.Getenv("TERM"), os.Getenv("TERM_PROGRAM"))
+	if opts.PointerShapes != nil {
+		pointerShapes = *opts.PointerShapes
+	}
 
 	app := &App{
 		side:            side,
@@ -239,11 +270,13 @@ func NewApp(opts Options) *App {
 		inviteOpen:      opts.InitialInviteOpen,
 		copiedChatIndex: -1,
 		pointerShape:    "",
+		pointerShapes:   pointerShapes,
 		localRole:       RolePending,
 		transport:       "starting",
 		composer:        composer,
 		styles:          NewStyleSet(SchemeDark),
 		scheme:          SchemeDark,
+		outerFocused:    true,
 		now:             time.Now,
 	}
 	app.configureComposerStyles()
@@ -252,7 +285,7 @@ func NewApp(opts Options) *App {
 }
 
 func (a *App) Init() tea.Cmd {
-	return tea.RequestBackgroundColor
+	return tea.Batch(tea.RequestBackgroundColor, tea.RequestForegroundColor)
 }
 
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -265,8 +298,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (a *App) handleInteractiveMessage(msg tea.Msg) (tea.Cmd, bool) {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
+		a.useKeyboardModality()
 		return a.handleKey(msg), true
 	case tea.PasteMsg:
+		a.useKeyboardModality()
 		return InputRouter{app: a}.RoutePaste(msg), true
 	case pointerMsg:
 		return HandleMouse(a, msg), true
@@ -281,23 +316,49 @@ func (a *App) applyMessage(msg tea.Msg) tea.Cmd {
 	if cmd, handled := a.applyTerminalMessage(msg); handled {
 		return cmd
 	}
+	if cmd, handled := a.applyDisplayMessage(msg); handled {
+		return cmd
+	}
+	return a.applyRuntimeMessage(msg)
+}
+
+func (a *App) applyDisplayMessage(msg tea.Msg) (tea.Cmd, bool) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		return a.applyWindowSize(msg)
+		return a.applyWindowSize(msg), true
 	case tea.BackgroundColorMsg:
 		a.applyBackgroundColor(msg)
+		return nil, true
+	case tea.ForegroundColorMsg:
+		a.applyForegroundColor(msg)
+		return nil, true
+	case tea.FocusMsg:
+		a.applyOuterFocus(true)
+		return nil, true
+	case tea.BlurMsg:
+		a.applyOuterFocus(false)
+		return nil, true
+	default:
+		return nil, false
+	}
+}
+
+func (a *App) applyRuntimeMessage(msg tea.Msg) tea.Cmd {
+	switch msg := msg.(type) {
 	case RuntimeStateMsg:
 		a.applyRuntimeState(msg)
 	case ChatMsg:
 		return a.appendChatMessage(ChatMessage(msg))
 	case ApprovalRequestMsg:
-		a.applyApprovalRequest(msg)
+		return a.applyApprovalRequest(msg)
 	case NoticeMsg:
 		a.applyNotice(msg)
 	case unreadChatPulseMsg:
 		return a.handleUnreadChatPulse(msg)
 	case clearCopiedChatMsg:
 		a.handleCopiedChatTick(msg)
+	case clearToastMsg:
+		a.handleToastTick(msg)
 	}
 	return nil
 }
@@ -328,16 +389,32 @@ func (a *App) applyTerminalMessage(msg tea.Msg) (tea.Cmd, bool) {
 }
 
 func (a *App) applyBackgroundColor(msg tea.BackgroundColorMsg) {
-	scheme := SchemeLight
-	if msg.IsDark() {
-		scheme = SchemeDark
-	}
-	if scheme == a.scheme {
+	a.terminalBackground = msg.Color
+	a.rebuildTerminalStyles()
+}
+
+func (a *App) applyForegroundColor(msg tea.ForegroundColorMsg) {
+	a.terminalForeground = msg.Color
+	a.rebuildTerminalStyles()
+}
+
+func (a *App) rebuildTerminalStyles() {
+	theme := newTerminalTheme(a.terminalBackground, a.terminalForeground)
+	a.scheme = theme.scheme
+	a.styles = newStyleSet(theme)
+	a.configureComposerStyles()
+}
+
+func (a *App) applyOuterFocus(focused bool) {
+	a.outerFocused = focused
+	if !a.terminal.InputMode().FocusEvents {
 		return
 	}
-	a.scheme = scheme
-	a.styles = NewStyleSet(scheme)
-	a.configureComposerStyles()
+	sequence := ansi.Blur
+	if focused {
+		sequence = ansi.Focus
+	}
+	a.emit(TerminalInputCommand{Data: []byte(sequence)})
 }
 
 func (a *App) configureComposerStyles() {
@@ -377,7 +454,7 @@ func (a *App) applyRuntimeState(msg RuntimeStateMsg) {
 	}
 }
 
-func (a *App) applyApprovalRequest(msg ApprovalRequestMsg) {
+func (a *App) applyApprovalRequest(msg ApprovalRequestMsg) tea.Cmd {
 	a.inviteOpen = false
 	a.approvalPeerID = strings.TrimSpace(msg.PeerID)
 	a.approvalPeer = strings.TrimSpace(valueOr(msg.Peer, msg.PeerID))
@@ -387,6 +464,10 @@ func (a *App) applyApprovalRequest(msg ApprovalRequestMsg) {
 		a.approvalChoice = approvalChoiceWrite
 		a.approvalGraceEnd = a.currentTime().Add(approvalInputGrace)
 	}
+	if a.outerFocused || !a.approvalActive() {
+		return nil
+	}
+	return desktopNotification("derpssh", a.displayHandle(a.approvalPeer, 32)+" wants to join")
 }
 
 func (a *App) applyNotice(msg NoticeMsg) {
@@ -423,15 +504,22 @@ func (a *App) buildScene() Scene {
 		Width: a.width, Height: a.height, Styles: a.styles, Backdrop: scene.Content,
 	})
 	if len(modalLayers) > 0 {
+		modalLayers = append(modalLayers, a.buildToastLayers()...)
 		scene = composeScene(a.width, a.height, modalLayers...)
+	} else if toastLayers := a.buildToastLayers(); len(toastLayers) > 0 {
+		scene = composeScene(a.width, a.height, append(layers, toastLayers...)...)
 	}
 	scene.Cursor = a.composerCursor()
+	if scene.Cursor == nil {
+		scene.Cursor = a.terminalCursor()
+	}
 	return scene
 }
 
 func (a *App) configureView(view tea.View, scene Scene) tea.View {
 	view.AltScreen = true
 	view.MouseMode = tea.MouseModeAllMotion
+	view.ReportFocus = true
 	if a.inviteOpen {
 		view.MouseMode = tea.MouseModeNone
 	}
@@ -799,18 +887,17 @@ func (a *App) handlePeerDialogKey(msg tea.KeyPressMsg) (tea.Cmd, bool) {
 		a.prefix = true
 		return nil, true
 	}
-	a.dispatchPeerDialogKey(msg)
-	return nil, true
+	return a.dispatchPeerDialogKey(msg), true
 }
 
-func (a *App) dispatchPeerDialogKey(msg tea.KeyPressMsg) {
+func (a *App) dispatchPeerDialogKey(msg tea.KeyPressMsg) tea.Cmd {
 	if isShiftTab(msg) {
 		a.movePeerActionChoice(-1)
-		return
+		return nil
 	}
 	switch msg.Code {
 	case tea.KeyEnter, tea.KeySpace:
-		a.confirmPeerActionChoice()
+		return a.confirmPeerActionChoice()
 	case tea.KeyEsc:
 		a.closePeerDialog()
 	case tea.KeyTab, tea.KeyRight, tea.KeyDown:
@@ -819,9 +906,10 @@ func (a *App) dispatchPeerDialogKey(msg tea.KeyPressMsg) {
 		a.movePeerActionChoice(-1)
 	default:
 		if len(msg.Text) > 0 {
-			a.handlePeerActionRune(msg.Text)
+			return a.handlePeerActionRune(msg.Text)
 		}
 	}
+	return nil
 }
 
 func (a *App) handleInviteKey(msg tea.KeyPressMsg) tea.Cmd {
@@ -999,18 +1087,21 @@ func (a *App) appendChatMessage(msg ChatMessage) tea.Cmd {
 		return nil
 	}
 	a.chatMessages = append(a.chatMessages, msg)
+	var notification tea.Cmd
+	if !msg.Local && !a.outerFocused {
+		notification = desktopNotification(a.displayHandle(msg.Author, 32), msg.Body)
+	}
 	if msg.Local {
 		a.chatScroll = 0
 	}
 	if !a.sidebarVisible() && !msg.Local {
 		a.unreadChat++
-		return a.startUnreadChatAttention()
+		return tea.Batch(notification, a.startUnreadChatAttention())
 	}
-	return nil
+	return notification
 }
 
 func (a *App) startUnreadChatAttention() tea.Cmd {
-	a.emit(TerminalBellCommand{})
 	if a.unreadTicking {
 		return nil
 	}
@@ -1063,6 +1154,25 @@ func (a *App) handleCopiedChatTick(msg clearCopiedChatMsg) {
 	}
 	a.copiedChatActive = false
 	a.copiedChatIndex = -1
+}
+
+func (a *App) showToast(text string) tea.Cmd {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	a.toast.seq++
+	a.toast.text = text
+	seq := a.toast.seq
+	return tea.Tick(toastFeedbackDuration, func(time.Time) tea.Msg {
+		return clearToastMsg{seq: seq}
+	})
+}
+
+func (a *App) handleToastTick(msg clearToastMsg) {
+	if msg.seq == a.toast.seq {
+		a.toast.text = ""
+	}
 }
 
 func (a *App) clearInvalidCopiedChatFeedback() {
@@ -1648,7 +1758,7 @@ func modalSpacer(styles StyleSet, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	return styles.ModalInterior.Render(strings.Repeat(" ", width))
+	return styles.ModalFooter.Render(strings.Repeat(" ", width))
 }
 
 func (a *App) noticeContentWidth() int {
@@ -1712,16 +1822,16 @@ func (a *App) renderPeerActionButton(choice peerActionChoice) string {
 }
 
 func (a *App) modalButtonStyle(target layerTarget, selected bool) lipgloss.Style {
-	if a.pressedTarget == target {
-		return a.styles.ApprovalButtonPressed
-	}
-	if a.hoverTarget == target {
-		return a.styles.ApprovalButtonHover
-	}
+	base := a.styles.ApprovalButton
 	if selected {
-		return a.styles.ApprovalButtonSelected
+		base = a.styles.ApprovalButtonSelected
 	}
-	return a.styles.ApprovalButton
+	return a.interactionStyle(
+		target,
+		base,
+		a.styles.ApprovalButtonHover,
+		a.styles.ApprovalButtonPressed,
+	)
 }
 
 func stringForQuitChoice(choice quitChoice) string {
@@ -1855,21 +1965,25 @@ func samePeer(left Peer, right Peer) bool {
 	return leftName != "" && leftName == rightName
 }
 
-func (a *App) confirmPeerActionChoice() {
+func (a *App) confirmPeerActionChoice() tea.Cmd {
 	if !a.peerDialogOpen {
-		return
+		return nil
 	}
 	peer := a.peerDialogPeer
 	peerName := valueOr(peer.Name, peer.ID)
+	var toast tea.Cmd
 	switch a.peerDialogChoice {
 	case peerActionRead:
 		a.emit(RoleChangeCommand{PeerID: peer.ID, Peer: peerName, Role: RoleRead})
+		toast = a.showToast(a.displayHandle(peerName, 24) + " can read")
 	case peerActionWrite:
 		a.emit(RoleChangeCommand{PeerID: peer.ID, Peer: peerName, Role: RoleWrite})
+		toast = a.showToast(a.displayHandle(peerName, 24) + " can write")
 	case peerActionKick:
 		a.emit(KickCommand{PeerID: peer.ID, Peer: peerName})
 	}
 	a.closePeerDialog()
+	return toast
 }
 
 func (a *App) movePeerActionChoice(delta int) {
@@ -1887,20 +2001,21 @@ func (a *App) movePeerActionChoice(delta int) {
 	a.peerDialogChoice = peerActionChoiceOrder[next]
 }
 
-func (a *App) handlePeerActionRune(key string) {
+func (a *App) handlePeerActionRune(key string) tea.Cmd {
 	switch strings.ToLower(key) {
 	case "r":
 		a.peerDialogChoice = peerActionRead
-		a.confirmPeerActionChoice()
+		return a.confirmPeerActionChoice()
 	case "w":
 		a.peerDialogChoice = peerActionWrite
-		a.confirmPeerActionChoice()
+		return a.confirmPeerActionChoice()
 	case "k", "d":
 		a.peerDialogChoice = peerActionKick
-		a.confirmPeerActionChoice()
+		return a.confirmPeerActionChoice()
 	case "q":
 		a.closePeerDialog()
 	}
+	return nil
 }
 
 func (a *App) focusTerminal() {
@@ -1918,15 +2033,17 @@ func (a *App) focusChat() {
 	a.clearUnreadChat()
 }
 
-func (a *App) changeFirstPeerRole(role Role) {
+func (a *App) changeFirstPeerRole(role Role) tea.Cmd {
 	if len(a.peers) == 0 {
-		return
+		return nil
 	}
 	if role != RoleRead && role != RoleWrite {
-		return
+		return nil
 	}
 	peer := a.peers[0]
-	a.emit(RoleChangeCommand{PeerID: peer.ID, Peer: valueOr(peer.Name, peer.ID), Role: role})
+	name := valueOr(peer.Name, peer.ID)
+	a.emit(RoleChangeCommand{PeerID: peer.ID, Peer: name, Role: role})
+	return a.showToast(a.displayHandle(name, 24) + " can " + string(role))
 }
 
 func (a *App) openQuitConfirm() {

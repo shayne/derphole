@@ -10,6 +10,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/charmbracelet/x/vt"
 )
 
 const (
@@ -213,6 +214,46 @@ func (a *App) composerCursor() *tea.Cursor {
 	cursor.X += contentRect.X
 	cursor.Y += contentRect.Y
 	return cursor
+}
+
+func (a *App) terminalCursor() *tea.Cursor {
+	if !a.terminalCursorAllowed() {
+		return nil
+	}
+	provider, ok := a.terminal.(terminalCursorProvider)
+	if !ok {
+		return nil
+	}
+	child := provider.TerminalCursor()
+	terminal := a.currentTerminalRect()
+	if !terminalCursorVisible(child, terminal) {
+		return nil
+	}
+	cursor := tea.NewCursor(terminal.X+child.cursor.X, terminal.Y+child.cursor.Y)
+	cursor.Color = child.color
+	cursor.Blink = !child.steady
+	cursor.Shape = bubbleCursorShape(child.style)
+	return cursor
+}
+
+func (a *App) terminalCursorAllowed() bool {
+	return a.focus == FocusTerminal && !a.copyMode && !a.inviteOpen && !a.modalActive()
+}
+
+func terminalCursorVisible(cursor terminalCursorView, terminal Rect) bool {
+	return cursor.visible && cursor.cursor.X >= 0 && cursor.cursor.Y >= 0 &&
+		cursor.cursor.X < terminal.W && cursor.cursor.Y < terminal.H
+}
+
+func bubbleCursorShape(style vt.CursorStyle) tea.CursorShape {
+	switch style {
+	case vt.CursorUnderline:
+		return tea.CursorUnderline
+	case vt.CursorBar:
+		return tea.CursorBar
+	default:
+		return tea.CursorBlock
+	}
 }
 
 func (a *App) prepareComposerViewport(layout Layout) bool {

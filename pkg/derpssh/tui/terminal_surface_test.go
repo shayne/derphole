@@ -214,6 +214,40 @@ func TestRenderTerminalSurfaceRowUsesStyleDiff(t *testing.T) {
 	}
 }
 
+func TestVTTerminalSurfacePreservesOSC8Hyperlinks(t *testing.T) {
+	surface := newVTTerminalSurface(terminalSize{Cols: 24, Rows: 2})
+	t.Cleanup(func() { _ = surface.Close() })
+	surface.SetCursorActive(false)
+	surface.Write([]byte("\x1b]8;id=docs;https://example.com\x07docs\x1b]8;;\x07 plain"))
+
+	cell := surface.Cell(0, 0)
+	if cell.Link.URL != "https://example.com" || cell.Link.Params != "id=docs" {
+		t.Fatalf("first linked cell = %+v, want URL and params", cell.Link)
+	}
+	if link := surface.Cell(4, 0).Link; !link.IsZero() {
+		t.Fatalf("cell after hyperlink reset = %+v, want zero link", link)
+	}
+
+	view := renderTerminalSurfaceRow(surface, 24, 0, surface.Cursor())
+	start := ansi.SetHyperlink("https://example.com", "id=docs")
+	reset := ansi.ResetHyperlink()
+	if !strings.Contains(view, start+"docs"+reset+" plain") {
+		t.Fatalf("rendered hyperlink transition = %q, want linked docs followed by reset", view)
+	}
+}
+
+func TestVTTerminalSurfaceResetsHyperlinkAtRenderedRowEnd(t *testing.T) {
+	surface := newVTTerminalSurface(terminalSize{Cols: 8, Rows: 2})
+	t.Cleanup(func() { _ = surface.Close() })
+	surface.SetCursorActive(false)
+	surface.Write([]byte("\x1b]8;;https://example.com\x07linked"))
+
+	view := renderTerminalSurfaceRow(surface, 8, 0, surface.Cursor())
+	if !strings.HasSuffix(view, ansi.ResetHyperlink()) {
+		t.Fatalf("linked row = %q, want hyperlink reset suffix", view)
+	}
+}
+
 func TestVTTerminalSurfaceRendersOnlySelectedCellsInReverseVideo(t *testing.T) {
 	surface := newVTTerminalSurface(terminalSize{Cols: 12, Rows: 2})
 	t.Cleanup(func() { _ = surface.Close() })
@@ -333,7 +367,7 @@ func TestVTTerminalSurfaceTracksModesThroughEmulatorCallbacks(t *testing.T) {
 	t.Cleanup(func() { _ = surface.Close() })
 
 	surface.Write([]byte("\x1b[?10"))
-	surface.Write([]byte("00;1006h\x1b[?1;2004;1007h"))
+	surface.Write([]byte("00;1006h\x1b[?1;1004;2004;1007h"))
 
 	if got := surface.MouseMode(); got != (MouseMode{Enabled: true, SGR: true}) {
 		t.Fatalf("MouseMode() = %+v", got)
@@ -342,11 +376,12 @@ func TestVTTerminalSurfaceTracksModesThroughEmulatorCallbacks(t *testing.T) {
 		ApplicationCursor: true,
 		BracketedPaste:    true,
 		AlternateScroll:   true,
+		FocusEvents:       true,
 	}) {
 		t.Fatalf("InputMode() = %+v", got)
 	}
 
-	surface.Write([]byte("\x1b[?1;1000;1002;1003;1006;1007;2004l"))
+	surface.Write([]byte("\x1b[?1;1000;1002;1003;1004;1006;1007;2004l"))
 	if got := surface.MouseMode(); got != (MouseMode{}) {
 		t.Fatalf("MouseMode() after disable = %+v", got)
 	}
