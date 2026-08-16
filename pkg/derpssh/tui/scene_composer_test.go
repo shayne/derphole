@@ -6,6 +6,7 @@ package tui
 
 import (
 	"image/color"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -36,6 +37,37 @@ func TestComposerUsesTextareaViewAndRealCursor(t *testing.T) {
 	app.focusTerminal()
 	if cursor := app.View().Cursor; cursor != nil {
 		t.Fatalf("terminal-focused View().Cursor = %+v, want nil", cursor)
+	}
+}
+
+func TestComposerAccentSpacerUsesComposerSurface(t *testing.T) {
+	tests := []struct {
+		name    string
+		hovered bool
+	}{
+		{name: "resting"},
+		{name: "hovered", hovered: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			app := NewApp(Options{Terminal: &fakePane{view: "shell$"}})
+			app.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+			app.setSidebarOpen(true)
+			app.focusChat()
+			if tc.hovered {
+				app.hoverTarget = targetComposer
+			}
+
+			scene := app.buildScene()
+			rect := app.layout.Composer
+			want := app.styles.Composer.GetBackground()
+			if tc.hovered {
+				want = app.styles.ComposerHover.GetBackground()
+			}
+			if got := scene.Canvas.CellAt(rect.X+1, rect.Y).Style.Bg; !reflect.DeepEqual(got, want) {
+				t.Fatalf("composer spacer background = %v, want composer surface %v", got, want)
+			}
+		})
 	}
 }
 

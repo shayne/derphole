@@ -191,12 +191,13 @@ func (a *App) composerLayer(layout Layout) *lipgloss.Layer {
 	rect := layout.Composer
 	contentRect := composerContentRect(rect)
 	content := fitSceneContent(a.composer.View(), contentRect.W, contentRect.H)
-	if contentRect.X > rect.X {
-		content = prefixChatBlock(content, a.styles.MessageAccentLocal.Render("┃")+" ")
-	}
 	surface := a.styles.Composer
 	if a.hoverTarget == targetComposer {
 		surface = a.styles.ComposerHover
+	}
+	if contentRect.X > rect.X {
+		accent := a.styles.MessageAccentLocal.Background(surface.GetBackground())
+		content = prefixChatBlock(content, accent.Render("┃")+surface.Render(" "))
 	}
 	content = surface.Width(rect.W).Height(rect.H).Render(content)
 	return sceneLayer(targetComposer, rect, composerLayerZ, content)
