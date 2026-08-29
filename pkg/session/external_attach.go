@@ -79,7 +79,7 @@ func issuePublicQUICSession(ctx context.Context, capabilities uint32, emitter *t
 	if err != nil {
 		return "", nil, err
 	}
-	bootstrap, err := resolveDERPBootstrap(ctx, route, 0, "no DERP node available")
+	bootstrap, err := resolveNewDERPBootstrap(ctx, route, "no DERP node available")
 	if err != nil {
 		return "", nil, err
 	}

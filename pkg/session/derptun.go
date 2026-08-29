@@ -183,7 +183,7 @@ func loadDerptunServeIdentity(serverToken string) (derptun.ServerCredential, ses
 }
 
 func openDerptunServeDERP(ctx context.Context, tok sessiontoken.Token, cred derptun.ServerCredential, emitter *telemetry.Emitter) (*tailcfg.DERPMap, *derpbind.Client, error) {
-	bootstrap, err := resolveDERPBootstrap(ctx, tok.DERPRoute, int(tok.BootstrapRegion), "no bootstrap DERP node available")
+	bootstrap, err := resolveDurableDERPBootstrap(ctx, tok.DERPRoute, int(tok.BootstrapRegion), "no bootstrap DERP node available")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -191,13 +191,18 @@ func openDerptunServeDERP(ctx context.Context, tok sessiontoken.Token, cred derp
 	if err != nil {
 		return nil, nil, err
 	}
-	emitDERPRouteDebug(emitter, bootstrap.route)
+	emitDerptunServeBootstrapDebug(emitter, bootstrap)
 	derpClient, err := derpbind.NewClientWithPrivateKey(ctx, bootstrap.node, bootstrap.serverURL, derpPriv)
 	if err != nil {
 		return nil, nil, derpbind.WrapCustomDERPConnectError(bootstrap.route, bootstrap.serverURL, err)
 	}
 	emitDERPProxyDebug(emitter, derpClient)
 	return bootstrap.dm, derpClient, nil
+}
+
+func emitDerptunServeBootstrapDebug(emitter *telemetry.Emitter, bootstrap derpBootstrap) {
+	emitDERPRouteDebug(emitter, bootstrap.route)
+	emitDERPMapDebug(emitter, bootstrap)
 }
 
 func openDerptunServeProbe(emitter *telemetry.Emitter) (net.PacketConn, publicPortmap, error) {
@@ -1848,7 +1853,7 @@ func loadDerptunDialToken(clientToken string) (derptun.ClientCredential, session
 }
 
 func openDerptunDialDERP(ctx context.Context, tok sessiontoken.Token, emitter *telemetry.Emitter) (*tailcfg.DERPMap, *derpbind.Client, error) {
-	bootstrap, err := resolveDERPBootstrap(ctx, tok.DERPRoute, int(tok.BootstrapRegion), "no bootstrap DERP node available")
+	bootstrap, err := resolveDurableDERPBootstrap(ctx, tok.DERPRoute, int(tok.BootstrapRegion), "no bootstrap DERP node available")
 	if err != nil {
 		return nil, nil, err
 	}

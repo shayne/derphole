@@ -169,6 +169,22 @@ func TestFetchMapUsesStaticFallbackForPublicDERPMap(t *testing.T) {
 	}
 }
 
+func TestNewDERPHTTPClientSetsAppName(t *testing.T) {
+	client, err := newDERPHTTPClient(
+		key.NewNode(),
+		"https://derp.example.test/derp",
+		logger.Discard,
+		netmon.NewStatic(),
+	)
+	if err != nil {
+		t.Fatalf("newDERPHTTPClient() error = %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	if got, want := client.AppName, AppName; got != want {
+		t.Fatalf("AppName = %q, want %q", got, want)
+	}
+}
+
 func TestClientReceiveTimeoutDoesNotKillSession(t *testing.T) {
 	srv := newTestDERPServer(t)
 

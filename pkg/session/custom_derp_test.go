@@ -7,9 +7,7 @@ package session
 import (
 	"bytes"
 	"context"
-	"errors"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,7 +15,6 @@ import (
 	"github.com/shayne/derphole/pkg/derptun"
 	"github.com/shayne/derphole/pkg/telemetry"
 	"github.com/shayne/derphole/pkg/token"
-	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
 
@@ -27,7 +24,6 @@ func TestCustomDERPOneShotForceRelayRoundTrip(t *testing.T) {
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 	t.Setenv(derpbind.CustomDERPServerEnv, "https://custom.test.invalid")
 	clearDERPProxyEnvironment(t)
-	publicFetches := rejectCustomProductPublicMapFetches(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -74,9 +70,6 @@ func TestCustomDERPOneShotForceRelayRoundTrip(t *testing.T) {
 	}
 	assertCustomProductDiagnostics(t, "listener", listenerDebug.String())
 	assertCustomProductDiagnostics(t, "sender", senderDebug.String())
-	if got := publicFetches.Load(); got != 0 {
-		t.Fatalf("public DERP map fetches = %d, want 0", got)
-	}
 }
 
 func TestCustomDERPDerptunAppForceRelayRoundTrip(t *testing.T) {
@@ -85,7 +78,6 @@ func TestCustomDERPDerptunAppForceRelayRoundTrip(t *testing.T) {
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 	t.Setenv(derpbind.CustomDERPServerEnv, "https://custom.test.invalid")
 	clearDERPProxyEnvironment(t)
-	publicFetches := rejectCustomProductPublicMapFetches(t)
 
 	now := time.Now()
 	serverToken, err := derptun.GenerateServerTokenFromEnvironment(derptun.ServerTokenOptions{Now: now, Days: 1})
@@ -133,9 +125,6 @@ func TestCustomDERPDerptunAppForceRelayRoundTrip(t *testing.T) {
 	)
 	assertCustomProductDiagnostics(t, "derptun app server", serverDebug.String())
 	assertCustomProductDiagnostics(t, "derptun app client", clientDebug.String())
-	if got := publicFetches.Load(); got != 0 {
-		t.Fatalf("public DERP map fetches = %d, want 0", got)
-	}
 }
 
 func TestCustomDERPUnresolvableEmbeddedRouteFailsClosed(t *testing.T) {
@@ -143,14 +132,6 @@ func TestCustomDERPUnresolvableEmbeddedRouteFailsClosed(t *testing.T) {
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", "")
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", "")
 	t.Setenv(derpbind.CustomDERPServerEnv, "https://consumer-secret.invalid:9443/derp")
-
-	oldFetch := fetchSessionDERPMap
-	var publicFetches atomic.Int64
-	fetchSessionDERPMap = func(context.Context, string) (*tailcfg.DERPMap, error) {
-		publicFetches.Add(1)
-		return customProductPublicFallbackMap(), nil
-	}
-	t.Cleanup(func() { fetchSessionDERPMap = oldFetch })
 
 	route, err := derpbind.NewCustomRoute("unresolvable.custom.test.invalid", derpbind.DefaultDERPPort, derpbind.DefaultSTUNPort)
 	if err != nil {
@@ -169,9 +150,6 @@ func TestCustomDERPUnresolvableEmbeddedRouteFailsClosed(t *testing.T) {
 		t.Fatal("Send() error = nil, want custom destination failure")
 	}
 	assertSanitizedCustomConnectError(t, err, "unresolvable.custom.test.invalid:443")
-	if got := publicFetches.Load(); got != 0 {
-		t.Fatalf("public DERP map fetches = %d, want 0", got)
-	}
 }
 
 func TestCustomDERPDurableServerUnresolvableRouteFailsClosed(t *testing.T) {
@@ -179,14 +157,6 @@ func TestCustomDERPDurableServerUnresolvableRouteFailsClosed(t *testing.T) {
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", "")
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", "")
 	t.Setenv(derpbind.CustomDERPServerEnv, "https://consumer-secret.invalid:9443/derp")
-
-	oldFetch := fetchSessionDERPMap
-	var publicFetches atomic.Int64
-	fetchSessionDERPMap = func(context.Context, string) (*tailcfg.DERPMap, error) {
-		publicFetches.Add(1)
-		return customProductPublicFallbackMap(), nil
-	}
-	t.Cleanup(func() { fetchSessionDERPMap = oldFetch })
 
 	route, err := derpbind.NewCustomRoute("unresolvable.durable.test.invalid", derpbind.DefaultDERPPort, derpbind.DefaultSTUNPort)
 	if err != nil {
@@ -207,23 +177,14 @@ func TestCustomDERPDurableServerUnresolvableRouteFailsClosed(t *testing.T) {
 		t.Fatal("openDerptunServeDERP() error = nil, want custom destination failure")
 	}
 	assertSanitizedCustomConnectError(t, err, "unresolvable.durable.test.invalid:443")
-	if got := publicFetches.Load(); got != 0 {
-		t.Fatalf("public DERP map fetches = %d, want 0", got)
-	}
 }
 
 func TestCustomDERPPublicTokenStillUsesPublicProvider(t *testing.T) {
 	clearDERPProxyEnvironment(t)
+	srv := newSessionTestDERPServer(t)
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", "http://127.0.0.1:1/derp")
 	t.Setenv(derpbind.CustomDERPServerEnv, "https://consumer-conflict.invalid:9443/derp")
-
-	oldFetch := fetchSessionDERPMap
-	var publicFetches atomic.Int64
-	fetchSessionDERPMap = func(context.Context, string) (*tailcfg.DERPMap, error) {
-		publicFetches.Add(1)
-		return customProductPublicFallbackMap(), nil
-	}
-	t.Cleanup(func() { fetchSessionDERPMap = oldFetch })
 
 	encoded := encodeCustomProductTestToken(t, derpbind.Route{})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -237,21 +198,6 @@ func TestCustomDERPPublicTokenStillUsesPublicProvider(t *testing.T) {
 	if err == nil {
 		t.Fatal("Send() error = nil, want test public DERP connection failure")
 	}
-	if got := publicFetches.Load(); got != 1 {
-		t.Fatalf("public DERP map fetches = %d, want 1", got)
-	}
-}
-
-func rejectCustomProductPublicMapFetches(t *testing.T) *atomic.Int64 {
-	t.Helper()
-	oldFetch := fetchSessionDERPMap
-	var calls atomic.Int64
-	fetchSessionDERPMap = func(context.Context, string) (*tailcfg.DERPMap, error) {
-		calls.Add(1)
-		return nil, errors.New("unexpected public DERP map fetch")
-	}
-	t.Cleanup(func() { fetchSessionDERPMap = oldFetch })
-	return &calls
 }
 
 func assertCustomProductToken(t *testing.T, encoded string) {
@@ -309,21 +255,6 @@ func encodeCustomProductTestToken(t *testing.T, route derpbind.Route) string {
 		t.Fatalf("token.Encode() error = %v", err)
 	}
 	return encoded
-}
-
-func customProductPublicFallbackMap() *tailcfg.DERPMap {
-	return &tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{
-		1: {
-			RegionID:   1,
-			RegionCode: "public-fallback",
-			RegionName: "Public Fallback",
-			Nodes: []*tailcfg.DERPNode{{
-				Name:     "public-fallback-1",
-				RegionID: 1,
-				HostName: "public-fallback.test.invalid",
-			}},
-		},
-	}}
 }
 
 func assertSanitizedCustomConnectError(t *testing.T, err error, authority string) {

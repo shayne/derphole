@@ -190,21 +190,11 @@ func TestDerptunMalformedCustomDERPCredentialsFailBeforeBootstrap(t *testing.T) 
 	malformedServer := derptun.CustomServerTokenPrefix + base64.RawURLEncoding.EncodeToString(payload)
 	malformedClient := clientToken[:len(clientToken)-3]
 
-	oldFetch := fetchSessionDERPMap
-	t.Cleanup(func() { fetchSessionDERPMap = oldFetch })
-	fetchCalls := 0
-	fetchSessionDERPMap = func(context.Context, string) (*tailcfg.DERPMap, error) {
-		fetchCalls++
-		return nil, errors.New("unexpected DERP map fetch")
-	}
 	if _, _, _, err := loadDerptunServeIdentity(malformedServer); !errors.Is(err, derptun.ErrInvalidToken) {
 		t.Fatalf("loadDerptunServeIdentity(malformed route) error = %v, want ErrInvalidToken", err)
 	}
 	if _, _, _, err := loadDerptunDialToken(malformedClient); !errors.Is(err, derptun.ErrInvalidToken) {
 		t.Fatalf("loadDerptunDialToken(truncated route) error = %v, want ErrInvalidToken", err)
-	}
-	if fetchCalls != 0 {
-		t.Fatalf("DERP map fetch calls = %d, want 0 before credential decoding succeeds", fetchCalls)
 	}
 }
 

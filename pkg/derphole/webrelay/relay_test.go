@@ -388,7 +388,11 @@ func TestWebRelayNewOfferPublicRouteKeepsV5Token(t *testing.T) {
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
 
-	offer, encoded, err := NewOffer(context.Background())
+	resolver, err := derpbind.NewMapResolver(derpbind.MapResolverConfig{})
+	if err != nil {
+		t.Fatalf("NewMapResolver() error = %v", err)
+	}
+	offer, encoded, err := newOfferWithResolver(context.Background(), resolver.Resolve)
 	if err != nil {
 		t.Fatalf("NewOffer() error = %v", err)
 	}
@@ -405,22 +409,276 @@ func TestWebRelayNewOfferPublicRouteKeepsV5Token(t *testing.T) {
 	}
 }
 
+func TestResolveWebRelayDERPTracksMapSource(t *testing.T) {
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", "https://map.example.test/private")
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", "")
+
+	node := &tailcfg.DERPNode{Name: "public-test", RegionID: 7, HostName: "derp.example.test"}
+	dm := &tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{
+		7: {RegionID: 7, Nodes: []*tailcfg.DERPNode{node}},
+	}}
+	storedAt := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	var calls atomic.Int32
+	resolve := func(_ context.Context, gotURL string) (derpbind.MapResult, error) {
+		calls.Add(1)
+		return derpbind.MapResult{
+			Map:      dm,
+			Source:   derpbind.MapSourceStaleCache,
+			URL:      gotURL,
+			StoredAt: storedAt,
+		}, nil
+	}
+
+	public, err := resolveWebRelayDERPWithResolver(context.Background(), derpbind.Route{}, 7, "missing", resolve)
+	if err != nil {
+		t.Fatalf("resolveWebRelayDERP(public): %v", err)
+	}
+	if public.dm != dm || public.node != node || public.serverURL != "https://derp.example.test/derp" {
+		t.Fatalf("public bootstrap = %+v, want resolver map and node", public)
+	}
+	if public.mapSource != derpbind.MapSourceStaleCache || !public.mapStoredAt.Equal(storedAt) {
+		t.Fatalf("public map metadata = %q/%v, want %q/%v", public.mapSource, public.mapStoredAt, derpbind.MapSourceStaleCache, storedAt)
+	}
+
+	route, err := derpbind.NewCustomRoute("custom.example.test", 8443, 3478)
+	if err != nil {
+		t.Fatalf("NewCustomRoute: %v", err)
+	}
+	custom, err := resolveWebRelayDERPWithResolver(context.Background(), route, 7, "missing", resolve)
+	if err != nil {
+		t.Fatalf("resolveWebRelayDERP(custom): %v", err)
+	}
+	if custom.route != route || custom.node == nil || custom.mapSource != derpbind.MapSourceEmbedded {
+		t.Fatalf("custom bootstrap = %+v, want embedded custom route", custom)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("public resolver calls = %d, want 1", got)
+	}
+}
+
+func TestResolveNewWebRelayDERPSelectsOnlyForPublicCreation(t *testing.T) {
+	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", "https://map.example.test/public")
+	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", "")
+
+	dm := &tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{
+		3: {RegionID: 3, Nodes: []*tailcfg.DERPNode{{Name: "three", RegionID: 3, HostName: "three.example.test"}}},
+		9: {RegionID: 9, Nodes: []*tailcfg.DERPNode{{Name: "nine", RegionID: 9, HostName: "nine.example.test"}}},
+	}}
+	var resolveCalls atomic.Int32
+	resolve := func(context.Context, string) (derpbind.MapResult, error) {
+		resolveCalls.Add(1)
+		return derpbind.MapResult{Map: dm, Source: derpbind.MapSourceNetwork}, nil
+	}
+	var pickCalls atomic.Int32
+	public, err := resolveNewWebRelayDERPWithResolverAndPicker(
+		context.Background(),
+		derpbind.Route{},
+		"missing",
+		resolve,
+		func(context.Context, *tailcfg.DERPMap) (derpbind.RegionSelection, error) {
+			pickCalls.Add(1)
+			return derpbind.RegionSelection{RegionID: 9, Latency: 12 * time.Millisecond, Measured: true}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("resolveNewWebRelayDERPWithPicker(public): %v", err)
+	}
+	if public.node == nil || public.node.RegionID != 9 || public.selection.RegionID != 9 || !public.selection.Measured {
+		t.Fatalf("public bootstrap = %+v, want measured region 9", public)
+	}
+
+	route, err := derpbind.NewCustomRoute("custom.example.test", 8443, 3478)
+	if err != nil {
+		t.Fatalf("NewCustomRoute: %v", err)
+	}
+	custom, err := resolveNewWebRelayDERPWithResolverAndPicker(
+		context.Background(),
+		route,
+		"missing",
+		resolve,
+		func(context.Context, *tailcfg.DERPMap) (derpbind.RegionSelection, error) {
+			pickCalls.Add(1)
+			return derpbind.RegionSelection{}, errors.New("custom picker must not run")
+		},
+	)
+	if err != nil {
+		t.Fatalf("resolveNewWebRelayDERPWithPicker(custom): %v", err)
+	}
+	if custom.node == nil || custom.node.RegionID != derpbind.CustomDERPRegionID || custom.selection != (derpbind.RegionSelection{}) {
+		t.Fatalf("custom bootstrap = %+v, want embedded route without selection", custom)
+	}
+	if got := resolveCalls.Load(); got != 1 {
+		t.Fatalf("public resolver calls = %d, want 1", got)
+	}
+	if got := pickCalls.Load(); got != 1 {
+		t.Fatalf("region picker calls = %d, want 1", got)
+	}
+}
+
+func TestWebRelayMissingEncodedRegionUsesExactCompiledFallback(t *testing.T) {
+	live := webRelayRegionMap(3)
+	resolve := func(context.Context, string) (derpbind.MapResult, error) {
+		return derpbind.MapResult{Map: live, Source: derpbind.MapSourceNetwork}, nil
+	}
+
+	bootstrap, err := resolveWebRelayDERPWithResolver(
+		context.Background(),
+		derpbind.Route{},
+		1,
+		"missing",
+		resolve,
+	)
+	if err != nil {
+		t.Fatalf("resolveWebRelayDERPWithResolver(): %v", err)
+	}
+	if bootstrap.node == nil || bootstrap.node.RegionID != 1 || bootstrap.mapSource != derpbind.MapSourceCompiled {
+		t.Fatalf("bootstrap = %+v, want exact compiled region 1", bootstrap)
+	}
+
+	_, err = resolveWebRelayDERPWithResolver(context.Background(), derpbind.Route{}, 41, "missing", resolve)
+	if err == nil {
+		t.Fatal("missing region 41 error = nil, want no cross-region substitution")
+	}
+}
+
+func TestNewWebRelayRestrictsPickerToLegacyCompatibleRegions(t *testing.T) {
+	dm := webRelayRegionMap(99, 3)
+	resolve := func(context.Context, string) (derpbind.MapResult, error) {
+		return derpbind.MapResult{Map: dm, Source: derpbind.MapSourceNetwork}, nil
+	}
+
+	bootstrap, err := resolveNewWebRelayDERPWithResolverAndPicker(
+		context.Background(),
+		derpbind.Route{},
+		"missing",
+		resolve,
+		func(_ context.Context, candidate *tailcfg.DERPMap) (derpbind.RegionSelection, error) {
+			if derpbind.NodeForRegion(candidate, 99) != nil {
+				t.Fatal("picker received post-compatibility region 99")
+			}
+			return derpbind.RegionSelection{RegionID: 99, Measured: true}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("resolveNewWebRelayDERPWithResolverAndPicker(): %v", err)
+	}
+	if bootstrap.node == nil || bootstrap.node.RegionID != 3 {
+		t.Fatalf("bootstrap node = %+v, want compatible region 3", bootstrap.node)
+	}
+	if bootstrap.selection != (derpbind.RegionSelection{RegionID: 3}) {
+		t.Fatalf("selection = %+v, want deterministic compatible region 3", bootstrap.selection)
+	}
+}
+
+func TestWebRelayMapTraceReportsCacheWriteDegradation(t *testing.T) {
+	bootstrap := webRelayBootstrap{
+		node:             &tailcfg.DERPNode{RegionID: 7},
+		mapSource:        derpbind.MapSourceNetwork,
+		cacheWriteFailed: true,
+	}
+	if got, want := formatWebRelayMapTrace(bootstrap, time.Now()), "derp-map-source=network region=7 cache-write=failed"; got != want {
+		t.Fatalf("formatWebRelayMapTrace() = %q, want %q", got, want)
+	}
+}
+
+func webRelayRegionMap(regionIDs ...int) *tailcfg.DERPMap {
+	dm := &tailcfg.DERPMap{Regions: make(map[int]*tailcfg.DERPRegion, len(regionIDs))}
+	for _, regionID := range regionIDs {
+		dm.Regions[regionID] = &tailcfg.DERPRegion{
+			RegionID: regionID,
+			Nodes: []*tailcfg.DERPNode{{
+				Name:     fmt.Sprintf("region-%d", regionID),
+				RegionID: regionID,
+				HostName: fmt.Sprintf("derp%d.example.test", regionID),
+			}},
+		}
+	}
+	return dm
+}
+
+func TestWebRelayBootstrapTraceIsRedacted(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	bootstrap := webRelayBootstrap{
+		node:        &tailcfg.DERPNode{RegionID: 7},
+		mapSource:   derpbind.MapSourceStaleCache,
+		mapStoredAt: now.Add(-74 * time.Minute),
+		selection: derpbind.RegionSelection{
+			RegionID: 7,
+			Latency:  18 * time.Millisecond,
+			Measured: true,
+		},
+	}
+	var traces []string
+	traceWebRelayBootstrapAt(Callbacks{Trace: func(message string) {
+		traces = append(traces, message)
+	}}, bootstrap, now)
+
+	want := []string{
+		"derp-map-source=stale-cache region=7 age=1h14m0s",
+		"derp-bootstrap-region=7 selection=measured latency=18ms",
+	}
+	if !slices.Equal(traces, want) {
+		t.Fatalf("traces = %q, want %q", traces, want)
+	}
+	for _, secret := range []string{"https://map.example.test/private", `"etag-canary"`} {
+		if strings.Contains(strings.Join(traces, "\n"), secret) {
+			t.Fatalf("trace contains secret canary %q: %q", secret, traces)
+		}
+	}
+
+	traces = nil
+	bootstrap.route = derpbind.Route{Host: "custom.example.test"}
+	bootstrap.mapSource = derpbind.MapSourceEmbedded
+	bootstrap.selection = derpbind.RegionSelection{RegionID: derpbind.CustomDERPRegionID}
+	traceWebRelayBootstrapAt(Callbacks{Trace: func(message string) {
+		traces = append(traces, message)
+	}}, bootstrap, now)
+	if len(traces) != 0 {
+		t.Fatalf("embedded route traces = %q, want none", traces)
+	}
+}
+
+func TestOfferSendTracesMapSourceBeforeWaitingForClaim(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	offer := &Offer{
+		client: newFakeDERPClient(),
+		bootstrap: webRelayBootstrap{
+			node:      &tailcfg.DERPNode{RegionID: 11},
+			mapSource: derpbind.MapSourceCompiled,
+		},
+	}
+	var traces []string
+	err := offer.Send(ctx, newFakeSource("trace.txt"), Callbacks{Trace: func(message string) {
+		traces = append(traces, message)
+	}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Offer.Send() error = %v, want context canceled", err)
+	}
+	if len(traces) < 2 {
+		t.Fatalf("traces = %q, want map source then wait trace", traces)
+	}
+	if traces[0] != "derp-map-source=compiled-fallback region=11" || traces[1] != "offer-wait-claim" {
+		t.Fatalf("first traces = %q, want map source before wait trace", traces[:2])
+	}
+}
+
 func TestWebRelayCustomRouteRoundTripIgnoresConsumerEnvironment(t *testing.T) {
 	srv := newWebRelayTestDERPServer(t)
 	t.Setenv(derpbind.CustomDERPServerEnv, "https://Creator.Invalid.:8443/derp")
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", srv.MapURL)
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", srv.DERPURL)
-	oldFetch := fetchWebRelayDERPMap
-	var publicFetches atomic.Int64
-	fetchWebRelayDERPMap = func(context.Context, string) (*tailcfg.DERPMap, error) {
-		publicFetches.Add(1)
-		return nil, errors.New("unexpected public DERP map fetch")
+	resolve := func(context.Context, string) (derpbind.MapResult, error) {
+		return derpbind.MapResult{}, errors.New("unexpected public DERP map fetch")
 	}
-	t.Cleanup(func() { fetchWebRelayDERPMap = oldFetch })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	offer, encoded, err := NewOffer(ctx)
+	offer, encoded, err := newOfferWithResolver(ctx, resolve)
 	if err != nil {
 		t.Fatalf("NewOffer() error = %v", err)
 	}
@@ -433,9 +691,6 @@ func TestWebRelayCustomRouteRoundTripIgnoresConsumerEnvironment(t *testing.T) {
 	if tok.Version != token.CustomDERPVersion || tok.DERPRoute != wantRoute {
 		t.Fatalf("custom token version/route = %d/%+v, want v%d %+v", tok.Version, tok.DERPRoute, token.CustomDERPVersion, wantRoute)
 	}
-	if got := publicFetches.Load(); got != 0 {
-		t.Fatalf("public map fetches after custom NewOffer = %d, want 0", got)
-	}
 
 	t.Setenv(derpbind.CustomDERPServerEnv, "https://consumer-conflict.invalid:9443/derp")
 	sendErr := make(chan error, 1)
@@ -443,7 +698,7 @@ func TestWebRelayCustomRouteRoundTripIgnoresConsumerEnvironment(t *testing.T) {
 		sendErr <- offer.Send(ctx, newFakeSource("route.txt", []byte("custom web relay")), Callbacks{})
 	}()
 	sink := &fakeSink{}
-	if err := Receive(ctx, encoded, sink, Callbacks{}); err != nil {
+	if err := receiveWithResolver(ctx, encoded, sink, Callbacks{}, TransferOptions{}, resolve); err != nil {
 		t.Fatalf("Receive() error = %v", err)
 	}
 	if err := <-sendErr; err != nil {
@@ -452,28 +707,21 @@ func TestWebRelayCustomRouteRoundTripIgnoresConsumerEnvironment(t *testing.T) {
 	if got := sink.buf.String(); got != "custom web relay" {
 		t.Fatalf("received payload = %q, want custom web relay", got)
 	}
-	if got := publicFetches.Load(); got != 0 {
-		t.Fatalf("public map fetches after custom Receive = %d, want 0", got)
-	}
 }
 
 func TestWebRelayCustomConnectFailuresAreSanitized(t *testing.T) {
 	clearWebRelayProxyEnvironment(t)
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", "")
 	t.Setenv("DERPHOLE_TEST_DERP_SERVER_URL", "")
-	oldFetch := fetchWebRelayDERPMap
-	var publicFetches atomic.Int64
-	fetchWebRelayDERPMap = func(context.Context, string) (*tailcfg.DERPMap, error) {
-		publicFetches.Add(1)
-		return nil, errors.New("unexpected public DERP map fetch")
+	resolve := func(context.Context, string) (derpbind.MapResult, error) {
+		return derpbind.MapResult{}, errors.New("unexpected public DERP map fetch")
 	}
-	t.Cleanup(func() { fetchWebRelayDERPMap = oldFetch })
 
 	t.Run("creator", func(t *testing.T) {
 		t.Setenv(derpbind.CustomDERPServerEnv, "https://unresolvable.webrelay.test.invalid/derp")
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, _, err := NewOffer(ctx)
+		_, _, err := newOfferWithResolver(ctx, resolve)
 		if err == nil {
 			t.Fatal("NewOffer() error = nil, want custom destination failure")
 		}
@@ -496,16 +744,13 @@ func TestWebRelayCustomConnectFailuresAreSanitized(t *testing.T) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		err = Receive(ctx, encoded, &fakeSink{}, Callbacks{})
+		err = receiveWithResolver(ctx, encoded, &fakeSink{}, Callbacks{}, TransferOptions{}, resolve)
 		if err == nil {
 			t.Fatal("Receive() error = nil, want custom destination failure")
 		}
 		assertSanitizedWebRelayConnectError(t, err, "unresolvable.webrelay.test.invalid:443")
 	})
 
-	if got := publicFetches.Load(); got != 0 {
-		t.Fatalf("public DERP map fetches = %d, want 0", got)
-	}
 }
 
 func clearWebRelayProxyEnvironment(t *testing.T) {
@@ -533,20 +778,20 @@ func assertSanitizedWebRelayConnectError(t *testing.T, err error, authority stri
 
 func TestWebRelayDERPMapSelectionAndEnvOverrides(t *testing.T) {
 	dm := &tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{
-		1: {RegionID: 1, Nodes: []*tailcfg.DERPNode{{Name: "one", RegionID: 1}}},
-		9: {RegionID: 9, Nodes: []*tailcfg.DERPNode{{Name: "nine", RegionID: 9}}},
+		1: {RegionID: 1, Nodes: []*tailcfg.DERPNode{{Name: "one", RegionID: 1, HostName: "one.example.test"}}},
+		9: {RegionID: 9, Nodes: []*tailcfg.DERPNode{{Name: "nine", RegionID: 9, HostName: "nine.example.test"}}},
 	}}
-	if got := firstDERPNode(dm, 9); got == nil || got.Name != "nine" {
-		t.Fatalf("firstDERPNode(region 9) = %#v, want nine", got)
+	if got := derpbind.NodeForRegion(dm, 9); got == nil || got.Name != "nine" {
+		t.Fatalf("NodeForRegion(region 9) = %#v, want nine", got)
 	}
-	if got := firstDERPNode(dm, 0); got == nil {
-		t.Fatal("firstDERPNode(region 0) = nil, want first map node")
+	if got := derpbind.FirstNode(dm); got == nil {
+		t.Fatal("FirstNode() = nil, want first map node")
 	}
-	if got := firstDERPNode(nil, 1); got != nil {
-		t.Fatalf("firstDERPNode(nil) = %#v, want nil", got)
+	if got := derpbind.NodeForRegion(nil, 1); got != nil {
+		t.Fatalf("NodeForRegion(nil) = %#v, want nil", got)
 	}
-	if got := firstDERPNode(&tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{}}, 1); got != nil {
-		t.Fatalf("firstDERPNode(empty) = %#v, want nil", got)
+	if got := derpbind.NodeForRegion(&tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{}}, 1); got != nil {
+		t.Fatalf("NodeForRegion(empty) = %#v, want nil", got)
 	}
 
 	t.Setenv("DERPHOLE_TEST_DERP_MAP_URL", "https://example.test/map")

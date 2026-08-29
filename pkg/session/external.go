@@ -149,7 +149,7 @@ func issuePublicSessionWithCapabilities(ctx context.Context, capabilities uint32
 	if err != nil {
 		return "", nil, err
 	}
-	bootstrap, err := resolveDERPBootstrap(ctx, route, 0, "no DERP node available")
+	bootstrap, err := resolveNewDERPBootstrap(ctx, route, "no DERP node available")
 	if err != nil {
 		return "", nil, err
 	}
@@ -333,7 +333,7 @@ func publicDirectBatchConn(conn net.PacketConn) transport.DirectBatchConn {
 		}
 		return nil
 	}
-	batchConn := batching.TryUpgradeToConn(udpConn, "udp4", batching.IdealBatchSize)
+	batchConn := batching.TryUpgradeToConn(udpConn, "udp4", batching.IdealBatchSize, "", nil)
 	directBatchConn, _ := batchConn.(transport.DirectBatchConn)
 	return directBatchConn
 }
@@ -458,24 +458,6 @@ func peerProgressReplayed(progress *peerProgress, lastSequence *uint64) bool {
 	}
 	*lastSequence = progress.Sequence
 	return false
-}
-
-func firstDERPNode(dm *tailcfg.DERPMap, regionID int) *tailcfg.DERPNode {
-	if dm == nil || len(dm.Regions) == 0 {
-		return nil
-	}
-	if regionID != 0 {
-		if region := dm.Regions[regionID]; region != nil && len(region.Nodes) > 0 {
-			return region.Nodes[0]
-		}
-	}
-	for _, regionID := range dm.RegionIDs() {
-		region := dm.Regions[regionID]
-		if region != nil && len(region.Nodes) > 0 {
-			return region.Nodes[0]
-		}
-	}
-	return nil
 }
 
 func derpServerURL(node *tailcfg.DERPNode) string {

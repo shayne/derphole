@@ -10,6 +10,29 @@ The client runtime is spread across three layers:
 
 This split is important because "DERP client behavior" is not just a socket dial. It includes measurement, ranking, stickiness, fallback, and route learning.
 
+## Public DERP Map Resolution
+
+derphole, derptun, derpssh, and the web relay share one public DERP map resolver. A request first uses a validated cache entry that is less than one hour old. Otherwise it attempts a live refresh with a five-second deadline and an 8 MiB response limit. If the refresh fails, the resolver uses a validated stale entry and then the compiled Tailscale map as the final fallback.
+
+The persistent cache is `derphole/derpmap-cache-v2.json` under the operating system's user cache directory. Version 2 hashes canonical source URLs and stores only validated typed map data, so query credentials and unknown response fields are not persisted. Its directory is mode 0700 and its file is mode 0600 on Unix systems. Cache corruption, unsupported data, and persistence failures do not block a session; the resolver continues through the remaining sources. Verbose diagnostics identify the source and selected region without printing the map URL or cache metadata:
+
+```text
+derp-map-source=stale-cache region=7 age=1h14m0s
+```
+
+If a usable map could not be persisted, the same redacted line adds
+`cache-write=failed`; the session still proceeds.
+
+New public one-shot tokens select only among the frozen region IDs understood
+by Derphole v0.18.2 and later. A consumer uses the encoded region exactly from
+its resolved map or the compiled compatibility map and fails if that region is
+absent from both; it never substitutes another relay region. Durable Derptun
+credentials whose encoded region remains zero continue to rendezvous through
+detached compiled maps, so independently refreshed live maps cannot split the
+server and client across regions.
+
+Custom DERP routes remain self-contained. Their map comes from the route embedded in the token, and failure never falls back to public infrastructure.
+
 ## Constrained Egress Through an HTTP Proxy
 
 derphole, derptun, and derpssh do not add proxy flags. Set the standard proxy environment variables before starting the process. Public `https://` DERP endpoints use `HTTPS_PROXY`; `HTTP_PROXY` applies to `http://` DERP endpoints. The lowercase forms and `NO_PROXY`/`no_proxy` follow Go's standard proxy resolver semantics.
@@ -105,6 +128,15 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 ```
 
 ## Region and Node Selection
+
+When creating a new public one-shot token, derphole and the web relay spend at most two seconds measuring the resolved regions. The lowest positive latency wins; ties use the lower region ID. If measurement is unavailable or inconclusive, creation continues with the first usable region in sorted order. The chosen ID is written into the existing `BootstrapRegion` field, so both peers rendezvous on the same relay without a token-format change.
+
+This selection is creation-only. A token consumer uses its encoded region. Current durable Derptun credentials with region zero retain their deterministic first-region behavior, and custom routes skip public measurement entirely. Verbose creation diagnostics distinguish a measured choice from fallback:
+
+```text
+derp-bootstrap-region=7 selection=measured latency=18ms
+derp-bootstrap-region=1 selection=deterministic-fallback
+```
 
 When using a DERP map, clients dial a region by trying nodes in priority order and skipping `STUNOnly` nodes for DERP transport.
 

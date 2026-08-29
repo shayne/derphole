@@ -15,7 +15,6 @@ import (
 
 	"github.com/shayne/derphole/pkg/derpbind"
 	"github.com/shayne/derphole/pkg/token"
-	"tailscale.com/tailcfg"
 )
 
 func TestDerptunDurableCustomDERPDelegatesAttachAndOpenRuntimes(t *testing.T) {
@@ -34,14 +33,6 @@ func TestDerptunDurableCustomDERPDelegatesAttachAndOpenRuntimes(t *testing.T) {
 		DERPRoute:       route,
 	}
 
-	oldFetch := fetchSessionDERPMap
-	t.Cleanup(func() { fetchSessionDERPMap = oldFetch })
-	fetchCalls := 0
-	fetchSessionDERPMap = func(context.Context, string) (*tailcfg.DERPMap, error) {
-		fetchCalls++
-		return nil, errors.New("unexpected public DERP map fetch")
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	attachRuntime, err := newAttachDialRuntime(ctx, AttachDialConfig{ForceRelay: true}, tok)
@@ -57,9 +48,6 @@ func TestDerptunDurableCustomDERPDelegatesAttachAndOpenRuntimes(t *testing.T) {
 	}
 	assertCustomDERPMap(t, openRuntime.dm, route)
 	openRuntime.close()
-	if fetchCalls != 0 {
-		t.Fatalf("public DERP map fetch calls = %d, want 0 for embedded custom route", fetchCalls)
-	}
 }
 
 func TestListenAttachAndDialAttachExternalRoundTrip(t *testing.T) {

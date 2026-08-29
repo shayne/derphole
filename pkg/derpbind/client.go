@@ -23,6 +23,9 @@ import (
 	"tailscale.com/types/logger"
 )
 
+// AppName identifies Derphole-family clients to DERP relay servers.
+const AppName = "derphole"
+
 type Packet struct {
 	From    key.NodePublic
 	Payload []byte
@@ -111,7 +114,7 @@ func newClientWithPrivateKey(ctx context.Context, node *tailcfg.DERPNode, server
 
 	logf := logger.Logf(func(string, ...any) {})
 	netMon := netmon.NewStatic()
-	dc, err := derphttp.NewClient(priv, serverURL, logf, netMon)
+	dc, err := newDERPHTTPClient(priv, serverURL, logf, netMon)
 	if err != nil {
 		return nil, err
 	}
@@ -134,6 +137,15 @@ func newClientWithPrivateKey(ctx context.Context, node *tailcfg.DERPNode, server
 	}
 	go c.recvLoop()
 	return c, nil
+}
+
+func newDERPHTTPClient(priv key.NodePrivate, serverURL string, logf logger.Logf, netMon *netmon.Monitor) (*derphttp.Client, error) {
+	client, err := derphttp.NewClient(priv, serverURL, logf, netMon)
+	if err != nil {
+		return nil, err
+	}
+	client.AppName = AppName
+	return client, nil
 }
 
 type derpDialTarget struct {

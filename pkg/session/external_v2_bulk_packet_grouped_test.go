@@ -684,6 +684,9 @@ func TestExternalV2BulkPacketGroupAssemblerBypassesLegacyClaimsAndRejectsLateDup
 }
 
 func TestExternalV2BulkPacketGroupAssemblerReusesCiphertextBuffers(t *testing.T) {
+	if raceDetectorEnabled {
+		t.Skip("the race detector deliberately drops sync.Pool entries at random")
+	}
 	// sync.Pool may discard every cached entry during a GC. Keep this assertion
 	// within one pool generation so it tests reuse rather than GC policy.
 	previousGCPercent := debug.SetGCPercent(-1)
